@@ -31,6 +31,7 @@ from manyforge_composer.backend.scenario_artifacts import (
     discover_scenario_artifacts,
     export_scenario_artifact,
     load_scenario_artifact,
+    prepare_scenario_artifact,
     save_scenario_artifact,
 )
 from manyforge_composer.backend.state import ComposerState
@@ -1006,6 +1007,34 @@ def test_save_as_rebases_project_source_references_without_copying(
     ]["project_path"]
     assert (copied / reference).resolve() == (tmp_path / "model.urdf").resolve()
     assert not (copied / "sources").exists()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["ur5e_lite6_wall_grouped", "ur5e_lite6_wall_isolation"],
+)
+def test_saving_unchanged_generated_scenario_reproduces_generator_bytes(
+    scenario: str,
+) -> None:
+    # These projects are written by
+    # scripts/qualification/generate_ui6i_dual_robot_scenario.py.
+    examples = Path(__file__).resolve().parents[2] / "examples"
+    project = examples / f"{scenario}.scenario"
+    document, path = load_scenario_artifact(
+        str(project), allowed_roots=[str(examples)]
+    )
+
+    _, target, members, manifest = prepare_scenario_artifact(
+        document,
+        path,
+        allowed_roots=[str(examples)],
+        source_project_path=path,
+    )
+
+    assert target == project
+    for filename, raw in members.items():
+        assert raw == (project / filename).read_bytes(), filename
+    assert manifest == (project / "scenario.yaml").read_bytes()
 
 
 def test_source_changes_are_advisory_and_export_is_self_contained(

@@ -1049,15 +1049,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control/248cb6ce5717b326d521db22f5b507f2edd43a251dbbc64efd6ba1c8c8747834",
-        "content_digest": "sha256:9750c3b838fbd5c3714185d9a33f15df6b25d0e0e3ad25e8019e63a070154b3c",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:248cb6ce5717b326d521db22f5b507f2edd43a251dbbc64efd6ba1c8c8747834",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
         "content_digest": "sha256:f231d8f52a7858c2ebbf4c1334650aeb973407ac780d2c4fbd194df0209e4cea",
         "record_id": "manyforge.ros2_control_execution_runtime",
@@ -1101,7 +1092,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-  "deployment_revision": "sha256:589608394c2d91afc5bf2a42cb90583cacfefe330bedb6f84fabe5e94886a24e",
+  "deployment_revision": "sha256:6232d9d58d4a863352f32891200678f2d901e1e7c9ec12e8d862315c344c6fe6",
   "description": "Retained Isaac UR10e light-scene pick-and-place deployment using the separately retained ROS 2 control execution product, commanded state authority, and Robotiq bridge profile.",
   "desired_control_configurations": [
     {
@@ -1994,17 +1985,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control/248cb6ce5717b326d521db22f5b507f2edd43a251dbbc64efd6ba1c8c8747834",
-        "content_digest": "sha256:9750c3b838fbd5c3714185d9a33f15df6b25d0e0e3ad25e8019e63a070154b3c",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:248cb6ce5717b326d521db22f5b507f2edd43a251dbbc64efd6ba1c8c8747834",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "isaac_ur10e_light_robot.arm.execution-contact-geometric",

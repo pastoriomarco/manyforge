@@ -44,8 +44,8 @@
             "fallback",
             "gripper.command_position",
             "inverter",
-            "logic.set_bool",
-            "logic.wait_for_bool",
+            "logic.set_value",
+            "logic.wait_for_value",
             "motion.follow_cartesian_path",
             "motion.move_to_joint_target",
             "motion.move_to_pose",
@@ -130,11 +130,11 @@
           "tool_name": "select_scene_object"
         },
         "template_text": "You are selecting the next object for a perception-guided pick cycle. Use the authoritative backend scene manifest as the primary source of truth for object IDs, poses, shapes, sizes, and spatial semantics. If an image is attached, use it only as auxiliary evidence for attributes that are not already explicit in the manifest. Selection request: `{{ selection_request_text }}`\nAuthoritative scene context JSON: {{ scene_context_json }}\nYou must answer by calling the `select_scene_object` tool. Use the exact candidate object ID when outcome=`selected`. Use an empty string for `selected_object_id` when outcome is `no_match` or `ambiguous`.",
-        "variable_ids": [
-          "candidate_object_ids",
-          "scene_context_json",
-          "selection_request_text"
-        ],
+        "variables": {
+          "candidate_object_ids": "string_list",
+          "scene_context_json": "string",
+          "selection_request_text": "string"
+        },
         "version": "1"
       }
     },
@@ -1239,15 +1239,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_semantic_shape_pick/ca69c920a416e440849e8ccddcea0d796b5b0f90ed48436d8ed43533817af0ba",
-        "content_digest": "sha256:8be74f84f2de9d8055b506f47644fa6d97357b5b9ef62893aef3548b25c42923",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_semantic_shape_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:ca69c920a416e440849e8ccddcea0d796b5b0f90ed48436d8ed43533817af0ba",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1288,7 +1279,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:a68574432f759d151ec41ffabdc2dec9e47be018bfc6a546c387a8c373c4e649",
+  "deployment_revision": "sha256:5ae4e6ed0a0507e39ea60189f61a22cb7dbf2dc42e6d84992a323b69524ec944",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {
@@ -2303,17 +2294,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_semantic_shape_pick/ca69c920a416e440849e8ccddcea0d796b5b0f90ed48436d8ed43533817af0ba",
-        "content_digest": "sha256:8be74f84f2de9d8055b506f47644fa6d97357b5b9ef62893aef3548b25c42923",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_semantic_shape_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:ca69c920a416e440849e8ccddcea0d796b5b0f90ed48436d8ed43533817af0ba",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",

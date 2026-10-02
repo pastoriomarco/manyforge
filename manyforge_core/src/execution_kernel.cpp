@@ -264,6 +264,11 @@ std::unordered_set<std::string> observed_target_object_ids(
       reference_identity_matches_type(*request.offset_reference)) {
     out.insert(std::string(reference_identity_value(*request.offset_reference)));
   }
+  if (request.goal_frame_reference.has_value() &&
+      request.goal_frame_reference->type == ReferenceDTO::Type::kSceneResource &&
+      reference_identity_matches_type(*request.goal_frame_reference)) {
+    out.insert(std::string(reference_identity_value(*request.goal_frame_reference)));
+  }
   if (!request.contact_policy_id.empty() && policy_snapshot.has_value()) {
     for (const auto& grasp : policy_snapshot->contact_grasps) {
       if (grasp.policy_id == request.contact_policy_id && !grasp.selected_object_id.empty()) {
@@ -6521,7 +6526,6 @@ ExecutionKernel::make_and_prepare_motion_participant(
                                         plan_phase.plan_request->planner_capability_binding},
       *validation_phase.validation_evidence,
       std::move(contact_policy),
-      PreparedRuntimePolicyRefDTO{authority.runtime_policy.value().source_artifact},
       authority.requested_tcp_linear_speed_mps,
       authority.deployment_maximum_tcp_linear_speed_mps,
       std::move(prepared_scopes),
@@ -6595,7 +6599,7 @@ ExecutionKernel::make_and_prepare_motion_participant(
           : std::nullopt};
 
   auto made = MakePreparedOperationParticipant(
-      std::move(candidate), authority.binding, authority.stop_readiness, &authority.runtime_policy,
+      std::move(candidate), authority.binding, authority.stop_readiness,
       authority.retained_default_stop_limits, authority.stop_node_category);
   if (!made.ok()) {
     return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(made.error());
@@ -8079,7 +8083,8 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
                   "motion_preview_planning_timeout_invalid");
   }
   if (request.target_mode != MotionTargetModeDTO::kAbsolute ||
-      request.target_reference.has_value() || request.offset_reference.has_value()) {
+      request.target_reference.has_value() || request.offset_reference.has_value() ||
+      request.goal_frame_reference.has_value()) {
     return reject(ErrorCode::kInvalidRequest,
                   "Motion preview requires an already-resolved absolute "
                   "motion target",
@@ -8897,11 +8902,15 @@ Result<uint64_t> ExecutionKernel::execute_impl(
 
   std::optional<ProgramFrameResolutionContextDTO> resolution_context;
   const auto continuation = prepared_session ? prepared_session->authority.continuation : nullptr;
-  if (!continuation && request.target_mode == MotionTargetModeDTO::kRelative) {
+  if (!continuation && (request.target_mode == MotionTargetModeDTO::kRelative ||
+                        request.goal_frame_reference.has_value())) {
     if (!synced_state.has_value()) {
-      return reject_admission(ErrorDTO{kErrorStartStateMismatch,
-                                       "Relative motion requires an authority-selected start state",
-                                       {{"reason", "relative_start_state_unavailable"}}});
+      return reject_admission(ErrorDTO{
+          kErrorStartStateMismatch,
+          "Referenced motion requires an authority-selected start state",
+          {{"reason", request.target_mode == MotionTargetModeDTO::kRelative
+                          ? "relative_start_state_unavailable"
+                          : "goal_frame_start_state_unavailable"}}});
     }
     const auto capture_time_ns = clock_.now();
     auto observed_publication = observed_state_.addressed_publication(
@@ -8920,6 +8929,9 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     }
     if (request.offset_reference.has_value()) {
       requested_references.push_back(*request.offset_reference);
+    }
+    if (request.goal_frame_reference.has_value()) {
+      requested_references.push_back(*request.goal_frame_reference);
     }
     ProgramFrameResolutionCaptureDTO capture{request.binding,
                                              controlled_start.value(),

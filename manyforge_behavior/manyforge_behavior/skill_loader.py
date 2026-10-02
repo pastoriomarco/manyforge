@@ -20,6 +20,7 @@ from .canonical_artifact import (
 )
 from .catalog import NodeCatalog
 from .catalog_schema import parse_schema, validate_value
+from .value_path import ValuePathError, parse_value_path
 
 
 SKILL_API_VERSION = "manyforge.skill.v1"
@@ -349,7 +350,13 @@ class SkillCatalog:
             type(metadata) is dict and "skill_expansions" not in metadata,
             "skill expansion provenance is generated, not supplied by the template",
         )
-        supplied = set(node["parameters"]) | set(node.get("value_sources", {}))
+        try:
+            source_roots = {
+                str(parse_value_path(path)[0]) for path in node.get("value_sources", {})
+            }
+        except ValuePathError as error:
+            raise SkillValidationError(f"invalid skill value-source path: {error}") from error
+        supplied = set(node["parameters"]) | source_roots
         _require(
             supplied <= {parameter.id for parameter in entry.parameters},
             "unknown primitive parameter",

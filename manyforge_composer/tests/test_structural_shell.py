@@ -50,9 +50,9 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 46
+    assert len(payload["entries"]) == 51
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
-    assert payload["contentVersion"] == "2.3.0"
+    assert payload["contentVersion"] == "2.4.0"
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
     assert payload["environmentDigest"].startswith("sha256:")
@@ -79,7 +79,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 46
+    assert len(environment_payload["executableRegistry"]) == 51
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:

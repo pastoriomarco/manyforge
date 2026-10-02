@@ -4,10 +4,12 @@ import type {
   CatalogJsonSchema,
   JsonValue,
   ProgramAuthoringDocument,
+  ProgramFormulaReferences,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
 } from '../types/api';
+import { hasSourcesWithin } from './valuePaths';
 
 const FORBIDDEN_DYNAMIC_PARAMETERS = new Set([
   'contact_policy_id',
@@ -36,6 +38,18 @@ export interface ProgramParameterUsage {
 
 export interface BlackboardUsage extends ProgramParameterUsage {
   field: string | null;
+}
+
+/** One formula that reads a declaration: a node field's or a computed key's. */
+export type FormulaUsage =
+  | { kind: 'node'; nodeId: string; path: string }
+  | { kind: 'computed_key'; key: string };
+
+export interface FormulaUsages {
+  /** By parameter ID. */
+  parameters: Record<string, FormulaUsage[]>;
+  /** By blackboard key. */
+  keys: Record<string, FormulaUsage[]>;
 }
 
 export const PROGRAM_MOTION_FIELDS = [
@@ -254,7 +268,7 @@ function compatibleBlackboardKeys(
   return keys.filter((key) => (
     (expectedTypes.size === 0 || expectedTypes.has(key.type))
     && (reads.length === 0 || key.access !== 'write')
-    && (writes.length === 0 || key.access !== 'read')
+    && (writes.length === 0 || (key.access !== 'read' && key.expression === undefined))
   ));
 }
 
@@ -482,6 +496,11 @@ export function schemaAcceptsProgramType(
   const semanticType = schema['x-manyforge-semantic-type'];
   if (semanticType === 'scene_resource') return programType === 'scene_resource';
   if (semanticType) return false;
+  // A value of one of several Program types (a prompt-template variable);
+  // a key-typed value is narrowed to its key's type before it gets here.
+  if (schema.anyOf !== undefined && schema['x-manyforge-value-type-from-key'] === undefined) {
+    return schema.anyOf.some((branch) => schemaAcceptsProgramType(branch, programType));
+  }
   if (programType === 'float64') return schema.type === 'number';
   if (programType === 'int64') return schema.type === 'integer';
   if (programType === 'bool') return schema.type === 'boolean';
@@ -517,16 +536,11 @@ function selectorParameterIds(entry: CatalogEntry): Set<string> {
   ].filter((value): value is string => value !== undefined)));
 }
 
-export function catalogFieldAcceptsValueSource(
-  entry: CatalogEntry,
-  fieldName: string,
-  sourceType: string,
-): boolean {
-  const parameter = entry.parameters.find((field) => field.id === fieldName);
-  return parameter !== undefined
-    && !FORBIDDEN_DYNAMIC_PARAMETERS.has(fieldName)
-    && !selectorParameterIds(entry).has(fieldName)
-    && schemaAcceptsProgramType(parameter.schema, sourceType);
+/** Whether any value of this parameter may come from a parameter, a key or a formula; effect selectors never do. */
+export function catalogParameterSourceable(entry: CatalogEntry, parameterId: string): boolean {
+  return entry.parameters.some((field) => field.id === parameterId)
+    && !FORBIDDEN_DYNAMIC_PARAMETERS.has(parameterId)
+    && !selectorParameterIds(entry).has(parameterId);
 }
 
 export function collectProgramBindingCandidates(
@@ -539,12 +553,10 @@ export function collectProgramBindingCandidates(
   for (const { node } of flattenProgramSource(root)) {
     const entry = catalog.get(node.node_id);
     if (!entry) continue;
-    const selectors = selectorParameterIds(entry);
     for (const field of entry.parameters) {
       if (
-        node.value_sources?.[field.id] !== undefined
-        || FORBIDDEN_DYNAMIC_PARAMETERS.has(field.id)
-        || selectors.has(field.id)
+        hasSourcesWithin(node.value_sources, field.id)
+        || !catalogParameterSourceable(entry, field.id)
         || !schemaAcceptsProgramType(field.schema, parameter.type)
       ) {
         continue;
@@ -622,6 +634,34 @@ export function collectBlackboardUsages(
       ),
     ]),
   );
+}
+
+/** Group the backend's per-formula names by the declaration each one reads. */
+export function collectFormulaUsages(references: ProgramFormulaReferences): FormulaUsages {
+  const usages: FormulaUsages = { parameters: {}, keys: {} };
+  const add = (names: string[], usage: FormulaUsage) => {
+    for (const name of names) {
+      const separator = name.indexOf('.');
+      const group = name.slice(0, separator) === 'param' ? usages.parameters : usages.keys;
+      const id = name.slice(separator + 1);
+      group[id] = [...(group[id] ?? []), usage];
+    }
+  };
+  for (const [key, names] of Object.entries(references.computedKeys)) {
+    add(names, { kind: 'computed_key', key });
+  }
+  for (const [nodeId, formulas] of Object.entries(references.nodes)) {
+    for (const [path, names] of Object.entries(formulas)) {
+      add(names, { kind: 'node', nodeId, path });
+    }
+  }
+  return usages;
+}
+
+export function formulaUsageLabel(usage: FormulaUsage): string {
+  return usage.kind === 'node'
+    ? `formula in ${usage.nodeId} at ${usage.path}`
+    : `formula of key ${usage.key}`;
 }
 
 export function resolveProgramParameterLiteralValue(

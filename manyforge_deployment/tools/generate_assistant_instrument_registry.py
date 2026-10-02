@@ -31,6 +31,32 @@ IDENTIFIER: dict[str, Any] = {
 }
 INSTANCE_OR_ROOT: dict[str, Any] = {"oneOf": [copy.deepcopy(IDENTIFIER), {"const": "@root"}]}
 BOUNDED_TEXT: dict[str, Any] = {"type": "string", "maxLength": 4096}
+# One whole-parameter value source in an assistant proposal: a Program
+# parameter, a blackboard key, or one declared field of a blackboard key.
+_FIELD_KIND: dict[str, Any] = {
+    "properties": {"kind": {"const": "blackboard_field"}},
+    "required": ["kind"],
+}
+VALUE_SOURCE: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field": {"type": "string"},
+        "kind": {
+            "type": "string",
+            "enum": ["program_parameter", "blackboard_key", "blackboard_field"],
+        },
+        "reference": {"type": "string"},
+    },
+    "required": ["kind", "reference"],
+    "allOf": [
+        {"if": copy.deepcopy(_FIELD_KIND), "then": {"required": ["field"]}},
+        {
+            "if": {"not": copy.deepcopy(_FIELD_KIND)},
+            "then": {"not": {"required": ["field"]}},
+        },
+    ],
+}
 
 # Exact translation of the maintained pre-cutover scene-authoring allowlist.
 # The old aggregate motion node becomes the three explicit v2 motion forms.
@@ -38,8 +64,8 @@ ASSISTANT_NODE_IDS = (
     "fallback",
     "gripper.command_position",
     "inverter",
-    "logic.set_bool",
-    "logic.wait_for_bool",
+    "logic.set_value",
+    "logic.wait_for_value",
     "motion.follow_cartesian_path",
     "motion.move_to_joint_target",
     "motion.move_to_pose",
@@ -110,15 +136,16 @@ STRUCTURED_PROGRAM_TYPES = {
     "scene_selection_context",
     "scene_selection_result",
 }
-RUNTIME_MUTABILITY = ("immutable", "before_run", "between_operations")
+RUNTIME_MUTABILITY = ("immutable", "before_run")
 BLACKBOARD_ACCESS = ("read", "write", "read_write")
-BLACKBOARD_PERSISTENCE = ("node", "run", "persistent")
+BLACKBOARD_PERSISTENCE = ("run", "persistent")
 VALUE_SOURCE_FORBIDDEN_PARAMETER_IDS = {
     "contact_policy_id",
     "model_endpoint_alias",
     "prompt_template_id",
 }
 VALUE_SOURCE_FORBIDDEN_SEMANTICS = {
+    "blackboard_key",
     "collision_body_role",
     "component_role",
     "frame_role",
@@ -398,9 +425,8 @@ def _node_configuration_schema(
         for parameter in sorted(entry.parameters, key=lambda item: item.id)
     }
     value_source_ids = _value_source_parameter_ids(catalog, entry)
-    value_source_schema = _catalog_schema(catalog, catalog.schema_registry.types["value_source"])
     value_source_properties = {
-        parameter_id: copy.deepcopy(value_source_schema)
+        parameter_id: copy.deepcopy(VALUE_SOURCE)
         for parameter_id in sorted(value_source_ids)
     }
     required_literals = tuple(
@@ -436,8 +462,10 @@ def _node_configuration_schema(
 
     all_of: list[dict[str, Any]] = []
     for parameter_id in sorted(value_source_ids):
-        # The Program contract never permits one parameter to be supplied both
-        # literally and through a top-level value source.
+        # Assistant proposals use the whole-parameter subset: a parameter is
+        # supplied literally or through one top-level value source. (Programs
+        # may keep a literal beside its source for "Type values"; a proposal
+        # never needs one.)
         all_of.append(
             {
                 "not": {
@@ -718,8 +746,10 @@ def _constraints_schema(*, numeric: str | None = None, length: bool = False) -> 
     return _object(properties, all_of=all_of)
 
 
-def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
-    default_schemas: dict[str, dict[str, Any]] = {
+def _authored_value_schemas(catalog: NodeCatalog) -> dict[str, dict[str, Any]]:
+    """Schemas of authored parameter defaults and blackboard initial values."""
+
+    return {
         "bool": {"type": "boolean"},
         "float64": {"type": "number"},
         "int64": {"type": "integer"},
@@ -728,6 +758,10 @@ def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
         "string": {"type": "string", "maxLength": 1_000_000},
         "string_list": _array({"type": "string", "maxLength": 1_000_000}, maximum=MAX_ITEMS),
     }
+
+
+def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
+    default_schemas = _authored_value_schemas(catalog)
     variants: list[dict[str, Any]] = []
     for parameter_type in PROGRAM_TYPES:
         if parameter_type in STRUCTURED_PROGRAM_TYPES:
@@ -766,7 +800,8 @@ def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
     return {"oneOf": variants}
 
 
-def _blackboard_key_schema() -> dict[str, Any]:
+def _blackboard_key_schema(catalog: NodeCatalog) -> dict[str, Any]:
+    initial_schemas = _authored_value_schemas(catalog)
     field = _object(
         {
             "field": copy.deepcopy(IDENTIFIER),
@@ -788,6 +823,8 @@ def _blackboard_key_schema() -> dict[str, Any]:
         }
         if key_type in STRUCTURED_PROGRAM_TYPES:
             properties["fields"] = _array(field, minimum=1)
+        else:
+            properties["initial"] = copy.deepcopy(initial_schemas[key_type])
         variants.append(
             _object(
                 properties,
@@ -1179,7 +1216,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Insert or replace strict v1 blackboard key declarations in the Draft.",
             _object(
-                {"keys": _array(_blackboard_key_schema(), minimum=1)},
+                {"keys": _array(_blackboard_key_schema(catalog), minimum=1)},
                 required=("keys",),
             ),
         ),

@@ -124,6 +124,44 @@ TEST(OperationIntentTest, RejectsAbsoluteMotionWithRelativeReference) {
   EXPECT_EQ(result.error().details.at("reason"), "absolute_motion_has_reference");
 }
 
+TEST(OperationIntentTest, AcceptsAbsolutePoseInNamedGoalFrameOnly) {
+  auto operation = valid_motion_operation();
+  auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+  Pose3DTO goal;
+  goal.orientation.w = 1.0;
+  motion.motion = PoseGoalDTO{goal};
+  const ReferenceTargetDTO peer{TargetRoleId("peer_arm"), ControllableComponentId("peer"),
+                                CommandTargetId("arm")};
+  for (const auto& frame :
+       {ReferenceDTO(ReferenceDTO::Type::kCellFrame, ""), ReferenceDTO(FrameRoleId("tcp"), peer),
+        ReferenceDTO(ReferenceDTO::Type::kSceneResource, "fixture")}) {
+    motion.goal_frame_reference = frame;
+    const auto accepted = validate_operation_intent(operation);
+    EXPECT_TRUE(accepted.ok()) << accepted.error().message;
+  }
+
+  const auto rejected = [&](const std::string& reason) {
+    const auto result = validate_operation_intent(operation);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+  };
+  motion.goal_frame_reference = ReferenceDTO(goal);
+  rejected("goal_frame_inline_pose_unsupported");
+  motion.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
+  motion.target_mode = MotionTargetModeDTO::kRelative;
+  motion.target_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+  rejected("goal_frame_requires_absolute_target");
+  motion.target_mode = MotionTargetModeDTO::kAbsolute;
+  motion.target_reference.reset();
+  motion.motion = JointGoalDTO{{"joint_1"}, {0.25}};
+  rejected("goal_frame_motion_type_unsupported");
+  motion.motion = PoseGoalDTO{goal};
+  auto incomplete = peer;
+  incomplete.controllable_component_id = ControllableComponentId("");
+  motion.goal_frame_reference = ReferenceDTO(FrameRoleId("tcp"), incomplete);
+  rejected("motion_reference_invalid");
+}
+
 TEST(OperationIntentTest, RejectsGripperEffortWithDifferentCoordinateKind) {
   auto operation = valid_motion_operation();
   operation.participants.front().payload = CapabilityCommandIntentDTO{

@@ -1,13 +1,13 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_isolation
-program_revision: sha256:e695415a062a59618e0d4af1dcad08bb479b0e65f86da59741c59dbc4cae06f7
+program_revision: sha256:26c38257b03734771dbfb1c99d9529a23304c10b2c41619a7f52b4913544a6ee
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_isolation
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups
   for the isolation case.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes:
   - manyforge-only

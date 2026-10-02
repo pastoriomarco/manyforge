@@ -9,11 +9,24 @@ import {
   resolveStructuralAssetUrl,
 } from './client';
 
-it('classifies only exact authoring admission refusals', () => {
-  for (const code of ['authoring_not_ready', 'stale_generation']) {
+it('classifies only exact authoring pre-effect refusals', () => {
+  for (const code of [
+    'authoring_not_ready',
+    'stale_generation',
+    'observed_move_node_unsupported',
+    'observed_move_role_missing',
+    'observed_move_configuration_changed',
+    'observed_move_target_unbound',
+    'observed_move_target_unavailable',
+    'observed_move_frame_mismatch',
+    'observed_move_unavailable',
+  ]) {
     expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code } })))
       .toContain('Edit not applied');
   }
+  // The retired catch-all code is no longer a recognised pre-effect refusal.
+  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code: 'observed_move_target_mismatch' } })))
+    .toBeNull();
   expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code: 'activation_preparation_failed' } })))
     .toBe('Not applied: the candidate could not be prepared. Correct it and try again.');
   expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: {
@@ -22,7 +35,48 @@ it('classifies only exact authoring admission refusals', () => {
   } }))).toBe('Not applied: the candidate could not be prepared (Program is missing compatibility). Correct it and try again.');
   expect(authoringRefusalMessage(new ApiError('fault', 409, { detail: { code: 'component_fault' } }))).toBeNull();
   expect(authoringRefusalMessage(new ApiError('failure', 500, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
+  expect(authoringRefusalMessage(new ApiError('failure', 503, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
   expect(authoringRefusalMessage(new Error('authoring_not_ready'))).toBeNull();
+});
+
+it('classifies a named observed-move refusal by its code, whatever its status', () => {
+  const message = 'current pose/joints could not be read: execution owner disconnected';
+  for (const status of [502, 503]) {
+    expect(authoringRefusalMessage(new ApiError(message, status, {
+      detail: { code: 'observed_move_unavailable', message },
+    }))).toBe('Edit not applied: current pose/joints could not be read: execution owner disconnected. '
+      + 'Wait for the robot to report its current state, then try again.');
+  }
+});
+
+it('never classifies a bare gateway or unavailable status as a refusal', () => {
+  for (const status of [502, 503]) {
+    // A proxy/gateway reply may hide a request that succeeded upstream.
+    expect(authoringRefusalMessage(new ApiError('Bad Gateway', status, null))).toBeNull();
+    expect(authoringRefusalMessage(new ApiError('Bad Gateway', status, '<html>bad gateway</html>'))).toBeNull();
+    expect(authoringRefusalMessage(new ApiError('failure', status, { detail: 'upstream unavailable' }))).toBeNull();
+    expect(authoringRefusalMessage(new ApiError('failure', status, { detail: { message: 'no code' } }))).toBeNull();
+    expect(authoringRefusalMessage(new ApiError('failure', status, { detail: { code: 'headless_unavailable' } }))).toBeNull();
+    expect(authoringRefusalMessage(new ApiError('failure', status, { code: 'observed_move_unavailable' }))).toBeNull();
+  }
+});
+
+it('names each observed-move refusal cause with the owner message', () => {
+  const refusal = (code: string, message: string) => authoringRefusalMessage(
+    new ApiError(message, 409, { detail: { code, message } }),
+  );
+  expect(refusal(
+    'observed_move_configuration_changed',
+    'the Applied configuration changed: the Applied Program binding belongs to a different configuration than the current execution owner; Apply the Program again',
+  )).toBe('Edit not applied: the Applied configuration changed: the Applied Program binding belongs to a different configuration than the current execution owner; Apply the Program again');
+  expect(refusal('observed_move_role_missing', 'the selected move has no TCP frame role; choose it before capturing the current robot pose'))
+    .toBe('Edit not applied: the selected move has no TCP frame role; choose it before capturing the current robot pose');
+  expect(refusal('observed_move_frame_mismatch', "TCP frame role 'base' resolves to 'robot.base'"))
+    .toBe("Edit not applied: TCP frame role 'base' resolves to 'robot.base'");
+  expect(refusal('observed_move_target_unavailable', 'the bound robot target is unavailable in the current execution owner'))
+    .toBe('Edit not applied: the bound robot target is unavailable in the current execution owner. Check that the robot is running in the current configuration.');
+  expect(refusal('observed_move_unavailable', 'execution owner has no complete current observed target.'))
+    .toBe('Edit not applied: execution owner has no complete current observed target. Wait for the robot to report its current state, then try again.');
 });
 import type {
   DraftFenceRequest,
@@ -372,7 +426,7 @@ function workspaceFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.3.0',
+      content_version: '2.4.0',
     },
     component_roles: {},
     target_roles: {},
@@ -402,6 +456,7 @@ function workspaceFixture(): Record<string, unknown> {
         tree,
       },
       diagnostics: [],
+      formulaReferences: { computedKeys: {}, nodes: {} },
     },
     applicability: {
       applyReady: true,

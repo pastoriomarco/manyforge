@@ -1058,15 +1058,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_pick_place/1baca0428864b00332716c1eaba321a31c63d48a54d728809dfb7fb9d5224141",
-        "content_digest": "sha256:21255ef54c4c224287c77c6f3093ffd17dc19debee1d8fa486e6c47e385ca58e",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_pick_place",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:1baca0428864b00332716c1eaba321a31c63d48a54d728809dfb7fb9d5224141",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1105,7 +1096,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-  "deployment_revision": "sha256:92a31480eec3663aa00c066534aa7f90a2aa1c75392ea0ae8b14ce800698c126",
+  "deployment_revision": "sha256:39bb7b85310e62781517f46473f35cd2abf2ea04727dfbeb22ec5ab8258d0373",
   "description": "Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
   "desired_control_configurations": [
     {
@@ -2091,17 +2082,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_pick_place/1baca0428864b00332716c1eaba321a31c63d48a54d728809dfb7fb9d5224141",
-        "content_digest": "sha256:21255ef54c4c224287c77c6f3093ffd17dc19debee1d8fa486e6c47e385ca58e",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_pick_place",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:1baca0428864b00332716c1eaba321a31c63d48a54d728809dfb7fb9d5224141",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",

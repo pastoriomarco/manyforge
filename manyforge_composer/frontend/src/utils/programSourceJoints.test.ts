@@ -32,7 +32,7 @@ const authoring: ProgramAuthoringDocument = {
   name: 'Pick',
   catalog: {
     api_version: 'manyforge.node_catalog.v2',
-    content_version: '2.3.0',
+    content_version: '2.4.0',
   },
   component_roles: { robot: {} },
   target_roles: { arm: targetRole },
@@ -49,7 +49,7 @@ const program: ProgramDocument = {
   name: 'Pick',
   catalog: {
     api_version: 'manyforge.node_catalog.v2',
-    content_version: '2.3.0',
+    content_version: '2.4.0',
   },
   component_roles: { robot: {} },
   target_roles: { arm: targetRole },
@@ -86,7 +86,7 @@ const applied: AppliedProgramSelection = {
     graph_revision: 'sha256:graph',
     node_environment: {
       catalog_id: 'manyforge_builtin',
-      content_version: '2.3.0',
+      content_version: '2.4.0',
       catalog_digest: 'sha256:catalog',
       environment_digest: 'sha256:environment',
     },

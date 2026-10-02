@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <limits>
 #include <manyforge_core/runtime_participant_policy.hpp>
 #include <optional>
@@ -9,10 +8,6 @@
 namespace {
 
 using namespace manyforge::core;
-
-[[nodiscard]] std::string digest(char value) {
-  return "sha256:" + std::string(64U, value);
-}
 
 [[nodiscard]] RuntimeParticipantBinding binding() {
   auto result = verify_runtime_participant_binding(RuntimeParticipantBindingDTO{
@@ -69,36 +64,12 @@ using namespace manyforge::core;
   return std::move(result.value());
 }
 
-[[nodiscard]] RuntimePolicyDTO policy() {
-  return RuntimePolicyDTO{
-      RuntimePolicyId("runtime.safe"),
-      RuntimePolicyRevision(digest('a')),
-      std::nullopt,
-      {InterruptPolicyId("interrupt.contact"), InterruptPolicyId("interrupt.limit")},
-      {RuntimeOpenLoopGraspAcknowledgementDTO{ControllableComponentId("robot.1"),
-                                              CommandTargetId("arm"),
-                                              OpenLoopGraspEnvironmentDTO::kSimulation, true}}};
-}
-
-[[nodiscard]] RuntimePolicyCatalogRecordRefDTO policy_reference(const RuntimePolicyDTO& value) {
-  return {value.runtime_policy_id,
-          value.runtime_policy_revision,
-          SchemaId(std::string(kRuntimePolicyApiVersion)),
-          SchemaRevision(digest('b')),
-          ContentDigest(digest('c')),
-          ContentAddressedStoreKey("catalog/runtime-policy/runtime.safe.json")};
-}
-
-TEST(RuntimeParticipantPolicy, SealsExactTargetWithoutTcpSpeedAuthority) {
+TEST(RuntimeParticipantPolicy, SealsExactTargetWithoutJerkProfile) {
   const auto participant = binding();
-  auto source = policy();
-  const auto source_reference = policy_reference(source);
-  auto selected =
-      verify_runtime_participant_policy_selection(source_reference, std::move(source), participant);
-  ASSERT_TRUE(selected.ok()) << selected.error().message;
-  EXPECT_EQ(selected.value().value().source_artifact.content_addressed_store_key,
-            ContentAddressedStoreKey("catalog/runtime-policy/runtime.safe.json"));
-  EXPECT_EQ(selected.value().value().policy, policy());
+  const auto selected = select_runtime_participant_policy(participant);
+  EXPECT_EQ(selected.value().controllable_component_id, ControllableComponentId("robot.1"));
+  EXPECT_EQ(selected.value().command_target_id, CommandTargetId("arm"));
+  EXPECT_FALSE(selected.value().ordinary_motion_jerk);
 }
 
 TEST(RuntimeParticipantPolicy, DeploymentMaximumCapsOperationRequest) {
@@ -135,41 +106,22 @@ TEST(RuntimeParticipantPolicy, DeploymentMaximumCapsOperationRequest) {
   EXPECT_FALSE(apply_deployment_motion_speed_limit(1000.1, {}).ok());
 }
 
-TEST(RuntimeParticipantPolicy, EnforcesCanonicalShapeAndInterruptMembership) {
-  const auto participant = binding();
-  auto noncanonical = policy();
-  std::reverse(noncanonical.interrupt_policy_ids.begin(), noncanonical.interrupt_policy_ids.end());
-  const auto noncanonical_reference = policy_reference(noncanonical);
-  EXPECT_FALSE(verify_runtime_participant_policy_selection(noncanonical_reference,
-                                                           std::move(noncanonical), participant)
-                   .ok());
-
-  auto source = policy();
-  const auto source_reference = policy_reference(source);
-  auto selected =
-      verify_runtime_participant_policy_selection(source_reference, std::move(source), participant);
-  ASSERT_TRUE(selected.ok());
-  MotionInterruptScopeDTO allowed;
-  allowed.scope_id = "scope.1";
-  allowed.policy_id = "interrupt.contact";
-  EXPECT_TRUE(
-      validate_runtime_participant_interrupt_policy_selection(selected.value(), {&allowed, 1U})
-          .ok());
-  allowed.policy_id = "interrupt.foreign";
-  auto rejected =
-      validate_runtime_participant_interrupt_policy_selection(selected.value(), {&allowed, 1U});
+TEST(RuntimeParticipantPolicy, RefusesEveryMotionInterruptScope) {
+  EXPECT_TRUE(validate_motion_interrupt_scope_admission({}).ok());
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = "scope.1";
+  scope.policy_id = "interrupt.contact";
+  const auto rejected = validate_motion_interrupt_scope_admission({&scope, 1U});
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"), "runtime_policy_interrupt_policy_not_selected");
+  EXPECT_EQ(rejected.error().code, std::string(to_string(ErrorCode::kInvalidRequest)));
+  EXPECT_EQ(rejected.error().details.at("reason"), "motion_interrupt_policy_not_admitted");
 }
 
 TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyFillsOmissionsAndRejectsWeakerRequests) {
   const auto participant = binding();
-  const auto source = policy();
-  const auto base =
-      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
-  ASSERT_TRUE(base.ok());
+  const auto base = select_runtime_participant_policy(participant);
   OrdinaryMotionJerkPolicy profile{true, false, {{"joint_1", AngularJerkDTO{10.0}}}};
-  const auto selected = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  const auto selected = apply_deployment_motion_jerk_policy(base, participant, profile);
   ASSERT_TRUE(selected.ok());
   profile.limits.at("joint_1") = AngularJerkDTO{100.0};
   const auto filled = apply_runtime_participant_motion_jerk_policy(selected.value(), {});
@@ -183,17 +135,14 @@ TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyFillsOmissionsAndRejectsWeakerR
   const auto rejected = apply_runtime_participant_motion_jerk_policy(selected.value(), requested);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "ordinary_motion_jerk_limit_exceeded");
-  EXPECT_FALSE(base.value().value().ordinary_motion_jerk);
+  EXPECT_FALSE(base.value().ordinary_motion_jerk);
 }
 
 TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWaiveRequiredLimits) {
   const auto participant = binding();
-  const auto source = policy();
-  const auto base =
-      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
-  ASSERT_TRUE(base.ok());
+  const auto base = select_runtime_participant_policy(participant);
   OrdinaryMotionJerkPolicy profile{false, false, {{"joint_1", AngularJerkDTO{10.0}}}};
-  const auto selected = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  const auto selected = apply_deployment_motion_jerk_policy(base, participant, profile);
   ASSERT_TRUE(selected.ok());
   EXPECT_TRUE(apply_runtime_participant_motion_jerk_policy(selected.value(), {}).value().empty());
   const auto rejected =
@@ -201,9 +150,9 @@ TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWai
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "ordinary_motion_jerk_disabled");
   profile.machine_required = true;
-  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base.value(), participant, profile).ok());
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base, participant, profile).ok());
   profile.enabled = true;
-  const auto required = apply_deployment_motion_jerk_policy(base.value(), participant, profile);
+  const auto required = apply_deployment_motion_jerk_policy(base, participant, profile);
   ASSERT_TRUE(required.ok());
   profile.machine_required = false;
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
@@ -216,20 +165,17 @@ TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWai
 
 TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyRejectsIncompleteCrossedAndWrongUnitLimits) {
   const auto participant = binding();
-  const auto source = policy();
-  const auto base =
-      verify_runtime_participant_policy_selection(policy_reference(source), source, participant);
-  ASSERT_TRUE(base.ok());
+  const auto base = select_runtime_participant_policy(participant);
   EXPECT_FALSE(
-      apply_deployment_motion_jerk_policy(base.value(), participant, {true, false, {}}).ok());
-  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base.value(), participant,
+      apply_deployment_motion_jerk_policy(base, participant, {true, false, {}}).ok());
+  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base, participant,
                                                    {true, false, {{"other", AngularJerkDTO{10.0}}}})
                    .ok());
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(
-                   base.value(), participant, {true, false, {{"joint_1", LinearJerkDTO{10.0}}}})
+                   base, participant, {true, false, {{"joint_1", LinearJerkDTO{10.0}}}})
                    .ok());
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(
-                   base.value(), participant, {true, false, {{"joint_1", AngularJerkDTO{0.0}}}})
+                   base, participant, {true, false, {{"joint_1", AngularJerkDTO{0.0}}}})
                    .ok());
 }
 

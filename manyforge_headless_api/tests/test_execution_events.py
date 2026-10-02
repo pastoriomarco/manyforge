@@ -223,6 +223,7 @@ def _stop_fault_clear_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
 
 def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
+        "operation_progress": [],
         "admission_generation": 1,
         "api_version": "manyforge.execution_command_response.v1",
         "command": "events",
@@ -1177,6 +1178,7 @@ class _PagedExecution:
         self.event = _event(self.owner_epoch, 1)
         self.stop_fault_offer: dict[str, Any] | None = None
         self.stop_fault_calls = 0
+        self.progress: list[dict[str, Any]] = []
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -1195,6 +1197,7 @@ class _PagedExecution:
         assert limit == 1
         events = [] if after_sequence else [self.event]
         return {
+            "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
             "has_more": False,
@@ -1234,6 +1237,7 @@ class _StreamingExecution(_PagedExecution):
             events = available[:limit]
         next_sequence = events[-1]["sequence"] if events else after_sequence
         return {
+            "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
             "has_more": len(available) > len(events),
@@ -1421,10 +1425,12 @@ def test_event_pump_logs_only_error_transitions(caplog) -> None:
     assert pump.last_error is None
 
 
-def test_event_pump_records_progress_without_rebuilding_control_projection() -> None:
+def test_event_pump_progress_advances_without_journal_events_or_cold_rebuild() -> None:
     core = _RecordingCore()
     execution = _StreamingExecution()
     wakes: list[None] = []
+    samples: list[list[dict[str, Any]]] = []
+    execution.progress = [_progress_row(execution.owner_epoch, 0.1)]
     execution.append(
         _progress_event(execution.owner_epoch, 1, state="executing", progress=0.1)
     )
@@ -1432,6 +1438,7 @@ def test_event_pump_records_progress_without_rebuilding_control_projection() -> 
         core, execution, poll_seconds=0.01, page_limit=1
     )
     pump.set_change_observer(lambda: wakes.append(None))
+    pump.set_progress_observer(samples.append)
     pump.start()
     for _ in range(100):
         if len(core.ingested) >= 1 and wakes:
@@ -1439,29 +1446,73 @@ def test_event_pump_records_progress_without_rebuilding_control_projection() -> 
         threading.Event().wait(0.01)
     first_wake_count = len(wakes)
 
-    execution.append(
-        _progress_event(execution.owner_epoch, 2, state="executing", progress=0.8)
-    )
+    execution.progress = [_progress_row(execution.owner_epoch, 0.8)]
     for _ in range(100):
-        if len(core.ingested) >= 2:
+        if samples and samples[-1] == execution.progress:
             break
         threading.Event().wait(0.01)
     threading.Event().wait(0.03)
 
-    assert len(core.ingested) == 2
+    assert samples[-1] == execution.progress
+    assert len(core.ingested) == 1
     assert len(wakes) == first_wake_count == 1
 
     execution.append(
-        _progress_event(execution.owner_epoch, 3, state="completed", progress=1.0)
+        _progress_event(execution.owner_epoch, 2, state="completed", progress=1.0)
     )
     for _ in range(100):
-        if len(core.ingested) >= 3 and len(wakes) > first_wake_count:
+        if len(core.ingested) >= 2 and len(wakes) > first_wake_count:
             break
         threading.Event().wait(0.01)
     pump.shutdown()
 
-    assert len(core.ingested) == 3
+    assert len(core.ingested) == 2
     assert len(wakes) == first_wake_count + 1
+
+
+def _progress_row(epoch: str, progress: float) -> dict[str, Any]:
+    return {"owner_epoch": epoch, "operation_id": "operation.1", "operation_revision": 1, "progress": progress}
+
+
+@pytest.mark.parametrize("invalid", [None, [{"progress": 0.5}], [_progress_row("wrong-owner", 0.5)],
+                                     [_progress_row("owner.1", float("nan"))],
+                                     [_progress_row("owner.1", 0.5)] * 2])
+def test_native_progress_requires_bounded_valid_unique_owner_rows(monkeypatch, tmp_path, invalid) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = _page("owner.1", [])
+    response["operation_progress"] = invalid
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    with pytest.raises(HeadlessApiError, match="progress"):
+        client.events("owner.1", 0)
+
+
+def test_native_progress_on_empty_journal_page(monkeypatch, tmp_path) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = _page("owner.1", [])
+    response["operation_progress"] = [_progress_row("owner.1", 0.6)]
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert client.events("owner.1", 0)["operation_progress"] == response["operation_progress"]
+
+
+def test_progress_is_latest_only_bounded_and_quiet_when_unchanged() -> None:
+    pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
+    samples = []
+    pump.set_progress_observer(samples.append)
+    pump._capture_progress([_progress_row("owner.1", 0.1)])
+    pump._publish_progress(1.0)
+    for sequence in range(2, 9):
+        pump._capture_progress([_progress_row("owner.1", sequence / 10)])
+        pump._publish_progress(1.1)
+    assert len(samples) == 1
+    pump._publish_progress(1.21)
+    assert samples[-1][0]["progress"] == 0.8
+    pump._publish_progress(2.0)
+    pump._capture_progress([_progress_row("owner.1", 0.8)])
+    pump._publish_progress(2.01)
+    assert len(samples) == 2
+    pump._capture_progress([])
+    pump._publish_progress(2.1)
+    assert samples[-1] == []
 
 
 def test_event_pump_operation_semantic_cache_has_the_native_resident_bound(

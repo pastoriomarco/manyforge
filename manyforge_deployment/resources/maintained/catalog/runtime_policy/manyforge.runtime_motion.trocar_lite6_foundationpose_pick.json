@@ -1,1 +1,0 @@
-{"api_version":"manyforge.runtime_policy.v1","description":"Maintained ros2_control motion policy for trocar_lite6_foundationpose_pick","interrupt_policy_ids":[],"open_loop_grasp_acknowledgements":[],"runtime_policy_id":"manyforge.runtime_motion.trocar_lite6_foundationpose_pick","runtime_policy_revision":"sha256:5e235e8be2c953efaa67749ff97d54e9672ebd434e3cc4f87235ca948bf44b40"}

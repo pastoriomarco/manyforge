@@ -378,7 +378,6 @@ def _final_pipeline(source, component_type):
         [],
         [],
         [],
-        [],
         selected_overlay,
     )
     compiled = core.compile_cell_ir(applicability)

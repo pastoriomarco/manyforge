@@ -420,6 +420,7 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
 
         def events(owner_epoch, after_sequence, *, limit):
             return {
+                "operation_progress": [],
                 "admission_generation": admission["admission_generation"],
                 "events": [],
                 "has_more": False,
@@ -557,6 +558,37 @@ def test_control_session_starts_with_versioned_current_snapshot() -> None:
     assert socket.sent[1]["semantic_status"] == "current"
     assert socket.sent[2]["complete"] is True
     assert socket.sent[2]["control"]["cycle_state"] == "idle_after_reset"
+
+
+def test_operation_progress_reuses_cached_facts_and_sends_only_progress() -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
+            ingress, program_runner_websocket_url=None,
+        )
+        sample = {"owner_epoch": "owner.1", "operation_id": "operation.1", "operation_revision": 1, "progress": 0.5}
+        source.notify_operation_progress([{**sample, "progress": 0.1}])
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            previous = source.take(subscription)
+            assert previous.shell["operation_progress"] == [{**sample, "progress": 0.1}]
+            reads = source.diagnostics()["owner_reads"]
+            source.notify_operation_progress([{**sample, "progress": 0.1}])
+            source.notify_operation_progress([sample])
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            current = source.take(subscription)
+            assert current is not None
+            assert source.diagnostics()["owner_reads"] == reads
+            session = ExecutionControlSession(object(), source, ingress)
+            assert session._delta_message(current, previous).shell == {
+                "complete": False, "operation_progress": [sample],
+            }
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+    asyncio.run(exercise())
 
 
 def test_control_delta_replaces_only_changed_immutable_owner_facts() -> None:

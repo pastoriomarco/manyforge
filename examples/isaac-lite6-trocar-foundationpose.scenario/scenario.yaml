@@ -10,11 +10,11 @@
     "assignment.yaml": "sha256:1a04360d772c4925b8f0b02708b479388500d222c3b642d3eb039df7d79528f5",
     "deployment.yaml": "sha256:76fd3931c2560363f0b7b717ed65b5692ac44d2db3da6e50fbbe7b57711408ad",
     "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:9f533bbfb6d526a6063da4dd840062ec707e257030067c24289b031d10d9d379"
+    "program.yaml": "sha256:51d6044bcfc429ca1b17bacd5ca2536438b82acd9899c0e12fc8dc30c3165b1b"
   },
   "name": "trocar_lite6_foundationpose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:2d1ea1313b400ba8063b91efc54d4f77ef3186d993f0535ed30bb5e95c2d6d33",
+    "checked_content_digest": "sha256:1e88c2467aabf979decf6d2df53c82932c959cd7defab9e597f09cc6551026ff",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

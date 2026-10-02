@@ -25,7 +25,7 @@
 #include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
-#include <manyforge_deployment/retained_runtime_policy.hpp>
+#include <manyforge_deployment/retained_stop_deadline_budget.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
@@ -2513,6 +2513,10 @@ TEST(
   ASSERT_FALSE(rejected_foreign.ok());
   EXPECT_EQ(rejected_foreign.error().details.at("reason"),
             "candidate_state_binding_unavailable");
+  // The predicted state is a request input, not the selected frame: the
+  // failure names no reference (spec 210 §4.4).
+  EXPECT_EQ(rejected_foreign.error().details.count("reference_type"), 0U);
+  EXPECT_EQ(rejected_foreign.error().details.count("reference_id"), 0U);
   auto reference_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 2U,
       core::SceneResourceId("reference-object"), 0.4, 0.05);
@@ -2794,6 +2798,738 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
+     CellResolverResolvesPeerRobotFramesAndPeerCarriedObjectsAtAdmission) {
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  const auto staging_parent = temporary.path() / "private-stages";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+
+  constexpr std::string_view cell_id = "i6_peer_reference_cell";
+  const auto materialized = deployment::test::
+      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto &products = bundle.value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto retained = load_lite6_planning_model(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.planning_collision_model.product_id});
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.symbol_role_maps.front().product_id});
+
+  const core::ControllableComponentId root_component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::ControllableComponentId peer_component_id(
+      deployment::test::lite6_controllable_fixture_detail::indexed_id(
+          deployment::test::kLite6ControllableComponentId, 1U));
+  const core::CommandTargetId arm_target_id(
+      std::string(deployment::test::kLite6ArmTargetId));
+  const core::RuntimeEpoch root_epoch("peer-reference-root-owner-epoch");
+  const auto root_binding = make_fixture_runtime_participant(
+      bundle, model_map, root_component_id, arm_target_id, std::nullopt,
+      std::nullopt, root_epoch);
+  const auto peer_binding = make_fixture_runtime_participant(
+      bundle, model_map, peer_component_id, arm_target_id);
+  const auto &root_component = require_fixture_one(
+      bundle.value().cell_graph.controllable_components,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == root_component_id;
+      },
+      "root peer-reference component");
+  const auto &root_graph_binding = require_fixture_one(
+      bundle.value().cell_graph.control_bindings,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == root_component_id &&
+               candidate.command_target_id == arm_target_id;
+      },
+      "root peer-reference control binding");
+  const auto &root_domain = require_fixture_one(
+      bundle.value().cell_graph.control_domains,
+      [&](const auto &candidate) {
+        return candidate.control_domain_id ==
+               root_graph_binding.control_domain_id;
+      },
+      "root peer-reference control domain");
+  std::set<core::RuntimeUnitId> root_runtime_units(
+      root_component.runtime_unit_ids.begin(),
+      root_component.runtime_unit_ids.end());
+  root_runtime_units.insert(root_domain.runtime_unit_ids.begin(),
+                            root_domain.runtime_unit_ids.end());
+  ASSERT_EQ(root_runtime_units.size(), 1U);
+  const auto root_runtime_unit_id = *root_runtime_units.begin();
+
+  auto stage =
+      RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      "retained_two_lite6_peer_reference_state",
+      std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
+      stage.package_paths(), retained_joint_limit_rows(retained)});
+  auto scene_mutex = std::make_shared<std::mutex>();
+  auto projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          scene, scene_mutex, bundle, model_map, retained,
+          std::vector<core::RuntimeParticipantBinding>{root_binding}, 0));
+  auto root_channel = std::make_shared<RetainedObservedStateChannel>(
+      root_binding, projector,
+      RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kPredictedState,
+          "test/peer-reference/root-arm", 0, 1U});
+  // The peer source is owned by its own projector with a positive freshness
+  // budget so admission-time staleness of the other robot is observable.
+  constexpr std::int64_t kPeerFreshnessBudgetNs = 5;
+  auto peer_scene = make_roboplan_scene(RoboPlanSceneInput{
+      "retained_two_lite6_peer_reference_peer_state",
+      std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
+      stage.package_paths(), retained_joint_limit_rows(retained)});
+  auto peer_projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          peer_scene, std::make_shared<std::mutex>(), bundle, model_map,
+          retained, std::vector<core::RuntimeParticipantBinding>{peer_binding},
+          kPeerFreshnessBudgetNs));
+  auto peer_channel = std::make_shared<RetainedObservedStateChannel>(
+      peer_binding, peer_projector,
+      RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kPredictedState,
+          "test/peer-reference/peer-arm", kPeerFreshnessBudgetNs, 1U});
+  ASSERT_TRUE(root_channel->initialize_from_projection(10).applied());
+  ASSERT_TRUE(peer_channel->initialize_from_projection(10).applied());
+
+  const auto *root_target =
+      model_map.find_target(root_component_id, arm_target_id);
+  ASSERT_NE(root_target, nullptr);
+  ASSERT_FALSE(root_target->model_groups.empty());
+  auto collision_model = ManyForgeCollisionEngine::load_shared_model(
+      "retained_two_lite6_peer_reference_state", stage.loader_urdf_path(),
+      stage.srdf_path(), stage.package_paths(),
+      root_target->model_groups.front().compiled_group_name);
+  const auto source_for = [](const auto &channel) {
+    return RetainedSceneFrameStateSourceInput{
+        channel->query_context(),
+        core::ObservedStateSourceKind::kPredictedState,
+        std::shared_ptr<const core::IObservedStateProvider>(
+            channel, channel->addressed_publication())};
+  };
+  const auto root_only_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, bundle, model_map, retained, root_runtime_unit_id,
+      root_epoch, {source_for(root_channel)}, root_component_id);
+  const auto cell_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, bundle, model_map, retained, root_runtime_unit_id,
+      root_epoch, {source_for(root_channel), source_for(peer_channel)});
+
+  // A Scene object carried by the peer TCP, expressed through its carrier.
+  const auto *peer_target =
+      model_map.find_target(peer_component_id, arm_target_id);
+  ASSERT_NE(peer_target, nullptr);
+  const auto peer_tcp_row = std::find_if(
+      peer_target->frames.begin(), peer_target->frames.end(),
+      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; });
+  ASSERT_NE(peer_tcp_row, peer_target->frames.end());
+  const auto *peer_tcp_model =
+      std::get_if<deployment::CompositionComponentModelFrame>(
+          &peer_tcp_row->frame);
+  ASSERT_NE(peer_tcp_model, nullptr);
+  const core::CarriedObjectAttachmentId attachment_id("peer-carried-attachment");
+  const core::CarriedObjectAttachmentRevision attachment_revision{
+      std::string(kZeroDigest)};
+  const core::Pose3DTO pose_in_carrier{{0.0, 0.0, 0.1}, {0.0, 0.0, 0.0, 1.0}};
+  auto logical_scene = *make_projection_runtime_shadow_snapshot(
+                            bundle.value().cell_graph.cell_id)
+                            .shared();
+  logical_scene.revision.revision_id = 2U;
+  logical_scene.transaction_sequence = 1U;
+  logical_scene.topology_epoch = 1U;
+  logical_scene.objects.push_back(core::SceneObjectSnapshotDTO{
+      core::SceneResourceId("peer-carried"),
+      {core::BoxShapeDTO{{0.02, 0.02, 0.02}}},
+      core::CarriedSceneObjectPlacementDTO{attachment_id, attachment_revision},
+      std::nullopt});
+  logical_scene.carried_object_attachments.push_back(
+      core::CarriedObjectAttachmentDTO{
+          attachment_id,
+          attachment_revision,
+          core::SceneResourceId("peer-carried"),
+          peer_component_id,
+          arm_target_id,
+          core::ComponentSceneFrameRefDTO{peer_component_id,
+                                          peer_tcp_model->model_instance_id,
+                                          peer_tcp_model->frame_role_id},
+          pose_in_carrier,
+          {}});
+  const auto sealed_attachment_revision =
+      core::logical_scene_identity::ComputeCarriedObjectAttachmentRevision(
+          logical_scene.carried_object_attachments.front());
+  logical_scene.carried_object_attachments.front()
+      .carried_object_attachment_revision = sealed_attachment_revision;
+  std::get<core::CarriedSceneObjectPlacementDTO>(
+      logical_scene.objects.front().placement)
+      .carried_object_attachment_revision = sealed_attachment_revision;
+  logical_scene.revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          logical_scene);
+  ASSERT_TRUE(logical_scene.locally_valid());
+  const auto scene_ptr =
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(logical_scene);
+  const core::ProjectionLeaseBindingDTO projection_binding{
+      {bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
+       logical_scene.revision},
+      core::ProjectionLeaseId("peer-reference-lease")};
+
+  // Both robots move away from the neutral projection before admission.
+  const std::vector<double> zero_velocities(6U, 0.0);
+  const std::vector<double> root_positions{0.2, -0.4, 0.6, 0.0, 1.0, 0.0};
+  const std::vector<double> peer_positions{-0.3, -0.785, 0.785,
+                                           0.1,  1.57,   0.2};
+  ASSERT_TRUE(
+      root_channel->publish_state(root_positions, zero_velocities, 20, 20)
+          .applied());
+  ASSERT_TRUE(
+      peer_channel->publish_state(peer_positions, zero_velocities, 20, 20)
+          .applied());
+
+  const auto exact_binding = make_fixture_execution_binding(root_binding);
+  const auto controlled_start_at = [&](const std::int64_t) {
+    auto publication = root_channel->addressed_publication()->publication(
+        exact_binding.control_binding_id,
+        exact_binding.control_binding_revision);
+    EXPECT_TRUE(publication.ok());
+    const auto &snapshot = publication.value().snapshot;
+    return std::pair{
+        core::ControlledStateDTO{
+            exact_binding.controllable_component_id,
+            exact_binding.command_target_id,
+            exact_binding.control_domain_id,
+            exact_binding.control_domain_revision,
+            exact_binding.control_binding_id,
+            exact_binding.control_binding_revision,
+            exact_binding.controller_topology_id,
+            exact_binding.topology_revision,
+            exact_binding.control_route_id,
+            exact_binding.active_control_configuration_id,
+            exact_binding.active_control_configuration_generation,
+            snapshot.resources, snapshot.joint_names, snapshot.positions,
+            snapshot.velocities},
+        publication.value()};
+  };
+  const core::ReferenceTargetDTO peer_robot{core::TargetRoleId("peer_arm"),
+                                            peer_component_id, arm_target_id};
+  const core::ReferenceDTO peer_tcp(core::FrameRoleId("tcp"), peer_robot);
+  const core::ReferenceDTO own_tcp(core::ReferenceDTO::Type::kFrameRole, "tcp");
+  const core::ReferenceDTO carried(core::ReferenceDTO::Type::kSceneResource,
+                                   "peer-carried");
+  const core::ReferenceDTO cell(core::ReferenceDTO::Type::kCellFrame, "");
+  const auto capture_with = [&](const RetainedSceneFrameResolver &resolver,
+                                std::vector<core::ReferenceDTO> references,
+                                const std::int64_t captured_at_ns) {
+    auto [start, publication] = controlled_start_at(captured_at_ns);
+    return resolver.capture_program_frame_resolution_context(
+        core::ProgramFrameResolutionCaptureDTO{
+            exact_binding, std::move(start), std::move(publication),
+            projection_binding, scene_ptr, {}, std::move(references),
+            captured_at_ns});
+  };
+
+  auto captured = capture_with(*cell_resolver,
+                               {own_tcp, peer_tcp, carried, cell}, 20);
+  ASSERT_TRUE(captured.ok()) << captured.error().message;
+  const auto resolve_cell_frame = [&](const core::ControllableComponentId &id,
+                                      const char *role,
+                                      const std::int64_t now_ns) {
+    auto resolved = cell_resolver->Resolve(
+        core::SceneFrameResolutionQueryDTO{
+            core::TargetCarrierSceneFrameRefDTO{id, arm_target_id,
+                                                core::FrameRoleId(role)},
+            projection_binding},
+        scene_ptr, now_ns);
+    EXPECT_TRUE(resolved.ok()) << resolved.error().message;
+    return resolved.value().frame_pose_in_cell;
+  };
+  const auto root_base = resolve_cell_frame(root_component_id, "base", 20);
+  const auto peer_tcp_in_cell = resolve_cell_frame(peer_component_id, "tcp", 20);
+  const auto in_root_base = [&](const core::Pose3DTO &pose_in_cell) {
+    return core::multiply_poses(core::inverse_pose(root_base), pose_in_cell);
+  };
+  const auto expect_pose_near = [](const core::Pose3DTO &actual,
+                                   const core::Pose3DTO &expected) {
+    EXPECT_NEAR(actual.position_m.x_m, expected.position_m.x_m, 1e-12);
+    EXPECT_NEAR(actual.position_m.y_m, expected.position_m.y_m, 1e-12);
+    EXPECT_NEAR(actual.position_m.z_m, expected.position_m.z_m, 1e-12);
+    EXPECT_NEAR(std::abs(actual.orientation.x * expected.orientation.x +
+                         actual.orientation.y * expected.orientation.y +
+                         actual.orientation.z * expected.orientation.z +
+                         actual.orientation.w * expected.orientation.w),
+                1.0, 1e-12);
+  };
+
+  const auto resolved_peer =
+      cell_resolver->resolve_reference_pose(peer_tcp, captured.value());
+  const auto resolved_own =
+      cell_resolver->resolve_reference_pose(own_tcp, captured.value());
+  const auto resolved_carried =
+      cell_resolver->resolve_reference_pose(carried, captured.value());
+  const auto resolved_cell =
+      cell_resolver->resolve_reference_pose(cell, captured.value());
+  ASSERT_TRUE(resolved_peer.ok()) << resolved_peer.error().message;
+  ASSERT_TRUE(resolved_own.ok()) << resolved_own.error().message;
+  ASSERT_TRUE(resolved_carried.ok()) << resolved_carried.error().message;
+  ASSERT_TRUE(resolved_cell.ok()) << resolved_cell.error().message;
+  expect_pose_near(resolved_peer.value(), in_root_base(peer_tcp_in_cell));
+  expect_pose_near(resolved_carried.value(),
+                   in_root_base(core::multiply_poses(peer_tcp_in_cell,
+                                                     pose_in_carrier)));
+  expect_pose_near(resolved_cell.value(), core::inverse_pose(root_base));
+  // The own-robot "tcp" and the peer "tcp" are different frames.
+  EXPECT_GT(std::abs(resolved_own.value().position_m.x_m -
+                     resolved_peer.value().position_m.x_m) +
+                std::abs(resolved_own.value().position_m.y_m -
+                         resolved_peer.value().position_m.y_m),
+            1e-3);
+
+  // Admission sampling: later peer motion does not change the captured
+  // answer, while a new admission samples the new peer state.
+  const std::vector<double> later_peer_positions{0.4, -0.2, 0.3,
+                                                 -0.1, 0.9, 0.0};
+  ASSERT_TRUE(peer_channel
+                  ->publish_state(later_peer_positions, zero_velocities, 30,
+                                  30)
+                  .applied());
+  const auto frozen_peer =
+      cell_resolver->resolve_reference_pose(peer_tcp, captured.value());
+  ASSERT_TRUE(frozen_peer.ok()) << frozen_peer.error().message;
+  EXPECT_EQ(frozen_peer.value(), resolved_peer.value());
+  const auto frozen_carried =
+      cell_resolver->resolve_reference_pose(carried, captured.value());
+  ASSERT_TRUE(frozen_carried.ok()) << frozen_carried.error().message;
+  EXPECT_EQ(frozen_carried.value(), resolved_carried.value());
+  auto recaptured = capture_with(*cell_resolver, {peer_tcp}, 30);
+  ASSERT_TRUE(recaptured.ok()) << recaptured.error().message;
+  const auto moved_peer =
+      cell_resolver->resolve_reference_pose(peer_tcp, recaptured.value());
+  ASSERT_TRUE(moved_peer.ok()) << moved_peer.error().message;
+  EXPECT_FALSE(moved_peer.value() == resolved_peer.value());
+
+  // Stale other-robot state fails at admission, before any motion exists.
+  const auto stale = capture_with(*cell_resolver, {peer_tcp}, 40);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"),
+            "observed_state_unavailable_at_evaluation_time");
+
+  // A robot without a state source in this resolver is refused by name.
+  const auto not_local = capture_with(*root_only_resolver, {peer_tcp}, 30);
+  ASSERT_FALSE(not_local.ok());
+  EXPECT_EQ(not_local.error().details.at("reason"),
+            "program_reference_robot_not_local");
+  // So is an object carried by such a robot.
+  const auto carried_not_local =
+      capture_with(*root_only_resolver, {carried}, 30);
+  ASSERT_FALSE(carried_not_local.ok());
+  EXPECT_EQ(carried_not_local.error().details.at("reason"),
+            "program_reference_robot_not_local");
+  const auto missing_frame = capture_with(
+      *cell_resolver,
+      {core::ReferenceDTO(core::FrameRoleId("no-such-frame"), peer_robot)}, 30);
+  ASSERT_FALSE(missing_frame.ok());
+  EXPECT_EQ(missing_frame.error().details.at("reason"),
+            "program_reference_robot_frame_missing");
+
+  // Every missing or ambiguous reference names the reference that failed
+  // (spec 210 §5.3); a robot-qualified frame also keeps its target role.
+  const auto expect_named = [](const core::ErrorDTO &error, const char *code,
+                               const char *reference_type,
+                               const char *reference_id,
+                               const char *target_role_id) {
+    EXPECT_EQ(error.code, code);
+    EXPECT_EQ(error.details.at("reference_type"), reference_type);
+    EXPECT_EQ(error.details.at("reference_id"), reference_id);
+    if (target_role_id == nullptr) {
+      EXPECT_EQ(error.details.count("target_role_id"), 0U);
+    } else {
+      EXPECT_EQ(error.details.at("target_role_id"), target_role_id);
+    }
+  };
+  expect_named(not_local.error(), "missing_reference", "frame_role", "tcp",
+               "peer_arm");
+  expect_named(carried_not_local.error(), "missing_reference",
+               "scene_resource", "peer-carried", nullptr);
+  expect_named(missing_frame.error(), "missing_reference", "frame_role",
+               "no-such-frame", "peer_arm");
+  const core::ReferenceDTO absent_resource(
+      core::ReferenceDTO::Type::kSceneResource, "no-such-resource");
+  const auto missing_resource =
+      capture_with(*cell_resolver, {absent_resource}, 30);
+  ASSERT_FALSE(missing_resource.ok());
+  EXPECT_EQ(missing_resource.error().details.at("reason"),
+            "program_scene_resource_missing");
+  expect_named(missing_resource.error(), "missing_reference", "scene_resource",
+               "no-such-resource", nullptr);
+  const auto resolved_missing_resource =
+      cell_resolver->resolve_reference_pose(absent_resource, captured.value());
+  ASSERT_FALSE(resolved_missing_resource.ok());
+  EXPECT_EQ(resolved_missing_resource.error().details.at("reason"),
+            "program_scene_resource_missing");
+  expect_named(resolved_missing_resource.error(), "missing_reference",
+               "scene_resource", "no-such-resource", nullptr);
+  const auto missing_own_role = capture_with(
+      *cell_resolver,
+      {core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
+                          "no-such-own-frame")},
+      30);
+  ASSERT_FALSE(missing_own_role.ok());
+  EXPECT_EQ(missing_own_role.error().details.at("reason"),
+            "program_frame_role_missing");
+  expect_named(missing_own_role.error(), "missing_reference", "frame_role",
+               "no-such-own-frame", nullptr);
+
+  // An error names exactly one reference. When the moving robot's own base
+  // frame fails while another robot's frame is requested, the details name
+  // that base with the moving robot's own target role and take no field of
+  // the requested peer reference.
+  const auto *base_frame = std::get_if<core::ResolvedComponentModelFrameDTO>(
+      &exact_binding.base_frame);
+  ASSERT_NE(base_frame, nullptr);
+  ASSERT_FALSE(exact_binding.target_role_id.empty());
+  ASSERT_NE(exact_binding.target_role_id.value(), "peer_arm");
+  auto without_base = captured.value();
+  const auto base_path =
+      std::find_if(without_base.kinematic_paths.begin(),
+                   without_base.kinematic_paths.end(), [&](const auto &path) {
+                     return path.terminal_frame == exact_binding.base_frame;
+                   });
+  ASSERT_NE(base_path, without_base.kinematic_paths.end());
+  const auto base_index =
+      std::distance(without_base.kinematic_paths.begin(), base_path);
+  without_base.kinematic_paths.erase(base_path);
+  without_base.kinematic_state_path_views.erase(
+      without_base.kinematic_state_path_views.begin() + base_index);
+  ASSERT_TRUE(without_base.valid());
+  for (const auto &requested : {peer_tcp, own_tcp, carried}) {
+    const auto base_failed =
+        cell_resolver->resolve_reference_pose(requested, without_base);
+    ASSERT_FALSE(base_failed.ok());
+    EXPECT_EQ(base_failed.error().details.at("reason"),
+              "program_reference_frame_view_missing");
+    expect_named(base_failed.error(), "missing_reference", "frame_role",
+                 base_frame->frame_role_id.value().c_str(),
+                 exact_binding.target_role_id.value().c_str());
+  }
+
+  // A failing runtime-object binding of the capture is named by its key.
+  const auto capture_with_objects =
+      [&](std::vector<core::RuntimeObjectReferenceBindingDTO> objects) {
+        auto [start, publication] = controlled_start_at(30);
+        return cell_resolver->capture_program_frame_resolution_context(
+            core::ProgramFrameResolutionCaptureDTO{exact_binding,
+                                                   std::move(start),
+                                                   std::move(publication),
+                                                   projection_binding,
+                                                   scene_ptr,
+                                                   std::move(objects),
+                                                   {},
+                                                   30});
+      };
+  const auto stale_object =
+      capture_with_objects({{core::RuntimeObjectId("stale-object"),
+                             core::SceneResourceId("no-such-resource")}});
+  ASSERT_FALSE(stale_object.ok());
+  EXPECT_EQ(stale_object.error().details.at("reason"),
+            "runtime_object_binding_invalid");
+  expect_named(stale_object.error(), "missing_reference", "runtime_object",
+               "stale-object", nullptr);
+  const auto duplicated_object =
+      capture_with_objects({{core::RuntimeObjectId("held-object"),
+                             core::SceneResourceId("peer-carried")},
+                            {core::RuntimeObjectId("held-object"),
+                             core::SceneResourceId("peer-carried")}});
+  ASSERT_FALSE(duplicated_object.ok());
+  EXPECT_EQ(duplicated_object.error().details.at("reason"),
+            "runtime_object_binding_invalid");
+  expect_named(duplicated_object.error(), "missing_reference", "runtime_object",
+               "held-object", nullptr);
+  // A binding without a key names nothing.
+  const auto keyless_object = capture_with_objects(
+      {{core::RuntimeObjectId(""), core::SceneResourceId("peer-carried")}});
+  ASSERT_FALSE(keyless_object.ok());
+  EXPECT_EQ(keyless_object.error().details.at("reason"),
+            "runtime_object_binding_invalid");
+  EXPECT_EQ(keyless_object.error().details.count("reference_type"), 0U);
+  EXPECT_EQ(keyless_object.error().details.count("reference_id"), 0U);
+
+  // A failure about the whole capture or context names no reference, even
+  // when raised while one requested reference is being resolved.
+  const auto expect_unnamed = [](const core::ErrorDTO &error) {
+    EXPECT_EQ(error.details.count("reference_type"), 0U);
+    EXPECT_EQ(error.details.count("reference_id"), 0U);
+    EXPECT_EQ(error.details.count("target_role_id"), 0U);
+  };
+  auto invalid_context = captured.value();
+  invalid_context.captured_at_ns = -1;
+  ASSERT_FALSE(invalid_context.valid());
+  const auto context_mismatch =
+      cell_resolver->resolve_reference_pose(peer_tcp, invalid_context);
+  ASSERT_FALSE(context_mismatch.ok());
+  EXPECT_EQ(context_mismatch.error().details.at("reason"),
+            "program_reference_context_mismatch");
+  expect_unnamed(context_mismatch.error());
+  {
+    auto [start, publication] = controlled_start_at(30);
+    const auto identity_mismatch =
+        cell_resolver->capture_program_frame_resolution_context(
+            core::ProgramFrameResolutionCaptureDTO{exact_binding,
+                                                   std::move(start),
+                                                   std::move(publication),
+                                                   projection_binding,
+                                                   scene_ptr,
+                                                   {},
+                                                   {peer_tcp},
+                                                   -1});
+    ASSERT_FALSE(identity_mismatch.ok());
+    EXPECT_EQ(identity_mismatch.error().details.at("reason"),
+              "program_reference_capture_identity_mismatch");
+    expect_unnamed(identity_mismatch.error());
+  }
+  const auto query_mismatch = cell_resolver->Resolve(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{peer_component_id, arm_target_id,
+                                              core::FrameRoleId("tcp")},
+          projection_binding},
+      make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id)
+          .shared(),
+      30);
+  ASSERT_FALSE(query_mismatch.ok());
+  EXPECT_EQ(query_mismatch.error().details.at("reason"),
+            "scene_frame_query_mismatch");
+  expect_unnamed(query_mismatch.error());
+  {
+    // A capture failure met while one requested reference's frame path is
+    // read is about the capture, not that reference: the own TCP path reads
+    // a root publication newer than the selected start, so the frame path
+    // conflicts with the start. Naming is opt-in, so it names nothing.
+    auto [selected_start, selected_publication] = controlled_start_at(30);
+    ASSERT_TRUE(
+        root_channel->publish_state(root_positions, zero_velocities, 30, 30)
+            .applied());
+    const auto capture_from_selected_start =
+        [&](std::vector<core::ReferenceDTO> references) {
+          return cell_resolver->capture_program_frame_resolution_context(
+              core::ProgramFrameResolutionCaptureDTO{exact_binding,
+                                                     selected_start,
+                                                     selected_publication,
+                                                     projection_binding,
+                                                     scene_ptr,
+                                                     {},
+                                                     std::move(references),
+                                                     30});
+        };
+    // The base frame alone agrees with the selected start; the conflict is
+    // met only on the requested reference's path.
+    const auto base_only = capture_from_selected_start({});
+    ASSERT_TRUE(base_only.ok()) << base_only.error().message;
+    const auto conflict = capture_from_selected_start({own_tcp});
+    ASSERT_FALSE(conflict.ok());
+    EXPECT_EQ(conflict.error().code, "missing_reference");
+    EXPECT_EQ(conflict.error().details.at("reason"),
+              "program_reference_state_capture_conflict");
+    expect_unnamed(conflict.error());
+  }
+
+  // Pose transform between frames of different robots and Scene objects.
+  const core::Pose3DTO probe{{0.05, -0.02, 0.03}, {0.0, 0.0, 0.0, 1.0}};
+  const auto transform = cell_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{
+          probe, carried,
+          core::ReferenceDTO(core::FrameRoleId("base"),
+                             core::ReferenceTargetDTO{
+                                 core::TargetRoleId("root_arm"),
+                                 root_component_id, arm_target_id}),
+          projection_binding},
+      scene_ptr, 30);
+  ASSERT_TRUE(transform.ok()) << transform.error().message;
+  const auto peer_tcp_at_30 = resolve_cell_frame(peer_component_id, "tcp", 30);
+  const auto root_base_at_30 = resolve_cell_frame(root_component_id, "base", 30);
+  expect_pose_near(
+      transform.value().pose_in_target_frame,
+      core::multiply_poses(
+          core::inverse_pose(root_base_at_30),
+          core::multiply_poses(
+              core::multiply_poses(peer_tcp_at_30, pose_in_carrier), probe)));
+  EXPECT_EQ(transform.value().resolution_evidence_digests.size(), 2U);
+  const auto to_cell = cell_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{probe, cell, cell, projection_binding},
+      scene_ptr, 30);
+  ASSERT_TRUE(to_cell.ok()) << to_cell.error().message;
+  expect_pose_near(to_cell.value().pose_in_target_frame, probe);
+  EXPECT_TRUE(to_cell.value().resolution_evidence_digests.empty());
+  const auto unqualified = cell_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{probe, own_tcp, cell,
+                                       projection_binding},
+      scene_ptr, 30);
+  ASSERT_FALSE(unqualified.ok());
+  EXPECT_EQ(unqualified.error().details.at("reason"),
+            "frame_transform_reference_unsupported");
+  expect_named(unqualified.error(), "invalid_request", "frame_role", "tcp",
+               nullptr);
+  const auto transform_not_local = root_only_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{probe, peer_tcp, cell,
+                                       projection_binding},
+      scene_ptr, 30);
+  ASSERT_FALSE(transform_not_local.ok());
+  EXPECT_EQ(transform_not_local.error().details.at("reason"),
+            "program_reference_robot_not_local");
+  expect_named(transform_not_local.error(), "missing_reference", "frame_role",
+               "tcp", "peer_arm");
+  const auto transform_stale = cell_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{probe, peer_tcp, cell,
+                                       projection_binding},
+      scene_ptr, 40);
+  ASSERT_FALSE(transform_stale.ok());
+  EXPECT_EQ(transform_stale.error().details.at("reason"),
+            "observed_state_unavailable_at_evaluation_time");
+  const auto carried_transform_not_local =
+      root_only_resolver->ResolveFrameTransform(
+          RetainedSceneFrameTransformQuery{probe, carried, cell,
+                                           projection_binding},
+          scene_ptr, 30);
+  ASSERT_FALSE(carried_transform_not_local.ok());
+  EXPECT_EQ(carried_transform_not_local.error().details.at("reason"),
+            "program_reference_robot_not_local");
+  expect_named(carried_transform_not_local.error(), "missing_reference",
+               "scene_resource", "peer-carried", nullptr);
+
+  // One coherent capture: the peer source publishes a new state right after
+  // its first read. Source (carried object) and target (its carrier TCP)
+  // cross the same peer path, so a coherent answer is exactly
+  // `pose_in_carrier * probe` whatever the robot state, and the peer source
+  // is read once.
+  class ScriptedPublications final : public core::IObservedStateProvider {
+  public:
+    ScriptedPublications(core::ObservedStatePublicationDTO first,
+                         core::ObservedStatePublicationDTO later)
+        : first_(std::move(first)), later_(std::move(later)) {}
+    [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
+    current_state(const core::ObservedStateQueryContextDTO &,
+                  std::int64_t) const override {
+      return core::Result<core::ObservedStateSnapshotDTO>::Err(
+          core::ErrorDTO{"unsupported", "unsupported", {}});
+    }
+    [[nodiscard]] core::Result<core::ObservedStatePublicationDTO>
+    publication(const core::ControlBindingId &id,
+                const core::ControlBindingRevision &revision) const override {
+      return publication_at(id, revision, 0);
+    }
+    [[nodiscard]] core::Result<core::ObservedStatePublicationDTO>
+    publication_at(const core::ControlBindingId &,
+                   const core::ControlBindingRevision &,
+                   std::int64_t) const override {
+      ++reads_;
+      return core::Result<core::ObservedStatePublicationDTO>::Ok(
+          reads_ == 1U ? first_ : later_);
+    }
+    [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
+
+  private:
+    core::ObservedStatePublicationDTO first_;
+    core::ObservedStatePublicationDTO later_;
+    mutable std::size_t reads_{};
+  };
+  const auto peer_context = peer_channel->query_context();
+  const auto first_peer = peer_channel->addressed_publication()->publication(
+      peer_context.control_binding_id, peer_context.control_binding_revision);
+  ASSERT_TRUE(first_peer.ok());
+  const std::vector<double> drifted_peer_positions{-0.6, -0.1, 0.9,
+                                                   0.3,  1.2,  -0.4};
+  ASSERT_TRUE(peer_channel
+                  ->publish_state(drifted_peer_positions, zero_velocities, 31,
+                                  31)
+                  .applied());
+  const auto drifted_peer = peer_channel->addressed_publication()->publication(
+      peer_context.control_binding_id, peer_context.control_binding_revision);
+  ASSERT_TRUE(drifted_peer.ok());
+  ASSERT_FALSE(drifted_peer.value().snapshot.positions ==
+               first_peer.value().snapshot.positions);
+  const auto scripted = std::make_shared<ScriptedPublications>(
+      first_peer.value(), drifted_peer.value());
+  const auto scripted_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, bundle, model_map, retained, root_runtime_unit_id,
+      root_epoch,
+      {source_for(root_channel),
+       RetainedSceneFrameStateSourceInput{
+           peer_context, core::ObservedStateSourceKind::kPredictedState,
+           scripted}});
+  const auto coherent = scripted_resolver->ResolveFrameTransform(
+      RetainedSceneFrameTransformQuery{probe, carried, peer_tcp,
+                                       projection_binding},
+      scene_ptr, 32);
+  ASSERT_TRUE(coherent.ok()) << coherent.error().message;
+  EXPECT_EQ(scripted->reads(), 1U);
+  expect_pose_near(coherent.value().pose_in_target_frame,
+                   core::multiply_poses(pose_in_carrier, probe));
+  EXPECT_EQ(coherent.value().source_frame_in_cell,
+            core::multiply_poses(coherent.value().target_frame_in_cell,
+                                 pose_in_carrier));
+
+  // One capture holds the retained receiver-time skew budget across robots:
+  // two individually fresh publications received further apart than the
+  // budget are never composed, at admission or in a frame transform.
+  constexpr std::int64_t kSkewBudgetNs = 10'000'000;
+  const core::ReferenceDTO root_tcp(
+      core::FrameRoleId("tcp"),
+      core::ReferenceTargetDTO{core::TargetRoleId("root_arm"),
+                               root_component_id, arm_target_id});
+  const auto publish_pair = [&](const std::int64_t root_at_ns,
+                                const std::int64_t peer_at_ns) {
+    ASSERT_TRUE(root_channel
+                    ->publish_state(root_positions, zero_velocities,
+                                    root_at_ns, root_at_ns)
+                    .applied());
+    ASSERT_TRUE(peer_channel
+                    ->publish_state(peer_positions, zero_velocities,
+                                    peer_at_ns, peer_at_ns)
+                    .applied());
+  };
+  const auto cross_robot_transform = [&](const std::int64_t now_ns) {
+    return cell_resolver->ResolveFrameTransform(
+        RetainedSceneFrameTransformQuery{probe, peer_tcp, root_tcp,
+                                         projection_binding},
+        scene_ptr, now_ns);
+  };
+  constexpr std::int64_t kSkewedRootNs = 1'000;
+  constexpr std::int64_t kSkewedPeerNs = kSkewedRootNs + kSkewBudgetNs + 1;
+  publish_pair(kSkewedRootNs, kSkewedPeerNs);
+  for (const auto &component_id : {root_component_id, peer_component_id}) {
+    const auto individually = cell_resolver->Resolve(
+        core::SceneFrameResolutionQueryDTO{
+            core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
+                                                core::FrameRoleId("tcp")},
+            projection_binding},
+        scene_ptr, kSkewedPeerNs);
+    ASSERT_TRUE(individually.ok()) << individually.error().message;
+  }
+  const auto skewed_capture = capture_with(*cell_resolver, {peer_tcp},
+                                           kSkewedPeerNs);
+  ASSERT_FALSE(skewed_capture.ok());
+  EXPECT_EQ(skewed_capture.error().details.at("reason"),
+            "kinematic_receiver_time_skew_exceeded");
+  const auto skewed_transform = cross_robot_transform(kSkewedPeerNs);
+  ASSERT_FALSE(skewed_transform.ok());
+  EXPECT_EQ(skewed_transform.error().details.at("reason"),
+            "kinematic_receiver_time_skew_exceeded");
+
+  constexpr std::int64_t kBudgetRootNs = 20'000'000;
+  constexpr std::int64_t kBudgetPeerNs = kBudgetRootNs + kSkewBudgetNs;
+  publish_pair(kBudgetRootNs, kBudgetPeerNs);
+  const auto within_capture = capture_with(*cell_resolver, {peer_tcp},
+                                           kBudgetPeerNs);
+  ASSERT_TRUE(within_capture.ok()) << within_capture.error().message;
+  const auto within_transform = cross_robot_transform(kBudgetPeerNs);
+  ASSERT_TRUE(within_transform.ok()) << within_transform.error().message;
+  EXPECT_EQ(within_transform.value().resolution_evidence_digests.size(), 2U);
+}
+
+TEST(RetainedProductCrossConsumer,
      BootstrapStopEnvelopeFollowsDeclaredCapabilityAndExactArtifacts) {
   ScopedTemporaryRoot temporary;
   const auto passive_root = temporary.path() / "not-stoppable";
@@ -2829,12 +3565,12 @@ TEST(RetainedProductCrossConsumer,
   } missing;
   EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(*motion.bundle,
                                                                  missing),
-               deployment::RetainedRuntimePolicyError);
+               deployment::RetainedStopDeadlineBudgetError);
   // Even a non-stoppable capability must prove its exact policy, not treat
   // missing/tampered artifacts as an empty or passive product.
   EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(
                    *passive.bundle, missing),
-               deployment::RetainedRuntimePolicyError);
+               deployment::RetainedStopDeadlineBudgetError);
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -3019,10 +3755,6 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
       {},
       {}};
   ManagedKernelAdmissionGate admission_gate;
-  deployment::FilesystemCatalogArtifactStore runtime_policy_store(package_root);
-  const auto runtime_policy = deployment::resolve_retained_runtime_policy(
-      *materialized.bundle, runtime_policy_store);
-  ASSERT_TRUE(runtime_policy.has_value());
   auto runtime_input = RetainedNativeRuntimeInput{
       arm_binding,
       gripper_binding,
@@ -3053,8 +3785,6 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
       {},
       {},
       &admission_gate,
-      runtime_policy->value(),
-      runtime_policy->reference(),
       {},
       {},
       {},
@@ -3171,19 +3901,16 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
                    std::string(deployment::test::kLite6ArmTargetId));
       });
   ASSERT_NE(motion_registration, runtime->participant_registrations.end());
-  ASSERT_TRUE(motion_registration->runtime_policy.has_value());
-  EXPECT_EQ(motion_registration->runtime_policy->value().policy,
-            runtime_policy->value());
+  ASSERT_TRUE(motion_registration->participant_policy.has_value());
   ASSERT_TRUE(
       motion_registration->deployment_maximum_tcp_linear_speed_mps.has_value());
   EXPECT_DOUBLE_EQ(
       *motion_registration->deployment_maximum_tcp_linear_speed_mps, 0.15);
-  EXPECT_EQ(motion_registration->runtime_policy->value().source_artifact,
-            runtime_policy->reference());
   ASSERT_TRUE(
-      motion_registration->runtime_policy->value().ordinary_motion_jerk);
-  EXPECT_EQ(*motion_registration->runtime_policy->value().ordinary_motion_jerk,
-            jerk_profile);
+      motion_registration->participant_policy->value().ordinary_motion_jerk);
+  EXPECT_EQ(
+      *motion_registration->participant_policy->value().ordinary_motion_jerk,
+      jerk_profile);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
@@ -3605,8 +4332,6 @@ TEST(RetainedProductCrossConsumer,
         {},
         {},
         {},
-        {},
-        {},
         {}};
     runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
     runtime_input.ordinary_motion_jerk =
@@ -3629,7 +4354,9 @@ TEST(RetainedProductCrossConsumer,
               1'000'000'000);
     EXPECT_EQ(runtime->cell_stop_deadline_budget->kernel_completion_reserve_ns,
               100'000'000);
-    EXPECT_FALSE(runtime->motion_runtime_policy.has_value());
+    ASSERT_TRUE(runtime->motion_participant_policy.has_value());
+    EXPECT_FALSE(
+        runtime->motion_participant_policy->value().ordinary_motion_jerk);
     ASSERT_NE(runtime->participant_engine, nullptr);
     ASSERT_NE(runtime->motion_state_channel, nullptr);
     ASSERT_NE(runtime->reference_resolver, nullptr);

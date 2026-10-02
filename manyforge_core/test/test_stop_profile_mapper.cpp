@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <optional>
+#include <string>
+#include <vector>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 
 namespace manyforge::core {
@@ -76,6 +79,71 @@ TEST(StopProfileMapper, ExplicitJerkActivationResolvesOnceWithMatchingUnits) {
       project_motion_interrupt_stop_profile_to_compiled_resources(frozen.value(), resources());
   ASSERT_TRUE(projected.ok());
   EXPECT_TRUE(projected.value().per_joint_max_jerk.contains("compiled.resource.a"));
+}
+
+// The Deployment compiler encodes an authored per-joint jerk as the resource
+// row's max_jerk; the decoded profile must use it instead of the preset.
+TEST(StopProfileMapper, CompiledAuthoredJerkReplacesThePresetForItsJointOnly) {
+  const std::vector<RuntimeResourceBindingDTO> scope{
+      resource("joint_1", "resource.a", CoordinateKind::kAngular),
+      resource("joint_2", "resource.b", CoordinateKind::kAngular),
+  };
+  const auto limit_row = [](std::string resource_id, double deceleration,
+                            std::optional<JsonValueDTO> jerk) {
+    JsonObjectDTO row{
+        {"resource_id", JsonValueDTO{std::move(resource_id)}},
+        {"max_deceleration",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
+                                    {"value_rad_s2", JsonValueDTO{deceleration}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s")}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}},
+    };
+    if (jerk.has_value()) row.emplace("max_jerk", std::move(*jerk));
+    return JsonValueDTO{std::move(row)};
+  };
+  const auto parameters = [&](std::optional<JsonValueDTO> jerk) {
+    return JsonObjectDTO{
+        {"stop_mode", JsonValueDTO{std::string("soft_on_path")}},
+        {"jerk_limits_enabled", JsonValueDTO{true}},
+        {"deceleration_time_s", JsonValueDTO{0.5}},
+        {"per_resource_limits",
+         JsonValueDTO{JsonValueDTO::Array{limit_row("resource.a", 2.0, std::move(jerk)),
+                                          limit_row("resource.b", 3.0, std::nullopt)}}},
+        {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+    };
+  };
+  const JsonValueDTO authored{
+      JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s3")}},
+                    {"value_rad_s3", JsonValueDTO{12.5}}}};
+  ASSERT_NE(motion_jerk_preset_limit(2.0, 0.5), 12.5);
+
+  const auto decoded =
+      map_motion_controlled_stop_contract_parameters_to_profile(parameters(authored), scope,
+                                                                "authored.jerk.profile");
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  ASSERT_EQ(decoded.value().per_joint_max_jerk.size(), 1U);
+  const auto resolved = resolve_motion_interrupt_stop_jerk_limits(decoded.value());
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularJerkDTO>(resolved.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
+      12.5);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularJerkDTO>(resolved.value().per_joint_max_jerk.at("joint_2")).value_rad_s3,
+      motion_jerk_preset_limit(3.0, 0.5));
+
+  const JsonValueDTO wrong_units{
+      JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
+                    {"value_rad_s3", JsonValueDTO{12.5}}}};
+  const JsonValueDTO non_positive{
+      JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s3")}},
+                    {"value_rad_s3", JsonValueDTO{0.0}}}};
+  for (const auto& invalid : {wrong_units, non_positive}) {
+    const auto rejected = map_motion_controlled_stop_contract_parameters_to_profile(
+        parameters(invalid), scope, "authored.jerk.profile");
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(reason(rejected.error()), "motion_controlled_stop_jerk_limit_invalid");
+  }
 }
 
 TEST(StopProfileMapper, OffDoesNotInventLimitsAndUnreviewedHistoryCannotBePrepared) {

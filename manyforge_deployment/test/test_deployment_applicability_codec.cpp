@@ -768,9 +768,6 @@ TEST(DeploymentApplicabilityCodec,
       catalog_record("stop_evidence_policy", "stop.alpha",
                      "manyforge.stop_evidence_policy.v2") +
       "," +
-      catalog_record("runtime_policy", "runtime.alpha",
-                     "manyforge.runtime_policy.v1") +
-      "," +
       catalog_record("contact_policy", "contact.alpha",
                      "manyforge.contact_policy.v1") +
       "]";
@@ -779,21 +776,17 @@ TEST(DeploymentApplicabilityCodec,
       minimal_document(),
       interrupt_policy_envelope("", "", interrupt_config(), retained)));
   const auto &references = candidate.value().retained_policy_records;
-  ASSERT_EQ(references.size(), 3U);
+  ASSERT_EQ(references.size(), 2U);
   EXPECT_TRUE(std::holds_alternative<core::ContactPolicyCatalogRecordRefDTO>(
       references[0]));
-  EXPECT_TRUE(std::holds_alternative<core::RuntimePolicyCatalogRecordRefDTO>(
-      references[1]));
   EXPECT_TRUE(
       std::holds_alternative<core::StopEvidencePolicyCatalogRecordRefDTO>(
-          references[2]));
+          references[1]));
 
   ASSERT_TRUE(candidate.normalized_policies().has_value());
   const std::string normalized =
       canonical_json(*candidate.normalized_policies());
   EXPECT_LT(normalized.find("\"contact_policy\""),
-            normalized.find("\"runtime_policy\""));
-  EXPECT_LT(normalized.find("\"runtime_policy\""),
             normalized.find("\"stop_evidence_policy\""));
 
   const auto revisioned =
@@ -815,9 +808,13 @@ TEST(DeploymentApplicabilityCodec,
       document_for(catalog_record("component_type", "arm",
                                   "manyforge.component_type.v1")),
       "outside the closed policy-family set");
+  expect_decode_error_containing(
+      document_for(catalog_record("runtime_policy", "runtime.alpha",
+                                  "manyforge.runtime_policy.v1")),
+      "outside the closed v1 catalog registry");
 
   const std::string duplicate = catalog_record(
-      "runtime_policy", "runtime.alpha", "manyforge.runtime_policy.v1");
+      "contact_policy", "contact.alpha", "manyforge.contact_policy.v1");
   expect_decode_error_containing(document_for(duplicate + "," + duplicate),
                                  "duplicate complete catalog-record identity");
 }

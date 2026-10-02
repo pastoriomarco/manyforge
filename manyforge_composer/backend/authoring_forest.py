@@ -6,12 +6,18 @@ from copy import deepcopy
 import math
 import re
 import uuid
-from typing import Any, NoReturn
+from typing import Any, Mapping, NoReturn
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.catalog_schema import validate_value
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.value_path import ValuePathError, parse_value_path
+from manyforge_behavior.program import (
+    Program,
+    ProgramValidationError,
+    check_draft_formulas,
+)
+from manyforge_behavior.program_expressions import CheckedExpression
 
 
 AUTHORING_FOREST_VERSION = "manyforge.composer_authoring_forest.v1"
@@ -255,19 +261,22 @@ def validate_invariants(authoring: dict[str, Any], catalog: NodeCatalog) -> None
                 detail={"path": path},
             )
         known = {parameter.id: parameter for parameter in entry.parameters}
-        unknown = sorted((set(parameters) | set(sources)) - set(known))
+        source_roots: set[str] = set()
+        for source_path in sources:
+            try:
+                source_roots.add(str(parse_value_path(source_path)[0]))
+            except ValuePathError as error:
+                _fail(
+                    "composer_authoring_value_path_invalid",
+                    f"{instance_id} value source {source_path!r}: {error}",
+                    detail={"path": path, "valuePath": source_path, "reason": error.code},
+                )
+        unknown = sorted((set(parameters) | source_roots) - set(known))
         if unknown:
             _fail(
                 "composer_authoring_parameter_unknown",
                 f"{instance_id} supplies unknown parameters: {', '.join(unknown)}",
                 detail={"path": path, "parameterIds": unknown},
-            )
-        duplicate = sorted(set(parameters) & set(sources))
-        if duplicate:
-            _fail(
-                "composer_authoring_parameter_duplicate",
-                f"{instance_id} supplies parameters twice: {', '.join(duplicate)}",
-                detail={"path": path, "parameterIds": duplicate},
             )
         for parameter_id, value in parameters.items():
             issues = validate_value(
@@ -378,11 +387,59 @@ def derive_candidate(
     return (candidate if not deduplicated else None), deduplicated
 
 
+def _references_projection(
+    computed_keys: Mapping[str, CheckedExpression],
+    value_expressions: Mapping[tuple[str, str], CheckedExpression],
+) -> dict[str, Any]:
+    def names(checked: CheckedExpression) -> list[str]:
+        return sorted(f"{source}.{name}" for source, name in checked.references)
+
+    nodes: dict[str, dict[str, list[str]]] = {}
+    for (instance_id, path), checked in sorted(value_expressions.items()):
+        nodes.setdefault(instance_id, {})[path] = names(checked)
+    return {
+        "computedKeys": {
+            key: names(checked) for key, checked in sorted(computed_keys.items())
+        },
+        "nodes": nodes,
+    }
+
+
+def formula_references(authoring: dict[str, Any], catalog: NodeCatalog) -> dict[str, Any]:
+    """The `param.`/`key.` names each formula of the forest reads, per the engine.
+
+    Computed keys by key and node formulas by instance and value path; a
+    formula that does not check is absent (its diagnostics say why).
+    """
+
+    try:
+        computed, fields = check_draft_formulas(
+            authoring,
+            (node for node, _path, _parent in _walk(authoring["forest"])),
+            catalog=catalog,
+        )
+    except ProgramValidationError:
+        computed, fields = {}, {}
+    return _references_projection(computed, fields)
+
+
+def program_formula_references(program: Program | None) -> dict[str, Any]:
+    """:func:`formula_references` of a validated Program, from its own checks."""
+
+    if program is None:
+        return _references_projection({}, {})
+    return _references_projection(
+        program.expressions.computed_keys, program.expressions.value_expressions
+    )
+
+
 __all__ = [
     "AUTHORING_FOREST_VERSION",
     "AuthoringForestError",
     "derive_candidate",
     "empty_authoring",
+    "formula_references",
     "from_program",
+    "program_formula_references",
     "validate_invariants",
 ]

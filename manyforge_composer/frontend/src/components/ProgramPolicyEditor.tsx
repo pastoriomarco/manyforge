@@ -168,6 +168,15 @@ export function validateProgramPolicy(
   return errors;
 }
 
+function splitGroupNames(names: string): string[] {
+  return names.split(',').map((name) => name.trim());
+}
+
+/** "All only" or "All + <group ids>", keeping the exact identifiers. */
+export function executionGroupMembershipSummary(groups: readonly string[]): string {
+  return groups.length === 0 ? 'All only' : `All + ${[...groups].sort().join(', ')}`;
+}
+
 function fieldId(instanceId: string, field: string): string {
   return `policy-${instanceId}-${field}`;
 }
@@ -190,6 +199,8 @@ function selectOptions<T extends string>(options: Array<[T, string]>) {
 interface ProgramPolicyEditorProps {
   node: ProgramTreeNode;
   inheritedGroups?: string[];
+  availableGroups?: string[];
+  onCreateGroup?: () => void;
   busy: boolean;
   onUpdate: (
     instanceId: string,
@@ -204,6 +215,8 @@ interface ProgramPolicyEditorProps {
 export function ProgramPolicyEditor({
   node,
   inheritedGroups = [],
+  availableGroups = [],
+  onCreateGroup,
   busy,
   onUpdate,
   onInvalidChange,
@@ -216,7 +229,6 @@ export function ProgramPolicyEditor({
 
   const errors = useMemo(() => validateProgramPolicy(form), [form]);
   const original = useMemo(() => effectiveProgramPolicy(node), [node]);
-  const dirty = JSON.stringify(form) !== JSON.stringify(original);
   const firstError = Object.values(errors)[0] ?? null;
   const invalidChange = useRef(onInvalidChange);
   useEffect(() => {
@@ -226,26 +238,48 @@ export function ProgramPolicyEditor({
     invalidChange.current?.(firstError);
   }, [firstError]);
   useEffect(() => () => invalidChange.current?.(null), []);
-  const commit = () => {
-    if (busy || !dirty || Object.keys(errors).length > 0) return;
+  // The form last handed to onUpdate for this node: a later blur (or a repeated
+  // change) must not submit it again while the Draft round trip is pending.
+  const submitted = useRef<string | null>(null);
+  useEffect(() => {
+    submitted.current = null;
+  }, [node]);
+  const commit = (next: ProgramPolicyForm = form) => {
+    const key = JSON.stringify(next);
+    if (busy || key === JSON.stringify(original) || key === submitted.current
+        || Object.keys(validateProgramPolicy(next)).length > 0) return;
+    submitted.current = key;
     onUpdate(
       node.instance_id,
-      { ...form.modification_policy },
+      { ...next.modification_policy },
       {
-        ...form.recovery_policy,
-        allowed_recovery_actions: [...form.recovery_policy.allowed_recovery_actions],
-        allowed_skills: [...form.recovery_policy.allowed_skills],
+        ...next.recovery_policy,
+        allowed_recovery_actions: [...next.recovery_policy.allowed_recovery_actions],
+        allowed_skills: [...next.recovery_policy.allowed_skills],
       },
-      form.operator_stop_policy,
-      form.execution_group_mode === 'named'
-        ? form.execution_group_names.split(',').map((name) => name.trim()).sort()
-        : form.execution_group_mode,
+      next.operator_stop_policy,
+      next.execution_group_mode === 'named'
+        ? splitGroupNames(next.execution_group_names).sort()
+        : next.execution_group_mode,
     );
+  };
+  // Membership checkboxes are discrete choices: they commit on change.
+  const changeGroups = (groups: string[] | 'inherit') => {
+    const next: ProgramPolicyForm = {
+      ...form,
+      execution_group_mode: groups === 'inherit' ? 'inherit' : groups.length > 0 ? 'named' : 'all',
+      execution_group_names: groups === 'inherit' ? '' : [...groups].sort().join(', '),
+    };
+    setForm(next);
+    commit(next);
   };
   const id = node.instance_id;
   const resolvedGroups = form.execution_group_mode === 'inherit' ? inheritedGroups
     : form.execution_group_mode === 'all' ? []
-      : form.execution_group_names.split(',').map((name) => name.trim()).filter(Boolean);
+      : splitGroupNames(form.execution_group_names).filter(Boolean);
+  // Memberships whose group is not declared stay visible so they can be removed.
+  const missingGroups = resolvedGroups.filter((groupId) => !availableGroups.includes(groupId));
+  const branch = node.children.length > 0;
   const updateModification = (
     field: keyof ProgramNodeModificationPolicy,
     value: ProgramModificationPolicyValue | ProgramInterventionDelegate,
@@ -279,7 +313,7 @@ export function ProgramPolicyEditor({
       <h4 id={fieldId(id, 'title')}>Node policy</h4>
       <form
         className="program-policy-form"
-        onBlur={commit}
+        onBlur={() => commit()}
         onSubmit={(event) => {
           event.preventDefault();
           commit();
@@ -482,48 +516,52 @@ export function ProgramPolicyEditor({
       </fieldset>
 
       <fieldset className="program-policy-fieldset">
-        <legend>Operator Stop policy</legend>
+        <legend>Control groups</legend>
         <label className="program-policy-field" htmlFor={fieldId(id, 'execution_groups')}>
-          Execution groups
-          <select
+          <input
+            type="checkbox"
             id={fieldId(id, 'execution_groups')}
-            value={form.execution_group_mode}
+            checked={form.execution_group_mode === 'inherit'}
             disabled={busy}
-            onChange={(event) => setForm((current) => ({
-              ...current,
-              execution_group_mode: event.target.value as ProgramPolicyForm['execution_group_mode'],
-            }))}
-          >
-            {selectOptions([
-              ['inherit', 'Inherit'],
-              ['all', 'All only'],
-              ['named', 'Named groups'],
-            ])}
-          </select>
+            // Turning Inherit off keeps the inherited named groups as the
+            // explicit choice, so this node stays covered by them.
+            onChange={(event) => changeGroups(event.target.checked ? 'inherit' : [...inheritedGroups])}
+          />
+          Inherit groups from parent
         </label>
-        {form.execution_group_mode === 'named' && (
-          <label className="program-policy-field" htmlFor={fieldId(id, 'execution_group_names')}>
-            Group names
-            <input
-              id={fieldId(id, 'execution_group_names')}
-              value={form.execution_group_names}
-              placeholder="robot_a, all_grippers"
-              disabled={busy}
-              aria-invalid={errors.execution_groups !== undefined}
-              aria-describedby={describedBy('execution_groups')}
-              title={errors.execution_groups}
-              onChange={(event) => setForm((current) => ({
-                ...current, execution_group_names: event.target.value,
-              }))}
-            />
-            <FieldError id={errorId('execution_groups')} message={errors.execution_groups} />
-          </label>
+        {[...availableGroups, ...missingGroups].map((groupId) => {
+          const missing = !availableGroups.includes(groupId);
+          return (
+            <label className="toggle-control" key={groupId}
+              title={missing ? 'This group is not declared in Program settings. Uncheck to remove it.' : undefined}>
+              <input
+                type="checkbox"
+                checked={resolvedGroups.includes(groupId)}
+                disabled={busy || form.execution_group_mode === 'inherit'}
+                onChange={(event) => changeGroups(event.target.checked
+                  ? [...resolvedGroups, groupId]
+                  : resolvedGroups.filter((name) => name !== groupId))}
+              />
+              {missing ? `${groupId} — missing` : groupId}
+            </label>
+          );
+        })}
+        {onCreateGroup !== undefined && (
+          <button type="button" disabled={busy} onClick={onCreateGroup}>Create group…</button>
         )}
+        <FieldError id={errorId('execution_groups')} message={errors.execution_groups} />
         <p className="program-policy-help">
-          Draft memberships: {['all', ...resolvedGroups].join(', ')}.
+          Draft memberships: {executionGroupMembershipSummary(resolvedGroups)}
+          {form.execution_group_mode === 'inherit' ? ' (inherited)' : ''}.
           {' '}All always includes this node. Named groups replace inherited names
-          and may overlap. Saved for the next Run; running membership cannot change.
+          and may overlap. With Inherit off and no groups selected, only All controls this node.
+          {branch && ' Child nodes that inherit follow later changes here.'}
+          {' '}Saved for the next Run; running membership cannot change.
         </p>
+      </fieldset>
+
+      <fieldset className="program-policy-fieldset">
+        <legend>Operator Stop policy</legend>
         <label className="program-policy-field" htmlFor={fieldId(id, 'operator_stop_policy')}>
           Stop behavior
           <select

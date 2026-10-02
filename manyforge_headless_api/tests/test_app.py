@@ -623,6 +623,15 @@ class FakeCore:
             )
         return copy.deepcopy(self.applied_program)
 
+    def committed_scenario_activation(self) -> dict[str, Any]:
+        activation = getattr(self, "committed_activation", None)
+        if activation is None:
+            raise HeadlessApiError(
+                "program_applied_selection_not_found",
+                "no Program has been authoritatively Applied",
+            )
+        return copy.deepcopy(activation)
+
     def applied_program_status(self) -> dict[str, Any]:
         if self.applied_program_status_projection is None:
             raise HeadlessApiError(
@@ -2508,6 +2517,130 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
     assert manager.apply_observations == [("apply/7", 7)]
 
 
+class _CommittingManager(FakeManager):
+    def __init__(self, state: str) -> None:
+        super().__init__()
+        self.state = state
+
+    def observe_apply(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+        return {**super().observe_apply(apply_id, apply_generation), "state": self.state}
+
+
+class _NotifiedRunner:
+    def __init__(self, error: ProgramRunnerClientError | None = None) -> None:
+        self.error = error
+        self.reconciliations = 0
+
+    def reconcile_persistent_values(self) -> dict[str, Any]:
+        self.reconciliations += 1
+        if self.error is not None:
+            raise self.error
+        return {"outcome": "reconciled"}
+
+    def close(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("state", "notified"),
+    [("succeeded", 1), ("pending", 0), ("failed", 0), ("unknown_effect", 0)],
+)
+def test_only_an_observed_committed_apply_notifies_the_program_runner(
+    state: str, notified: int
+) -> None:
+    runner = _NotifiedRunner()
+    manager = _CommittingManager(state)
+    with TestClient(
+        create_app(service=_service(FakeCore(), manager, program_runner=runner))
+    ) as client:
+        response = client.get(
+            "/api/manager/apply/status",
+            params={"apply_id": "apply.1", "apply_generation": 1},
+        )
+    assert response.status_code == 200
+    assert response.json()["state"] == state
+    assert runner.reconciliations == notified
+
+
+def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
+    runner = _NotifiedRunner(
+        ProgramRunnerClientError(
+            "persistent_key_storage_unavailable", "read-only file system", 503
+        )
+    )
+    manager = _CommittingManager("succeeded")
+    with TestClient(
+        create_app(service=_service(FakeCore(), manager, program_runner=runner))
+    ) as client:
+        observed = [
+            client.get(
+                "/api/manager/apply/status",
+                params={"apply_id": "apply.1", "apply_generation": 1},
+            )
+            for _ in range(2)
+        ]
+    # The Apply stays succeeded, unchanged, however often it is observed; the
+    # storage fault is the runner's to report.
+    assert [response.status_code for response in observed] == [200, 200]
+    assert observed[0].json() == observed[1].json()
+    assert observed[0].json()["state"] == "succeeded"
+    assert runner.reconciliations == 2
+
+
+def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
+    return {
+        "schema_version": "manyforge.committed_scenario_activation.v1",
+        "apply_id": apply_id,
+        "apply_generation": 1,
+        "publication_generation": 3,
+        "record_digest": "sha256:" + "d" * 64,
+        "scenario_id": "scenario.1",
+        "program": None,
+        "committed_applies": [
+            {
+                "apply_id": "apply.1",
+                "apply_generation": 1,
+                "record_digest": "sha256:" + "c" * 64,
+                "scenario_id": "scenario.2",
+            },
+            {
+                "apply_id": apply_id,
+                "apply_generation": 1,
+                "record_digest": "sha256:" + "d" * 64,
+                "scenario_id": "scenario.1",
+            },
+        ],
+    }
+
+
+def test_committed_activation_projects_every_committed_apply_of_the_history() -> None:
+    core = FakeCore()
+    core.committed_activation = _committed_activation()  # type: ignore[attr-defined]
+    with TestClient(create_app(service=_service(core, FakeManager()))) as client:
+        response = client.get("/api/program/committed-activation")
+        assert response.status_code == 200
+        assert response.json() == _committed_activation()
+
+        # A history that does not account for every publication is refused.
+        core.committed_activation = {  # type: ignore[attr-defined]
+            **_committed_activation(),
+            "publication_generation": 4,
+        }
+        refused = client.get("/api/program/committed-activation")
+        assert refused.json()["detail"]["code"] == "program_activation_invalid"
+
+        # Every committed Apply is named by its Apply identity; the current
+        # one by the same identity it is current under.
+        anonymous = _committed_activation()
+        del anonymous["committed_applies"][0]["apply_id"]
+        renamed = _committed_activation()
+        renamed["committed_applies"][1]["apply_generation"] = 2
+        for invalid in (anonymous, renamed):
+            core.committed_activation = invalid  # type: ignore[attr-defined]
+            refused = client.get("/api/program/committed-activation")
+            assert refused.json()["detail"]["code"] == "program_activation_invalid"
+
+
 def _scene_body() -> dict[str, Any]:
     scene_id = "sha256:" + "d" * 64
     return {
@@ -3888,3 +4021,74 @@ def test_alarm_owner_rejections_preserve_their_public_http_class(
 
     assert response.status_code == expected_status
     assert response.json()["detail"]["code"] == code
+
+
+class _PersistentValuesRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def persistent_values(self, scenario_id: str) -> dict[str, Any]:
+        self.calls.append(("read", scenario_id))
+        return {"scenario_id": scenario_id, "keys": []}
+
+    def persistent_value_action(
+        self, scenario_id: str, action: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.calls.append((action, copy.deepcopy(body)))
+        if body.get("key") == "halted":
+            raise ProgramRunnerClientError(
+                "persistent_key_run_conflict",
+                "Program run program-cycle.1 refused the edit",
+                409,
+            )
+        return {"action": action}
+
+
+def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
+    runner = _PersistentValuesRunner()
+    client = TestClient(
+        create_app(service=_service(FakeCore(), FakeManager(), program_runner=runner))
+    )
+    base = "/api/program/scenarios/cell-pick/persistent-values"
+    caller = {
+        "request_id": "request.1",
+        "request_owner_epoch": "composer.epoch.1",
+        "source_label": "operator_ui",
+        "scenario_id": "cell-pick",
+    }
+    edit = {
+        **caller,
+        "key": "layer",
+        "expected_program_revision": "sha256:" + "a" * 64,
+    }
+
+    assert client.get(base).json() == {"scenario_id": "cell-pick", "keys": []}
+    assert client.post(base, json={**edit, "value": 2}).json() == {"action": "set"}
+    assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
+    assert client.post(f"{base}/clear", json=caller).json() == {"action": "clear"}
+    refused = client.post(
+        base,
+        json={
+            **edit,
+            "key": "halted",
+            "value": 2,
+            "program_run_id": "run.1",
+            "expected_run_revision": 3,
+        },
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "persistent_key_run_conflict"
+    mismatch = client.post(
+        "/api/program/scenarios/other/persistent-values/clear", json=caller
+    )
+    assert mismatch.status_code == 400
+    assert mismatch.json()["detail"]["code"] == "persistent_key_path_invalid"
+
+    assert [name for name, _body in runner.calls] == [
+        "read",
+        "set",
+        "reset",
+        "clear",
+        "set",
+    ]
+    assert runner.calls[1][1]["value"] == 2

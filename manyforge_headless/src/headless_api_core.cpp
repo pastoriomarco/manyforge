@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -982,6 +983,96 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
        CanonicalValue(std::string(kAppliedProgramStatusSchemaVersion))},
       {"source_document_digest",
        RequiredMember(prepared, "source_document_digest")},
+  });
+}
+
+CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  // One Manager source snapshot answers both which committed activation is
+  // current and which committed Applies its publication history holds.
+  const auto runtime = RefreshLocked();
+  const auto &record = ActiveAppliedRecordLocked(runtime);
+  const auto &manager_payload =
+      RequiredMember(RequiredSection(runtime.root, "manager"), "payload");
+  const auto publication_generation = RequiredCounter(
+      RequiredMember(RequiredMember(manager_payload, "active"), "publication"),
+      "publication_generation", 2U);
+  // Each committed Apply: record digest, Scenario, and Apply identity.
+  using CommittedApply =
+      std::tuple<std::string, std::string, std::string, std::uint64_t>;
+  const auto committed_apply = [](const CanonicalValue &apply_record) {
+    return CommittedApply(
+        RequiredString(apply_record, "intent_digest"),
+        RequiredString(RequiredMember(apply_record, "prepared_activation"),
+                       "scenario_id"),
+        RequiredString(apply_record, "apply_id"),
+        RequiredCounter(apply_record, "apply_generation", 1U));
+  };
+  std::vector<CommittedApply> committed;
+  for (const auto &candidate :
+       RequiredArray(RequiredMember(manager_payload, "apply"), "records")) {
+    if (RequiredBool(candidate, "committed")) {
+      committed.push_back(committed_apply(candidate));
+    }
+  }
+  std::sort(committed.begin(), committed.end());
+  // Publication 1 is the canonical-empty bootstrap and every later one is
+  // exactly one committed named Apply, so the inventory must account for
+  // every publication; otherwise no consumer can prove it saw them all.
+  Require(committed.size() + 1U == publication_generation &&
+              std::adjacent_find(committed.begin(), committed.end(),
+                                 [](const auto &left, const auto &right) {
+                                   return std::get<0>(left) ==
+                                          std::get<0>(right);
+                                 }) == committed.end(),
+          "program_activation_history_incomplete",
+          "Manager's committed Applies do not account for every publication");
+  CanonicalValue::Array committed_applies;
+  committed_applies.reserve(committed.size());
+  for (const auto &[record_digest, scenario_id, apply_id, apply_generation] :
+       committed) {
+    committed_applies.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"apply_generation", Number(apply_generation, "apply_generation")},
+        {"apply_id", CanonicalValue(apply_id)},
+        {"record_digest", CanonicalValue(record_digest)},
+        {"scenario_id", CanonicalValue(scenario_id)},
+    }));
+  }
+  const auto &prepared = RequiredMember(record, "prepared_activation");
+  const auto outcome = ReadAppliedProgramOutcome(prepared);
+  CanonicalValue program(nullptr);
+  if (outcome.program_binding_id.has_value() ||
+      outcome.non_executable.has_value()) {
+    // Bound or not, the committed declarations are the authored Program's.
+    const auto bundle = retained_bundle_source_.get_verified(
+        core::RetainedBundleId(RequiredString(prepared, "retained_bundle_id")));
+    Require(bundle != nullptr, "program_applied_selection_invalid",
+            "active retained bundle is unavailable");
+    const auto authored = program_repository_.get_verified(
+        core::ProgramId(RequiredString(prepared, "program_id")),
+        core::ProgramRevision(RequiredString(prepared, "program_revision")),
+        *bundle);
+    Require(authored != nullptr, "program_applied_selection_invalid",
+            "active Program is unavailable");
+    program = authored->normalized_program_root();
+  }
+  const auto active = committed_apply(record);
+  Require(std::binary_search(committed.begin(), committed.end(), active),
+          "program_activation_history_incomplete",
+          "the active Apply is not among Manager's committed Applies");
+  const auto &[record_digest, scenario_id, apply_id, apply_generation] = active;
+  return CanonicalValue(CanonicalValue::Object{
+      {"apply_generation", Number(apply_generation, "apply_generation")},
+      {"apply_id", CanonicalValue(apply_id)},
+      {"committed_applies", CanonicalValue(std::move(committed_applies))},
+      {"program", std::move(program)},
+      {"publication_generation",
+       Number(publication_generation, "publication_generation")},
+      {"record_digest", CanonicalValue(record_digest)},
+      {"scenario_id", CanonicalValue(scenario_id)},
+      {"schema_version",
+       CanonicalValue(std::string(kCommittedScenarioActivationSchemaVersion))},
   });
 }
 

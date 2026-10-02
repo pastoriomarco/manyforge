@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
-import { BreakableId } from './BreakableId';
 
 import type {
-  BlackboardKeyDeclaration,
   AppliedProgramSelection,
   CatalogEntry,
+  CatalogJsonSchema,
   CatalogParameter,
   DraftMutationResponse,
   DeploymentWorkspaceResponse,
+  ExpressionValueType,
   JsonValue,
   ProgramAuthoringDiagnostic,
   ProgramAuthoringDocument,
@@ -22,8 +22,9 @@ import type {
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
+import { keyValueParameterRule } from '../utils/keyValueAuthoring';
 import {
-  catalogFieldAcceptsValueSource,
+  catalogDefaultParameters,
   deriveProgramMotionConfiguration,
   flattenProgramForest,
   inheritedProgramExecutionGroups,
@@ -36,11 +37,31 @@ import {
 import {
   programSourceJointInventory,
 } from '../utils/programSourceJoints';
-import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
+import { valueSourceMenuModel } from '../utils/valueSourceMenu';
 import {
+  hasSourcesWithin,
+  setValueAtPath,
+  sourcesAfterLiteral,
+  valueAtPath,
+  valuePathParameter,
+  valuePathWithin,
+  withValueSource,
+  type ListMove,
+} from '../utils/valuePaths';
+import { formatBlackboardValue } from './BlackboardValueEditor';
+import { CanvasContextMenu } from './CanvasContextMenu';
+import { DraftTextInput, DraftTextarea } from './common/DraftInputs';
+import { FormulaEditor } from './property/FormulaEditor';
+import {
+  defaultSchemaValue,
   ProgramSchemaValueEditor,
   type ProgramSchemaValueEditorContext,
 } from './property/ProgramSchemaValueEditor';
+import {
+  ValueSourceContext,
+  valueSourceMenuEntries,
+  type ValueSourceController,
+} from './property/ValueSourceField';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 
 interface ProgramPropertyEditorProps {
@@ -60,6 +81,7 @@ interface ProgramPropertyEditorProps {
     args: Record<string, JsonValue>,
   ) => Promise<DraftMutationResponse | null> | DraftMutationResponse | null | void;
   onCreateReference?: ProgramSchemaValueEditorContext['onCreateReference'];
+  onCreateGroup?: () => void;
   onRenamed?: (previousId: string, renamedId: string) => void;
   onUpdateNodePolicies: (
     instanceId: string,
@@ -72,11 +94,6 @@ interface ProgramPropertyEditorProps {
   diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
-interface SourceChoice {
-  label: string;
-  source: ProgramValueSource;
-}
-
 function isProgramMotionField(field: string): field is ProgramMotionField {
   return PROGRAM_MOTION_FIELDS.includes(field as ProgramMotionField);
 }
@@ -87,9 +104,20 @@ function isProgramMotionCeilingField(field: string): boolean {
   );
 }
 
+/**
+ * One change to a node's parameters and value sources, at a value path:
+ * - `literal`: a typed value for a whole parameter. List moves carry the
+ *   sources inside its items along; sources whose value is gone are dropped.
+ * - `source`: the value at `path` comes from a key, a parameter or a formula.
+ *   The stored literal is kept and overlapping sources are replaced.
+ * - `type_values`: the value at `path` is typed again; `literal` is stored
+ *   only when the parameter has none.
+ * - `clear`: the parameter is omitted, with every source inside it.
+ */
 export type ProgramParameterTransition =
-  | { kind: 'literal'; value: JsonValue }
+  | { kind: 'literal'; value: JsonValue; moves?: readonly ListMove[] }
   | { kind: 'source'; source: ProgramValueSource }
+  | { kind: 'type_values'; literal?: JsonValue }
   | { kind: 'clear' };
 
 export interface ProgramParameterMutation {
@@ -99,25 +127,36 @@ export interface ProgramParameterMutation {
 
 /**
  * Build the one full-replacement Draft mutation used by every property
- * interaction. The selected field changes representation atomically while
+ * interaction. The value at `path` changes representation atomically while
  * every unrelated literal and source is retained.
  */
 export function buildProgramParameterMutation(
   node: ProgramTreeNode,
-  parameterId: string,
+  path: string,
   transition: ProgramParameterTransition,
 ): ProgramParameterMutation {
-  const parameters = { ...node.parameters };
-  const sources = { ...(node.value_sources ?? {}) };
+  let parameters = { ...node.parameters };
+  let sources = { ...(node.value_sources ?? {}) };
   if (transition.kind === 'literal') {
-    parameters[parameterId] = transition.value;
-    delete sources[parameterId];
+    sources = sourcesAfterLiteral(
+      sources,
+      path,
+      transition.value,
+      transition.moves,
+      parameters[path],
+    );
+    parameters[path] = transition.value;
   } else if (transition.kind === 'source') {
-    sources[parameterId] = transition.source;
-    delete parameters[parameterId];
+    sources = withValueSource(sources, path, transition.source);
+  } else if (transition.kind === 'type_values') {
+    delete sources[path];
+    if (transition.literal !== undefined) {
+      parameters = setValueAtPath(parameters, path, transition.literal) ?? parameters;
+    }
   } else {
-    delete parameters[parameterId];
-    delete sources[parameterId];
+    delete parameters[path];
+    sources = Object.fromEntries(Object.entries(sources).filter(([entry]) =>
+      !valuePathWithin(entry, path)));
   }
   return {
     mutation: 'tree_draft_update_node_params',
@@ -131,61 +170,51 @@ export function buildProgramParameterMutation(
   };
 }
 
-function sourceChoices(
-  entry: CatalogEntry,
-  fieldName: string,
-  parameters: ProgramParameterDeclaration[],
-  keys: BlackboardKeyDeclaration[],
-  preferredProgramParameterId: string | null,
-): SourceChoice[] {
-  const result: SourceChoice[] = [];
-  const programMotionDefault = preferredProgramParameterId === null
-    ? undefined
-    : parameters.find(
-      (parameter) => parameter.parameter_id === preferredProgramParameterId,
-    );
-  if (
-    programMotionDefault
-    && catalogFieldAcceptsValueSource(entry, fieldName, programMotionDefault.type)
-  ) {
-    return [{
-      label: `Program default · ${programMotionDefault.parameter_id}`,
-      source: {
-        kind: 'program_parameter',
-        reference: programMotionDefault.parameter_id,
-      },
-    }];
+/**
+ * Return the value at `path` to its typed literal. A nested value always has
+ * one; a whole parameter bound before it had a literal falls back to the
+ * bound parameter's default or the catalog default, which must be valid.
+ */
+export function typeValuesTransition(
+  node: ProgramTreeNode,
+  path: string,
+  field: CatalogParameter,
+  programParameters: ProgramParameterDeclaration[],
+  /** The typed value of a map entry a source supplied without a literal. */
+  entryDefault?: JsonValue,
+): { transition: ProgramParameterTransition } | { error: string } {
+  if (path !== field.id) {
+    return {
+      transition: valueAtPath(node.parameters, path) === undefined && entryDefault !== undefined
+        ? { kind: 'type_values', literal: entryDefault }
+        : { kind: 'type_values' },
+    };
   }
-  for (const parameter of parameters) {
-    if (catalogFieldAcceptsValueSource(entry, fieldName, parameter.type)) {
-      result.push({
-        label: `Program parameter · ${parameter.parameter_id}`,
-        source: { kind: 'program_parameter', reference: parameter.parameter_id },
-      });
-    }
+  if (Object.prototype.hasOwnProperty.call(node.parameters, field.id)) {
+    return { transition: { kind: 'type_values' } };
   }
-  for (const key of keys) {
-    if (key.access === 'write') continue;
-    if (catalogFieldAcceptsValueSource(entry, fieldName, key.type)) {
-      result.push({
-        label: `Blackboard key · ${key.key}`,
-        source: { kind: 'blackboard_key', reference: key.key },
-      });
-    }
-    for (const field of key.fields ?? []) {
-      if (catalogFieldAcceptsValueSource(entry, fieldName, field.type)) {
-        result.push({
-          label: `Blackboard field · ${key.key}.${field.field}`,
-          source: {
-            kind: 'blackboard_field',
-            reference: key.key,
-            field: field.field,
-          },
-        });
-      }
-    }
-  }
-  return result;
+  const fallback = resolveProgramParameterLiteralValue(
+    node.value_sources?.[path],
+    undefined,
+    field.hasDefault ? field.default as JsonValue : undefined,
+    programParameters,
+  );
+  const message = fallback === undefined
+    ? field.required ? `${field.id} has no valid literal fallback` : null
+    : firstCatalogParameterValidationMessage(field, fallback);
+  return message === null
+    ? { transition: { kind: 'type_values', literal: fallback } }
+    : { error: message };
+}
+
+/** Whether a backend diagnostic path names this parameter's literal or one of its sources. */
+function diagnosticTargetsParameter(path: string, parameterId: string): boolean {
+  return ['parameters', 'value_sources'].some((section) => {
+    const prefix = `.${section}.${parameterId}`;
+    const at = path.indexOf(prefix);
+    const next = path[at + prefix.length];
+    return at >= 0 && (next === undefined || next === '.' || next === '[');
+  });
 }
 
 export function ProgramPropertyEditor({
@@ -202,6 +231,7 @@ export function ProgramPropertyEditor({
   busy,
   onMutate,
   onCreateReference,
+  onCreateGroup,
   onRenamed,
   onUpdateNodePolicies,
   onInvalidEditChange,
@@ -230,6 +260,19 @@ export function ProgramPropertyEditor({
     });
   }, []);
   const [discardEpoch, setDiscardEpoch] = useState(0);
+  const [sourceMenu, setSourceMenu] = useState<{
+    path: string;
+    schema: CatalogJsonSchema;
+    x: number;
+    y: number;
+    returnFocus: HTMLElement | null;
+  } | null>(null);
+  const [formula, setFormula] = useState<{
+    path: string;
+    type: ExpressionValueType;
+    expression: string;
+    returnFocus: HTMLElement | null;
+  } | null>(null);
   const cardLayout = useCardPanelLayout();
   const selected = useMemo(
     () => flattenProgramForest(roots).find(
@@ -287,6 +330,8 @@ export function ProgramPropertyEditor({
   useEffect(() => {
     setErrors({});
     setDiscardEpoch((current) => current + 1);
+    setSourceMenu(null);
+    setFormula(null);
   }, [selectedId]);
   const hasInvalidEdit = Object.keys(errors).length > 0;
   const invalidEditCallback = useRef(onInvalidEditChange);
@@ -315,11 +360,110 @@ export function ProgramPropertyEditor({
   }
 
   const applyTransition = (
-    parameterId: string,
+    path: string,
     transition: ProgramParameterTransition,
   ) => {
-    const request = buildProgramParameterMutation(selected, parameterId, transition);
+    const request = buildProgramParameterMutation(selected, path, transition);
     void onMutate(request.mutation, request.args);
+  };
+
+  const motionBindingOf = (parameterId: string) => isProgramMotionField(parameterId)
+    ? motionBindings?.[parameterId] ?? null
+    : null;
+
+  const valueSourceModel = (path: string, schema: CatalogJsonSchema) => valueSourceMenuModel({
+    entry,
+    path,
+    schema,
+    sources: selected.value_sources,
+    literals: { ...catalogDefaultParameters(entry), ...selected.parameters },
+    parameters: programParameters,
+    keys: blackboardKeys,
+    preferredParameter: motionBindingOf(valuePathParameter(path)),
+  });
+
+  const typeValues = (path: string, schema: CatalogJsonSchema) => {
+    const parameterId = valuePathParameter(path);
+    const field = entry.parameters.find((parameter) => parameter.id === parameterId);
+    if (field === undefined) return;
+    const result = typeValuesTransition(
+      selected,
+      path,
+      field,
+      programParameters,
+      defaultSchemaValue(schema),
+    );
+    if ('error' in result) {
+      setFieldError(parameterId, result.error, 'commit');
+      return;
+    }
+    setFieldError(parameterId, null, 'commit');
+    applyTransition(path, result.transition);
+  };
+
+  const sourceController: ValueSourceController = {
+    model: valueSourceModel,
+    openMenu: (path, schema, anchor, point) => {
+      // A whole-value scope has no box of its own; the focused field has.
+      const focused = document.activeElement;
+      const field = focused instanceof HTMLElement && anchor.contains(focused) ? focused : anchor;
+      const rect = field.getBoundingClientRect();
+      setSourceMenu({
+        path,
+        schema,
+        x: point?.x ?? rect.left,
+        y: point?.y ?? rect.bottom,
+        returnFocus: field,
+      });
+    },
+    editFormula: (path, schema) => {
+      const model = valueSourceModel(path, schema);
+      if (model?.formulaType == null) return;
+      setFormula({
+        path,
+        type: model.formulaType,
+        expression: model.current?.kind === 'expression' ? model.current.expression : '',
+        returnFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+      });
+    },
+    describe: (source) => {
+      if (source.kind === 'expression') {
+        return { label: source.expression, title: `f(x) = ${source.expression}` };
+      }
+      if (source.kind === 'program_parameter') {
+        const row = programParameters.find((candidate) => candidate.parameter_id === source.reference);
+        return {
+          label: `param.${source.reference}`,
+          title: row === undefined
+            ? `param.${source.reference} is not declared.`
+            : `param.${source.reference} = ${formatBlackboardValue(row.type, row.default)} (parameter default)`,
+        };
+      }
+      if (source.kind === 'blackboard_field') {
+        return {
+          label: `key.${source.reference}.${source.field}`,
+          title: `Field ${source.field} of key ${source.reference}; written while the Program runs.`,
+        };
+      }
+      const row = blackboardKeys.find((candidate) => candidate.key === source.reference);
+      return {
+        label: `key.${source.reference}`,
+        title: row === undefined
+          ? `key.${source.reference} is not declared.`
+          : row.expression !== undefined
+            ? `key.${source.reference} = ${row.expression} (computed)`
+            : row.initial !== undefined
+              ? `key.${source.reference} starts at ${formatBlackboardValue(row.type, row.initial)}`
+              : `key.${source.reference} is empty until written.`,
+      };
+    },
+    hasSourcesWithin: (path) => hasSourcesWithin(selected.value_sources, path),
+    disabled: busy,
+  };
+  const menuModel = sourceMenu === null ? null : valueSourceModel(sourceMenu.path, sourceMenu.schema);
+  const closeSourceMenu = () => {
+    sourceMenu?.returnFocus?.focus();
+    setSourceMenu(null);
   };
 
   const renameNode = (replacement: string) => {
@@ -350,7 +494,11 @@ export function ProgramPropertyEditor({
     });
   };
 
-  const commitLiteral = (parameter: CatalogParameter, value: JsonValue) => {
+  const commitLiteral = (
+    parameter: CatalogParameter,
+    value: JsonValue,
+    moves?: readonly ListMove[],
+  ) => {
     const motionBinding = isProgramMotionField(parameter.id)
       ? motionBindings?.[parameter.id] ?? null
       : null;
@@ -370,7 +518,7 @@ export function ProgramPropertyEditor({
     }
     // A schema-valid sibling commit does not settle another child's local text.
     setFieldError(parameter.id, null, 'commit');
-    applyTransition(parameter.id, { kind: 'literal', value });
+    applyTransition(parameter.id, { kind: 'literal', value, moves });
   };
 
   const removeLiteral = (parameter: CatalogParameter) => {
@@ -385,36 +533,6 @@ export function ProgramPropertyEditor({
       return;
     }
     applyTransition(parameter.id, { kind: 'clear' });
-  };
-
-  const selectSource = (parameter: CatalogParameter, encoded: string) => {
-    if (encoded) {
-      applyTransition(parameter.id, {
-        kind: 'source',
-        source: JSON.parse(encoded) as ProgramValueSource,
-      });
-    } else {
-      const fallback = resolveProgramParameterLiteralValue(
-        selected.value_sources?.[parameter.id],
-        selected.parameters[parameter.id],
-        parameter.hasDefault ? parameter.default as JsonValue : undefined,
-        programParameters,
-      );
-      const fallbackMessage = fallback === undefined
-        ? parameter.required ? `${parameter.id} has no valid literal fallback` : null
-        : firstCatalogParameterValidationMessage(parameter, fallback);
-      if (fallbackMessage) {
-        setFieldError(parameter.id, fallbackMessage, 'commit');
-        return;
-      }
-      applyTransition(
-        parameter.id,
-        fallback === undefined
-          ? { kind: 'clear' }
-          : { kind: 'literal', value: fallback },
-      );
-    }
-    setFieldError(parameter.id, null, 'commit');
   };
 
   return (
@@ -516,6 +634,7 @@ export function ProgramPropertyEditor({
           </details>
         )}
       </section>
+      <ValueSourceContext.Provider value={sourceController}>
       <section className="dcard" aria-label="Parameters">
         <h4>Parameters</h4>
         {entry.parameters.length === 0 && (
@@ -523,45 +642,28 @@ export function ProgramPropertyEditor({
         )}
         {entry.parameters.map((parameter) => {
           const source = selected.value_sources?.[parameter.id];
-          const choices = sourceChoices(
-            entry,
-            parameter.id,
-            programParameters,
-            blackboardKeys,
-            isProgramMotionField(parameter.id)
-              ? motionBindings?.[parameter.id] ?? null
-              : null,
-          );
+          const rule = keyValueParameterRule(entry, selected, blackboardKeys, parameter.id);
           const hasLiteral = Object.prototype.hasOwnProperty.call(
             selected.parameters,
             parameter.id,
           );
+          if (rule.inapplicable !== undefined && !hasLiteral && source === undefined) return null;
           const literal = hasLiteral
             ? selected.parameters[parameter.id]
             : parameter.hasDefault ? parameter.default as JsonValue : undefined;
-          const fallback = resolveProgramParameterLiteralValue(
-            source,
-            selected.parameters[parameter.id],
-            parameter.hasDefault ? parameter.default as JsonValue : undefined,
-            programParameters,
-          );
-          const fallbackValid = fallback !== undefined
-            && firstCatalogParameterValidationMessage(parameter, fallback) === null;
           const displayedSpeed = source === undefined ? literal
             : source.kind === 'program_parameter'
               ? programParameters.find((row) => row.parameter_id === source.reference)?.default
               : undefined;
-          const canSelectLiteral = !parameter.required || fallbackValid;
           const literalValidation = hasLiteral
             ? firstCatalogParameterValidationMessage(parameter, literal)
             : null;
-          const repairMode = literalValidation !== null;
-          const currentSourceIsOffCatalog = source !== undefined
-            && !choices.some((choice) =>
-              JSON.stringify(choice.source) === JSON.stringify(source));
+          const repairMode = literalValidation !== null && source === undefined;
+          const schema = rule.choices === undefined
+            ? parameter.schema
+            : { ...parameter.schema, enum: [...rule.choices] };
           const backendDiagnostic = selectedDiagnostics.find((diagnostic) =>
-            diagnostic.path.endsWith(`.parameters.${parameter.id}`)
-            || diagnostic.path.endsWith(`.value_sources.${parameter.id}`));
+            diagnosticTargetsParameter(diagnostic.path, parameter.id));
           return (
             <div
               className={`program-property${backendDiagnostic ? ' backend-invalid' : ''}`}
@@ -583,49 +685,16 @@ export function ProgramPropertyEditor({
                     : `Currently applied Deployment maximum for ${selectedDeploymentSpeed.target}: ${selectedDeploymentSpeed.maximum} m/s. ${typeof displayedSpeed === 'number' && Number.isFinite(displayedSpeed) && displayedSpeed > 0 ? `With ${source === undefined ? 'request' : 'parameter default'} ${displayedSpeed} m/s, the effective ceiling is ${Math.min(displayedSpeed, selectedDeploymentSpeed.maximum)} m/s. ` : 'The backend resolves the effective ceiling when the request is known. '}The authored value is unchanged.`}
                 </p>
               )}
-              {(choices.length > 0 || source !== undefined) && (
-                <label className="program-source-select">
-                  Value source
-                  <select
-                    value={source ? JSON.stringify(source) : ''}
-                    disabled={busy}
-                    onChange={(event) => selectSource(parameter, event.target.value)}
-                  >
-                    <option
-                      value=""
-                      disabled={source !== undefined && !canSelectLiteral}
-                    >
-                      Literal value
-                    </option>
-                    {currentSourceIsOffCatalog && (
-                      <option value={JSON.stringify(source)}>
-                        Current binding (not compatible with this catalog)
-                      </option>
-                    )}
-                    {choices.map((choice) => {
-                      const encoded = JSON.stringify(choice.source);
-                      return <option key={encoded} value={encoded}>{choice.label}</option>;
-                    })}
-                  </select>
-                </label>
+              {rule.inapplicable !== undefined && (
+                <p className="program-form-hint">{rule.inapplicable} Omit it below.</p>
               )}
-              {source ? (
-                <div className="program-source-summary">
-                  <dl>
-                    <div>
-                      <dt>Bound to</dt>
-                      <dd title={source.kind}>
-                        <code><BreakableId text={`${source.reference}${source.field ? `.${source.field}` : ''}`} /></code>
-                        {' '}<small>{source.kind.replaceAll('_', ' ')}</small>
-                      </dd>
-                    </div>
-                  </dl>
-                  <span>The literal is absent while this exact source is bound.</span>
-                  {!canSelectLiteral && (
-                    <span>A required parameter cannot become literal until a schema-valid fallback exists.</span>
-                  )}
-                </div>
-              ) : repairMode ? (
+              {rule.choices !== undefined && typeof literal === 'string'
+                && !rule.choices.includes(literal) && (
+                <p className="program-form-error inline-message severity-error">
+                  {literal} does not apply to this key; choose {rule.choices.join(' or ')}.
+                </p>
+              )}
+              {repairMode ? (
                 <>
                   <p className="program-form-error inline-message severity-error" role="alert">
                     Catalog-invalid value: {literalValidation}. Repair it as strict JSON; specialized controls are disabled to preserve every represented field.
@@ -661,7 +730,7 @@ export function ProgramPropertyEditor({
               ) : (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   <ProgramSchemaValueEditor
-                    schema={parameter.schema}
+                    schema={schema}
                     value={literal}
                     disabled={busy}
                     context={{
@@ -673,7 +742,7 @@ export function ProgramPropertyEditor({
                       onCreateReference,
                     }}
                     path={parameter.id}
-                    onCommit={(value) => commitLiteral(parameter, value)}
+                    onCommit={(value, moves) => commitLiteral(parameter, value, moves)}
                     onInvalidChange={(message) => setFieldError(parameter.id, message)}
                   />
                 </div>
@@ -697,6 +766,7 @@ export function ProgramPropertyEditor({
                     title={unavailable ?? (
                       `Write the ${pose ? 'current TCP pose' : 'current joint positions'} of `
                       + `${String(targetRole)} into this goal`
+                      + (pose ? '. Replaces the goal frame with this robot’s base frame' : '')
                       + (relative ? '. This switches the move to absolute.' : '.')
                     )}
                     onClick={() => {
@@ -727,10 +797,44 @@ export function ProgramPropertyEditor({
           );
         })}
       </section>
+      </ValueSourceContext.Provider>
+      {sourceMenu !== null && menuModel !== null && (
+        <CanvasContextMenu
+          x={sourceMenu.x}
+          y={sourceMenu.y}
+          heading={sourceMenu.path}
+          label={`Where ${sourceMenu.path} comes from`}
+          entries={valueSourceMenuEntries(menuModel, {
+            typeValues: () => typeValues(menuModel.path, sourceMenu.schema),
+            use: (chosen) => {
+              setFieldError(valuePathParameter(menuModel.path), null, 'commit');
+              applyTransition(menuModel.path, { kind: 'source', source: chosen });
+            },
+            editFormula: () => sourceController.editFormula(menuModel.path, sourceMenu.schema),
+          })}
+          onClose={closeSourceMenu}
+        />
+      )}
+      {formula !== null && (
+        <FormulaEditor
+          title={`Formula for ${formula.path}`}
+          expression={formula.expression}
+          destinationType={formula.type}
+          excludeComputedKey={null}
+          onSave={(expression) => applyTransition(formula.path, {
+            kind: 'source',
+            source: { kind: 'expression', expression },
+          })}
+          onClose={() => setFormula(null)}
+          returnFocus={formula.returnFocus}
+        />
+      )}
       <ProgramPolicyEditor
         key={`${selected.instance_id}:${discardEpoch}`}
         node={selected}
         inheritedGroups={inheritedGroups}
+        availableGroups={Object.keys(program.execution_groups ?? {}).sort()}
+        onCreateGroup={onCreateGroup}
         busy={busy}
         onUpdate={onUpdateNodePolicies}
         onInvalidChange={(message) => setFieldError('_policy', message)}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import re
 import socket
 import sys
 import threading
@@ -36,6 +37,8 @@ from .models import (
     RuntimeScaleControlRequest,
     OperationRuntimeScaleRequest,
     RuntimeScaleControlSelectorRequest,
+    SHA256_PATTERN,
+    SceneRevisionRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
@@ -978,6 +981,9 @@ class ExecutionCommandClient:
         observation = response.get("target_observation")
         expected = request.model_dump(mode="json", exclude_none=True)
         expected["schema_version"] = "manyforge.target_observation.v1"
+        if request.kind == "frame_transform":
+            self._require_frame_transform(response, observation, expected)
+            return response
         if (
             response.get("command") != "query_target"
             or not isinstance(observation, dict)
@@ -1040,6 +1046,55 @@ class ExecutionCommandClient:
                 "native target query returned invalid typed evidence",
             ) from error
         return response
+
+    @staticmethod
+    def _require_frame_transform(
+        response: dict[str, Any], observation: Any, expected: dict[str, Any]
+    ) -> None:
+        """A transform answer echoes its query and carries one evaluation:
+        the pose, the owner sample time, the scene revision and the evidence
+        of every crossed frame path. It has no source sequence."""
+
+        try:
+            if (
+                response.get("command") != "query_target"
+                or not isinstance(observation, dict)
+                or set(observation)
+                != set(expected)
+                | {
+                    "evaluated_at_ns",
+                    "resolution_evidence_digests",
+                    "scene_revision",
+                    "value",
+                }
+                or any(observation.get(key) != value for key, value in expected.items())
+            ):
+                raise ValueError("frame transform answer does not echo its query")
+            nonnegative_int64(observation["evaluated_at_ns"])
+            SceneRevisionRequest.model_validate(observation["scene_revision"])
+            digests = observation["resolution_evidence_digests"]
+            if (
+                not isinstance(digests, list)
+                or any(
+                    not isinstance(digest, str) or re.fullmatch(SHA256_PATTERN, digest) is None
+                    for digest in digests
+                )
+                or digests != sorted(set(digests))
+            ):
+                raise ValueError("frame transform evidence is not a sorted digest set")
+            pose = Pose3Request.model_validate(observation["value"])
+            orientation = pose.orientation
+            norm_squared = sum(
+                value * value
+                for value in (orientation.x, orientation.y, orientation.z, orientation.w)
+            )
+            if abs(norm_squared - 1.0) > 1e-6:
+                raise ValueError("frame transform orientation is not a unit quaternion")
+        except (KeyError, TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "execution_target_observation_invalid",
+                "native frame transform returned a mismatched or invalid answer",
+            ) from error
 
     def observation(self) -> dict[str, Any]:
         # A long-poll observation session may legitimately occupy the
@@ -1174,6 +1229,27 @@ class ExecutionCommandClient:
                 "execution_command_response_invalid",
                 "native execution event cursor does not match its records",
             )
+        progress = response.get("operation_progress")
+        if not isinstance(progress, list) or len(progress) > MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS:
+            raise HeadlessApiError("execution_command_response_invalid", "native operation progress exceeds its bound")
+        seen: set[str] = set()
+        for row in progress:
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"owner_epoch", "operation_id", "operation_revision", "progress"}
+                or row["owner_epoch"] != owner_epoch
+                or not isinstance(row["operation_id"], str)
+                or not 0 < len(row["operation_id"].encode("utf-8")) <= 2_048
+                or row["operation_id"] in seen
+                or type(row["operation_revision"]) is not int
+                or not 1 <= row["operation_revision"] <= MAXIMUM_SAFE_INTEGER
+                or type(row["progress"]) not in (float, int)
+                or not math.isfinite(row["progress"])
+                or not 0 <= row["progress"] <= 1
+            ):
+                raise HeadlessApiError("execution_command_response_invalid", "native operation progress is invalid")
+            seen.add(row["operation_id"])
+        page["operation_progress"] = progress
         page["admission_generation"] = admission_generation
         return page
 
@@ -2145,6 +2221,36 @@ class ExecutionEventPump:
         self._health_lock = threading.Lock()
         self._change_observer: Callable[[], None] | None = None
         self._settled_observer: Callable[[], None] | None = None
+        self._progress_observer: Callable[[list[dict[str, Any]]], None] | None = None
+        self._progress_rows: dict[str, dict[str, Any]] = {}
+        self._progress_dirty = False
+        self._progress_sent_at = float("-inf")
+
+    def set_progress_observer(
+        self, observer: Callable[[list[dict[str, Any]]], None] | None,
+    ) -> None:
+        self._progress_observer = observer
+
+    def _capture_progress(self, rows: list[dict[str, Any]]) -> None:
+        # The native page carries a complete bounded latest-only projection,
+        # including an empty list when no manual operation is executing.
+        current = {row["operation_id"]: row for row in rows}
+        if self._progress_rows != current:
+            self._progress_rows = current
+            self._progress_dirty = True
+
+    def _publish_progress(self, now: float) -> None:
+        # Reuse the event pump's existing wake: no poller, timer or owner read.
+        # The native client validates the bound before accepting each page.
+        if not self._progress_dirty or now - self._progress_sent_at < 0.2:
+            return
+        self._progress_dirty = False
+        self._progress_sent_at = now
+        if self._progress_observer is not None:
+            try:
+                self._progress_observer(list(self._progress_rows.values()))
+            except Exception:
+                logging.getLogger(__name__).exception("Operation progress observer failed")
 
     def set_change_observer(self, observer: Callable[[], None] | None) -> None:
         if observer is not None and not callable(observer):
@@ -2228,10 +2334,10 @@ class ExecutionEventPump:
     def _control_projection_key(event: dict[str, Any]) -> tuple[Any, ...]:
         """Return only operation facts that can change the control shell.
 
-        Native ``state_observed`` rows deliberately retain exact progress and
-        timing in History.  Those high-rate samples belong to the credited
-        Viewer/history paths, not to the cold control projection.  Lifecycle,
-        Stop, runtime-scale, and fault meaning remains in this small key.
+        Native journal rows record lifecycle transitions, not progress-only
+        samples. The events response carries a separate in-memory progress
+        projection without rebuilding the cold control projection. Lifecycle,
+        Stop, runtime-scale, and fault meaning remain in this small key.
         """
 
         record_kind = event["record_kind"]
@@ -2429,6 +2535,7 @@ class ExecutionEventPump:
                             **condition_snapshot_kwargs(idle_epoch, source_high_water),
                         )
                         publish_if_changed(idle_epoch, "idle")
+                        self._publish_progress(time.monotonic())
                         if self._record_error(None):
                             self._notify_change()
                         self._stop.wait(self._poll_seconds)
@@ -2447,6 +2554,8 @@ class ExecutionEventPump:
                         source_high_water = 0
                         after_sequence = 0
                         operation_control_keys.clear()
+                        self._progress_rows.clear()
+                        self._progress_dirty = True
                     else:
                         after_sequence = source_high_water
                     owner_epoch = next_epoch
@@ -2505,6 +2614,8 @@ class ExecutionEventPump:
                         "execution_command_response_invalid",
                         "operation event pump cursor diverged from its page",
                     )
+                self._capture_progress(page["operation_progress"])
+                self._publish_progress(time.monotonic())
                 if not page["has_more"]:
                     self._core.complete_operation_event_snapshot(
                         source_owner_epoch=owner_epoch,
@@ -2521,6 +2632,9 @@ class ExecutionEventPump:
                     # combiner still retains only the newest requested value.
                     publish_if_changed(owner_epoch, "active")
             except Exception as error:
+                self._progress_rows.clear()
+                self._progress_dirty = True
+                self._publish_progress(time.monotonic())
                 if owner_epoch is not None:
                     try:
                         quality = self._core.mark_operation_event_source_unknown(

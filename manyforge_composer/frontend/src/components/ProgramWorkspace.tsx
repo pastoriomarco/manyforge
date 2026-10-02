@@ -122,6 +122,7 @@ export function ProgramWorkspace({
   // Program settings show in the Program inspector, opened from the tree
   // editor gear or the Composer settings; closing returns to the properties.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const focusGroupsOnOpen = useRef(false);
   const [settingsInvalid, setSettingsInvalid] = useState(false);
   useEffect(() => onOpenSettingsRequest('program', () => setSettingsOpen(true)), []);
   // Selecting another node shows its properties (unless a setting is invalid).
@@ -160,6 +161,11 @@ export function ProgramWorkspace({
   const observedRequirementSequence = useRef(0);
   const authoringGrid = useRef<HTMLDivElement>(null);
   const settingsPanel = useCardPanelLayout();
+  useEffect(() => {
+    if (!settingsOpen || !focusGroupsOnOpen.current) return;
+    focusGroupsOnOpen.current = false;
+    document.getElementById('program-settings-execution-groups')?.focus();
+  }, [settingsOpen]);
   const paletteCollapseButton = useRef<HTMLButtonElement>(null);
   const paletteRail = useRef<HTMLButtonElement>(null);
   const previousPaletteCollapsed = useRef(false);
@@ -533,6 +539,7 @@ export function ProgramWorkspace({
               parameters={authoring.parameters ?? []}
               namespaces={authoring.blackboard?.namespaces ?? []}
               keys={authoring.blackboard?.keys ?? []}
+              formulaReferences={workspace!.draft.formulaReferences}
               selected={declarationSelection}
               onSelect={selectDeclaration}
               motionDefaults={motionDefaults}
@@ -694,6 +701,10 @@ export function ProgramWorkspace({
                   motionDescriptors={motionDescriptors}
                   busy={authoringBusy}
                   onMutate={mutate}
+                  onCreateGroup={() => {
+                    focusGroupsOnOpen.current = true;
+                    setSettingsOpen(true);
+                  }}
                   onCreateReference={(target, expectedType, expectedAccess, source) => {
                     if (target === 'scene_resource') {
                       onOpenScene?.();
@@ -737,6 +748,7 @@ export function ProgramWorkspace({
                   parameters={authoring.parameters ?? []}
                   namespaces={authoring.blackboard?.namespaces ?? []}
                   keys={authoring.blackboard?.keys ?? []}
+                  formulaReferences={workspace!.draft.formulaReferences}
                   catalogEntries={catalogEntries}
                   motionDefaults={motionDefaults}
                   creationExpectedType={declarationPrefill?.expectedType ?? null}
@@ -753,6 +765,7 @@ export function ProgramWorkspace({
                   }}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
+                  frameProgram={authoring}
                 />
               )}
               </div>

@@ -435,6 +435,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             "motion.move_to_pose",
             "tcp_pose",
             {
+                "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
                 "current_tcp_pose": {
                     "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -442,7 +443,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             },
             {
                 "goal": {
-                    "frame_ref": {"kind": "cell_frame"},
+                    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
                     "position_m": [0.1, 0.2, 0.3],
                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
                 }
@@ -511,6 +512,7 @@ def test_store_observed_move_updates_only_selected_node(
 def test_store_observed_pose_replaces_old_goal_source_and_relative_target() -> None:
     session = ComposerDraftSession(_pick_program())
     observed = {
+        "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
         "current_tcp_pose": {
             "position_m": {"x_m": 0.4, "y_m": 0.2, "z_m": 0.1},
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -2380,7 +2382,7 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
         {
             "instance_id": "assistant_timer_replaced",
             "replacement": {
-                "node_id": "logic.set_bool",
+                "node_id": "logic.set_value",
                 "parameters": {"key": "scratch.flag", "value": True},
             },
             "parameters_mode": "replace",

@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_core/types/controller_lifecycle.hpp>
@@ -10,7 +9,6 @@
 #include <manyforge_core/types/interrupt.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_core/types/prepared_participant_stop_plan.hpp>
-#include <manyforge_core/types/runtime_policy.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <optional>
 #include <string>
@@ -74,12 +72,6 @@ struct PreparedContactPolicyRefDTO final {
   friend bool operator==(const PreparedContactPolicyRefDTO&,
                          const PreparedContactPolicyRefDTO&) = default;
 };
-struct PreparedRuntimePolicyRefDTO final {
-  /// Exact retained artifact accepted by Deployment for this operation.
-  RuntimePolicyCatalogRecordRefDTO source_artifact;
-  friend bool operator==(const PreparedRuntimePolicyRefDTO&,
-                         const PreparedRuntimePolicyRefDTO&) = default;
-};
 struct PreparedMotionInterruptScopeDTO final {
   MotionInterruptScopeId scope_id;
   InterruptPolicyId interrupt_policy_id;
@@ -101,7 +93,6 @@ struct PreparedMotionExecutionDTO final {
   PreparedMotionPlanningEvidenceDTO planning_evidence;
   PreparedMotionValidationEvidenceDTO validation_evidence;
   std::optional<PreparedContactPolicyRefDTO> contact_policy;
-  PreparedRuntimePolicyRefDTO runtime_policy;
   std::optional<double> requested_tcp_linear_speed_mps;
   double deployment_maximum_tcp_linear_speed_mps{};
   std::vector<PreparedMotionInterruptScopeDTO> interrupt_scopes;

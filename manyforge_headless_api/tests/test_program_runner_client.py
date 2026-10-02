@@ -128,3 +128,38 @@ def test_program_runner_client_rejects_non_object_or_duplicate_json() -> None:
             assert captured.value.code == "program_runner_response_invalid"
     finally:
         raw.close()
+
+
+def test_program_runner_client_addresses_scenario_persistent_values() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    raw = httpx.Client(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = ProgramRunnerHttpClient("http://runner.test", client=raw)
+    try:
+        assert client.persistent_values("cell-pick") == {"ok": True}
+        for action in ("set", "reset", "clear"):
+            assert client.persistent_value_action(
+                "cell-pick", action, {"request_id": action}
+            ) == {"ok": True}
+        with pytest.raises(ValueError, match="unsupported"):
+            client.persistent_value_action("cell-pick", "delete", {})
+        with pytest.raises(ValueError, match="scenario_id"):
+            client.persistent_values("../cell-pick")
+    finally:
+        raw.close()
+
+    base = "/api/program/scenarios/cell-pick/persistent-values"
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", base),
+        ("POST", base),
+        ("POST", f"{base}/reset"),
+        ("POST", f"{base}/clear"),
+    ]
+    assert json.loads(requests[2].content) == {"request_id": "reset"}

@@ -84,15 +84,22 @@ class StrictRequest(BaseModel):
 
 
 class TargetObservationQuery(StrictRequest):
-    """One exact, effect-free read of a captured Program target."""
+    """One exact, effect-free read of a captured Program target.
+
+    `frame_transform` names no target: it expresses `pose`, given in
+    `source_frame`, in `target_frame` through the cell frame resolver.
+    """
 
     schema_version: Literal["manyforge.target_observation_query.v1"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    target_role_id: str
-    kind: Literal["frame_pose", "gripper_status", "gripper_confirmation"]
+    target_role_id: str | None = None
+    kind: Literal["frame_pose", "gripper_status", "gripper_confirmation", "frame_transform"]
     frame_role_id: str | None = None
     relative_to_frame_role_id: str | None = None
+    pose: Pose3Request | None = None
+    source_frame: FrameReferenceRequest | None = None
+    target_frame: FrameReferenceRequest | None = None
 
     @field_validator(
         "owner_epoch", "target_role_id", "frame_role_id", "relative_to_frame_role_id"
@@ -107,6 +114,19 @@ class TargetObservationQuery(StrictRequest):
 
     @model_validator(mode="after")
     def exact_query(self) -> "TargetObservationQuery":
+        transform = self.kind == "frame_transform"
+        if transform != (self.pose is not None) or any(
+            (frame is not None) != transform
+            for frame in (self.source_frame, self.target_frame)
+        ):
+            raise ValueError("only a frame-transform query names a pose and two frames")
+        if transform == (self.target_role_id is not None):
+            raise ValueError("a frame-transform query names no target; every other kind does")
+        if transform and any(
+            isinstance(frame, FrameRoleReferenceRequest) and frame.target is None
+            for frame in (self.source_frame, self.target_frame)
+        ):
+            raise ValueError("a frame-transform frame role names its robot")
         frame_query = self.kind == "frame_pose"
         if frame_query != (self.frame_role_id is not None):
             raise ValueError("only a frame-pose query names a frame role")
@@ -834,6 +854,70 @@ class RuntimeBlackboardWriteRequest(ProgramRunControlRequest):
     @classmethod
     def validate_key(cls, value: str) -> str:
         return _bounded_nfc(value, label="key", maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+ScenarioId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
+]
+
+
+class PersistentKeyValuesClearRequest(CallerAttributionRequest):
+    """Reset every writable persistent key of the Applied Scenario at once.
+
+    Exactly one Reset per key the Applied Program declares writable (access
+    write or read_write): each starts again from `initial:`, or empty; read
+    keys keep their stored values. Clearing is refused while a run holds the
+    values. Without a run the last admitted edit wins; a request already
+    applied is refused by its identity, never applied again.
+    """
+
+    scenario_id: ScenarioId
+
+
+class PersistentKeyValueResetRequest(CallerAttributionRequest):
+    """Forget one stored value so the key starts again from `initial:`.
+
+    The expected Applied Program revision fences the declaration the operator
+    saw. While a run holds the values the edit names it and the revision the
+    operator saw (`program_run_id` with `expected_run_revision`); without a
+    run the last admitted edit wins. The Program runner refuses a changed
+    Program or run, and a request already applied, by its identity.
+    """
+
+    scenario_id: ScenarioId
+    key: str
+    expected_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_run_id: str | None = None
+    expected_run_revision: (
+        Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
+    ) = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return _bounded_nfc(value, label="key", maximum_bytes=MAX_IDENTITY_BYTES)
+
+    @field_validator("program_run_id")
+    @classmethod
+    def validate_run(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label="program_run_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @model_validator(mode="after")
+    def exact_fence(self) -> "PersistentKeyValueResetRequest":
+        if (self.program_run_id is None) != (self.expected_run_revision is None):
+            raise ValueError("program_run_id and expected_run_revision are paired")
+        return self
+
+
+class PersistentKeyValueSetRequest(PersistentKeyValueResetRequest):
+    """Store one persistent blackboard value, validated against its declaration."""
+
+    value: Any
 
 
 class ManualResultStageRequest(ProgramRunControlRequest):
@@ -2159,9 +2243,29 @@ class CapabilityCommandParticipantRequest(StrictRequest):
         return self
 
 
+class ReferenceTargetRequest(StrictRequest):
+    """The robot owning a robot-qualified frame, from the exact Program Binding."""
+
+    target_role_id: str
+    controllable_component_id: str
+    command_target_id: str
+
+    @field_validator("target_role_id", "controllable_component_id", "command_target_id")
+    @classmethod
+    def validate_target_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class FrameRoleReferenceRequest(StrictRequest):
+    """A frame role of the moving robot, or of `target` when it is named."""
+
     type: Literal["frame_role"]
     frame_role_id: str
+    target: ReferenceTargetRequest | None = None
 
     @field_validator("frame_role_id")
     @classmethod
@@ -2171,6 +2275,17 @@ class FrameRoleReferenceRequest(StrictRequest):
             label="frame_role_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+    @model_serializer(mode="wrap")
+    def serialize_reference(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if self.target is None:
+            result.pop("target", None)
+        return result
+
+
+class CellFrameReferenceRequest(StrictRequest):
+    type: Literal["cell_frame"]
 
 
 class ComponentBodyRoleReferenceRequest(StrictRequest):
@@ -2221,11 +2336,18 @@ class InlinePoseReferenceRequest(StrictRequest):
 
 
 MotionReferenceRequest = Annotated[
-    FrameRoleReferenceRequest
+    CellFrameReferenceRequest
+    | FrameRoleReferenceRequest
     | ComponentBodyRoleReferenceRequest
     | SceneResourceReferenceRequest
     | RuntimeObjectReferenceRequest
     | InlinePoseReferenceRequest,
+    Field(discriminator="type"),
+]
+
+# A named frame an absolute goal or a frame transform is expressed in.
+FrameReferenceRequest = Annotated[
+    CellFrameReferenceRequest | FrameRoleReferenceRequest | SceneResourceReferenceRequest,
     Field(discriminator="type"),
 ]
 
@@ -2264,6 +2386,15 @@ class MotionParticipantRequest(StrictRequest):
     runtime_object_bindings: list[RuntimeObjectReferenceBindingRequest] = Field(
         default_factory=list, max_length=4096
     )
+    # Frame of an absolute pose/Cartesian goal; absent means the base frame.
+    goal_frame_reference: FrameReferenceRequest | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_motion(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if self.goal_frame_reference is None:
+            result.pop("goal_frame_reference", None)
+        return result
 
     @field_validator(
         "move_id", "base_frame_role_id", "tcp_frame_role_id", "contact_policy_id"
@@ -2335,6 +2466,12 @@ class MotionParticipantRequest(StrictRequest):
                 raise ValueError(
                     "relative pose and Cartesian motion require target_reference"
                 )
+        if self.goal_frame_reference is not None and (
+            self.target_mode != "absolute" or is_joint
+        ):
+            raise ValueError(
+                "goal_frame_reference requires an absolute pose or Cartesian goal"
+            )
         return self
 
 
@@ -2539,6 +2676,9 @@ PickComponentBodyRoleReferenceRequest = ComponentBodyRoleReferenceRequest
 PickSceneResourceReferenceRequest = SceneResourceReferenceRequest
 PickRuntimeObjectReferenceRequest = RuntimeObjectReferenceRequest
 PickInlinePoseReferenceRequest = InlinePoseReferenceRequest
+# Pick and approach offsets accept every motion-reference form, including the
+# cell frame and another robot's frame; the native owner verifies a robot
+# qualifier against the Program Binding exactly like a motion reference.
 PickOffsetReferenceRequest = MotionReferenceRequest
 
 

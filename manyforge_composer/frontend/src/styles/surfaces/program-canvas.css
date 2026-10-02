@@ -76,6 +76,12 @@
   border-color: var(--mf-status-failure);
 }
 
+/* Interrupted: a cancellable node stopped by a Program Stop, Reset or cancel. */
+.bt-node.status-interrupted {
+  border-color: var(--mf-status-interrupted);
+  border-style: dashed;
+}
+
 /* Held: ticking, but its motion waits for Run. Magenta border (same width
    as every status) plus a pause badge, so it does not rely on colour alone. */
 .bt-node.status-held {
@@ -260,6 +266,10 @@
 .bt-node-collapsed-item.status-failure,
 .bt-node-collapsed-item.invalid {
   --item-status: var(--mf-status-failure);
+}
+
+.bt-node-collapsed-item.status-interrupted {
+  --item-status: var(--mf-status-interrupted);
 }
 
 /* Only a running leaf glows; a running box would light its whole group. */
@@ -1228,6 +1238,11 @@
 
 .program-canvas-help-swatch.status-failure {
   border-color: var(--mf-status-failure);
+}
+
+.program-canvas-help-swatch.status-interrupted {
+  border-color: var(--mf-status-interrupted);
+  border-style: dashed;
 }
 
 .program-canvas-help-swatch.invalid {

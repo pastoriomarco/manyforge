@@ -12,6 +12,7 @@ import threading
 import uuid
 
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
     HTTPException,
     Path,
@@ -82,6 +83,9 @@ from .models import (
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
+    PersistentKeyValueResetRequest,
+    PersistentKeyValueSetRequest,
+    PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -118,6 +122,9 @@ from .activation_preparer import ActivationPreparer
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+ScenarioPath = Annotated[
+    str, Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
+]
 _MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
@@ -349,6 +356,7 @@ def _error_status(code: str) -> int:
             "deployment_candidate_cell_mismatch",
             "cclc_request_namespace_refreshed",
             "cclc_request_admission_deferred",
+            "persistent_key_request_replayed",
         }
     ):
         return 409
@@ -358,10 +366,12 @@ def _error_status(code: str) -> int:
         "execution_owner_not_ready",
         "operator_alarm_state_unavailable",
         "program_applied_selection_not_active",
+        "program_activation_history_incomplete",
         "program_runner_unavailable",
         "program_run_scheduling_failed",
         "request_ledger_full",
         "scene_projection_commit_uncertain",
+        "persistent_key_storage_uncertain",
         "execution_control_ingress_busy",
     }:
         return 503
@@ -512,6 +522,7 @@ def create_app(
     if event_pump is not None:
         event_pump.set_change_observer(control_state_source.notify_cold)
         event_pump.set_settled_observer(control_state_source.notify_motion_settled)
+        event_pump.set_progress_observer(control_state_source.notify_operation_progress)
     service_cclc = getattr(service, "cclc", None)
     if cclc is None:
         cclc = service_cclc
@@ -615,6 +626,8 @@ def create_app(
             yield
         finally:
             try:
+                # Stop following Applies before their owners' clients close.
+                service.close()
                 await control_state_source.close()
                 if owns_core:
                     try:
@@ -899,6 +912,10 @@ def create_app(
     @app.get("/api/program/applied/status")
     def program_applied_status() -> dict[str, Any]:
         return service.program_applied_status()
+
+    @app.get("/api/program/committed-activation")
+    def program_committed_activation() -> dict[str, Any]:
+        return service.committed_scenario_activation()
 
     @app.post("/api/program/model-attempts")
     def program_model_attempt(
@@ -1226,6 +1243,43 @@ def create_app(
             transport_request=request,
         )
 
+    def require_scenario_path(scenario_id: str, request: Any) -> None:
+        if request.scenario_id != scenario_id:
+            raise HeadlessApiError(
+                "persistent_key_path_invalid",
+                "Scenario identity in path and body must match",
+            )
+
+    # Persistent blackboard values are Scenario state kept by the Program
+    # runner; editing them is a value edit, not an execution command.
+    @app.get("/api/program/scenarios/{scenario_id}/persistent-values")
+    def program_persistent_values(scenario_id: ScenarioPath) -> dict[str, Any]:
+        return service.program_persistent_values(scenario_id)
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values")
+    def set_program_persistent_value(
+        scenario_id: ScenarioPath,
+        body: PersistentKeyValueSetRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return service.program_persistent_value_action(scenario_id, "set", body)
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/reset")
+    def reset_program_persistent_value(
+        scenario_id: ScenarioPath,
+        body: PersistentKeyValueResetRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return service.program_persistent_value_action(scenario_id, "reset", body)
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/clear")
+    def clear_program_persistent_values(
+        scenario_id: ScenarioPath,
+        body: PersistentKeyValuesClearRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return service.program_persistent_value_action(scenario_id, "clear", body)
+
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -1362,9 +1416,15 @@ def create_app(
     def manager_apply_status(
         apply_id: Annotated[str, Query(min_length=1, max_length=256)],
         apply_generation: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
+        background: BackgroundTasks,
     ) -> JSONResponse:
         response = service.manager_apply_status(apply_id, apply_generation)
         if response.get("ok") is True:
+            if response.get("state") == "succeeded":
+                # Carry Manager's committed publication to the Program runner
+                # after this response: the Apply outcome is already final and
+                # nothing the runner does can change or delay it.
+                background.add_task(service.notify_committed_apply)
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
         code = error.get("code") if isinstance(error, dict) else None

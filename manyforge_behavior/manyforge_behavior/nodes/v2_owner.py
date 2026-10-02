@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import time
 from typing import Any
 
 import py_trees
@@ -22,15 +21,27 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramInterventionPort,
+    describe_owner_failure,
+    owner_failure_details,
 )
+from manyforge_behavior.nodes.interruption import InterruptedOutcome
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
+from manyforge_behavior.program_clock import AttemptTime, ProgramClock
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     ProgramValueError,
+    input_failure_reason,
+    node_input_failure_details,
 )
 
 
-class _OwnerAdapter(py_trees.behaviour.Behaviour):
+def _owner_request_message(exc: BaseException) -> str:
+    """A refused owner request keeps its reason and any failed reference."""
+
+    return describe_owner_failure(str(exc), owner_failure_details(exc))
+
+
+class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
     def __init__(
         self,
         *,
@@ -43,8 +54,12 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         input_resolver: NodeAttemptInputResolver,
         output_key_parameter: str | None = None,
         blackboard_read_parameters: tuple[str, ...] = (),
+        cancellable: bool = False,
     ) -> None:
         super().__init__(name=name)
+        # The catalog entry's `execution.cancellable`: only such a node
+        # reports the `interrupted` outcome when it is stopped.
+        self.cancellable = cancellable
         self._node_id = node_id
         self._node_instance_id = node_instance_id
         self._attempt_source = attempt_source
@@ -59,11 +74,13 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._input_error: str | None = None
         self._failure_reason_code: str | None = None
         self._failure_message = ""
+        self._failure_details: Mapping[str, Any] | None = None
         self._operator_stop_state: OperatorMotionStopState | None = None
         self._held_before_admission: int | None = None
         self._held_after_operator_stop = False
 
     def initialise(self) -> None:
+        self._clear_interruption()
         self._held_before_admission = None
         self._held_after_operator_stop = False
         self._inputs = None
@@ -72,6 +89,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._input_error = None
         self._failure_reason_code = None
         self._failure_message = ""
+        self._failure_details = None
         try:
             self._identity = self._attempt_source.begin(self._node_instance_id)
             snapshot = self._input_resolver.snapshot(
@@ -85,11 +103,13 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
             self._owner_inputs = OwnerNodeInputs(
                 parameters=self._inputs,
                 blackboard=snapshot.blackboard,
-                embedded_values=snapshot.embedded_values,
             )
         except (KeyError, ProgramValueError, TypeError, ValueError) as exc:
+            # The inputs fail before any owner request, whatever outcomes the
+            # catalog entry declares (spec 440 §4.6).
             self._input_error = str(exc)
-            self._record_failure("node_input_unavailable", str(exc))
+            self._record_failure(input_failure_reason(exc), str(exc))
+            self._failure_details = node_input_failure_details(exc)
 
     @property
     def failure_reason_code(self) -> str | None:
@@ -98,6 +118,12 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
     @property
     def failure_message(self) -> str:
         return self._failure_message
+
+    @property
+    def failure_details(self) -> Mapping[str, Any] | None:
+        """For an input failure: missing or invalid, path and source."""
+
+        return self._failure_details
 
     @property
     def attempt_identity(self) -> NodeAttemptIdentity | None:
@@ -148,6 +174,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         reason = reason_code or "owner_result_invalid"
         self._failure_reason_code = reason
         self._failure_message = message
+        self._failure_details = None
         self.feedback_message = f"{reason}: {message}".rstrip()
 
     def _wait_for_admission_release(self) -> bool:
@@ -418,7 +445,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._hold_before_admission(error)
             return py_trees.common.Status.RUNNING
         except Exception as exc:
-            self._record_failure("owner_request_failed", str(exc))
+            self._record_failure("owner_request_failed", _owner_request_message(exc))
             return py_trees.common.Status.FAILURE
         return self._settle(self._task)
 
@@ -449,7 +476,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._task = None
             self._hold_before_admission(error)
         except Exception as exc:
-            self._record_failure("owner_request_failed", str(exc))
+            self._record_failure("owner_request_failed", _owner_request_message(exc))
 
     def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
         """Observe accepted Program-scope work without ticking the tree.
@@ -513,6 +540,10 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return "unrecoverable"
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
+        # Halt, Stop or cancel of a running attempt: a cancellable node
+        # reports `interrupted`, including a held or not yet admitted one,
+        # once the stop is confirmed.
+        self._record_interruption(new_status)
         if (
             new_status is py_trees.common.Status.INVALID
             and self._task is not None
@@ -522,6 +553,10 @@ class OwnerTaskAdapter(_OwnerAdapter):
             try:
                 self._port.cancel(self._task.task_id, self._identity)
             except Exception as exc:
+                # The owner refused the cancellation: the stop is not
+                # confirmed, so the attempt reports `failure`, never
+                # `interrupted`, and the run pauses for operator attention.
+                self._record_stop_failure()
                 self._record_failure("owner_cancellation_failed", str(exc))
 
 
@@ -572,7 +607,7 @@ class OwnerInvocationAdapter(_OwnerAdapter):
                 # Lookup/transport failure cannot settle a submitted effect.
                 self.feedback_message = "Owner transaction outcome remains unconfirmed"
                 return py_trees.common.Status.RUNNING
-            self._record_failure("owner_request_failed", str(exc))
+            self._record_failure("owner_request_failed", _owner_request_message(exc))
             self._status = py_trees.common.Status.FAILURE
             return self._status
         self._pending_observation = None
@@ -625,35 +660,59 @@ class GripperStatusWaitAdapter(_OwnerAdapter):
 
     Cancelling a read-only waiter has no physical command to cancel. It never
     follows a replacement command/source, renews evidence, or owns a worker.
+    A Program Stop, Reset, cancel or a parent ending the wait reports
+    `interrupted`. `timeout_s` counts the run's Program time, which stands
+    still while the run is halted; with `timeout_while_held: pause` (the
+    default) the time an operator Stop holds the wait does not count either,
+    so a Stop never turns into a timeout failure when the wait resumes.
     """
 
-    def __init__(self, *, port: OwnerInvocationPort, clock=time.monotonic, **kwargs: Any):
+    def __init__(
+        self,
+        *,
+        port: OwnerInvocationPort,
+        program_clock: ProgramClock,
+        operator_stop_state: OperatorMotionStopState | None = None,
+        operator_stop_hold_scope: str | None = None,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         self._port = port
-        self._clock = clock
-        self._deadline = 0.0
+        self._clock = program_clock
+        self._attempt_time = AttemptTime(
+            program_clock,
+            operator_stop_state=operator_stop_state,
+            operator_stop_hold_scope=operator_stop_hold_scope,
+        )
         self._next_read = 0.0
         self._scope = None
 
     def initialise(self) -> None:
         super().initialise()
         self._scope = None
-        self._next_read = 0.0
-        self._deadline = self._clock() + (
-            float(self._inputs["timeout_s"]) if self._inputs is not None else 0.0
+        self._next_read = self._clock.now()
+        self._attempt_time.start(
+            exclude_held=self._inputs is not None
+            and self._inputs.get("timeout_while_held") == "pause"
         )
+
+    def _timed_out(self) -> bool:
+        assert self._inputs is not None  # Checked before every deadline test.
+        return self._attempt_time.elapsed() >= float(self._inputs["timeout_s"])
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._record_interruption(new_status)
 
     def update(self) -> py_trees.common.Status:
         if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
-        now = self._clock()
-        if now >= self._deadline:
+        if self._timed_out():
             self._record_failure(
                 "gripper_wait_timeout",
                 "Expected gripper state was not observed before the deadline.",
             )
             return py_trees.common.Status.FAILURE
-        if now < self._next_read:
+        if self._clock.now() < self._next_read:
             return py_trees.common.Status.RUNNING
         try:
             result = self._port.invoke(self._node_id, self._identity, self._owner_inputs)
@@ -663,7 +722,7 @@ class GripperStatusWaitAdapter(_OwnerAdapter):
         except Exception as exc:
             self._record_failure("gripper_wait_source_unavailable", str(exc))
             return py_trees.common.Status.FAILURE
-        self._next_read = self._clock() + 0.1
+        self._next_read = self._clock.now() + 0.1
         if self._scope is None:
             self._scope = scope
         if scope != self._scope:
@@ -671,7 +730,7 @@ class GripperStatusWaitAdapter(_OwnerAdapter):
                 "gripper_wait_stale", "The captured command or source was replaced."
             )
             return py_trees.common.Status.FAILURE
-        if self._clock() >= self._deadline:
+        if self._timed_out():
             self._record_failure(
                 "gripper_wait_timeout", "Gripper read completed after the deadline."
             )

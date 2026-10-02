@@ -191,11 +191,21 @@ struct AssistantPromptResponseContractDTO final {
                          const AssistantPromptResponseContractDTO&) = default;
 };
 
+/// One prompt-template variable and the Program value type it holds: bool,
+/// float64, int64, string or string_list.
+struct AssistantPromptTemplateVariableDTO final {
+  std::string variable_id;
+  std::string value_type;
+
+  friend bool operator==(const AssistantPromptTemplateVariableDTO&,
+                         const AssistantPromptTemplateVariableDTO&) = default;
+};
+
 struct AssistantPromptTemplateDTO final {
   std::string prompt_template_id;
   std::string version;
   std::string template_text;
-  std::vector<std::string> variable_ids;
+  std::vector<AssistantPromptTemplateVariableDTO> variables;  // sorted by ID
   AssistantPromptResponseContractDTO response_contract;
   ContentDigest content_digest;
 

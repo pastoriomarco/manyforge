@@ -4,7 +4,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -17,6 +19,8 @@
 #include "embedded_build_evidence.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/expression.hpp"
+#include "manyforge_deployment/program_value_path.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -262,6 +266,12 @@ void verify_value_source(const CanonicalValue &value, std::string_view path) {
         require_string(require_member(source, "reference", path),
                        child_path(path, "reference")),
         child_path(path, "reference"));
+    return;
+  }
+  if (kind == "expression") {
+    require_exact_fields(source, {"kind", "expression"}, path);
+    (void)require_string(require_member(source, "expression", path),
+                         child_path(path, "expression"));
     return;
   }
   if (kind == "blackboard_field") {
@@ -783,15 +793,31 @@ void verify_tree(const CanonicalValue &value, std::string_view path,
       fail(std::string(path) +
            ".value_sources: violates fixed non-empty bound");
     }
-    for (const auto &[parameter_id, source] : sources) {
-      require_program_local_identity(
-          parameter_id, child_path(path, "value_sources") + " key");
-      if (find_member(parameters, parameter_id) != nullptr) {
-        fail(std::string(path) + ": parameter '" + parameter_id +
-             "' is supplied by both parameters and value_sources");
+    // Keys are value paths; a literal may stay beside its source (it is
+    // restored when the source is removed). Entries never overlap.
+    std::set<ValuePath> paths;
+    for (const auto &[key, source] : sources) {
+      try {
+        paths.insert(parse_value_path(key));
+      } catch (const ValuePathError &error) {
+        fail(child_path(path, "value_sources") + " key '" + key +
+             "': " + error.code() + ": " + error.what());
       }
-      verify_value_source(
-          source, child_path(child_path(path, "value_sources"), parameter_id));
+      verify_value_source(source,
+                          child_path(child_path(path, "value_sources"), key));
+    }
+    for (const auto &value_path : paths) {
+      for (std::size_t length = 1U; length < value_path.size(); ++length) {
+        const ValuePath outer(value_path.begin(), value_path.begin() + length);
+        if (paths.contains(outer)) {
+          fail(child_path(child_path(path, "value_sources"),
+                          format_value_path(value_path)) +
+               ": overlaps the value_sources entry '" +
+               format_value_path(outer) +
+               "'; a value bound as a whole cannot also have entries for its "
+               "own fields");
+        }
+      }
     }
   }
   if (const auto *metadata = find_member(node, "metadata");
@@ -1289,11 +1315,1058 @@ struct QualifiedExecutionCatalog final {
   return effects;
 }
 
+[[nodiscard]] const CanonicalValue::Object *
+find_declaration(const CanonicalValue *rows, std::string_view id_field,
+                 std::string_view id, std::string_view path) {
+  if (rows == nullptr) {
+    return nullptr;
+  }
+  for (const auto &row : require_array(*rows, path)) {
+    const auto &fields = require_object(row, path);
+    const auto *name = find_member(fields, id_field);
+    if (name != nullptr && require_string(*name, path) == id) {
+      return &fields;
+    }
+  }
+  return nullptr;
+}
+
+// ------------------------------------------------------------ pose values
+// A stored_pose literal (a key's initial value or a key-typed node parameter)
+// and a key's allowed_frames are checked as the Python Program validator
+// checks them (program.py _validate_declared_type_value and
+// _validate_allowed_frames), with its wording
+// (program_pose_value_conformance.v1.yaml runs both).
+
+struct PoseFrames final {
+  const std::vector<core::ProgramTargetRoleRequirementDTO> &targets;
+  std::set<std::string> scene_resource_ids;
+};
+
+[[nodiscard]] std::set<std::string>
+declared_scene_resource_ids(const CanonicalValue::Object &root) {
+  std::set<std::string> ids;
+  if (const auto *scene = find_member(root, "scene")) {
+    for (const auto &row : require_array(*scene, "program.scene")) {
+      const auto &fields = require_object(row, "program.scene[]");
+      ids.insert(require_string(
+          require_member(fields, "scene_resource_id", "program.scene[]"),
+          "program.scene[].scene_resource_id"));
+    }
+  }
+  return ids;
+}
+
+void require_closed_pose_value(const CanonicalValue::Object &object,
+                               const std::set<std::string_view> &required,
+                               const std::string &path) {
+  const auto python_list = [](const std::set<std::string_view> &names) {
+    std::string text = "[";
+    for (const auto name : names) {
+      text += (text.size() > 1U ? ", '" : "'") + std::string(name) + "'";
+    }
+    return text + "]";
+  };
+  std::set<std::string_view> missing = required;
+  std::set<std::string_view> unknown;
+  for (const auto &[name, unused] : object) {
+    (void)unused;
+    if (missing.erase(name) == 0U && !required.contains(name)) {
+      unknown.insert(name);
+    }
+  }
+  if (!missing.empty()) {
+    fail(path + ": is missing required fields " + python_list(missing));
+  }
+  if (!unknown.empty()) {
+    fail(path + ": contains unknown fields " + python_list(unknown));
+  }
+}
+
+[[nodiscard]] const CanonicalValue::Object &
+require_pose_mapping(const CanonicalValue &value, const std::string &path) {
+  if (!value.is_object()) {
+    fail(path + ": must be a mapping");
+  }
+  return value.as_object();
+}
+
+[[nodiscard]] std::vector<double> pose_numbers(const CanonicalValue &value,
+                                               std::size_t count,
+                                               std::string_view count_text,
+                                               const std::string &path) {
+  if (!value.is_array()) {
+    fail(path + ": must be a list");
+  }
+  if (value.as_array().size() != count) {
+    fail(path + ": must contain " + std::string(count_text) + " numbers");
+  }
+  std::vector<double> numbers;
+  for (std::size_t index = 0U; index < count; ++index) {
+    const auto &item = value.as_array()[index];
+    if (!item.is_number() || !std::isfinite(item.as_number())) {
+      fail(index_path(path, index) + ": must be a finite number");
+    }
+    numbers.push_back(item.as_number());
+  }
+  return numbers;
+}
+
+// Returns the canonical order of the frame: kind, then target role or scene
+// resource, then frame role.
+std::tuple<std::string, std::string, std::string>
+verify_pose_frame_ref(const CanonicalValue &value, const PoseFrames &frames,
+                      const std::string &path) {
+  const auto &frame = require_pose_mapping(value, path);
+  const auto *kind_value = find_member(frame, "kind");
+  const std::string kind = kind_value != nullptr && kind_value->is_string()
+                               ? kind_value->as_string()
+                               : std::string{};
+  if (kind == "cell_frame") {
+    require_closed_pose_value(frame, {"kind"}, path);
+    return {kind, {}, {}};
+  }
+  if (kind == "scene_resource") {
+    require_closed_pose_value(frame, {"kind", "scene_resource_id"}, path);
+    const auto &resource = require_string(
+        require_member(frame, "scene_resource_id", path),
+        child_path(path, "scene_resource_id"));
+    if (!frames.scene_resource_ids.contains(resource)) {
+      fail(child_path(path, "scene_resource_id") +
+           ": does not name a declared scene resource");
+    }
+    return {kind, resource, {}};
+  }
+  if (kind != "target_frame") {
+    fail(child_path(path, "kind") +
+         ": must be cell_frame, target_frame, or scene_resource");
+  }
+  require_closed_pose_value(frame, {"kind", "target_role", "frame_role"}, path);
+  const auto &target_role =
+      require_string(require_member(frame, "target_role", path),
+                     child_path(path, "target_role"));
+  const auto &frame_role =
+      require_string(require_member(frame, "frame_role", path),
+                     child_path(path, "frame_role"));
+  const auto target = std::find_if(
+      frames.targets.begin(), frames.targets.end(), [&](const auto &item) {
+        return item.target_role_id.value() == target_role;
+      });
+  if (target == frames.targets.end()) {
+    fail(child_path(path, "target_role") +
+         ": does not name a declared target role");
+  }
+  if (std::none_of(target->required_frame_roles.begin(),
+                   target->required_frame_roles.end(),
+                   [&](const auto &role) { return role.value() == frame_role; })) {
+    fail(child_path(path, "frame_role") +
+         ": is not required by the selected target role");
+  }
+  return {kind, target_role, frame_role};
+}
+
+void verify_stored_pose(const CanonicalValue &value, const PoseFrames &frames,
+                        const std::string &path) {
+  const auto &pose = require_pose_mapping(value, path);
+  require_closed_pose_value(pose, {"frame_ref", "position_m", "orientation"},
+                            path);
+  (void)pose_numbers(require_member(pose, "position_m", path), 3U, "three",
+                     child_path(path, "position_m"));
+  const auto orientation_path = child_path(path, "orientation");
+  const auto &orientation = require_pose_mapping(
+      require_member(pose, "orientation", path), orientation_path);
+  if (orientation.size() != 1U || (orientation.front().first != "xyzw" &&
+                                   orientation.front().first != "rpy_deg")) {
+    fail(orientation_path + ": must contain exactly one of xyzw or rpy_deg");
+  }
+  const auto &[name, components] = orientation.front();
+  const bool quaternion = name == "xyzw";
+  const auto numbers =
+      pose_numbers(components, quaternion ? 4U : 3U, quaternion ? "4" : "3",
+                   child_path(orientation_path, name));
+  if (quaternion) {
+    double squared_norm = 0.0;
+    for (const double item : numbers) {
+      squared_norm += item * item;
+    }
+    if (std::fabs(squared_norm - 1.0) > 1e-6) {
+      fail(child_path(orientation_path, "xyzw") +
+           ": must already be a unit quaternion");
+    }
+  }
+  (void)verify_pose_frame_ref(require_member(pose, "frame_ref", path), frames,
+                              child_path(path, "frame_ref"));
+}
+
+// A stored_pose key may narrow its frames with `allowed_frames`; its initial
+// value is a complete pose in one of them.
+void verify_blackboard_pose_keys(const CanonicalValue::Object &root,
+                                 const PoseFrames &frames) {
+  const auto *blackboard = find_member(root, "blackboard");
+  const auto *keys =
+      blackboard == nullptr
+          ? nullptr
+          : find_member(require_object(*blackboard, "program.blackboard"),
+                        "keys");
+  if (keys == nullptr) {
+    return;
+  }
+  const auto &rows = require_array(*keys, "program.blackboard.keys");
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const auto path = index_path("program.blackboard.keys", index);
+    const auto &fields = require_object(rows[index], path);
+    const bool pose =
+        require_string(require_member(fields, "type", path),
+                       child_path(path, "type")) == "stored_pose";
+    const auto *allowed = find_member(fields, "allowed_frames");
+    if (allowed != nullptr) {
+      const auto allowed_path = child_path(path, "allowed_frames");
+      if (!pose) {
+        fail(allowed_path + ": is valid only for a stored_pose key");
+      }
+      if (!allowed->is_array()) {
+        fail(allowed_path + ": must be a list");
+      }
+      const auto &allowed_rows = allowed->as_array();
+      if (allowed_rows.empty()) {
+        fail(allowed_path +
+             ": must not be empty; omit it to allow every declared frame");
+      }
+      std::vector<std::tuple<std::string, std::string, std::string>> order;
+      for (std::size_t item = 0U; item < allowed_rows.size(); ++item) {
+        order.push_back(verify_pose_frame_ref(allowed_rows[item], frames,
+                                              index_path(allowed_path, item)));
+      }
+      if (std::adjacent_find(order.begin(), order.end(),
+                             std::greater_equal<>()) != order.end()) {
+        fail(allowed_path +
+             ": must be duplicate-free and canonical-sorted by kind, target "
+             "role or scene resource, and frame role");
+      }
+    }
+    const auto *initial = find_member(fields, "initial");
+    if (!pose || initial == nullptr) {
+      continue;
+    }
+    const auto initial_path = child_path(path, "initial");
+    verify_stored_pose(*initial, frames, initial_path);
+    if (allowed != nullptr &&
+        std::none_of(allowed->as_array().begin(), allowed->as_array().end(),
+                     [&](const auto &frame) {
+                       return frame == require_member(initial->as_object(),
+                                                      "frame_ref",
+                                                      initial_path);
+                     })) {
+      fail(child_path(initial_path, "frame_ref") +
+           ": is not one of the key's allowed_frames");
+    }
+  }
+}
+
+[[nodiscard]] bool literal_has_key_type(const CanonicalValue &value,
+                                        std::string_view type) {
+  if (type == "bool") {
+    return value.is_bool();
+  }
+  if (type == "string") {
+    return value.is_string();
+  }
+  if (type == "float64") {
+    return value.is_number();
+  }
+  if (type == "int64") {
+    return value.is_number() &&
+           std::trunc(value.as_number()) == value.as_number() &&
+           std::fabs(value.as_number()) <= 9007199254740991.0;
+  }
+  if (type == "stored_pose") {
+    return value.is_object(); // its members are checked by verify_stored_pose
+  }
+  return false;
+}
+
+// A catalog `key_value` parameter is typed by the blackboard key named by its
+// `value_type_from_key` parameter. The key must be one literal declared key of
+// an admitted type, and a literal must carry exactly that type (value sources
+// are typed by the key in verify_node_value_sources). A pose literal is a
+// complete stored_pose in a declared frame, as in Python.
+void verify_key_typed_parameters(const CanonicalValue::Object &node,
+                                 const CanonicalValue::Object &entry,
+                                 const CanonicalValue::Object &root,
+                                 const PoseFrames &frames,
+                                 std::string_view path) {
+  const auto &parameters =
+      require_object(require_member(node, "parameters", path), path);
+  const auto *sources_value = find_member(node, "value_sources");
+  const auto *sources = sources_value == nullptr
+                            ? nullptr
+                            : &require_object(*sources_value, path);
+  const auto *blackboard = find_member(root, "blackboard");
+  const auto *keys =
+      blackboard == nullptr
+          ? nullptr
+          : find_member(require_object(*blackboard, "program.blackboard"),
+                        "keys");
+  const auto &definitions =
+      require_array(require_member(entry, "parameters", path), path);
+  const auto declares = [&](std::string_view id) {
+    return std::any_of(definitions.begin(), definitions.end(),
+                       [&](const auto &definition) {
+                         return require_string(
+                                    require_member(require_object(definition,
+                                                                  path),
+                                                   "id", path),
+                                    path) == id;
+                       });
+  };
+  for (const auto &definition : definitions) {
+    const auto &fields = require_object(definition, "catalog.parameter");
+    const auto *schema = find_member(fields, "schema");
+    const auto *from_key =
+        schema == nullptr ? nullptr
+                          : find_member(require_object(*schema, path),
+                                        "value_type_from_key");
+    if (from_key == nullptr) {
+      continue;
+    }
+    const auto &shape = require_object(*schema, path);
+    const auto &id = require_string(require_member(fields, "id", path), path);
+    const auto &key_parameter = require_string(*from_key, path);
+    const auto &value_types =
+        require_array(require_member(shape, "value_types", path), path);
+    if (require_string(require_member(shape, "type", path), path) !=
+            "key_value" ||
+        value_types.empty() || !declares(key_parameter)) {
+      fail(std::string(path) +
+           ": inconsistent catalog key-typed declaration: " + id);
+    }
+    if (sources != nullptr && find_member(*sources, key_parameter) != nullptr) {
+      fail(std::string(path) +
+           ": key-typed parameter requires a literal key parameter: " +
+           key_parameter);
+    }
+    const auto *key_name = find_member(parameters, key_parameter);
+    const auto *key =
+        key_name == nullptr
+            ? nullptr
+            : find_declaration(keys, "key", require_string(*key_name, path),
+                               "program.blackboard.keys");
+    if (key == nullptr) {
+      fail(std::string(path) +
+           ": key-typed parameter names no declared blackboard key: " + id);
+    }
+    const auto &key_type =
+        require_string(require_member(*key, "type", path), path);
+    if (std::find(value_types.begin(), value_types.end(),
+                  CanonicalValue(key_type)) == value_types.end()) {
+      fail(std::string(path) + ": blackboard key type '" + key_type +
+           "' is not admitted by the node: " + id);
+    }
+    if (const auto *literal = find_member(parameters, id)) {
+      if (!literal_has_key_type(*literal, key_type)) {
+        fail(std::string(path) + ": literal does not match key type '" +
+             key_type + "': " + id);
+      }
+      if (key_type == "stored_pose") {
+        verify_stored_pose(*literal, frames,
+                           child_path(child_path(path, "parameters"), id));
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------ expressions
+// Computed keys and field expressions are checked by the one expression
+// engine against the Program's parameters and readable keys, exactly as the
+// Python Program validator does (EXPRESSION_LANGUAGE_REFERENCE.md).
+
+[[nodiscard]] std::optional<expression::ValueType>
+expression_type(std::string_view declared) {
+  if (declared == "bool") {
+    return expression::ValueType{expression::ValueKind::kBool, {}};
+  }
+  if (declared == "int64") {
+    return expression::ValueType{expression::ValueKind::kInt64, {}};
+  }
+  if (declared == "float64") {
+    return expression::ValueType{expression::ValueKind::kFloat64, {}};
+  }
+  if (declared == "string" || declared == "scene_resource") {
+    return expression::ValueType{expression::ValueKind::kString, {}};
+  }
+  if (declared == "stored_pose") {
+    return expression::ValueType{expression::ValueKind::kPose, {}};
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<expression::ValueKind>
+expression_destination(std::string_view declared) {
+  if (declared == "bool") {
+    return expression::ValueKind::kBool;
+  }
+  if (declared == "int64") {
+    return expression::ValueKind::kInt64;
+  }
+  if (declared == "float64") {
+    return expression::ValueKind::kFloat64;
+  }
+  if (declared == "string") {
+    return expression::ValueKind::kString;
+  }
+  return std::nullopt;
+}
+
+/// Check one expression; returns the keys it reads.
+std::vector<std::string>
+check_program_expression(std::string_view text,
+                         const expression::TypeEnvironment &environment,
+                         expression::ValueKind destination,
+                         std::string_view path) {
+  const auto describe = [&](const expression::Diagnostic &diagnostic) {
+    return std::string(path) + ": " + diagnostic.code + " at character " +
+           std::to_string(diagnostic.position) + ": " + diagnostic.message;
+  };
+  auto parsed = expression::parse(text);
+  if (const auto *diagnostic = std::get_if<expression::Diagnostic>(&parsed)) {
+    fail(describe(*diagnostic));
+  }
+  auto checked = expression::check(
+      std::get<expression::ParsedExpression>(parsed), environment, destination);
+  if (const auto *diagnostics =
+          std::get_if<std::vector<expression::Diagnostic>>(&checked)) {
+    fail(describe(diagnostics->front()));
+  }
+  std::vector<std::string> keys;
+  for (const auto &[reference, type] :
+       std::get<expression::CheckedExpression>(checked).references()) {
+    (void)type;
+    if (reference.source == expression::Source::kKey) {
+      keys.push_back(reference.name);
+    }
+  }
+  return keys;
+}
+
+struct ProgramExpressionContext final {
+  expression::TypeEnvironment environment;
+  std::map<std::string, std::string, std::less<>> key_types;
+};
+
+/// Build the expression environment and check every computed key, refusing
+/// computed keys that read each other in a cycle.
+[[nodiscard]] ProgramExpressionContext
+verify_program_expressions(const CanonicalValue::Object &root) {
+  ProgramExpressionContext context;
+  if (const auto *rows = find_member(root, "parameters")) {
+    for (const auto &row : require_array(*rows, "program.parameters")) {
+      const auto &fields = require_object(row, "program.parameters[]");
+      const auto type = expression_type(require_string(
+          require_member(fields, "type", "program.parameters[]"),
+          "program.parameters[].type"));
+      if (type.has_value()) {
+        context.environment.parameters.emplace(
+            require_string(
+                require_member(fields, "parameter_id", "program.parameters[]"),
+                "program.parameters[].parameter_id"),
+            *type);
+      }
+    }
+  }
+  const auto *blackboard = find_member(root, "blackboard");
+  const auto *keys =
+      blackboard == nullptr
+          ? nullptr
+          : find_member(require_object(*blackboard, "program.blackboard"),
+                        "keys");
+  if (keys == nullptr) {
+    return context;
+  }
+  const auto &rows = require_array(*keys, "program.blackboard.keys");
+  for (const auto &row : rows) {
+    const auto &fields = require_object(row, "program.blackboard.keys[]");
+    const auto &name = require_string(
+        require_member(fields, "key", "program.blackboard.keys[]"),
+        "program.blackboard.keys[].key");
+    const auto &type = require_string(
+        require_member(fields, "type", "program.blackboard.keys[]"),
+        "program.blackboard.keys[].type");
+    context.key_types.emplace(name, type);
+    const auto &access = require_string(
+        require_member(fields, "access", "program.blackboard.keys[]"),
+        "program.blackboard.keys[].access");
+    if (access != "read" && access != "read_write") {
+      continue;
+    }
+    if (const auto *record = find_member(fields, "fields")) {
+      expression::ValueType value{expression::ValueKind::kRecord, {}};
+      for (const auto &field :
+           require_array(*record, "program.blackboard.keys[].fields")) {
+        const auto &declared = require_object(field, "fields[]");
+        const auto field_type = expression_type(
+            require_string(require_member(declared, "type", "fields[]"),
+                           "fields[].type"));
+        if (field_type.has_value()) {
+          value.fields.push_back(
+              {require_string(require_member(declared, "field", "fields[]"),
+                              "fields[].field"),
+               *field_type});
+        }
+      }
+      if (!value.fields.empty()) {
+        context.environment.keys.emplace(name, std::move(value));
+      }
+    } else if (const auto engine = expression_type(type)) {
+      context.environment.keys.emplace(name, *engine);
+    }
+  }
+  std::map<std::string, std::vector<std::string>> reads;
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const auto &fields = require_object(rows[index], "program.blackboard.keys[]");
+    const auto *text = find_member(fields, "expression");
+    if (text == nullptr) {
+      continue;
+    }
+    const auto path = index_path("program.blackboard.keys", index);
+    const auto &name = require_string(require_member(fields, "key", path), path);
+    if (find_member(fields, "initial") != nullptr) {
+      fail(path + ".initial: a computed key has no initial value");
+    }
+    if (require_string(require_member(fields, "persistence", path), path) !=
+        "run") {
+      fail(path + ".persistence: a computed key cannot be persistent");
+    }
+    if (require_string(require_member(fields, "access", path), path) !=
+        "read") {
+      fail(path + ".access: a computed key is read-only; declare access read");
+    }
+    const auto destination = expression_destination(
+        require_string(require_member(fields, "type", path), path));
+    if (!destination.has_value() || find_member(fields, "fields") != nullptr) {
+      fail(path + ".type: a computed key must be bool, int64, float64 or "
+                  "string");
+    }
+    reads.emplace(name, check_program_expression(
+                            require_string(*text, child_path(path, "expression")),
+                            context.environment, *destination,
+                            child_path(path, "expression")));
+  }
+  // Depth-first search over computed keys only; a key on the active stack
+  // closes a cycle.
+  std::map<std::string, int> state;
+  std::vector<std::string> stack;
+  const auto visit = [&](auto &&self, const std::string &name) -> void {
+    const auto marked = state.find(name);
+    if (marked != state.end() && marked->second == 2) {
+      return;
+    }
+    if (marked != state.end() && marked->second == 1) {
+      std::string cycle;
+      for (auto item = std::find(stack.begin(), stack.end(), name);
+           item != stack.end(); ++item) {
+        cycle += *item + " -> ";
+      }
+      fail("program.blackboard.keys: computed keys read each other in a "
+           "cycle: " +
+           cycle + name);
+    }
+    state[name] = 1;
+    stack.push_back(name);
+    for (const auto &dependency : reads.at(name)) {
+      if (reads.contains(dependency)) {
+        self(self, dependency);
+      }
+    }
+    stack.pop_back();
+    state[name] = 2;
+  };
+  for (const auto &[name, unused] : reads) {
+    (void)unused;
+    visit(visit, name);
+  }
+  return context;
+}
+
+[[nodiscard]] const CanonicalValue::Object &
+resolve_catalog_schema(const CanonicalValue::Object &holder,
+                       std::string_view path) {
+  const CanonicalValue::Object *current = &holder;
+  if (const auto *inline_schema = find_member(holder, "schema")) {
+    current = &require_object(*inline_schema, path);
+  }
+  for (std::size_t hops = 0U; hops < 64U; ++hops) {
+    const auto *reference = find_member(*current, "schema_ref");
+    if (reference == nullptr) {
+      return *current;
+    }
+    const auto &text = require_string(*reference, path);
+    constexpr std::string_view prefix = "#/schema_types/";
+    if (!text.starts_with(prefix)) {
+      fail(std::string(path) + ": invalid catalog schema reference");
+    }
+    const auto name = text.substr(prefix.size());
+    const auto *target =
+        execution_catalog().schema_types.find_object_member(name);
+    if (target == nullptr) {
+      fail(std::string(path) + ": absent catalog schema reference");
+    }
+    current = &require_object(*target, path);
+  }
+  fail(std::string(path) + ": catalog schema reference chain is too long");
+}
+
+/// Where a path-keyed value source writes: the catalog schema at the path,
+/// or the key type of a whole key-typed value (`schema` is then null).
+struct SourceDestination final {
+  const CanonicalValue::Object *schema{};
+  std::string key;
+  std::string key_type;
+};
+
+/// A path into a value must name a value of the literal, or of the catalog
+/// default when there is no literal; a list index must be within the list.
+/// Only the first `depth` segments are checked: a source may supply an absent
+/// map entry, whose parent map must exist.
+void require_value_at(const ValuePath &value_path, std::size_t depth,
+                      const CanonicalValue::Object &definition,
+                      const CanonicalValue::Object &parameters,
+                      const std::string &path) {
+  const CanonicalValue *current =
+      find_member(parameters, std::get<std::string>(value_path.front()));
+  if (current == nullptr) {
+    current = find_member(definition, "default");
+  }
+  for (std::size_t item = 1U; current != nullptr && item < depth; ++item) {
+    if (const auto *index = std::get_if<std::size_t>(&value_path[item])) {
+      current = current->is_array() && *index < current->as_array().size()
+                    ? &current->as_array()[*index]
+                    : nullptr;
+    } else {
+      current = current->is_object()
+                    ? find_member(current->as_object(),
+                                  std::get<std::string>(value_path[item]))
+                    : nullptr;
+    }
+  }
+  if (current == nullptr) {
+    fail(path + ": names no value in the node's parameters");
+  }
+}
+
+/// Whether the path ends at an entry of a map (an object's additional
+/// properties), which a source may supply without a literal entry. A path the
+/// schema does not admit is not a map entry.
+[[nodiscard]] bool names_map_entry(const ValuePath &value_path,
+                                   const CanonicalValue::Object &root_schema,
+                                   const std::string &path) {
+  const CanonicalValue::Object *schema = &root_schema;
+  for (std::size_t item = 1U; item + 1U < value_path.size(); ++item) {
+    const auto *type = find_member(*schema, "type");
+    const std::string kind =
+        type == nullptr ? std::string() : require_string(*type, path);
+    const CanonicalValue *child = nullptr;
+    if (std::holds_alternative<std::size_t>(value_path[item])) {
+      child = kind == "array" ? find_member(*schema, "items") : nullptr;
+    } else if (kind == "object") {
+      if (const auto *properties = find_member(*schema, "properties")) {
+        child = find_member(require_object(*properties, path),
+                            std::get<std::string>(value_path[item]));
+      }
+      if (child == nullptr) {
+        child = find_member(*schema, "additional_properties");
+      }
+    }
+    if (child == nullptr || !child->is_object()) {
+      return false;
+    }
+    schema = &resolve_catalog_schema(child->as_object(), path);
+  }
+  const auto *last = std::get_if<std::string>(&value_path.back());
+  const auto *type = find_member(*schema, "type");
+  const auto *extra = find_member(*schema, "additional_properties");
+  const auto *properties = find_member(*schema, "properties");
+  return last != nullptr && type != nullptr &&
+         require_string(*type, path) == "object" && extra != nullptr &&
+         extra->is_object() &&
+         (properties == nullptr ||
+          find_member(require_object(*properties, path), *last) == nullptr);
+}
+
+[[nodiscard]] SourceDestination
+value_source_destination(const ValuePath &value_path,
+                         const CanonicalValue::Object &definition,
+                         const CanonicalValue::Object &parameters,
+                         const ProgramExpressionContext &context,
+                         const std::string &path) {
+  const CanonicalValue::Object *schema =
+      &resolve_catalog_schema(definition, path);
+  if (const auto *from_key = find_member(*schema, "value_type_from_key")) {
+    const auto *key_name =
+        find_member(parameters, require_string(*from_key, path));
+    const auto key =
+        key_name == nullptr
+            ? context.key_types.end()
+            : context.key_types.find(require_string(*key_name, path));
+    if (key == context.key_types.end()) {
+      fail(path + ": key-typed value source names no declared blackboard key");
+    }
+    if (value_path.size() == 1U) {
+      return {nullptr, key->first, key->second};
+    }
+    if (key->second != "stored_pose") {
+      fail(path + ": " + key->second + " values have no fields");
+    }
+    const auto *pose = execution_catalog().schema_types.find_object_member(
+        "stored_pose");
+    if (pose == nullptr) {
+      fail(path + ": absent catalog stored_pose schema");
+    }
+    schema = &require_object(*pose, path);
+  }
+  if (value_path.size() > 1U) {
+    require_value_at(value_path,
+                     value_path.size() -
+                         (names_map_entry(value_path, *schema, path) ? 1U : 0U),
+                     definition, parameters, path);
+  }
+  std::string previous = std::get<std::string>(value_path.front());
+  for (std::size_t item = 1U; item < value_path.size(); ++item) {
+    const auto *type = find_member(*schema, "type");
+    const std::string kind =
+        type == nullptr ? std::string() : require_string(*type, path);
+    const CanonicalValue *child = nullptr;
+    if (std::holds_alternative<std::size_t>(value_path[item])) {
+      if (kind != "array" || find_member(*schema, "items") == nullptr) {
+        fail(path + ": indexes a value that is not a list");
+      }
+      child = find_member(*schema, "items");
+      previous.clear();
+    } else {
+      const auto &name = std::get<std::string>(value_path[item]);
+      if (previous == "orientation" && name == "xyzw") {
+        fail(path + ": quaternion components depend on each other; an xyzw "
+                    "orientation is typed or bound whole");
+      }
+      if (kind == "object") {
+        if (const auto *properties = find_member(*schema, "properties")) {
+          child = find_member(require_object(*properties, path), name);
+        }
+        if (child == nullptr) {
+          const auto *extra = find_member(*schema, "additional_properties");
+          child = extra != nullptr && extra->is_object() ? extra : nullptr;
+        }
+      }
+      if (child == nullptr) {
+        fail(path + ": names no field '" + name + "'");
+      }
+      previous = name;
+    }
+    schema = &resolve_catalog_schema(require_object(*child, path), path);
+  }
+  return {schema, {}, {}};
+}
+
+[[nodiscard]] std::string schema_kind(const CanonicalValue::Object &schema,
+                                      const std::string &path) {
+  const auto *type = find_member(schema, "type");
+  return type == nullptr ? std::string() : require_string(*type, path);
+}
+
+[[nodiscard]] const std::string *
+schema_semantic(const CanonicalValue::Object &schema, const std::string &path) {
+  const auto *semantic = find_member(schema, "semantic_type");
+  return semantic == nullptr ? nullptr : &require_string(*semantic, path);
+}
+
+/// Whether `semantic` occurs at or anywhere below `schema`.
+[[nodiscard]] bool
+schema_contains_semantic(const CanonicalValue::Object &schema,
+                         std::string_view semantic, const std::string &path,
+                         std::set<const CanonicalValue::Object *> &visited) {
+  if (!visited.insert(&schema).second) {
+    return false;
+  }
+  if (const auto *own = schema_semantic(schema, path);
+      own != nullptr && *own == semantic) {
+    return true;
+  }
+  const auto below = [&](const CanonicalValue *child) {
+    return child != nullptr && child->is_object() &&
+           schema_contains_semantic(
+               resolve_catalog_schema(child->as_object(), path), semantic,
+               path, visited);
+  };
+  if (const auto *properties = find_member(schema, "properties")) {
+    for (const auto &[name, child] : require_object(*properties, path)) {
+      (void)name;
+      if (below(&child)) {
+        return true;
+      }
+    }
+  }
+  return below(find_member(schema, "items")) ||
+         below(find_member(schema, "additional_properties"));
+}
+
+[[nodiscard]] bool has_properties(const CanonicalValue::Object &schema,
+                                  std::initializer_list<std::string_view> names,
+                                  const std::string &path) {
+  const auto *properties = find_member(schema, "properties");
+  if (properties == nullptr) {
+    return false;
+  }
+  const auto &fields = require_object(*properties, path);
+  return std::all_of(names.begin(), names.end(), [&](std::string_view name) {
+    return find_member(fields, name) != nullptr;
+  });
+}
+
+/// The declared type a binding reads: a Program parameter, a readable key
+/// or a declared field of one.
+[[nodiscard]] std::string source_declared_type(const CanonicalValue::Object &source,
+                                               const CanonicalValue::Object &root,
+                                               const std::string &path) {
+  const auto &kind = require_string(require_member(source, "kind", path), path);
+  const auto &reference =
+      require_string(require_member(source, "reference", path), path);
+  const CanonicalValue::Object *row = nullptr;
+  if (kind == "program_parameter") {
+    row = find_declaration(find_member(root, "parameters"), "parameter_id",
+                           reference, "program.parameters");
+    if (row == nullptr) {
+      fail(path + ".reference: names no Program parameter");
+    }
+    return require_string(require_member(*row, "type", path), path);
+  }
+  const auto *blackboard = find_member(root, "blackboard");
+  row = find_declaration(
+      blackboard == nullptr
+          ? nullptr
+          : find_member(require_object(*blackboard, "program.blackboard"),
+                        "keys"),
+      "key", reference, "program.blackboard.keys");
+  if (row == nullptr) {
+    fail(path + ".reference: names no blackboard key");
+  }
+  const auto &access = require_string(require_member(*row, "access", path), path);
+  if (access != "read" && access != "read_write") {
+    fail(path + ".reference: does not permit reads");
+  }
+  if (kind == "blackboard_field") {
+    row = find_declaration(
+        find_member(*row, "fields"), "field",
+        require_string(require_member(source, "field", path), path),
+        "program.blackboard.keys[].fields");
+    if (row == nullptr) {
+      fail(path + ".field: names no declared field");
+    }
+  }
+  return require_string(require_member(*row, "type", path), path);
+}
+
+[[nodiscard]] bool source_type_compatible(std::string_view source_type,
+                                          const CanonicalValue::Object &destination,
+                                          const std::string &path) {
+  const auto *semantic = schema_semantic(destination, path);
+  if (semantic != nullptr && *semantic == "scene_resource") {
+    return source_type == "scene_resource";
+  }
+  const auto kind = schema_kind(destination, path);
+  if (kind == "key_value") {
+    const auto &types =
+        require_array(require_member(destination, "value_types", path), path);
+    return std::find(types.begin(), types.end(),
+                     CanonicalValue(std::string(source_type))) != types.end();
+  }
+  if (kind == "float") {
+    return source_type == "float64";
+  }
+  if (kind == "int") {
+    return source_type == "int64";
+  }
+  if (kind == "bool") {
+    return source_type == "bool";
+  }
+  if (kind == "string" || kind == "enum") {
+    return source_type == "string";
+  }
+  if (kind == "array") {
+    const auto *items = find_member(destination, "items");
+    if (items == nullptr) {
+      return false;
+    }
+    const auto &item =
+        resolve_catalog_schema(require_object(*items, path), path);
+    if (source_type == "string_list") {
+      return schema_kind(item, path) == "string";
+    }
+    if (source_type == "cartesian_path") {
+      return schema_kind(item, path) == "object" &&
+             has_properties(item, {"position_m", "orientation"}, path);
+    }
+    return false;
+  }
+  if (kind == "object") {
+    if (source_type == "stored_pose") {
+      return has_properties(destination, {"position_m", "orientation"}, path);
+    }
+    if (source_type == "coordinate_position") {
+      return has_properties(destination, {"kind", "value_m", "value_rad"},
+                            path);
+    }
+  }
+  return false;
+}
+
+/// The parameters whose values select the node's binding effects.
+[[nodiscard]] std::set<std::string>
+selector_parameters(const CanonicalValue::Object &entry, std::string_view path) {
+  std::set<std::string> selectors;
+  for (const auto &requirement : require_array(
+           require_member(entry, "required_capabilities", path), path)) {
+    const auto &fields =
+        require_object(requirement, "catalog.required_capability");
+    for (const auto *name :
+         {find_member(fields, "target_parameter"),
+          find_member(fields, "component_parameter")}) {
+      if (name != nullptr) {
+        selectors.insert(require_string(*name, path));
+      }
+    }
+    if (const auto *when = find_member(fields, "when")) {
+      selectors.insert(require_string(
+          require_member(require_object(*when, path), "parameter", path),
+          path));
+    }
+  }
+  return selectors;
+}
+
+// The same refusals as the Python Program validator's path-keyed value-source
+// checks (program_value_source_conformance.v1.yaml runs both).
+void verify_node_value_sources(const CanonicalValue::Object &node,
+                               const CanonicalValue::Object &entry,
+                               const CanonicalValue::Object &root,
+                               const ProgramExpressionContext &context,
+                               std::string_view path) {
+  static const std::set<std::string, std::less<>> kForbiddenParameters{
+      "contact_policy_id", "model_endpoint_alias", "prompt_template_id"};
+  static const std::set<std::string, std::less<>> kForbiddenSemantics{
+      "blackboard_key", "collision_body_role", "component_role",
+      "frame_role",     "resource_role",       "source_joint",
+      "target_role"};
+  const auto *sources_value = find_member(node, "value_sources");
+  if (sources_value == nullptr) {
+    return;
+  }
+  const auto &parameters =
+      require_object(require_member(node, "parameters", path), path);
+  const auto &definitions =
+      require_array(require_member(entry, "parameters", path), path);
+  const auto selectors = selector_parameters(entry, path);
+  const auto &sources = require_object(*sources_value, path);
+  const auto definition_of = [&](const std::string &id) {
+    const CanonicalValue::Object *definition = nullptr;
+    for (const auto &candidate : definitions) {
+      const auto &fields = require_object(candidate, "catalog.parameter");
+      if (require_string(require_member(fields, "id", path), path) == id) {
+        definition = &fields;
+      }
+    }
+    return definition;
+  };
+  for (const auto &[key, unused] : sources) {
+    (void)unused;
+    const auto name = std::get<std::string>(parse_value_path(key).front());
+    if (definition_of(name) == nullptr) {
+      fail(std::string(path) + ": supplies unknown catalog parameter '" +
+           name + "'");
+    }
+  }
+  for (const auto &[key, unused] : sources) {
+    (void)unused;
+    const auto name = std::get<std::string>(parse_value_path(key).front());
+    if (kForbiddenParameters.contains(name) || selectors.contains(name)) {
+      fail(child_path(child_path(path, "value_sources"), key) +
+           ": cannot dynamically select runtime/binding semantics");
+    }
+  }
+  for (const auto &[key, source_value] : sources) {
+    const auto entry_path = child_path(child_path(path, "value_sources"), key);
+    const auto &source = require_object(source_value, entry_path);
+    const auto value_path = parse_value_path(key);
+    const auto destination = value_source_destination(
+        value_path,
+        *definition_of(std::get<std::string>(value_path.front())), parameters,
+        context, entry_path);
+    if (destination.schema != nullptr) {
+      const auto *semantic = schema_semantic(*destination.schema, entry_path);
+      std::set<const CanonicalValue::Object *> visited;
+      if ((semantic != nullptr && kForbiddenSemantics.contains(*semantic)) ||
+          schema_contains_semantic(*destination.schema, "source_joint",
+                                   entry_path, visited)) {
+        fail(entry_path +
+             ": cannot dynamically select runtime/binding semantics");
+      }
+      const auto kind = schema_kind(*destination.schema, entry_path);
+      if (value_path.size() > 1U &&
+          (kind == "string" || kind == "enum" || semantic != nullptr)) {
+        fail(entry_path +
+             ": nested text, choice and identifier fields stay literal");
+      }
+    }
+    const auto &kind = require_string(
+        require_member(source, "kind", entry_path), entry_path);
+    if (kind == "expression") {
+      std::optional<expression::ValueKind> computes;
+      if (destination.schema == nullptr) {
+        computes = expression_destination(destination.key_type);
+      } else if (schema_semantic(*destination.schema, entry_path) == nullptr) {
+        const auto type = schema_kind(*destination.schema, entry_path);
+        if (type == "float") {
+          computes = expression::ValueKind::kFloat64;
+        } else if (type == "int") {
+          computes = expression::ValueKind::kInt64;
+        } else if (type == "bool") {
+          computes = expression::ValueKind::kBool;
+        } else if (type == "string") {
+          computes = expression::ValueKind::kString;
+        }
+      }
+      if (!computes.has_value()) {
+        fail(entry_path + ": an expression computes only a bool, int64, "
+                          "float64 or string value (not a choice, identifier "
+                          "or whole value)");
+      }
+      (void)check_program_expression(
+          require_string(require_member(source, "expression", entry_path),
+                         entry_path),
+          context.environment, *computes, child_path(entry_path, "expression"));
+      continue;
+    }
+    const auto source_type = source_declared_type(source, root, entry_path);
+    if (destination.schema == nullptr) {
+      if (source_type != destination.key_type) {
+        fail(entry_path + ": source type '" + source_type +
+             "' does not match the '" + destination.key_type +
+             "' type of key '" + destination.key + "'");
+      }
+      continue;
+    }
+    if (!source_type_compatible(source_type, *destination.schema, entry_path)) {
+      fail(entry_path + ": source type '" + source_type +
+           "' is incompatible with the destination schema");
+    }
+  }
+}
+
 [[nodiscard]] core::ProgramExecutionTableDTO capture_execution_table(
-    const CanonicalValue &tree, const std::set<std::string> &instances,
+    const CanonicalValue &tree, const CanonicalValue::Object &root,
+    const std::set<std::string> &instances,
     const core::RetainedNodeEnvironmentDTO &environment,
     const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
-    const std::map<std::string, core::ProgramExecutionPolicy> &group_policies) {
+    const std::map<std::string, core::ProgramExecutionPolicy> &group_policies,
+    const ProgramExpressionContext &expressions, const PoseFrames &frames) {
   const auto &catalog = execution_catalog();
   if (catalog.catalog_id != environment.catalog_id ||
       catalog.content_version != environment.content_version ||
@@ -1366,6 +2439,8 @@ struct QualifiedExecutionCatalog final {
         require_object(require_member(entry, "execution", path), path);
     selected->owner_api =
         require_string(require_member(execution, "owner_api", path), path);
+    verify_key_typed_parameters(node, entry, root, frames, path);
+    verify_node_value_sources(node, entry, root, expressions, path);
     selected->target_effects = node_target_effects(node, entry, targets, path);
     if (selected->target_effects.size() >
         core::kMaxProgramTargetEffects - effect_count) {
@@ -1600,15 +2675,18 @@ extract_contract(const CanonicalValue &root_value,
   }
 
   verify_optional_top_level_shapes(root);
+  const PoseFrames frames{targets, declared_scene_resource_ids(root)};
+  verify_blackboard_pose_keys(root, frames);
   std::size_t tree_count = 0U;
   std::set<std::string> instance_ids;
   std::vector<core::ProgramNodePolicyDTO> node_policies;
   verify_tree(require_member(root, "tree", "program"), "program.tree", 0U,
               tree_count, instance_ids, node_policies);
+  const auto expressions = verify_program_expressions(root);
   execution_table = capture_execution_table(
-      require_member(root, "tree", "program"), instance_ids,
+      require_member(root, "tree", "program"), root, instance_ids,
       bundle.catalogs.node_environment, targets,
-      execution_group_policies(root, "program"));
+      execution_group_policies(root, "program"), expressions, frames);
   std::sort(node_policies.begin(), node_policies.end(),
             [](const auto &left, const auto &right) {
               return left.instance_id < right.instance_id;

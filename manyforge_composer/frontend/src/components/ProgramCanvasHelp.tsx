@@ -8,7 +8,8 @@ const STATUSES = [
   ['running', 'Running', 'Executing now.'],
   ['held', 'Waiting for Run', 'Executing, but held by a Stop: its work (motion, gripper, Scene edits…) starts when Run is pressed in the Motion panel.'],
   ['success', 'Success', 'Finished successfully.'],
-  ['failure', 'Failure', 'Failed; the parent decides what happens next.'],
+  ['failure', 'Failure', 'Failed: its own work failed, or its inputs (a key, field, parameter or formula) were missing or invalid when it started; the parent decides what happens next.'],
+  ['interrupted', 'Interrupted', 'A cancellable node stopped by a Program Stop, Reset or cancel while executing; not a failure. Halt only freezes it.'],
 ] as const;
 
 const FAMILIES = [

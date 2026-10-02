@@ -20,7 +20,12 @@ from .liveness import RetainedLiveness
 
 
 LEGACY_SCHEMA_VERSION: Final = 3
-SCHEMA_VERSION: Final = 4
+# Version 4 lacks only the completed persistent-value request table; an
+# existing version 4 journal is upgraded in place when it is opened.
+V4_SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
+# How many of the most recent completed persistent-value requests are kept.
+MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 _LEGACY_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
@@ -122,7 +127,7 @@ _LEGACY_TABLE_SQL: Final[dict[str, str]] = {
         )
     """,
 }
-_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
+_V4_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
         ("schema_version", "INTEGER", 1, 0),
@@ -161,13 +166,29 @@ _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] 
     "program_runner_liveness": _LEGACY_TABLE_SHAPES["program_runner_liveness"],
     "program_run_history": _LEGACY_TABLE_SHAPES["program_run_history"],
 }
-_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
-    "program_cycle_metadata": f"""
+_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
+    **_V4_TABLE_SHAPES,
+    "program_persistent_value_requests": (
+        ("request_owner_epoch", "TEXT", 1, 1),
+        ("request_id", "TEXT", 1, 2),
+        ("action", "TEXT", 1, 0),
+        ("outcome", "TEXT", 1, 0),
+        ("position", "INTEGER", 1, 0),
+    ),
+}
+
+
+def _metadata_sql(schema_version: int) -> str:
+    return f"""
         CREATE TABLE "program_cycle_metadata" (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          schema_version INTEGER NOT NULL CHECK(schema_version={SCHEMA_VERSION})
+          schema_version INTEGER NOT NULL CHECK(schema_version={schema_version})
         )
-    """,
+    """
+
+
+_V4_TABLE_SQL: Final[dict[str, str]] = {
+    "program_cycle_metadata": _metadata_sql(V4_SCHEMA_VERSION),
     "program_cycle": """
         CREATE TABLE "program_cycle" (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -209,6 +230,25 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
     "program_runner_liveness": _LEGACY_TABLE_SQL["program_runner_liveness"],
     "program_run_history": _LEGACY_TABLE_SQL["program_run_history"],
 }
+# Identities of completed persistent-value requests (Set, Reset, Clear), so a
+# resend is refused instead of applied again. Bounded: the oldest rows by
+# insertion `position` are trimmed. Node writes carry no request and never
+# appear here.
+_PERSISTENT_VALUE_REQUESTS_SQL: Final = """
+    CREATE TABLE program_persistent_value_requests (
+      request_owner_epoch TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      action TEXT NOT NULL CHECK(action IN ('set','reset','clear')),
+      outcome TEXT NOT NULL CHECK(outcome IN ('applied','storage_uncertain')),
+      position INTEGER NOT NULL UNIQUE CHECK(position>0),
+      PRIMARY KEY(request_owner_epoch, request_id)
+    )
+"""
+_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
+    **_V4_TABLE_SQL,
+    "program_cycle_metadata": _metadata_sql(SCHEMA_VERSION),
+    "program_persistent_value_requests": _PERSISTENT_VALUE_REQUESTS_SQL,
+}
 _SCHEMA_SQL: Final = (
     ";\n".join(statement.strip() for statement in _REQUIRED_TABLE_SQL.values()) + ";"
 )
@@ -239,8 +279,18 @@ _REQUEST_KINDS: Final = frozenset(
         "resume_motion",
         "prepare_manual_handover",
         "discard_full_stop",
+        "persistent_value_set",
+        "persistent_value_reset",
+        "persistent_values_clear",
     }
 )
+# The persistent-value action each request kind performs.
+_PERSISTENT_VALUE_ACTIONS: Final = {
+    "persistent_value_set": "set",
+    "persistent_value_reset": "reset",
+    "persistent_values_clear": "clear",
+}
+_PERSISTENT_VALUE_OUTCOMES: Final = frozenset({"applied", "storage_uncertain"})
 _TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
 
 
@@ -326,7 +376,11 @@ class RequestRecord:
 
 
 class ProgramCycleJournal:
-    """One-row cycle state plus a bounded set of unresolved commands."""
+    """One-row cycle state plus a bounded set of unresolved commands.
+
+    Completed persistent-value requests also keep their identities, bounded,
+    so a resend is refused instead of applied again.
+    """
 
     @staticmethod
     @contextmanager
@@ -722,6 +776,10 @@ class ProgramCycleJournal:
                 schema_version = LEGACY_SCHEMA_VERSION
                 expected_shapes = _LEGACY_TABLE_SHAPES
                 expected_sql = _LEGACY_TABLE_SQL
+            elif metadata_rows == [(1, V4_SCHEMA_VERSION)]:
+                schema_version = V4_SCHEMA_VERSION
+                expected_shapes = _V4_TABLE_SHAPES
+                expected_sql = _V4_TABLE_SQL
             elif metadata_rows == [(1, SCHEMA_VERSION)]:
                 schema_version = SCHEMA_VERSION
                 expected_shapes = _REQUIRED_TABLE_SHAPES
@@ -787,7 +845,7 @@ class ProgramCycleJournal:
             for index in (5, 6, 8, 9, 10, 12):
                 _strict_object(cycle_rows[0][index])
 
-            if schema_version == SCHEMA_VERSION:
+            if schema_version != LEGACY_SCHEMA_VERSION:
                 if (
                     type(cycle_rows[0][14]) is not int
                     or not 1 <= cycle_rows[0][14] <= 9_007_199_254_740_991
@@ -827,7 +885,7 @@ class ProgramCycleJournal:
                     (
                         request_count > 4_096
                         and (
-                            schema_version != SCHEMA_VERSION
+                            schema_version == LEGACY_SCHEMA_VERSION
                             or request_count > 4_097
                             or reset_request_count != 1
                         )
@@ -848,6 +906,26 @@ class ProgramCycleJournal:
                 if schema_version == LEGACY_SCHEMA_VERSION:
                     _strict_object(request[5])
                     _strict_object(request[6])
+
+            if schema_version == SCHEMA_VERSION:
+                completed_count = 0
+                for completed in database.execute(
+                    "SELECT request_owner_epoch,request_id,action,outcome,position "
+                    "FROM program_persistent_value_requests"
+                ):
+                    completed_count += 1
+                    if (
+                        completed_count > MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
+                        or not _bounded_identity(completed[0])
+                        or not _bounded_identity(completed[1])
+                        or completed[2] not in _PERSISTENT_VALUE_ACTIONS.values()
+                        or completed[3] not in _PERSISTENT_VALUE_OUTCOMES
+                        or type(completed[4]) is not int
+                        or completed[4] < 1
+                    ):
+                        raise RuntimeError(
+                            "Program-cycle persistent-value request table is corrupt"
+                        )
 
             liveness_rows = database.execute(
                 "SELECT singleton,manager_runtime_epoch,manager_owner_epoch,"
@@ -926,10 +1004,25 @@ class ProgramCycleJournal:
         owner_epoch: str,
         maximum_inflight_commands: int = 4_096,
         maximum_retained_runs: int = 4_096,
+        maximum_completed_persistent_value_requests: int = (
+            MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
+        ),
     ) -> None:
         if not 1 <= maximum_inflight_commands <= 4_096:
             raise ValueError("maximum_inflight_commands must be in [1, 4096]")
         self._maximum_inflight_commands = maximum_inflight_commands
+        if (
+            not 1
+            <= maximum_completed_persistent_value_requests
+            <= MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
+        ):
+            raise ValueError(
+                "maximum_completed_persistent_value_requests must be in "
+                f"[1, {MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS}]"
+            )
+        self._maximum_completed_persistent_value_requests = (
+            maximum_completed_persistent_value_requests
+        )
         if not 1 <= maximum_retained_runs <= 4_096:
             raise ValueError("maximum_retained_runs must be in [1, 4096]")
         self._maximum_retained_runs = maximum_retained_runs
@@ -1098,8 +1191,11 @@ class ProgramCycleJournal:
             self._database.execute("PRAGMA synchronous=FULL")
             if new_database:
                 self._database.executescript(_SCHEMA_SQL)
-            elif existing_schema_version == LEGACY_SCHEMA_VERSION:
-                self._migrate_v3()
+            else:
+                if existing_schema_version == LEGACY_SCHEMA_VERSION:
+                    self._migrate_v3()
+                if existing_schema_version != SCHEMA_VERSION:
+                    self._migrate_v4()
             with self._transaction():
                 if new_database:
                     self._database.execute(
@@ -1268,6 +1364,30 @@ class ProgramCycleJournal:
             self._database.execute("DROP TABLE program_cycle_metadata")
             self._database.execute(
                 "ALTER TABLE program_cycle_metadata_v4 "
+                "RENAME TO program_cycle_metadata"
+            )
+        except BaseException:
+            self._database.execute("ROLLBACK")
+            raise
+        self._database.execute("COMMIT")
+
+    def _migrate_v4(self) -> None:
+        """Atomically add v5's completed persistent-value request table."""
+
+        self._database.execute("BEGIN IMMEDIATE")
+        try:
+            self._database.execute(_PERSISTENT_VALUE_REQUESTS_SQL)
+            self._database.execute(
+                _metadata_sql(SCHEMA_VERSION).replace(
+                    '"program_cycle_metadata"', "program_cycle_metadata_v5"
+                )
+            )
+            self._database.execute(
+                "INSERT INTO program_cycle_metadata_v5 VALUES(1,?)", (SCHEMA_VERSION,)
+            )
+            self._database.execute("DROP TABLE program_cycle_metadata")
+            self._database.execute(
+                "ALTER TABLE program_cycle_metadata_v5 "
                 "RENAME TO program_cycle_metadata"
             )
         except BaseException:
@@ -1618,6 +1738,20 @@ class ProgramCycleJournal:
             raise ValueError("Program-cycle request kind is unsupported")
         encoded = self._dump(intent)
         with self._transaction():
+            if kind in _PERSISTENT_VALUE_ACTIONS:
+                completed = self._database.execute(
+                    """
+                    SELECT action,outcome FROM program_persistent_value_requests
+                    WHERE request_owner_epoch=? AND request_id=?
+                    """,
+                    (owner_epoch, request_id),
+                ).fetchone()
+                if completed is not None:
+                    # Already applied: refused by its identity, never again.
+                    return RequestRecord(
+                        "completed",
+                        result={"action": completed[0], "outcome": completed[1]},
+                    )
             current = self._database.execute(
                 """
                 SELECT request_kind,intent_json
@@ -2422,6 +2556,58 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle in-flight command is absent")
 
+    def complete_persistent_value_request(
+        self,
+        *,
+        owner_epoch: str,
+        request_id: str,
+        outcome: str,
+    ) -> None:
+        """Resolve one persistent-value request and keep its identity.
+
+        The identity joins the bounded completed-request table in the same
+        transaction, so a resend is refused even after the journal reopens;
+        the oldest identities beyond the bound are trimmed.
+        """
+
+        if outcome not in _PERSISTENT_VALUE_OUTCOMES:
+            raise ValueError("persistent-value request outcome is unsupported")
+        with self._transaction():
+            request = self._database.execute(
+                """
+                SELECT request_kind FROM program_cycle_inflight_commands
+                WHERE request_owner_epoch=? AND request_id=?
+                """,
+                (owner_epoch, request_id),
+            ).fetchone()
+            if request is None or request[0] not in _PERSISTENT_VALUE_ACTIONS:
+                raise RuntimeError("Program-cycle in-flight command is absent")
+            self._database.execute(
+                """
+                DELETE FROM program_cycle_inflight_commands
+                WHERE request_owner_epoch=? AND request_id=?
+                """,
+                (owner_epoch, request_id),
+            )
+            (position,) = self._database.execute(
+                "SELECT COALESCE(MAX(position),0)+1 "
+                "FROM program_persistent_value_requests"
+            ).fetchone()
+            self._database.execute(
+                "INSERT INTO program_persistent_value_requests VALUES(?,?,?,?,?)",
+                (
+                    owner_epoch,
+                    request_id,
+                    _PERSISTENT_VALUE_ACTIONS[request[0]],
+                    outcome,
+                    position,
+                ),
+            )
+            self._database.execute(
+                "DELETE FROM program_persistent_value_requests WHERE position<=?",
+                (position - self._maximum_completed_persistent_value_requests,),
+            )
+
     def complete_control_request(
         self,
         *,
@@ -2520,6 +2706,7 @@ class ProgramCycleJournal:
 
 __all__ = [
     "CycleRecord",
+    "MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS",
     "ProgramCycleJournal",
     "RequestRecord",
     "SCHEMA_VERSION",

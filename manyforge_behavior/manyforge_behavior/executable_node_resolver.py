@@ -28,26 +28,41 @@ from manyforge_behavior.node_registry import (
     BUILTIN_EXECUTABLE_PACKAGE_ID,
     ExecutableRegistryRow,
 )
-from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
+from manyforge_behavior.nodes.control_flow import (
+    NodeAttemptParameters,
+    ProgramParallel,
+    RepeatDecorator,
+    RetryDecorator,
+)
 from manyforge_behavior.nodes.v2_owner import (
     OwnerInvocationAdapter,
     OwnerTaskAdapter,
     GripperStatusWaitAdapter,
 )
 from manyforge_behavior.nodes.v2_pure import (
+    GeometryCheckPoseBounds,
     GeometryCheckPoseDistance,
-    LogicCheckBool,
-    LogicSetBool,
-    LogicWaitForBool,
+    GeometryOffsetPose,
+    LogicCheckCondition,
+    LogicCheckValue,
+    LogicSetValue,
+    LogicWaitForValue,
+    ProgramTimer,
 )
 from manyforge_behavior.orchestration_ports import (
+    FrameTransformError,
+    FrameTransformPort,
     NodeAdapterPorts,
+    NodeAttemptIdentity,
     NodeAttemptSource,
     OwnerInvocationPort,
+    OwnerInvocationResult,
+    OwnerNodeInputs,
     OwnerTaskPort,
 )
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
+from manyforge_behavior.program_clock import ProgramClock
 
 I8_ADAPTER_REASON: Final = "kernel_policy_node_adapter_unavailable_until_i8"
 I11_ADAPTER_REASON: Final = "semantic_io_node_adapter_unavailable_until_i11"
@@ -80,6 +95,12 @@ class NodeAdapterBuildContext:
     attempt_source: NodeAttemptSource | None = None
     ports: NodeAdapterPorts = field(default_factory=NodeAdapterPorts)
     operator_stop_state: OperatorMotionStopState | None = None
+    # The nearest self-or-ancestor whose effective operator-stop policy is
+    # `hold`: its decorator is what stops ticking this node while that
+    # subtree is held. None when nothing above holds it; it keeps running.
+    operator_stop_hold_scope: str | None = None
+    # The run's one Program clock: waits and the timer read time from it.
+    program_clock: ProgramClock | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -123,6 +144,15 @@ class NodeAdapterBuildContext:
             self.operator_stop_state, OperatorMotionStopState
         ):
             raise TypeError("operator_stop_state must be one OperatorMotionStopState")
+        if self.operator_stop_hold_scope is not None and (
+            not isinstance(self.operator_stop_hold_scope, str)
+            or not self.operator_stop_hold_scope
+        ):
+            raise TypeError("operator_stop_hold_scope must be non-empty text")
+        if self.program_clock is not None and not isinstance(
+            self.program_clock, ProgramClock
+        ):
+            raise TypeError("program_clock must be the run's ProgramClock")
 
 
 NodeAdapterBuilder = Callable[[NodeAdapterBuildContext], py_trees.behaviour.Behaviour]
@@ -173,18 +203,25 @@ def _fallback(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
     )
 
 
+def _attempt_parameters(
+    context: NodeAdapterBuildContext, node_id: str
+) -> NodeAttemptParameters:
+    """A control node's parameters, resolved from each attempt's snapshot."""
+
+    return NodeAttemptParameters(
+        node_id=node_id,
+        node_instance_id=context.node_instance_id,
+        parameters=context.parameters,
+        value_sources=context.value_sources,
+        input_resolver=_required_input_resolver(context),
+    )
+
+
 def _parallel(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
-    success_policy = context.parameters.get("success_policy", "all")
-    if success_policy == "all":
-        policy = py_trees.common.ParallelPolicy.SuccessOnAll()
-    elif success_policy == "one":
-        policy = py_trees.common.ParallelPolicy.SuccessOnOne()
-    else:
-        raise ValueError("parallel success_policy must be 'all' or 'one'")
-    return py_trees.composites.Parallel(
+    return ProgramParallel(
         name=context.name,
-        policy=policy,
         children=list(context.children),
+        attempt_inputs=_attempt_parameters(context, "parallel"),
     )
 
 
@@ -199,7 +236,7 @@ def _repeat(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
     return RepeatDecorator(
         name=context.name,
         child=context.children[0],
-        num_cycles=context.parameters.get("num_cycles", -1),
+        attempt_inputs=_attempt_parameters(context, "repeat"),
     )
 
 
@@ -207,25 +244,21 @@ def _retry(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
     return RetryDecorator(
         name=context.name,
         child=context.children[0],
-        num_attempts=context.parameters.get("num_attempts", -1),
+        attempt_inputs=_attempt_parameters(context, "retry"),
     )
 
 
-def _timer(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
-    duration = context.parameters["duration_s"]
-    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
-        raise TypeError("duration_s must be a number")
-    duration_s = float(duration)
-    if not 0.0 < duration_s <= 86_400.0:
-        raise ValueError("duration_s must be in (0, 86400]")
-    return py_trees.timers.Timer(name=context.name, duration=duration_s)
+def _required_program_clock(context: NodeAdapterBuildContext) -> ProgramClock:
+    if context.program_clock is None:
+        raise ValueError("a timed node requires the run's Program clock")
+    return context.program_clock
 
 
 def _required_input_resolver(
     context: NodeAdapterBuildContext,
 ) -> NodeAttemptInputResolver:
     if context.input_resolver is None:
-        raise ValueError("leaf adapter requires one node-attempt input resolver")
+        raise ValueError("node adapter requires one node-attempt input resolver")
     return context.input_resolver
 
 
@@ -254,6 +287,7 @@ def _owner_task_builder(
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
     require_initial_running: bool = False,
+    cancellable: bool = False,
 ) -> NodeAdapterBuilder:
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
@@ -272,9 +306,52 @@ def _owner_task_builder(
             blackboard_read_parameters=blackboard_read_parameters,
             require_initial_running=require_initial_running,
             operator_stop_state=context.operator_stop_state,
+            cancellable=cancellable,
         )
 
     return build
+
+
+class FramedObjectPoseQuery:
+    """Get object pose: the Scene owner answers in the cell frame; any other
+    declared frame is one owner frame transform of the object's own frame
+    (carried objects included), never a client-side composition."""
+
+    def __init__(
+        self, scene: OwnerInvocationPort, frames: FrameTransformPort | None
+    ) -> None:
+        self._scene = scene
+        self._frames = frames
+
+    def invoke(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        frame = inputs.parameters.get("frame")
+        if frame is None or dict(frame) == {"kind": "cell_frame"}:
+            return self._scene.invoke(node_id, identity, inputs)
+        if self._frames is None:
+            return OwnerInvocationResult(
+                False,
+                reason_code="frame_transform_unavailable",
+                message="this Program run has no native frame transform owner",
+            )
+        object_frame = {
+            "kind": "scene_resource",
+            "scene_resource_id": inputs.parameters["scene_resource_id"],
+        }
+        try:
+            result = self._frames.express_pose(
+                identity,
+                {
+                    "frame_ref": object_frame,
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                },
+                frame,
+            )
+        except FrameTransformError as exc:
+            return OwnerInvocationResult(False, reason_code=exc.reason_code, message=str(exc))
+        return OwnerInvocationResult(True, output=result.pose, metadata=result.metadata)
 
 
 def _owner_invocation_builder(
@@ -284,17 +361,18 @@ def _owner_invocation_builder(
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
     transform_port: Callable[[OwnerInvocationPort], OwnerInvocationPort] | None = None,
+    framed_port: (
+        Callable[[OwnerInvocationPort, FrameTransformPort | None], OwnerInvocationPort] | None
+    ) = None,
+    cancellable: bool = False,
 ) -> NodeAdapterBuilder:
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
         if transform_port is not None:
             port = transform_port(port)
-        adapter = (
-            GripperStatusWaitAdapter
-            if node_id == "gripper.wait_for_status"
-            else OwnerInvocationAdapter
-        )
-        return adapter(
+        if framed_port is not None:
+            port = framed_port(port, context.ports.model_queries)
+        common = dict(
             name=context.name,
             node_id=node_id,
             node_instance_id=context.node_instance_id,
@@ -302,58 +380,57 @@ def _owner_invocation_builder(
             parameters=context.parameters,
             value_sources=context.value_sources,
             input_resolver=_required_input_resolver(context),
-            port=port,  # type: ignore[arg-type]
+            port=port,
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
-            **({"operator_stop_state": context.operator_stop_state}
-               if adapter is OwnerInvocationAdapter else {}),
+            cancellable=cancellable,
+        )
+        if node_id != "gripper.wait_for_status":
+            return OwnerInvocationAdapter(
+                operator_stop_state=context.operator_stop_state,
+                **common,  # type: ignore[arg-type]
+            )
+        # Only a waiter some hold policy can stop ticking sees the Stop
+        # state, with the subtree whose hold actually stops it.
+        held = (
+            context.operator_stop_state is not None
+            and context.operator_stop_hold_scope is not None
+        )
+        return GripperStatusWaitAdapter(
+            program_clock=_required_program_clock(context),
+            operator_stop_state=context.operator_stop_state if held else None,
+            operator_stop_hold_scope=context.operator_stop_hold_scope if held else None,
+            **common,  # type: ignore[arg-type]
         )
 
     return build
 
 
-def _logic_check_bool(
-    context: NodeAdapterBuildContext,
-) -> py_trees.behaviour.Behaviour:
-    return LogicCheckBool(
-        name=context.name,
-        parameters=context.parameters,
-        value_sources=context.value_sources,
-        input_resolver=_required_input_resolver(context),
-    )
+def _pure_leaf(
+    adapter: Callable[..., py_trees.behaviour.Behaviour],
+    *,
+    timed: bool = False,
+) -> NodeAdapterBuilder:
+    def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
+        return adapter(
+            name=context.name,
+            parameters=context.parameters,
+            value_sources=context.value_sources,
+            input_resolver=_required_input_resolver(context),
+            attempt_source=_required_attempt_source(context),
+            frame_transforms=context.ports.model_queries,
+            # A timed node reads the run's Program clock. Only one some hold
+            # policy can stop ticking sees the Stop state, with the subtree
+            # whose hold actually stops it.
+            **({"program_clock": _required_program_clock(context)} if timed else {}),
+            **({"operator_stop_state": context.operator_stop_state,
+                "operator_stop_hold_scope": context.operator_stop_hold_scope}
+               if timed
+               and context.operator_stop_state is not None
+               and context.operator_stop_hold_scope is not None else {}),
+        )
 
-
-def _logic_set_bool(
-    context: NodeAdapterBuildContext,
-) -> py_trees.behaviour.Behaviour:
-    return LogicSetBool(
-        name=context.name,
-        parameters=context.parameters,
-        value_sources=context.value_sources,
-        input_resolver=_required_input_resolver(context),
-    )
-
-
-def _logic_wait_for_bool(
-    context: NodeAdapterBuildContext,
-) -> py_trees.behaviour.Behaviour:
-    return LogicWaitForBool(
-        name=context.name,
-        parameters=context.parameters,
-        value_sources=context.value_sources,
-        input_resolver=_required_input_resolver(context),
-    )
-
-
-def _geometry_check_pose_distance(
-    context: NodeAdapterBuildContext,
-) -> py_trees.behaviour.Behaviour:
-    return GeometryCheckPoseDistance(
-        name=context.name,
-        parameters=context.parameters,
-        value_sources=context.value_sources,
-        input_resolver=_required_input_resolver(context),
-    )
+    return build
 
 
 _PURE_BUILDERS: Final[Mapping[str, NodeAdapterBuilder]] = MappingProxyType(
@@ -364,11 +441,14 @@ _PURE_BUILDERS: Final[Mapping[str, NodeAdapterBuilder]] = MappingProxyType(
         "inverter_v1": _inverter,
         "repeat_v1": _repeat,
         "retry_v1": _retry,
-        "timer_v1": _timer,
-        "logic_check_bool_v1": _logic_check_bool,
-        "logic_set_bool_v1": _logic_set_bool,
-        "logic_wait_for_bool_v1": _logic_wait_for_bool,
-        "geometry_check_pose_distance_v1": _geometry_check_pose_distance,
+        "timer_v1": _pure_leaf(ProgramTimer, timed=True),
+        "logic_check_condition_v1": _pure_leaf(LogicCheckCondition),
+        "logic_set_value_v1": _pure_leaf(LogicSetValue),
+        "logic_check_value_v1": _pure_leaf(LogicCheckValue),
+        "logic_wait_for_value_v1": _pure_leaf(LogicWaitForValue, timed=True),
+        "geometry_check_pose_distance_v1": _pure_leaf(GeometryCheckPoseDistance),
+        "geometry_offset_pose_v1": _pure_leaf(GeometryOffsetPose),
+        "geometry_check_pose_bounds_v1": _pure_leaf(GeometryCheckPoseBounds),
     }
 )
 _OWNER_NEUTRAL_APIS: Final = frozenset(
@@ -401,11 +481,13 @@ _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
     {
         "model.kinematics": "model_queries",
         "scene.carried_attachment": "scene_transactions",
+        "scene.query": "scene_transactions",
         "scene.transaction": "scene_transactions",
     }
 )
 _DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingProxyType(
     {
+        "io.check_input": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.get_input": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.set_output": (I11_ADAPTER_REASON, ("I11", "T")),
         "io.wait_for_input": (I11_ADAPTER_REASON, ("I11", "T")),
@@ -501,6 +583,7 @@ def _definition_for(
                 output_key_parameter=output_key_parameter,
                 blackboard_read_parameters=blackboard_read_parameters,
                 require_initial_running=row.node_id == "assistant.query_model",
+                cancellable=entry.execution.cancellable,
             ),
             task_port,
             None,
@@ -514,6 +597,10 @@ def _definition_for(
                 invocation_port,
                 output_key_parameter=output_key_parameter,
                 blackboard_read_parameters=blackboard_read_parameters,
+                framed_port=(
+                    FramedObjectPoseQuery if row.node_id == "scene.get_object_pose" else None
+                ),
+                cancellable=entry.execution.cancellable,
             ),
             invocation_port,
             None,

@@ -1,7 +1,10 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import { RobotControlPanel } from './RobotControlPanel';
+import { RobotControlPanel, RobotControlPanelView } from './RobotControlPanel';
+import { useRobotControl } from '../hooks/useRobotControl';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { LogicalSceneProjection } from '../types/api';
 
 const controller = vi.hoisted(() => ({
   state: {
@@ -190,6 +193,76 @@ vi.mock('../hooks/useRobotControl', () => ({
 }));
 
 describe('RobotControlPanel layout', () => {
+  it('offers Applied stored goals, never Draft goals, and invalidates removed sources', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    const previous = { ...state };
+    const node = (id: string) => ({ instance_id: id, node_id: 'motion.move_to_joint_target',
+      parameters: { target_role: 'arm', goal: [{ joint_name: 'joint_1', position_rad: 0.2 }] }, children: [] });
+    const applied = { graphRevision: 'sha256:graph', retainedBundleId: 'sha256:bundle',
+      program: { tree: node('applied-goal') }, programBinding: { target_role_bindings: [
+        { target_role_id: 'arm', controllable_component_id: 'robot-1', command_target_id: 'arm' },
+      ] } };
+    const program = { state: { applied, controlPending: null } } as unknown as ProgramRuntimeController;
+    try {
+      state.mode = 'move_to';
+      state.moveToDraft = { source: { id: 'node:applied-goal', kind: 'joint', positionsRad: [0.2] } };
+      let markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={useRobotControl(true)} program={program} />);
+      expect(markup).toContain('Stored joints · applied-goal');
+      expect(markup).not.toContain('draft-goal');
+      applied.graphRevision = 'replaced';
+      markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={useRobotControl(true)} program={program} />);
+      expect(markup).not.toContain('Stored joints · applied-goal');
+      expect(markup).toMatch(/class="approve-button"[^>]*disabled=""/);
+    } finally {
+      Object.assign(state, previous);
+      delete state.moveToDraft;
+    }
+  });
+
+  it('uses runtime object poses, not Draft poses or carried-object authored positions', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    const previous = { ...state };
+    const providers = controller.state.status.directControl.targetDescriptor.contracts.supportingProviders;
+    providers.push({ ...providers[0], capabilityId: 'planning.motion.pose_goal' });
+    const scene = { access: { projection_leases_open: true }, snapshot: { objects: [
+      { scene_resource_id: 'runtime-object', placement: { kind: 'cell_fixed',
+        pose_in_cell: { position_m: { x: 0.3, y: 0, z: 0 }, orientation_xyzw: [0, 0, 0, 1] } } },
+      { scene_resource_id: 'carried-object', placement: { kind: 'carried' } },
+    ] } } as unknown as LogicalSceneProjection;
+    try {
+      state.mode = 'move_to';
+      state.moveToDraft = { source: { id: 'scene:runtime-object', kind: 'pose',
+        pose: { position: [0.3, 0, 0], quaternion: [0, 0, 0, 1] } } };
+      const panelController = useRobotControl(true);
+      const render = () => renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController}
+        runtimeScene={scene} controlBasePoseInCell={{ position: [0, 0, 0], quaternion: [0, 0, 0, 1] }} />);
+      expect(render()).toContain('Object · runtime-object');
+      expect(render()).not.toContain('Object · draft-object');
+      expect(render()).not.toContain('Object · carried-object');
+      expect(render()).not.toMatch(/class="approve-button"[^>]*disabled=""/);
+      const placement = scene.snapshot!.objects[0].placement;
+      if (placement.kind !== 'cell_fixed') throw new Error('invalid fixture');
+      placement.pose_in_cell.position_m.x = 0.6;
+      expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
+      placement.pose_in_cell.position_m.x = 0.3;
+      scene.access.projection_leases_open = false;
+      expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
+    } finally {
+      providers.pop();
+      Object.assign(state, previous);
+      delete state.moveToDraft;
+    }
+  });
+  it('warns that unapplied edits do not affect manual motion', () => {
+    const mutable = controller as typeof controller & { unappliedChanges?: boolean };
+    mutable.unappliedChanges = true;
+    try {
+      expect(renderToStaticMarkup(<RobotControlPanel enabled />))
+        .toContain('Robots use the current runtime Scene and Applied Deployment.');
+    } finally {
+      delete mutable.unappliedChanges;
+    }
+  });
   it('shows a compact robot selector only when the owner offers multiple targets', () => {
     const second = structuredClone(controller.state.status.directControl) as Record<string, unknown>;
     second.controllableComponentId = 'robot-2';

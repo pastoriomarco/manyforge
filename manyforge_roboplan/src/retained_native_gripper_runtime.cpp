@@ -382,7 +382,7 @@ core::RuntimeParticipantExecutionRegistration RetainedNativeGripperRuntime::regi
       .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
       .engine = participant_engine_.get(),
       .stop_execution_port = stop_execution_port_,
-      .runtime_policy = {},
+      .participant_policy = {},
       .prepared_motion_engine = dynamic_cast<
           core::IResolvedPreparedParticipantExecutionEngine *>(
           participant_engine_.get()),

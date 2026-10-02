@@ -33,6 +33,8 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.orchestration_ports import (
     PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
+    FrameTransformError,
+    FrameTransformResult,
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerInvocationPendingError,
@@ -45,6 +47,8 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
+    describe_owner_failure,
+    owner_failure_details,
 )
 from manyforge_behavior.scene_client import (
     SceneClient,
@@ -142,21 +146,16 @@ def _number(value: object, *, field: str) -> float:
 
 
 def _owner_failure_message(exc: BaseException) -> str:
-    """Return a bounded failure message that keeps the owner's structured reason.
+    """Return a bounded failure message that keeps the owner's structured cause.
 
-    Owner rejections carry the precise cause in ``error.details.reason``; the
-    human message alone is often generic (for example "addressed observed state
-    is unavailable"), so the reason is appended when the message lacks it.
+    Owner rejections carry the precise cause in ``error.details.reason`` and a
+    failed reference in ``reference_type``/``reference_id``; the human message
+    alone is often generic (for example "addressed observed state is
+    unavailable"), so both are appended when present.
     """
 
     message = str(exc) or type(exc).__name__
-    response = getattr(exc, "response", None)
-    error = response.get("error") if isinstance(response, Mapping) else None
-    details = error.get("details") if isinstance(error, Mapping) else None
-    reason = details.get("reason") if isinstance(details, Mapping) else None
-    if isinstance(reason, str) and reason and reason not in message:
-        message = f"{message} ({reason[:256]})"
-    return message[:1024]
+    return describe_owner_failure(message, owner_failure_details(exc))[:1024]
 
 
 def _request_identity(prefix: str, *coordinates: str) -> str:
@@ -172,23 +171,48 @@ def _sequence(value: object, *, field: str, length: int | None = None) -> Sequen
     return value
 
 
-def _pose3(
+def _base_framed_pose3(
     value: object,
     *,
     field: str,
     target_role_id: str,
     base_frame_role_id: str,
 ) -> dict[str, Any]:
+    """A wire pose that must be stated in the moving robot's base frame."""
+
+    if not _is_base_frame(
+        _mapping(value, field=field).get("frame_ref"),
+        field=f"{field}.frame_ref",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+    ):
+        raise ProductionPortError(f"{field}.frame_ref is not the selected target base frame")
+    return _pose3(value, field=field)
+
+
+def _is_base_frame(
+    frame: object, *, field: str, target_role_id: str, base_frame_role_id: str
+) -> bool:
+    """True for an absent frame (the base by contract) or the move's base frame."""
+
+    if frame is None:
+        return True
+    frame_value = _mapping(frame, field=field)
+    return (
+        frame_value.get("kind") == "target_frame"
+        and frame_value.get("target_role") == target_role_id
+        and frame_value.get("frame_role") == base_frame_role_id
+    )
+
+
+def _pose3(value: object, *, field: str) -> dict[str, Any]:
+    """The wire position and unit quaternion of one authored pose.
+
+    The frame the pose is stated in travels separately (a goal frame or a
+    transform source frame); it is never applied here.
+    """
+
     pose = _mapping(value, field=field)
-    frame = pose.get("frame_ref")
-    if frame is not None:
-        frame_value = _mapping(frame, field=f"{field}.frame_ref")
-        if (
-            frame_value.get("kind") != "target_frame"
-            or frame_value.get("target_role") != target_role_id
-            or frame_value.get("frame_role") != base_frame_role_id
-        ):
-            raise ProductionPortError(f"{field}.frame_ref is not the selected target base frame")
     position = _sequence(pose.get("position_m"), field=f"{field}.position_m", length=3)
     orientation = _mapping(pose.get("orientation"), field=f"{field}.orientation")
     if set(orientation) == {"xyzw"}:
@@ -334,13 +358,70 @@ def _scene_support_contacts(value: object, *, field: str) -> list[dict[str, Any]
     ]
 
 
+def _robot_target(
+    targets: Mapping[str, "_TargetBinding"], target_role_id: str, *, field: str
+) -> dict[str, str]:
+    """The exact robot of one target role, from the captured Program Binding."""
+
+    try:
+        target = targets[target_role_id]
+    except KeyError as exc:
+        raise ProductionPortError(
+            f"{field} names target role {target_role_id!r} absent from the Program Binding"
+        ) from exc
+    return {
+        "target_role_id": target.target_role_id,
+        "controllable_component_id": target.controllable_component_id,
+        "command_target_id": target.command_target_id,
+    }
+
+
+def _frame_reference(
+    frame: object,
+    *,
+    field: str,
+    targets: Mapping[str, "_TargetBinding"],
+) -> dict[str, Any]:
+    """Map one authored pose frame to its native frame reference.
+
+    Only forwarding: the native cell frame resolver owns every transform.
+    """
+
+    frame_value = _mapping(frame, field=field)
+    kind = frame_value.get("kind")
+    if kind == "cell_frame" and set(frame_value) == {"kind"}:
+        return {"type": "cell_frame"}
+    if kind == "scene_resource" and set(frame_value) == {"kind", "scene_resource_id"}:
+        return {
+            "type": "scene_resource",
+            "scene_resource_id": _text(
+                frame_value["scene_resource_id"], field=f"{field}.scene_resource_id"
+            ),
+        }
+    if kind == "target_frame" and set(frame_value) == {"kind", "target_role", "frame_role"}:
+        target_role_id = _text(frame_value["target_role"], field=f"{field}.target_role")
+        return {
+            "type": "frame_role",
+            "frame_role_id": _text(frame_value["frame_role"], field=f"{field}.frame_role"),
+            "target": _robot_target(targets, target_role_id, field=f"{field}.target_role"),
+        }
+    raise ProductionPortError(f"{field} has an unsupported frame form")
+
+
 def _reference(
     value: object,
     *,
     field: str,
     target_role_id: str,
     base_frame_role_id: str,
+    targets: Mapping[str, "_TargetBinding"],
 ) -> dict[str, Any] | None:
+    """Map one authored motion or pick-offset reference to its native form.
+
+    A robot-qualified frame role must name a target role of the captured
+    Program Binding (``targets``); the native owner resolves every form.
+    """
+
     if value is None:
         return None
     reference = dict(_mapping(value, field=field))
@@ -351,6 +432,19 @@ def _reference(
         "scene_resource": "scene_resource_id",
         "runtime_object": "runtime_object_id",
     }
+    if reference_type == "cell_frame" and set(reference) == {"type"}:
+        return {"type": "cell_frame"}
+    if reference_type == "frame_role" and set(reference) == {
+        "type",
+        "frame_role_id",
+        "target_role",
+    }:
+        robot = _text(reference["target_role"], field=f"{field}.target_role")
+        return {
+            "type": "frame_role",
+            "frame_role_id": _text(reference["frame_role_id"], field=f"{field}.frame_role_id"),
+            "target": _robot_target(targets, robot, field=f"{field}.target_role"),
+        }
     if reference_type in identity_fields:
         identity_field = identity_fields[reference_type]
         if set(reference) != {"type", identity_field}:
@@ -358,9 +452,11 @@ def _reference(
         _text(reference[identity_field], field=f"{field}.{identity_field}")
         return reference
     if reference_type == "pose" and set(reference) == {"type", "pose"}:
+        # A reference pose has no frame of its own on the wire: it is the
+        # moving robot's base frame by contract.
         return {
             "type": "pose",
-            "pose": _pose3(
+            "pose": _base_framed_pose3(
                 reference["pose"],
                 field=f"{field}.pose",
                 target_role_id=target_role_id,
@@ -374,6 +470,8 @@ def _reference(
 class _TargetBinding:
     target_role_id: str
     component_role_id: str
+    controllable_component_id: str
+    command_target_id: str
     capabilities: Mapping[str, Mapping[str, Any]]
 
 
@@ -558,6 +656,14 @@ class NativeKernelProgramPort:
             targets[target_role_id] = _TargetBinding(
                 target_role_id,
                 component_role_id,
+                _text(
+                    row.get("controllable_component_id"),
+                    field=f"target_role_bindings[{index}].controllable_component_id",
+                ),
+                _text(
+                    row.get("command_target_id"),
+                    field=f"target_role_bindings[{index}].command_target_id",
+                ),
                 capabilities,
             )
         contact_grasps: dict[str, _ContactGraspBinding] = {}
@@ -717,12 +823,51 @@ class NativeKernelProgramPort:
         return self._owner_status_for_capture(context.capture)
 
     @staticmethod
+    def _goal_frame_reference(
+        poses: Sequence[object],
+        *,
+        field: str,
+        target_mode: str,
+        target_role_id: str,
+        base_frame_role_id: str,
+        targets: Mapping[str, _TargetBinding],
+    ) -> dict[str, Any] | None:
+        """The one frame an absolute pose/Cartesian goal is stated in.
+
+        None means the moving robot's base frame (the wire default). Any other
+        declared frame is forwarded as `goal_frame_reference` and resolved by
+        the native owner at motion admission.
+        """
+
+        frames: list[Mapping[str, Any] | None] = []
+        for index, pose in enumerate(poses):
+            label = field if len(poses) == 1 else f"{field}[{index}]"
+            frame = _mapping(pose, field=label).get("frame_ref")
+            frames.append(
+                None
+                if _is_base_frame(
+                    frame,
+                    field=f"{label}.frame_ref",
+                    target_role_id=target_role_id,
+                    base_frame_role_id=base_frame_role_id,
+                )
+                else _mapping(frame, field=f"{label}.frame_ref")
+            )
+        if any(frame != frames[0] for frame in frames):
+            raise ProductionPortError(f"{field} waypoints must all use one frame")
+        if frames[0] is None:
+            return None
+        if target_mode != "absolute":
+            raise ProductionPortError(
+                f"{field}.frame_ref must be the moving robot's base frame for a "
+                "relative goal; its reference is target_reference"
+            )
+        return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets)
+
+    @staticmethod
     def _motion_spec(
         node_id: str,
         parameters: Mapping[str, Any],
-        *,
-        target_role_id: str,
-        base_frame_role_id: str,
     ) -> dict[str, Any]:
         if node_id == "motion.move_to_joint_target":
             goals = _sequence(parameters.get("goal"), field="goal")
@@ -745,24 +890,14 @@ class NativeKernelProgramPort:
         if node_id == "motion.move_to_pose":
             return {
                 "kind": "pose_goal",
-                "goal": _pose3(
-                    parameters.get("goal"),
-                    field="goal",
-                    target_role_id=target_role_id,
-                    base_frame_role_id=base_frame_role_id,
-                ),
+                "goal": _pose3(parameters.get("goal"), field="goal"),
             }
         if node_id == "motion.follow_cartesian_path":
             path = _sequence(parameters.get("path"), field="path")
             return {
                 "kind": "cartesian_path",
                 "waypoints": [
-                    _pose3(
-                        waypoint,
-                        field=f"path[{index}]",
-                        target_role_id=target_role_id,
-                        base_frame_role_id=base_frame_role_id,
-                    )
+                    _pose3(waypoint, field=f"path[{index}]")
                     for index, waypoint in enumerate(path)
                 ],
                 "max_translation_step_m": parameters["max_translation_step_m"],
@@ -799,12 +934,35 @@ class NativeKernelProgramPort:
             field="target_reference",
             target_role_id=target_role_id,
             base_frame_role_id=base_frame_role_id,
+            targets=context.targets,
         )
         offset_reference = _reference(
             parameters.get("offset_reference"),
             field="offset_reference",
             target_role_id=target_role_id,
             base_frame_role_id=base_frame_role_id,
+            targets=context.targets,
+        )
+        goal_poses: Sequence[object] = (
+            ()
+            if node_id == "motion.move_to_joint_target"
+            else (
+                (parameters.get("goal"),)
+                if node_id == "motion.move_to_pose"
+                else _sequence(parameters.get("path"), field="path")
+            )
+        )
+        goal_frame_reference = (
+            None
+            if not goal_poses
+            else self._goal_frame_reference(
+                goal_poses,
+                field="goal" if node_id == "motion.move_to_pose" else "path",
+                target_mode=target_mode,
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+                targets=context.targets,
+            )
         )
         runtime_object_ids = {
             reference["runtime_object_id"]
@@ -863,17 +1021,14 @@ class NativeKernelProgramPort:
             "target_mode": target_mode,
             "target_reference": target_reference,
             "offset_reference": offset_reference,
-            "motion": self._motion_spec(
-                node_id,
-                parameters,
-                target_role_id=target_role_id,
-                base_frame_role_id=base_frame_role_id,
-            ),
+            "motion": self._motion_spec(node_id, parameters),
             "contact_policy_id": contact_policy_id,
             "per_joint_dynamics_limits": dict(parameters.get("per_joint_dynamics_limits", {})),
             "motion_interrupt_scopes": [],
             "runtime_object_bindings": runtime_object_bindings,
         }
+        if goal_frame_reference is not None:
+            payload["goal_frame_reference"] = goal_frame_reference
         return context, target, payload
 
     def _gripper_payload(
@@ -926,6 +1081,7 @@ class NativeKernelProgramPort:
         *,
         target_role_id: str,
         base_frame_role_id: str,
+        targets: Mapping[str, _TargetBinding],
     ) -> dict[str, Any]:
         synthesis = _mapping(parameters.get("synthesis"), field="synthesis")
 
@@ -951,11 +1107,14 @@ class NativeKernelProgramPort:
             }
 
         def reference(name: str) -> dict[str, Any] | None:
+            # Pick offsets accept every motion-reference form, resolved by the
+            # native owner like a motion reference.
             return _reference(
                 synthesis.get(name),
                 field=f"synthesis.{name}",
                 target_role_id=target_role_id,
                 base_frame_role_id=base_frame_role_id,
+                targets=targets,
             )
 
         base_orientation = synthesis.get("base_tool_orientation_rpy_deg", (180.0, 0.0, 0.0))
@@ -1174,11 +1333,12 @@ class NativeKernelProgramPort:
                 base_frame_role_id=_text(
                     parameters.get("base_frame_role"), field="base_frame_role"
                 ),
+                targets=context.targets,
             )
         else:
             contact_policy_id = None
             contact = None
-            place_pose = _pose3(
+            place_pose = _base_framed_pose3(
                 parameters.get("place_pose"),
                 field="place_pose",
                 target_role_id=target_role_id,
@@ -1659,7 +1819,10 @@ class NativeKernelProgramPort:
                     code = error.get("code")
                     message = error.get("message")
                     if isinstance(code, str) and code:
-                        return code, message if isinstance(message, str) else ""
+                        return code, describe_owner_failure(
+                            message if isinstance(message, str) else "",
+                            error.get("details"),
+                        ).strip()[:1024]
         return "operation_failed", "native operation did not succeed"
 
     def _recovery_assessment(
@@ -2861,6 +3024,83 @@ class _NativeTargetQueryPort:
     def __init__(self, owner: NativeKernelProgramPort) -> None:
         self._owner = owner
 
+    def express_pose(
+        self,
+        identity: NodeAttemptIdentity,
+        pose: Mapping[str, Any],
+        target_frame: Mapping[str, Any],
+    ) -> FrameTransformResult:
+        """Express one stored pose in another declared frame.
+
+        One native `frame_transform` query: the cell frame resolver resolves
+        both frames from one coherent state capture. Robots on another
+        execution host are refused there by name.
+        """
+
+        try:
+            context = self._owner._context(identity.program_run_id)
+            stored = _mapping(pose, field="pose")
+            query = {
+                "schema_version": "manyforge.target_observation_query.v1",
+                "owner_epoch": context.request_owner_epoch,
+                "program_binding_id": context.capture.program_binding_id,
+                "kind": "frame_transform",
+                "pose": _pose3(stored, field="pose"),
+                "source_frame": _frame_reference(
+                    stored.get("frame_ref"), field="pose.frame_ref", targets=context.targets
+                ),
+                "target_frame": _frame_reference(
+                    target_frame, field="target_frame", targets=context.targets
+                ),
+            }
+            response = self._owner._kernel.query_target(query)
+            observation = _mapping(
+                response.get("target_observation"), field="target_observation"
+            )
+            expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+            if any(observation.get(key) != value for key, value in expected.items()):
+                raise ProductionPortError("native frame transform crossed the captured query")
+            value = _mapping(observation.get("value"), field="frame transform value")
+            position = _mapping(value.get("position_m"), field="frame transform position")
+            orientation = _mapping(value.get("orientation"), field="frame transform orientation")
+            return FrameTransformResult(
+                pose={
+                    "frame_ref": dict(_mapping(target_frame, field="target_frame")),
+                    "position_m": [
+                        _number(position.get(axis), field=axis) for axis in ("x_m", "y_m", "z_m")
+                    ],
+                    "orientation": {
+                        "xyzw": normalize_quat(
+                            [
+                                _number(orientation.get(axis), field=axis)
+                                for axis in ("x", "y", "z", "w")
+                            ]
+                        )
+                    },
+                },
+                metadata={
+                    key: observation[key]
+                    for key in (
+                        "evaluated_at_ns",
+                        "scene_revision",
+                        "resolution_evidence_digests",
+                    )
+                },
+            )
+        except FrameTransformError:
+            raise
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            error = response.get("error") if isinstance(response, Mapping) else None
+            details = getattr(exc, "details", None)
+            if not isinstance(details, Mapping):
+                details = error.get("details") if isinstance(error, Mapping) else None
+            reason = details.get("reason") if isinstance(details, Mapping) else None
+            raise FrameTransformError(
+                reason if isinstance(reason, str) and reason else "frame_transform_failed",
+                _owner_failure_message(exc),
+            ) from exc
+
     def invoke(
         self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
     ) -> OwnerInvocationResult:
@@ -3298,7 +3538,9 @@ class HeadlessSceneProgramPort:
             except KeyError as exc:
                 raise ProductionPortError("Program-run scene context is not initialized") from exc
 
-    def _read_view(self, context: _SceneBoundContext) -> _SceneView:
+    def _read_view(
+        self, context: _SceneBoundContext, *, require_writes: bool = True
+    ) -> _SceneView:
         projection = self._scene.snapshot()
         logical = _mapping(projection.get("logical_scene"), field="logical_scene")
         if (
@@ -3312,7 +3554,7 @@ class HeadlessSceneProgramPort:
         if payload.get("api_version") != "manyforge.logical_scene_source.v1":
             raise ProductionPortError("logical-scene payload version is unsupported")
         access = _mapping(payload.get("access"), field="logical_scene.access")
-        if (
+        if require_writes and (
             access.get("scene_writes_open") is not True
             or access.get("projection_leases_open") is not True
         ):
@@ -4053,6 +4295,76 @@ class HeadlessSceneProgramPort:
     def release(self, program_run_id: str) -> None:
         self.unbind(program_run_id)
 
+    def _object_pose(
+        self, context: _SceneBoundContext, parameters: Mapping[str, Any]
+    ) -> OwnerInvocationResult:
+        """Read one object's current cell-frame pose; never a transaction.
+
+        A fixed object's pose is owner truth in the cell frame. A carried
+        object's pose is composed by the native owner, never in Python.
+        """
+        view = self._read_view(context, require_writes=False)
+        resource_id = _text(parameters.get("scene_resource_id"), field="scene_resource_id")
+        scene_object = view.objects.get(resource_id)
+        if scene_object is None:
+            raise ProductionPortError(
+                f"scene resource {resource_id!r} is absent from the logical scene"
+            )
+        placement = _mapping(scene_object.get("placement"), field="placement")
+        kind = placement.get("kind")
+        if kind == "cell_fixed":
+            if placement.get("cell_id") != view.cell_id:
+                raise ProductionPortError("scene resource is fixed in another cell")
+            pose = placement.get("pose_in_cell")
+        elif kind == "carried":
+            resolve = getattr(self._transport, "resolve_scene_resources", None)
+            if not callable(resolve):
+                raise ProductionPortError("native carried-object pose projection is unavailable")
+            response = _mapping(
+                resolve(
+                    {
+                        "api_version": "manyforge.scene_resource_pose_query.v1",
+                        "expected_projection_revision": view.projection_revision,
+                        "scene_resource_ids": [resource_id],
+                    }
+                ),
+                field="scene resource pose response",
+            )
+            rows = _sequence(response.get("poses"), field="resolved poses", length=1)
+            row = _mapping(rows[0], field="resolved pose")
+            if (
+                response.get("api_version") != "manyforge.scene_resource_pose_response.v1"
+                or dict(_mapping(response.get("projection_revision"), field="revision"))
+                != view.projection_revision
+                or row.get("scene_resource_id") != resource_id
+            ):
+                raise ProductionPortError("native scene pose projection changed owner revision")
+            pose = row.get("pose_in_cell")
+        else:
+            raise ProductionPortError("scene resource placement is unsupported")
+        pose = _mapping(pose, field="pose_in_cell")
+        position = _mapping(pose.get("position_m"), field="pose_in_cell.position_m")
+        return OwnerInvocationResult(
+            True,
+            output={
+                "frame_ref": {"kind": "cell_frame"},
+                "position_m": [
+                    _number(position.get(axis), field=f"pose_in_cell.position_m.{axis}")
+                    for axis in "xyz"
+                ],
+                "orientation": {
+                    "xyzw": normalize_quat(
+                        _sequence(
+                            pose.get("orientation_xyzw"),
+                            field="pose_in_cell.orientation_xyzw",
+                            length=4,
+                        )
+                    )
+                },
+            },
+            metadata={"placement": kind},
+        )
+
     def invoke(
         self,
         node_id: str,
@@ -4061,6 +4373,8 @@ class HeadlessSceneProgramPort:
     ) -> OwnerInvocationResult:
         try:
             context = self._context(identity.program_run_id)
+            if node_id == "scene.get_object_pose":
+                return self._object_pose(context, inputs.parameters)
             if self._program_node_evidence is None:
                 raise ProductionPortError("runtime Scene node admission is unavailable")
             owner_api = (

@@ -107,6 +107,7 @@ if(MANYFORGE_HEADLESS_BUILD_PYTHON)
   pybind11_add_module(manyforge_headless_py NO_EXTRAS python/bindings.cpp)
   target_link_libraries(manyforge_headless_py PRIVATE
     manyforge_event_historian
+    manyforge::expression
     pybind11::module
     pybind11::headers)
   install(TARGETS manyforge_headless_py

@@ -37,7 +37,7 @@ const entry: CatalogEntry = {
 const node = { node_id: entry.id, instance_id: 'edit', parameters: {}, children: [] };
 const program: ProgramAuthoringDocument = {
   api_version: 'manyforge.program.v2', program_id: 'editor_fixture', name: 'Editor fixture',
-  program_profile: 'composable-cell-v1', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.3.0' },
+  program_profile: 'composable-cell-v1', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
   component_roles: {}, target_roles: {}, schema_version: 'manyforge.composer_authoring_forest.v1',
   forest: [node], positions: {},
 };

@@ -85,7 +85,7 @@ EXPECTED_KINDS = [
     "model_asset", "runtime_profile", "component_type",
     "control_interface_contract", "controller_topology", "provider_manifest",
     "command_schema", "capability_definition", "contact_policy",
-    "stop_evidence_policy", "runtime_policy",
+    "stop_evidence_policy",
 ]
 EXPECTED_FORMULAS = {
     "collision_body_id": "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}",

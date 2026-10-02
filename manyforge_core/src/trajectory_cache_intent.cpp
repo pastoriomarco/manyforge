@@ -77,6 +77,12 @@ void mix_reference(IntentIdentityBuilder& identity, const ReferenceDTO& referenc
   if (reference.pose.has_value()) {
     mix_pose(identity, *reference.pose);
   }
+  identity.mix(static_cast<std::int64_t>(reference.target.has_value()));
+  if (reference.target.has_value()) {
+    identity.mix(reference.target->target_role_id.value())
+        .mix(reference.target->controllable_component_id.value())
+        .mix(reference.target->command_target_id.value());
+  }
 }
 
 void mix_resolved_frame(IntentIdentityBuilder& identity, const ResolvedFrameDTO& frame) {
@@ -239,7 +245,7 @@ TrajectoryCacheKey trajectory_cache_key(const ExecuteRequestDTO& request) {
 
 std::string trajectory_cache_intent_identity(const ExecuteRequestDTO& request) {
   IntentIdentityBuilder identity;
-  identity.mix("manyforge_core/trajectory_cache_intent/v5");
+  identity.mix("manyforge_core/trajectory_cache_intent/v6");
   mix_resolved_binding(identity, request.binding);
   identity.mix(request.contact_policy_id)
       .mix(static_cast<std::int64_t>(request.target_mode))
@@ -251,6 +257,10 @@ std::string trajectory_cache_intent_identity(const ExecuteRequestDTO& request) {
   identity.mix(static_cast<std::int64_t>(request.offset_reference.has_value()));
   if (request.offset_reference.has_value()) {
     mix_reference(identity, *request.offset_reference);
+  }
+  identity.mix(static_cast<std::int64_t>(request.goal_frame_reference.has_value()));
+  if (request.goal_frame_reference.has_value()) {
+    mix_reference(identity, *request.goal_frame_reference);
   }
   identity.mix(static_cast<std::uint64_t>(request.runtime_object_bindings.size()));
   for (const auto& runtime_object : request.runtime_object_bindings) {

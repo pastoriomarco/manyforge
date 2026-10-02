@@ -33,7 +33,6 @@
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
-#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
@@ -639,7 +638,6 @@ struct QualifiedCatalogClosure final {
   std::vector<deployment::QualifiedControlInterfaceContract> contracts;
   std::vector<deployment::QualifiedControllerTopology> topologies;
   std::vector<deployment::QualifiedProviderManifest> provider_manifests;
-  std::vector<deployment::QualifiedRuntimePolicy> runtime_policies;
   std::vector<deployment::QualifiedRuntimeProfile> runtime_profiles;
   std::vector<deployment::QualifiedStopEvidencePolicy> stop_policies;
   std::vector<deployment::SourceVerifiedModelAsset> model_assets;
@@ -874,13 +872,6 @@ materialize_scenarios(const std::filesystem::path &root,
                             value.value().runtime_profile_id.value(),
                             value.value().runtime_profile_revision.value()};
         });
-    const auto runtime_policies = select_catalog_values(
-        catalog.runtime_policies, selected_records, [](const auto &value) {
-          return CatalogKey{static_cast<std::uint8_t>(
-                                core::CatalogRecordKind::kRuntimePolicy),
-                            value.value().runtime_policy_id.value(),
-                            value.value().runtime_policy_revision.value()};
-        });
     const auto stop_policies = select_catalog_values(
         catalog.stop_policies, selected_records, [](const auto &value) {
           return CatalogKey{
@@ -954,8 +945,8 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const auto applicability = deployment::qualify_cell_applicability(
         composition, verified.applicability_inputs(), profiles,
-        runtime_policies, command_schemas, capabilities, contracts, topologies,
-        manifests, stop_policies, selected_value_schemas,
+        command_schemas, capabilities, contracts, topologies, manifests,
+        stop_policies, selected_value_schemas,
         selected_commissioning_evidence, selected_overlay);
     const auto qualified = deployment::qualify_deployment_for_retention(
         verified, deployment::compile_cell_ir(applicability));
@@ -1036,7 +1027,6 @@ materialize_scenarios(const std::filesystem::path &root,
           nullptr);
       const auto empty_applicability = deployment::qualify_cell_applicability(
           empty_composition, empty_deployment.applicability_inputs(), profiles,
-          std::span<const deployment::QualifiedRuntimePolicy>{},
           std::span<const deployment::QualifiedCommandSchema>{},
           std::span<const deployment::QualifiedCapabilityDefinition>{},
           std::span<const deployment::QualifiedControlInterfaceContract>{},
@@ -1267,14 +1257,38 @@ struct MaintainedScenarioInput final {
   return deployment::CanonicalValue(std::move(identified));
 }
 
+// The closed maintained Scenario set: the thirteen described Program/Scenario
+// assignments plus the two generated UI6-I dual-robot fixtures. Other folders
+// under examples/ (for example the editable workbench Scenario) are ordinary
+// user projects and are never maintained qualification inputs.
+constexpr std::array<std::string_view, 15U> kMaintainedScenarioIds{{
+    "isaac-lite6-pick-place",
+    "isaac-lite6-trocar-foundationpose",
+    "isaac-ur10e-light-scene",
+    "isaac-ur10e-light-scene-assistant",
+    "isaac-ur10e-light-scene-collision",
+    "lite6_pick_and_place",
+    "ur10e_assistant_scene_authoring",
+    "ur10e_pick_and_place",
+    "ur5_pick_and_place",
+    "ur5_pick_and_place_minimal",
+    "ur5_semantic_shape_pick",
+    "ur5_vision_guided_bin_pick",
+    "ur5_vision_guided_pose_pick",
+    "ur5e_lite6_wall_grouped",
+    "ur5e_lite6_wall_isolation",
+}};
+
 [[nodiscard]] std::vector<MaintainedScenarioInput>
 load_maintained_scenario_inputs(const std::filesystem::path &root) {
   std::vector<MaintainedScenarioInput> result;
   const auto examples = root / "examples";
-  for (const auto &entry : std::filesystem::directory_iterator(examples)) {
-    if (!entry.is_directory() ||
-        !entry.path().filename().string().ends_with(".scenario")) {
-      continue;
+  for (const auto scenario_id : kMaintainedScenarioIds) {
+    const std::filesystem::directory_entry entry(
+        examples / (std::string(scenario_id) + ".scenario"));
+    if (!entry.is_directory() || entry.is_symlink()) {
+      throw std::invalid_argument(
+          "maintained Scenario project is missing: " + entry.path().string());
     }
     const auto manifest_path = entry.path() / "scenario.yaml";
     const auto manifest = deployment::parse_strict_json_model_yaml(
@@ -1326,9 +1340,16 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
                require_member(row, "command_target_id", "target role"),
                "command_target_id"))});
     }
-    result.push_back(MaintainedScenarioInput{
+    const auto declared_id =
         require_text(require_member(document, "scenario_id", "Scenario"),
-                     "Scenario.scenario_id"),
+                     "Scenario.scenario_id");
+    if (declared_id != scenario_id) {
+      throw std::invalid_argument(
+          "maintained Scenario project declares another Scenario ID: " +
+          manifest_path.string());
+    }
+    result.push_back(MaintainedScenarioInput{
+        declared_id,
         entry.path(),
         deployment_value,
         program_from_authoring_draft(program_draft),
@@ -1465,8 +1486,7 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
 }
 
 template <typename Record>
-[[nodiscard]] Record make_reference(std::string_view bytes,
-                                    std::string_view source = "maintained") {
+[[nodiscard]] Record make_reference(std::string_view bytes) {
   constexpr core::CatalogRecordKind kind = Record::kRecordKind;
   const auto *descriptor = core::catalog_record_type_descriptor(kind);
   if (descriptor == nullptr) {
@@ -1493,8 +1513,7 @@ template <typename Record>
   }
   const core::ContentDigest content_digest(deployment::sha256_digest(bytes));
   const core::ContentAddressedStoreKey store_key(
-      "catalog/" + std::string(source) + "/" +
-      std::string(core::to_string(kind)) + "/" + record_id + "/" +
+      "catalog/maintained/" + std::string(core::to_string(kind)) + "/" + record_id + "/" +
       record_revision.substr(7U));
   return Record{
       typename Record::IdType(record_id),
@@ -1512,59 +1531,6 @@ void insert_reference(QualifiedCatalogClosure &closure,
     throw std::invalid_argument(
         "maintained catalog contains a duplicate typed referent");
   }
-}
-
-[[nodiscard]] core::RuntimePolicyCatalogRecordRefDTO
-prepare_captured_motion_policy(const deployment::detail::ActivationDeploymentIntent &intent,
-                               QualifiedCatalogClosure &catalog,
-                               ExactCompilerInputSource &input_source) {
-  // An authored Deployment currently grants no interrupt or open-loop grasp
-  // permissions. Retain that restrictive choice explicitly: the execution
-  // kernel requires one verified policy even for ordinary motion.
-  const auto policy_root = [&](std::string revision) {
-    return deployment::CanonicalValue(deployment::CanonicalValue::Object{
-        {"api_version",
-         deployment::CanonicalValue("manyforge.runtime_policy.v1")},
-        {"runtime_policy_id",
-         deployment::CanonicalValue(intent.deployment_artifact_id)},
-        {"runtime_policy_revision",
-         deployment::CanonicalValue(std::move(revision))},
-        {"interrupt_policy_ids",
-         deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
-        {"open_loop_grasp_acknowledgements",
-         deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
-    });
-  };
-  const auto *schema = deployment::build_qualified_closed_schema_registry()
-                           .find_catalog_schema_family(
-                               core::CatalogRecordKind::kRuntimePolicy);
-  if (schema == nullptr || schema->compiled_schema() == nullptr ||
-      schema->qualification() !=
-          deployment::CatalogSchemaQualification::kQualified) {
-    throw std::logic_error("runtime policy schema is not build-qualified");
-  }
-  const auto candidate = policy_root("sha256:" + std::string(64U, '0'));
-  const auto normalized =
-      deployment::validate_and_normalize_unqualified_artifact_candidate(
-          *schema->compiled_schema(),
-          deployment::parse_strict_json_model_yaml(
-              deployment::canonical_json(candidate)));
-  const std::string revision = deployment::detail::compute_content_identity(
-      normalized.normalized_root(),
-      deployment::detail::ContentIdentitySpec{
-          .identity_domain = "catalog-record-revision/runtime_policy",
-          .api_version = "manyforge.runtime_policy.v1",
-          .own_field = "runtime_policy_revision",
-      });
-  const std::string bytes = deployment::canonical_json(policy_root(revision));
-  const auto reference =
-      make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes, "prepared");
-  catalog.runtime_policies.push_back(deployment::resolve_and_qualify_runtime_policy(
-      reference, reference.content_addressed_store_key, bytes));
-  input_source.add(reference.content_addressed_store_key,
-                   reference.content_digest, bytes);
-  insert_reference(catalog, reference);
-  return reference;
 }
 
 [[nodiscard]] QualifiedCatalogClosure
@@ -1789,21 +1755,6 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  // One generated policy per single-robot occurrence plus the bounded UI6-I
-  // dual-robot qualification policy.
-  for (const auto &path :
-       source_files(catalog_root / "runtime_policy", kScenarios.size() + 1U)) {
-    const std::string bytes = read_file(path);
-    const auto reference =
-        make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes);
-    result.runtime_policies.push_back(
-        deployment::resolve_and_qualify_runtime_policy(
-            reference, reference.content_addressed_store_key, bytes));
-    input_source.add(reference.content_addressed_store_key,
-                     reference.content_digest, bytes);
-    insert_reference(result, reference);
-  }
-
   for (const auto &path :
        source_files(catalog_root / "stop_evidence_policy", 2U)) {
     const std::string bytes = read_file(path);
@@ -1948,12 +1899,11 @@ qualify_catalog(const std::filesystem::path &root,
       result.command_schemas.size() + result.component_types.size() +
       result.capabilities.size() + result.contracts.size() +
       result.topologies.size() + result.provider_manifests.size() +
-      result.runtime_policies.size() + result.runtime_profiles.size() +
+      result.runtime_profiles.size() +
       result.stop_policies.size() + result.model_assets.size();
   if (result.records.size() != expected_record_count ||
       result.model_assets.size() != result.structural_preparations.size() ||
-      result.runtime_profiles.size() != 2U ||
-      result.runtime_policies.size() != kScenarios.size() + 1U) {
+      result.runtime_profiles.size() != 2U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -2025,7 +1975,7 @@ void verify_scenarios(const std::filesystem::path &root,
     // lifecycle capability definitions); the Lite6 vendor providers are no
     // longer selected by native scenarios.
     const std::size_t expected_catalog_count =
-        (scenario.ros2_control_execution ? 54U : 55U) +
+        (scenario.ros2_control_execution ? 53U : 54U) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
@@ -2057,27 +2007,6 @@ void verify_scenarios(const std::filesystem::path &root,
       throw std::invalid_argument("maintained scenario has an incomplete "
                                   "component/runtime/capability closure: " +
                                   std::string(scenario.source));
-    }
-    if (applicability.retained_policy_records.size() != 1U) {
-      throw std::invalid_argument(
-          "maintained scenario does not select one exact runtime policy: " +
-          std::string(scenario.source));
-    }
-    const auto *runtime_policy_ref =
-        std::get_if<core::RuntimePolicyCatalogRecordRefDTO>(
-            &applicability.retained_policy_records.front());
-    const auto selected_policy =
-        runtime_policy_ref == nullptr
-            ? catalog.runtime_policies.end()
-            : std::find_if(catalog.runtime_policies.begin(),
-                           catalog.runtime_policies.end(),
-                           [runtime_policy_ref](const auto &policy) {
-                             return policy.reference() == *runtime_policy_ref;
-                           });
-    if (selected_policy == catalog.runtime_policies.end()) {
-      throw std::invalid_argument(
-          "maintained scenario runtime policy is absent or incomplete: " +
-          std::string(scenario.source));
     }
     const auto &runtime = graph.runtime_units.front();
     if (runtime.runtime_profile_id.value() != expected_runtime_profile_id) {
@@ -2409,8 +2338,6 @@ PreparedActivationMaterialization materialize_prepared_activation(
   ExactCompilerInputSource input_source;
   auto catalog = qualify_catalog(options.workspace_root, input_source, {},
                                  prepared_models);
-  const auto runtime_policy =
-      prepare_captured_motion_policy(intent, catalog, input_source);
   std::vector<core::CatalogRecordRefDTO> catalog_records;
   catalog_records.reserve(catalog.records.size());
   for (const auto &[unused, reference] : catalog.records) {
@@ -2421,7 +2348,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   try {
     compiled = compile_activation_deployment(
         intent, runtime_cell_id, component_profiles, prepared_models, catalog_records,
-        catalog.runtime_profiles, runtime_policy);
+        catalog.runtime_profiles);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");

@@ -114,7 +114,6 @@ void WriteDeploymentSource(
       source.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = deployment::qualify_cell_applicability(
       composition, source.applicability_inputs(), profiles,
-      std::span<const deployment::QualifiedRuntimePolicy>{},
       std::span<const deployment::QualifiedCommandSchema>{},
       std::span<const deployment::QualifiedCapabilityDefinition>{},
       std::span<const deployment::QualifiedControlInterfaceContract>{},

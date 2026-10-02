@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from manyforge_behavior import model_source_preparation as preparation
 from manyforge_deployment.tools import prepare_structural_model as subject
 
 
@@ -294,15 +295,16 @@ def test_uri_outside_mesh_or_texture_is_rejected() -> None:
 def test_entrypoint_and_aggregate_xml_budgets_are_enforced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(subject, "MAX_XML_ENTRYPOINT_BYTES", 64)
+    # The CLI re-exports the shared preparer; its bounds live in the owner.
+    monkeypatch.setattr(preparation, "MAX_XML_ENTRYPOINT_BYTES", 64)
     with pytest.raises(
         subject.StructuralModelPreparationError,
         match="byte bound",
     ):
         _prepare(_minimal_urdf('<link name="base"/>') + b" " * 64)
 
-    monkeypatch.setattr(subject, "MAX_XML_ENTRYPOINT_BYTES", 1024)
-    monkeypatch.setattr(subject, "MAX_XML_ELEMENTS", 2)
+    monkeypatch.setattr(preparation, "MAX_XML_ENTRYPOINT_BYTES", 1024)
+    monkeypatch.setattr(preparation, "MAX_XML_ELEMENTS", 2)
     with pytest.raises(
         subject.StructuralModelPreparationError,
         match="aggregate XML element bound",
@@ -391,16 +393,10 @@ def test_qualified_receipt_binds_exact_configuration_inputs_and_closure(
             sort_keys=True,
         ).encode()
     )
+    # The build digest names the module that owns preparation semantics.
     assert manifest["build_digest"] == (
         "sha256:"
-        + hashlib.sha256(
-            (
-                _repo_root()
-                / "manyforge_deployment"
-                / "tools"
-                / "prepare_structural_model.py"
-            ).read_bytes()
-        ).hexdigest()
+        + hashlib.sha256(Path(preparation.__file__).read_bytes()).hexdigest()
     )
     projection = dict(manifest)
     del projection["configuration_digest"]

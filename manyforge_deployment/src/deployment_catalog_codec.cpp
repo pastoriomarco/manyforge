@@ -262,9 +262,6 @@ template <typename Record>
       return parse_typed_record<
           core::StopEvidencePolicyCatalogRecordRefDTO>(
           object, descriptor, path);
-    case core::CatalogRecordKind::kRuntimePolicy:
-      return parse_typed_record<core::RuntimePolicyCatalogRecordRefDTO>(
-          object, descriptor, path);
   }
   fail(child_path(path, "record_kind"),
        "record kind is outside the closed v1 catalog registry");

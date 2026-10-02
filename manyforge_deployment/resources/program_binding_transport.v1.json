@@ -50,7 +50,7 @@
     "provenance": ["binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"],
     "provenance_record": ["record_kind", "record_id", "revision"]
   },
-  "catalog_record_kinds": ["model_asset", "runtime_profile", "component_type", "control_interface_contract", "controller_topology", "provider_manifest", "command_schema", "capability_definition", "contact_policy", "stop_evidence_policy", "runtime_policy"],
+  "catalog_record_kinds": ["model_asset", "runtime_profile", "component_type", "control_interface_contract", "controller_topology", "provider_manifest", "command_schema", "capability_definition", "contact_policy", "stop_evidence_policy"],
   "formulas": {
     "collision_body_id": "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}"
   },

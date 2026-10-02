@@ -401,6 +401,33 @@ class HeadlessControlStateSource:
         self._source_incidents: dict[str, tuple[int, int]] = {}
         self._incident_recording_failed = False
         self._semantic_reason: str | None = None
+        self._operation_progress: list[dict[str, Any]] = []
+        self._progress_lock = threading.Lock()
+        self._pending_progress: list[dict[str, Any]] | None = None
+
+    def notify_operation_progress(self, rows: list[dict[str, Any]]) -> None:
+        # Keep one latest value even before the first browser subscribes.
+        with self._progress_lock:
+            scheduled = self._pending_progress is not None
+            self._pending_progress = rows
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            if not scheduled:
+                loop.call_soon_threadsafe(self._drain_operation_progress)
+
+    def _drain_operation_progress(self) -> None:
+        with self._progress_lock:
+            rows, self._pending_progress = self._pending_progress, None
+        if rows is not None:
+            self._accept_operation_progress(rows)
+
+    def _accept_operation_progress(self, rows: list[dict[str, Any]]) -> None:
+        if rows == self._operation_progress:
+            return
+        self._operation_progress = rows
+        # Reuse already-captured owner facts. Progress never rebuilds the cold
+        # projection or grants new command authority.
+        self._publish("cold")
 
     @property
     def active_clients(self) -> int:
@@ -672,6 +699,7 @@ class HeadlessControlStateSource:
             if len(self._subscriptions) >= CONTROL_MAXIMUM_CLIENTS:
                 raise RuntimeError("control state client limit reached")
             self._loop = loop
+            self._drain_operation_progress()
             subscription = ControlStateSubscription(asyncio.Event())
             self._subscriptions.add(subscription)
             if len(self._subscriptions) == 1:
@@ -870,7 +898,7 @@ class HeadlessControlStateSource:
             generation=self._generation,
             event_class=event_class,
             control=build_control_projection(self._cycle, self._ingress),
-            shell=dict(self._shell),
+            shell={**self._shell, "operation_progress": self._operation_progress},
         )
 
     def _publish(self, event_class: str) -> None:

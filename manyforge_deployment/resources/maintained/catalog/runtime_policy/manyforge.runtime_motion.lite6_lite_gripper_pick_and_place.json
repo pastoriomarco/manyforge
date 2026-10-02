@@ -1,1 +1,0 @@
-{"api_version":"manyforge.runtime_policy.v1","description":"Maintained native motion policy for lite6_lite_gripper_pick_and_place","interrupt_policy_ids":[],"open_loop_grasp_acknowledgements":[],"runtime_policy_id":"manyforge.runtime_motion.lite6_lite_gripper_pick_and_place","runtime_policy_revision":"sha256:0e1b3d371c71a7d8a3d11e062a57af07be90fbefc1e9a6f46f68da7ebd0d0945"}

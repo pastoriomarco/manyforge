@@ -299,9 +299,13 @@ def validate_scenario_document(
 
 
 def _json_bytes(value: Any, *, label: str) -> bytes:
+    # Sorted keys keep one byte form for one content, matching the maintained
+    # Scenario generators, so saving unchanged content never rewrites a file.
     try:
         canonical_json_bytes(value)
-        raw = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        raw = (
+            json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
     except (StrictArtifactError, TypeError, ValueError) as error:
         _fail("scenario_artifact_invalid", f"{label}: {error}")
     if len(raw) > MAX_DOCUMENT_BYTES:

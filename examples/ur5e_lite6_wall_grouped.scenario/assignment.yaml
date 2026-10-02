@@ -11,12 +11,12 @@
   ],
   "target_roles": [
     {
-      "target_role_id": "lite6_arm",
-      "command_target_id": "arm"
+      "command_target_id": "arm",
+      "target_role_id": "lite6_arm"
     },
     {
-      "target_role_id": "ur5e_arm",
-      "command_target_id": "arm"
+      "command_target_id": "arm",
+      "target_role_id": "ur5e_arm"
     }
   ]
 }

@@ -123,7 +123,9 @@ namespace {
     return invalid("motion payload is malformed", "motion_payload_invalid");
   }
   if ((motion.target_reference.has_value() && !valid_reference(*motion.target_reference)) ||
-      (motion.offset_reference.has_value() && !valid_reference(*motion.offset_reference))) {
+      (motion.offset_reference.has_value() && !valid_reference(*motion.offset_reference)) ||
+      (motion.goal_frame_reference.has_value() &&
+       !valid_reference(*motion.goal_frame_reference))) {
     return invalid("motion reference is malformed", "motion_reference_invalid");
   }
   if ((motion.contact_policy_id.has_value() && motion.contact_policy_id->empty()) ||
@@ -150,6 +152,21 @@ namespace {
       (motion.target_reference.has_value() || motion.offset_reference.has_value())) {
     return invalid("absolute motion cannot carry relative references",
                    "absolute_motion_has_reference");
+  }
+  if (motion.goal_frame_reference.has_value()) {
+    if (motion.target_mode != MotionTargetModeDTO::kAbsolute) {
+      return invalid("a goal frame is only valid for absolute motion",
+                     "goal_frame_requires_absolute_target");
+    }
+    if (!std::holds_alternative<PoseGoalDTO>(motion.motion) &&
+        !std::holds_alternative<CartesianPathDTO>(motion.motion)) {
+      return invalid("a goal frame requires a pose or Cartesian goal",
+                     "goal_frame_motion_type_unsupported");
+    }
+    if (motion.goal_frame_reference->type == ReferenceDTO::Type::kPose) {
+      return invalid("a goal frame must name a frame, not an inline pose",
+                     "goal_frame_inline_pose_unsupported");
+    }
   }
   for (const auto& [joint_name, limit] : motion.per_joint_dynamics_limits) {
     if (joint_name.empty() || !valid_limit(limit)) {

@@ -73,10 +73,12 @@ from .models import (
 from .cell_admission import CellAdmissionError
 from .component_overview import ComponentOverviewFacts
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
+from .apply_follower import CommittedApplyFollower
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
+    validate_committed_scenario_activation,
 )
 
 
@@ -206,6 +208,25 @@ class HeadlessService:
         self.cell_admission = cell_admission
         self.cclc = cclc
         self.activation_preparer = activation_preparer
+        # Each Apply Headless forwards is followed to its committed outcome,
+        # which wakes the Program runner (see apply_follower).
+        self.apply_follower: CommittedApplyFollower | None = (
+            None
+            if program_runner is None
+            else CommittedApplyFollower(
+                observe_apply=lambda apply_id, generation: self.manager.observe_apply(
+                    apply_id, generation
+                ),
+                committed_activation=lambda: self.committed_scenario_activation(),
+                wake=lambda: self.notify_committed_apply(),
+            )
+        )
+
+    def close(self) -> None:
+        """Stop following forwarded Applies; owners are untouched."""
+
+        if self.apply_follower is not None:
+            self.apply_follower.close()
 
     def _cell_admission(self) -> Any:
         if self.cell_admission is None:
@@ -1205,6 +1226,43 @@ class HeadlessService:
             )
         return projection
 
+    def committed_scenario_activation(self) -> dict[str, Any]:
+        """Manager's current committed Scenario activation and its history.
+
+        The Program runner reconciles its persistent-key register against it;
+        Draft edits and Applies that never published are never part of it.
+        """
+
+        projection = self.core.committed_scenario_activation()
+        try:
+            return validate_committed_scenario_activation(projection)
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "program_activation_invalid",
+                "native core returned an unsupported committed Scenario activation",
+            ) from error
+
+    def notify_committed_apply(self) -> None:
+        """Wake the Program runner after a committed Apply was observed: by
+        the follower of each forwarded Apply, or by an Apply-status read.
+
+        The runner reads the committed activation itself, so a duplicate, late
+        or lost wake changes nothing it would not otherwise do; a failure is
+        logged and never touches the Apply.
+        """
+
+        if self.program_runner is None:
+            return
+        try:
+            self.program_runner.reconcile_persistent_values()
+        except ProgramRunnerClientError as error:
+            logging.getLogger(__name__).warning(
+                "Program runner did not reconcile persistent values after a "
+                "committed Apply: %s: %s",
+                error.code,
+                error,
+            )
+
     def program_model_attempt(
         self,
         request: ProgramModelAttemptRequest,
@@ -1310,7 +1368,8 @@ class HeadlessService:
             or any(
                 not _bounded_text(instance_id, maximum_bytes=512)
                 or not isinstance(status, str)
-                or status not in {"idle", "running", "held", "success", "failure"}
+                or status
+                not in {"idle", "running", "held", "success", "failure", "interrupted"}
                 for instance_id, status in node_statuses.items()
             )
             or (
@@ -1789,6 +1848,22 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
+    def program_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+        try:
+            return self._program_runner().persistent_values(scenario_id)
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
+    def program_persistent_value_action(
+        self, scenario_id: str, action: str, request: Any
+    ) -> dict[str, Any]:
+        try:
+            return self._program_runner().persistent_value_action(
+                scenario_id, action, request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
     def cycle_recovery_action(
         self, request: CycleRecoveryActionRequest
     ) -> dict[str, Any]:
@@ -2202,7 +2277,17 @@ class HeadlessService:
         }
 
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
-        return self.manager.apply(request)
+        response = self.manager.apply(request)
+        apply_id = response.get("apply_id")
+        apply_generation = response.get("apply_generation")
+        if (
+            self.apply_follower is not None
+            and response.get("ok") is True
+            and isinstance(apply_id, str)
+            and type(apply_generation) is int
+        ):
+            self.apply_follower.follow(apply_id, apply_generation)
+        return response
 
     def manager_apply_status(
         self, apply_id: str, apply_generation: int

@@ -2116,7 +2116,9 @@ def test_run_rejects_unapplied_program_draft_before_transport() -> None:
     assert response.json()["detail"]["code"] == "execution_program_draft_unapplied"
 
 
-def test_manual_start_rejects_unapplied_deployment_before_transport() -> None:
+@pytest.mark.parametrize("command_kind", ["program_motion_start", "operation_start", "operation_resume",
+                                         "direct_http_operation", "direct_http_refused"])
+def test_only_program_start_rejects_unapplied_deployment_before_transport(command_kind: str) -> None:
     state = ComposerState()
     _replace_deployment_session(
         state,
@@ -2141,17 +2143,56 @@ def test_manual_start_rejects_unapplied_deployment_before_transport() -> None:
 
     class Headless:
         def submit_control_command(self, _body):
-            raise AssertionError("manual Start must be rejected before transport")
+            assert command_kind != "program_motion_start"
+            return {"accepted": True}
+
+        def execute(self, _body):
+            if command_kind == "direct_http_refused":
+                from manyforge_headless_api.client import HeadlessClientError
+                raise HeadlessClientError("authoring_not_ready", "activation holds admission", status_code=409)
+            return {"accepted": True}
 
     state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
+    if command_kind.startswith("direct_http_"):
+        body = {
+            "request_context": {"request_id": "manual", "request_owner_epoch": "owner",
+                                "source_label": "test", "correlation_id": None},
+            "program_id": "manual", "program_revision": _DIGEST,
+            "program_binding_id": _DIGEST, "program_run_id": "manual-run",
+            "expected_graph_revision": _DIGEST, "expected_retained_bundle_id": _DIGEST,
+            "expected_scene_revision": {"scene_id": _DIGEST, "revision_id": 1, "content_hash": _DIGEST},
+            "participants": [{"component_role_id": "robot", "target_role_id": "arm",
+                              "required_capability_id": "execution.trajectory.execute", "action_span": None,
+                              "payload": {
+                                  "kind": "motion", "move_id": "manual-move",
+                                  "base_frame_role_id": "base", "tcp_frame_role_id": "tcp",
+                                  "tolerances": {"joint_position_tol_rad": 0.05, "translation_tol_m": 0.005,
+                                                 "rotation_tol_rad": 0.05},
+                                  "speed_profile": {"velocity_scale": 1.0, "acceleration_scale": 1.0,
+                                                    "max_tcp_linear_speed_mps": None},
+                                  "timeouts": {"planning_timeout_s": 2.0, "execution_timeout_s": 10.0},
+                                  "cache_mode": "default", "planning_profile": "balanced",
+                                  "target_mode": "absolute", "per_joint_dynamics_limits": {},
+                                  "motion_interrupt_scopes": [],
+                                  "motion": {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.1]},
+                              }}],
+            "coordination_policy": "independent",
+        }
+        response = TestClient(app).post("/api/execution/operations", json=body)
+        assert response.status_code == (409 if command_kind == "direct_http_refused" else 200), response.text
+        if command_kind == "direct_http_refused":
+            assert response.json()["detail"]["code"] == "authoring_not_ready"
+        else:
+            assert response.json() == {"accepted": True}
+        return
     response = TestClient(app).post(
         "/api/control/commands",
         json={
             "command_envelope": {
                 "schema_version": "manyforge.execution_command.v1",
-                "command_kind": "program_motion_start",
+                "command_kind": command_kind,
                 "correlation_id": "manual-start-1",
                 "source_label": "test",
                 "control_session_id": None,
@@ -2170,5 +2211,9 @@ def test_manual_start_rejects_unapplied_deployment_before_transport() -> None:
             "payload": {},
         },
     )
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "execution_deployment_draft_unapplied"
+    if command_kind == "program_motion_start":
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "execution_deployment_draft_unapplied"
+    else:
+        assert response.status_code == 200
+        assert response.json() == {"accepted": True}

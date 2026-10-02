@@ -33,6 +33,7 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
   };
   collect_runtime_object(request.target_reference);
   collect_runtime_object(request.offset_reference);
+  collect_runtime_object(request.goal_frame_reference);
   if (request.resolved_contact_grasp.has_value()) {
     referenced_runtime_objects.insert(
         request.resolved_contact_grasp->runtime_object_id);
@@ -90,7 +91,50 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
           "Absolute motion must not carry target references",
           "absolute_target_has_reference");
     }
-    return Result<ResolvedMotionSpecDTO>::Ok(request.motion);
+    if (!request.goal_frame_reference.has_value()) {
+      return Result<ResolvedMotionSpecDTO>::Ok(request.motion);
+    }
+    if (request.goal_frame_reference->type == ReferenceDTO::Type::kPose) {
+      return invalid_target_shape(
+          "A goal frame must name a frame, not an inline pose",
+          "goal_frame_inline_pose_unsupported");
+    }
+    const auto *pose_goal = std::get_if<PoseGoalDTO>(&request.motion);
+    const auto *path = std::get_if<CartesianPathDTO>(&request.motion);
+    if (pose_goal == nullptr && path == nullptr) {
+      return invalid_target_shape(
+          "A goal frame requires a pose or Cartesian goal",
+          "goal_frame_motion_type_unsupported");
+    }
+    if (resolution_context == nullptr || !resolution_context->valid()) {
+      return Result<ResolvedMotionSpecDTO>::Err(ErrorDTO{
+          kErrorStartStateMismatch,
+          "A framed absolute goal requires one exact Program start context",
+          {{"reason", "goal_frame_reference_context_unavailable"}}});
+    }
+    // The resolver returns the frame expressed in the moving target's base
+    // frame, so the authored goal composes directly into the planner frame.
+    auto frame_in_base = reference_resolver.resolve_reference_pose(
+        *request.goal_frame_reference, *resolution_context);
+    if (!frame_in_base.ok()) {
+      return Result<ResolvedMotionSpecDTO>::Err(frame_in_base.error());
+    }
+    if (pose_goal != nullptr) {
+      return Result<ResolvedMotionSpecDTO>::Ok(ResolvedMotionSpecDTO{
+          PoseGoalDTO{multiply_poses(frame_in_base.value(), pose_goal->goal)}});
+    }
+    CartesianPathDTO resolved = *path;
+    for (auto &waypoint : resolved.waypoints) {
+      waypoint = multiply_poses(frame_in_base.value(), waypoint);
+    }
+    return Result<ResolvedMotionSpecDTO>::Ok(
+        ResolvedMotionSpecDTO{std::move(resolved)});
+  }
+
+  if (request.goal_frame_reference.has_value()) {
+    return invalid_target_shape(
+        "A goal frame is only valid for absolute motion",
+        "goal_frame_requires_absolute_target");
   }
 
   if (joint_goal != nullptr) {

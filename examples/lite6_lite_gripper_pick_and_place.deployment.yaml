@@ -1058,15 +1058,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.lite6_lite_gripper_pick_and_place/0e1b3d371c71a7d8a3d11e062a57af07be90fbefc1e9a6f46f68da7ebd0d0945",
-        "content_digest": "sha256:2ef736f51e0afc9a201466c9d3de96ea9c62936df6e0bdb0b03c812357f84cc1",
-        "record_id": "manyforge.runtime_motion.lite6_lite_gripper_pick_and_place",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:0e1b3d371c71a7d8a3d11e062a57af07be90fbefc1e9a6f46f68da7ebd0d0945",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1107,7 +1098,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:332909369c856b186cc7b6466a63d9e4b19d8cfdbc9953bb4aebd146833b2e09",
+  "deployment_revision": "sha256:92ee989a82f8b830d72d5c61556a6e8e7b637a0c0a8b5dad926644bcc2686640",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -2115,17 +2106,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.lite6_lite_gripper_pick_and_place/0e1b3d371c71a7d8a3d11e062a57af07be90fbefc1e9a6f46f68da7ebd0d0945",
-        "content_digest": "sha256:2ef736f51e0afc9a201466c9d3de96ea9c62936df6e0bdb0b03c812357f84cc1",
-        "record_id": "manyforge.runtime_motion.lite6_lite_gripper_pick_and_place",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:0e1b3d371c71a7d8a3d11e062a57af07be90fbefc1e9a6f46f68da7ebd0d0945",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric",

@@ -1,86 +1,18 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
-  "deployment_artifact_id": "ur5e_lite6_wall",
-  "name": "ur5e_lite6_wall",
-  "description": "UI6-I dual-robot wall qualification occurrence",
+  "assistant_profile_id": null,
+  "attachments": [],
+  "compatibility": {
+    "lane": "manyforge-only",
+    "provides": [],
+    "tags": [
+      "dual-robot"
+    ]
+  },
   "components": [
     {
       "component_id": "lite6_robot",
       "component_profile_id": "lite6_native_simulated_v0",
-      "model_source": {
-        "urdf": {
-          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
-        },
-        "package_roots": {
-          "manyforge_example_models": {
-            "project_path": "../../manyforge_example_models"
-          }
-        },
-        "srdf": {
-          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf"
-        }
-      },
-      "root_pose_in_cell": {
-        "position_m": [
-          0.0,
-          0.0,
-          0.0
-        ],
-        "orientation_xyzw": [
-          0.0,
-          0.0,
-          0.0,
-          1.0
-        ]
-      },
-      "target_settings": {
-        "arm": {
-          "controlled_stop": {
-            "stop_mode": "soft_on_path",
-            "allow_natural_completion_on_short_path": true,
-            "jerk_limits_enabled": true,
-            "deceleration_time_s": 1.0,
-            "per_joint_limits": [
-              {
-                "source_joint_name": "joint1",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              },
-              {
-                "source_joint_name": "joint2",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              },
-              {
-                "source_joint_name": "joint3",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              },
-              {
-                "source_joint_name": "joint4",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              },
-              {
-                "source_joint_name": "joint5",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              },
-              {
-                "source_joint_name": "joint6",
-                "max_deceleration_rad_s2": 4.0,
-                "settle_velocity_threshold_rad_s": 0.01
-              }
-            ],
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 750000000
-            }
-          },
-          "maximum_tcp_linear_speed_mps": 0.15
-        }
-      },
       "configuration": {
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
@@ -134,85 +66,85 @@
           "planner_rng_seed": 12345
         },
         "runtime_kind": "native"
-      }
-    },
-    {
-      "component_id": "ur5e_robot",
-      "component_profile_id": "ur5e_robotiq_native_simulated_v0",
+      },
       "model_source": {
-        "urdf": {
-          "project_path": "../../manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.urdf"
-        },
         "package_roots": {
           "manyforge_example_models": {
             "project_path": "../../manyforge_example_models"
           }
         },
         "srdf": {
-          "project_path": "../../manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.srdf"
+          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
         }
       },
       "root_pose_in_cell": {
-        "position_m": [
-          0.0,
-          1.0,
-          0.0
-        ],
         "orientation_xyzw": [
           0.0,
           0.0,
           0.0,
           1.0
+        ],
+        "position_m": [
+          0.0,
+          0.0,
+          0.0
         ]
       },
       "target_settings": {
         "arm": {
           "controlled_stop": {
-            "stop_mode": "soft_on_path",
             "allow_natural_completion_on_short_path": true,
-            "jerk_limits_enabled": true,
             "deceleration_time_s": 1.0,
+            "jerk_limits_enabled": true,
             "per_joint_limits": [
               {
-                "source_joint_name": "elbow_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint1"
               },
               {
-                "source_joint_name": "shoulder_lift_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint2"
               },
               {
-                "source_joint_name": "shoulder_pan_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint3"
               },
               {
-                "source_joint_name": "wrist_1_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint4"
               },
               {
-                "source_joint_name": "wrist_2_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint5"
               },
               {
-                "source_joint_name": "wrist_3_joint",
-                "max_deceleration_rad_s2": 10.0,
-                "settle_velocity_threshold_rad_s": 0.01
+                "max_deceleration_rad_s2": 4.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint6"
               }
             ],
+            "stop_mode": "soft_on_path",
             "timing": {
               "command_latency_allowance_ns": 250000000,
               "operational_timeout_ns": 3000000000,
               "settling_allowance_ns": 750000000
             }
           },
-          "maximum_tcp_linear_speed_mps": 0.25
+          "maximum_tcp_linear_speed_mps": 0.15
         }
-      },
+      }
+    },
+    {
+      "component_id": "ur5e_robot",
+      "component_profile_id": "ur5e_robotiq_native_simulated_v0",
       "configuration": {
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
@@ -272,10 +204,86 @@
           "planner_rng_seed": 12345
         },
         "runtime_kind": "native"
+      },
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.urdf"
+        }
+      },
+      "root_pose_in_cell": {
+        "orientation_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "position_m": [
+          0.0,
+          1.0,
+          0.0
+        ]
+      },
+      "target_settings": {
+        "arm": {
+          "controlled_stop": {
+            "allow_natural_completion_on_short_path": true,
+            "deceleration_time_s": 1.0,
+            "jerk_limits_enabled": true,
+            "per_joint_limits": [
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "shoulder_pan_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "shoulder_lift_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "elbow_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_1_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_2_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_3_joint"
+              }
+            ],
+            "stop_mode": "soft_on_path",
+            "timing": {
+              "command_latency_allowance_ns": 250000000,
+              "operational_timeout_ns": 3000000000,
+              "settling_allowance_ns": 750000000
+            }
+          },
+          "maximum_tcp_linear_speed_mps": 0.25
+        }
       }
     }
   ],
-  "attachments": [],
+  "deployment_artifact_id": "ur5e_lite6_wall",
+  "description": "UI6-I dual-robot wall qualification occurrence",
+  "name": "ur5e_lite6_wall",
   "policies": {
     "interrupt_config": {
       "cancel_validation_timeout_ns": 1000,
@@ -283,13 +291,5 @@
       "queue_depth": 8,
       "supervisory_poll_rate_hz": 10
     }
-  },
-  "assistant_profile_id": null,
-  "compatibility": {
-    "lane": "manyforge-only",
-    "provides": [],
-    "tags": [
-      "dual-robot"
-    ]
   }
 }

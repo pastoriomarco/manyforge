@@ -30,6 +30,7 @@ import {
 import {
   buildProgramParameterMutation,
   ProgramPropertyEditor,
+  typeValuesTransition,
 } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 import { ProgramWorkspace } from './ProgramWorkspace';
@@ -128,7 +129,7 @@ function authoringProgram(
     name: 'Test Program',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.3.0',
+      content_version: '2.4.0',
     },
     component_roles: { robot: {} },
     target_roles: {},
@@ -199,7 +200,7 @@ describe('Program authoring panels', () => {
     });
   });
 
-  it('binds either source kind without losing unrelated sources or literals', () => {
+  it('binds either source kind, keeping the literal to restore and unrelated sources', () => {
     expect(buildProgramParameterMutation(
       mutationNode,
       'pose',
@@ -211,10 +212,7 @@ describe('Program authoring panels', () => {
       instance_id: 'specialized-instance',
       expected_node_id: 'specialized-node',
       merge: false,
-      parameters: {
-        coordinate: mutationNode.parameters.coordinate,
-        retained_literal: 7,
-      },
+      parameters: mutationNode.parameters,
       value_sources: {
         ...mutationNode.value_sources,
         pose: { kind: 'program_parameter', reference: 'target_pose' },
@@ -231,10 +229,7 @@ describe('Program authoring panels', () => {
       instance_id: 'specialized-instance',
       expected_node_id: 'specialized-node',
       merge: false,
-      parameters: {
-        pose: mutationNode.parameters.pose,
-        retained_literal: 7,
-      },
+      parameters: mutationNode.parameters,
       value_sources: {
         ...mutationNode.value_sources,
         coordinate: { kind: 'blackboard_field', reference: 'tool', field: 'opening' },
@@ -450,8 +445,10 @@ describe('Program authoring panels', () => {
     );
 
     expect(markup).toContain('aria-pressed="true"');
-    expect(markup).toContain('<dd title="program_parameter"><code>wait_<wbr/>time</code> <small>program parameter</small></dd>');
-    expect(markup).toContain('The literal is absent while this exact source is bound.');
+    // A bound number shows its source in the field's own box; no separate dropdown.
+    expect(markup).toMatch(/<span class="program-value-field sourced"><input readOnly=""[^>]*value="param.wait_time"/);
+    expect(markup).toContain('title="param.wait_time = 0.5 (parameter default)"');
+    expect(markup).not.toContain('Value source');
   });
 
   it('offers the current robot pose or joints for a move goal', () => {
@@ -526,7 +523,7 @@ describe('Program authoring panels', () => {
       expect(markup).toContain(referenced ? 'parameter default' : 'With request');
       expect(markup).not.toContain('exceeds Deployment');
       expect(JSON.stringify(node)).toBe(before);
-      if (referenced) expect(markup).toContain('<dd title="program_parameter"><code>speed</code>');
+      if (referenced) expect(markup).toContain('value="param.speed"');
     }
   });
 
@@ -676,37 +673,151 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('Joint name');
   });
 
-  it('does not offer an empty Literal transition for a required blackboard binding', () => {
-    const requiredTree: ProgramTreeNode = {
+  it('returns to typed values only with a valid literal to restore', () => {
+    const field = timer.parameters[0]!;
+    const bound: ProgramTreeNode = {
       node_id: 'timer',
       instance_id: 'required-source',
       parameters: {},
-      value_sources: {
-        duration_s: { kind: 'blackboard_key', reference: 'duration' },
-      },
+      value_sources: { duration_s: { kind: 'blackboard_key', reference: 'duration' } },
       children: [],
     };
-    const markup = renderToStaticMarkup(
+    // A required value bound before it had a literal has nothing to restore.
+    expect(typeValuesTransition(bound, 'duration_s', field, [])).toEqual({
+      error: 'duration_s has no valid literal fallback',
+    });
+    // A parameter binding restores the parameter's default.
+    expect(typeValuesTransition({
+      ...bound,
+      value_sources: { duration_s: { kind: 'program_parameter', reference: 'wait_time' } },
+    }, 'duration_s', field, [parameter])).toEqual({
+      transition: { kind: 'type_values', literal: 0.5 },
+    });
+    // The literal kept beside the source is restored as it is.
+    const kept = { ...bound, parameters: { duration_s: 2 } };
+    expect(typeValuesTransition(kept, 'duration_s', field, [])).toEqual({
+      transition: { kind: 'type_values' },
+    });
+    expect(buildProgramParameterMutation(kept, 'duration_s', { kind: 'type_values' }).args)
+      .toMatchObject({ parameters: { duration_s: 2 }, value_sources: {} });
+  });
+
+  it('keeps a map entry supplied only by a source and types it with the entry default', () => {
+    const query: ProgramTreeNode = {
+      node_id: 'assistant.query_model',
+      instance_id: 'query',
+      parameters: { template_variables: { count: '1' } },
+      value_sources: { 'template_variables.label': { kind: 'program_parameter', reference: 'label' } },
+      children: [],
+    };
+    // Typing another entry keeps the sourced one; removing the map's literal entry would not.
+    const edited = buildProgramParameterMutation(query, 'template_variables', {
+      kind: 'literal',
+      value: { count: '2', extra: 'x' },
+    }).args;
+    expect(edited.value_sources).toEqual(query.value_sources);
+    const typed = { ...query, parameters: { template_variables: { count: '1', label: 'tray' } } };
+    expect(buildProgramParameterMutation(typed, 'template_variables', {
+      kind: 'literal',
+      value: { count: '1' },
+    }).args.value_sources).toEqual({});
+    // Type values gives the sourced entry its typed default.
+    const field = { id: 'template_variables', required: true, schema: {}, schemaHash: 'sha256:m', hasDefault: false };
+    const result = typeValuesTransition(query, 'template_variables.label', field, [], '');
+    expect(result).toEqual({ transition: { kind: 'type_values', literal: '' } });
+    expect(buildProgramParameterMutation(query, 'template_variables.label', {
+      kind: 'type_values',
+      literal: '',
+    }).args).toMatchObject({
+      parameters: { template_variables: { count: '1', label: '' } },
+      value_sources: {},
+    });
+  });
+
+  it('sets and removes a formula at a nested path without touching the pose literal', () => {
+    const withFormula = buildProgramParameterMutation(mutationNode, 'pose.position_m[2]', {
+      kind: 'source',
+      source: { kind: 'expression', expression: '-param.tube_length / 2' },
+    }).args;
+    expect(withFormula.parameters).toEqual(mutationNode.parameters);
+    expect(withFormula.value_sources).toEqual({
+      ...mutationNode.value_sources,
+      'pose.position_m[2]': { kind: 'expression', expression: '-param.tube_length / 2' },
+    });
+    // Binding the whole pose replaces the entries inside it.
+    const node = { ...mutationNode, value_sources: withFormula.value_sources as ProgramTreeNode['value_sources'] };
+    expect(buildProgramParameterMutation(node, 'pose', {
+      kind: 'source',
+      source: { kind: 'blackboard_key', reference: 'place_pose' },
+    }).args.value_sources).toEqual({
+      ...mutationNode.value_sources,
+      pose: { kind: 'blackboard_key', reference: 'place_pose' },
+    });
+    // Typing a new pose keeps the formula while its value still exists.
+    const typed = buildProgramParameterMutation(node, 'pose', {
+      kind: 'literal',
+      value: { position_m: [1, 2, 3], orientation: { rpy_deg: [0, 0, 0] } },
+    }).args.value_sources as Record<string, unknown>;
+    expect(typed['pose.position_m[2]']).toEqual({ kind: 'expression', expression: '-param.tube_length / 2' });
+  });
+
+  it('shows a formula in its field with the f(x) marker and a whole pose key as one chip', () => {
+    const poseEntry: CatalogEntry = { ...timer, id: 'mover', parameters: [{
+      id: 'goal',
+      required: true,
+      schema: {
+        type: 'object',
+        required: ['position_m', 'orientation'],
+        properties: {
+          position_m: { type: 'array', minItems: 3, maxItems: 3, items: { type: 'number' } },
+          orientation: {
+            type: 'object',
+            properties: {
+              rpy_deg: { type: 'array', minItems: 3, maxItems: 3, items: { type: 'number' } },
+              xyzw: { type: 'array', minItems: 4, maxItems: 4, items: { type: 'number' } },
+            },
+          },
+        },
+      },
+      schemaHash: 'sha256:goal',
+      hasDefault: false,
+    }] };
+    const render = (node: ProgramTreeNode) => renderToStaticMarkup(
       <ProgramPropertyEditor
-        roots={[requiredTree]}
-        selectedId="required-source"
-        catalogEntries={[timer]}
-        program={authoringProgram([requiredTree], [], [{
-          key: 'duration',
-          type: 'float64',
-          access: 'read',
-          persistence: 'run',
+        roots={[node]}
+        selectedId="move"
+        catalogEntries={[poseEntry]}
+        program={authoringProgram([node], [], [{
+          key: 'place_pose', type: 'stored_pose', access: 'read', persistence: 'run',
         }])}
         busy={false}
         onMutate={vi.fn()}
         onUpdateNodePolicies={vi.fn()}
       />,
     );
+    const goal = { position_m: [0.3, 0.1, 0], orientation: { rpy_deg: [180, 0, 0] } };
+    const formula = render({
+      node_id: 'mover', instance_id: 'move', children: [], parameters: { goal },
+      value_sources: { 'goal.position_m[2]': { kind: 'expression', expression: 'param.z + 0.02' } },
+    });
+    expect(formula).toMatch(/<span class="program-value-field sourced"><input readOnly="" aria-label="Position z: formula param.z \+ 0.02"[^>]*value="param.z \+ 0.02"/);
+    expect(formula).toContain('title="f(x) = param.z + 0.02"');
+    expect(formula).toContain('>f(x)</button>');
+    // The other coordinates stay typed, each in its own marked field.
+    expect(formula.match(/class="program-value-field"/g)).toHaveLength(5);
+    // Roll/pitch/yaw with a formula cannot switch to a quaternion that would drop it.
+    const angle = render({
+      node_id: 'mover', instance_id: 'move', children: [], parameters: { goal },
+      value_sources: { 'goal.orientation.rpy_deg[2]': { kind: 'expression', expression: 'key.yaw' } },
+    });
+    expect(angle).toMatch(/aria-label="Orientation representation" disabled=""/);
 
-    expect(markup).toContain('<option value="" disabled="">Literal value</option>');
-    expect(markup).toContain(
-      'A required parameter cannot become literal until a schema-valid fallback exists.',
-    );
+    const chip = render({
+      node_id: 'mover', instance_id: 'move', children: [], parameters: { goal },
+      value_sources: { goal: { kind: 'blackboard_key', reference: 'place_pose' } },
+    });
+    expect(chip).toContain('class="program-value-chip" title="key.place_pose is empty until written.">key.place_pose</button>');
+    expect(chip).not.toContain('Orientation representation');
   });
 
   it('reports declaration usage and prevents deleting a referenced parameter', () => {
@@ -716,6 +827,7 @@ describe('Program authoring panels', () => {
         parameters={[parameter]}
         namespaces={[]}
         keys={[]}
+        formulaReferences={{ computedKeys: {}, nodes: {} }}
         busy={false}
         onMutate={vi.fn()}
       />,
@@ -787,6 +899,7 @@ describe('Program authoring panels', () => {
             programRevision: null,
             program: null,
             diagnostics: [],
+            formulaReferences: { computedKeys: {}, nodes: {} },
           },
           applicability: {
             applyReady: true,
@@ -849,6 +962,7 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       active: false,
       commandAllowed: vi.fn(() => false),
+      commandDisabledReason: vi.fn(() => null),
       startBlockedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
@@ -870,6 +984,7 @@ describe('Program authoring panels', () => {
       materializePromotion: vi.fn(),
       promotionMaterializationReason: vi.fn(() => null),
       writeRuntimeBlackboard: vi.fn(),
+      persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
@@ -961,6 +1076,7 @@ describe('Program authoring panels', () => {
           tree: blockedTree,
         },
         diagnostics: [],
+        formulaReferences: { computedKeys: {}, nodes: {} },
       },
       applicability: {
         applyReady: false,
@@ -1037,6 +1153,7 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       active: false,
       commandAllowed: vi.fn(() => false),
+      commandDisabledReason: vi.fn(() => null),
       startBlockedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
@@ -1058,6 +1175,7 @@ describe('Program authoring panels', () => {
       materializePromotion: vi.fn(),
       promotionMaterializationReason: vi.fn(() => null),
       writeRuntimeBlackboard: vi.fn(),
+      persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(

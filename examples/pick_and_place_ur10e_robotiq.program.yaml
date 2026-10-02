@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:96aad02308d01570b271793a0276073985f19c5b9d1bc2ec8a922dc80c7361e3
+program_revision: sha256:87540b07639df35b5b7b5fd29d61d8fb77c8517dcdd7125cd90a997553c19f3d
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: >-
@@ -9,7 +9,7 @@ description: >-
   rest sequence together with the Robotiq finger-joint coordinate semantics.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: optional

@@ -28,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cycle-journal-path", type=Path, required=True)
     parser.add_argument("--manager-liveness-socket", type=Path)
     parser.add_argument("--cell-id")
+    parser.add_argument("--persistent-key-register-path", type=Path)
     parser.add_argument("--owner-id", default="program-runner")
     parser.add_argument("--headless-timeout-s", type=float, default=30.0)
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
@@ -55,6 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tick_workers=args.tick_workers,
             manager_liveness_socket=args.manager_liveness_socket,
             cell_id=args.cell_id,
+            persistent_key_register_path=args.persistent_key_register_path,
         )
         model_transport = (
             None

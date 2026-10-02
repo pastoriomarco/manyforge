@@ -515,7 +515,7 @@ qualify_lite6_passive_deployment(
       deployment.applicability_inputs().value().external_resources,
       nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {},
       {}, {}, {}, {}, {}, overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));

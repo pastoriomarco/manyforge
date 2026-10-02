@@ -248,8 +248,11 @@ class ExecutionControlSession:
         for name, value in current.items():
             if (
                 name not in prior
-                or control_shell_fact_key(current, name)
-                != control_shell_fact_key(prior, name)
+                or (
+                    value is not prior[name]
+                    and control_shell_fact_key(current, name)
+                    != control_shell_fact_key(prior, name)
+                )
             ):
                 shell[name] = value
         # Joint samples are excluded from the meaningful key. A frame published
@@ -258,6 +261,7 @@ class ExecutionControlSession:
         if (
             "execution_control_state" not in shell
             and "execution_control_state" in current
+            and current["execution_control_state"] is not prior.get("execution_control_state")
             and execution_observation_values_key(current["execution_control_state"])
             != execution_observation_values_key(prior.get("execution_control_state"))
         ):

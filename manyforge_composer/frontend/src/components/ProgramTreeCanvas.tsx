@@ -87,6 +87,7 @@ import {
   type ProgramNoticeInput,
 } from './ProgramNoticeRail';
 import { statusEdgePath } from './StatusEdge';
+import { valuePathParameter } from '../utils/valuePaths';
 import { CANVAS_COLORS, STATUS_COLORS } from '../styles/tokens';
 
 // UI6-I-VC D3: every node has the same fixed size (--mf-node-width/height).
@@ -888,7 +889,7 @@ export function ProgramTreeCanvas({
     ? []
     : [
         ...Object.keys(selectedRow.node.parameters),
-        ...Object.keys(selectedRow.node.value_sources ?? {}),
+        ...Object.keys(selectedRow.node.value_sources ?? {}).map(valuePathParameter),
       ];
   const replacementParameterNames = new Set(
     topologyEntry?.parameters.map((parameter) => parameter.id) ?? [],
@@ -1029,7 +1030,7 @@ export function ProgramTreeCanvas({
     if (authoringDisabled) return;
     const mutation = programChangeKindMutation(entry, row.node.instance_id, [
       ...Object.keys(row.node.parameters),
-      ...Object.keys(row.node.value_sources ?? {}),
+      ...Object.keys(row.node.value_sources ?? {}).map(valuePathParameter),
     ]);
     if (await onMutate(mutation.mutation, mutation.args) === null) return;
     showCanvasMessage(`Node type changed to ${entry.name} without dropping parameters.`, 'info');
@@ -1062,7 +1063,7 @@ export function ProgramTreeCanvas({
   const nodeMenuEntries = (row: FlatProgramNode): CanvasMenuEntry[] => {
     const retained = [
       ...Object.keys(row.node.parameters),
-      ...Object.keys(row.node.value_sources ?? {}),
+      ...Object.keys(row.node.value_sources ?? {}).map(valuePathParameter),
     ];
     const replacements = topologyEntries
       .filter((entry) => entry.id !== row.node.node_id

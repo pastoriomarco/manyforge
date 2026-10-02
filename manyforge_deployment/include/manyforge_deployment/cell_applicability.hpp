@@ -12,7 +12,6 @@
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
-#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -382,10 +381,6 @@ public:
   runtime_profiles() const noexcept {
     return data_->runtime_profiles;
   }
-  [[nodiscard]] const std::vector<QualifiedRuntimePolicy> &
-  runtime_policies() const noexcept {
-    return data_->runtime_policies;
-  }
   [[nodiscard]] const std::vector<QualifiedContactPolicy> &
   contact_policies() const noexcept {
     return data_->contact_policies;
@@ -459,7 +454,6 @@ private:
          std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_in,
          const QualifiedAssistantSettings &assistant_settings_in,
          std::vector<QualifiedRuntimeProfile> runtime_profiles_in,
-         std::vector<QualifiedRuntimePolicy> runtime_policies_in,
          std::vector<QualifiedContactPolicy> contact_policies_in,
          std::vector<QualifiedCommandSchema> command_schemas_in,
          std::vector<QualifiedCapabilityDefinition> capability_definitions_in,
@@ -482,7 +476,6 @@ private:
           selected_site_overlay_ref(std::move(selected_site_overlay_ref_in)),
           assistant_settings(assistant_settings_in),
           runtime_profiles(std::move(runtime_profiles_in)),
-          runtime_policies(std::move(runtime_policies_in)),
           contact_policies(std::move(contact_policies_in)),
           command_schemas(std::move(command_schemas_in)),
           capability_definitions(std::move(capability_definitions_in)),
@@ -506,7 +499,6 @@ private:
     std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref;
     QualifiedAssistantSettings assistant_settings;
     std::vector<QualifiedRuntimeProfile> runtime_profiles;
-    std::vector<QualifiedRuntimePolicy> runtime_policies;
     std::vector<QualifiedContactPolicy> contact_policies;
     std::vector<QualifiedCommandSchema> command_schemas;
     std::vector<QualifiedCapabilityDefinition> capability_definitions;
@@ -531,7 +523,6 @@ private:
       std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref,
       const QualifiedAssistantSettings &assistant_settings,
       std::vector<QualifiedRuntimeProfile> runtime_profiles,
-      std::vector<QualifiedRuntimePolicy> runtime_policies,
       std::vector<QualifiedContactPolicy> contact_policies,
       std::vector<QualifiedCommandSchema> command_schemas,
       std::vector<QualifiedCapabilityDefinition> capability_definitions,
@@ -553,8 +544,8 @@ private:
       : data_(std::make_shared<const Data>(
             composition, deployment_inputs,
             std::move(selected_site_overlay_ref), assistant_settings,
-            std::move(runtime_profiles), std::move(runtime_policies),
-            std::move(contact_policies), std::move(command_schemas),
+            std::move(runtime_profiles), std::move(contact_policies),
+            std::move(command_schemas),
             std::move(capability_definitions),
             std::move(control_interface_contracts),
             std::move(controller_topologies), std::move(provider_manifests),
@@ -571,7 +562,6 @@ private:
       const CompositionQualifiedCellIr &,
       const RevisionVerifiedDeploymentApplicabilityInputs &,
       std::span<const QualifiedRuntimeProfile>,
-      std::span<const QualifiedRuntimePolicy>,
       std::span<const QualifiedCommandSchema>,
       std::span<const QualifiedCapabilityDefinition>,
       std::span<const QualifiedControlInterfaceContract>,
@@ -588,7 +578,6 @@ private:
     const CompositionQualifiedCellIr &composition,
     const RevisionVerifiedDeploymentApplicabilityInputs &deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
-    std::span<const QualifiedRuntimePolicy> runtime_policies,
     std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract>

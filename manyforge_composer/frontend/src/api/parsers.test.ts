@@ -23,6 +23,10 @@ import {
   parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
   parseOperationObservation,
+  parsePersistentKeyEdit,
+  parseExpressionCheckResult,
+  parsePersistentKeyValues,
+  parsePersistentKeyValuesCleared,
   parseRuntimeScaleControlAccepted,
   parseRuntimeScaleControlStatus,
   parseMotionPreviewResponse,
@@ -242,7 +246,7 @@ function programFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.3.0',
+      content_version: '2.4.0',
     },
     component_roles: {},
     target_roles: {},
@@ -292,6 +296,7 @@ function workspaceFixture(): Record<string, unknown> {
       programRevision: program.program_revision,
       program,
       diagnostics: [],
+      formulaReferences: { computedKeys: {}, nodes: {} },
     },
     applicability: {
       applyReady: true,
@@ -1028,6 +1033,15 @@ describe('Program product projections', () => {
     };
     expect(parseProgramRuntimeControlProjection(mixed).executionSelections.groups[0].state)
       .toBe('mixed');
+    // Stop preserves never-started Ready nodes alongside Stopped nodes.
+    expect(parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'mixed', node_count: 8, held_node_count: 8,
+    })).executionSelections.groups[0].heldNodeCount).toBe(8);
+    for (const held of [0, 9]) {
+      expect(() => parseProgramRuntimeControlProjection(withGroup({
+        ...releasable, state: 'mixed', node_count: 8, held_node_count: held,
+      }))).toThrow(/coherent bounded selection status and eligibility/);
+    }
 
     // Run and Resume can never disagree, and nothing releases running work.
     expect(() => parseProgramRuntimeControlProjection(withGroup({
@@ -1682,6 +1696,103 @@ describe('Program workspace parsers', () => {
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
       'exactly [sphere_radius_m, type]',
     );
+  });
+
+  it('parses run-scoped declarations and refuses removed lifetimes', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const parameter = (program.parameters as Record<string, unknown>[])[0];
+    const key: Record<string, unknown> = {
+      key: 'count', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 3,
+    };
+    program.blackboard = { namespaces: [], keys: [key] };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0])
+      .toEqual({ key: 'count', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 3 });
+    delete key.initial;
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0])
+      .not.toHaveProperty('initial');
+
+    key.initial = null;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('omitted instead of null');
+    Object.assign(key, { type: 'model_response', initial: {} });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('model_response has no authored value');
+    Object.assign(key, { type: 'int64', initial: 3, persistence: 'node' });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('run or persistent');
+    key.persistence = 'run';
+    parameter.runtime_mutability = 'between_operations';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('immutable or before_run');
+  });
+
+  it('parses computed keys and refuses them with initial: or persistent', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const key: Record<string, unknown> = {
+      key: 'grasp_z', type: 'float64', access: 'read', persistence: 'run',
+      expression: '-param.duration / 2',
+    };
+    program.blackboard = { namespaces: [], keys: [key] };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.blackboard?.keys[0]).toEqual(key);
+    key.initial = 1;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent for a key with initial: or persistent');
+    delete key.initial;
+    key.persistence = 'persistent';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent for a key with initial: or persistent');
+    Object.assign(key, { persistence: 'run', expression: '' });
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('a non-empty string');
+  });
+
+  it('parses value sources keyed by canonical paths, formulas included, and refuses overlaps', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.parameters = { goal: { position_m: [0.3, 0.1, 0], orientation: { rpy_deg: [0, 0, 0] } } };
+    tree.value_sources = {
+      'goal.position_m[2]': { kind: 'expression', expression: '-param.duration / 2' },
+      'goal.orientation.rpy_deg[0]': { kind: 'blackboard_key', reference: 'roll' },
+      duration_s: { kind: 'blackboard_field', reference: 'plan', field: 'wait' },
+    };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.value_sources)
+      .toEqual(tree.value_sources);
+    tree.value_sources = { goal: { kind: 'blackboard_key', reference: 'pose' }, 'goal.position_m[2]': {
+      kind: 'expression', expression: '1',
+    } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('absent while goal is sourced as a whole');
+    tree.value_sources = { 'goal.position_m[02]': { kind: 'expression', expression: '1' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('keyed by a canonical value path');
+    tree.value_sources = { goal: { kind: 'expression', expression: '1', reference: 'x' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('exactly [expression, kind]');
+    tree.value_sources = { goal: { kind: 'program_parameter', reference: 'x', field: 'y' } };
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('exactly [kind, reference]');
+  });
+
+  it('parses the names each Draft formula reads and refuses formulas the Draft lacks', () => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const program = draft.program as Record<string, unknown>;
+    (program.blackboard as { keys: unknown[] }).keys.push({
+      key: 'half', type: 'float64', access: 'read', persistence: 'run',
+      expression: 'param.duration / 2',
+    });
+    (program.tree as Record<string, unknown>).value_sources = {
+      duration_s: { kind: 'expression', expression: 'key.half + param.duration' },
+    };
+    const references = {
+      computedKeys: { half: ['param.duration'] },
+      nodes: { wait: { duration_s: ['key.half', 'param.duration'] } },
+    };
+    draft.formulaReferences = references;
+    expect(parseProgramWorkspaceResponse(fixture).draft.formulaReferences).toEqual(references);
+    for (const [invalid, message] of [
+      [{ ...references, nodes: { wait: { duration_s: ['param.duration', 'key.half'] } } }, 'sorted unique'],
+      [{ ...references, nodes: { wait: { duration_s: ['duration'] } } }, 'sorted unique'],
+      [{ ...references, nodes: { wait: { goal: [] } } }, 'a formula of a Draft node'],
+      [{ ...references, nodes: { other: { duration_s: [] } } }, 'a formula of a Draft node'],
+      [{ ...references, computedKeys: { duration: [] } }, 'a computed key of the Draft'],
+      [{ computedKeys: {} }, 'exactly'],
+    ] as const) {
+      draft.formulaReferences = invalid;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(message);
+    }
   });
 
   it('parses complete canonical node policies and rejects closed-shape drift', () => {
@@ -3494,5 +3605,196 @@ describe('addressed Robot Control parsers', () => {
     });
     expect(() => parseCapabilityCommandPreviewResponse(undeclaredNested))
       .toThrow(/exactly/);
+  });
+});
+
+
+describe('persistent key value parsers', () => {
+  const listing = {
+    schema_version: 'manyforge.persistent_key_values.v1',
+    scenario_id: 'cell-pick',
+    program_revision: `sha256:${'a'.repeat(64)}`,
+    program_run_id: null,
+    sequence: 3,
+    keys: [
+      {
+        key: 'layer', type: 'int64', access: 'read_write',
+        has_initial: true, initial: 0, stored: true, value: 3, sequence: 2,
+      },
+      {
+        key: 'part', type: 'string', access: 'read',
+        has_initial: false, initial: null, stored: false, value: null, sequence: null,
+      },
+    ],
+    edits: [{
+      sequence: 2, scenario_id: 'cell-pick', key: 'layer', action: 'set',
+      request_id: 'request.1', source_label: 'operator_ui',
+      program_run_id: null, node_instance_id: null, node_attempt_id: null,
+      reason: null, detail: null,
+    }, {
+      sequence: 3, scenario_id: 'cell-pick', key: 'layer', action: 'set',
+      request_id: null, source_label: 'program_node',
+      program_run_id: 'program-cycle.1', node_instance_id: 'set_layer', node_attempt_id: null,
+      reason: null, detail: null,
+    }],
+    storage_fault: null,
+    apply_observation_fault: null,
+  };
+
+  it('parses stored values, their starting values and the audited edits', () => {
+    const parsed = parsePersistentKeyValues(listing);
+    expect(parsed.keys).toEqual([
+      {
+        key: 'layer', type: 'int64', access: 'read_write',
+        initial: 0, stored: true, value: 3, sequence: 2,
+      },
+      {
+        key: 'part', type: 'string', access: 'read',
+        initial: undefined, stored: false, value: null, sequence: null,
+      },
+    ]);
+    expect(parsed.sequence).toBe(3);
+    expect(parsed.edits).toEqual([{
+      sequence: 2, key: 'layer', action: 'set',
+      requestId: 'request.1', sourceLabel: 'operator_ui',
+      programRunId: null, nodeInstanceId: null, nodeAttemptId: null,
+      reason: null, detail: null,
+    }, {
+      // A run's node write names the run and node instead of a request.
+      sequence: 3, key: 'layer', action: 'set',
+      requestId: null, sourceLabel: 'program_node',
+      programRunId: 'program-cycle.1', nodeInstanceId: 'set_layer', nodeAttemptId: null,
+      reason: null, detail: null,
+    }]);
+    expect(parsed.storageFault).toBeNull();
+    expect(parsed.applyObservationFault).toBeNull();
+    expect(parsePersistentKeyEdit({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.2', action: 'reset', key: 'layer', values: listing,
+    }).scenarioId).toBe('cell-pick');
+    expect(parsePersistentKeyValuesCleared({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.3', action: 'clear', scenario_id: 'cell-pick', removed: 2,
+    })).toEqual({ requestId: 'request.3', scenarioId: 'cell-pick', removed: 2 });
+  });
+
+  it('refuses inconsistent rows instead of guessing', () => {
+    const row = listing.keys[1];
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, value: 'ghost' }],
+    })).toThrow(StructuralContractError);
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, has_initial: true }],
+    })).toThrow(/has_initial/);
+    expect(() => parsePersistentKeyValues({
+      ...listing, keys: [{ ...row, access: 'owner' }],
+    })).toThrow(/access/);
+    expect(() => parsePersistentKeyValues({ ...listing, extra: true })).toThrow(/exactly/);
+    expect(() => parsePersistentKeyValues({ ...listing, sequence: null })).toThrow(/sequence/);
+    expect(() => parsePersistentKeyEdit({
+      schema_version: 'manyforge.persistent_key_edit.v1',
+      request_id: 'request.2', action: 'clear', key: 'layer', values: listing,
+    })).toThrow(/set or reset/);
+  });
+
+  it('parses dropped values with their reason and a storage fault', () => {
+    const dropped = {
+      sequence: 4, scenario_id: 'cell-pick', key: null, action: 'dropped',
+      request_id: null, source_label: 'committed_apply',
+      program_run_id: null, node_instance_id: null, node_attempt_id: null,
+      reason: 'applied_program_not_observed', detail: null,
+    };
+    const parsed = parsePersistentKeyValues({
+      ...listing,
+      edits: [dropped],
+      storage_fault: {
+        code: 'persistent_key_storage_unavailable', message: 'read-only file system',
+      },
+    });
+    expect(parsed.edits[0]).toMatchObject({
+      action: 'dropped', key: null, reason: 'applied_program_not_observed',
+    });
+    expect(parsed.storageFault).toEqual({
+      code: 'persistent_key_storage_unavailable', message: 'read-only file system',
+    });
+    // A drop always names why; nothing else does.
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...dropped, reason: null }],
+    })).toThrow(/reason/);
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...listing.edits[0], reason: 'key_declaration_changed' }],
+    })).toThrow(/reason/);
+  });
+
+  it('parses a committed Apply the runner never observed as a named fault', () => {
+    const missed = `sha256:${'b'.repeat(64)}`;
+    const parsed = parsePersistentKeyValues({
+      ...listing,
+      edits: [{
+        sequence: 4, scenario_id: 'cell-pick', key: null, action: 'fault',
+        request_id: null, source_label: 'committed_apply',
+        program_run_id: null, node_instance_id: null, node_attempt_id: null,
+        reason: 'applied_program_not_observed', detail: `committed Apply ${missed} was not observed`,
+      }],
+      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [missed] },
+    });
+    expect(parsed.edits[0]).toMatchObject({ action: 'fault', reason: 'applied_program_not_observed' });
+    expect(parsed.applyObservationFault).toEqual({
+      code: 'applied_program_not_observed', recordDigests: [missed],
+    });
+    expect(() => parsePersistentKeyValues({
+      ...listing,
+      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [] },
+    })).toThrow(/at least one/);
+  });
+});
+
+describe('expression check parser', () => {
+  const valid = {
+    schema_version: 'manyforge.expression_check.v1',
+    result_type: 'float64',
+    diagnostics: [],
+    preview: { value: -0.05, unavailable_reason: null },
+    names: [{ name: 'param.tube_length', type: 'float64' }, { name: 'key.part_pose', type: 'stored_pose' }],
+  };
+
+  it('parses a checked formula with its preview and names', () => {
+    expect(parseExpressionCheckResult(valid)).toEqual({
+      resultType: 'float64',
+      diagnostics: [],
+      preview: { value: -0.05 },
+      names: valid.names,
+    });
+    expect(parseExpressionCheckResult({
+      ...valid,
+      result_type: null,
+      diagnostics: [
+        { code: 'unknown_name', message: 'Unknown name param.tube', position: 1, length: 10, name: 'param.tube' },
+        { code: 'cycle', message: 'Computed keys a and b use each other', position: null, length: null, name: null },
+      ],
+      preview: { value: null, unavailable_reason: 'The formula has errors.' },
+    })).toMatchObject({
+      resultType: null,
+      diagnostics: [{ position: 1, length: 10 }, { position: null, length: null }],
+      preview: { unavailableReason: 'The formula has errors.' },
+    });
+  });
+
+  it('refuses a drifted or inconsistent check', () => {
+    expect(() => parseExpressionCheckResult({ ...valid, schema_version: 'v0' })).toThrow('manyforge.expression_check.v1');
+    expect(() => parseExpressionCheckResult({ ...valid, result_type: 'pose' })).toThrow('bool, int64, float64 or string');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: 'x', unavailable_reason: null } }))
+      .toThrow('a value of the result type');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: 1, unavailable_reason: 'both' } }))
+      .toThrow('either a value or a non-empty unavailable_reason');
+    expect(() => parseExpressionCheckResult({ ...valid, preview: { value: null, unavailable_reason: null } }))
+      .toThrow('either a value or a non-empty unavailable_reason');
+    expect(() => parseExpressionCheckResult({ ...valid, names: [{ name: 'tube_length', type: 'float64' }] }))
+      .toThrow('a param. or key. name');
+    expect(() => parseExpressionCheckResult({
+      ...valid,
+      diagnostics: [{ code: 'x', message: 'm', position: 1, length: null, name: null }],
+    })).toThrow('a position and a length together, or neither');
+    expect(() => parseExpressionCheckResult({ ...valid, extra: true })).toThrow('exactly');
   });
 });

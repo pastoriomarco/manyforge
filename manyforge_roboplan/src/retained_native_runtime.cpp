@@ -499,20 +499,20 @@ runtime_registration(
     core::IResolvedParticipantExecutionEngine *engine,
     core::IControlDomainExecutionPort *stop_execution_port,
     const std::optional<core::RuntimeParticipantPolicySelection>
-        &runtime_policy,
+        &participant_policy,
     std::optional<core::MotionInterruptStopProfileDTO>
         default_operator_stop_profile = std::nullopt,
     std::optional<core::MotionInterruptStopProfileDTO>
         default_fault_stop_profile = std::nullopt,
     std::optional<double> deployment_maximum_tcp_linear_speed_mps =
         std::nullopt) {
-  if (runtime_policy.has_value() &&
-      (runtime_policy->value().controllable_component_id !=
+  if (participant_policy.has_value() &&
+      (participant_policy->value().controllable_component_id !=
            binding.value().controllable_component_id ||
-       runtime_policy->value().command_target_id !=
+       participant_policy->value().command_target_id !=
            binding.value().command_target_id)) {
     throw std::invalid_argument(
-        "runtime policy selection crosses its participant binding");
+        "participant motion policy crosses its participant binding");
   }
   if (const auto retained_profiles =
           retained_controlled_stop_profiles(binding, readiness);
@@ -538,7 +538,7 @@ runtime_registration(
       core::MotionInterruptNodeCategory::kGeneric,
       engine,
       stop_execution_port,
-      runtime_policy,
+      participant_policy,
       dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(engine),
       std::move(default_operator_stop_profile),
       std::move(default_fault_stop_profile),
@@ -556,7 +556,7 @@ gripper_runtime_registration(
 }
 
 [[nodiscard]] std::optional<core::RuntimeParticipantPolicySelection>
-representative_runtime_policy(
+representative_participant_policy(
     const bool primary, const bool motion_owner,
     const std::optional<core::RuntimeParticipantPolicySelection> &policy) {
   if (primary && motion_owner) {
@@ -981,7 +981,7 @@ make_kernel_participant_resolver(
       auto registration = runtime_registration(
           std::move(binding.value().binding), physical->stop_readiness,
           physical->engine, physical->stop_execution_port,
-          physical->runtime_policy, physical->default_operator_stop_profile,
+          physical->participant_policy, physical->default_operator_stop_profile,
           physical->default_fault_stop_profile,
           physical->deployment_maximum_tcp_linear_speed_mps);
       registration.intrinsic_direct_control =
@@ -1047,11 +1047,11 @@ make_kernel_participant_resolver(
     const core::RuntimeParticipantExecutionRegistration &predecessor,
     const core::RuntimeParticipantExecutionRegistration &candidate) {
   const bool policy_equal =
-      predecessor.runtime_policy.has_value() ==
-          candidate.runtime_policy.has_value() &&
-      (!predecessor.runtime_policy.has_value() ||
-       predecessor.runtime_policy->value() ==
-           candidate.runtime_policy->value());
+      predecessor.participant_policy.has_value() ==
+          candidate.participant_policy.has_value() &&
+      (!predecessor.participant_policy.has_value() ||
+       predecessor.participant_policy->value() ==
+           candidate.participant_policy->value());
   return same_binding_after_product_reseal(predecessor.binding,
                                            candidate.binding) &&
          same_readiness_after_product_reseal(predecessor.stop_readiness,
@@ -1285,25 +1285,9 @@ create_retained_native_runtime_participants(
   require_planner_binding(input.motion_binding, *input.planner,
                           projection_revision);
 
-  std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
-  if (input.runtime_policy.has_value() !=
-      input.runtime_policy_source_artifact.has_value()) {
-    throw std::invalid_argument(
-        "native runtime policy value and source artifact must be retained "
-        "together");
-  }
-  if (input.runtime_policy.has_value()) {
-    auto sealed = core::verify_runtime_participant_policy_selection(
-        *input.runtime_policy_source_artifact, *input.runtime_policy,
-        input.motion_binding);
-    if (!sealed.ok()) {
-      throw std::invalid_argument(
-          "native runtime policy does not seal against the exact motion "
-          "binding: " +
-          sealed.error().message);
-    }
-    motion_runtime_policy = std::move(sealed.value());
-  }
+  std::optional<core::RuntimeParticipantPolicySelection>
+      motion_participant_policy =
+          core::select_runtime_participant_policy(input.motion_binding);
 
   if (!input.deployment_maximum_tcp_linear_speed_mps.has_value() ||
       !std::isfinite(*input.deployment_maximum_tcp_linear_speed_mps) ||
@@ -1315,9 +1299,9 @@ create_retained_native_runtime_participants(
   }
 
   if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled &&
-      (!motion_runtime_policy || input.backend_factory)) {
+      input.backend_factory) {
     throw std::invalid_argument(
-        "ordinary jerk profile requires a qualified native execution policy");
+        "ordinary jerk profile requires the native execution backend");
   }
 
   auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
@@ -1328,7 +1312,7 @@ create_retained_native_runtime_participants(
       std::move(input.control_binding_representatives);
   runtime->motion_operator_stop_profile = motion_operator_stop_profile;
   runtime->motion_fault_stop_profile = motion_fault_stop_profile;
-  runtime->motion_runtime_policy = motion_runtime_policy;
+  runtime->motion_participant_policy = motion_participant_policy;
   runtime->deployment_maximum_tcp_linear_speed_mps =
       input.deployment_maximum_tcp_linear_speed_mps;
   runtime->direct_control_joint_limits =
@@ -1403,12 +1387,12 @@ create_retained_native_runtime_participants(
             joint);
     }
     auto selected = core::apply_deployment_motion_jerk_policy(
-        *motion_runtime_policy, runtime->motion_binding,
+        *motion_participant_policy, runtime->motion_binding,
         std::move(profile.value()));
     if (!selected.ok())
       throw std::invalid_argument(selected.error().message);
-    motion_runtime_policy = std::move(selected.value());
-    runtime->motion_runtime_policy = motion_runtime_policy;
+    motion_participant_policy = std::move(selected.value());
+    runtime->motion_participant_policy = motion_participant_policy;
   }
   runtime->trajectory_validator = RoboPlanTrajectoryValidator::create(
       runtime->motion_binding, runtime->scene, runtime->scene_mutex);
@@ -1620,7 +1604,8 @@ create_retained_native_runtime_participants(
           runtime->participant_engine_for(true),
           static_cast<core::IControlDomainExecutionPort *>(
               runtime->execution.get()),
-          representative_runtime_policy(primary, true, motion_runtime_policy),
+          representative_participant_policy(primary, true,
+                                            motion_participant_policy),
           motion_operator_stop_profile, motion_fault_stop_profile,
           input.deployment_maximum_tcp_linear_speed_mps));
     } else {
@@ -1634,7 +1619,7 @@ create_retained_native_runtime_participants(
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.motion_stop_readiness, runtime->participant_engine.get(),
-        runtime->execution.get(), motion_runtime_policy,
+        runtime->execution.get(), motion_participant_policy,
         motion_operator_stop_profile, motion_fault_stop_profile,
         input.deployment_maximum_tcp_linear_speed_mps));
   }
@@ -1649,7 +1634,7 @@ create_retained_native_runtime_participants(
   physical_registrations.push_back(runtime_registration(
       runtime->motion_binding, input.motion_stop_readiness,
       runtime->participant_engine.get(), runtime->execution.get(),
-      motion_runtime_policy, motion_operator_stop_profile,
+      motion_participant_policy, motion_operator_stop_profile,
       motion_fault_stop_profile,
       input.deployment_maximum_tcp_linear_speed_mps));
   physical_registrations.back().direct_control_joint_limits =
@@ -2399,7 +2384,7 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
           return row.binding.value() == runtime.motion_binding.value();
         });
     if (registration != runtime.participant_registrations.end()) {
-      runtime.motion_runtime_policy = registration->runtime_policy;
+      runtime.motion_participant_policy = registration->participant_policy;
       runtime.deployment_maximum_tcp_linear_speed_mps =
           registration->deployment_maximum_tcp_linear_speed_mps;
       runtime.direct_control_joint_limits =
@@ -2791,7 +2776,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
              std::optional<core::RuntimeParticipantStopReadiness>>
         readiness_by_binding;
     std::optional<core::RuntimeParticipantPolicySelection>
-        motion_runtime_policy;
+        motion_participant_policy;
     const auto current_registration =
         [&](const core::RuntimeParticipantBinding &binding)
         -> const core::RuntimeParticipantExecutionRegistration * {
@@ -2815,7 +2800,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     if (const auto *current = current_registration(motion_binding);
         current != nullptr) {
-      motion_runtime_policy = current->runtime_policy;
+      motion_participant_policy = current->participant_policy;
     }
 
     std::set<core::ControlBindingId> supplied_bindings;
@@ -2946,8 +2931,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
-          representative_runtime_policy(primary, motion_owner,
-                                        motion_runtime_policy),
+          representative_participant_policy(primary, motion_owner,
+                                        motion_participant_policy),
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
@@ -2958,7 +2943,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_runtime_policy, motion_operator_stop_profile,
+          motion_participant_policy, motion_operator_stop_profile,
           motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps));
     }
@@ -3498,10 +3483,10 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
              std::optional<core::RuntimeParticipantStopReadiness>>
         readiness_by_binding;
     std::optional<core::RuntimeParticipantPolicySelection>
-        motion_runtime_policy;
+        motion_participant_policy;
     if (const auto *current = current_registration(motion_binding);
         current != nullptr) {
-      motion_runtime_policy = current->runtime_policy;
+      motion_participant_policy = current->participant_policy;
     }
     for (std::size_t index = 0U; index < control_binding_representatives.size();
          ++index) {
@@ -3586,8 +3571,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
-          representative_runtime_policy(primary, motion_owner,
-                                        motion_runtime_policy),
+          representative_participant_policy(primary, motion_owner,
+                                        motion_participant_policy),
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
@@ -3598,7 +3583,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_runtime_policy, motion_operator_stop_profile,
+          motion_participant_policy, motion_operator_stop_profile,
           motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps));
     }

@@ -1058,15 +1058,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
-        "content_digest": "sha256:fb3abfd2bbda31c30e6bcdd6aee0c5dc85aa32c736ca36dcdf1dea448069caf4",
-        "record_id": "manyforge.runtime_motion.ur10e_robotiq_pick_place_preview",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1108,7 +1099,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-  "deployment_revision": "sha256:b1295df2dce5fb7bea65bb58d562d70480344e8742eaa452f1b2513d26af537a",
+  "deployment_revision": "sha256:db81761ca74eab538c97aad18a537512fb5863a591387b01e932f15aaffe7380",
   "description": "Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
   "desired_control_configurations": [
     {
@@ -2094,17 +2085,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
-        "content_digest": "sha256:fb3abfd2bbda31c30e6bcdd6aee0c5dc85aa32c736ca36dcdf1dea448069caf4",
-        "record_id": "manyforge.runtime_motion.ur10e_robotiq_pick_place_preview",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur10e_robot.arm.execution-contact-geometric",

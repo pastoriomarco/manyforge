@@ -168,6 +168,7 @@ function workspace(
       programRevision,
       program,
       diagnostics: [],
+      formulaReferences: { computedKeys: {}, nodes: {} },
     },
     applicability: {
       applyReady: true,

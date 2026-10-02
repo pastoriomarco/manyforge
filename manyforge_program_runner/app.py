@@ -40,6 +40,9 @@ from .models import (
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
+    PersistentKeyValueResetRequest,
+    PersistentKeyValueSetRequest,
+    PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -48,6 +51,9 @@ from .models import (
 from .runtime import ProgramRunnerError
 
 
+ScenarioPath = Annotated[
+    str, Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
+]
 _MAXIMUM_PROGRAM_CONTROL_CLIENTS = 4
 _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES = 16 * 1024 * 1024
 _NODE_PROGRESS_PERIOD_NS = 50_000_000
@@ -330,6 +336,22 @@ class ProgramRunnerApplicationPort(Protocol):
         self, program_run_id: str, request: ManualResultStageRequest
     ) -> dict[str, Any]: ...
 
+    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]: ...
+
+    def set_persistent_value(
+        self, scenario_id: str, request: PersistentKeyValueSetRequest
+    ) -> dict[str, Any]: ...
+
+    def reset_persistent_value(
+        self, scenario_id: str, request: PersistentKeyValueResetRequest
+    ) -> dict[str, Any]: ...
+
+    def clear_persistent_values(
+        self, scenario_id: str, request: PersistentKeyValuesClearRequest
+    ) -> dict[str, Any]: ...
+
+    def reconcile_persistent_values(self) -> dict[str, Any]: ...
+
     def apply_recovery_action(
         self, request: CycleRecoveryActionRequest
     ) -> dict[str, Any]: ...
@@ -347,6 +369,7 @@ def _status(code: str) -> int:
             "program_cycle_reset_required",
             "program_run_already_active",
             "program_run_draft_applied_mismatch",
+            "persistent_key_request_replayed",
             "stale_generation",
         }
     ):
@@ -354,6 +377,7 @@ def _status(code: str) -> int:
     if (
         "unavailable" in code
         or code.endswith("_unknown")
+        or code.endswith("_uncertain")
         or code.endswith("_in_progress")
         or code.endswith("_ledger_full")
         or code == "program_cycle_reconciliation_required"
@@ -645,6 +669,43 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         return await control_call(
             lambda: runtime.stage_manual_result(program_run_id, request)
         )
+
+    @app.get("/api/program/scenarios/{scenario_id}/persistent-values")
+    def read_persistent_values(scenario_id: ScenarioPath) -> dict[str, Any]:
+        return runtime.read_persistent_values(scenario_id)
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values")
+    async def set_persistent_value(
+        scenario_id: ScenarioPath,
+        request: PersistentKeyValueSetRequest,
+    ) -> dict[str, Any]:
+        return await control_call(
+            lambda: runtime.set_persistent_value(scenario_id, request)
+        )
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/reset")
+    async def reset_persistent_value(
+        scenario_id: ScenarioPath,
+        request: PersistentKeyValueResetRequest,
+    ) -> dict[str, Any]:
+        return await control_call(
+            lambda: runtime.reset_persistent_value(scenario_id, request)
+        )
+
+    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/clear")
+    async def clear_persistent_values(
+        scenario_id: ScenarioPath,
+        request: PersistentKeyValuesClearRequest,
+    ) -> dict[str, Any]:
+        return await control_call(
+            lambda: runtime.clear_persistent_values(scenario_id, request)
+        )
+
+    @app.post("/api/program/persistent-values/reconcile")
+    async def reconcile_persistent_values() -> dict[str, Any]:
+        """Headless observed a committed Apply; the runner reads it itself."""
+
+        return await control_call(runtime.reconcile_persistent_values)
 
     @app.post("/api/cycle/recovery-actions")
     async def apply_recovery_action(

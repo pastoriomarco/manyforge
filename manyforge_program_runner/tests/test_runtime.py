@@ -3616,7 +3616,8 @@ def test_runtime_override_uses_the_held_multi_robot_target(node_id: str) -> None
         "base_frame_role": "base",
         "tcp_frame_role": "tcp",
         "target_mode": "absolute",
-        "goal": {},
+        # The authored goal's frame is not the frame the TCP is measured in.
+        "goal": {"frame_ref": {"kind": "cell_frame"}},
     }
 
     class Owner:
@@ -3711,7 +3712,9 @@ def test_runtime_override_uses_the_held_multi_robot_target(node_id: str) -> None
         ]
         assert runtime._kernel.queries == []  # type: ignore[attr-defined]
     else:
+        # Measured relative to the moving robot's base, and labelled so.
         assert candidate["value"] == {
+            "frame_ref": {"kind": "target_frame", "target_role": "ur5e_arm", "frame_role": "base"},
             "position_m": [0.1, 0.2, 0.3],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
         }

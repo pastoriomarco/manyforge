@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Mapping, NoReturn
+from typing import Any, Final, Iterable, Mapping, NoReturn
 
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
@@ -25,7 +25,27 @@ from manyforge_behavior.canonical_artifact import (
     verify_content_identity,
 )
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.catalog_schema import CatalogSchema, validate_value
+from manyforge_behavior.catalog_schema import (
+    CatalogSchema,
+    CatalogSchemaRegistry,
+    validate_value,
+)
+from manyforge_behavior.nodes.logic import comparison_supported
+from manyforge_behavior.program_expressions import (
+    DESTINATION_TYPES,
+    CheckedExpression,
+    ComputedKeyCycleError,
+    ExpressionEnvironment,
+    ExpressionError,
+    computed_key_order,
+    describe_diagnostic,
+)
+from manyforge_behavior.value_path import (
+    Segment,
+    ValuePathError,
+    parse_value_path,
+    value_at_path,
+)
 from manyforge_behavior.skill_loader import SkillCatalog
 
 _MAX_TREE_DEPTH: Final = 256
@@ -1532,6 +1552,8 @@ def _validate_execution_group_policies(
             parent is None
             or parent.node_id != "parallel"
             or parent.parameters.get("success_policy", "all") != "all"
+            # A sourced policy is resolved per attempt and could be `one`.
+            or "success_policy" in parent.value_sources
             or any(parents[instance_id] is not parent for instance_id in members[1:])
         ):
             raise ProgramValidationError(
@@ -1721,6 +1743,15 @@ class BlackboardKeyDeclaration:
     persistence: str
     fields: Mapping[str, BlackboardFieldDeclaration]
     description: str = ""
+    # `initial` is meaningful only when `has_initial`; an omitted initial value
+    # leaves the key empty until it is written.
+    has_initial: bool = False
+    initial: Any = None
+    # A computed key's formula; its value is always the formula's result.
+    expression: str | None = None
+    # Pose keys only: the declared frames a value may be stated in, in
+    # canonical order; None admits any declared frame.
+    allowed_frames: tuple[Mapping[str, Any], ...] | None = None
 
 
 def _program_error(path: str, message: str) -> NoReturn:
@@ -1870,9 +1901,14 @@ class _ProgramValidationContext:
     blackboard_namespaces: set[str]
     blackboard_keys: dict[str, BlackboardKeyDeclaration]
     contact_policy_ids: set[str]
+    expressions: ExpressionEnvironment
     execution_groups_supported: bool = True
     target_effect_count: int = 0
     tree_instance_ids: set[str] = field(default_factory=set)
+    # Checked field expressions by (node instance, value path).
+    value_expressions: dict[tuple[str, str], CheckedExpression] = field(
+        default_factory=dict
+    )
 
 
 _TOP_LEVEL_FIELDS: Final = frozenset(
@@ -1913,13 +1949,12 @@ _PROGRAM_PARAMETER_TYPES: Final = frozenset(
         "string_list",
     }
 )
-_RUNTIME_MUTABILITY_VALUES: Final = frozenset(
-    {"immutable", "before_run", "between_operations"}
-)
+_RUNTIME_MUTABILITY_VALUES: Final = frozenset({"immutable", "before_run"})
 _BLACKBOARD_ACCESS_VALUES: Final = frozenset({"read", "write", "read_write"})
-_BLACKBOARD_PERSISTENCE_VALUES: Final = frozenset({"node", "run", "persistent"})
+_BLACKBOARD_PERSISTENCE_VALUES: Final = frozenset({"run", "persistent"})
 _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS: Final = frozenset(
     {
+        "blackboard_key",
         "collision_body_role",
         "component_role",
         "frame_role",
@@ -2485,6 +2520,65 @@ def _validate_pose_frame_ref(
         )
 
 
+def _frame_ref_order(frame: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Canonical order of pose frames: by kind, then target role or scene
+    resource, then frame role."""
+
+    return (
+        str(frame["kind"]),
+        str(frame.get("target_role", frame.get("scene_resource_id", ""))),
+        str(frame.get("frame_role", "")),
+    )
+
+
+def _validate_allowed_frames(
+    value: Any,
+    *,
+    path: str,
+    declared_type: str,
+    target_roles: Mapping[str, dict[str, Any]],
+    scene_resource_ids: set[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """A closed, non-empty, duplicate-free, canonically ordered list of
+    declared pose frames; valid only for pose keys."""
+
+    if declared_type != "stored_pose":
+        _program_error(path, "is valid only for a stored_pose key")
+    rows = _program_list(value, path=path)
+    if not rows:
+        _program_error(path, "must not be empty; omit it to allow every declared frame")
+    for index, row in enumerate(rows):
+        _validate_pose_frame_ref(
+            row,
+            path=f"{path}[{index}]",
+            target_roles=target_roles,
+            scene_resource_ids=scene_resource_ids,
+        )
+    order = [_frame_ref_order(row) for row in rows]
+    if order != sorted(order) or len(order) != len(set(order)):
+        _program_error(
+            path,
+            "must be duplicate-free and canonical-sorted by kind, target role or "
+            "scene resource, and frame role",
+        )
+    return tuple(MappingProxyType(dict(row)) for row in rows)
+
+
+def _require_allowed_frame(
+    value: Any,
+    allowed_frames: tuple[Mapping[str, Any], ...] | None,
+    *,
+    path: str,
+) -> None:
+    """A pose whose frame is outside the key's `allowed_frames` is refused."""
+
+    if allowed_frames is None:
+        return
+    frame = value["frame_ref"]
+    if not any(dict(allowed) == frame for allowed in allowed_frames):
+        _program_error(f"{path}.frame_ref", "is not one of the key's allowed_frames")
+
+
 def _validate_declared_type_value(
     declared_type: str,
     value: Any,
@@ -2669,6 +2763,13 @@ def _validate_parameters(
         runtime_mutability = _program_identifier(
             row["runtime_mutability"], path=f"{row_path}.runtime_mutability"
         )
+        if runtime_mutability == "between_operations":
+            _program_error(
+                f"{row_path}.runtime_mutability",
+                "between_operations was removed; parameters change only before "
+                "Run (use before_run), and values that change during a run "
+                "belong in blackboard keys",
+            )
         if runtime_mutability not in _RUNTIME_MUTABILITY_VALUES:
             _program_error(f"{row_path}.runtime_mutability", "has an unsupported value")
         default = deepcopy(row["default"])
@@ -2709,6 +2810,8 @@ def _validate_blackboard(
     value: Any,
     *,
     path: str,
+    scene_resource_ids: set[str],
+    target_roles: Mapping[str, dict[str, Any]],
 ) -> tuple[set[str], dict[str, BlackboardKeyDeclaration]]:
     root = _program_mapping(value, path=path)
     _program_closed(
@@ -2758,7 +2861,9 @@ def _validate_blackboard(
         _program_closed(
             row,
             required=frozenset({"key", "type", "access", "persistence"}),
-            optional=frozenset({"fields", "description"}),
+            optional=frozenset(
+                {"fields", "description", "initial", "expression", "allowed_frames"}
+            ),
             path=row_path,
         )
         key = _program_identifier(row["key"], path=f"{row_path}.key")
@@ -2776,6 +2881,12 @@ def _validate_blackboard(
         persistence = _program_identifier(
             row["persistence"], path=f"{row_path}.persistence"
         )
+        if persistence == "node":
+            _program_error(
+                f"{row_path}.persistence",
+                "node was removed; use run or persistent, and reset the key "
+                "explicitly where the Program needs it",
+            )
         if persistence not in _BLACKBOARD_PERSISTENCE_VALUES:
             _program_error(f"{row_path}.persistence", "has an unsupported value")
         fields: dict[str, BlackboardFieldDeclaration] = {}
@@ -2817,12 +2928,69 @@ def _validate_blackboard(
                 f"{row_path}.fields",
                 "are valid only for a declared structured bundle type",
             )
+        allowed_frames = (
+            None
+            if "allowed_frames" not in row
+            else _validate_allowed_frames(
+                row["allowed_frames"],
+                path=f"{row_path}.allowed_frames",
+                declared_type=declared_type,
+                target_roles=target_roles,
+                scene_resource_ids=scene_resource_ids,
+            )
+        )
+        has_initial = "initial" in row
+        initial = deepcopy(row.get("initial"))
+        if has_initial:
+            if initial is None:
+                _program_error(
+                    f"{row_path}.initial",
+                    "must be omitted instead of null for an empty key",
+                )
+            _validate_declared_type_value(
+                declared_type,
+                initial,
+                path=f"{row_path}.initial",
+                scene_resource_ids=scene_resource_ids,
+                target_roles=target_roles,
+            )
+            _require_allowed_frame(initial, allowed_frames, path=f"{row_path}.initial")
+        expression: str | None = None
+        if "expression" in row:
+            expression = _program_text(
+                row["expression"], path=f"{row_path}.expression"
+            )
+            if has_initial:
+                _program_error(
+                    f"{row_path}.initial",
+                    "a computed key has no initial value; its value is always "
+                    "its expression's result",
+                )
+            if persistence != "run":
+                _program_error(
+                    f"{row_path}.persistence", "a computed key cannot be persistent"
+                )
+            if access != "read":
+                _program_error(
+                    f"{row_path}.access",
+                    "a computed key is read-only for nodes and the operator; "
+                    "declare access read",
+                )
+            if fields or declared_type not in DESTINATION_TYPES:
+                _program_error(
+                    f"{row_path}.type",
+                    "a computed key must be bool, int64, float64 or string",
+                )
         key_ids.append(key)
         keys[key] = BlackboardKeyDeclaration(
             key=key,
             type=declared_type,
             access=access,
             persistence=persistence,
+            has_initial=has_initial,
+            initial=initial,
+            expression=expression,
+            allowed_frames=allowed_frames,
             fields=MappingProxyType(fields),
             description=_program_text(
                 row.get("description", ""),
@@ -3084,7 +3252,12 @@ def _validate_semantic_value(
     path: str,
     context: _ProgramValidationContext,
     node_parameters: Mapping[str, Any],
+    sibling_target_role: str | None = None,
 ) -> None:
+    """Check declared identities. A role beside a target role in the same
+    object (a pose frame, a robot-qualified reference) belongs to that target;
+    otherwise it is scoped by the schema's semantic scope parameter."""
+
     concrete = context.catalog.schema_registry.resolve(schema)
     semantic_type = concrete.semantic_type
     if semantic_type is not None:
@@ -3122,7 +3295,13 @@ def _validate_semantic_value(
                     "model_role": "required_model_roles",
                 }[semantic_type]
                 scope_parameter = concrete.semantic_scope_parameter
-                if scope_parameter is None:
+                if sibling_target_role is not None:
+                    scoped_target = context.target_roles.get(sibling_target_role)
+                    accepted = scoped_target is not None and identity in scoped_target.get(
+                        role_field, ()
+                    )
+                    scope_description = f"target role {sibling_target_role!r}"
+                elif scope_parameter is None:
                     accepted = any(
                         identity in target.get(role_field, ())
                         for target in context.target_roles.values()
@@ -3151,6 +3330,16 @@ def _validate_semantic_value(
                         f"does not name a {semantic_type} required by {scope_description}",
                     )
     if concrete.schema_type == "object" and type(value) is dict:
+        sibling_target = next(
+            (
+                value[name]
+                for name, property_schema in concrete.properties.items()
+                if type(value.get(name)) is str
+                and context.catalog.schema_registry.resolve(property_schema).semantic_type
+                == "target_role"
+            ),
+            None,
+        )
         for name, nested in value.items():
             child_schema = concrete.properties.get(name)
             if child_schema is None:
@@ -3162,6 +3351,7 @@ def _validate_semantic_value(
                     path=f"{path}.{name}",
                     context=context,
                     node_parameters=node_parameters,
+                    sibling_target_role=sibling_target,
                 )
         orientation = value.get("orientation")
         if orientation is not None:
@@ -3251,6 +3441,8 @@ def _source_type_compatible(
     destination = context.catalog.schema_registry.resolve(destination_schema)
     if destination.semantic_type == "scene_resource":
         return source_type == "scene_resource"
+    if destination.schema_type == "key_value":
+        return source_type in destination.value_types
     if destination.schema_type == "float":
         return source_type == "float64"
     if destination.schema_type == "int":
@@ -3298,48 +3490,6 @@ def _validate_value_source(
             f"source type {source_type!r} is incompatible with the destination schema",
         )
     return source_type
-
-
-def _validate_nested_value_sources(
-    schema: CatalogSchema,
-    value: Any,
-    *,
-    path: str,
-    context: _ProgramValidationContext,
-) -> None:
-    if schema.ref == "#/schema_types/value_source":
-        _validate_value_source(
-            value,
-            path=path,
-            context=context,
-            destination_schema=None,
-        )
-        return
-    concrete = context.catalog.schema_registry.resolve(schema)
-    if concrete.schema_type == "object" and type(value) is dict:
-        for name, nested in value.items():
-            child_schema = concrete.properties.get(name)
-            if child_schema is None:
-                child_schema = concrete.additional_property_schema
-            if child_schema is not None:
-                _validate_nested_value_sources(
-                    child_schema,
-                    nested,
-                    path=f"{path}.{name}",
-                    context=context,
-                )
-    elif (
-        concrete.schema_type == "array"
-        and type(value) is list
-        and concrete.items is not None
-    ):
-        for index, nested in enumerate(value):
-            _validate_nested_value_sources(
-                concrete.items,
-                nested,
-                path=f"{path}[{index}]",
-                context=context,
-            )
 
 
 def _effective_parameter_value(
@@ -3447,23 +3597,33 @@ def _validate_catalog_blackboard_bindings(
         ("read", entry.blackboard_reads),
         ("write", entry.blackboard_writes),
     ):
+        # Several bindings of one key parameter declare the admitted types.
+        admitted: dict[str, list[str]] = {}
         for binding in bindings:
-            key = parameters.get(binding.key_parameter)
+            admitted.setdefault(binding.key_parameter, []).append(binding.value_type)
+        for key_parameter, value_types in admitted.items():
+            key = parameters.get(key_parameter)
             if type(key) is not str:
                 _program_error(
-                    f"{path}.parameters.{binding.key_parameter}",
+                    f"{path}.parameters.{key_parameter}",
                     "must be one literal declared blackboard key",
                 )
             declaration = context.blackboard_keys.get(key)
             if declaration is None:
                 _program_error(
-                    f"{path}.parameters.{binding.key_parameter}",
+                    f"{path}.parameters.{key_parameter}",
                     "does not name a declared blackboard key",
                 )
-            if declaration.type != binding.value_type:
+            if declaration.type not in value_types:
+                expected = " or ".join(repr(item) for item in value_types)
                 _program_error(
-                    f"{path}.parameters.{binding.key_parameter}",
-                    f"declares type {declaration.type!r}, expected {binding.value_type!r}",
+                    f"{path}.parameters.{key_parameter}",
+                    f"declares type {declaration.type!r}, expected {expected}",
+                )
+            if direction == "write" and declaration.expression is not None:
+                _program_error(
+                    f"{path}.parameters.{key_parameter}",
+                    f"names computed key {key!r}, which nodes cannot write",
                 )
             permitted = (
                 declaration.access in {"read", "read_write"}
@@ -3472,29 +3632,314 @@ def _validate_catalog_blackboard_bindings(
             )
             if not permitted:
                 _program_error(
-                    f"{path}.parameters.{binding.key_parameter}",
+                    f"{path}.parameters.{key_parameter}",
                     f"does not permit {direction} access",
                 )
+
+
+def _validate_key_typed_parameters(
+    entry: Any,
+    parameters: Mapping[str, Any],
+    *,
+    path: str,
+    context: _ProgramValidationContext,
+) -> None:
+    """Type each key_value literal by its key (after the key bindings)."""
+
+    for catalog_parameter in entry.parameters:
+        schema = catalog_parameter.schema
+        if schema.value_type_from_key is None:
+            continue
+        key_type = context.blackboard_keys[parameters[schema.value_type_from_key]].type
+        parameter_id = catalog_parameter.id
+        if parameter_id in parameters:
+            _validate_declared_type_value(
+                key_type,
+                parameters[parameter_id],
+                path=f"{path}.parameters.{parameter_id}",
+                scene_resource_ids=context.scene_resource_ids,
+                target_roles=context.target_roles,
+            )
+
+
+def _parse_value_source_paths(
+    value_sources: Mapping[str, Any], *, path: str
+) -> dict[str, tuple[Segment, ...]]:
+    """Parse every key; refuse unsorted keys and overlapping entries."""
+
+    parsed: dict[str, tuple[Segment, ...]] = {}
+    for key in value_sources:
+        try:
+            parsed[key] = parse_value_path(key)
+        except ValuePathError as error:
+            _program_error(f"{path} key {key!r}", f"{error.code}: {error}")
+    if tuple(sorted(value_sources)) != tuple(value_sources):
+        _program_error(path, "keys must be canonical-sorted")
+    by_segments = {segments: key for key, segments in parsed.items()}
+    for key, segments in parsed.items():
+        for length in range(1, len(segments)):
+            outer = by_segments.get(segments[:length])
+            if outer is not None:
+                _program_error(
+                    f"{path}.{key}",
+                    f"overlaps the value_sources entry {outer!r}; a value bound "
+                    "as a whole cannot also have entries for its own fields",
+                )
+    return parsed
+
+
+_SCHEMA_EXPRESSION_TYPES: Final = MappingProxyType(
+    {"bool": "bool", "int": "int64", "float": "float64", "string": "string"}
+)
+
+
+def _value_source_destination(
+    catalog_parameter: Any,
+    segments: tuple[Segment, ...],
+    parameters: Mapping[str, Any],
+    *,
+    path: str,
+    catalog: NodeCatalog,
+    blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
+) -> tuple[CatalogSchema | None, str | None]:
+    """Return the destination schema, or the key type of a whole key_value."""
+
+    registry = catalog.schema_registry
+    schema = catalog_parameter.schema
+    key_type: str | None = None
+    if schema.value_type_from_key is not None:
+        key_type = blackboard_keys[parameters[schema.value_type_from_key]].type
+        if len(segments) == 1:
+            return None, key_type
+        if key_type != "stored_pose":
+            _program_error(path, f"{key_type} values have no fields")
+        schema = registry.types["stored_pose"]
+    if len(segments) > 1:
+        if catalog_parameter.id in parameters:
+            current = parameters[catalog_parameter.id]
+        elif catalog_parameter.has_default:
+            current = catalog_parameter.default
+        else:
+            _program_error(path, "names no value in the node's parameters")
+        try:
+            # A source may supply an absent map entry (an object's additional
+            # property); every other path names an authored value.
+            value_at_path(
+                current,
+                segments[:-1] if _names_map_entry(segments, schema, registry) else segments,
+            )
+        except KeyError:
+            _program_error(path, "names no value in the node's parameters")
+    previous: Segment = segments[0]
+    for segment in segments[1:]:
+        concrete = registry.resolve(schema)
+        if type(segment) is int:
+            if concrete.schema_type != "array" or concrete.items is None:
+                _program_error(path, "indexes a value that is not a list")
+            schema = concrete.items
+        else:
+            if previous == "orientation" and segment == "xyzw":
+                _program_error(
+                    path,
+                    "quaternion components depend on each other; an xyzw "
+                    "orientation is typed or bound whole (per-component "
+                    "sources are allowed only under rpy_deg)",
+                )
+            child = (
+                concrete.properties.get(segment)
+                if concrete.schema_type == "object"
+                else None
+            )
+            if child is None and concrete.schema_type == "object":
+                child = concrete.additional_property_schema
+            if child is None:
+                _program_error(path, f"names no field {segment!r}")
+            schema = child
+        previous = segment
+    return schema, None
+
+
+def _names_map_entry(
+    segments: tuple[Segment, ...],
+    schema: CatalogSchema,
+    registry: CatalogSchemaRegistry,
+) -> bool:
+    """True when ``segments`` ends at an entry of a map (an object's additional
+    properties); a path the schema does not admit is not a map entry."""
+
+    for segment in segments[1:-1]:
+        concrete = registry.resolve(schema)
+        if type(segment) is int:
+            child = concrete.items if concrete.schema_type == "array" else None
+        elif concrete.schema_type == "object":
+            child = concrete.properties.get(segment) or concrete.additional_property_schema
+        else:
+            child = None
+        if child is None:
+            return False
+        schema = child
+    concrete = registry.resolve(schema)
+    return (
+        type(segments[-1]) is str
+        and concrete.schema_type == "object"
+        and segments[-1] not in concrete.properties
+        and concrete.additional_property_schema is not None
+    )
+
+
+def _expression_destination(
+    concrete: CatalogSchema | None, key_type: str | None
+) -> str | None:
+    """The type a formula computes for this destination, if it may have one."""
+
+    if concrete is not None:
+        if concrete.semantic_type is not None:
+            return None
+        return _SCHEMA_EXPRESSION_TYPES.get(concrete.schema_type)
+    return key_type if key_type in DESTINATION_TYPES else None
+
+
+def _validate_node_value_sources(
+    entry: Any,
+    instance_id: str,
+    parameters: Mapping[str, Any],
+    value_sources: Mapping[str, Any],
+    source_paths: Mapping[str, tuple[Segment, ...]],
+    *,
+    path: str,
+    context: _ProgramValidationContext,
+) -> None:
+    """Check each path-keyed source against the value it replaces (effect
+    selector roots are refused before the literals are checked)."""
+
+    registry = context.catalog.schema_registry
+    by_id = {parameter.id: parameter for parameter in entry.parameters}
+    for key, segments in source_paths.items():
+        entry_path = f"{path}.value_sources.{key}"
+        catalog_parameter = by_id[segments[0]]
+        schema, key_type = _value_source_destination(
+            catalog_parameter,
+            segments,
+            parameters,
+            path=entry_path,
+            catalog=context.catalog,
+            blackboard_keys=context.blackboard_keys,
+        )
+        concrete = registry.resolve(schema) if schema is not None else None
+        if concrete is not None and (
+            concrete.semantic_type in _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS
+            or "source_joint" in _schema_semantic_types(schema, context.catalog)
+        ):
+            _program_error(entry_path, "cannot dynamically select runtime/binding semantics")
+        nested = len(segments) > 1
+        if (
+            concrete is not None
+            and nested
+            and (
+                concrete.schema_type in {"string", "enum"}
+                or concrete.semantic_type is not None
+            )
+        ):
+            _program_error(
+                entry_path,
+                "nested text, choice and identifier fields stay literal",
+            )
+        source = _program_mapping(value_sources[key], path=entry_path)
+        if source.get("kind") == "expression":
+            _program_closed(
+                source, required=frozenset({"kind", "expression"}), path=entry_path
+            )
+            text = _program_text(source["expression"], path=f"{entry_path}.expression")
+            destination = _expression_destination(concrete, key_type)
+            if destination is None:
+                _program_error(
+                    entry_path,
+                    "an expression computes only a bool, int64, float64 or "
+                    "string value (not a choice, identifier or whole value)",
+                )
+            try:
+                checked = context.expressions.check(text, destination)
+            except ExpressionError as error:
+                _program_error(
+                    f"{entry_path}.expression",
+                    describe_diagnostic(error.diagnostics[0]),
+                )
+            context.value_expressions[(instance_id, key)] = checked
+            continue
+        if concrete is None:
+            source_type = _validate_value_source(
+                source, path=entry_path, context=context, destination_schema=None
+            )
+            if source_type != key_type:
+                key_name = parameters[catalog_parameter.schema.value_type_from_key]
+                _program_error(
+                    entry_path,
+                    f"source type {source_type!r} does not match the "
+                    f"{key_type!r} type of key {key_name!r}",
+                )
+            continue
+        _validate_value_source(
+            source, path=entry_path, context=context, destination_schema=schema
+        )
+
+
+def _goal_frame(
+    pose: Any, parameters: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    """The authored frame of a goal pose; None for the moving robot's base."""
+
+    frame = pose.get("frame_ref") if type(pose) is dict else None
+    if frame is None or frame == {
+        "kind": "target_frame",
+        "target_role": parameters.get("target_role"),
+        "frame_role": parameters.get("base_frame_role"),
+    }:
+        return None
+    return frame
 
 
 def _validate_node_cross_fields(
     node_id: str,
     parameters: Mapping[str, Any],
     *,
+    sourced: frozenset[str],
     path: str,
     context: _ProgramValidationContext,
 ) -> None:
+    """Checks across literal fields. ``parameters`` holds the literals; a
+    parameter in ``sourced`` comes whole from a value source and is checked
+    when its value is resolved at node start."""
+
     goal = parameters.get("goal")
     if node_id == "motion.move_to_joint_target" and type(goal) is list:
         joints = [item.get("joint_name") for item in goal if type(item) is dict]
         if len(joints) != len(set(joints)):
             _program_error(f"{path}.parameters.goal", "contains duplicate joint names")
-    if node_id == "motion.move_to_pose":
+    if node_id in {"motion.move_to_pose", "motion.follow_cartesian_path"}:
         mode = parameters.get("target_mode", "absolute")
-        if mode == "relative" and "target_reference" not in parameters:
+        if (
+            mode == "relative"
+            and "target_reference" not in parameters
+            and "target_reference" not in sourced
+        ):
             _program_error(
                 f"{path}.parameters.target_reference",
                 "is required for relative pose motion",
+            )
+        poses = (
+            [goal]
+            if node_id == "motion.move_to_pose"
+            else parameters.get("path") if type(parameters.get("path")) is list else []
+        )
+        frames = [_goal_frame(pose, parameters) for pose in poses if type(pose) is dict]
+        field = "goal" if node_id == "motion.move_to_pose" else "path"
+        if any(frame != frames[0] for frame in frames):
+            _program_error(f"{path}.parameters.{field}", "waypoints must all use one frame")
+        if frames and frames[0] is not None and mode == "relative":
+            _program_error(
+                f"{path}.parameters.{field}",
+                "a relative goal is stated in the moving robot's base frame; "
+                "its reference is target_reference",
             )
     if "contact_policy_id" in parameters:
         policy_id = _program_identifier(
@@ -3505,6 +3950,29 @@ def _validate_node_cross_fields(
             _program_error(
                 f"{path}.parameters.contact_policy_id",
                 "does not name a declared contact policy",
+            )
+    if node_id in {"logic.check_value", "logic.wait_for_value"}:
+        key_type = context.blackboard_keys[parameters["key"]].type
+        reason = comparison_supported(
+            key_type,
+            parameters.get("operator", "=="),
+            has_tolerance="tolerance" in parameters,
+        )
+        if reason is not None:
+            _program_error(f"{path}.parameters.operator", reason)
+    if node_id == "geometry.check_pose_bounds":
+        _validate_pose_frame_ref(
+            parameters["frame_ref"],
+            path=f"{path}.parameters.frame_ref",
+            target_roles=context.target_roles,
+            scene_resource_ids=context.scene_resource_ids,
+        )
+        if any(
+            low > high
+            for low, high in zip(parameters["min_position_m"], parameters["max_position_m"])
+        ):
+            _program_error(
+                f"{path}.parameters.min_position_m", "exceeds max_position_m"
             )
     position = parameters.get("position")
     effort = parameters.get("max_effort")
@@ -3589,15 +4057,17 @@ def _validate_program_tree(
         _program_error(f"{path}.value_sources", "must be omitted when empty")
     if len(value_sources) > _MAX_MAPPING_ITEMS:
         _program_error(f"{path}.value_sources", "exceeds the fixed item bound")
-    _canonical_mapping_keys(value_sources, path=f"{path}.value_sources")
+    source_paths = _parse_value_source_paths(
+        value_sources, path=f"{path}.value_sources"
+    )
 
     catalog_parameters = {parameter.id: parameter for parameter in entry.parameters}
-    unknown = sorted((set(parameters) | set(value_sources)) - set(catalog_parameters))
+    unknown = sorted(
+        (set(parameters) | {segments[0] for segments in source_paths.values()})
+        - set(catalog_parameters)
+    )
     if unknown:
         _program_error(path, f"supplies unknown catalog parameters {unknown}")
-    duplicate = sorted(set(parameters) & set(value_sources))
-    if duplicate:
-        _program_error(path, f"supplies parameters twice {duplicate}")
 
     condition_parameters = {
         requirement.when_parameter
@@ -3617,6 +4087,15 @@ def _validate_program_tree(
     selector_parameters = (
         condition_parameters | target_parameters | component_parameters
     )
+    for key, segments in source_paths.items():
+        if (
+            segments[0] in _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS
+            or segments[0] in selector_parameters
+        ):
+            _program_error(
+                f"{path}.value_sources.{key}",
+                "cannot dynamically select runtime/binding semantics",
+            )
     effective_parameters = {
         parameter_id: catalog_parameter.default
         for parameter_id, catalog_parameter in catalog_parameters.items()
@@ -3626,6 +4105,8 @@ def _validate_program_tree(
 
     for parameter_id, catalog_parameter in catalog_parameters.items():
         supplied_literal = parameter_id in parameters
+        # A whole-value source supplies the parameter; the literal, if kept,
+        # is what "Type values" restores when the source is removed.
         supplied_source = parameter_id in value_sources
         if (
             catalog_parameter.required
@@ -3657,35 +4138,6 @@ def _validate_program_tree(
                 context=context,
                 node_parameters=effective_parameters,
             )
-            _validate_nested_value_sources(
-                catalog_parameter.schema,
-                parameters[parameter_id],
-                path=f"{path}.parameters.{parameter_id}",
-                context=context,
-            )
-        if supplied_source:
-            semantic_types = _schema_semantic_types(
-                catalog_parameter.schema, context.catalog
-            )
-            if (
-                parameter_id in _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS
-                or parameter_id in selector_parameters
-                or "source_joint" in semantic_types
-                or context.catalog.schema_registry.resolve(
-                    catalog_parameter.schema
-                ).semantic_type
-                in _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS
-            ):
-                _program_error(
-                    f"{path}.value_sources.{parameter_id}",
-                    "cannot dynamically select runtime/binding semantics",
-                )
-            _validate_value_source(
-                value_sources[parameter_id],
-                path=f"{path}.value_sources.{parameter_id}",
-                context=context,
-                destination_schema=catalog_parameter.schema,
-            )
 
     for parameter_id in sorted(_PROGRAM_MOTION_DEFAULTS & set(catalog_parameters)):
         declaration = context.parameters.get(parameter_id)
@@ -3707,7 +4159,8 @@ def _validate_program_tree(
                     f"{path}.parameters.{parameter_id}",
                     f"must not exceed Program {parameter_id}={float(ceiling):g}",
                 )
-            continue
+            if parameter_id not in value_sources:
+                continue
         source = value_sources.get(parameter_id)
         if source != {
             "kind": "program_parameter",
@@ -3720,7 +4173,29 @@ def _validate_program_tree(
 
     _validate_node_capabilities(entry, parameters, path=path, context=context)
     _validate_catalog_blackboard_bindings(entry, parameters, path=path, context=context)
-    _validate_node_cross_fields(node_id, parameters, path=path, context=context)
+    _validate_key_typed_parameters(entry, parameters, path=path, context=context)
+    _validate_node_value_sources(
+        entry,
+        instance_id,
+        parameters,
+        value_sources,
+        source_paths,
+        path=path,
+        context=context,
+    )
+    # Cross-field checks read literals; a parameter supplied whole by a source
+    # is checked when its value is resolved at node start.
+    _validate_node_cross_fields(
+        node_id,
+        {
+            name: value
+            for name, value in parameters.items()
+            if name not in value_sources
+        },
+        sourced=frozenset(str(segments[0]) for segments in source_paths.values()),
+        path=path,
+        context=context,
+    )
 
     raw_children = _program_list(node["children"], path=f"{path}.children")
     if len(raw_children) < entry.children_min or len(raw_children) > entry.children_max:
@@ -3778,6 +4253,158 @@ def _validate_program_tree(
     )
 
 
+def program_value_declarations(
+    document: Mapping[str, Any], *, catalog: NodeCatalog, source: str = "program"
+) -> tuple[dict[str, ProgramParameterDeclaration], dict[str, BlackboardKeyDeclaration]]:
+    """Validate only the declarations expressions read: Program parameters and
+    blackboard keys, with the roles and scene their values may name.
+
+    Used where a whole Program is not required, such as checking a formula
+    while the rest of a Draft is still being edited.
+    """
+
+    root = _program_mapping(dict(document), path=source)
+    component_roles = _validate_component_roles(
+        root.get("component_roles", {}), path=f"{source}.component_roles"
+    )
+    target_roles = _validate_target_roles(
+        root.get("target_roles", {}),
+        path=f"{source}.target_roles",
+        component_roles=component_roles,
+    )
+    scene_resource_ids, _roles, _policies = _validate_scene(
+        root.get("scene", []),
+        path=f"{source}.scene",
+        catalog=catalog,
+        component_roles=component_roles,
+    )
+    parameters = _validate_parameters(
+        root.get("parameters", []),
+        path=f"{source}.parameters",
+        scene_resource_ids=scene_resource_ids,
+        target_roles=target_roles,
+    )
+    _namespaces, keys = _validate_blackboard(
+        root.get("blackboard", {"namespaces": [], "keys": []}),
+        path=f"{source}.blackboard",
+        scene_resource_ids=scene_resource_ids,
+        target_roles=target_roles,
+    )
+    return parameters, keys
+
+
+def check_draft_formulas(
+    document: Mapping[str, Any],
+    nodes: Iterable[Mapping[str, Any]],
+    *,
+    catalog: NodeCatalog,
+    source: str = "program",
+) -> tuple[dict[str, CheckedExpression], dict[tuple[str, str], CheckedExpression]]:
+    """Check the formulas of a Draft that need not be a whole Program yet.
+
+    Returns the computed keys by key and the node field formulas by
+    ``(node instance, value path)``, typed as Program validation types them.
+    A formula that does not check is left out; Program validation reports why.
+    Raises ProgramValidationError when the declarations themselves are invalid.
+    """
+
+    parameters, keys = program_value_declarations(
+        document, catalog=catalog, source=source
+    )
+    environment = ExpressionEnvironment.from_declarations(parameters, keys)
+    computed: dict[str, CheckedExpression] = {}
+    for name, declaration in keys.items():
+        if declaration.expression is None:
+            continue
+        try:
+            computed[name] = environment.check(declaration.expression, declaration.type)
+        except ExpressionError:
+            continue
+    fields: dict[tuple[str, str], CheckedExpression] = {}
+    for node in nodes:
+        values = node.get("parameters", {})
+        for key, value_source in node.get("value_sources", {}).items():
+            if (
+                type(value_source) is not dict
+                or value_source.get("kind") != "expression"
+                or type(value_source.get("expression")) is not str
+            ):
+                continue
+            try:
+                segments = parse_value_path(key)
+                catalog_parameter = {
+                    parameter.id: parameter
+                    for parameter in catalog.get(node["node_id"]).parameters
+                }[segments[0]]
+                schema, key_type = _value_source_destination(
+                    catalog_parameter,
+                    segments,
+                    values,
+                    path=key,
+                    catalog=catalog,
+                    blackboard_keys=keys,
+                )
+                destination = _expression_destination(
+                    catalog.schema_registry.resolve(schema)
+                    if schema is not None
+                    else None,
+                    key_type,
+                )
+                if destination is None:
+                    continue
+                fields[(node["instance_id"], key)] = environment.check(
+                    value_source["expression"], destination
+                )
+            # An unknown node or field, or an unbound or undeclared key.
+            except (
+                ExpressionError,
+                KeyError,
+                ProgramValidationError,
+                ValuePathError,
+            ):
+                continue
+    return computed, fields
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramExpressions:
+    """The checked expressions of one validated Program.
+
+    ``computed_key_order`` lists computed keys so each follows the computed
+    keys it reads; ``value_expressions`` holds field expressions by
+    ``(node instance, value path)``.
+    """
+
+    environment: ExpressionEnvironment
+    computed_keys: Mapping[str, CheckedExpression]
+    computed_key_order: tuple[str, ...]
+    value_expressions: Mapping[tuple[str, str], CheckedExpression]
+
+
+def _check_computed_keys(
+    keys: Mapping[str, BlackboardKeyDeclaration],
+    expressions: ExpressionEnvironment,
+    *,
+    path: str,
+) -> dict[str, CheckedExpression]:
+    checked: dict[str, CheckedExpression] = {}
+    for index, (key, declaration) in enumerate(keys.items()):
+        if declaration.expression is None:
+            continue
+        try:
+            checked[key] = expressions.check(declaration.expression, declaration.type)
+        except ExpressionError as error:
+            _program_error(
+                f"{path}[{index}].expression",
+                describe_diagnostic(error.diagnostics[0]),
+            )
+    try:
+        computed_key_order(checked)
+    except ComputedKeyCycleError as error:
+        _program_error(path, f"computed keys read each other in a cycle: {error}")
+    return checked
+
+
 def _validate_program_document(
     data: dict[str, Any],
     *,
@@ -3789,6 +4416,7 @@ def _validate_program_document(
     ProgramTreeNode,
     dict[str, ProgramParameterDeclaration],
     dict[str, BlackboardKeyDeclaration],
+    "ProgramExpressions",
 ]:
     root = _program_mapping(data, path=source)
     root = _select_identity_verified_program_root(
@@ -3882,6 +4510,12 @@ def _validate_program_document(
     namespaces, blackboard_keys = _validate_blackboard(
         root.get("blackboard", {"namespaces": [], "keys": []}),
         path=f"{source}.blackboard",
+        scene_resource_ids=scene_resource_ids,
+        target_roles=target_roles,
+    )
+    expressions = ExpressionEnvironment.from_declarations(parameters, blackboard_keys)
+    computed_keys = _check_computed_keys(
+        blackboard_keys, expressions, path=f"{source}.blackboard.keys"
     )
     contact_policy_ids = _validate_contact_policies(
         root.get("contact_policies", []),
@@ -3906,6 +4540,7 @@ def _validate_program_document(
         blackboard_namespaces=namespaces,
         blackboard_keys=blackboard_keys,
         contact_policy_ids=contact_policy_ids,
+        expressions=expressions,
         execution_groups_supported=api_version == _PROGRAM_API_VERSION,
     )
     tree = _validate_program_tree(
@@ -3953,7 +4588,12 @@ def _validate_program_document(
         )
     except StrictArtifactError as exc:
         _program_error(f"{source}.program_revision", str(exc))
-    return normalized_root, tree, parameters, blackboard_keys
+    return normalized_root, tree, parameters, blackboard_keys, ProgramExpressions(
+        environment=expressions,
+        computed_keys=MappingProxyType(computed_keys),
+        computed_key_order=computed_key_order(computed_keys),
+        value_expressions=MappingProxyType(dict(context.value_expressions)),
+    )
 
 
 class Program:
@@ -4028,7 +4668,13 @@ class Program:
         source: str,
     ) -> None:
         try:
-            normalized, tree, parameters, blackboard_keys = _validate_program_document(
+            (
+                normalized,
+                tree,
+                parameters,
+                blackboard_keys,
+                expressions,
+            ) = _validate_program_document(
                 data,
                 catalog=catalog,
                 source=source,
@@ -4059,7 +4705,43 @@ class Program:
         )
         self.parameters = MappingProxyType(dict(parameters))
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))
+        self.expressions = expressions
         self.canonical_bytes = canonical
+
+    def validate_key_value(self, key: str, value: Any, *, path: str) -> None:
+        """Validate one value against the declared type of ``key``.
+
+        The one check for initial, node, operator and restored values alike:
+        pose frames are checked against this Program's declared target roles
+        and scene resources, and against the key's ``allowed_frames``.
+        """
+
+        declaration = self.blackboard_keys.get(key)
+        if declaration is None:
+            _program_error(path, f"blackboard key {key!r} is undeclared")
+        _validate_declared_type_value(
+            declaration.type,
+            value,
+            path=path,
+            scene_resource_ids=self._scene_resource_ids(),
+            target_roles=self._data["target_roles"],
+        )
+        if declaration.type == "stored_pose":
+            _require_allowed_frame(value, declaration.allowed_frames, path=path)
+
+    def validate_pose_frame(self, value: Any, *, path: str) -> None:
+        """Validate one pose ``frame_ref`` against this Program's declared
+        target roles and scene resources (a pose inside a structured value)."""
+
+        _validate_pose_frame_ref(
+            value,
+            path=path,
+            target_roles=self._data["target_roles"],
+            scene_resource_ids=self._scene_resource_ids(),
+        )
+
+    def _scene_resource_ids(self) -> set[str]:
+        return {row["scene_resource_id"] for row in self._data.get("scene", [])}
 
     def to_dict(self) -> dict[str, Any]:
         """Return one detached exact v2 authoring document."""
@@ -4078,7 +4760,7 @@ def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
         raise ProgramValidationError("Program root must be a built-in mapping")
     try:
         canonical_json_bytes(data)
-        normalized, _tree, _parameters, _blackboard = _validate_program_document(
+        normalized, *_validated = _validate_program_document(
             deepcopy(data),
             catalog=catalog,
             source="v1 migration",
@@ -4182,18 +4864,21 @@ __all__ = [
     "BlackboardFieldDeclaration",
     "BlackboardKeyDeclaration",
     "Program",
+    "ProgramExpressions",
     "ProgramNodePolicy",
     "ProgramParameterDeclaration",
     "ProgramTreeNode",
     "ProgramValidationError",
     "TreeNode",
     "apply_tree_param_overrides",
+    "check_draft_formulas",
     "compute_program_tree_hash",
     "find_tree_node_by_name",
     "merge_param_patch",
     "migrate_program_v1",
     "migrate_program_execution_groups",
     "program_node_policies",
+    "program_value_declarations",
     "require_exact_program_binding_node_policies",
     "tree_node_from_dict",
 ]

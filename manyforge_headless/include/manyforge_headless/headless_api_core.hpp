@@ -33,6 +33,8 @@ inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
     "manyforge.applied_program_selection.v2";
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
+inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
+    "manyforge.committed_scenario_activation.v1";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -187,6 +189,14 @@ public:
   /// and the named unresolved references; it never carries a binding.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AppliedProgramStatus();
+  /// The committed Scenario activation Manager currently publishes: its
+  /// publication generation and Apply (identity and record digest), the
+  /// authored Program (null when
+  /// the Scenario has none), and every committed Apply of this publication
+  /// history (identity, record digest and Scenario), all read from one
+  /// Manager source snapshot.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  CommittedScenarioActivation();
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
   [[nodiscard]] ViewerModelAsset
   ViewerModelResource(std::string_view expected_retained_bundle_id,

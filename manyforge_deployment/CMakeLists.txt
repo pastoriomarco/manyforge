@@ -561,11 +561,6 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml
   mf_rt_profile)
 manyforge_embed_closed_schema(
-  kEmbeddedRuntimePolicySchema
-  runtime_policy
-  resources/closed_schema/catalog/manyforge.runtime_policy.v1.yaml
-  mf_rt_policy)
-manyforge_embed_closed_schema(
   kEmbeddedStopEvidencePolicySchema
   stop_evidence_policy
   resources/closed_schema/catalog/manyforge.stop_evidence_policy.v2.yaml
@@ -633,6 +628,17 @@ else()
     manyforge_deployment_runtime_contract_codec)
 endif()
 
+# The one Program expression engine (EXPRESSION_LANGUAGE_REFERENCE.md). It
+# depends only on the standard library so the Program contract, the Python
+# binding and the Program runner share it without the codec closure.
+add_library(manyforge_expression src/expression.cpp)
+add_library(manyforge::expression ALIAS manyforge_expression)
+target_include_directories(manyforge_expression PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+set_target_properties(
+  manyforge_expression PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Canonical projection/parsing, semantic contract verification, and retained-
 # bundle readback. This private substrate cannot mint retention
 # authority and is deliberately free of materializer, repository-writer,
@@ -671,6 +677,7 @@ add_library(manyforge_deployment_verification_core
   src/prepared_activation_input.cpp
   src/program_binding_outcome.cpp
   src/program_contract.cpp
+  src/program_value_path.cpp
   src/program_binding.cpp
   src/provider_manifest_codec.cpp
   src/runtime_program_binding.cpp
@@ -678,8 +685,7 @@ add_library(manyforge_deployment_verification_core
   src/runtime_contract_registry.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
-  src/runtime_policy_codec.cpp
-  src/retained_runtime_policy.cpp
+  src/retained_stop_deadline_budget.cpp
   src/stop_evidence_policy_codec.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
@@ -694,6 +700,7 @@ target_include_directories(manyforge_deployment_verification_core PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment_verification_core PUBLIC
   manyforge::content_identity
+  manyforge::expression
   ${MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES}
   ${MANYFORGE_RUNTIME_CONTRACT_CODEC_TARGET})
 set_target_properties(
@@ -1265,7 +1272,9 @@ if(BUILD_TESTING)
   target_compile_definitions(test_program_contract PRIVATE
     MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
-    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper"
+    MANYFORGE_VALUE_SOURCE_CONFORMANCE="${CMAKE_CURRENT_SOURCE_DIR}/resources/expression/program_value_source_conformance.v1.yaml"
+    MANYFORGE_POSE_VALUE_CONFORMANCE="${CMAKE_CURRENT_SOURCE_DIR}/resources/expression/program_pose_value_conformance.v1.yaml")
   target_include_directories(test_program_contract PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_program_contract PRIVATE
@@ -1658,6 +1667,10 @@ if(BUILD_TESTING)
     PrepareActivationIntentRejections
     "examples/ur5e_lite6_wall_grouped.scenario"
     --intent-rejections)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationStopLimitNames
+    "examples/lite6_pick_and_place.scenario"
+    --stop-limit-names)
 
   add_executable(test_model_source
     test/test_model_source.cpp)
@@ -1966,17 +1979,26 @@ if(BUILD_TESTING)
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
 
-  add_executable(test_runtime_policy_codec
-    test/test_runtime_policy_codec.cpp)
-  target_link_libraries(test_runtime_policy_codec PRIVATE
-    manyforge_deployment GTest::gtest_main)
-  gtest_discover_tests(test_runtime_policy_codec
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
   add_executable(test_stop_evidence_policy_codec
     test/test_stop_evidence_policy_codec.cpp)
   target_link_libraries(test_stop_evidence_policy_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_stop_evidence_policy_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_program_value_path test/test_program_value_path.cpp)
+  target_compile_definitions(test_program_value_path PRIVATE
+    MANYFORGE_VALUE_PATH_CONFORMANCE="${CMAKE_CURRENT_SOURCE_DIR}/resources/expression/value_path_conformance.v1.yaml")
+  target_link_libraries(test_program_value_path PRIVATE
+    manyforge_deployment PkgConfig::LIBYAML GTest::gtest_main)
+  gtest_discover_tests(test_program_value_path
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_expression test/test_expression.cpp)
+  target_compile_definitions(test_expression PRIVATE
+    MANYFORGE_EXPRESSION_CONFORMANCE="${CMAKE_CURRENT_SOURCE_DIR}/resources/expression/conformance.v1.yaml")
+  target_link_libraries(test_expression PRIVATE
+    manyforge_expression PkgConfig::LIBYAML GTest::gtest_main)
+  gtest_discover_tests(test_expression
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

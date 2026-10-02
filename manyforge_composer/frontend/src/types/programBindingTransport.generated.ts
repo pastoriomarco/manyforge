@@ -1,6 +1,6 @@
 /* GENERATED FILE -- program_binding_transport.v1.json; DO NOT EDIT. */
 
-export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy' | 'runtime_policy';
+export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy';
 export type ProgramModificationPolicyValue = 'forbidden' | 'human_approval' | 'llm_allowed';
 export type ProgramInterventionDelegate = 'forbidden' | 'human_only' | 'llm_allowed' | 'program_only';
 export type ProgramRecoveryAction = 'intervention' | 'runtime_override';

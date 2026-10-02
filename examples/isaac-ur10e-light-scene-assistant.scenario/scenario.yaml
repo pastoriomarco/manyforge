@@ -10,11 +10,11 @@
     "assignment.yaml": "sha256:0609b83a2c63f70215b846bae55b156fc1e15046d49c48f2c7b579f7b4be09a0",
     "deployment.yaml": "sha256:b6c5bc7bdf17db7518749d3e9b005a657a1e1d497daff56706bab1abfc292a7c",
     "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:381f2c0fc5b1eadb3dac574756676eb9d840a73a2592cc6f274a25e2bea0bfc7"
+    "program.yaml": "sha256:2c0a720af19f40eb78f00d506ff6668a5d9e77183e2e223d0ef30cec8eec9758"
   },
   "name": "isaac_manipulator_scene_light_assistant",
   "saved_status": {
-    "checked_content_digest": "sha256:f4a00152eb6e8bc044f21eff4c4a61415fefbd1b9ea35fcae14a5fae7c44210b",
+    "checked_content_digest": "sha256:de091d2045c574affb8442f21805b94b4e53bfc6379055c07b8ac894a50e4bb8",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

@@ -209,6 +209,27 @@ build_manyforge_headless() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+# Python Program validation, the runner and Composer evaluate expressions
+# through the one C++ engine binding; build just that module when the lane
+# has not built the headless tree yet, and put it on PYTHONPATH.
+setup_expression_binding() {
+    local build="$BUILD_DIR/headless"
+    local pybind11_cmake_dir
+    if [[ ! -f "$build/CMakeCache.txt" ]]; then
+        pybind11_cmake_dir="$(
+            python3 -c 'import pybind11; print(pybind11.get_cmake_dir())'
+        )"
+        cmake -S "$WORKSPACE/manyforge_headless" -B "$build" -G "$BUILD_GENERATOR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
+            -Dpybind11_DIR="$pybind11_cmake_dir" 2>&1 | tail -3
+    fi
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
+        --target manyforge_headless_py 2>&1 | tail -3
+    export PYTHONPATH="$build:${PYTHONPATH:-}"
+    python_has_modules manyforge_headless_py
+}
+
 run_cpp_tests() {
     section "C++ manyforge_content_identity tests"
     local identity_build="$BUILD_DIR/content-identity"
@@ -542,6 +563,11 @@ run_python_tests() {
     section "Retained Python behavior and observation tests"
     cd "$WORKSPACE"
     setup_pythonpath
+    if ! setup_expression_binding; then
+        echo -e "${RED}  FAIL: the expression engine binding (manyforge_headless_py) is unavailable${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
     if pytest \
         manyforge_behavior/tests/ \
         manyforge_operator/tests/ \
@@ -605,6 +631,11 @@ run_composer_backend_tests() {
     # dependency is a hard lane failure, never a skipped runtime test.
     if ! python_has_modules fastapi httpx yaml; then
         echo -e "${RED}  FAIL: missing Python deps for Composer structural-shell tests — run in the dev container${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if ! setup_expression_binding; then
+        echo -e "${RED}  FAIL: the expression engine binding (manyforge_headless_py) is unavailable${NC}"
         FAIL=$((FAIL + 1))
         return
     fi

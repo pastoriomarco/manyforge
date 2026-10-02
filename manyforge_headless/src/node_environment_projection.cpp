@@ -386,7 +386,9 @@ struct DeferredAdapter final {
   std::string_view gate;
 };
 
-constexpr std::array<DeferredAdapter, 5U> kDeferredAdapters{{
+constexpr std::array<DeferredAdapter, 6U> kDeferredAdapters{{
+    {"io.check_input", "semantic_io_node_adapter_unavailable_until_i11", "I11",
+     "T"},
     {"io.get_input", "semantic_io_node_adapter_unavailable_until_i11", "I11",
      "T"},
     {"io.set_output", "semantic_io_node_adapter_unavailable_until_i11", "I11",

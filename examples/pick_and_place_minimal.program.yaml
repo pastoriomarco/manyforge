@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_minimal
-program_revision: sha256:0de1602d3f61777d9ac006202378727703ad069680e0be35f9c39488672ca807
+program_revision: sha256:4825e96be7777551227dc329d3e67fee9059477e5aa994fedcd9dae6b8d61181
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: >-
@@ -9,7 +9,7 @@ description: >-
   resource.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: forbidden

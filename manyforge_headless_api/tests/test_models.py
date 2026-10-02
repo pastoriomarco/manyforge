@@ -425,6 +425,18 @@ def _pick_request() -> dict[str, object]:
         {"type": "scene_resource", "scene_resource_id": "workpiece"},
         {"type": "runtime_object", "runtime_object_id": "selected_object"},
         {"type": "pose", "pose": _planning_pose()},
+        # Pick offsets accept the same forms as motion references, including
+        # the cell frame and another robot's frame.
+        {"type": "cell_frame"},
+        {
+            "type": "frame_role",
+            "frame_role_id": "frame-role:tcp",
+            "target": {
+                "target_role_id": "observer_arm",
+                "controllable_component_id": "observer.component",
+                "command_target_id": "observer.command",
+            },
+        },
     ],
 )
 def test_pick_offset_reference_uses_closed_portable_forms(
@@ -434,11 +446,16 @@ def test_pick_offset_reference_uses_closed_portable_forms(
     synthesis = request["synthesis"]
     assert isinstance(synthesis, dict)
     synthesis["pick_offset_reference"] = reference
+    synthesis["approach_offset_reference"] = reference
 
     parsed = PickSequencePlanningRequest.model_validate(request)
 
     assert parsed.synthesis.pick_offset_reference is not None
     assert parsed.synthesis.pick_offset_reference.model_dump(mode="json") == (reference)
+    assert parsed.synthesis.approach_offset_reference is not None
+    assert parsed.synthesis.approach_offset_reference.model_dump(mode="json") == (
+        reference
+    )
 
 
 def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
@@ -552,6 +569,16 @@ def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> No
     [
         {"type": "frame_role", "frame_role_id": "base"},
         {
+            "type": "frame_role",
+            "frame_role_id": "tcp",
+            "target": {
+                "target_role_id": "peer",
+                "controllable_component_id": "robot.2",
+                "command_target_id": "arm.command",
+            },
+        },
+        {"type": "cell_frame"},
+        {
             "type": "component_body_role",
             "collision_body_role_id": "wrist_collision",
         },
@@ -574,6 +601,48 @@ def test_relative_motion_accepts_closed_portable_references(
     assert parsed.target_mode == "relative"
     assert parsed.target_reference is not None
     assert parsed.target_reference.model_dump(mode="json") == reference
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "cell_frame"},
+        {"type": "scene_resource", "scene_resource_id": "fixture"},
+        {
+            "type": "frame_role",
+            "frame_role_id": "tcp",
+            "target": {
+                "target_role_id": "peer",
+                "controllable_component_id": "robot.2",
+                "command_target_id": "arm.command",
+            },
+        },
+    ],
+)
+def test_absolute_goal_frame_is_one_named_frame_and_absent_means_base(frame) -> None:
+    request = _planning_motion("framed", {"kind": "pose_goal", "goal": _planning_pose()})
+    assert "goal_frame_reference" not in MotionParticipantRequest.model_validate(
+        request
+    ).model_dump(mode="json")
+    request["goal_frame_reference"] = frame
+    parsed = MotionParticipantRequest.model_validate(request)
+    assert parsed.model_dump(mode="json")["goal_frame_reference"] == frame
+    path = _planning_motion("framed-path", _cartesian_path())
+    path["goal_frame_reference"] = frame
+    MotionParticipantRequest.model_validate(path)
+    relative = {**request, "target_mode": "relative", "target_reference": {"type": "cell_frame"}}
+    with pytest.raises(ValidationError, match="goal_frame_reference requires an absolute"):
+        MotionParticipantRequest.model_validate(relative)
+    joint = _planning_motion(
+        "joint", {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.0]}
+    )
+    joint["goal_frame_reference"] = frame
+    with pytest.raises(ValidationError, match="goal_frame_reference requires an absolute"):
+        MotionParticipantRequest.model_validate(joint)
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(
+            {**request, "goal_frame_reference": {"type": "pose", "pose": _planning_pose()}}
+        )
 
 
 def test_motion_reference_shape_fails_closed_before_native_admission() -> None:

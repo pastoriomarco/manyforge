@@ -15,7 +15,10 @@ from manyforge_behavior.assistant_program_port import (
     HeadlessProgramSceneSource,
     ProgramAssistantPort,
 )
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    KernelOperationAdmissionRejectedError,
+)
 from manyforge_behavior.orchestration_ports import OwnerTaskState
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
@@ -25,6 +28,7 @@ from manyforge_behavior.nodes.stop_policy import (
 from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
+    FrameTransformError,
     NodeAttemptIdentity,
     OwnerInvocationHeldError,
     OwnerNodeInputs,
@@ -39,6 +43,7 @@ from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
     NativeKernelProgramPort,
     ProductionPortError,
+    _owner_failure_message,
 )
 
 
@@ -666,6 +671,8 @@ def _context() -> ProgramRunPortContext:
                 {
                     "target_role_id": "arm",
                     "component_role_id": "robot",
+                    "controllable_component_id": "robot.1",
+                    "command_target_id": "arm.command",
                     "capability_bindings": [
                         {
                             "capability_id": "execution.trajectory.execute",
@@ -684,6 +691,8 @@ def _context() -> ProgramRunPortContext:
                 {
                     "target_role_id": "gripper",
                     "component_role_id": "tool",
+                    "controllable_component_id": "tool.1",
+                    "command_target_id": "gripper.command",
                     "capability_bindings": [
                         {
                             "capability_id": "tool.gripper.command",
@@ -968,6 +977,221 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     assert "compiled_frame_name" not in repr(request)
 
 
+_ARM = {
+    "target_role_id": "arm",
+    "controllable_component_id": "robot.1",
+    "command_target_id": "arm.command",
+}
+_GRIPPER = {
+    "target_role_id": "gripper",
+    "controllable_component_id": "tool.1",
+    "command_target_id": "gripper.command",
+}
+
+
+def _absolute_inputs(node_id: str, frames: list[Any]) -> OwnerNodeInputs:
+    parameters = dict(_motion_inputs().parameters)
+    parameters.update(target_mode="absolute", target_reference=None, offset_reference=None)
+
+    def pose(frame: Any) -> dict[str, Any]:
+        value = {"position_m": [0.1, 0.0, 0.2], "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}}
+        return value if frame is None else {**value, "frame_ref": frame}
+
+    if node_id == "motion.move_to_pose":
+        parameters["goal"] = pose(frames[0])
+    else:
+        parameters.pop("goal")
+        parameters.update(
+            path=[pose(frame) for frame in frames],
+            max_translation_step_m=0.005,
+            max_rotation_step_rad=0.05,
+            max_angular_speed_rad_s=0.5,
+            max_linear_acceleration_mps2=0.5,
+            max_angular_acceleration_rad_s2=2.5,
+            fallback_policy="fail_closed",
+            max_blend_deviation_rad=0.01,
+        )
+    return OwnerNodeInputs(parameters=parameters)
+
+
+_BASE = {"kind": "target_frame", "target_role": "arm", "frame_role": "base"}
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (None, None),
+        (_BASE, None),
+        ({"kind": "cell_frame"}, {"type": "cell_frame"}),
+        (
+            {"kind": "scene_resource", "scene_resource_id": "fixture"},
+            {"type": "scene_resource", "scene_resource_id": "fixture"},
+        ),
+        (
+            {"kind": "target_frame", "target_role": "arm", "frame_role": "tcp"},
+            {"type": "frame_role", "frame_role_id": "tcp", "target": _ARM},
+        ),
+        (
+            {"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"},
+            {"type": "frame_role", "frame_role_id": "tcp", "target": _GRIPPER},
+        ),
+    ],
+)
+@pytest.mark.parametrize("node_id", ["motion.move_to_pose", "motion.follow_cartesian_path"])
+def test_absolute_goal_frame_is_forwarded_as_one_goal_frame_reference(
+    node_id, frame, expected
+) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    frames = [frame] if node_id == "motion.move_to_pose" else [frame, frame]
+
+    port.operations.start(node_id, _identity(), _absolute_inputs(node_id, frames))
+
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["target_mode"] == "absolute"
+    assert payload.get("goal_frame_reference") == expected
+    assert ("goal_frame_reference" in payload) is (expected is not None)
+    # The goal coordinates are forwarded unchanged; the owner resolves the frame.
+    goal = payload["motion"]["goal"] if node_id == "motion.move_to_pose" else (
+        payload["motion"]["waypoints"][0]
+    )
+    assert goal["position_m"] == {"x_m": 0.1, "y_m": 0.0, "z_m": 0.2}
+
+
+@pytest.mark.parametrize(
+    ("node_id", "frames", "target_mode", "message"),
+    [
+        (
+            "motion.follow_cartesian_path",
+            [{"kind": "cell_frame"}, _BASE],
+            "absolute",
+            "waypoints must all use one frame",
+        ),
+        ("motion.move_to_pose", [{"kind": "cell_frame"}], "relative", "relative goal"),
+        (
+            "motion.move_to_pose",
+            [{"kind": "target_frame", "target_role": "ghost", "frame_role": "tcp"}],
+            "absolute",
+            "absent from the Program Binding",
+        ),
+    ],
+)
+def test_goal_frames_the_owner_cannot_take_fail_before_submission(
+    node_id, frames, target_mode, message
+) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = _absolute_inputs(node_id, frames)
+    if target_mode == "relative":
+        inputs = OwnerNodeInputs(
+            parameters={
+                **inputs.parameters,
+                "target_mode": "relative",
+                "target_reference": {"type": "cell_frame"},
+            }
+        )
+
+    with pytest.raises(ProductionPortError, match=message):
+        port.operations.start(node_id, _identity(), inputs)
+
+    assert transport.submissions == []
+
+
+def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = OwnerNodeInputs(
+        parameters={
+            **_motion_inputs().parameters,
+            "target_reference": {
+                "type": "frame_role",
+                "frame_role_id": "tcp",
+                "target_role": "gripper",
+            },
+            "offset_reference": {"type": "cell_frame"},
+        }
+    )
+
+    port.operations.start("motion.move_to_pose", _identity(), inputs)
+
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["target_reference"] == {
+        "type": "frame_role",
+        "frame_role_id": "tcp",
+        "target": _GRIPPER,
+    }
+    assert payload["offset_reference"] == {"type": "cell_frame"}
+    assert "goal_frame_reference" not in payload
+
+
+def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -> None:
+    queries: list[dict[str, Any]] = []
+
+    class TransformTransport(_Transport):
+        refusal: str | None = None
+
+        def query_target(self, query):
+            queries.append(deepcopy(query))
+            if self.refusal is not None:
+                raise KernelOperationAdmissionRejectedError(
+                    "missing_reference", "robot is hosted elsewhere", {"reason": self.refusal}
+                )
+            return {
+                "ok": True,
+                "target_observation": {
+                    **query,
+                    "schema_version": "manyforge.target_observation.v1",
+                    "evaluated_at_ns": 12,
+                    "scene_revision": {"scene_id": _DIGEST_A, "revision_id": 4, "content_hash": _DIGEST_B},
+                    "resolution_evidence_digests": [_DIGEST_C],
+                    "value": {
+                        "position_m": {"x_m": 1.0, "y_m": 2.0, "z_m": 3.0},
+                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    },
+                },
+            }
+
+    transport = TransformTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    pose = {
+        "frame_ref": {"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"},
+        "position_m": [0.0, 0.0, 0.1],
+        "orientation": {"rpy_deg": [0.0, 0.0, 0.0]},
+    }
+
+    result = port.queries.express_pose(_identity("bounds"), pose, {"kind": "cell_frame"})
+
+    assert queries == [
+        {
+            "schema_version": "manyforge.target_observation_query.v1",
+            "owner_epoch": "kernel.epoch.7",
+            "program_binding_id": _DIGEST_A,
+            "kind": "frame_transform",
+            "pose": {
+                "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.1},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+            "source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": _GRIPPER},
+            "target_frame": {"type": "cell_frame"},
+        }
+    ]
+    assert result.pose == {
+        "frame_ref": {"kind": "cell_frame"},
+        "position_m": [1.0, 2.0, 3.0],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    assert result.metadata["evaluated_at_ns"] == 12
+    transport.refusal = "program_reference_robot_not_local"
+    with pytest.raises(FrameTransformError) as refused:
+        port.queries.express_pose(_identity("bounds"), pose, {"kind": "cell_frame"})
+    assert refused.value.reason_code == "program_reference_robot_not_local"
+    assert transport.submissions == []
+
+
 def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
     transport = _LostAcceptanceReplyTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1113,6 +1337,53 @@ def test_failed_native_operation_is_observed_as_a_failure_with_its_owner_reason(
     assert snapshot.state is OwnerTaskState.FAILED
     assert snapshot.reason_code == (
         "planning_failed" if operation.get("participants") else "operation_failed"
+    )
+
+
+def test_owner_failures_name_the_reference_that_failed() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    operation = transport.operations[started.task_id]
+    operation.update({"state": "failed", "operation_revision": 3})
+    details = {
+        "reason": "program_reference_robot_frame_missing",
+        "reference_type": "frame_role",
+        "reference_id": "tcp",
+        "target_role_id": "gripper",
+    }
+    operation["participants"] = [
+        {
+            "terminal_error": {
+                "code": "missing_reference",
+                "message": "robot frame role is absent from the retained target map",
+                "details": dict(details),
+            }
+        }
+    ]
+
+    snapshot = port.operations.observe(started.task_id)
+
+    assert snapshot.state is OwnerTaskState.FAILED
+    assert snapshot.reason_code == "missing_reference"
+    assert snapshot.message == (
+        "robot frame role is absent from the retained target map "
+        "(program_reference_robot_frame_missing; "
+        "reference frame_role 'tcp' of target role 'gripper')"
+    )
+    rejected = KernelOperationAdmissionRejectedError(
+        "missing_reference",
+        "Program reference names a scene resource absent from the retained snapshot",
+        {
+            "reason": "program_scene_resource_missing",
+            "reference_type": "scene_resource",
+            "reference_id": "bin",
+        },
+    )
+    assert _owner_failure_message(rejected) == (
+        "Program reference names a scene resource absent from the retained snapshot "
+        "(program_scene_resource_missing; reference scene_resource 'bin')"
     )
 
 
@@ -2007,6 +2278,53 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
             "no_feasible_plan_policy": policy,
         }
     )
+
+
+def test_pick_offsets_accept_cell_and_other_robot_frames_like_motion_references() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = _pick_inputs()
+    parameters = dict(inputs.parameters)
+    synthesis = dict(parameters["synthesis"])
+    synthesis["pick_offset_reference"] = {"type": "cell_frame"}
+    synthesis["approach_offset_reference"] = {
+        "type": "frame_role",
+        "frame_role_id": "tcp",
+        "target_role": "gripper",
+    }
+    parameters["synthesis"] = synthesis
+
+    result = port.operations.start(
+        "planning.plan_pick_sequence",
+        _identity("plan-pick-offsets"),
+        OwnerNodeInputs(parameters=parameters),
+    )
+
+    assert result.state is OwnerTaskState.SUCCEEDED
+    forwarded = transport.pick_requests[-1]["synthesis"]
+    assert forwarded["pick_offset_reference"] == {"type": "cell_frame"}
+    # The robot qualifier resolves through the captured Program Binding, the
+    # same mapping a motion reference uses.
+    assert forwarded["approach_offset_reference"] == {
+        "type": "frame_role",
+        "frame_role_id": "tcp",
+        "target": _GRIPPER,
+    }
+
+    synthesis["approach_offset_reference"] = {
+        "type": "frame_role",
+        "frame_role_id": "tcp",
+        "target_role": "unbound_robot",
+    }
+    requests = len(transport.pick_requests)
+    with pytest.raises(ProductionPortError, match="absent from the Program Binding"):
+        port.operations.start(
+            "planning.plan_pick_sequence",
+            _identity("plan-pick-unbound-offset"),
+            OwnerNodeInputs(parameters=parameters),
+        )
+    assert len(transport.pick_requests) == requests
 
 
 def test_pick_planning_assembles_portable_intent_without_prepared_authority() -> None:
@@ -2962,7 +3280,7 @@ def test_lost_scene_reply_is_observed_while_held_without_replaying_the_action() 
         attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
         input_resolver=SimpleNamespace(
             snapshot=lambda **kwargs: SimpleNamespace(
-                parameters=kwargs["parameters"], blackboard={}, embedded_values={}
+                parameters=kwargs["parameters"], blackboard={}
             )
         ),
     )
@@ -3053,7 +3371,7 @@ def test_scene_rejected_by_stop_stays_unstarted_until_a_newer_release(lose_reply
         attempt_source=SimpleNamespace(begin=begin),
         input_resolver=SimpleNamespace(
             snapshot=lambda **kwargs: SimpleNamespace(
-                parameters=kwargs["parameters"], blackboard={}, embedded_values={}
+                parameters=kwargs["parameters"], blackboard={}
             )
         ),
     )
@@ -3360,3 +3678,80 @@ def test_stale_scene_projection_fails_before_a_node_commit() -> None:
     assert result.succeeded is False
     assert "captured Program deployment" in result.message
     assert transport.submissions == []
+
+
+def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> None:
+    class _ResolvingTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__(populated=True)
+            self.queries: list[dict[str, Any]] = []
+
+        def scene(self) -> dict[str, Any]:
+            projection = super().scene()
+            # A read does not need Scene writes to be open.
+            projection["logical_scene"]["payload"]["access"]["scene_writes_open"] = False
+            return projection
+
+        def resolve_scene_resources(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.queries.append(deepcopy(dict(body)))
+            return {
+                "api_version": "manyforge.scene_resource_pose_response.v1",
+                "projection_revision": deepcopy(self.revision),
+                "poses": [
+                    {
+                        "scene_resource_id": body["scene_resource_ids"][0],
+                        "pose_in_cell": {
+                            "position_m": {"x": 0.5, "y": 0.0, "z": 0.25},
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 2.0],
+                        },
+                    }
+                ],
+            }
+
+    transport = _ResolvingTransport()
+    port = _scene_port(transport)
+    port.bind(_scene_context())
+
+    def read(resource_id: str):
+        return port.invoke(
+            "scene.get_object_pose",
+            _identity(f"read-{resource_id}"),
+            OwnerNodeInputs(
+                parameters={"scene_resource_id": resource_id, "output_key": "pose"}
+            ),
+        )
+
+    fixed = read("old-support")
+    assert fixed.succeeded is True
+    assert fixed.output == {
+        "frame_ref": {"kind": "cell_frame"},
+        "position_m": [1.0, 2.0, 3.0],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    assert fixed.metadata == {"placement": "cell_fixed"}
+    carried = read("old-part")
+    assert carried.succeeded is True
+    assert carried.output["position_m"] == [0.5, 0.0, 0.25]
+    assert carried.output["orientation"] == {"xyzw": [0.0, 0.0, 0.0, 1.0]}
+    assert transport.queries == [
+        {
+            "api_version": "manyforge.scene_resource_pose_query.v1",
+            "expected_projection_revision": transport.revision,
+            "scene_resource_ids": ["old-part"],
+        }
+    ]
+    absent = read("missing")
+    assert absent.succeeded is False
+    assert "absent from the logical scene" in absent.message
+    assert transport.submissions == []
+
+    plain = _SceneTransport(populated=True)
+    plain_port = _scene_port(plain)
+    plain_port.bind(_scene_context())
+    unresolved = plain_port.invoke(
+        "scene.get_object_pose",
+        _identity("read-carried"),
+        OwnerNodeInputs(parameters={"scene_resource_id": "old-part", "output_key": "pose"}),
+    )
+    assert unresolved.succeeded is False
+    assert "carried-object pose projection is unavailable" in unresolved.message

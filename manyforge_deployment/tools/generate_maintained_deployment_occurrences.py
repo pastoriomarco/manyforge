@@ -388,7 +388,6 @@ SCHEMA_SOURCES: Final = {
     "model_asset": "manyforge_deployment/resources/closed_schema/catalog/manyforge.model_asset.v1.yaml",
     "provider_manifest": "manyforge_deployment/resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml",
     "runtime_profile": "manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml",
-    "runtime_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_policy.v1.yaml",
     "stop_evidence_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.stop_evidence_policy.v2.yaml",
 }
 
@@ -1785,30 +1784,6 @@ def ros2_control_runtime_profile() -> dict[str, Any]:
     )
 
 
-def deployment_runtime_policy(
-    deployment: dict[str, Any], *, ros2_control: bool
-) -> dict[str, Any]:
-    policy_id = "manyforge.runtime_motion." + deployment["deployment_artifact_id"]
-    value = {
-        "api_version": "manyforge.runtime_policy.v1",
-        "runtime_policy_id": policy_id,
-        "description": (
-            "Maintained "
-            + ("ros2_control" if ros2_control else "native")
-            + " motion policy for "
-            + deployment["deployment_artifact_id"]
-        ),
-        "interrupt_policy_ids": [],
-        "open_loop_grasp_acknowledgements": [],
-    }
-    return revisioned_document(
-        value,
-        domain="catalog-record-revision/runtime_policy",
-        api_version="manyforge.runtime_policy.v1",
-        revision_field="runtime_policy_revision",
-    )
-
-
 def catalog_sources(
     root: Path,
     description: dict[str, Any],
@@ -2054,35 +2029,6 @@ def catalog_sources(
         value=ros_runtime,
         canonical_output=True,
     )
-
-    runtime_profiles_by_id = {
-        profile["runtime_restoration_profile_id"]: profile
-        for profile in description["runtime_restoration_profiles"]
-    }
-    for deployment in description["deployments"]:
-        restoration = runtime_profiles_by_id[
-            deployment["runtime_restoration_profile_id"]
-        ]
-        runtime_policy = deployment_runtime_policy(
-            deployment,
-            ros2_control="ros2_control_runtime" in restoration,
-        )
-        sources[f"runtime_policy:{deployment['deployment_artifact_id']}"] = (
-            generated_catalog_document(
-                root=root,
-                relative_path=(
-                    "manyforge_deployment/resources/maintained/catalog/"
-                    f"runtime_policy/{runtime_policy['runtime_policy_id']}.json"
-                ),
-                kind="runtime_policy",
-                record_id=runtime_policy["runtime_policy_id"],
-                record_revision=runtime_policy["runtime_policy_revision"],
-                schema_id="manyforge.runtime_policy.v1",
-                schema_revision=schemas["runtime_policy"],
-                value=runtime_policy,
-                canonical_output=True,
-            )
-        )
 
     component_references: dict[str, dict[str, str]] = {}
     fixed_scale_profiles = {
@@ -2581,7 +2527,6 @@ def operator_stop_contract_parameters(
 
 def stop_policy_projection(
     graph: dict[str, Any],
-    runtime_policy_ref: dict[str, str],
     family: dict[str, Any],
     runtime_restoration_profile: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2642,7 +2587,7 @@ def stop_policy_projection(
         )
     )
     return {
-        "retained_policy_records": [copy.deepcopy(runtime_policy_ref)],
+        "retained_policy_records": [],
         "stop_stage_parameters": stop_stage_parameters,
         # Explicit new example settings, not a reinterpretation of the old
         # catalog's outer envelope. ROS/controller-backed examples retain a
@@ -2850,7 +2795,6 @@ def deployment_candidate(
         ("provider:ros2_control" if ros2_control else "provider:control"),
         *([] if ros2_control else ["provider:planning"]),
         ("runtime:ros2_control" if ros2_control else "runtime"),
-        f"runtime_policy:{deployment['deployment_artifact_id']}",
         "stop:arm",
         "stop:goal_cancel",
         f"topology:{key_prefix}arm",
@@ -2894,7 +2838,6 @@ def deployment_candidate(
         "capability_provider_bindings": provider_bindings,
         "policies": stop_policy_projection(
             graph,
-            refs[f"runtime_policy:{deployment['deployment_artifact_id']}"],
             family,
             runtime_restoration_profile,
         ),

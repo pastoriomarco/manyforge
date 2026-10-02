@@ -796,9 +796,7 @@ def _edit_motion_target_limit(
 ) -> dict[str, Any]:
     """Edit one exact Deployment-owned target ceiling.
 
-    The immutable catalog runtime policy remains untouched.  Runtime combines
-    this authored ceiling with that policy conservatively after both sources
-    have been independently verified.
+    This authored ceiling is the target's sole configured TCP-speed maximum.
     """
 
     if (

@@ -20,7 +20,6 @@
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
-#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -100,8 +99,7 @@ template <typename Record>
                                                                                          bounded) ||
         append_catalog_record_ref_if_exact_type<ContactPolicyCatalogRecordRefDTO>(item, bounded) ||
         append_catalog_record_ref_if_exact_type<StopEvidencePolicyCatalogRecordRefDTO>(item,
-                                                                                       bounded) ||
-        append_catalog_record_ref_if_exact_type<RuntimePolicyCatalogRecordRefDTO>(item, bounded);
+                                                                                       bounded);
     if (!appended) {
       throw py::type_error(std::string(argument_name) +
                            " must contain only CatalogRecordRefDTO values");
@@ -1300,14 +1298,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
                                return deployment::canonical_json(profile.normalized_root());
                              });
 
-  py::class_<deployment::QualifiedRuntimePolicy>(module, "QualifiedRuntimePolicy", py::is_final())
-      .def_property_readonly("value", &deployment::QualifiedRuntimePolicy::value)
-      .def_property_readonly("normalized_canonical_json",
-                             [](const deployment::QualifiedRuntimePolicy& policy) {
-                               py::gil_scoped_release release;
-                               return deployment::canonical_json(policy.normalized_root());
-                             });
-
   py::class_<deployment::QualifiedStopEvidencePolicy>(module, "QualifiedStopEvidencePolicy",
                                                       py::is_final())
       .def_property_readonly("value", &deployment::QualifiedStopEvidencePolicy::value)
@@ -1443,9 +1433,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
   module.def("resolve_and_qualify_runtime_profile",
              &deployment::resolve_and_qualify_runtime_profile, py::arg("reference"),
              py::arg("resolved_store_key"), py::arg("stored_bytes"),
-             py::call_guard<py::gil_scoped_release>());
-  module.def("resolve_and_qualify_runtime_policy", &deployment::resolve_and_qualify_runtime_policy,
-             py::arg("reference"), py::arg("resolved_store_key"), py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());
   module.def("resolve_and_qualify_stop_evidence_policy",
              &deployment::resolve_and_qualify_stop_evidence_policy, py::arg("reference"),

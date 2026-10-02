@@ -97,6 +97,14 @@ dependency-internal fixes are carried:
    distribution metadata. The build requirements remain unchanged and the
    dependency-stack verifier continues to prove the selected native linkage.
 
+Patches 0010 through 0013 are the rebased 0.7 successors of the retired 0.6
+series 0005, 0006, 0008 and 0009. Those 0.6 bodies are no longer kept in this
+directory: the external-delta ledger binds each to its exact Git blob at
+ManyForge commit `6ff42c4cf70be415159624adba1428100a2ee116`, the last commit
+that applied them, and byte-identical E1 evidence copies remain under
+`verification/composable_cell_e1/patches/` for the frozen 0.6 restoration
+closure.
+
 Each dossier freezes the clean reproduction, impact, smallest patch,
 compatibility risk, focused evidence, intended upstream contract, and
 objective removal predicate. Upstream submission follows E1; the reproducible

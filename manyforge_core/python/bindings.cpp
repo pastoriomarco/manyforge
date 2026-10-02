@@ -306,6 +306,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kSceneResource", manyforge::core::ReferenceDTO::Type::kSceneResource)
       .value("kRuntimeObject", manyforge::core::ReferenceDTO::Type::kRuntimeObject)
       .value("kPose", manyforge::core::ReferenceDTO::Type::kPose)
+      .value("kCellFrame", manyforge::core::ReferenceDTO::Type::kCellFrame)
       .export_values();
 
   py::class_<manyforge::core::ReferenceDTO>(m, "ReferenceDTO")

@@ -9,7 +9,7 @@ namespace manyforge::core {
 
 /// Bounded cold-path evidence for one exact prepared motion participant.
 ///
-/// This deliberately retains only the measurements and policy identity needed
+/// This deliberately retains only the measurements and speed facts needed
 /// to explain the accepted trajectory.  The trajectory itself remains in the
 /// immutable prepared participant and is not duplicated in the operation
 /// journal.
@@ -19,7 +19,6 @@ struct PreparedMotionDiagnosticsDTO final {
   MoveId move_id;
   std::vector<std::string> joint_names;
   TrajectoryValidationMetricsDTO trajectory_metrics;
-  PreparedRuntimePolicyRefDTO runtime_policy;
   std::optional<double> requested_tcp_linear_speed_mps;
   double deployment_maximum_tcp_linear_speed_mps{};
   double admitted_tcp_linear_speed_mps{};

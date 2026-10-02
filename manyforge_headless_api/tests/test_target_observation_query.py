@@ -207,3 +207,101 @@ def test_owner_rejection_is_not_retried_or_replaced_by_cached_state():
         client.query_target(TargetObservationQuery.model_validate(_query()))
     assert caught.value.code == "observation_expired"
     assert len(requests) == 1
+
+
+_ROBOT = {
+    "target_role_id": "peer",
+    "controllable_component_id": "robot.2",
+    "command_target_id": "arm.command",
+}
+
+
+def _transform_query(**change):
+    return {
+        "schema_version": "manyforge.target_observation_query.v1",
+        "owner_epoch": "owner.1",
+        "program_binding_id": "sha256:" + "a" * 64,
+        "kind": "frame_transform",
+        "pose": {
+            "position_m": {"x_m": 0.1, "y_m": 0.0, "z_m": 0.2},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": _ROBOT},
+        "target_frame": {"type": "cell_frame"},
+        **change,
+    }
+
+
+def _transform_response(query):
+    return {
+        "ok": True,
+        "command": "query_target",
+        "api_version": "manyforge.execution_command_response.v1",
+        "target_observation": {
+            **query,
+            "schema_version": "manyforge.target_observation.v1",
+            "evaluated_at_ns": "18446744073",
+            "scene_revision": {
+                "scene_id": "sha256:" + "c" * 64,
+                "revision_id": 3,
+                "content_hash": "sha256:" + "d" * 64,
+            },
+            "resolution_evidence_digests": ["sha256:" + "e" * 64],
+            "value": {
+                "position_m": {"x_m": 1.0, "y_m": 2.0, "z_m": 3.0},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+        },
+    }
+
+
+def test_frame_transform_names_two_frames_and_no_target_and_keeps_its_answer_shape():
+    query = _transform_query()
+    response = _transform_response(query)
+    client, requests = _client(response)
+
+    assert client.query_target(TargetObservationQuery.model_validate(query)) == response
+    assert requests[0]["query"] == query
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"target_role_id": "arm"},
+        {"frame_role_id": "tcp"},
+        {"pose": None},
+        {"target_frame": None},
+        # A transform frame role always names its robot.
+        {"source_frame": {"type": "frame_role", "frame_role_id": "tcp"}},
+        {"source_frame": {"type": "pose", "pose": None}},
+        {"source_frame": {"type": "frame_role", "frame_role_id": "tcp", "target": {}}},
+    ],
+)
+def test_frame_transform_query_is_closed(change):
+    with pytest.raises(ValidationError):
+        TargetObservationQuery.model_validate(_transform_query(**change))
+    with pytest.raises(ValidationError):
+        TargetObservationQuery.model_validate({**_query(), "pose": _transform_query()["pose"]})
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"source_epoch": "source.1"},
+        {"evaluated_at_ns": -1},
+        {"scene_revision": None},
+        {"resolution_evidence_digests": ["sha256:" + "e" * 64] * 2},
+        {"resolution_evidence_digests": ["not a digest"]},
+        {"target_frame": {"type": "scene_resource", "scene_resource_id": "table"}},
+        {"value": {"position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
+                   "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}}},
+    ],
+)
+def test_frame_transform_answer_must_echo_one_evaluation(change):
+    query = _transform_query()
+    response = _transform_response(query)
+    response["target_observation"].update(change)
+    client, _ = _client(response)
+    with pytest.raises(HeadlessApiError) as caught:
+        client.query_target(TargetObservationQuery.model_validate(query))
+    assert caught.value.code == "execution_target_observation_invalid"

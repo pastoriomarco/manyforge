@@ -81,30 +81,22 @@ export interface ManualCartesianDefaults {
 
 /**
  * The Program's Cartesian defaults for manual moves. Program values reach
- * motion through Apply, so the Applied Program supplies them; an unapplied
- * Draft change takes effect at once only where it is stricter (smaller
- * tolerance, less blending). Without an Applied Program the manual defaults
- * stand in for it.
+ * motion through Apply, so the Applied Program supplies them. Without an
+ * Applied Program the manual defaults stand in for it.
  */
-export function stricterCartesianDefaults(
+export function appliedCartesianDefaults(
   applied: ManualCartesianDefaults | null,
-  draft: ManualCartesianDefaults | null,
 ): ManualCartesianDefaults {
-  const base = applied ?? {
+  return applied ?? {
     translationToleranceM: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianTranslationToleranceM,
     maxBlendDeviationRad: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
-  };
-  if (draft === null) return base;
-  return {
-    translationToleranceM: Math.min(base.translationToleranceM, draft.translationToleranceM),
-    maxBlendDeviationRad: Math.min(base.maxBlendDeviationRad, draft.maxBlendDeviationRad),
   };
 }
 
 /**
  * Tolerance and blend are defaults, not limits: the operator may set any
  * valid value for a manual move. When the Program default itself changes
- * (Apply, or a stricter unapplied Draft), the manual value takes it.
+ * (Apply), the manual value takes it.
  */
 function followCartesianDefault(current: number, previous: number | null, next: number): number {
   return previous === next ? current : next;

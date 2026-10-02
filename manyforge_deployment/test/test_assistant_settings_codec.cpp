@@ -78,7 +78,7 @@ assistant_document(std::string modes = mode(),
                        "\"choose_object_v1\":{"
                        "\"version\":\"1\","
                        "\"template_text\":\"Choose {{object_id}}\","
-                       "\"variable_ids\":[\"object_id\"],"
+                       "\"variables\":{\"object_id\":\"string\"},"
                        "\"response_contract\":{"
                        "\"response_mode\":\"json_object\"}}") {
   return std::string(
@@ -101,7 +101,7 @@ model_query_document(std::string_view prompt_templates =
                          "\"choose_object_v1\":{"
                          "\"version\":\"1\","
                          "\"template_text\":\"Choose {{object_id}}\","
-                         "\"variable_ids\":[\"object_id\"],"
+                         "\"variables\":{\"object_id\":\"string\"},"
                          "\"response_contract\":{"
                          "\"response_mode\":\"json_object\"}}",
                      std::string model_endpoint_aliases = model_alias(),
@@ -388,8 +388,8 @@ TEST(AssistantSettingsCodec,
   EXPECT_EQ(
       node_ids,
       (std::vector<std::string>{
-          "fallback", "gripper.command_position", "inverter", "logic.set_bool",
-          "logic.wait_for_bool", "motion.follow_cartesian_path",
+          "fallback", "gripper.command_position", "inverter", "logic.set_value",
+          "logic.wait_for_value", "motion.follow_cartesian_path",
           "motion.move_to_joint_target", "motion.move_to_pose", "parallel",
           "repeat", "retry", "scene.add_object", "scene.attach_carried_object",
           "scene.detach_carried_object", "scene.remove_object",
@@ -425,7 +425,7 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
       model_query_document("\"choose_object_v1\":{"
                            "\"version\":\"1\","
                            "\"template_text\":\"Choose\","
-                           "\"variable_ids\":[],"
+                           "\"variables\":{},"
                            "\"response_contract\":{"
                            "\"response_mode\":\"json_object\"}}",
                            model_alias(),
@@ -440,7 +440,7 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
           "\"choose_object_v1\":{"
           "\"version\":\"1\","
           "\"template_text\":\"Choose\","
-          "\"variable_ids\":[],"
+          "\"variables\":{},"
           "\"response_contract\":{"
           "\"response_mode\":\"json_object\"}}",
           model_alias(model_request_contract("false", "\"http_url\""))),
@@ -451,7 +451,7 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
           "\"choose_object_v1\":{"
           "\"version\":\"1\","
           "\"template_text\":\"Choose\","
-          "\"variable_ids\":[],"
+          "\"variables\":{},"
           "\"response_contract\":{\"response_mode\":\"tool_call\"}}"),
       "missing required field 'tool_name'");
   expect_decode_error(
@@ -459,10 +459,10 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
                          "\"choose_object_v1\":{"
                          "\"version\":\"1\","
                          "\"template_text\":\"Choose\","
-                         "\"variable_ids\":[\"object_id\",\"object_id\"],"
+                         "\"variables\":{\"object_id\":\"stored_pose\"},"
                          "\"response_contract\":{"
                          "\"response_mode\":\"json_object\"}}"),
-      "duplicate instrument ID");
+      "is outside the closed template variable types");
 }
 
 TEST(AssistantSettingsCodec, RejectsUnresolvedOrWrongKindExternalAliases) {

@@ -100,16 +100,11 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
             "control_domain_revision"
         ]
 
-    policy = load_strict_json_yaml(
-        ROOT
-        / "manyforge_deployment/resources/maintained/catalog/runtime_policy/"
-        "manyforge.runtime_motion.ur5e_lite6_wall.json"
+    assert deployment["policies"]["retained_policy_records"] == []
+    assert all(
+        row["record_kind"] != "runtime_policy"
+        for row in deployment["catalogs"]["records"]
     )
-    assert "motion_speed_limits" not in policy
-    retained = deployment["policies"]["retained_policy_records"]
-    assert len(retained) == 1
-    assert retained[0]["record_id"] == policy["runtime_policy_id"]
-    assert retained[0]["record_revision"] == policy["runtime_policy_revision"]
 
 
 def test_program_variants_keep_one_noninteracting_wall_scenario() -> None:

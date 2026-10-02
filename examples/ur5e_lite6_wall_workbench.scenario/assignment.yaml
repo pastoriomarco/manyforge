@@ -1,0 +1,22 @@
+{
+  "component_roles": [
+    {
+      "component_role_id": "lite6_robot",
+      "controllable_component_id": "lite6_robot"
+    },
+    {
+      "component_role_id": "ur5e_robot",
+      "controllable_component_id": "ur5e_robot"
+    }
+  ],
+  "target_roles": [
+    {
+      "command_target_id": "arm",
+      "target_role_id": "lite6_arm"
+    },
+    {
+      "command_target_id": "arm",
+      "target_role_id": "ur5e_arm"
+    }
+  ]
+}

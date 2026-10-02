@@ -2,8 +2,18 @@
 // viewport. Values that also exist in tokens.css are listed in
 // CSS_SHARED_TOKENS; tokens.test.ts keeps the two files equal.
 
-/** ``held``: ticking, but its owner work waits for the operator's Run. */
-export type ProgramExecutionStatus = 'idle' | 'running' | 'held' | 'success' | 'failure';
+/**
+ * ``held``: ticking, but its owner work waits for the operator's Run.
+ * ``interrupted``: a cancellable node stopped by a Program Stop, Reset or
+ * cancel while it ran; not a failure. A Halt freezes it and interrupts nothing.
+ */
+export type ProgramExecutionStatus =
+  | 'idle'
+  | 'running'
+  | 'held'
+  | 'success'
+  | 'failure'
+  | 'interrupted';
 
 /** Execution status on Program canvas node borders and the edges into them. */
 export const STATUS_COLORS: Record<ProgramExecutionStatus, string> = {
@@ -12,6 +22,7 @@ export const STATUS_COLORS: Record<ProgramExecutionStatus, string> = {
   held: '#d45fc8',
   success: '#65c59b',
   failure: '#d86f66',
+  interrupted: '#d0894a',
 };
 
 /** Node availability that is shown (executable nodes show no symbol). */
@@ -100,6 +111,7 @@ export const CSS_SHARED_TOKENS: Readonly<Record<string, string>> = {
   '--mf-status-held': STATUS_COLORS.held,
   '--mf-status-success': STATUS_COLORS.success,
   '--mf-status-failure': STATUS_COLORS.failure,
+  '--mf-status-interrupted': STATUS_COLORS.interrupted,
   '--mf-availability-configuration-required': AVAILABILITY_COLORS.configuration_required,
   '--mf-availability-unavailable': AVAILABILITY_COLORS.unavailable,
   '--mf-category-execution-control': CATEGORY_FAMILY_COLORS.execution_control,

@@ -40,6 +40,7 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
       programRevision: null,
       program: null,
       diagnostics: [],
+      formulaReferences: { computedKeys: {}, nodes: {} },
     },
     applicability: {
       applyReady: true,

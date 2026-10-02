@@ -1376,15 +1376,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
-        "content_digest": "sha256:b05883bbba217b8926c221d7f5eb23f1625e8a385eac22135123aca874565867",
-        "record_id": "manyforge.runtime_motion.ur5e_lite6_wall",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1428,7 +1419,7 @@
     ]
   },
   "deployment_artifact_id": "ur5e_lite6_wall",
-  "deployment_revision": "sha256:72667ace062c39078b0dc3d2d85a91106525d78487c6c2cb02bc572c146e8e42",
+  "deployment_revision": "sha256:1a5d730fd2e1c6093a7d9135dab80545a401caae82c8363f51c907e7b23047b7",
   "description": "Minimal native UR5e and Lite6 qualification cell derived from the simple ManyMove dual-robot wall layout. The robots plan independently; both are owned by one cell execution Kernel and remain independently planned.",
   "desired_control_configurations": [
     {
@@ -3403,17 +3394,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
-        "content_digest": "sha256:b05883bbba217b8926c221d7f5eb23f1625e8a385eac22135123aca874565867",
-        "record_id": "manyforge.runtime_motion.ur5e_lite6_wall",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric",

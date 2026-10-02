@@ -339,6 +339,7 @@ void set_absolute_pose(OperationIntentDTO& operation, const Pose3DTO& pose) {
   request->target_mode = MotionTargetModeDTO::kAbsolute;
   request->target_reference.reset();
   request->offset_reference.reset();
+  request->goal_frame_reference.reset();
   request->motion = PoseGoalDTO{pose};
   request->cache_mode = CacheMode::kDisable;
 }
@@ -352,6 +353,7 @@ void set_absolute_path(OperationIntentDTO& operation,
   request->target_mode = MotionTargetModeDTO::kAbsolute;
   request->target_reference.reset();
   request->offset_reference.reset();
+  request->goal_frame_reference.reset();
   request->motion = path;
   request->cache_mode = CacheMode::kDisable;
 }

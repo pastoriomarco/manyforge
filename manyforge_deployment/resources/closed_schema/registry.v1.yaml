@@ -51,11 +51,6 @@ catalog_schemas:
     schema_revision: sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc
     relative_path: catalog/manyforge.provider_manifest.v1.yaml
     qualification: qualified
-  - record_kind: runtime_policy
-    schema_id: manyforge.runtime_policy.v1
-    schema_revision: sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4
-    relative_path: catalog/manyforge.runtime_policy.v1.yaml
-    qualification: qualified
   - record_kind: runtime_profile
     schema_id: manyforge.runtime_profile.v1
     schema_revision: sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7

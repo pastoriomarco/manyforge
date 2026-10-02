@@ -102,7 +102,7 @@ blackboard:
       owner: program
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   assistant: required
   lanes:
@@ -149,7 +149,7 @@ description: Vision-guided pick-and-place Program. A bounded model request selec
 name: vision_guided_bin_pick
 program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:5469ef72039f1d3120eb70840434b8c8afc751c875d84d1d71aa12cf3b47a4ed
+program_revision: sha256:25e19b3bf1966fbb42491708720ea9429bf3eafcad4994017c7d081427316a78
 scene:
   - pose:
       frame_ref:
@@ -299,11 +299,10 @@ tree:
         - children:
             - children: []
               instance_id: left_was_selected
-              node_id: logic.check_bool
-              parameters:
-                expected_value: true
+              node_id: logic.check_condition
+              parameters: {}
               value_sources:
-                actual_value:
+                condition:
                   field: pick_left_bin
                   kind: blackboard_field
                   reference: perception.pick_target
@@ -551,14 +550,12 @@ tree:
         - children:
             - children: []
               instance_id: right_was_selected
-              node_id: logic.check_bool
-              parameters:
-                expected_value: false
+              node_id: logic.check_condition
+              parameters: {}
               value_sources:
-                actual_value:
-                  field: pick_left_bin
-                  kind: blackboard_field
-                  reference: perception.pick_target
+                condition:
+                  expression: '!key.perception.pick_target.pick_left_bin'
+                  kind: expression
             - children:
                 - children: []
                   instance_id: pick_right_part.plan

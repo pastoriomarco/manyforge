@@ -52,6 +52,9 @@ class _ProgramSession:
     def revision(self) -> int:
         return self._revision
 
+    def formula_references(self) -> dict[str, Any]:
+        return {"computedKeys": {}, "nodes": {}}
+
     def retained_state(self) -> dict[str, Any]:
         return {
             "schema_version": "manyforge.composer_retained_draft.v2",

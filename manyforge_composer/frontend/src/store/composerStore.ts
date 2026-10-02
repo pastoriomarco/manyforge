@@ -1,4 +1,10 @@
-export type NodePresentationStatus = 'idle' | 'running' | 'held' | 'success' | 'failure';
+export type NodePresentationStatus =
+  | 'idle'
+  | 'running'
+  | 'held'
+  | 'success'
+  | 'failure'
+  | 'interrupted';
 export type EdgeStyle =
   | 'smoothstep'
   | 'default'

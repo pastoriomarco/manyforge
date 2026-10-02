@@ -5,10 +5,14 @@ import math
 import py_trees
 import pytest
 
+from manyforge_behavior.geometry import quat_mul
+
 from manyforge_behavior.nodes.geometry import (
     CheckPoseDistance,
     GeometryNodeUnavailableError,
     GetLinkPose,
+    offset_pose,
+    position_within_bounds,
     quaternion_angular_distance_rad,
     translation_distance_m,
 )
@@ -22,6 +26,7 @@ from manyforge_behavior.nodes.logic import (
     WaitForKeyBool,
     WaitForSignalEdge,
     boolean_condition_matches,
+    compare_values,
     detect_boolean_edge,
 )
 from manyforge_behavior.nodes.motion import (
@@ -226,6 +231,28 @@ def test_operator_stop_projection_keeps_only_current_node_holds() -> None:
         state.publish(OperatorMotionStopSnapshot(3, frozenset({"foreign"})))
     state.publish(OperatorMotionStopSnapshot(3))
     assert not state.holds_subtree("b")
+
+
+def test_operator_stop_state_measures_held_time_per_subtree_on_its_clock() -> None:
+    now = [10.0]
+    state = OperatorMotionStopState(
+        {"a": (), "b": (), "root": ("a", "b")}, clock=lambda: now[0]
+    )
+    assert state.held_seconds("a") == 0.0
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"a", "root"})))
+    now[0] = 12.0
+    # A parent holds only when its whole subtree does.
+    assert (state.held_seconds("a"), state.held_seconds("root")) == (2.0, 0.0)
+    state.publish(OperatorMotionStopSnapshot(2, frozenset({"a", "b", "root"})))
+    now[0] = 13.0
+    assert (state.held_seconds("a"), state.held_seconds("root")) == (3.0, 1.0)
+    state.publish(OperatorMotionStopSnapshot(3))
+    now[0] = 20.0
+    assert (state.held_seconds("a"), state.held_seconds("b")) == (3.0, 1.0)
+    # A later hold accumulates; an in-progress hold counts up to now.
+    state.publish(OperatorMotionStopSnapshot(4, frozenset({"a"})))
+    now[0] = 20.5
+    assert state.held_seconds("a") == 3.5
 
 
 @pytest.mark.parametrize("result", [py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE])
@@ -437,3 +464,53 @@ def test_operator_stop_mixed_ancestor_preserves_independent_work_and_sequence_or
     list(root.tick())
     assert a.ticks == 1
     assert b.ticks == (2 if composite == "parallel" else 0)
+
+
+def test_typed_comparison_never_coerces_between_key_types() -> None:
+    assert compare_values(3, "<", 3.5, value_type="float64") is True
+    assert compare_values(1.0, "==", 1.0000001, value_type="float64", tolerance=1e-6) is True
+    with pytest.raises(TypeError, match="not both bool"):
+        compare_values(1, "==", True, value_type="bool")
+    with pytest.raises(TypeError, match="not both int64"):
+        compare_values(1, "==", 1.0, value_type="int64")
+    with pytest.raises(TypeError, match="finite numbers"):
+        compare_values(True, "==", 1, value_type="float64")
+    with pytest.raises(ValueError, match="only == and !="):
+        compare_values("a", "<", "b", value_type="string")
+    with pytest.raises(ValueError, match="Check pose distance"):
+        compare_values({}, "==", {}, value_type="stored_pose")
+
+
+def test_pose_offset_composes_intrinsic_rpy_in_pose_or_given_axes() -> None:
+    rolled = {
+        "frame_ref": {"kind": "scene_resource", "scene_resource_id": "fixture"},
+        "position_m": [1.0, 0.0, 0.0],
+        "orientation": {"xyzw": [math.sin(math.pi / 4), 0.0, 0.0, math.cos(math.pi / 4)]},
+    }
+    offset = {"position_m": [0.0, 0.1, 0.0], "rpy_deg": [0.0, 0.0, 90.0]}
+
+    moved = offset_pose(rolled, offset)
+    assert moved["frame_ref"] == rolled["frame_ref"]
+    # Rolled 90 degrees about X, the pose's own +Y is the frame's +Z.
+    assert moved["position_m"] == pytest.approx([1.0, 0.0, 0.1])
+    # Along the pose frame's own axes (identity): +Y stays +Y, yaw about +Z.
+    framed = offset_pose(rolled, offset, axes_xyzw=[0.0, 0.0, 0.0, 1.0])
+    assert framed["frame_ref"] == rolled["frame_ref"]
+    assert framed["position_m"] == pytest.approx([1.0, 0.1, 0.0])
+    yaw = [0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)]
+    expected = quat_mul(yaw, rolled["orientation"]["xyzw"])
+    assert abs(sum(a * b for a, b in zip(framed["orientation"]["xyzw"], expected))) == (
+        pytest.approx(1.0)
+    )
+    # Along axes yawed +90 degrees: their +Y is the frame's -X.
+    turned = offset_pose(rolled, offset, axes_xyzw=yaw)
+    assert turned["position_m"] == pytest.approx([0.9, 0.0, 0.0])
+    with pytest.raises(ValueError, match="offset axes orientation"):
+        offset_pose(rolled, offset, axes_xyzw=[0.0, 0.0, 0.0])
+
+
+def test_position_bounds_are_inclusive_by_choice_and_reject_empty_boxes() -> None:
+    assert position_within_bounds([1, 1, 1], [0, 0, 0], [1, 1, 1], inclusive=True)
+    assert not position_within_bounds([1, 1, 1], [0, 0, 0], [1, 1, 1], inclusive=False)
+    with pytest.raises(ValueError, match="exceeds"):
+        position_within_bounds([0, 0, 0], [1, 0, 0], [0, 1, 1], inclusive=True)

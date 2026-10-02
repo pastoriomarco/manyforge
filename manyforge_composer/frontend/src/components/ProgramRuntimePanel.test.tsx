@@ -10,6 +10,7 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
+import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
 import {
   deriveTransportGuidance,
   MotionControlSettings,
@@ -156,6 +157,7 @@ function controller(
 ): ProgramRuntimeController {
   return {
     commandAllowed: vi.fn(() => true),
+    commandDisabledReason: vi.fn(() => null),
     startBlockedReason: null,
     state: {
       currentScenario: null,
@@ -187,14 +189,14 @@ function controller(
           name: 'Next pick',
           catalog: {
             api_version: 'manyforge.node_catalog.v2',
-            content_version: '2.3.0',
+            content_version: '2.4.0',
           },
           component_roles: { component: {} },
           target_roles: {},
           tree: {
-            node_id: 'logic.check_bool',
+            node_id: 'logic.check_condition',
             instance_id: 'root',
-            parameters: { actual_value: true, expected_value: true },
+            parameters: { condition: true },
             children: [],
           },
         },
@@ -207,7 +209,7 @@ function controller(
           graph_revision: `sha256:${'b'.repeat(64)}`,
           node_environment: {
             catalog_id: 'manyforge.default',
-            content_version: '2.3.0',
+            content_version: '2.4.0',
             catalog_digest: `sha256:${'a'.repeat(64)}`,
             environment_digest: `sha256:${'c'.repeat(64)}`,
           },
@@ -289,6 +291,7 @@ function controller(
     materializePromotion: vi.fn(),
     promotionMaterializationReason: vi.fn(() => null),
     writeRuntimeBlackboard: vi.fn(),
+    persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
     stageManualResult: vi.fn(),
     groupRuntimeScales: {},
     setGroupRuntimeScale: vi.fn(),
@@ -314,7 +317,37 @@ describe('Program runtime projection', () => {
     expect(markup).not.toContain('Execute Applied Program');
     expect(markup).not.toContain('Reset Program cycle');
     // Advanced tools exist only with run controls; no empty section otherwise.
-    expect(markup).not.toContain('Advanced: runtime overrides, blackboard and audit');
+    expect(markup).not.toContain('Advanced: runtime overrides');
+  });
+
+  it('offers typed runtime writes and shows the backend reason when they are refused', () => {
+    const halted = controller('full_stopped');
+    halted.state.applied!.program.blackboard = {
+      namespaces: [],
+      keys: [
+        { key: 'flag', type: 'bool', access: 'read_write', persistence: 'run' },
+        { key: 'layer', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 0 },
+        { key: 'limit', type: 'float64', access: 'read', persistence: 'run' },
+        { key: 'reply', type: 'model_response', access: 'write', persistence: 'run' },
+      ],
+    };
+    halted.commandAllowed = vi.fn((kind: string) => kind !== 'program_runtime_blackboard_write');
+    halted.commandDisabledReason = vi.fn(() => 'program_run_state_full_stopped');
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={halted} />,
+    );
+
+    expect(markup).toContain('Advanced: runtime overrides, blackboard, stored values and audit');
+    // Only writable keys with a typed editor; no raw JSON entry remains.
+    expect(markup).toContain('<option value="flag">flag · bool</option>');
+    expect(markup).toContain('<option value="layer">layer · int64</option>');
+    expect(markup).not.toContain('limit · float64');
+    expect(markup).not.toContain('reply · model_response');
+    expect(markup).toContain('Writes are refused now: program run state full stopped.');
+    expect(markup).toMatch(/<button type="button" disabled="">Write current-run value<\/button>/);
+    const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
+    expect(source).not.toContain('parseRuntimeValue');
+    expect(source).toContain('<PersistentKeyValuesSection');
   });
 
   it('never turns an unavailable or unknown owner fact into idle or zero work', () => {
@@ -383,9 +416,16 @@ describe('Program runtime projection', () => {
 
   it('edits displayed groups in the Draft and applies them to the Motion panel after Apply', () => {
     const changes: string[][] = [];
+    const scopes = executionGroupScopes([{
+      node_id: 'parallel', instance_id: 'root', parameters: {}, children: [
+        { node_id: 'motion.move_to_pose', instance_id: 'a', parameters: { target_role: 'arm' }, execution_groups: ['robot_a'], children: [] },
+        { node_id: 'motion.move_to_pose', instance_id: 'b', parameters: {}, execution_groups: ['robot_b'], children: [] },
+      ],
+    }], ['robot_a', 'robot_b']);
     const settings = renderToStaticMarkup(
       <MotionControlSettings groups={{
-        groupIds: ['all', 'robot_a', 'robot_b'],
+        scopes,
+        targetLabels: { arm: 'arm (component role: robot)' },
         hidden: undefined,
         pendingApply: true,
         onChange: (hidden) => changes.push(hidden),
@@ -397,10 +437,13 @@ describe('Program runtime projection', () => {
     expect(settings).toContain('Confirm before halting the Program');
     // Default: named groups shown, "all" not.
     expect(settings).toMatch(/<input type="checkbox"\/><span title="all">All groups/);
+    expect(settings).toContain('Show All, or another covering group, before hiding this group.');
+    expect(settings).toContain('disabled="" checked=""/><span title="robot_a"');
+    expect(settings).toContain('arm (component role: robot)');
 
     const readOnly = renderToStaticMarkup(
       <MotionControlSettings groups={{
-        groupIds: ['all', 'robot_a'], hidden: ['robot_a'], pendingApply: false,
+        scopes, hidden: ['robot_a'], pendingApply: false,
       }} />,
     );
     expect(readOnly).toContain('The Program Draft cannot be edited right now.');
@@ -424,7 +467,80 @@ describe('Program runtime projection', () => {
     expect(transport).toContain('robot_a controls');
     expect(transport).not.toContain('robot_b controls');
     expect(transport).toMatch(/aria-label="Open viewer settings; 1 command groups hidden"/);
+    running.state.applied!.program.tree = {
+      node_id: 'motion.move_to_pose', instance_id: 'new-move', parameters: {}, children: [],
+    };
+    const uncovered = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    expect(uncovered).toContain('all controls');
+    expect(uncovered).toContain('leave some move, gripper or I/O nodes without a visible control');
+    expect(uncovered).not.toContain('membership is unavailable');
+    expect(running.state.applied!.program.viewer.hidden_execution_groups).toEqual(['all', 'robot_b']);
     expect(changes).toEqual([]);
+  });
+
+  it('keeps All visible, and says why, when the run was captured from another revision', () => {
+    const running = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    const group = controls.executionSelections.groups[0];
+    controls.executionSelections.groups = [group, { ...group, groupId: 'robot_a' }];
+    running.state.controls = controls;
+    const applied = running.state.applied!;
+    applied.program.viewer = { hidden_execution_groups: ['all'] };
+    applied.program.execution_groups = { robot_a: { execution_policy: 'independent' } };
+    applied.program.target_roles = { arm: { component_role: 'robot' } };
+    applied.program.tree = {
+      node_id: 'motion.move_to_pose', instance_id: 'a', parameters: { target_role: 'arm' },
+      execution_groups: ['robot_a'], children: [],
+    };
+    applied.programBinding.target_role_bindings = [{
+      target_role_id: 'arm', component_role_id: 'robot',
+      controllable_component_id: 'ur10e', command_target_id: 'arm',
+      frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [],
+    }];
+    const render = () => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    const matched = render();
+    expect(matched).toContain('robot_a controls');
+    expect(matched).not.toContain('all controls');
+    // Robot names only from the Applied binding of the captured revision.
+    expect(matched).toContain('title="robot_a: arm (ur10e)"');
+
+    running.state.run!.capture.programRevision = `sha256:${'9'.repeat(64)}`;
+    const mismatched = render();
+    expect(mismatched).toContain('all controls');
+    expect(mismatched).toContain('robot_a controls');
+    expect(mismatched).toContain('group membership is unavailable');
+    expect(mismatched).toContain('different Program revision than the Applied Program');
+    expect(mismatched).not.toContain('ur10e');
+    expect(applied.program.viewer.hidden_execution_groups).toEqual(['all']);
+  });
+
+  it('labels Draft targets with component roles unless an authoritative binding names the robot', () => {
+    const scopes = executionGroupScopes([{
+      node_id: 'gripper.command_position', instance_id: 'g', parameters: { target_role: 'gripper' },
+      execution_groups: ['tool'], children: [],
+    }], ['tool']);
+    const targetRoles = { gripper: { component_role: 'hand' } };
+    const draft = renderToStaticMarkup(<MotionControlSettings groups={{
+      scopes, targetLabels: executionGroupTargetLabels(targetRoles, null), hidden: undefined, pendingApply: false,
+    }} />);
+    expect(draft).toContain('1 hardware node · gripper (component role: hand)');
+    const binding = controller().state.applied!.programBinding;
+    binding.target_role_bindings = [{
+      target_role_id: 'gripper', component_role_id: 'hand',
+      controllable_component_id: 'robotiq', command_target_id: 'gripper',
+      frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [],
+    }];
+    const applied = renderToStaticMarkup(<MotionControlSettings groups={{
+      scopes, targetLabels: executionGroupTargetLabels(targetRoles, binding), hidden: undefined, pendingApply: false,
+    }} />);
+    expect(applied).toContain('gripper (robotiq)');
   });
 
   it('shows Retry during a failure pause, disabled until containment is confirmed', () => {
@@ -509,6 +625,7 @@ describe('Program runtime projection', () => {
     expect(flow).toContain("await program.stopMotion(['all'])");
     // Halted: motion is already contained, so no refused motion Stop is sent.
     expect(source).toContain('allGroup === undefined || allMotionQuiesced || programFullStopped');
+    expect(source).toContain('state.runnerAvailable && executionSelectionIsQuiescent(allGroup)');
     expect(flow).toContain('if (programFullStopping) return;');
     expect(source).toContain(
       "if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');",
@@ -696,7 +813,8 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={idle} robot={robotController()} />,
     );
 
-    expect(markup).toContain('title="all"');
+    // The idle Applied group names its robot from the Applied binding.
+    expect(markup).toContain('title="all: arm (robot)"');
     expect(markup).toMatch(/type="range"[^>]*value="0.35"/);
     expect(markup).toMatch(/type="range"[^>]*disabled=/);
   });
@@ -985,5 +1103,82 @@ describe('Program runtime projection', () => {
       incidentKind: 'viewer_observation_stale',
     });
     expect(guidance('live')).toEqual([]);
+  });
+
+  it('starts fresh pose fields when the runtime blackboard switches key', async () => {
+    // Minimal mounted React DOM host (see ProgramSchemaValueEditor.mounted.test.tsx).
+    const created: Record<string, unknown>[] = [];
+    const document: Record<string, unknown> = {
+      nodeType: 9, activeElement: null, defaultView: {},
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
+    };
+    const node = (tag: string): Record<string, unknown> => {
+      const element: Record<string, unknown> = {
+        nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+        namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {}, options: [],
+        addEventListener: () => undefined, removeEventListener: () => undefined,
+        appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
+        setAttribute: () => undefined, removeAttribute: () => undefined,
+      };
+      created.push(element);
+      return element;
+    };
+    document.createElement = node;
+    document.documentElement = node('html');
+    const window = {
+      document, HTMLIFrameElement: class {},
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout,
+    };
+    document.defaultView = window;
+    vi.stubGlobal('window', window);
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    type Props = Record<string, unknown> & Partial<Record<
+      'onFocus' | 'onChange' | 'onBlur', (event: unknown) => void>>;
+    const props = (element: Record<string, unknown>) => element[
+      Object.keys(element).find((name) => name.startsWith('__reactProps$'))!] as Props;
+    const control = (match: (candidate: Props) => boolean) => created
+      .filter((element) => Object.keys(element).some((name) => name.startsWith('__reactProps$')))
+      .filter((element) => match(props(element))).at(-1)!;
+    const positionX = () => control((candidate) => candidate['aria-label'] === 'Position x');
+    const writeButton = () => control((candidate) => candidate.children === 'Write current-run value');
+
+    const program = controller('running');
+    program.state.applied!.program.blackboard = {
+      namespaces: [],
+      keys: [
+        { key: 'pick_pose', type: 'stored_pose', access: 'read_write', persistence: 'run' },
+        { key: 'place_pose', type: 'stored_pose', access: 'read_write', persistence: 'run' },
+      ],
+    };
+    const { act } = await import('react');
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(node('div') as unknown as Element);
+    try {
+      await act(() => { root.render(<ProgramRuntimePanel enabled controller={program} />); });
+      const chooseKey = (key: string) => act(() => {
+        const target = { value: key };
+        props(control((candidate) => Array.isArray(candidate.children)
+          && (candidate.children[0] as { props?: { children?: unknown } } | undefined)
+            ?.props?.children === 'Choose a key')).onChange!({ target, currentTarget: target });
+      });
+      await chooseKey('pick_pose');
+      const target = { value: 'abc' };
+      await act(() => { props(positionX()).onFocus!({ target, currentTarget: target }); });
+      await act(() => { props(positionX()).onChange!({ target, currentTarget: target }); });
+      await act(() => { props(positionX()).onBlur!({ target, currentTarget: target }); });
+      expect(props(writeButton()).disabled).toBe(true);
+
+      await chooseKey('place_pose');
+
+      // What Write sends is what is shown: place_pose's neutral pose.
+      expect(props(positionX()).value).toBe('0');
+      expect(props(writeButton()).disabled).toBe(false);
+    } finally {
+      await act(() => { root.unmount(); });
+      vi.unstubAllGlobals();
+    }
   });
 });

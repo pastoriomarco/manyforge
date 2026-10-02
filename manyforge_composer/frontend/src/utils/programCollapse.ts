@@ -46,7 +46,7 @@ export interface CollapsedProgramItem {
   label: string;
   catalogId: string;
   category: string;
-  status: 'idle' | 'running' | 'held' | 'success' | 'failure';
+  status: 'idle' | 'running' | 'held' | 'success' | 'failure' | 'interrupted';
   invalid: boolean;
   selected: boolean;
   descendantCount: number;

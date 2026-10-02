@@ -237,30 +237,18 @@ class OwnerNodeInputs:
 
     parameters: Mapping[str, Any]
     blackboard: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
-    embedded_values: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.parameters, Mapping):
             raise TypeError("owner parameters must be a mapping")
         if not isinstance(self.blackboard, Mapping):
             raise TypeError("owner blackboard inputs must be a mapping")
-        if not isinstance(self.embedded_values, Mapping):
-            raise TypeError("owner embedded values must be a mapping")
         if any(not isinstance(key, str) or not key for key in self.parameters):
             raise ValueError("owner parameter keys must be non-empty text")
         if any(not isinstance(key, str) or not key for key in self.blackboard):
             raise ValueError("owner blackboard keys must be non-empty text")
-        if any(not isinstance(key, str) or not key for key in self.embedded_values):
-            raise ValueError("owner embedded-value paths must be non-empty text")
         object.__setattr__(self, "parameters", _freeze(self.parameters))
         object.__setattr__(self, "blackboard", _freeze(self.blackboard))
-        object.__setattr__(
-            self,
-            "embedded_values",
-            _freeze(self.embedded_values),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +383,92 @@ class OwnerInvocationPort(Protocol):
         identity: NodeAttemptIdentity,
         inputs: OwnerNodeInputs,
     ) -> OwnerInvocationResult: ...
+
+
+def describe_owner_failure(message: str, details: object) -> str:
+    """Append an owner rejection's structured cause to its human message.
+
+    Owner rejections carry the precise cause in ``details.reason``; a missing
+    or ambiguous reference also names the failed reference in
+    ``details.reference_type`` and ``details.reference_id`` (and
+    ``details.target_role_id`` for another robot's frame). The human message
+    alone is often generic, so these are appended for logs and the Composer.
+    """
+
+    if not isinstance(details, Mapping):
+        return message
+    notes: list[str] = []
+    reason = details.get("reason")
+    if isinstance(reason, str) and reason and reason not in message:
+        notes.append(reason[:256])
+    reference_type = details.get("reference_type")
+    if isinstance(reference_type, str) and reference_type:
+        reference = reference_type[:64]
+        reference_id = details.get("reference_id")
+        if isinstance(reference_id, str) and reference_id:
+            reference += f" {reference_id[:256]!r}"
+        target_role_id = details.get("target_role_id")
+        if isinstance(target_role_id, str) and target_role_id:
+            reference += f" of target role {target_role_id[:256]!r}"
+        notes.append(f"reference {reference}")
+    return f"{message} ({'; '.join(notes)})" if notes else message
+
+
+def owner_failure_details(exc: BaseException) -> Mapping[str, Any] | None:
+    """The structured details of an owner rejection, if the error carries any."""
+
+    details = getattr(exc, "details", None)
+    if isinstance(details, Mapping):
+        return details
+    response = getattr(exc, "response", None)
+    error = response.get("error") if isinstance(response, Mapping) else None
+    details = error.get("details") if isinstance(error, Mapping) else None
+    return details if isinstance(details, Mapping) else None
+
+
+class FrameTransformError(RuntimeError):
+    """The owner refused or could not answer one frame transform.
+
+    ``reason_code`` is the owner's stable reason (for example
+    ``program_reference_robot_not_local``) or ``frame_transform_failed``.
+    """
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True, slots=True)
+class FrameTransformResult:
+    """One owner-proven pose, as a stored pose in the requested frame."""
+
+    pose: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pose, Mapping) or not isinstance(self.metadata, Mapping):
+            raise TypeError("frame transform result pose and metadata must be mappings")
+        object.__setattr__(self, "pose", deepcopy(dict(self.pose)))
+        object.__setattr__(self, "metadata", deepcopy(dict(self.metadata)))
+
+
+class FrameTransformPort(Protocol):
+    """Express one stored pose in another declared frame.
+
+    The native cell frame resolver answers from one coherent state capture;
+    the client only forwards the two frames and never composes them.
+    """
+
+    def express_pose(
+        self,
+        identity: NodeAttemptIdentity,
+        pose: Mapping[str, Any],
+        target_frame: Mapping[str, Any],
+    ) -> FrameTransformResult: ...
+
+
+class ModelQueryPort(OwnerInvocationPort, FrameTransformPort, Protocol):
+    """Native model/target queries, including frame transforms."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,6 +657,70 @@ class ProgramInterventionPort(Protocol):
     def release(self, program_run_id: str) -> None: ...
 
 
+class PersistentValueUncertainError(RuntimeError):
+    """The register applied a change that may not survive a crash.
+
+    Unlike other register failures the change did happen, so the value store
+    shows it too; the register refuses further changes until reconciled.
+    """
+
+
+class PersistentKeyRegisterPort(Protocol):
+    """Values of `persistent` blackboard keys, owned by the Program runner.
+
+    Declarations stay in the Program; the register keeps only values, scoped
+    to one Scenario and key name.
+    """
+
+    def restore(
+        self, scenario_id: str, declarations: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Return stored values still compatible with the committed Program.
+
+        The owner reconciles stored rows with Manager's committed Applies
+        before a run starts; restoring only reads, and returns nothing it
+        cannot show still belongs to this Scenario's committed Program.
+        """
+        ...
+
+    def drop(
+        self,
+        scenario_id: str,
+        key: str,
+        *,
+        reason: str,
+        detail: str | None = None,
+        edit: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Durably forget a restored value the committed Program refuses.
+
+        The value store has already left it out; the drop is noticed for the
+        starting run's audit even if the removal fails, which raises.
+        """
+        ...
+
+    def commit(
+        self,
+        scenario_id: str,
+        declaration: Any,
+        value: Any,
+        *,
+        edit: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Durably store one value before the write is reported; raise on failure.
+
+        ``edit`` is the write's metadata (run, node, attempt or request
+        identity), audited with the change.
+        """
+        ...
+
+    def remove(
+        self, scenario_id: str, key: str, *, edit: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Durably forget one stored value; raise on failure."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class NodeAdapterPorts:
     """Explicit focused ports; co-location never merges semantic ownership."""
@@ -590,13 +728,14 @@ class NodeAdapterPorts:
     kernel_operations: OwnerTaskPort | None = None
     scene_transactions: OwnerInvocationPort | None = None
     gripper_status: OwnerInvocationPort | None = None
-    model_queries: OwnerInvocationPort | None = None
+    model_queries: ModelQueryPort | None = None
     assistant_requests: OwnerTaskPort | None = None
     simulator_control: OwnerTaskPort | None = None
     kernel_controls: OwnerTaskPort | None = None
     program_run_scope: ProgramRunScopePort | None = None
     program_run_context: ProgramRunContextPort | None = None
     program_interventions: ProgramInterventionPort | None = None
+    persistent_keys: PersistentKeyRegisterPort | None = None
 
 
 __all__ = [
@@ -611,6 +750,14 @@ __all__ = [
     "PROGRAM_MOTION_STOP_RECOVERY_CLASSES",
     "ProgramRunPortContext",
     "OwnerNodeInputs",
+    "describe_owner_failure",
+    "owner_failure_details",
+    "FrameTransformError",
+    "FrameTransformPort",
+    "FrameTransformResult",
+    "ModelQueryPort",
+    "PersistentKeyRegisterPort",
+    "PersistentValueUncertainError",
     "OwnerInvocationPort",
     "OwnerInvocationResult",
     "OwnerInvocationPendingError",

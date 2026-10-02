@@ -1049,15 +1049,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control_collision/78875bc27b8f6a71501a40957d21b3e9b93bb1ef34a27aecbd842ddb1ad79dcc",
-        "content_digest": "sha256:9ae8fe5a3854a8720b7b735f72f3a349839f6c5c6da78963607d857bba6046e1",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control_collision",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:78875bc27b8f6a71501a40957d21b3e9b93bb1ef34a27aecbd842ddb1ad79dcc",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
         "content_digest": "sha256:f231d8f52a7858c2ebbf4c1334650aeb973407ac780d2c4fbd194df0209e4cea",
         "record_id": "manyforge.ros2_control_execution_runtime",
@@ -1101,7 +1092,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
-  "deployment_revision": "sha256:3cc9d3a7d866fb8053f3e6dddedcc0ae26b678850f1516c4321ae8511dbcc337",
+  "deployment_revision": "sha256:5c2e7cdfde46c017f02711cb0b3915cecbe623992354467c9c69f2383509eace",
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
   "desired_control_configurations": [
     {
@@ -1994,17 +1985,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control_collision/78875bc27b8f6a71501a40957d21b3e9b93bb1ef34a27aecbd842ddb1ad79dcc",
-        "content_digest": "sha256:9ae8fe5a3854a8720b7b735f72f3a349839f6c5c6da78963607d857bba6046e1",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_ros2_control_collision",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:78875bc27b8f6a71501a40957d21b3e9b93bb1ef34a27aecbd842ddb1ad79dcc",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "isaac_ur10e_collision_robot.arm.execution-contact-geometric",

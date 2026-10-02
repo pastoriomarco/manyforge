@@ -23,7 +23,7 @@ from manyforge_behavior.program_runtime import ProgramRunAttemptSource
 def test_indefinite_execution_yields_each_tick_and_has_no_lifetime_counter(retry):
     leaf = CountingLeaf("leaf", fail_until=100_000 if retry else 0)
     node = (
-        RetryDecorator("forever", leaf) if retry else RepeatDecorator("forever", leaf)
+        RetryDecorator("forever", leaf, -1) if retry else RepeatDecorator("forever", leaf, -1)
     )
     tree = py_trees.trees.BehaviourTree(node)
     for _ in range(10_000):
@@ -36,6 +36,14 @@ def test_indefinite_execution_yields_each_tick_and_has_no_lifetime_counter(retry
     # Resume starts an ordinary fresh attempt, with no discarded backlog.
     tree.tick()
     assert leaf.tick_count == 10_001
+
+
+@pytest.mark.parametrize("decorator", [RepeatDecorator, RetryDecorator])
+def test_a_count_is_fixed_or_resolved_per_attempt_never_defaulted(decorator):
+    """No silent `-1`: a decorator built with neither a count nor its
+    per-attempt parameters is refused rather than repeating forever."""
+    with pytest.raises(ValueError, match="fixed or resolved per attempt"):
+        decorator("loop", CountingLeaf("leaf"))
 
 
 def test_attempt_ids_retain_no_counts_or_completed_identity_history():

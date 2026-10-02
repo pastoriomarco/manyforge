@@ -47,8 +47,8 @@
             "fallback",
             "gripper.command_position",
             "inverter",
-            "logic.set_bool",
-            "logic.wait_for_bool",
+            "logic.set_value",
+            "logic.wait_for_value",
             "motion.follow_cartesian_path",
             "motion.move_to_joint_target",
             "motion.move_to_pose",
@@ -131,7 +131,7 @@
           "response_mode": "json_object"
         },
         "template_text": "You are planning a top-down pick for a UR5 cell. Inspect the attached scene snapshot and choose exactly one visible target: `left_part` or `right_part`. Return JSON only with: - `selected_object_id`: string, one of `left_part` or `right_part` - `approach_pose`: object with `position_m` and `orientation_rpy_deg` - `grasp_pose`: object with `position_m` and `orientation_rpy_deg` - `confidence`: number from 0.0 to 1.0 - `reason`: short string Both poses must be expressed in `base_link`. Use a top-down tool orientation `[180.0, 0.0, -90.0]`. `approach_pose` should be above the part, and `grasp_pose` should be the final descend target.",
-        "variable_ids": [],
+        "variables": {},
         "version": "1"
       }
     },
@@ -1236,15 +1236,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
-        "content_digest": "sha256:22d640b87b7cd93263292aa7358247e96f40c74ab6e55fb087aa130cfed10eaf",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1285,7 +1276,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:2b4b3b2b6334c7e12ef14085c5e9aa76b64e354c5a9d28d14ca0c760db6b239f",
+  "deployment_revision": "sha256:fa418cb855e59cfb0217c113e42e88a1243c666e870d287403a05f346f51eb3a",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {
@@ -2300,17 +2291,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
-        "content_digest": "sha256:22d640b87b7cd93263292aa7358247e96f40c74ab6e55fb087aa130cfed10eaf",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",

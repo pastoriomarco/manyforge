@@ -31,6 +31,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--scenario", required=True, type=Path)
     parser.add_argument("--negative-matrix", action="store_true")
     parser.add_argument("--intent-rejections", action="store_true")
+    parser.add_argument("--stop-limit-names", action="store_true")
     parser.add_argument("--source-closure-rejections", action="store_true")
     parser.add_argument("--runtime-identity", action="store_true")
     parser.add_argument("--no-program", action="store_true")
@@ -359,38 +360,8 @@ def _run(
             return value
     if bundle["cell_graph"]["cell_id"] != request["runtime_cell_id"]:
         raise AssertionError("candidate did not use the configured runtime identity")
-    policies = bundle["retained_policy_records"]
-    if len(policies) != 1 or policies[0]["record_kind"] != "runtime_policy":
-        raise AssertionError("motion bundle has no single verified runtime policy")
-    policy_ref = policies[0]
-    if policy_ref not in bundle["catalogs"]["records"]:
-        raise AssertionError("runtime policy is not in the exact catalog closure")
-    artifacts = [
-        artifact for artifact in payload["catalog_artifacts"]
-        if artifact["content_addressed_store_key"]
-        == policy_ref["content_addressed_store_key"]
-    ]
-    if (
-        len(artifacts) != 1
-        or artifacts[0]["content_digest"] != policy_ref["content_digest"]
-    ):
-        raise AssertionError("runtime policy bytes are missing from the handoff")
-    policy_bytes = base64.b64decode(
-        "".join(artifacts[0]["chunks"]), validate=True
-    )
-    if (
-        len(policy_bytes) != artifacts[0]["byte_size"]
-        or raw_sha256_digest(policy_bytes) != policy_ref["content_digest"]
-    ):
-        raise AssertionError("prepared runtime policy has incorrect byte identity")
-    policy = json.loads(policy_bytes)
-    if (
-        policy["runtime_policy_id"] != request["deployment"]["deployment_artifact_id"]
-        or policy["runtime_policy_revision"] != policy_ref["record_revision"]
-        or policy["interrupt_policy_ids"] != []
-        or policy["open_loop_grasp_acknowledgements"] != []
-    ):
-        raise AssertionError("prepared runtime policy is not restrictive and exact")
+    if bundle["retained_policy_records"]:
+        raise AssertionError("motion bundle retains an unexpected policy record")
     if not any(activation_root.iterdir()):
         raise AssertionError("preparer omitted the activation closure")
     if publish_canonical_empty:
@@ -424,6 +395,177 @@ def _require_oversized_request_rejection(
         raise AssertionError(
             "native preparer accepted an oversized encoded request: "
             f"return={result.returncode}, stderr={result.stderr!r}"
+        )
+
+
+def _arm_source_joints(workspace: Path, component: dict[str, object]) -> list[str]:
+    sources = load_strict_json_yaml(
+        workspace
+        / "manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"
+    )
+    family_id = {
+        row["runtime_restoration_profile_id"]: row["model_family_id"]
+        for row in sources["runtime_restoration_profiles"]
+    }[component["component_profile_id"]]
+    for family in sources["model_families"]:
+        if family["model_family_id"] != family_id:
+            continue
+        for binding in family["semantics"]["resource_role_bindings"]:
+            if binding["resource_role_id"] == "arm_joints":
+                return list(binding["source_joint_names"])
+    raise AssertionError(f"model family {family_id} has no arm joints")
+
+
+def _compiled_stop_limits(
+    prepared: dict[str, object],
+) -> dict[str, tuple[float, float, float | None]]:
+    """Every compiled controlled-Stop limit, keyed by its arm resource.
+
+    Each value is (deceleration, settle threshold, authored jerk or None).
+    """
+
+    found: dict[str, tuple[float, float, float | None]] = {}
+
+    def jerk(row: dict[str, object]) -> float | None:
+        encoded = row.get("max_jerk")
+        if encoded is None:
+            return None
+        if encoded != {
+            "coordinate_kind": "angular_rad_s3",
+            "value_rad_s3": encoded.get("value_rad_s3"),
+        }:
+            raise AssertionError(f"{row['resource_id']} has a malformed jerk limit")
+        return encoded["value_rad_s3"]
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "per_resource_limits":
+                    for row in child:
+                        limit = (
+                            row["max_deceleration"]["value_rad_s2"],
+                            row["settle_velocity_threshold"]["value_rad_s"],
+                            jerk(row),
+                        )
+                        if found.setdefault(row["resource_id"], limit) != limit:
+                            raise AssertionError(
+                                f"{row['resource_id']} has inconsistent Stop limits"
+                            )
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for artifact in prepared["activation_payload"]["raw_artifacts"]:
+        try:
+            value = json.loads(
+                base64.b64decode("".join(artifact["chunks"]), validate=True)
+            )
+        except ValueError:
+            continue
+        walk(value)
+    return found
+
+
+def _require_stop_limits_by_joint_name(
+    args: argparse.Namespace, request: dict[str, object], root: Path
+) -> None:
+    component = request["deployment"]["components"][0]
+    component_id = component["component_id"]
+    joints = _arm_source_joints(args.workspace.resolve(), component)
+    if len(joints) < 3:
+        raise AssertionError("Stop limit pairing test requires three arm joints")
+
+    def with_limits(rows: list[dict[str, object]]) -> dict[str, object]:
+        changed = copy.deepcopy(request)
+        changed["deployment"]["components"][0]["target_settings"]["arm"][
+            "controlled_stop"
+        ]["per_joint_limits"] = rows
+        _rehash_request(changed)
+        return changed
+
+    # Distinct, exactly representable limits per joint, authored in reverse.
+    rows = [
+        {
+            "source_joint_name": joint,
+            "max_deceleration_rad_s2": 2.0 + index,
+            "settle_velocity_threshold_rad_s": (index + 1) / 64,
+        }
+        for index, joint in enumerate(joints)
+    ]
+    def compiled_arm_limits(
+        selected: list[dict[str, object]], name: str
+    ) -> dict[str, tuple[float, float, float | None]]:
+        prepared = _run(args, with_limits(selected), root / name)
+        assert prepared is not None
+        return {
+            resource_id: limit
+            for resource_id, limit in _compiled_stop_limits(prepared).items()
+            if resource_id.startswith(f"{component_id}.arm.")
+        }
+
+    expected = {
+        f"{component_id}.arm.coordinate.{index:06d}": (
+            2.0 + index,
+            (index + 1) / 64,
+            None,
+        )
+        for index in range(len(joints))
+    }
+    compiled = compiled_arm_limits(rows[::-1], "shuffled")
+    if compiled != expected:
+        raise AssertionError(
+            f"controlled Stop limits were not paired by joint name: {compiled!r}"
+        )
+
+    # An authored jerk limit reaches exactly its own joint's resource; rows
+    # without one still compile without a jerk member.
+    with_jerk = copy.deepcopy(rows)
+    with_jerk[1]["max_jerk_rad_s3"] = 12.5
+    compiled = compiled_arm_limits(with_jerk[::-1], "authored-jerk")
+    expected_with_jerk = dict(expected)
+    expected_with_jerk[f"{component_id}.arm.coordinate.000001"] = (3.0, 2 / 64, 12.5)
+    if compiled != expected_with_jerk:
+        raise AssertionError(
+            f"authored controlled Stop jerk was not compiled for {joints[1]}: "
+            f"{compiled!r}"
+        )
+
+    unnamed = copy.deepcopy(rows)
+    del unnamed[1]["source_joint_name"]
+    rejections = {
+        "missing": (
+            rows[:2] + rows[3:],
+            f"controlled Stop limits miss joint {joints[2]}",
+        ),
+        "unknown": (
+            rows[:-1] + [{**rows[-1], "source_joint_name": "not_an_arm_joint"}],
+            "controlled Stop limits name unknown arm joint not_an_arm_joint",
+        ),
+        "extra": (
+            rows + [{**rows[0], "source_joint_name": "extra_joint"}],
+            "controlled Stop limits name unknown arm joint extra_joint",
+        ),
+        "duplicate": (
+            rows + [rows[1]],
+            f"controlled Stop limits repeat joint {joints[1]}",
+        ),
+        "unnamed": (unnamed, "controlled Stop limit row lacks source_joint_name"),
+    }
+    jerk_message = (
+        f"controlled Stop max_jerk_rad_s3 for joint {joints[2]} "
+        "must be a finite positive number"
+    )
+    for name, value in (("zero", 0.0), ("negative", -1.0), ("text", "fast")):
+        invalid = copy.deepcopy(rows)
+        invalid[2]["max_jerk_rad_s3"] = value
+        rejections[f"jerk-{name}"] = (invalid, jerk_message)
+    for name, (selected, message) in rejections.items():
+        _run(
+            args,
+            with_limits(selected),
+            root / f"stop-limits-{name}",
+            expect_error=message,
         )
 
 
@@ -547,6 +689,13 @@ def main() -> int:
                 invalid_policies,
                 temporary / "invalid-policies",
                 expect_error="Deployment intent policies must be an object",
+            )
+            return 0
+
+        if args.stop_limit_names:
+            temporary.joinpath("stop-limits").mkdir()
+            _require_stop_limits_by_joint_name(
+                args, request, temporary / "stop-limits"
             )
             return 0
 

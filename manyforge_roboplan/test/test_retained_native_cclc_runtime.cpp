@@ -17,7 +17,6 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
-#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 #include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
@@ -1216,7 +1215,6 @@ private:
                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Sha('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().source_artifact},
         request.speed_profile.max_tcp_linear_speed_mps,
         authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
@@ -1286,8 +1284,7 @@ private:
             : std::nullopt};
     return MakePreparedOperationParticipant(
         std::move(candidate), authority.binding, authority.stop_readiness,
-        &authority.runtime_policy, authority.retained_default_stop_limits,
-        authority.stop_node_category);
+        authority.retained_default_stop_limits, authority.stop_node_category);
   }
 
   std::size_t execute_count_{};
@@ -1306,13 +1303,9 @@ public:
   PublicationOwner(
       core::RuntimeParticipantBinding binding,
       std::filesystem::path journal_path, core::CellId cell_id,
-      core::FakeClock &clock, core::RuntimePolicyDTO runtime_policy,
-      core::RuntimePolicyCatalogRecordRefDTO runtime_policy_source_artifact)
+      core::FakeClock &clock)
       : binding_(std::move(binding)), journal_path_(std::move(journal_path)),
-        cell_id_(std::move(cell_id)), clock_(clock),
-        runtime_policy_(std::move(runtime_policy)),
-        runtime_policy_source_artifact_(
-            std::move(runtime_policy_source_artifact)) {}
+        cell_id_(std::move(cell_id)), clock_(clock) {}
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
@@ -1344,13 +1337,6 @@ public:
             {resource.resource_id,
              core::CoordinateVelocityDTO{core::LinearVelocityDTO{0.02}}});
       }
-    }
-    auto runtime_policy = core::verify_runtime_participant_policy_selection(
-        runtime_policy_source_artifact_, runtime_policy_,
-        participants.front().participant_binding);
-    if (!runtime_policy.ok()) {
-      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-          runtime_policy.error());
     }
     const auto &base_plan =
         participants.front().stop_readiness.value().resolved_stop_base_plan;
@@ -1388,7 +1374,8 @@ public:
         .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
         .engine = &engine_,
         .stop_execution_port = &engine_,
-        .runtime_policy = std::move(runtime_policy.value()),
+        .participant_policy = core::select_runtime_participant_policy(
+            participants.front().participant_binding),
         .prepared_motion_engine = &engine_,
         .default_operator_stop_profile = std::move(operator_profile.value()),
         .default_fault_stop_profile = std::move(fault_profile),
@@ -1458,8 +1445,6 @@ private:
   std::filesystem::path journal_path_;
   core::CellId cell_id_;
   core::FakeClock &clock_;
-  core::RuntimePolicyDTO runtime_policy_;
-  core::RuntimePolicyCatalogRecordRefDTO runtime_policy_source_artifact_;
   core::ManualScheduler scheduler_;
   mutable std::mutex mutex_;
   std::vector<deployment::VerifiedRouteReadinessParticipant> participants_;
@@ -1699,17 +1684,11 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
                           bundle->value().cell_graph.graph_revision);
   const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
       fixture_root / "retained-package");
-  const deployment::FilesystemCatalogArtifactStore policy_artifacts(
-      fixture_root / "retained-package");
-  const auto runtime_policy =
-      deployment::resolve_retained_runtime_policy(*bundle, policy_artifacts);
-  ASSERT_TRUE(runtime_policy.has_value());
   core::FakeClock clock;
   clock.set(1'000);
   PublicationOwner publication_owner(
       runtime.binding, state.path() / "operation-journal.sqlite3",
-      bundle->value().cell_graph.cell_id, clock, runtime_policy->value(),
-      runtime_policy->reference());
+      bundle->value().cell_graph.cell_id, clock);
   core::ManualScheduler scheduler;
 
   auto composition = CreateRetainedNativeCCLCRuntime(

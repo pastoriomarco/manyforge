@@ -1,1 +1,0 @@
-{"api_version":"manyforge.runtime_policy.v1","description":"Maintained native motion policy for ur5e_lite6_wall","interrupt_policy_ids":[],"open_loop_grasp_acknowledgements":[],"runtime_policy_id":"manyforge.runtime_motion.ur5e_lite6_wall","runtime_policy_revision":"sha256:45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605"}

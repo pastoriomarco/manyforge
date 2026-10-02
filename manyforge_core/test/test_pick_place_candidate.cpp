@@ -1134,6 +1134,144 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
   EXPECT_NEAR(inverse_candidate.approach_pose.position_m.y_m, 0.05, 1.0e-9);
 }
 
+TEST(AddressedPickPlacePlanningOwner, AcceptsAnyFrameOffsetReferenceAndNamesAnUnboundObject) {
+  auto predecessor = predecessor_projection();
+  FakeMotionPreviewOwner motion;
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+  const auto request = [](const std::string& id, PickCandidateSynthesisIntentDTO synthesis) {
+    return PickSequencePlanningIntentDTO{
+        id, SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
+        FrameRoleId("frame-role:tcp"), std::move(synthesis),
+        motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+        motion_operation(id + ".descend", "descend", CartesianPathDTO{},
+                         ContactPolicyId("pick.contact"),
+                         {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                                           SceneResourceId("workpiece")}}),
+        tool_operation(id + ".tool", 0.0),
+        motion_operation(id + ".retreat", "retreat", CartesianPathDTO{})};
+  };
+
+  // The cell frame and another robot's frame are ordinary offset references:
+  // both reach the one reference resolution like motion references.
+  auto synthesis = PickCandidateSynthesisIntentDTO{};
+  synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
+  synthesis.approach_offset_reference =
+      ReferenceDTO(FrameRoleId("frame-role:tcp"),
+                   ReferenceTargetDTO{TargetRoleId("observer_arm"),
+                                      ControllableComponentId("observer.component"),
+                                      CommandTargetId("observer.command")});
+  const auto accepted = owner.PlanPick(request("any-frame-offsets", synthesis));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(motion.reference_resolution_count, 1U);
+
+  // A runtime object other than the selected one is refused by name.
+  synthesis.pick_offset_reference =
+      ReferenceDTO(ReferenceDTO::Type::kRuntimeObject, "other_object");
+  synthesis.approach_offset_reference.reset();
+  const auto unbound = owner.PlanPick(request("unbound-offset-object", synthesis));
+  ASSERT_FALSE(unbound.ok());
+  EXPECT_EQ(unbound.error().code, "missing_reference");
+  EXPECT_EQ(unbound.error().details.at("reason"), "pick_offset_runtime_object_unbound");
+  EXPECT_EQ(unbound.error().details.at("reference_type"), "runtime_object");
+  EXPECT_EQ(unbound.error().details.at("reference_id"), "other_object");
+  EXPECT_EQ(motion.reference_resolution_count, 1U);
+}
+
+TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTargetRole) {
+  const auto expect_carrier_named = [](const ErrorDTO& error, const char* reason) {
+    EXPECT_EQ(error.code, "missing_reference");
+    EXPECT_EQ(error.details.at("reason"), reason);
+    EXPECT_EQ(error.details.at("reference_type"), "frame_role");
+    EXPECT_EQ(error.details.at("reference_id"), "frame-role:absent");
+    EXPECT_EQ(error.details.at("target_role_id"), "target-role:tool");
+  };
+  {
+    auto predecessor = predecessor_projection();
+    FakeMotionPreviewOwner motion;
+    FakeSceneCandidatePreview scene(predecessor);
+    FakeSceneCandidateProjection projection(predecessor);
+    AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+    const auto pick = owner.PlanPick(PickSequencePlanningIntentDTO{
+        "absent-carrier-pick", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
+        FrameRoleId("frame-role:absent"), PickCandidateSynthesisIntentDTO{},
+        motion_operation("absent-carrier-pick.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+        motion_operation("absent-carrier-pick.descend", "descend", CartesianPathDTO{},
+                         ContactPolicyId("pick.contact"),
+                         {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                                           SceneResourceId("workpiece")}}),
+        tool_operation("absent-carrier-pick.tool", 0.0),
+        motion_operation("absent-carrier-pick.retreat", "retreat", CartesianPathDTO{})});
+    ASSERT_FALSE(pick.ok());
+    expect_carrier_named(pick.error(), "pick_carrier_frame_unresolved");
+  }
+  {
+    auto predecessor = carried_predecessor_projection();
+    FakeMotionPreviewOwner motion;
+    FakeSceneCandidatePreview scene(predecessor);
+    FakeSceneCandidateProjection projection(predecessor);
+    AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+    const auto place = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
+        "absent-carrier-place", SceneResourceId("workpiece"), FrameRoleId("frame-role:absent"),
+        motion_operation("absent-carrier-place.approach", "place.approach",
+                         PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}}),
+        motion_operation(
+            "absent-carrier-place.descend", "place.descend",
+            CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}}),
+        tool_operation("absent-carrier-place.tool", 0.04),
+        motion_operation(
+            "absent-carrier-place.retreat", "place.retreat",
+            CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}})});
+    ASSERT_FALSE(place.ok());
+    expect_carrier_named(place.error(), "place_carrier_frame_unresolved");
+  }
+}
+
+TEST(AddressedPickPlacePlanningOwner, NamesTheRuntimeObjectAndPolicyOfAnUnresolvedContactGrasp) {
+  const auto plan = [](const std::string& id, const std::string& runtime_object_id,
+                       const std::string& contact_policy_id) {
+    auto predecessor = predecessor_projection();
+    FakeMotionPreviewOwner motion;
+    FakeSceneCandidatePreview scene(predecessor);
+    FakeSceneCandidateProjection projection(predecessor);
+    AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+    return owner.PlanPick(PickSequencePlanningIntentDTO{
+        id, SceneResourceId("workpiece"), RuntimeObjectId(runtime_object_id),
+        FrameRoleId("frame-role:tcp"), PickCandidateSynthesisIntentDTO{},
+        motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+        motion_operation(id + ".descend", "descend", CartesianPathDTO{},
+                         ContactPolicyId(contact_policy_id),
+                         {RuntimeObjectReferenceBindingDTO{RuntimeObjectId(runtime_object_id),
+                                                           SceneResourceId("workpiece")}}),
+        tool_operation(id + ".tool", 0.0),
+        motion_operation(id + ".retreat", "retreat", CartesianPathDTO{})});
+  };
+  const auto expect_named = [](const ErrorDTO& error, const char* runtime_object_id,
+                               const char* contact_policy_id) {
+    EXPECT_EQ(error.code, "missing_reference");
+    EXPECT_EQ(error.details.at("reason"), "pick_contact_grasp_template_unresolved");
+    EXPECT_EQ(error.details.at("reference_type"), "runtime_object");
+    EXPECT_EQ(error.details.at("reference_id"), runtime_object_id);
+    EXPECT_EQ(error.details.at("contact_policy_id"), contact_policy_id);
+    EXPECT_FALSE(error.details.contains("target_role_id"));
+  };
+
+  // The Program binds no contact-grasp policy with the descend's ID.
+  const auto missing_policy = plan("absent-policy-pick", "selected_object", "pick.absent");
+  ASSERT_FALSE(missing_policy.ok());
+  expect_named(missing_policy.error(), "selected_object", "pick.absent");
+  EXPECT_NE(missing_policy.error().message.find("absent"), std::string::npos)
+      << missing_policy.error().message;
+
+  // The policy exists but is bound to another runtime object than the selected one.
+  const auto mismatch = plan("mismatched-object-pick", "other_object", "pick.contact");
+  ASSERT_FALSE(mismatch.ok());
+  expect_named(mismatch.error(), "other_object", "pick.contact");
+  EXPECT_NE(mismatch.error().message.find("other than the selected"), std::string::npos)
+      << mismatch.error().message;
+}
+
 TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotionDiagnostic) {
   auto predecessor = predecessor_projection();
   FakeMotionPreviewOwner motion;

@@ -31,7 +31,7 @@ struct AuthoredReference {
 
 // Authored independently from kCatalogRecordTypeRegistry so this fixture can
 // catch a mistaken or incomplete implementation mapping.
-constexpr std::array<AuthoredReference, 11> kAllReferences{{
+constexpr std::array<AuthoredReference, 10> kAllReferences{{
     {"model_asset", "model.alpha", "manyforge.model_asset.v1", '1', '2',
      '3', '4'},
     {"runtime_profile", "runtime.alpha", "manyforge.runtime_profile.v1",
@@ -52,8 +52,6 @@ constexpr std::array<AuthoredReference, 11> kAllReferences{{
      'a', 'b', 'c'},
     {"stop_evidence_policy", "stop.alpha",
      "manyforge.stop_evidence_policy.v2", 'a', 'b', 'c', 'd'},
-    {"runtime_policy", "policy.alpha", "manyforge.runtime_policy.v1", 'b',
-     'c', 'd', 'e'},
 }};
 
 [[nodiscard]] std::string digest(char digit) {
@@ -136,9 +134,6 @@ template <typename Record>
     case 9U:
       return typed_reference_as<
           core::StopEvidencePolicyCatalogRecordRefDTO>(reference);
-    case 10U:
-      return typed_reference_as<core::RuntimePolicyCatalogRecordRefDTO>(
-          reference);
     default:
       throw std::out_of_range("unknown authored catalog reference index");
   }
@@ -171,10 +166,10 @@ template <typename Record>
   });
 }
 
-TEST(DeploymentCatalogCodec, DecodesAllElevenStrongVariantsAndRetainsFields) {
+TEST(DeploymentCatalogCodec, DecodesAllTenStrongVariantsAndRetainsFields) {
   const auto decoded =
-      decode_deployment_catalogs(catalogs_value({10, 7, 4, 1, 9, 6, 3, 0,
-                                                 8, 5, 2}));
+      decode_deployment_catalogs(catalogs_value({7, 4, 1, 9, 6, 3, 0, 8,
+                                                 5, 2}));
   ASSERT_EQ(decoded.size(), kAllReferences.size());
   EXPECT_TRUE(std::holds_alternative<
               core::CapabilityDefinitionCatalogRecordRefDTO>(decoded[0]));
@@ -194,13 +189,11 @@ TEST(DeploymentCatalogCodec, DecodesAllElevenStrongVariantsAndRetainsFields) {
       decoded[6]));
   EXPECT_TRUE(std::holds_alternative<core::ProviderManifestCatalogRecordRefDTO>(
       decoded[7]));
-  EXPECT_TRUE(std::holds_alternative<core::RuntimePolicyCatalogRecordRefDTO>(
-      decoded[8]));
   EXPECT_TRUE(std::holds_alternative<core::RuntimeProfileCatalogRecordRefDTO>(
-      decoded[9]));
+      decoded[8]));
   EXPECT_TRUE(
       std::holds_alternative<core::StopEvidencePolicyCatalogRecordRefDTO>(
-          decoded[10]));
+          decoded[9]));
 
   for (const auto& actual : decoded) {
     const std::string_view kind =
@@ -231,10 +224,10 @@ TEST(DeploymentCatalogCodec, DecodesAllElevenStrongVariantsAndRetainsFields) {
 TEST(DeploymentCatalogCodec, EncodingIsCanonicalAndShuffleIndependent) {
   const auto forward =
       decode_deployment_catalogs(catalogs_value({0, 1, 2, 3, 4, 5, 6, 7, 8,
-                                                 9, 10}));
+                                                 9}));
   const auto reverse =
-      decode_deployment_catalogs(catalogs_value({10, 9, 8, 7, 6, 5, 4, 3, 2,
-                                                 1, 0}));
+      decode_deployment_catalogs(catalogs_value({9, 8, 7, 6, 5, 4, 3, 2, 1,
+                                                 0}));
   const CanonicalValue forward_encoded = encode_deployment_catalogs(forward);
   const CanonicalValue reverse_encoded = encode_deployment_catalogs(reverse);
   EXPECT_EQ(forward_encoded, reverse_encoded);
@@ -255,7 +248,7 @@ TEST(DeploymentCatalogCodec, EncodingIsCanonicalAndShuffleIndependent) {
             "stop_evidence_policy");
 }
 
-TEST(DeploymentCatalogCodec, EncoderMatchesIndependentElevenVariantOracle) {
+TEST(DeploymentCatalogCodec, EncoderMatchesIndependentTenVariantOracle) {
   std::vector<core::CatalogRecordRefDTO> typed;
   typed.reserve(kAllReferences.size());
   for (std::size_t index = 0U; index < kAllReferences.size(); ++index) {
@@ -264,7 +257,7 @@ TEST(DeploymentCatalogCodec, EncoderMatchesIndependentElevenVariantOracle) {
 
   const CanonicalValue encoded = encode_deployment_catalogs(typed);
   const CanonicalValue expected = catalogs_value(
-      {7U, 6U, 2U, 8U, 3U, 4U, 0U, 5U, 10U, 1U, 9U});
+      {7U, 6U, 2U, 8U, 3U, 4U, 0U, 5U, 1U, 9U});
   EXPECT_EQ(encoded, expected);
   EXPECT_EQ(canonical_json(encoded), canonical_json(expected));
 }

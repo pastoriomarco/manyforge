@@ -1,6 +1,7 @@
 import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
 import type { ProgramBindingDocument } from '../types/api';
 import type { PoseTuple } from './poseTransforms';
+import { rpyDegToXyzw } from './orientation';
 
 export type MoveToOrientationMode = 'keep-current' | 'face-down' | 'use-entity';
 
@@ -88,15 +89,9 @@ export function canonicalProgramPose(value: unknown): PoseTuple | null {
     const values = orientation.xyzw.map(Number) as [number, number, number, number];
     if (values.every(Number.isFinite)) quaternion = new Quaternion(...values);
   } else if (Array.isArray(orientation.rpy_deg) && orientation.rpy_deg.length === 3) {
-    const values = orientation.rpy_deg.map(Number);
-    if (values.every(Number.isFinite)) {
-      quaternion = new Quaternion().setFromEuler(new Euler(
-        values[0] * Math.PI / 180,
-        values[1] * Math.PI / 180,
-        values[2] * Math.PI / 180,
-        'XYZ',
-      ));
-    }
+    // Stored Program RPY is intrinsic ZYX, like the backend.
+    const xyzw = rpyDegToXyzw(orientation.rpy_deg);
+    if (xyzw !== undefined) quaternion = new Quaternion(...xyzw);
   }
   if (quaternion === null || quaternion.lengthSq() < 1e-12) return null;
   quaternion.normalize();

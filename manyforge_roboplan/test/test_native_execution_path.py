@@ -37,8 +37,10 @@ from manyforge_headless_api.models import (
     FullStopIntentRequest,
     OperationControlRequest,
     OperationIntentRequest,
+    PickSequencePlanningRequest,
     ProgramRunStopIntentRequest,
     StopIntentRequest,
+    TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
@@ -2281,6 +2283,33 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         assert infeasible["planning_result"]["status"] == ("no_feasible_candidate")
         assert infeasible["planning_result"]["attempted_candidate_count"] > 0
         assert infeasible["planning_result"]["last_attempted_candidate"]
+
+        # A pick offset may name another robot's frame, but that robot must be
+        # bound in the Program Binding, exactly like a motion reference; the
+        # refusal names the failed reference.
+        unbound_request = _pick_planning_request()
+        unbound_request["sequence_id"] = "process-pick-unbound-offset"
+        unbound_request["synthesis"]["approach_offset_reference"] = {
+            "type": "frame_role",
+            "frame_role_id": "frame-role:tcp",
+            "target": {
+                "target_role_id": "unbound-robot",
+                "controllable_component_id": "unbound.component",
+                "command_target_id": "unbound.target",
+            },
+        }
+        unbound = native.plan_pick(
+            PickSequencePlanningRequest.model_validate(unbound_request),
+            trusted_principal_id=None,
+        )
+        assert unbound["ok"] is False
+        assert unbound["error"]["code"] == "missing_reference"
+        assert unbound["error"]["details"] == {
+            "reason": "program_reference_target_role_unbound",
+            "reference_type": "frame_role",
+            "reference_id": "frame-role:tcp",
+            "target_role_id": "unbound-robot",
+        }
         assert native.events(owner_epoch, 0)["events"] == before
     finally:
         _stop_host(process)
@@ -2396,6 +2425,47 @@ def _check_malformed_stop_recovery(
     assert clear_history["fault_latch"]["state"] == "cleared"
     assert clear_history["fault_latch"]["recovery_status"] == "cleared"
     assert clear_history["result"]["accepted"] is True
+
+
+def test_events_sample_live_progress_without_durable_progress_records(tmp_path: Path) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    execution = ExecutionCommandClient(run_root, timeout_seconds=3.0)
+    try:
+        status = execution.diagnostics()["status"]
+        request = _direct_control_gripper_operation(status, request_id="progress-only", position=0.004)
+        payload = request["participants"][0]["payload"]
+        payload["caller_options"][0]["value_s"] = 3.0
+        payload["completion_timeout_s"] = 5.0
+        accepted = execution.submit(OperationIntentRequest.model_validate(request), trusted_principal_id="test")
+        assert accepted.get("ok") is True, accepted
+        operation_id = accepted["accepted"]["operation_id"]
+        epoch = status["identity"]["owner_epoch"]
+        cursor = 0
+        previous = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            page = execution.events(epoch, cursor)
+            cursor = page["next_after_sequence"]
+            sample = next((row for row in page["operation_progress"]
+                           if row["operation_id"] == operation_id), None)
+            if sample is not None:
+                assert 0 <= sample["progress"] <= 1
+                if (previous is not None and not page["events"]
+                        and sample["operation_revision"] == previous["operation_revision"]
+                        and sample["progress"] > previous["progress"]):
+                    break
+                previous = sample
+            time.sleep(0.02)
+        else:
+            pytest.fail("native progress did not advance independently of journal events")
+    finally:
+        _stop_host(process)
 
 
 @pytest.mark.parametrize("restart_with_fault", [False, True])
@@ -2978,6 +3048,70 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         _wait_retired(native, relative_operation_id)
 
+        # An absolute pose expressed in a named frame is resolved by the
+        # native cell resolver from the admission-time state. The TCP frame
+        # with an identity goal therefore holds the current TCP pose.
+        framed_status = headless.execution_diagnostics()["status"]
+        framed_start_pose = _status_observation(
+            framed_status, presentation="motion"
+        )["current_tcp_pose"]
+        framed_operation = OperationIntentRequest.model_validate(
+            _direct_control_motion_operation(
+                framed_status,
+                request_id="native-direct-framed-absolute-pose",
+                motion={"kind": "pose_goal", "goal": _pose()},
+            )
+        ).model_dump(mode="json")
+        framed_payload = framed_operation["participants"][0]["payload"]
+        assert framed_payload["target_mode"] == "absolute"
+        framed_payload["goal_frame_reference"] = {
+            "type": "frame_role",
+            "frame_role_id": relative_direct["tcp_frame_role_id"],
+        }
+        native_commands = ExecutionCommandClient(
+            execution_run_root, timeout_seconds=10.0
+        )
+        framed_submit = {
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "attribution": native_commands._request_attribution(
+                "operator.process-test"
+            ),
+            "command": "submit",
+        }
+        relative_framed = copy.deepcopy(framed_operation)
+        relative_framed["request_context"]["request_id"] = "native-direct-framed-relative"
+        relative_framed["participants"][0]["payload"] |= {
+            "target_mode": "relative",
+            "target_reference": framed_payload["goal_frame_reference"],
+        }
+        malformed = native_commands._exchange(
+            {**framed_submit, "operation": relative_framed}
+        )
+        assert malformed["ok"] is False, malformed
+        framed_response = native_commands._exchange(
+            {**framed_submit, "operation": framed_operation}
+        )
+        assert framed_response["ok"] is True, framed_response
+        framed_operation_id = framed_response["accepted"]["operation_id"]
+        framed_terminal = _wait_terminal(runner, framed_operation_id)["operation"]
+        assert framed_terminal["state"] == "completed", framed_terminal
+        framed_end_pose = _status_observation(
+            headless.execution_diagnostics()["status"], presentation="motion"
+        )["current_tcp_pose"]
+        assert (
+            _translation_error_m(
+                framed_end_pose["position_m"], framed_start_pose["position_m"]
+            )
+            <= framed_payload["tolerances"]["translation_tol_m"]
+        )
+        assert (
+            _rotation_error_rad(
+                framed_end_pose["orientation"], framed_start_pose["orientation"]
+            )
+            <= framed_payload["tolerances"]["rotation_tol_rad"]
+        )
+        _wait_retired(native, framed_operation_id)
+
         direct_gripper_accepted = composer.execute(gripper_intent)
         direct_gripper_operation_id = direct_gripper_accepted["accepted"][
             "operation_id"
@@ -3557,6 +3691,131 @@ def test_target_queries_cannot_borrow_undeclared_capabilities(tmp_path: Path) ->
         with pytest.raises(HeadlessApiError) as caught:
             client.query_target(gripper_query)
         assert caught.value.code == "execution_target_observation_unavailable"
+        assert client.events(identity["owner_epoch"], 0) == before
+    finally:
+        _stop_host(process)
+
+
+def test_frame_transform_query_uses_cell_resolver_and_verified_target_roles(
+    tmp_path: Path,
+) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    binding = json.loads((fixture_root / "program_binding.json").read_text("utf-8"))
+    arm = next(
+        row
+        for row in binding["target_role_bindings"]
+        if row["target_role_id"] == manifest["target_role_id"]
+    )
+    frame_roles = sorted(row["frame_role_id"] for row in arm["frame_role_bindings"])
+    assert len(frame_roles) >= 2
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    client = ExecutionCommandClient(run_root, timeout_seconds=10.0)
+    try:
+        identity = client.identity()["identity"]
+        robot = {
+            "target_role_id": arm["target_role_id"],
+            "controllable_component_id": arm["controllable_component_id"],
+            "command_target_id": arm["command_target_id"],
+        }
+        probe = _pose(0.05, -0.02, 0.03)
+        query = {
+            "schema_version": "manyforge.target_observation_query.v1",
+            "owner_epoch": identity["owner_epoch"],
+            "program_binding_id": manifest["program_binding_id"],
+            "kind": "frame_transform",
+            "pose": probe,
+            "source_frame": {"type": "cell_frame"},
+            "target_frame": {"type": "cell_frame"},
+        }
+
+        def exchange(change: dict[str, Any]) -> dict[str, Any]:
+            return client._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "command": "query_target",
+                    "query": {**query, **change},
+                }
+            )
+
+        before = client.events(identity["owner_epoch"], 0)
+        identity_transform = exchange({})
+        assert identity_transform["ok"] is True, identity_transform
+        # The typed client accepts the transform answer shape.
+        typed = client.query_target(TargetObservationQuery.model_validate(query))
+        assert typed["target_observation"]["value"] == (
+            identity_transform["target_observation"]["value"]
+        )
+        observation = identity_transform["target_observation"]
+        assert observation["schema_version"] == "manyforge.target_observation.v1"
+        for key, value in query.items():
+            if key != "schema_version":
+                assert observation[key] == value
+        assert observation["resolution_evidence_digests"] == []
+        assert observation["scene_revision"]["scene_id"]
+        assert _translation_error_m(
+            observation["value"]["position_m"], probe["position_m"]
+        ) < 1e-12
+
+        source = {"type": "frame_role", "frame_role_id": frame_roles[0], "target": robot}
+        target = {"type": "frame_role", "frame_role_id": frame_roles[1], "target": robot}
+        forward = exchange({"source_frame": source, "target_frame": target})
+        assert forward["ok"] is True, forward
+        assert len(forward["target_observation"]["resolution_evidence_digests"]) == 2
+        backward = exchange(
+            {
+                "pose": forward["target_observation"]["value"],
+                "source_frame": target,
+                "target_frame": source,
+            }
+        )
+        assert backward["ok"] is True, backward
+        assert _translation_error_m(
+            backward["target_observation"]["value"]["position_m"],
+            probe["position_m"],
+        ) < 1e-9
+
+        # Every refusal names the failed reference (spec 210 §5.3); the host
+        # passes the owner's details through unchanged.
+        for change, reason, named in [
+            (
+                {"source_frame": {**source, "target": {**robot, "command_target_id": "other"}}},
+                "program_reference_target_role_mismatch",
+                {
+                    "reference_type": "frame_role",
+                    "reference_id": frame_roles[0],
+                    "target_role_id": robot["target_role_id"],
+                },
+            ),
+            (
+                {"source_frame": {**source, "target": {**robot, "target_role_id": "absent"}}},
+                "program_reference_target_role_unbound",
+                {
+                    "reference_type": "frame_role",
+                    "reference_id": frame_roles[0],
+                    "target_role_id": "absent",
+                },
+            ),
+            (
+                {"source_frame": {"type": "scene_resource", "scene_resource_id": "absent"}},
+                "program_scene_resource_missing",
+                {"reference_type": "scene_resource", "reference_id": "absent"},
+            ),
+            (
+                {"source_frame": {"type": "frame_role", "frame_role_id": frame_roles[0]}},
+                "frame_transform_reference_unsupported",
+                {"reference_type": "frame_role", "reference_id": frame_roles[0]},
+            ),
+        ]:
+            rejected = exchange(change)
+            assert rejected["ok"] is False, rejected
+            assert rejected["error"]["details"] == {"reason": reason, **named}
+        stale_owner = exchange({"owner_epoch": "old.owner"})
+        assert stale_owner["error"]["code"] == "execution_target_owner_stale"
         assert client.events(identity["owner_epoch"], 0) == before
     finally:
         _stop_host(process)

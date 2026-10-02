@@ -34,6 +34,7 @@ from manyforge_composer.backend.routes_draft import (
 )
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
+from manyforge_headless_api.client import HeadlessClientError
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -183,7 +184,15 @@ def _motion_targets_projection() -> dict:
                     "command_target_id": "arm",
                     "operation_capability_id": "execution.trajectory.execute",
                     "presentation": "motion",
-                    "command": {"target_role_id": "arm"},
+                    "command": {
+                        "target_role_id": "command_target",
+                        "base_frame_role_id": "base",
+                        "tcp_frame_role_id": "tcp",
+                        "target_descriptor": {"frames": [
+                            {"frame_role_id": "base", "compiled_frame_name": "robot.base"},
+                            {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp"},
+                        ]},
+                    },
                 }],
             }],
         },
@@ -313,9 +322,312 @@ def _node_environment_projection() -> dict:
     }
 
 
-def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
+def _mock_applied_motion_binding(monkeypatch: pytest.MonkeyPatch) -> dict:
+    binding = {
+        "graph_revision": "graph-1", "retained_bundle_id": "bundle-1",
+        "target_role_bindings": [{
+            "target_role_id": "arm", "controllable_component_id": "robot",
+            "command_target_id": "arm", "frame_role_bindings": [
+                {"frame_role_id": "base", "compiled_frame_name": "robot.base"},
+                {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp"},
+            ],
+        }],
+    }
+    monkeypatch.setattr(routes_draft, "_applied_context", lambda _state: (
+        SimpleNamespace(binding_document=binding, program_revision=None), None,
+    ))
+    return binding
+
+
+def test_observed_pose_joins_applied_address_and_preserves_base_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_applied_motion_binding(monkeypatch)
+    targets = _motion_targets_projection()
+    other = deepcopy(targets["targets"]["components"][0])
+    other["controllable_component_id"] = "other-robot"
+    targets["targets"]["components"].insert(0, other)
+    control = _motion_control_projection()
+    other_observed = deepcopy(control["control_state"]["observed_targets"][0])
+    other_observed["controllable_component_id"] = "other-robot"
+    other_observed["observed"]["current_tcp_pose"]["position_m"]["x_m"] = 99
+    control["control_state"]["observed_targets"].insert(0, other_observed)
+    parameters = {"target_role": "arm", "base_frame_role": "base", "tcp_frame_role": "tcp"}
+    authoring = {"forest": [{"instance_id": "move", "node_id": "motion.move_to_pose", "parameters": parameters}]}
+    state = SimpleNamespace(
+        headless_client=SimpleNamespace(execution_targets=lambda: targets, execution_control_state=lambda: control),
+        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}),
+    )
+    args = {"instance_id": "move", "observed_kind": "tcp_pose"}
+    resolved, _identity = routes_draft._observed_move_arguments(state, args)
+    assert resolved["observed"]["current_tcp_pose"]["position_m"]["x_m"] == 0.1
+    assert resolved["observed"]["frame_ref"] == {
+        "kind": "target_frame", "target_role": "arm", "frame_role": "base",
+    }
+
+
+def _set_parameter(field: str, value: object):
+    def change(node: dict, _binding: dict, _targets: dict) -> None:
+        if value is None:
+            node["parameters"].pop(field)
+        else:
+            node["parameters"][field] = value
+    return change
+
+
+def _replace_configuration_and_lose_target(_node: dict, binding: dict, _targets: dict) -> None:
+    # A stale configuration also hides the target; the configuration is named.
+    binding["graph_revision"] = "replaced"
+    binding["target_role_bindings"][0]["command_target_id"] = "gone"
+
+
+def _lose_bound_target(_node: dict, binding: dict, _targets: dict) -> None:
+    binding["target_role_bindings"][0]["command_target_id"] = "gone"
+
+
+def _duplicate_bound_target(_node: dict, _binding: dict, targets: dict) -> None:
+    component = targets["targets"]["components"][0]
+    component["targets"].append(deepcopy(component["targets"][0]))
+
+
+def _unbind_frame_role(_node: dict, binding: dict, _targets: dict) -> None:
+    binding["target_role_bindings"][0]["frame_role_bindings"].pop(0)
+
+
+def _drop_observed_base_frame(_node: dict, _binding: dict, targets: dict) -> None:
+    command = targets["targets"]["components"][0]["targets"][0]["command"]
+    command["target_descriptor"]["frames"].pop(0)
+
+
+def _drop_owner_identity(_node: dict, _binding: dict, targets: dict) -> None:
+    targets.pop("identity")
+
+
+def _no_change(_node: dict, _binding: dict, _targets: dict) -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("observed_kind", "change", "applied", "code", "message"),
+    [
+        pytest.param("joint", _set_parameter("target_role", None), "bound",
+                     "observed_move_role_missing", "has no target role", id="target-role-missing"),
+        pytest.param("tcp_pose", _set_parameter("base_frame_role", None), "bound",
+                     "observed_move_role_missing", "has no base frame role", id="base-role-missing"),
+        pytest.param("tcp_pose", _set_parameter("tcp_frame_role", None), "bound",
+                     "observed_move_role_missing", "has no TCP frame role", id="tcp-role-missing"),
+        pytest.param("joint", _no_change, "unavailable", "observed_move_unavailable",
+                     "could not be read: Applied owner disconnected", id="applied-unreadable"),
+        pytest.param("joint", _no_change, "none", "observed_move_target_unbound",
+                     "no Program with robot target bindings is Applied", id="nothing-applied"),
+        pytest.param("joint", _drop_owner_identity, "bound", "observed_move_unavailable",
+                     "publishes no configuration identity", id="owner-identity-missing"),
+        pytest.param("tcp_pose", _replace_configuration_and_lose_target, "bound",
+                     "observed_move_configuration_changed", "the Applied configuration changed",
+                     id="configuration-changed-first"),
+        pytest.param("joint", _set_parameter("target_role", "unbound"), "bound",
+                     "observed_move_target_unbound",
+                     "target role 'unbound' is not bound in the Applied Program",
+                     id="target-role-unbound"),
+        pytest.param("joint", _lose_bound_target, "bound", "observed_move_target_unavailable",
+                     "bound robot target is unavailable in the current execution owner",
+                     id="target-unavailable"),
+        pytest.param("joint", _duplicate_bound_target, "bound", "observed_move_target_unavailable",
+                     "more than one matching robot target", id="target-ambiguous"),
+        pytest.param("tcp_pose", _unbind_frame_role, "bound", "observed_move_target_unbound",
+                     "base frame role 'base' is not bound for target role 'arm'",
+                     id="frame-role-unbound"),
+        pytest.param("tcp_pose", _set_parameter("tcp_frame_role", "base"), "bound",
+                     "observed_move_frame_mismatch",
+                     "TCP frame role 'base' resolves to 'robot.base', but the robot reports "
+                     "its current pose with TCP frame 'robot.tcp'",
+                     id="frame-mismatch"),
+        pytest.param("tcp_pose", _drop_observed_base_frame, "bound", "observed_move_frame_mismatch",
+                     "does not report a base frame", id="observed-frame-missing"),
+    ],
+)
+def test_observed_move_names_each_refusal_cause_before_any_draft_change(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_kind: str,
+    change,
+    applied: str,
+    code: str,
+    message: str,
 ) -> None:
+    binding = _mock_applied_motion_binding(monkeypatch)
+    if applied == "unavailable":
+        monkeypatch.setattr(routes_draft, "_applied_context", lambda _state: (
+            None, {"code": "headless_unavailable", "message": "Applied owner disconnected"},
+        ))
+    elif applied == "none":
+        monkeypatch.setattr(routes_draft, "_applied_context", lambda _state: (
+            SimpleNamespace(binding_document=None, program_revision=None), None,
+        ))
+    targets = _motion_targets_projection()
+
+    class Headless:
+        def execution_targets(self) -> dict:
+            return targets
+
+        def node_environment(self) -> dict:
+            return _node_environment_projection()
+
+        def execution_control_state(self) -> dict:
+            return _motion_control_projection()
+
+        def program_applied(self) -> dict:
+            return {}
+
+    program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    state.headless_client = Headless()  # type: ignore[assignment]
+    state.execution_observation_source = ExecutionObservationSource(
+        state.headless_client  # type: ignore[arg-type]
+    )
+    workspace = state.draft_session.workspace_snapshot()
+    session = state.draft_session
+    # The resolver sees the selected move in the requested shape; the stored
+    # Draft itself is never touched by this test.
+    view = deepcopy(session.snapshot())
+    node = view["authoring"]["forest"][0]["children"][0]
+    assert node["instance_id"] == "move_to_pick"
+    if observed_kind == "tcp_pose":
+        node["node_id"] = "motion.move_to_pose"
+    change(node, binding, targets)
+
+    def snapshot() -> dict:
+        return deepcopy(view)
+
+    def prepare_mutation(**_kwargs):
+        raise AssertionError("a refused observed move must not prepare a Draft change")
+
+    monkeypatch.setattr(session, "snapshot", snapshot)
+    monkeypatch.setattr(session, "prepare_mutation", prepare_mutation)
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(workspace),
+            "mutation": "program_draft_store_observed_move",
+            "arguments": {"instance_id": "move_to_pick", "observed_kind": observed_kind},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == code
+    assert message in detail["message"]
+    monkeypatch.undo()
+    after = state.draft_session.workspace_snapshot()
+    assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
+    assert after["draft"]["authoring"] == workspace["draft"]["authoring"]
+
+
+@pytest.mark.parametrize(
+    ("node_id", "observed_kind", "message"),
+    [
+        ("motion.move_to_pose", "joint", "Move to joint target node"),
+        ("motion.move_to_joint_target", "tcp_pose", "Move to pose node"),
+        ("scene.remove_object", "joint", "Move to joint target node"),
+    ],
+)
+def test_observed_move_refuses_a_node_that_cannot_hold_the_capture(
+    node_id: str, observed_kind: str, message: str,
+) -> None:
+    authoring = {"forest": [{"instance_id": "move", "node_id": node_id,
+                             "parameters": {"target_role": "arm"}}]}
+    state = SimpleNamespace(
+        headless_client=SimpleNamespace(
+            execution_targets=_motion_targets_projection,
+            execution_control_state=_motion_control_projection,
+        ),
+        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}),
+    )
+    with pytest.raises(DraftSessionError, match=message) as refused:
+        routes_draft._observed_move_arguments(
+            state, {"instance_id": "move", "observed_kind": observed_kind},
+        )
+    assert refused.value.code == "observed_move_node_unsupported"
+    assert refused.value.status_code == 409
+
+
+@pytest.mark.parametrize("failing_read", ["execution_targets", "execution_control_state"])
+def test_observed_move_names_a_failed_robot_pose_read_before_any_draft_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_read: str,
+) -> None:
+    class Headless:
+        def execution_targets(self) -> dict:
+            if failing_read == "execution_targets":
+                raise HeadlessClientError(
+                    "headless_unavailable", "execution owner disconnected", 503,
+                )
+            return _motion_targets_projection()
+
+        def execution_control_state(self) -> dict:
+            if failing_read == "execution_control_state":
+                raise HeadlessClientError(
+                    "headless_unavailable", "execution owner disconnected", 502,
+                )
+            return _motion_control_projection()
+
+        def node_environment(self) -> dict:
+            return _node_environment_projection()
+
+    program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    state.headless_client = Headless()  # type: ignore[assignment]
+    state.execution_observation_source = ExecutionObservationSource(
+        state.headless_client  # type: ignore[arg-type]
+    )
+    workspace = state.draft_session.workspace_snapshot()
+
+    def prepare_mutation(**_kwargs):
+        raise AssertionError("a failed pose read must not prepare a Draft change")
+
+    monkeypatch.setattr(state.draft_session, "prepare_mutation", prepare_mutation)
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(workspace),
+            "mutation": "program_draft_store_observed_move",
+            "arguments": {"instance_id": "move_to_pick", "observed_kind": "joint"},
+        },
+    )
+
+    # The code, not the status, is what tells the client nothing was prepared.
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "observed_move_unavailable"
+    assert "could not be read: execution owner disconnected" in detail["message"]
+    assert detail["context"] == {"headless_code": "headless_unavailable"}
+    monkeypatch.undo()
+    after = state.draft_session.workspace_snapshot()
+    assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
+    assert after["draft"]["authoring"] == workspace["draft"]["authoring"]
+
+
+def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_applied_motion_binding(monkeypatch)
     class Headless:
         def __init__(self) -> None:
             self.reads = 0
@@ -377,7 +689,8 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
     ]
 
 
-def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path) -> None:
+def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_applied_motion_binding(monkeypatch)
     class Headless:
         def execution_targets(self) -> dict:
             return _motion_targets_projection()
@@ -1319,3 +1632,275 @@ def test_artifact_roots_symlinks_overwrite_confirmation_and_atomic_failure(
     assert failed.value.code == "program_artifact_write_failed"
     assert existing.read_text(encoding="utf-8") == "sentinel"
     assert list(allowed.glob(".*.tmp-*")) == []
+
+
+# --- V13.5 formula checks and path-keyed value sources --------------------
+
+
+def _expression_program(tmp_path: Path) -> Path:
+    import json
+
+    document = Program(_SOURCE_PROGRAM, build_node_environment().catalog).to_dict()
+
+    def parameter(parameter_id: str, value_type: str, default) -> dict:
+        return {
+            "parameter_id": parameter_id,
+            "type": value_type,
+            "default": default,
+            "runtime_mutability": "before_run",
+        }
+
+    def key(name: str, value_type: str, **extra) -> dict:
+        return {
+            "key": name,
+            "type": value_type,
+            "access": "read_write",
+            "persistence": "run",
+            **extra,
+        }
+
+    document["parameters"] = sorted(
+        [
+            *document["parameters"],
+            parameter("grasp_offset", "float64", 0.01),
+            parameter("tube_length", "float64", 0.2),
+        ],
+        key=lambda row: row["parameter_id"],
+    )
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            key("approach_z", "float64", access="read",
+                expression="key.grasp_z + 0.05"),
+            key("count", "int64"),
+            key("grasp_z", "float64", access="read",
+                expression="-param.tube_length / 2 + param.grasp_offset"),
+            key("index", "int64", initial=3),
+            key("names", "string_list"),
+            key("place", "stored_pose"),
+        ],
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    target = tmp_path / "formulas.program.yaml"
+    target.write_text(json.dumps(document), encoding="utf-8")
+    return target
+
+
+def _check(client: TestClient, expression: str, destination: str = "float64", **extra):
+    return client.post(
+        "/api/program/draft/expression-check",
+        json={"expression": expression, "destination_type": destination, **extra},
+    )
+
+
+def test_expression_check_reports_type_preview_and_names(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    missing = _check(client, "1.0")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "composer_draft_unavailable"
+
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(_expression_program(tmp_path))},
+    )
+    assert opened.status_code == 200, opened.json()
+
+    reply = _check(client, "key.approach_z + key.index * 0.5")
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["schema_version"] == "manyforge.expression_check.v1"
+    assert body["result_type"] == "float64"
+    assert body["diagnostics"] == []
+    # Preview from authoring values: -0.2 / 2 + 0.01 + 0.05 + 3 * 0.5.
+    assert body["preview"]["value"] == pytest.approx(1.46)
+    assert body["preview"]["unavailable_reason"] is None
+    names = {row["name"]: row["type"] for row in body["names"]}
+    assert names["param.tube_length"] == "float64"
+    assert names["key.place"] == "stored_pose"
+    assert names["key.approach_z"] == "float64"
+    assert "key.names" not in names  # string_list cannot be read
+
+    unavailable = _check(client, "key.count + 1", "int64").json()
+    assert unavailable["result_type"] == "int64"
+    assert unavailable["preview"] == {
+        "value": None,
+        "unavailable_reason": "key.count has no authoring value",
+    }
+
+    errors = _check(client, "key.names + 1").json()
+    assert errors["result_type"] is None
+    assert errors["diagnostics"][0] == {
+        "code": "unknown_name",
+        "message": "key.names has type string_list, which expressions cannot read",
+        "position": 0,
+        "length": 9,
+        "name": "key.names",
+    }
+    assert errors["preview"]["value"] is None
+
+    syntax = _check(client, "(1 +", "int64").json()
+    assert syntax["diagnostics"][0]["position"] == 4
+
+    mismatch = _check(client, "key.index > 1", "float64").json()
+    assert mismatch["diagnostics"][0]["code"] == "destination_type_mismatch"
+
+    invalid = client.post(
+        "/api/program/draft/expression-check",
+        json={"expression": "1", "destination_type": "pose"},
+    )
+    assert invalid.status_code == 422
+
+
+def test_expression_check_excludes_the_edited_computed_key_and_dependents(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(_expression_program(tmp_path))},
+    )
+    body = _check(
+        client, "key.approach_z + 1", exclude_computed_key="grasp_z"
+    ).json()
+    # approach_z reads grasp_z, so it would close a cycle.
+    assert body["diagnostics"][0]["code"] == "unknown_name"
+    assert "depends on it" in body["diagnostics"][0]["message"]
+    names = {row["name"] for row in body["names"]}
+    assert {"key.grasp_z", "key.approach_z"}.isdisjoint(names)
+    assert "key.index" in names
+
+    refused = _check(client, "1.0", exclude_computed_key="index")
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "expression_check_exclusion_invalid"
+
+
+def test_merged_literal_replaces_sources_on_the_parameter_but_full_edits_keep_both(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(_expression_program(tmp_path))},
+    ).json()
+    opened_node = None
+    draft = client.get("/api/program/draft").json()
+    for candidate in draft["authoring"]["forest"][0]["children"]:
+        if candidate["instance_id"] == "move_to_pick":
+            opened_node = candidate
+    assert opened_node is not None
+    sources = {
+        **opened_node.get("value_sources", {}),
+        "goal[0].position_rad": {
+            "kind": "expression",
+            "expression": "key.grasp_z * 2",
+        },
+    }
+    full = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "tree_draft_update_node_params",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "expected_node_id": "motion.move_to_joint_target",
+                "merge": False,
+                "parameters": opened_node["parameters"],
+                "value_sources": dict(sorted(sources.items())),
+            },
+        },
+    )
+    assert full.status_code == 200, full.json()
+    workspace = full.json()["workspace"]
+    draft = client.get("/api/program/draft").json()
+    assert draft["candidate_available"] is True, draft["diagnostics"]
+    node = draft["authoring"]["forest"][0]["children"][0]
+    assert "goal[0].position_rad" in node["value_sources"]
+    assert node["parameters"]["goal"] == opened_node["parameters"]["goal"]
+
+    merged = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(workspace),
+            "mutation": "tree_draft_update_node_params",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "expected_node_id": "motion.move_to_joint_target",
+                "parameters": {"goal": opened_node["parameters"]["goal"]},
+            },
+        },
+    )
+    assert merged.status_code == 200, merged.json()
+    node = client.get("/api/program/draft").json()["authoring"]["forest"][0][
+        "children"
+    ][0]
+    assert "goal[0].position_rad" not in node["value_sources"]
+    assert "velocity_scale" in node["value_sources"]
+
+
+def test_workspace_reports_the_names_each_draft_formula_reads(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    assert empty["draft"]["formulaReferences"] == {"computedKeys": {}, "nodes": {}}
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(_expression_program(tmp_path))},
+    ).json()
+    computed = {
+        "approach_z": ["key.grasp_z"],
+        "grasp_z": ["param.grasp_offset", "param.tube_length"],
+    }
+    assert opened["draft"]["formulaReferences"] == {
+        "computedKeys": computed,
+        "nodes": {},
+    }
+
+    node = client.get("/api/program/draft").json()["authoring"]["forest"][0][
+        "children"
+    ][0]
+    assert node["instance_id"] == "move_to_pick"
+    sources = {
+        **node.get("value_sources", {}),
+        "goal[0].position_rad": {
+            "kind": "expression",
+            "expression": "key.grasp_z * 2 + param.tube_length + key.grasp_z",
+        },
+        # Does not check (string_list cannot be read): reported as reading nothing.
+        "goal[1].position_rad": {"kind": "expression", "expression": "key.names + 1"},
+    }
+    edited = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "tree_draft_update_node_params",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "expected_node_id": "motion.move_to_joint_target",
+                "merge": False,
+                "parameters": node["parameters"],
+                "value_sources": dict(sorted(sources.items())),
+            },
+        },
+    )
+    assert edited.status_code == 200, edited.json()
+    draft = edited.json()["workspace"]["draft"]
+    # The Draft has no candidate, yet its formulas that check are reported.
+    assert draft["candidateAvailable"] is False
+    expected = {
+        "computedKeys": computed,
+        "nodes": {
+            "move_to_pick": {
+                "goal[0].position_rad": ["key.grasp_z", "param.tube_length"],
+            },
+        },
+    }
+    assert draft["formulaReferences"] == expected
+    snapshot = client.get("/api/authoring/workspace").json()
+    assert snapshot["program"]["formulaReferences"] == expected

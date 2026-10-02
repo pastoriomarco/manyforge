@@ -15,7 +15,6 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
-#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
@@ -238,7 +237,7 @@ qualify_empty(std::string_view cell_id) {
       deployment.applicability_inputs().value().site_overlay_ref,
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
       {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(deployment,
                                           compile_cell_ir(applicability));
@@ -257,95 +256,6 @@ materialize_empty(std::string_view cell_id, IRawArtifactStore &store) {
 [[nodiscard]] CanonicalValue replace_object_member(const CanonicalValue &value,
                                                    std::string_view member_name,
                                                    CanonicalValue replacement);
-
-struct RuntimePolicyRetentionFixture final {
-  RetentionQualifiedDeployment qualified;
-  QualifiedRuntimePolicy policy;
-  std::string policy_bytes;
-};
-
-[[nodiscard]] RuntimePolicyRetentionFixture
-make_runtime_policy_retention_fixture() {
-  CanonicalValue policy(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.runtime_policy.v1")},
-      {"runtime_policy_id", CanonicalValue("runtime.safe")},
-      {"runtime_policy_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
-      {"open_loop_grasp_acknowledgements",
-       CanonicalValue(CanonicalValue::Array{})},
-  });
-  policy = replace_object_member(
-      policy, "runtime_policy_revision",
-      CanonicalValue(detail::compute_content_identity(
-          policy,
-          detail::ContentIdentitySpec{
-              .identity_domain = "catalog-record-revision/runtime_policy",
-              .api_version = "manyforge.runtime_policy.v1",
-              .own_field = "runtime_policy_revision",
-          })));
-  const std::string policy_bytes = canonical_json(policy);
-  const std::string policy_digest = sha256_digest(policy_bytes);
-  const core::RuntimePolicyCatalogRecordRefDTO reference{
-      core::RuntimePolicyId("runtime.safe"),
-      core::RuntimePolicyRevision(
-          string_member(policy, "runtime_policy_revision")),
-      core::SchemaId("manyforge.runtime_policy.v1"),
-      core::SchemaRevision(
-          "sha256:"
-          "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"),
-      core::ContentDigest(policy_digest),
-      core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
-  };
-  QualifiedRuntimePolicy qualified_policy = resolve_and_qualify_runtime_policy(
-      reference, reference.content_addressed_store_key, policy_bytes);
-
-  const CanonicalValue catalogs = detail::encode_deployment_catalogs(
-      std::array<core::CatalogRecordRefDTO, 1U>{reference});
-  const CanonicalValue &records = member(catalogs, "records");
-  const CanonicalValue deployment_root(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id", CanonicalValue("runtime_policy_retention")},
-      {"deployment_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"cell_id", CanonicalValue("runtime_policy_cell")},
-      {"name", CanonicalValue("Runtime policy retention")},
-      {"catalogs", catalogs},
-      {"graph", parse_strict_json_model_yaml(empty_graph()).root()},
-      {"desired_control_configurations",
-       CanonicalValue(CanonicalValue::Array{})},
-      {"capability_provider_bindings", CanonicalValue(CanonicalValue::Array{})},
-      {"policies",
-       CanonicalValue(CanonicalValue::Object{
-           {"retained_policy_records", records},
-           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
-           {"commissioned_stop_interfaces",
-            CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_config",
-            CanonicalValue(CanonicalValue::Object{
-                {"queue_depth", CanonicalValue(8.0)},
-                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-            })},
-       })},
-  });
-  const auto deployment = compute_deployment_artifact_revision(
-      parse_strict_json_model_yaml(canonical_json(deployment_root)), {});
-  const auto composition = compose_cell_occurrences(
-      deployment.graph(), std::span<const SourceVerifiedModelAsset>{},
-      std::span<const QualifiedComponentType>{});
-  const auto overlay = select_site_overlay_for_deployment(
-      deployment.applicability_inputs().value().site_overlay_ref,
-      deployment.applicability_inputs().value().external_resources, nullptr);
-  const std::array policies{qualified_policy};
-  const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, policies, {}, {}, {},
-      {}, {}, {}, {}, {}, overlay);
-  return {qualify_deployment_for_retention(deployment,
-                                           compile_cell_ir(applicability)),
-          std::move(qualified_policy), policy_bytes};
-}
 
 struct ContactPolicyRetentionFixture final {
   RetentionQualifiedDeployment qualified;
@@ -454,7 +364,7 @@ make_contact_policy_retention_fixture() {
       deployment.applicability_inputs().value().external_resources, nullptr);
   const std::array policies{qualified_policy};
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
       {}, {}, {}, {}, overlay, policies);
   return {qualify_deployment_for_retention(deployment,
                                            compile_cell_ir(applicability)),
@@ -747,42 +657,6 @@ TEST(RetainedBundleMaterializer,
   EXPECT_TRUE(array_member(provenance, "source_records").empty());
   EXPECT_TRUE(array_member(provenance, "generator_records").empty());
   EXPECT_EQ(array_member(provenance, "output_records").size(), 2U);
-}
-
-TEST(RetainedBundleMaterializer,
-     RuntimePolicySelectionIsRetainedAndReloadedAsOneExactCatalogReferent) {
-  auto fixture = make_runtime_policy_retention_fixture();
-  PolicyCompilerInputSource input_source(fixture.policy.reference(),
-                                         fixture.policy_bytes);
-  test::InMemoryCatalogArtifactStoreFixture catalog_store;
-  test::InMemoryRawArtifactStoreFixture raw_store;
-  const auto bundle = detail::RetainedBundleMaterializer::materialize(
-      fixture.qualified,
-      detail::RetentionMaterializerTestAccess::make_context(), input_source, {},
-      catalog_store, raw_store);
-
-  ASSERT_NE(bundle, nullptr);
-  ASSERT_EQ(bundle->value().retained_policy_records.size(), 1U);
-  EXPECT_EQ(bundle->value().retained_policy_records.front(),
-            core::CatalogRecordRefDTO(fixture.policy.reference()));
-  ASSERT_EQ(bundle->value().catalogs.records.size(), 1U);
-  EXPECT_EQ(bundle->value().catalogs.records.front(),
-            bundle->value().retained_policy_records.front());
-  ASSERT_EQ(
-      array_member(bundle->normalized_root(), "retained_policy_records").size(),
-      1U);
-  EXPECT_EQ(catalog_store.size(), 1U);
-  EXPECT_NO_THROW(
-      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
-          bundle->canonical_bytes())));
-
-  CanonicalValue changed =
-      replace_root_member(bundle->normalized_root(), "retained_policy_records",
-                          CanonicalValue(CanonicalValue::Array{}));
-  changed = reidentify_retained_bundle(std::move(changed));
-  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
-                   canonical_json(changed))),
-               RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
@@ -1339,8 +1213,8 @@ TEST(RetainedBundleMaterializer,
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 13U);
-  EXPECT_EQ(catalog_store.size(), 13U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 12U);
+  EXPECT_EQ(catalog_store.size(), 12U);
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
   const auto &unit = bundle->value().cell_graph.runtime_units.front();
   ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 3U);
@@ -1732,8 +1606,8 @@ TEST(RetainedBundleMaterializer,
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 13U);
-  EXPECT_EQ(catalog_store.size(), 13U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 12U);
+  EXPECT_EQ(catalog_store.size(), 12U);
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
   const auto &runtime_unit = bundle->value().cell_graph.runtime_units.front();
   EXPECT_EQ(runtime_unit.runtime_unit_id.value(),

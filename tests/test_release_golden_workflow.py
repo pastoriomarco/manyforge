@@ -139,27 +139,9 @@ def test_ordinary_development_paths_contain_no_fixed_release_gate() -> None:
         / "manyforge_deployment"
         / "test"
         / "test_canonical_empty_admission.cpp",
-        _REPO_ROOT
-        / "verification"
-        / "composable_cell_i2"
-        / "verify_qualification_manifest.py",
     )
     for path in paths:
         source = path.read_text(encoding="utf-8")
         assert "MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN" not in source
         assert "kExpectedReleaseCanonicalEmptyBundleId" not in source
         assert "kExpectedReleaseCompilerBuildDigest" not in source
-
-    qualification_manifest = json.loads(
-        (
-            _REPO_ROOT
-            / "verification"
-            / "composable_cell_i2"
-            / "qualification_manifest.v1.json"
-        ).read_text(encoding="utf-8")
-    )
-    tracked_paths = {
-        row["path"]
-        for row in qualification_manifest["pinned_inputs"]["tracked_files"]
-    }
-    assert not any("canonical_empty_admission" in path for path in tracked_paths)

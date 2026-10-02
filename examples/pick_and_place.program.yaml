@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_demo
-program_revision: sha256:9ae235ff605d1d63c2763a70d1b300d723bbb2c75d95e33fa7e1720ce1a18c43
+program_revision: sha256:4477bda3a8aa160c27c21ac6cc387819d7b2b434e89457bf6516629c6a0b1b7b
 program_profile: composable-cell-v1
 name: pick_and_place_demo
 description: >-
@@ -10,7 +10,7 @@ description: >-
   scene and attachment revisions now invalidate planning automatically.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: forbidden
@@ -129,7 +129,7 @@ tree:
           kind: program_parameter
           reference: velocity_scale
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: close_gripper
       parameters: {key: gripper_closed, value: true}
       children: []
@@ -200,7 +200,7 @@ tree:
           kind: program_parameter
           reference: velocity_scale
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: open_gripper
       parameters: {key: gripper_closed, value: false}
       children: []

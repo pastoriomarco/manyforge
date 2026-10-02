@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:10e5bbd90903b5f79f2876e057c13d436dfd81d3f1083092290e1a4ddc61f57a
+program_revision: sha256:2080f6e8877a5197ca9230dcf551cf2b6edefcb39ff5f3918564c4ad5f927ea8
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   remains visible in the Program.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required
@@ -211,26 +211,23 @@ tree:
       parameters:
         model_endpoint_alias: selection_model
         prompt_template_id: select_scene_object_v1
-        template_variables:
-          - variable_id: candidate_object_ids
-            source:
-              kind: blackboard_field
-              reference: selection.context
-              field: candidate_object_ids
-          - variable_id: scene_context_json
-            source:
-              kind: blackboard_field
-              reference: selection.context
-              field: scene_context_json
-          - variable_id: selection_request_text
-            source:
-              kind: blackboard_field
-              reference: selection.context
-              field: selection_request_text
         scene_attachment: none
         output_key: selection.response
         timeout_s: 20.0
         min_confidence: 0.7
+      value_sources:
+        template_variables.candidate_object_ids:
+          kind: blackboard_field
+          reference: selection.context
+          field: candidate_object_ids
+        template_variables.scene_context_json:
+          kind: blackboard_field
+          reference: selection.context
+          field: scene_context_json
+        template_variables.selection_request_text:
+          kind: blackboard_field
+          reference: selection.context
+          field: selection_request_text
       children: []
     - node_id: assistant.validate_scene_selection
       instance_id: validate_selected_object
@@ -303,7 +300,7 @@ tree:
           reference: planning.pick_plan
           field: pick_pose
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: close_gripper
       parameters: {key: gripper_closed, value: true}
       children: []
@@ -363,7 +360,7 @@ tree:
           orientation: {rpy_deg: [180.0, 0.0, 0.0]}
         velocity_scale: 0.2
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: open_gripper
       parameters: {key: gripper_closed, value: false}
       children: []

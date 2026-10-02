@@ -197,11 +197,12 @@ class RetainedNativeCellCommandReadinessPort final
              lhs.stop_readiness->value() == rhs.stop_readiness->value();
     };
     const auto same_policy = [&]() {
-      if (lhs.runtime_policy.has_value() != rhs.runtime_policy.has_value()) {
+      if (lhs.participant_policy.has_value() !=
+          rhs.participant_policy.has_value()) {
         return false;
       }
-      return !lhs.runtime_policy.has_value() ||
-             lhs.runtime_policy->value() == rhs.runtime_policy->value();
+      return !lhs.participant_policy.has_value() ||
+             lhs.participant_policy->value() == rhs.participant_policy->value();
     };
     return lhs.binding.value() == rhs.binding.value() &&
            same_readiness() &&

@@ -932,6 +932,30 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, initial);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
 
+    const shellChanged = vi.fn();
+    const viewerChanged = vi.fn();
+    const progressChanged = vi.fn();
+    source.subscribeShell(shellChanged);
+    source.subscribeViewer(viewerChanged);
+    source.subscribeOperationProgress(progressChanged);
+    const progress = [{ owner_epoch: 'owner.1', operation_id: 'op.1', operation_revision: 1, progress: 0.6 }];
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
+      control: {
+        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1, freshness: controlFreshness(1),
+      },
+      shell: { complete: false, operation_progress: progress },
+    });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getOperationProgress()).toEqual(progress);
+    expect(progressChanged).toHaveBeenCalledTimes(1);
+    expect(shellChanged).not.toHaveBeenCalled();
+    expect(viewerChanged).not.toHaveBeenCalled();
+
     const cycle = structuredClone(initial.program_cycle) as Record<string, unknown>;
     cycle.execution_control_revision = 2;
     cycle.state = 'starting';

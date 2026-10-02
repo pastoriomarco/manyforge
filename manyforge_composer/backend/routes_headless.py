@@ -46,6 +46,9 @@ from manyforge_headless_api.models import (
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
+    PersistentKeyValueResetRequest,
+    PersistentKeyValueSetRequest,
+    PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -71,6 +74,9 @@ from .state import ComposerState
 
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+_ScenarioPath = Annotated[
+    str, Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
+]
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
 _SCENE_RESULT_FIELDS = {
@@ -503,6 +509,50 @@ def create_headless_router(
             )
         )
 
+    def require_scenario_path(scenario_id: str, body: Any) -> None:
+        if body.scenario_id != scenario_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "persistent_key_path_invalid",
+                    "message": "Scenario identity in path and body must match",
+                },
+            )
+
+    @router.get("/api/program/scenarios/{scenario_id}/persistent-values")
+    def program_persistent_values(scenario_id: _ScenarioPath) -> dict[str, Any]:
+        return _call(lambda: client.program_persistent_values(scenario_id))
+
+    @router.post("/api/program/scenarios/{scenario_id}/persistent-values")
+    def set_program_persistent_value(
+        scenario_id: _ScenarioPath,
+        body: PersistentKeyValueSetRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return _call(lambda: client.program_persistent_value_action(
+            scenario_id, "set", body.model_dump(mode="json")
+        ))
+
+    @router.post("/api/program/scenarios/{scenario_id}/persistent-values/reset")
+    def reset_program_persistent_value(
+        scenario_id: _ScenarioPath,
+        body: PersistentKeyValueResetRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return _call(lambda: client.program_persistent_value_action(
+            scenario_id, "reset", body.model_dump(mode="json")
+        ))
+
+    @router.post("/api/program/scenarios/{scenario_id}/persistent-values/clear")
+    def clear_program_persistent_values(
+        scenario_id: _ScenarioPath,
+        body: PersistentKeyValuesClearRequest,
+    ) -> dict[str, Any]:
+        require_scenario_path(scenario_id, body)
+        return _call(lambda: client.program_persistent_value_action(
+            scenario_id, "clear", body.model_dump(mode="json")
+        ))
+
     @router.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -733,7 +783,7 @@ def create_headless_router(
             "program_resume_full_stop", "operation_start", "operation_resume",
         }
         def submit():
-            if start:
+            if start and body.command_envelope.command_kind.startswith("program_"):
                 _require_applied_authoring_drafts(state)
             return client.submit_control_command(body.model_dump(mode="json"))
 
@@ -749,7 +799,8 @@ def create_headless_router(
     @router.post("/api/execution/operations")
     async def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
         def submit():
-            _require_applied_authoring_drafts(state)
+            # Manual requests address the active runtime, never the Draft.
+            # Keep the shared admission serialization and Kernel checks below.
             return client.execute(body.model_dump(mode="json"))
 
         assert state.authoring_admission is not None

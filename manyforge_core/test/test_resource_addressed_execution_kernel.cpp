@@ -1232,7 +1232,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Digest('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().source_artifact},
         authority.requested_tcp_linear_speed_mps,
         authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
@@ -1299,7 +1298,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
             ? std::optional<PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
             : std::nullopt};
     return MakePreparedOperationParticipant(std::move(candidate), authority.binding,
-                                            authority.stop_readiness, &authority.runtime_policy,
+                                            authority.stop_readiness,
                                             authority.retained_default_stop_limits,
                                             authority.stop_node_category);
   }
@@ -2074,24 +2073,6 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
                                   ? CoordinateVelocityDTO{AngularVelocityDTO{0.02}}
                                   : CoordinateVelocityDTO{LinearVelocityDTO{0.02}}});
   }
-  RuntimePolicyDTO policy{RuntimePolicyId("runtime.test"),
-                          RuntimePolicyRevision(test_digest('d')),
-                          std::nullopt,
-                          {},
-                          {}};
-  RuntimePolicyCatalogRecordRefDTO policy_reference{
-      policy.runtime_policy_id,
-      policy.runtime_policy_revision,
-      SchemaId(std::string(kRuntimePolicyApiVersion)),
-      SchemaRevision(test_digest('e')),
-      ContentDigest(test_digest('f')),
-      ContentAddressedStoreKey("catalog/runtime-policy/runtime.test.json")};
-  auto runtime_policy = verify_runtime_participant_policy_selection(std::move(policy_reference),
-                                                                    std::move(policy), participant);
-  if (!runtime_policy.ok()) {
-    throw std::logic_error(runtime_policy.error().message + ": " +
-                           runtime_policy.error().details.at("reason"));
-  }
   std::optional<MotionInterruptStopProfileDTO> operator_stop_profile;
   std::optional<MotionInterruptStopProfileDTO> fault_stop_profile;
   if (participant.value().capability_id.value() == "execution.trajectory.execute") {
@@ -2123,7 +2104,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       MotionInterruptNodeCategory::kGeneric,
       &engine,
       dynamic_cast<IControlDomainExecutionPort*>(&engine),
-      std::move(runtime_policy.value()),
+      select_runtime_participant_policy(participant),
       dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(&engine),
       std::move(operator_stop_profile),
       std::move(fault_stop_profile),
@@ -6205,14 +6186,14 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     RefusesMotionWhenStopReadinessExistsButRuntimePolicyIsUnqualified) {
+     RefusesMotionWhenStopReadinessExistsButParticipantPolicyIsAbsent) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto unqualified = registration(binding, engine);
-  unqualified.runtime_policy.reset();
+  unqualified.participant_policy.reset();
 
   ResourceAddressedExecutionKernel kernel(
       {std::move(unqualified)}, clock, scheduler, default_journal,
@@ -8952,6 +8933,35 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.preview_calls, 0);
 }
 
+TEST(ResourceAddressedExecutionKernelTest, RefusesEveryMotionInterruptScopeBeforePreparation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  auto intent = motion_operation("request.interrupt.scope");
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = "scope.contact";
+  scope.policy_id = "interrupt.contact";
+  std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+      .motion_interrupt_scopes.push_back(scope);
+
+  const auto result = kernel.execute(intent);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "motion_interrupt_policy_not_admitted");
+  EXPECT_EQ(engine.execute_calls, 0);
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      OrdinaryJerkPolicyIsSharedByProgramManualPreviewAndExecution) {
   for (const bool manual : {false, true}) {
@@ -8970,9 +8980,9 @@ TEST(ResourceAddressedExecutionKernelTest,
       for (const auto& resource : target.binding.value().resources)
         profile.limits.emplace(*resource.source_joint_name, AngularJerkDTO{10.0});
       auto policy =
-          apply_deployment_motion_jerk_policy(*target.runtime_policy, target.binding, profile);
+          apply_deployment_motion_jerk_policy(*target.participant_policy, target.binding, profile);
       ASSERT_TRUE(policy.ok());
-      target.runtime_policy = std::move(policy.value());
+      target.participant_policy = std::move(policy.value());
       ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                     CellId("cell.test"), 8U};
       config.manager_liveness_required_set = EmptyManagerLivenessSet();
@@ -9142,13 +9152,33 @@ TEST(ResourceAddressedExecutionKernelTest,
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto expect_policy_object_named = [](const ErrorDTO& error) {
+    EXPECT_EQ(error.code, "missing_reference");
+    EXPECT_EQ(error.details.at("reason"), "contact_grasp_runtime_object_unresolved");
+    // The one reference is the runtime object the contact policy requires.
+    EXPECT_EQ(error.details.at("reference_type"), "runtime_object");
+    EXPECT_EQ(error.details.at("reference_id"), "selected_object");
+    EXPECT_FALSE(error.details.contains("target_role_id"));
+  };
   auto intent = motion_operation();
-  std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).contact_policy_id =
-      ContactPolicyId("selected_object_grasp");
+  auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
 
   const auto result = kernel.execute(intent);
   ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "contact_grasp_runtime_object_unresolved");
+  expect_policy_object_named(result.error());
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  // Selecting a different runtime object still names the one the policy needs,
+  // never the selected one.
+  auto other = motion_operation("request.contact_grasp.other_object");
+  auto& other_motion = std::get<MotionParticipantIntentDTO>(other.participants.front().payload);
+  other_motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
+  other_motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
+      RuntimeObjectId("other_object"), SceneResourceId("part.7")}};
+  const auto other_result = kernel.execute(other);
+  ASSERT_FALSE(other_result.ok());
+  expect_policy_object_named(other_result.error());
   EXPECT_EQ(engine.execute_calls, 0);
 }
 
@@ -16113,7 +16143,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                     CoordinateKind::kLinear, schema);
   auto gripper_registration = registration(binding, gripper_engine);
   // A gripper-only capability command has no arm motion policy requirement.
-  gripper_registration.runtime_policy.reset();
+  gripper_registration.participant_policy.reset();
 
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U, {}, &gate};

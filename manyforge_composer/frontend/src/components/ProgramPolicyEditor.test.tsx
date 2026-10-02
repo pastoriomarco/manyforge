@@ -18,7 +18,7 @@ const node: ProgramTreeNode = {
 };
 
 describe('ProgramPolicyEditor', () => {
-  it('previews inherited or replaced Draft membership without a group registry', () => {
+  it('shows inherited groups as checked but disabled, with a creation shortcut', () => {
     const leaf = { ...node };
     const parent: ProgramTreeNode = {
       ...node, instance_id: 'branch', execution_groups: ['all_grippers', 'robot_a'], children: [leaf],
@@ -26,12 +26,47 @@ describe('ProgramPolicyEditor', () => {
     expect(inheritedProgramExecutionGroups([parent], leaf.instance_id)).toEqual(['all_grippers', 'robot_a']);
     const markup = renderToStaticMarkup(
       <ProgramPolicyEditor node={leaf} inheritedGroups={parent.execution_groups as string[]}
+        availableGroups={['all_grippers', 'robot_a']} onCreateGroup={vi.fn()}
         busy={false} onUpdate={vi.fn()} />,
     );
-    expect(markup).toContain('all, all_grippers, robot_a');
+    expect(markup).toContain('Draft memberships: All + all_grippers, robot_a (inherited).');
+    expect(markup).toContain('<legend>Control groups</legend>');
+    expect(markup).toContain('Inherit groups from parent');
     expect(markup).toContain('running membership cannot change');
+    expect(markup).toContain('type="checkbox" disabled="" checked=""/>all_grippers');
+    expect(markup).toContain('Create group…');
+    expect(markup).not.toContain('placeholder="robot_a, all_grippers"');
     parent.execution_groups = 'all';
     expect(inheritedProgramExecutionGroups([parent], leaf.instance_id)).toEqual([]);
+  });
+
+  it('offers only existing named groups and keeps empty explicit membership in All', () => {
+    const explicit = renderToStaticMarkup(
+      <ProgramPolicyEditor node={{ ...node, execution_groups: ['robot_a', 'robot_b'] }}
+        availableGroups={['robot_a', 'robot_b', 'robot_c']} busy={false} onUpdate={vi.fn()} />,
+    );
+    expect(explicit).toContain('type="checkbox" checked=""/>robot_a');
+    expect(explicit).toContain('type="checkbox" checked=""/>robot_b');
+    expect(explicit).toContain('type="checkbox"/>robot_c');
+    const allOnly = renderToStaticMarkup(
+      <ProgramPolicyEditor node={{ ...node, execution_groups: 'all' }}
+        availableGroups={['robot_a']} busy={false} onUpdate={vi.fn()} />,
+    );
+    expect(allOnly).toContain('Draft memberships: All only.');
+    expect(allOnly).toContain('type="checkbox"/>robot_a');
+    expect(allOnly).not.toContain('>All only</option>');
+  });
+
+  it('keeps undeclared memberships visible as missing, and branch hints mention inheriting children', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramPolicyEditor node={{ ...node, execution_groups: ['ghost', 'robot_a'], children: [{ ...node, instance_id: 'child' }] }}
+        availableGroups={['robot_a', 'robot_b']} busy={false} onUpdate={vi.fn()} />,
+    );
+    expect(markup).toContain('type="checkbox" checked=""/>ghost — missing');
+    expect(markup).toContain('Draft memberships: All + ghost, robot_a.');
+    expect(markup).toContain('Child nodes that inherit follow later changes here.');
+    expect(markup.indexOf('<legend>Control groups</legend>'))
+      .toBeLessThan(markup.indexOf('<legend>Operator Stop policy</legend>'));
   });
 
   it('validates named groups before submitting the existing policy form', () => {

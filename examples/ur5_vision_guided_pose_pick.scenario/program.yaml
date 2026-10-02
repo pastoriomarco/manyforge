@@ -47,7 +47,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.3.0"
+    "content_version": "2.4.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -131,7 +131,7 @@
         {
           "children": [],
           "instance_id": "close_gripper",
-          "node_id": "logic.set_bool",
+          "node_id": "logic.set_value",
           "parameters": {
             "key": "gripper_closed",
             "value": true
@@ -204,7 +204,7 @@
         {
           "children": [],
           "instance_id": "open_gripper",
-          "node_id": "logic.set_bool",
+          "node_id": "logic.set_value",
           "parameters": {
             "key": "gripper_closed",
             "value": false

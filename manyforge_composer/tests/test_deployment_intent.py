@@ -92,6 +92,33 @@ def _intent() -> dict:
     }
 
 
+def _stop_limits(value: dict) -> list:
+    return value["components"][0]["target_settings"]["arm"]["controlled_stop"][
+        "per_joint_limits"
+    ]
+
+
+def test_intent_keeps_authored_stop_limit_order() -> None:
+    intent = _intent()
+    _stop_limits(intent).insert(
+        0,
+        {
+            "source_joint_name": "joint2",
+            "max_deceleration_rad_s2": 2.0,
+            "settle_velocity_threshold_rad_s": 0.02,
+        },
+    )
+
+    normalized = validate_deployment_intent(intent, source="fixture")
+
+    assert [
+        row["source_joint_name"]
+        for row in normalized["components"][1]["target_settings"]["arm"][
+            "controlled_stop"
+        ]["per_joint_limits"]
+    ] == ["joint2", "joint1"]
+
+
 def test_intent_is_closed_normalized_and_component_ordered() -> None:
     normalized = validate_deployment_intent(_intent(), source="fixture")
 
@@ -134,6 +161,18 @@ def test_intent_is_closed_normalized_and_component_ordered() -> None:
                 "maximum_tcp_linear_speed_mps", 0
             ),
             "positive and finite",
+        ),
+        (
+            lambda value: _stop_limits(value).append(dict(_stop_limits(value)[0])),
+            "duplicate source joint 'joint1'",
+        ),
+        (
+            lambda value: _stop_limits(value)[0].pop("source_joint_name"),
+            "missing source_joint_name",
+        ),
+        (
+            lambda value: _stop_limits(value)[0].__setitem__("source_joint_name", " "),
+            "source_joint_name must be bounded non-empty text",
         ),
     ],
 )

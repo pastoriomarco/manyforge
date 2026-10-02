@@ -146,7 +146,7 @@ TEST(CommandSchemaCodec, BindsEveryCatalogReferenceFieldAndStoredBytes) {
                CommandSchemaCodecError);
 
   auto wrong_schema = reference;
-  wrong_schema.schema_id = core::SchemaId("manyforge.runtime_policy.v1");
+  wrong_schema.schema_id = core::SchemaId("manyforge.contact_policy.v1");
   EXPECT_THROW(resolve_and_qualify_command_schema(
                    wrong_schema, store_key, stored_bytes),
                CommandSchemaCodecError);

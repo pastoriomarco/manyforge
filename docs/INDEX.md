@@ -41,12 +41,13 @@ scenario package; standalone packaged installation is not yet available.
 
 | Task                                          | Start here                                                                                                                                                                                                                            |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Start the current development workbench       | [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md); repository Scenario project or empty startup, simulated native execution, HMR-enabled frontend                                                           |
+| Start the current development workbench       | [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md); repository Scenario project or empty startup, simulated native execution, HMR-enabled frontend                                                          |
 | Study former stack workflows                  | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                                                                                                                           |
 | Study historical runtime diagnosis            | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)                                                                                                     |
 | Study historical stop/recovery controls       | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                                                                                                                          |
 | Study the historical robot-import workflow    | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md); v0 migration/reference input                                                                                                                                          |
 | Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                                                                                                                           |
+| Author Programs: blackboard keys and formulas | [`authoring/BLACKBOARD_KEYS.md`](authoring/BLACKBOARD_KEYS.md) and [`authoring/EXPRESSIONS.md`](authoring/EXPRESSIONS.md) (expression language v1)                                                                                    |
 | Understand ownership and data flow            | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                                                                                                                              |
 | Integrate the current Composer API            | Generated [`reference/REST_API.md`](reference/REST_API.md); structural/authoring plus configured thin runtime clients are current                                                                                                     |
 | Integrate the current headless API            | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview and the maintained native Program path are current, while packaged/Isaac/real product readiness remains unavailable |
@@ -143,13 +144,6 @@ commands must not be run or cited as current lane evidence.
   - Historical v0 robot-import workflow and bounded migration reference:
     URDF/SRDF requirements, arm/gripper intent, adapter selection, and smoke
     acceptance cases. It is not the current artifact schema or runnable path.
-
-- [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md)
-
-  - Migration and acceptance inventory of every captured
-    `examples/*.program.yaml` × `*.deployment.yaml` pair, mapped to its
-    historical scenario. It is not a source of runnable current combinations;
-    each artifact must be ported through its named compiler and lane gate.
 
 - [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)
 

@@ -275,6 +275,26 @@ class FakeRuntime:
         self.calls.append(("apply_recovery_action", request))
         return {"accepted": True}
 
+    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+        self.calls.append(("read_persistent_values", scenario_id))
+        return {"scenario_id": scenario_id}
+
+    def set_persistent_value(self, scenario_id: str, request) -> dict[str, Any]:
+        self.calls.append(("set_persistent_value", (scenario_id, request)))
+        return {"action": "set"}
+
+    def reset_persistent_value(self, scenario_id: str, request) -> dict[str, Any]:
+        self.calls.append(("reset_persistent_value", (scenario_id, request)))
+        return {"action": "reset"}
+
+    def clear_persistent_values(self, scenario_id: str, request) -> dict[str, Any]:
+        self.calls.append(("clear_persistent_values", (scenario_id, request)))
+        return {"action": "clear"}
+
+    def reconcile_persistent_values(self) -> dict[str, Any]:
+        self.calls.append(("reconcile_persistent_values", None))
+        return {"outcome": "duplicate"}
+
 
 def _caller() -> dict[str, Any]:
     return {
@@ -739,3 +759,59 @@ def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
         )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == code
+
+
+def test_persistent_value_routes_are_scenario_scoped_strict_requests() -> None:
+    runtime = FakeRuntime()
+    base = "/api/program/scenarios/cell-pick/persistent-values"
+    edit = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "key": "layer",
+        "expected_program_revision": _DIGEST_A,
+    }
+    with TestClient(create_app(runtime)) as client:
+        assert client.get(base).json() == {"scenario_id": "cell-pick"}
+        assert client.post(base, json={**edit, "value": 3}).json() == {
+            "action": "set"
+        }
+        assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
+        cleared = client.post(
+            f"{base}/clear",
+            json={**_caller(), "scenario_id": "cell-pick"},
+        )
+        assert cleared.json() == {"action": "clear"}
+        # A value is required to set, and nothing else is accepted.
+        assert client.post(base, json=edit).status_code == 422
+        assert client.post(f"{base}/reset", json={**edit, "value": 3}).status_code == 422
+        # A live run is named with its revision; the register sequence is no
+        # longer a fence (without a run the last admitted edit wins).
+        assert client.post(
+            f"{base}/reset", json={**edit, "program_run_id": "run.1"}
+        ).status_code == 422
+        assert client.post(
+            f"{base}/reset", json={**edit, "expected_sequence": 4}
+        ).status_code == 422
+        assert client.post(
+            f"{base}/reset",
+            json={**edit, "program_run_id": "run.1", "expected_run_revision": 2},
+        ).json() == {"action": "reset"}
+        assert client.post(
+            f"{base}/clear",
+            json={**_caller(), "scenario_id": "cell-pick", "expected_sequence": 4},
+        ).status_code == 422
+        assert client.get("/api/program/scenarios/Bad!/persistent-values").status_code == 422
+        # Headless's wake after a committed Apply carries nothing to trust.
+        assert client.post("/api/program/persistent-values/reconcile").json() == {
+            "outcome": "duplicate"
+        }
+
+    assert [name for name, _values in runtime.calls] == [
+        "read_persistent_values",
+        "set_persistent_value",
+        "reset_persistent_value",
+        "clear_persistent_values",
+        "reset_persistent_value",
+        "reconcile_persistent_values",
+    ]
+    assert runtime.calls[1][1][1].value == 3

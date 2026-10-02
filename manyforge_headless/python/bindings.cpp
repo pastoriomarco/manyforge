@@ -1,11 +1,16 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/deployment_authoring.hpp>
+#include <manyforge_deployment/expression.hpp>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -14,6 +19,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "manyforge_headless/headless_api_core.hpp"
@@ -250,6 +256,11 @@ public:
   std::string AppliedProgramStatus() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->AppliedProgramStatus(); });
+  }
+
+  std::string CommittedScenarioActivation() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->CommittedScenarioActivation(); });
   }
 
   py::dict ViewerModelUrdf() {
@@ -613,6 +624,318 @@ private:
   std::unique_ptr<HeadlessApiCore> core_;
 };
 
+namespace expression = manyforge::deployment::expression;
+
+PYBIND11_CONSTINIT py::gil_safe_call_once_and_store<py::object>
+    expression_error_type;
+
+constexpr std::array<std::pair<std::string_view, expression::ValueKind>, 5>
+    kExpressionKinds{{
+        {"bool", expression::ValueKind::kBool},
+        {"int64", expression::ValueKind::kInt64},
+        {"float64", expression::ValueKind::kFloat64},
+        {"string", expression::ValueKind::kString},
+        {"pose", expression::ValueKind::kPose},
+    }};
+
+expression::ValueKind ExpressionKind(const std::string &name) {
+  for (const auto &[text, kind] : kExpressionKinds) {
+    if (text == name) {
+      return kind;
+    }
+  }
+  throw py::value_error("unknown expression type '" + name + "'");
+}
+
+std::string_view ExpressionKindName(const expression::ValueKind kind) {
+  for (const auto &[text, value] : kExpressionKinds) {
+    if (value == kind) {
+      return text;
+    }
+  }
+  throw std::logic_error("expression kind has no Python name");
+}
+
+[[noreturn]] void
+RaiseExpressionError(const std::vector<expression::Diagnostic> &diagnostics) {
+  py::list rows;
+  for (const auto &diagnostic : diagnostics) {
+    py::dict row;
+    row["code"] = diagnostic.code;
+    row["message"] = diagnostic.message;
+    row["position"] = diagnostic.position;
+    row["length"] = diagnostic.length;
+    row["name"] = diagnostic.name;
+    rows.append(std::move(row));
+  }
+  const auto &type = expression_error_type.get_stored();
+  py::object error = type(diagnostics.front().message);
+  error.attr("diagnostics") = std::move(rows);
+  PyErr_SetObject(type.ptr(), error.ptr());
+  throw py::error_already_set();
+}
+
+expression::ValueType ExpressionType(const py::handle &value) {
+  if (py::isinstance<py::str>(value)) {
+    return {ExpressionKind(value.cast<std::string>()), {}};
+  }
+  expression::ValueType type{expression::ValueKind::kRecord, {}};
+  for (const auto &[name, field] : value.cast<py::dict>()) {
+    type.fields.push_back({name.cast<std::string>(), ExpressionType(field)});
+  }
+  return type;
+}
+
+std::map<std::string, expression::ValueType, std::less<>>
+ExpressionTypes(const py::dict &section) {
+  std::map<std::string, expression::ValueType, std::less<>> types;
+  for (const auto &[name, type] : section) {
+    types.emplace(name.cast<std::string>(), ExpressionType(type));
+  }
+  return types;
+}
+
+// Program-shaped mappings: {"parameters": {...}, "keys": {...}}.
+void RequireExpressionSections(const py::dict &mapping) {
+  for (const auto &[name, section] : mapping) {
+    const auto text = name.cast<std::string>();
+    if (text != "parameters" && text != "keys") {
+      throw py::value_error("expression mapping has unknown section '" + text +
+                            "'");
+    }
+  }
+}
+
+py::dict ExpressionSection(const py::dict &mapping, const char *name) {
+  return mapping.contains(name) ? mapping[name].cast<py::dict>() : py::dict();
+}
+
+double ExpressionNumber(const py::handle &value) {
+  if (py::isinstance<py::bool_>(value) ||
+      !(py::isinstance<py::int_>(value) || py::isinstance<py::float_>(value))) {
+    throw py::type_error("expression float64 value must be a number");
+  }
+  return value.cast<double>();
+}
+
+template <std::size_t Size>
+std::array<double, Size> ExpressionNumbers(const py::handle &value) {
+  const auto items = value.cast<py::sequence>();
+  if (items.size() != Size) {
+    throw py::value_error("expression pose list must have " +
+                          std::to_string(Size) + " numbers");
+  }
+  std::array<double, Size> result{};
+  for (std::size_t index = 0; index < Size; ++index) {
+    result[index] = ExpressionNumber(items[index]);
+  }
+  return result;
+}
+
+expression::Value ExpressionValue(const py::handle &value,
+                                  const expression::ValueType &type) {
+  switch (type.kind) {
+  case expression::ValueKind::kBool:
+    if (!py::isinstance<py::bool_>(value)) {
+      throw py::type_error("expression bool value must be a bool");
+    }
+    return {value.cast<bool>()};
+  case expression::ValueKind::kInt64:
+    if (py::isinstance<py::bool_>(value) || !py::isinstance<py::int_>(value)) {
+      throw py::type_error("expression int64 value must be an int");
+    }
+    return {value.cast<std::int64_t>()};
+  case expression::ValueKind::kFloat64:
+    return {ExpressionNumber(value)};
+  case expression::ValueKind::kString:
+    if (!py::isinstance<py::str>(value)) {
+      throw py::type_error("expression string value must be a str");
+    }
+    return {value.cast<std::string>()};
+  case expression::ValueKind::kPose: {
+    const auto pose = value.cast<py::dict>();
+    for (const auto &[name, item] : pose) {
+      const auto text = name.cast<std::string>();
+      if (text != "position_m" && text != "orientation" &&
+          text != "frame_ref") {
+        throw py::value_error("expression pose has unknown field '" + text +
+                              "'");
+      }
+    }
+    // Expressions read a pose in its own frame, so frame_ref is not needed.
+    const auto orientation = pose["orientation"].cast<py::dict>();
+    if (orientation.size() != 1U) {
+      throw py::value_error(
+          "expression pose orientation needs exactly one of rpy_deg or xyzw");
+    }
+    expression::Pose result;
+    result.position_m = ExpressionNumbers<3>(pose["position_m"]);
+    if (orientation.contains("rpy_deg")) {
+      result.orientation =
+          expression::RpyDeg{ExpressionNumbers<3>(orientation["rpy_deg"])};
+    } else if (orientation.contains("xyzw")) {
+      result.orientation =
+          expression::Xyzw{ExpressionNumbers<4>(orientation["xyzw"])};
+    } else {
+      throw py::value_error(
+          "expression pose orientation needs exactly one of rpy_deg or xyzw");
+    }
+    return {std::move(result)};
+  }
+  case expression::ValueKind::kRecord: {
+    expression::Record record;
+    for (const auto &[name, item] : value.cast<py::dict>()) {
+      const auto text = name.cast<std::string>();
+      const auto field =
+          std::find_if(type.fields.begin(), type.fields.end(),
+                       [&](const auto &row) { return row.name == text; });
+      if (field == type.fields.end()) {
+        throw py::value_error("expression record field '" + text +
+                              "' is not declared");
+      }
+      record.push_back({text, ExpressionValue(item, field->type)});
+    }
+    return {std::move(record)};
+  }
+  }
+  throw std::logic_error("expression kind has no Python conversion");
+}
+
+py::object ExpressionResult(const expression::Value &value) {
+  return std::visit(
+      [](const auto &item) -> py::object {
+        using Item = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<Item, expression::Pose> ||
+                      std::is_same_v<Item, expression::Record>) {
+          throw std::logic_error("expression result is not a scalar");
+        } else {
+          return py::cast(item);
+        }
+      },
+      value.data);
+}
+
+expression::ParsedExpression
+ParseExpression(const std::string &text,
+                const std::optional<py::dict> &limits) {
+  expression::Limits bounds;
+  if (limits.has_value()) {
+    for (const auto &[name, value] : *limits) {
+      const auto text_name = name.cast<std::string>();
+      const auto number = value.cast<std::size_t>();
+      if (text_name == "text_length") {
+        bounds.text_length = number;
+      } else if (text_name == "nesting_depth") {
+        bounds.nesting_depth = number;
+      } else if (text_name == "tokens") {
+        bounds.tokens = number;
+      } else if (text_name == "syntax_nodes") {
+        bounds.syntax_nodes = number;
+      } else if (text_name == "evaluation_steps") {
+        bounds.evaluation_steps = number;
+      } else {
+        throw py::value_error("unknown expression limit '" + text_name + "'");
+      }
+    }
+  }
+  auto parsed = expression::parse(text, bounds);
+  if (auto *diagnostic = std::get_if<expression::Diagnostic>(&parsed)) {
+    RaiseExpressionError({std::move(*diagnostic)});
+  }
+  return std::get<expression::ParsedExpression>(std::move(parsed));
+}
+
+expression::CheckedExpression
+CheckExpression(const expression::ParsedExpression &parsed,
+                const py::dict &environment, const std::string &destination) {
+  RequireExpressionSections(environment);
+  expression::TypeEnvironment types;
+  types.parameters =
+      ExpressionTypes(ExpressionSection(environment, "parameters"));
+  types.keys = ExpressionTypes(ExpressionSection(environment, "keys"));
+  auto checked = expression::check(parsed, types, ExpressionKind(destination));
+  if (auto *diagnostics =
+          std::get_if<std::vector<expression::Diagnostic>>(&checked)) {
+    RaiseExpressionError(*diagnostics);
+  }
+  return std::get<expression::CheckedExpression>(std::move(checked));
+}
+
+py::object EvaluateExpression(const expression::CheckedExpression &checked,
+                              const py::dict &values) {
+  RequireExpressionSections(values);
+  const auto parameters = ExpressionSection(values, "parameters");
+  const auto keys = ExpressionSection(values, "keys");
+  expression::ValueSnapshot snapshot;
+  // Only referenced names are converted; a missing one is the engine's
+  // missing_value diagnostic.
+  for (const auto &[reference, type] : checked.references()) {
+    const bool parameter = reference.source == expression::Source::kParameter;
+    const auto &section = parameter ? parameters : keys;
+    if (!section.contains(reference.name)) {
+      continue;
+    }
+    (parameter ? snapshot.parameters : snapshot.keys)
+        .emplace(reference.name,
+                 ExpressionValue(section[py::str(reference.name)], type));
+  }
+  auto result = expression::evaluate(checked, snapshot);
+  if (auto *diagnostic = std::get_if<expression::Diagnostic>(&result)) {
+    RaiseExpressionError({std::move(*diagnostic)});
+  }
+  return ExpressionResult(std::get<expression::Value>(result));
+}
+
+void RegisterExpressionModule(py::module_ &parent) {
+  auto module = parent.def_submodule(
+      "expression", "Thin binding over the one C++ Program expression engine");
+  expression_error_type.call_once_and_store_result([&]() {
+    return py::reinterpret_steal<py::object>(
+        PyErr_NewException("manyforge_headless_py.expression.ExpressionError",
+                           PyExc_ValueError, nullptr));
+  });
+  module.attr("ExpressionError") = expression_error_type.get_stored();
+  py::dict limits;
+  limits["text_length"] = expression::kMaxTextLength;
+  limits["nesting_depth"] = expression::kMaxNestingDepth;
+  limits["tokens"] = expression::kMaxTokens;
+  limits["syntax_nodes"] = expression::kMaxSyntaxNodes;
+  limits["evaluation_steps"] = expression::kMaxEvaluationSteps;
+  module.attr("LIMITS") = limits;
+  py::class_<expression::CheckedExpression>(module, "CheckedExpression")
+      .def_property_readonly("text",
+                             [](const expression::CheckedExpression &self) {
+                               return std::string(self.text());
+                             })
+      .def_property_readonly("result_type",
+                             [](const expression::CheckedExpression &self) {
+                               return std::string(
+                                   ExpressionKindName(self.result_kind()));
+                             })
+      .def_property_readonly(
+          "references",
+          [](const expression::CheckedExpression &self) {
+            py::list rows;
+            for (const auto &[reference, type] : self.references()) {
+              rows.append(py::make_tuple(
+                  reference.source == expression::Source::kParameter ? "param"
+                                                                     : "key",
+                  reference.name));
+            }
+            return rows;
+          })
+      .def("evaluate", &EvaluateExpression, py::arg("values"));
+  py::class_<expression::ParsedExpression>(module, "ParsedExpression")
+      .def_property_readonly("text",
+                             [](const expression::ParsedExpression &self) {
+                               return std::string(self.text());
+                             })
+      .def("check", &CheckExpression, py::arg("environment"),
+           py::arg("destination"));
+  module.def("parse", &ParseExpression, py::arg("text"),
+             py::arg("limits") = std::nullopt);
+}
+
 } // namespace
 } // namespace manyforge::headless
 
@@ -621,6 +944,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
 
   module.doc() =
       "Thin binding over the C++ ManyForge headless runtime API core";
+  manyforge::headless::RegisterExpressionModule(module);
   module.def(
       "compile_deployment_draft",
       [](const std::string &source) {
@@ -682,6 +1006,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            &HeadlessApiBridge::AppliedProgramSelection)
       .def("applied_program_status",
            &HeadlessApiBridge::AppliedProgramStatus)
+      .def("committed_scenario_activation",
+           &HeadlessApiBridge::CommittedScenarioActivation)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
       .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
            py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))

@@ -41,7 +41,7 @@ const program: ProgramAuthoringDocument = {
   program_id: 'schema_editor',
   program_profile: 'composable-cell-v1',
   name: 'Schema editor',
-  catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.3.0' },
+  catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
   component_roles: { tool: {} },
   target_roles: {
     arm: { required_collision_body_roles: ['arm_collision'] },

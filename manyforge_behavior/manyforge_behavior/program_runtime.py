@@ -45,6 +45,7 @@ from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopSnapshot,
     OperatorMotionStopState,
 )
+from manyforge_behavior.program_clock import ProgramClock
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
 
@@ -259,6 +260,12 @@ def _presented_node_status(behaviour: py_trees.behaviour.Behaviour) -> str:
         return "held"
     status = getattr(behaviour, "presented_status", behaviour.status)
     if status is py_trees.common.Status.INVALID:
+        # A cancellable leaf stopped while running (spec 440 §4.6).
+        if getattr(behaviour, "presented_interrupted", False):
+            return "interrupted"
+        # A stop whose cancellation the owner refused is a failure.
+        if getattr(behaviour, "presented_stop_failed", False):
+            return "failure"
         return "idle"
     return status.name.lower()
 
@@ -275,6 +282,7 @@ class ExecutableProgramRun:
         readiness: NodeExecutionReadiness,
         ports: NodeAdapterPorts,
         program_parameter_values: Mapping[str, Any] | None = None,
+        program_clock: ProgramClock | None = None,
     ) -> None:
         if not isinstance(program, Program):
             raise TypeError("program must be one validated Program")
@@ -286,6 +294,8 @@ class ExecutableProgramRun:
             raise TypeError("readiness must contain exact headless facts")
         if not isinstance(ports, NodeAdapterPorts):
             raise TypeError("ports must be one focused owner-port set")
+        if program_clock is not None and not isinstance(program_clock, ProgramClock):
+            raise TypeError("program_clock must be one ProgramClock")
         if program.program_id != capture.program_id:
             raise ProgramRuntimeError("captured Program ID does not match the Program")
         if program.program_revision != capture.program_revision:
@@ -336,7 +346,13 @@ class ExecutableProgramRun:
                 f"Program execution is unavailable for the selected binding: {reasons}"
             )
 
-        self._value_store = ProgramValueStore.from_program(program)
+        self._value_store = ProgramValueStore.from_program(
+            program,
+            parameter_values=program_parameter_values,
+            scenario_id=capture.scenario_id,
+            register=ports.persistent_keys,
+            program_run_id=capture.program_run_id,
+        )
         self._runtime_overrides = ProgramRuntimeOverrideStore(
             program=program,
             catalog=environment.catalog,
@@ -345,7 +361,6 @@ class ExecutableProgramRun:
             program=program,
             catalog=environment.catalog,
             value_store=self._value_store,
-            program_parameter_values=program_parameter_values,
             runtime_overrides=self._runtime_overrides,
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
@@ -362,8 +377,14 @@ class ExecutableProgramRun:
         capture_topology(program.tree)
         self._scope_node_ids = tuple(sorted(node_children))
         self._scope_identity: tuple[str, str, int] | None = None
+        # The run's one Program clock. Its owner freezes it while the run is
+        # halted; waits, the timer and held-time measurement all read it, so
+        # a hold that spans a Halt is never subtracted twice.
+        self._program_clock = program_clock or ProgramClock()
         self._operator_stop_state = OperatorMotionStopState(
-            node_children, read_scope=self._read_operator_stop_scope
+            node_children,
+            read_scope=self._read_operator_stop_scope,
+            clock=self._program_clock.now,
         )
         self._authored_nodes: dict[str, py_trees.behaviour.Behaviour] = {}
         root = self._build_node(
@@ -381,6 +402,7 @@ class ExecutableProgramRun:
         node: ProgramTreeNode,
         *,
         inherited_stop_policy: str,
+        hold_scope: str | None = None,
         root: bool = False,
     ) -> py_trees.behaviour.Behaviour:
         authored_stop_policy = node.operator_stop_policy or "inherit"
@@ -397,10 +419,15 @@ class ExecutableProgramRun:
             )
         else:
             effective_stop_policy = authored_stop_policy
+        # The nearest hold decorator at or above this node: the one whose
+        # held subtree stops ticking it.
+        if effective_stop_policy == "hold":
+            hold_scope = node.instance_id
         children = tuple(
             self._build_node(
                 child,
                 inherited_stop_policy=effective_stop_policy,
+                hold_scope=hold_scope,
             )
             for child in node.children
         )
@@ -417,6 +444,8 @@ class ExecutableProgramRun:
                 attempt_source=self._attempt_source,
                 ports=self._ports,
                 operator_stop_state=self._operator_stop_state,
+                operator_stop_hold_scope=hold_scope,
+                program_clock=self._program_clock,
             ),
         )
         policy = self._capture.node_policy_by_instance_id.get(node.instance_id)
@@ -446,6 +475,12 @@ class ExecutableProgramRun:
     @property
     def capture(self) -> ProgramRunCapture:
         return self._capture
+
+    @property
+    def program_clock(self) -> ProgramClock:
+        """The run-scoped clock; the run's owner freezes it during a Halt."""
+
+        return self._program_clock
 
     @property
     def availability(self) -> dict[str, Any]:

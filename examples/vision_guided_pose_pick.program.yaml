@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: vision_guided_pose_pick
-program_revision: sha256:a3150510e0513ed2d50149dab45b53f0bb4588aae6891cac0529ee39e735d3a3
+program_revision: sha256:7a8c5e951d6a66dfe4136db3a23d155753af8976fc9860090cc83a4597e9a6cc
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   grounding them in an authoritative pose source.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required
@@ -153,7 +153,7 @@ tree:
           reference: perception.grasp_plan
           field: grasp_pose
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: close_gripper
       parameters: {key: gripper_closed, value: true}
       children: []
@@ -183,7 +183,7 @@ tree:
           orientation: {rpy_deg: [180.0, 0.0, -90.0]}
         velocity_scale: 0.35
       children: []
-    - node_id: logic.set_bool
+    - node_id: logic.set_value
       instance_id: open_gripper
       parameters: {key: gripper_closed, value: false}
       children: []

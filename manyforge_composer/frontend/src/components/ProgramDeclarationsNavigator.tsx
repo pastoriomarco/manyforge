@@ -3,11 +3,13 @@ import { useMemo } from 'react';
 import type {
   BlackboardKeyDeclaration,
   BlackboardNamespaceDeclaration,
+  ProgramFormulaReferences,
   ProgramParameterDeclaration,
   ProgramTreeNode,
 } from '../types/api';
 import {
   collectBlackboardUsages,
+  collectFormulaUsages,
   collectProgramParameterUsages,
   type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
@@ -22,6 +24,8 @@ interface ProgramDeclarationsNavigatorProps {
   parameters: ProgramParameterDeclaration[];
   namespaces: BlackboardNamespaceDeclaration[];
   keys: BlackboardKeyDeclaration[];
+  /** The names each Draft formula reads; formulas count as usages. */
+  formulaReferences: ProgramFormulaReferences;
   selected: ProgramDeclarationSelection | null;
   onSelect: (selection: ProgramDeclarationSelection) => void;
   /** Parameters acting as Program motion defaults, by parameter ID. */
@@ -42,12 +46,17 @@ export function ProgramDeclarationsNavigator({
   parameters,
   namespaces,
   keys,
+  formulaReferences,
   selected,
   onSelect,
   motionDefaults = new Map(),
 }: ProgramDeclarationsNavigatorProps) {
   const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
   const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
+  const formulaUsages = useMemo(
+    () => collectFormulaUsages(formulaReferences),
+    [formulaReferences],
+  );
 
   return (
     <nav className="program-declaration-navigator dpanel" aria-label="Program declarations">
@@ -79,7 +88,10 @@ export function ProgramDeclarationsNavigator({
                 /{motionDefaults.get(parameter.parameter_id)!.applicable}
               </small>
             ) : (
-              <small>{parameterUsages[parameter.parameter_id]?.length ?? 0}</small>
+              <small>
+                {(parameterUsages[parameter.parameter_id]?.length ?? 0)
+                  + (formulaUsages.parameters[parameter.parameter_id]?.length ?? 0)}
+              </small>
             )}
           </button>
         ))}
@@ -120,7 +132,10 @@ export function ProgramDeclarationsNavigator({
             onClick={() => onSelect({ kind: 'key', id: key.key })}
           >
             <span><strong>{key.key}</strong><small>{key.type}</small></span>
-            <small>{blackboardUsages[key.key]?.length ?? 0}</small>
+            <small>
+              {(blackboardUsages[key.key]?.length ?? 0)
+                + (formulaUsages.keys[key.key]?.length ?? 0)}
+            </small>
           </button>
         ))}
       </section>

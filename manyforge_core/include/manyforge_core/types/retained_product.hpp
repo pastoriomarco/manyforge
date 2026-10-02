@@ -189,9 +189,6 @@ using RetainedContactPolicySourceRecordDTO =
 using RetainedStopEvidencePolicySourceRecordDTO =
     TypedRetainedSourceRecordDTO<CatalogRecordKind::kStopEvidencePolicy, StopEvidencePolicyId,
                                  StopEvidencePolicyRevision>;
-using RetainedRuntimePolicySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kRuntimePolicy, RuntimePolicyId,
-                                 RuntimePolicyRevision>;
 
 /// Closed source-provenance union. The selected record kind fixes the strong
 /// source ID and revision domains.
@@ -201,8 +198,7 @@ using RetainedSourceRecordDTO =
                  RetainedControlInterfaceContractSourceRecordDTO,
                  RetainedControllerTopologySourceRecordDTO, RetainedProviderManifestSourceRecordDTO,
                  RetainedCommandSchemaSourceRecordDTO, RetainedCapabilityDefinitionSourceRecordDTO,
-                 RetainedContactPolicySourceRecordDTO, RetainedStopEvidencePolicySourceRecordDTO,
-                 RetainedRuntimePolicySourceRecordDTO>;
+                 RetainedContactPolicySourceRecordDTO, RetainedStopEvidencePolicySourceRecordDTO>;
 
 static_assert(std::variant_size_v<RetainedSourceRecordDTO> == kCatalogRecordTypeRegistry.size());
 

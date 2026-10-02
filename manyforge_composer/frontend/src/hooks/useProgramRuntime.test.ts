@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   AppliedProgramSelection,
+  PersistentKeyValues,
   ProgramRuntimeControlProjection,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
@@ -13,6 +14,7 @@ import {
   buildProgramResetRequest,
   buildProgramStartRequest,
   controlPendingAfterProjection,
+  persistentValuesFence,
   programPendingAfterProjection,
   programRunProjectionKey,
   programRuntimeAfterSnapshot,
@@ -590,4 +592,32 @@ describe('Program runtime authority requests', () => {
     )).toBeNull();
   });
 
+});
+
+describe('stored persistent value edits', () => {
+  const values = (programRunId: string | null): PersistentKeyValues => ({
+    scenarioId: 'cell-pick',
+    programRevision: digest('a'),
+    programRunId,
+    sequence: 7,
+    keys: [],
+    edits: [],
+    storageFault: null,
+    applyObservationFault: null,
+  });
+  const run = (programRunId: string, runRevision: number) => ({
+    capture: { programRunId }, runRevision,
+  });
+
+  it('names the live run the operator saw; without a run the last edit wins', () => {
+    // Without a run nothing is named: the runner admits the edit unless the
+    // same request was applied already.
+    expect(persistentValuesFence(values(null), run('program-cycle.1', 4))).toEqual({});
+    // With a live run: that run at its current revision.
+    expect(persistentValuesFence(values('program-cycle.2'), run('program-cycle.2', 4)))
+      .toEqual({ program_run_id: 'program-cycle.2', expected_run_revision: 4 });
+    // Never a run other than the one holding the values.
+    expect(persistentValuesFence(values('program-cycle.2'), run('program-cycle.1', 4))).toBeNull();
+    expect(persistentValuesFence(values('program-cycle.2'), null)).toBeNull();
+  });
 });

@@ -215,6 +215,8 @@ export interface RobotControlController {
   gripperTargets: DirectControlGripperStatus[];
   manualControlAllowed: boolean;
   manualControlUnavailableReason: string | null;
+  unappliedChanges?: boolean;
+  controlSource?: HeadlessStateSource | null;
   setManualPanelVisible: (visible: boolean) => void;
   controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
@@ -262,6 +264,7 @@ export function useRobotControl(
   headlessSnapshot: ComposerHeadlessState | null = null,
   controlSource: HeadlessStateSource | null = null,
   cartesianDefaults: ManualCartesianDefaults | null = null,
+  unappliedChanges = false,
 ): RobotControlController {
   const [state, dispatch] = useReducer(
     robotControlReducer,
@@ -1047,6 +1050,8 @@ export function useRobotControl(
     gripperTargets,
     manualControlAllowed,
     manualControlUnavailableReason,
+    unappliedChanges,
+    controlSource,
     setManualPanelVisible,
     controlPending,
     runtimeScaleStatus,
@@ -1121,6 +1126,8 @@ export function useRobotControl(
     gripperTargets,
     manualControlAllowed,
     manualControlUnavailableReason,
+    unappliedChanges,
+    controlSource,
     stop,
     fullStop,
     recoverStopFault,

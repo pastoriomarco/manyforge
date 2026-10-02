@@ -299,7 +299,7 @@ TEST(ContactPolicyCodec,
       nullptr);
   const std::array policies{qualified};
   const auto applicability =
-      qualify_cell_applicability(composition, inputs, {}, {}, {}, {}, {}, {},
+      qualify_cell_applicability(composition, inputs, {}, {}, {}, {}, {},
                                  {}, {}, {}, {}, overlay, policies);
   ASSERT_EQ(applicability.contact_policies().size(), 1U);
   EXPECT_EQ(applicability.contact_policies().front().reference(), reference);
@@ -308,7 +308,7 @@ TEST(ContactPolicyCodec,
   EXPECT_EQ(compiled.catalog_record_refs().front(),
             core::CatalogRecordRefDTO(reference));
 
-  EXPECT_THROW((void)qualify_cell_applicability(composition, inputs, {}, {}, {},
+  EXPECT_THROW((void)qualify_cell_applicability(composition, inputs, {}, {},
                                                 {}, {}, {}, {}, {}, {}, {},
                                                 overlay),
                CellApplicabilityError);

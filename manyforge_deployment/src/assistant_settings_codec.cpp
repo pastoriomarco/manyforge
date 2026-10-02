@@ -393,6 +393,47 @@ enum class InstrumentIdKind { kPortable, kTool };
   return result;
 }
 
+[[nodiscard]] std::vector<core::AssistantPromptTemplateVariableDTO>
+parse_template_variables(const CanonicalValue& value, std::string_view path) {
+  const auto& object = require_object(value, path);
+  if (object.size() > kMaximumAssistantRows) {
+    fail(path, "template variables exceed the 4096-row ceiling");
+  }
+  std::vector<core::AssistantPromptTemplateVariableDTO> result;
+  result.reserve(object.size());
+  for (const auto& [variable_id, type] : object) {
+    const std::string entry_path = child_path(path, variable_id);
+    const std::string& value_type = require_string(type, entry_path);
+    if (value_type != "bool" && value_type != "float64" &&
+        value_type != "int64" && value_type != "string" &&
+        value_type != "string_list") {
+      fail(entry_path, "is outside the closed template variable types");
+    }
+    result.push_back({parse_portable_token(CanonicalValue(variable_id), entry_path),
+                      value_type});
+  }
+  std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+    return left.variable_id < right.variable_id;
+  });
+  if (std::adjacent_find(result.begin(), result.end(),
+                         [](const auto& left, const auto& right) {
+                           return left.variable_id == right.variable_id;
+                         }) != result.end()) {
+    fail(path, "duplicate template variable ID");
+  }
+  return result;
+}
+
+[[nodiscard]] CanonicalValue encode_template_variables(
+    const std::vector<core::AssistantPromptTemplateVariableDTO>& variables) {
+  CanonicalValue::Object result;
+  result.reserve(variables.size());
+  for (const auto& variable : variables) {
+    result.emplace_back(variable.variable_id, CanonicalValue(variable.value_type));
+  }
+  return CanonicalValue(std::move(result));
+}
+
 [[nodiscard]] CanonicalValue encode_string_array(
     const std::vector<std::string>& values) {
   CanonicalValue::Array result;
@@ -471,13 +512,13 @@ enum class InstrumentIdKind { kPortable, kTool };
 
 [[nodiscard]] core::ContentDigest prompt_template_content_digest(
     std::string_view prompt_template_id, std::string_view version, std::string_view template_text,
-    const std::vector<std::string>& variable_ids,
+    const std::vector<core::AssistantPromptTemplateVariableDTO>& variables,
     const core::AssistantPromptResponseContractDTO& response_contract) {
   const CanonicalValue content(CanonicalValue::Object{
       {"prompt_template_id", CanonicalValue(std::string(prompt_template_id))},
       {"response_contract", encode_prompt_response_contract(response_contract)},
       {"template_text", CanonicalValue(std::string(template_text))},
-      {"variable_ids", encode_string_array(variable_ids)},
+      {"variables", encode_template_variables(variables)},
       {"version", CanonicalValue(std::string(version))},
   });
   return core::ContentDigest(sha256_digest(canonical_json(content)));
@@ -878,24 +919,23 @@ parse_prompt_response_contract(const CanonicalValue& value,
   const auto& object = require_object(value, path);
   require_exact_fields(
       object,
-      {"version", "template_text", "variable_ids", "response_contract"},
+      {"version", "template_text", "variables", "response_contract"},
       path);
   const std::string version =
       parse_portable_token(require_member(object, "version", path), child_path(path, "version"));
   const std::string template_text = parse_prompt_template_text(
       require_member(object, "template_text", path), child_path(path, "template_text"));
-  std::vector<std::string> variable_ids =
-      parse_id_list(require_member(object, "variable_ids", path), child_path(path, "variable_ids"),
-                    InstrumentIdKind::kPortable);
+  std::vector<core::AssistantPromptTemplateVariableDTO> variables = parse_template_variables(
+      require_member(object, "variables", path), child_path(path, "variables"));
   const auto response_contract = parse_prompt_response_contract(
       require_member(object, "response_contract", path),
       child_path(path, "response_contract"));
   const core::ContentDigest digest =
       prompt_template_content_digest(prompt_template_id, version, template_text,
-                                     variable_ids, response_contract);
+                                     variables, response_contract);
   return {
       std::move(prompt_template_id), version, template_text,
-      std::move(variable_ids), response_contract, digest,
+      std::move(variables), response_contract, digest,
   };
 }
 
@@ -1017,7 +1057,7 @@ template <typename DTO, typename Parser>
                                        encode_prompt_response_contract(
                                            prompt.response_contract)},
                                       {"template_text", CanonicalValue(prompt.template_text)},
-                                      {"variable_ids", encode_string_array(prompt.variable_ids)},
+                                      {"variables", encode_template_variables(prompt.variables)},
                                       {"version", CanonicalValue(prompt.version)},
                                   }));
   }
@@ -1111,7 +1151,7 @@ template <typename DTO, typename Parser>
         {"response_contract",
          encode_prompt_response_contract(prompt.response_contract)},
         {"template_text", CanonicalValue(prompt.template_text)},
-        {"variable_ids", encode_string_array(prompt.variable_ids)},
+        {"variables", encode_template_variables(prompt.variables)},
         {"version", CanonicalValue(prompt.version)},
     });
   }
@@ -1410,7 +1450,7 @@ void require_mode_semantics(
     const auto& object = require_object(prompt_templates[index], path);
     require_exact_fields(
         object,
-        {"prompt_template_id", "version", "template_text", "variable_ids",
+        {"prompt_template_id", "version", "template_text", "variables",
          "response_contract", "content_digest"},
         path);
     const std::string prompt_template_id = parse_portable_token(
@@ -1421,7 +1461,7 @@ void require_mode_semantics(
         {"response_contract",
          require_member(object, "response_contract", path)},
         {"template_text", require_member(object, "template_text", path)},
-        {"variable_ids", require_member(object, "variable_ids", path)},
+        {"variables", require_member(object, "variables", path)},
         {"version", require_member(object, "version", path)},
     };
     const auto parsed =

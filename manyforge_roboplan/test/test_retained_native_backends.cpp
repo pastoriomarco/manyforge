@@ -2050,7 +2050,7 @@ TEST(RetainedNativeGripperRuntimeTest,
   EXPECT_NE(dynamic_cast<GripperParticipantEngine*>(before.engine), nullptr);
   EXPECT_EQ(before.stop_execution_port, nullptr);
   EXPECT_FALSE(before.stop_readiness.has_value());
-  EXPECT_FALSE(before.runtime_policy.has_value());
+  EXPECT_FALSE(before.participant_policy.has_value());
   EXPECT_TRUE(before.intrinsic_direct_control);
   EXPECT_EQ(owner.backend(), backend.get());
   EXPECT_EQ(owner.state_channel(), state_channel);

@@ -53,7 +53,7 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
-#include <manyforge_deployment/retained_runtime_policy.hpp>
+#include <manyforge_deployment/retained_stop_deadline_budget.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -2477,19 +2477,42 @@ std::vector<double> NumberArray(const CanonicalValue &root,
                           Number(orientation, "z"), Number(orientation, "w")}};
 }
 
-[[nodiscard]] std::optional<core::ReferenceDTO>
-DecodeOptionalReference(const CanonicalValue &root,
-                        const std::string_view name) {
-  const auto &value = Member(root, name);
-  if (std::holds_alternative<std::nullptr_t>(value.storage())) {
-    return std::nullopt;
+/// Decode one portable reference. `frame_role` may carry an exact robot
+/// qualifier `target` ({target_role_id, controllable_component_id,
+/// command_target_id}); its Program-Binding agreement is checked at admission
+/// by `VerifyReferenceTargets`, never inferred here.
+[[nodiscard]] core::ReferenceDTO
+DecodeReference(const CanonicalValue &value, const bool allow_robot_target) {
+  Require(value.is_object(), "motion reference must be an object");
+  const auto type = Text(value, "type");
+  if (type == "cell_frame") {
+    RequireExactObjectSize(value, 1U, "cell-frame reference");
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kCellFrame,
+                              std::string{});
+  }
+  if (type == "frame_role") {
+    const auto *target = value.find_object_member("target");
+    if (target == nullptr) {
+      RequireExactObjectSize(value, 2U, "motion reference");
+      return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
+                                Text(value, "frame_role_id"));
+    }
+    Require(allow_robot_target,
+            "robot-qualified frame reference is unsupported here");
+    RequireExactObjectSize(value, 3U, "robot frame reference");
+    RequireExactObjectSize(*target, 3U, "robot frame reference target");
+    core::ReferenceDTO reference(
+        core::FrameRoleId(Text(value, "frame_role_id")),
+        core::ReferenceTargetDTO{
+            core::TargetRoleId(Text(*target, "target_role_id")),
+            core::ControllableComponentId(
+                Text(*target, "controllable_component_id")),
+            core::CommandTargetId(Text(*target, "command_target_id"))});
+    Require(core::reference_identity_matches_type(reference),
+            "robot frame reference is incomplete");
+    return reference;
   }
   RequireExactObjectSize(value, 2U, "motion reference");
-  const auto type = Text(value, "type");
-  if (type == "frame_role") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
-                              Text(value, "frame_role_id"));
-  }
   if (type == "component_body_role") {
     return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
                               Text(value, "collision_body_role_id"));
@@ -2506,6 +2529,16 @@ DecodeOptionalReference(const CanonicalValue &root,
     return core::ReferenceDTO(DecodePose(Member(value, "pose")));
   }
   Fail("motion reference type is unsupported");
+}
+
+[[nodiscard]] std::optional<core::ReferenceDTO>
+DecodeOptionalReference(const CanonicalValue &root, const std::string_view name,
+                        const bool allow_robot_target = false) {
+  const auto &value = Member(root, name);
+  if (std::holds_alternative<std::nullptr_t>(value.storage())) {
+    return std::nullopt;
+  }
+  return DecodeReference(value, allow_robot_target);
 }
 
 [[nodiscard]] core::MotionSpecDTO
@@ -2646,11 +2679,15 @@ DecodeMotionPayload(const CanonicalValue &value) {
   const bool has_runtime_object_bindings =
       value.is_object() &&
       value.find_object_member("runtime_object_bindings") != nullptr;
-  Require(
+  // Optional nullable member; omitted by callers that predate framed goals.
+  const bool has_goal_frame_member =
       value.is_object() &&
-          ((value.as_object().size() == 16U && !has_runtime_object_bindings) ||
-           (value.as_object().size() == 17U && has_runtime_object_bindings)),
-      "motion payload has an unknown or missing field");
+      value.find_object_member("goal_frame_reference") != nullptr;
+  Require(value.is_object() &&
+              value.as_object().size() ==
+                  16U + (has_runtime_object_bindings ? 1U : 0U) +
+                      (has_goal_frame_member ? 1U : 0U),
+          "motion payload has an unknown or missing field");
   Require(Text(value, "kind") == "motion",
           "operation payload kind is unsupported");
 
@@ -2690,8 +2727,14 @@ DecodeMotionPayload(const CanonicalValue &value) {
   } else {
     Fail("motion target mode is unsupported");
   }
-  auto target_reference = DecodeOptionalReference(value, "target_reference");
-  auto offset_reference = DecodeOptionalReference(value, "offset_reference");
+  auto target_reference =
+      DecodeOptionalReference(value, "target_reference", true);
+  auto offset_reference =
+      DecodeOptionalReference(value, "offset_reference", true);
+  auto goal_frame_reference =
+      has_goal_frame_member
+          ? DecodeOptionalReference(value, "goal_frame_reference", true)
+          : std::nullopt;
   Require(Array(value, "motion_interrupt_scopes").empty(),
           "native motion cannot carry I8 interrupt scopes");
 
@@ -2699,6 +2742,15 @@ DecodeMotionPayload(const CanonicalValue &value) {
   auto decoded_motion = DecodeMotionSpec(motion);
   const bool joint_goal =
       std::holds_alternative<core::JointGoalDTO>(decoded_motion);
+  if (goal_frame_reference.has_value()) {
+    Require(target_mode == core::MotionTargetModeDTO::kAbsolute &&
+                (std::holds_alternative<core::PoseGoalDTO>(decoded_motion) ||
+                 std::holds_alternative<core::CartesianPathDTO>(
+                     decoded_motion)) &&
+                goal_frame_reference->type != core::ReferenceDTO::Type::kPose,
+            "goal frame requires an absolute pose or Cartesian goal and a "
+            "named frame");
+  }
   if (target_mode == core::MotionTargetModeDTO::kAbsolute) {
     Require(!target_reference.has_value() && !offset_reference.has_value(),
             "absolute motion cannot carry references");
@@ -2771,7 +2823,8 @@ DecodeMotionPayload(const CanonicalValue &value) {
       std::move(contact_policy),
       std::move(limits),
       {},
-      std::move(runtime_objects)};
+      std::move(runtime_objects),
+      std::move(goal_frame_reference)};
 }
 
 [[nodiscard]] core::CoordinatePositionDTO
@@ -2992,8 +3045,8 @@ DecodePickSynthesis(const CanonicalValue &value) {
   return core::PickCandidateSynthesisIntentDTO{
       DecodePickEnvelope(Member(value, "pick_offset_envelope")),
       DecodePickEnvelope(Member(value, "approach_offset_envelope")),
-      DecodeOptionalReference(value, "pick_offset_reference"),
-      DecodeOptionalReference(value, "approach_offset_reference"),
+      DecodeOptionalReference(value, "pick_offset_reference", true),
+      DecodeOptionalReference(value, "approach_offset_reference", true),
       DecodeTriple(value, "base_tool_orientation_rpy_deg"),
       translation_step,
       rotation_step,
@@ -3328,6 +3381,18 @@ struct MalformedStopCommand final {
   std::string reason;
 };
 
+/// `frame_transform`: express `pose` (given in `source_frame`) in
+/// `target_frame` through the cell frame resolver. The canonical request
+/// members are retained verbatim for the response echo.
+struct FrameTransformQuery final {
+  core::Pose3DTO pose;
+  core::ReferenceDTO source_frame;
+  core::ReferenceDTO target_frame;
+  CanonicalValue pose_value;
+  CanonicalValue source_frame_value;
+  CanonicalValue target_frame_value;
+};
+
 struct TargetObservationQuery final {
   core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
@@ -3335,6 +3400,7 @@ struct TargetObservationQuery final {
   std::optional<core::FrameRoleId> frame_role_id;
   std::optional<core::FrameRoleId> relative_to_frame_role_id;
   bool grasp_confirmation{};
+  std::optional<FrameTransformQuery> frame_transform{};
 };
 
 struct GripperConfirmationCommand final {
@@ -3520,6 +3586,27 @@ struct Command final {
     RequireExactObjectSize(root, 3U, "target observation command");
     const auto &query = Member(root, "query");
     const auto kind = Text(query, "kind");
+    if (kind == "frame_transform") {
+      RequireExactObjectSize(query, 7U, "frame transform query");
+      Require(Text(query, "schema_version") ==
+                  "manyforge.target_observation_query.v1",
+              "target observation query schema is unsupported");
+      const auto &pose = Member(query, "pose");
+      const auto &source = Member(query, "source_frame");
+      const auto &target = Member(query, "target_frame");
+      Command decoded{CommandKind::kQueryTarget};
+      decoded.target_query = TargetObservationQuery{
+          core::RequestOwnerEpoch(Text(query, "owner_epoch")),
+          core::ProgramBindingId(Text(query, "program_binding_id")),
+          core::TargetRoleId(std::string{}),
+          std::nullopt,
+          std::nullopt,
+          false,
+          FrameTransformQuery{DecodePose(pose), DecodeReference(source, true),
+                              DecodeReference(target, true), pose, source,
+                              target}};
+      return decoded;
+    }
     Require(kind == "frame_pose" || kind == "gripper_status" ||
                 kind == "gripper_confirmation",
             "target observation kind is unsupported");
@@ -7324,7 +7411,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     const core::JointLimitsDTO &motion_limits,
     const std::optional<RetainedGripperPositionLimits> &gripper_limits,
     const std::optional<core::RuntimeParticipantPolicySelection>
-        &motion_runtime_policy,
+        &motion_participant_policy,
     const std::optional<double> &deployment_maximum_tcp_linear_speed_mps,
     const deployment::native_execution_runtime_contract::
         OrdinaryMotionJerkSettings *ordinary_jerk_settings,
@@ -7428,10 +7515,10 @@ CanonicalNullableText(const std::optional<std::string> &value) {
           std::min(effective_velocity, authored_velocity.value());
     }
     auto effective_jerk = CanonicalNullableNumber(authored_jerk);
-    if (motion_runtime_policy &&
-        motion_runtime_policy->value().ordinary_motion_jerk) {
+    if (motion_participant_policy &&
+        motion_participant_policy->value().ordinary_motion_jerk) {
       const auto &profile =
-          *motion_runtime_policy->value().ordinary_motion_jerk;
+          *motion_participant_policy->value().ordinary_motion_jerk;
       if (!profile.enabled) {
         effective_jerk = CanonicalValue(nullptr);
       } else {
@@ -7446,8 +7533,9 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     if (ordinary_jerk_settings != nullptr) {
       const auto &settings = *ordinary_jerk_settings;
       const auto *profile =
-          motion_runtime_policy && motion_runtime_policy->value().ordinary_motion_jerk
-              ? &*motion_runtime_policy->value().ordinary_motion_jerk
+          motion_participant_policy &&
+                  motion_participant_policy->value().ordinary_motion_jerk
+              ? &*motion_participant_policy->value().ordinary_motion_jerk
               : nullptr;
       if (settings.enabled) {
         Require(profile != nullptr && profile->enabled,
@@ -9154,15 +9242,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   const auto &products = input.bundle->value().compiled_products;
   const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
       input.package_root);
-  const auto qualified_runtime_policy =
-      deployment::resolve_retained_runtime_policy(*input.bundle, catalog_store);
-  std::optional<core::RuntimePolicyDTO> runtime_policy;
-  std::optional<core::RuntimePolicyCatalogRecordRefDTO>
-      runtime_policy_source_artifact;
-  if (qualified_runtime_policy.has_value()) {
-    runtime_policy = qualified_runtime_policy->value();
-    runtime_policy_source_artifact = qualified_runtime_policy->reference();
-  }
   auto direct_control_inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
@@ -9527,8 +9606,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       std::move(participant_resolver),
       participant_resolver_factory,
       input.operation_admission_gate,
-      std::move(runtime_policy),
-      std::move(runtime_policy_source_artifact),
       {},
       {},
       {},
@@ -9722,7 +9799,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       direct_control_motion_binding.value(),
       direct_control_gripper_binding,
       direct_control_joint_limits.value(), runtime->gripper_position_limits,
-      runtime->motion_runtime_policy,
+      runtime->motion_participant_policy,
       runtime->deployment_maximum_tcp_linear_speed_mps,
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       &motion_limit->ordinary_motion_jerk,
@@ -14589,6 +14666,91 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   return 0;
 }
 
+/// Admission check for robot-qualified references: each portable target
+/// role must resolve through the operation's exact Program Binding to the
+/// named controllable component and command target. Locality is checked by the
+/// cell frame resolver when the reference is captured.
+[[nodiscard]] core::Result<void>
+VerifyReferenceTarget(const ProductBackedRuntimeParticipantResolver &resolver,
+                      const core::ProgramBindingId &program_binding_id,
+                      const core::ReferenceDTO &reference) {
+  if (!reference.target.has_value())
+    return core::Result<void>::Ok();
+  const auto &target = *reference.target;
+  const auto bound =
+      resolver.ResolveOperationTarget(program_binding_id, target.target_role_id);
+  // Both refusals name the failed reference (spec 210 §5.3).
+  const std::string frame_role_id(core::reference_identity_value(reference));
+  if (!bound.ok())
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kMissingReference)),
+        "frame reference names a target role absent from the Program Binding",
+        {{"reason", "program_reference_target_role_unbound"},
+         {"reference_type", "frame_role"},
+         {"reference_id", frame_role_id},
+         {"target_role_id", target.target_role_id.value()}}});
+  if (bound.value().controllable_component_id !=
+          target.controllable_component_id ||
+      bound.value().command_target_id != target.command_target_id)
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorInvalidRequest,
+        "frame reference robot differs from its Program Binding target role",
+        {{"reason", "program_reference_target_role_mismatch"},
+         {"reference_type", "frame_role"},
+         {"reference_id", frame_role_id},
+         {"target_role_id", target.target_role_id.value()}}});
+  return core::Result<void>::Ok();
+}
+
+[[nodiscard]] core::Result<void>
+VerifyReferenceTargets(const ProductBackedRuntimeParticipantResolver &resolver,
+                       const core::OperationIntentDTO &operation) {
+  for (const auto &participant : operation.participants) {
+    const auto *motion =
+        std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
+    if (motion == nullptr)
+      continue;
+    for (const auto *reference :
+         {&motion->target_reference, &motion->offset_reference,
+          &motion->goal_frame_reference}) {
+      if (!reference->has_value())
+        continue;
+      if (auto verified = VerifyReferenceTarget(
+              resolver, operation.program_binding_id, **reference);
+          !verified.ok())
+        return verified;
+    }
+  }
+  return core::Result<void>::Ok();
+}
+
+/// Pick and approach offset references accept every motion-reference form
+/// (spec 475 §3.5); a robot-qualified one passes the same Program-Binding
+/// check against the picking motion's binding as a motion reference.
+[[nodiscard]] core::Result<void>
+VerifyPickReferenceTargets(const ProductBackedRuntimeParticipantResolver &resolver,
+                           const core::PickSequencePlanningIntentDTO &intent) {
+  for (const auto *operation :
+       {&intent.approach_operation, &intent.descend_operation,
+        &intent.tool_operation, &intent.retreat_operation}) {
+    if (auto verified = VerifyReferenceTargets(resolver, *operation);
+        !verified.ok())
+      return verified;
+  }
+  for (const auto *reference : {&intent.synthesis.pick_offset_reference,
+                                &intent.synthesis.approach_offset_reference}) {
+    if (!reference->has_value())
+      continue;
+    if (auto verified =
+            VerifyReferenceTarget(resolver,
+                                  intent.approach_operation.program_binding_id,
+                                  **reference);
+        !verified.ok())
+      return verified;
+  }
+  return core::Result<void>::Ok();
+}
+
 class ExecutionCommandSurface final {
 public:
   ExecutionCommandSurface(
@@ -15030,11 +15192,90 @@ private:
   }
 
   [[nodiscard]] CanonicalValue
+  FrameTransformResponse(const TargetObservationQuery &query,
+                         Composition &composition) const {
+    const auto &transform = *query.frame_transform;
+    for (const auto *reference :
+         {&transform.source_frame, &transform.target_frame}) {
+      const auto verified = VerifyReferenceTarget(
+          *composition.target_resolver, query.program_binding_id, *reference);
+      if (!verified.ok())
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(verified.error())},
+            {"ok", CanonicalValue(false)},
+        });
+    }
+    if (composition.scene_frame_resolver == nullptr)
+      return ErrorResponse("execution_frame_transform_unavailable",
+                           "cell has no installed frame resolver");
+    std::optional<core::CollisionWorldLeaseInventory> inventory;
+    if (composition.planner_scene_projection != nullptr) {
+      inventory = composition.planner_scene_projection
+                      ->current_scene_snapshot_lease_inventory();
+    } else if (composition.runtime != nullptr &&
+               composition.runtime->collision_publisher != nullptr) {
+      inventory = composition.runtime->collision_publisher
+                      ->current_scene_snapshot_lease_inventory();
+    }
+    if (!inventory.has_value() || !inventory->logical_scene)
+      return ErrorResponse("execution_frame_transform_unavailable",
+                           "cell has no current retained scene projection");
+    const auto now_ns = composition.cell_runtime != nullptr
+                            ? composition.cell_runtime->clock()->now()
+                        : composition.runtime != nullptr
+                            ? composition.runtime->clock->now()
+                            : std::int64_t{-1};
+    const auto resolved = composition.scene_frame_resolver->ResolveFrameTransform(
+        RetainedSceneFrameTransformQuery{transform.pose, transform.source_frame,
+                                         transform.target_frame,
+                                         inventory->projection_binding},
+        inventory->logical_scene, now_ns);
+    if (!resolved.ok())
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(resolved.error())},
+          {"ok", CanonicalValue(false)},
+      });
+    CanonicalValue::Array evidence;
+    for (const auto &digest : resolved.value().resolution_evidence_digests)
+      evidence.emplace_back(digest.value());
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("query_target")},
+        {"ok", CanonicalValue(true)},
+        {"target_observation",
+         CanonicalValue(CanonicalValue::Object{
+             {"evaluated_at_ns",
+              content_identity::nonnegative_int64_value(
+                  resolved.value().evaluated_at_ns)},
+             {"kind", CanonicalValue("frame_transform")},
+             {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+             {"pose", transform.pose_value},
+             {"program_binding_id",
+              CanonicalValue(query.program_binding_id.value())},
+             {"resolution_evidence_digests", CanonicalValue(std::move(evidence))},
+             {"scene_revision",
+              SceneRevisionValue(resolved.value()
+                                     .projection_binding.projection_revision
+                                     .scene_revision)},
+             {"schema_version",
+              CanonicalValue("manyforge.target_observation.v1")},
+             {"source_frame", transform.source_frame_value},
+             {"target_frame", transform.target_frame_value},
+             {"value", PoseValue(resolved.value().pose_in_target_frame)},
+         })},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue
   QueryTargetResponse(const TargetObservationQuery &query,
                       Composition &composition) const {
     if (query.owner_epoch != owner_epoch_)
       return ErrorResponse("execution_target_owner_stale",
                            "target query names a replaced owner");
+    if (query.frame_transform.has_value())
+      return FrameTransformResponse(query, composition);
     const bool frame_query = query.frame_role_id.has_value();
     const auto capability_id = core::CapabilityId(
         frame_query                ? "model.kinematics.fk"
@@ -16666,6 +16907,25 @@ private:
       const auto admission =
           composition.active_addressed_kernel()
               ->GetAuthoringAdmission();
+      // Progress is presentation-only: the journal deliberately records only
+      // lifecycle changes. Sample resident manual operations on this existing
+      // read, without adding durable writes or rebuilding control_state.
+      CanonicalValue::Array operation_progress;
+      for (const auto &operation :
+           composition.active_addressed_kernel()->get_resident_operations(
+               {direct_control_program_run_id_,
+                direct_control_gripper_program_run_id_})) {
+        if (operation.state != core::OperationStateKind::kExecuting ||
+            operation.participants.size() != 1U)
+          continue;
+        operation_progress.emplace_back(CanonicalValue::Object{
+            {"owner_epoch", CanonicalValue(command.event_owner_epoch->value())},
+            {"operation_id", CanonicalValue(operation.operation_id.value())},
+            {"operation_revision", CanonicalValue(static_cast<double>(
+                                       operation.operation_revision.value()))},
+            {"progress", CanonicalValue(operation.participants.front().progress)},
+        });
+      }
       return CanonicalValue(CanonicalValue::Object{
           {"admission_generation",
            CanonicalValue(
@@ -16673,6 +16933,7 @@ private:
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("events")},
           {"event_page", OperationEventPageValue(page.value())},
+          {"operation_progress", CanonicalValue(std::move(operation_progress))},
           {"ok", CanonicalValue(true)},
       });
     }
@@ -16990,6 +17251,17 @@ private:
       const auto sequence_id = command.kind == CommandKind::kPlanPick
                                    ? command.pick_planning->sequence_id
                                    : command.place_planning->sequence_id;
+      if (command.kind == CommandKind::kPlanPick) {
+        if (auto verified = VerifyPickReferenceTargets(
+                *composition.target_resolver, *command.pick_planning);
+            !verified.ok()) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+              {"error", ErrorValue(verified.error())},
+              {"ok", CanonicalValue(false)},
+          });
+        }
+      }
       const auto result =
           command.kind == CommandKind::kPlanPick
               ? composition.pick_place_planning_owner->PlanPick(
@@ -17041,8 +17313,11 @@ private:
       });
     }
     if (command.kind == CommandKind::kSubmit) {
-      const auto origin = composition.target_resolver->ValidateExecutionOrigin(
+      auto origin = composition.target_resolver->ValidateExecutionOrigin(
           *command.operation);
+      if (origin.ok())
+        origin = VerifyReferenceTargets(*composition.target_resolver,
+                                        *command.operation);
       if (!origin.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},

@@ -69,9 +69,9 @@ struct RuntimeParticipantExecutionRegistration final {
   /// calls that engine's deployment-wide Stop surface.
   IControlDomainExecutionPort* stop_execution_port{};
 
-  /// Exact retained runtime policy sealed against this participant binding.
+  /// Exact motion policy sealed against this participant binding.
   /// Absence remains observable but motion admission fails closed.
-  std::optional<RuntimeParticipantPolicySelection> runtime_policy{};
+  std::optional<RuntimeParticipantPolicySelection> participant_policy{};
 
   /// Exact two-phase motion preparation boundary. Motion registrations must
   /// provide it; capability-command registrations leave it absent.

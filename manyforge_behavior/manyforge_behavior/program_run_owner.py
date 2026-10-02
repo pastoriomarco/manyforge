@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 from threading import RLock
+import time
 from types import MappingProxyType
 from typing import Any, Final
 from uuid import uuid4
@@ -35,6 +36,7 @@ from manyforge_behavior.program import (
     ProgramValidationError,
     require_exact_program_binding_node_policies,
 )
+from manyforge_behavior.program_clock import ProgramClock
 from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
     ProgramRunCapture,
@@ -48,7 +50,9 @@ PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v1"
 APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v2"
 _MAX_RETAINED_RUNS: Final = 4_096
 _MAX_NODE_STATUSES: Final = 100_000
-_NODE_STATUSES: Final = frozenset({"idle", "running", "held", "success", "failure"})
+_NODE_STATUSES: Final = frozenset(
+    {"idle", "running", "held", "success", "failure", "interrupted"}
+)
 _FAILURE_PAUSE_UNCONFIRMED: Final = (
     "Stopping the Program's other motion is not confirmed yet."
 )
@@ -397,6 +401,7 @@ class ProgramRunOwner:
         ports: NodeAdapterPorts,
         run_id_factory: Callable[[], str] | None = None,
         maximum_retained_runs: int = _MAX_RETAINED_RUNS,
+        program_clock_source: Callable[[], float] = time.monotonic,
     ) -> None:
         self._owner_id = _text(owner_id, field="owner_id")
         self._owner_epoch = _text(owner_epoch, field="owner_epoch")
@@ -409,6 +414,9 @@ class ProgramRunOwner:
             or not 1 <= maximum_retained_runs <= _MAX_RETAINED_RUNS
         ):
             raise ValueError("maximum_retained_runs is outside its bound")
+        if not callable(program_clock_source):
+            raise TypeError("program_clock_source must be a monotonic clock")
+        self._program_clock_source = program_clock_source
         self._ports = ports
         self._scope = ports.program_run_scope
         self._run_id_factory = run_id_factory or (lambda: f"program-run-{uuid4().hex}")
@@ -423,6 +431,17 @@ class ProgramRunOwner:
             return self._runs[program_run_id]
         except KeyError as exc:
             raise ProgramRunOwnerError("Program run does not exist") from exc
+
+    @staticmethod
+    def _schedule_program_time(entry: _RunEntry, *, tree_ticks: bool) -> None:
+        """Program time advances exactly while the run's tree is scheduled
+        to tick: Running, or waiting on an operator-Stop intervention (only
+        held subtrees are skipped, and each held node decides whether its
+        held time counts). It stands still during a Halt (Full Stopping and
+        Full Stopped), a node-failure pause that keeps the tree dormant, and
+        once the run stops or finishes."""
+
+        entry.run.program_clock.set_running(tree_ticks)
 
     def _snapshot(self, entry: _RunEntry) -> ProgramRunSnapshot:
         return ProgramRunSnapshot(
@@ -473,6 +492,7 @@ class ProgramRunOwner:
         message: str,
     ) -> None:
         entry.state = ProgramRunState.FINALIZING
+        ProgramRunOwner._schedule_program_time(entry, tree_ticks=False)
         entry.state_after_finalize = state_after_finalize
         entry.state_after_finalize_reason_code = reason_code
         entry.state_after_finalize_message = message
@@ -600,6 +620,7 @@ class ProgramRunOwner:
                     readiness=admission.readiness,
                     ports=self._ports,
                     program_parameter_values=admission.program_parameter_values,
+                    program_clock=ProgramClock(self._program_clock_source),
                 )
                 run.refresh_operator_stop_scope()
                 entry = _RunEntry(
@@ -922,6 +943,41 @@ class ProgramRunOwner:
             entry.revision += 1
             return self._snapshot(entry)
 
+    def reset_runtime_blackboard(
+        self,
+        program_run_id: str,
+        *,
+        key: str,
+        request_id: str,
+    ) -> ProgramRunSnapshot:
+        """Forget a persistent key's stored value; the run sees `initial:` again."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state not in {
+                ProgramRunState.RUNNING,
+                ProgramRunState.INTERVENTION_REQUIRED,
+            }:
+                raise ProgramRunOwnerError(
+                    "runtime blackboard writes require a current Program run"
+                )
+            store = entry.run.value_store
+        try:
+            store.reset_to_initial(
+                key,
+                metadata={
+                    "program_run_id": program_run_id,
+                    "request_id": request_id,
+                    "value_source": "runtime_control",
+                },
+            )
+        except ProgramValueError as error:
+            raise ProgramRunOwnerError(str(error)) from error
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.revision += 1
+            return self._snapshot(entry)
+
     def resolve_intervention(
         self,
         program_run_id: str,
@@ -947,6 +1003,7 @@ class ProgramRunOwner:
                 raise ProgramRunOwnerError("Program recovery attempt is stale")
             port.resolve(intervention.identity, action=action, result=result)
             entry.state = ProgramRunState.RUNNING
+            self._schedule_program_time(entry, tree_ticks=True)
             entry.reason_code = None
             entry.message = ""
             entry.revision += 1
@@ -1081,6 +1138,7 @@ class ProgramRunOwner:
                     if first_stop or transitioning_from_full_stop:
                         entry.stop_requested = True
                         entry.state = ProgramRunState.STOPPING
+                        self._schedule_program_time(entry, tree_ticks=False)
                         entry.state_after_stop = state_after_stop
                         entry.state_after_stop_reason_code = reason_code
                         entry.state_after_stop_message = message
@@ -1836,6 +1894,11 @@ class ProgramRunOwner:
                             if remaining is not None
                             else ProgramRunState.RUNNING
                         )
+                        self._schedule_program_time(
+                            entry,
+                            tree_ticks=remaining is None
+                            or remaining.policy_parameter == "operator_stop_policy",
+                        )
                         entry.reason_code = (
                             None if remaining is None else remaining.reason_code
                         )
@@ -1884,6 +1947,7 @@ class ProgramRunOwner:
                 )
                 return self._snapshot(entry)
             entry.state = ProgramRunState.FULL_STOPPED
+            self._schedule_program_time(entry, tree_ticks=False)
             entry.active_operation_count = 0
             if unrecoverable:
                 entry.reason_code = "program_full_stop_resume_unavailable"
@@ -1928,6 +1992,9 @@ class ProgramRunOwner:
                     ProgramRunState.FULL_STOPPED,
                 }:
                     entry.state = ProgramRunState.FULL_STOPPING
+                    # Halt freezes the Program: its waits and timers keep
+                    # their attempt and lose no time until Execute.
+                    self._schedule_program_time(entry, tree_ticks=False)
                     entry.stop_requested = True
                     entry.reason_code = None
                     entry.message = ""
@@ -2084,6 +2151,8 @@ class ProgramRunOwner:
                         "Program state changed during Full Stop recovery"
                     )
                 entry.state = ProgramRunState.RUNNING
+                # Execute after Halt continues the same attempts.
+                self._schedule_program_time(entry, tree_ticks=True)
                 entry.stop_requested = False
                 entry.active_operation_count = active_count
                 entry.reason_code = None
@@ -2362,10 +2431,12 @@ class ProgramRunOwner:
                         if intervention_port is None
                         else intervention_port.read(program_run_id)
                     )
-                    if (
+                    dormant = (
                         intervention is None
                         or intervention.policy_parameter != "operator_stop_policy"
-                    ):
+                    )
+                    self._schedule_program_time(entry, tree_ticks=not dormant)
+                    if dormant:
                         if not self.operator_stop_observation_required(program_run_id):
                             return self._snapshot(entry)
                         # A separate intervention keeps ordinary tree work
@@ -2439,6 +2510,13 @@ class ProgramRunOwner:
                     entry.node_status_revision += 1
                 if intervention is not None and entry.state is ProgramRunState.RUNNING:
                     entry.state = ProgramRunState.INTERVENTION_REQUIRED
+                    # A node-failure pause keeps the tree dormant, like Halt;
+                    # an operator-Stop intervention keeps it ticking.
+                    self._schedule_program_time(
+                        entry,
+                        tree_ticks=intervention.policy_parameter
+                        == "operator_stop_policy",
+                    )
                     entry.reason_code = intervention.reason_code
                     entry.message = intervention.message
                     entry.revision += 1

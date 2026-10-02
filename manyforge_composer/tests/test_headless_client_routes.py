@@ -701,6 +701,8 @@ def headless_client() -> (
                 "schema_version": "manyforge.historian_reconciliation.v1",
                 "reconciled": True,
             }
+        elif path.startswith("/api/program/scenarios/cell-pick/persistent-values"):
+            payload = {"forwarded": path}
         else:
             return httpx.Response(404, json={"detail": "unknown"}, request=request)
         return httpx.Response(200, json=payload, request=request)
@@ -2036,3 +2038,48 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
 _ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"
 _LOAD_PROGRAM_PATH = _ROOT / "examples" / "semantic_shape_pick.program.yaml"
+
+
+def test_composer_forwards_persistent_value_edits_as_strict_requests(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    base = "/api/program/scenarios/cell-pick/persistent-values"
+    caller = {
+        "request_id": "request.1",
+        "request_owner_epoch": "composer.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+        "scenario_id": "cell-pick",
+    }
+    edit = {
+        **caller,
+        "key": "layer",
+        "expected_program_revision": "sha256:" + "a" * 64,
+        "program_run_id": None,
+        "expected_run_revision": None,
+    }
+
+    with _composer(client) as composer:
+        assert composer.get(base).json() == {"forwarded": base}
+        assert composer.post(base, json={**edit, "value": 3}).status_code == 200
+        assert composer.post(f"{base}/reset", json=edit).status_code == 200
+        assert composer.post(f"{base}/clear", json=caller).status_code == 200
+        assert composer.post(base, json=edit).status_code == 422
+        mismatch = composer.post(
+            "/api/program/scenarios/other/persistent-values/clear", json=caller
+        )
+
+    assert mismatch.status_code == 400
+    assert mismatch.json()["detail"]["code"] == "persistent_key_path_invalid"
+    forwarded = [
+        (item["method"], item["path"], item["body"])
+        for item in requests
+        if item["path"].startswith("/api/program/scenarios/")
+    ]
+    assert forwarded == [
+        ("GET", base, None),
+        ("POST", base, {**edit, "value": 3}),
+        ("POST", f"{base}/reset", edit),
+        ("POST", f"{base}/clear", caller),
+    ]

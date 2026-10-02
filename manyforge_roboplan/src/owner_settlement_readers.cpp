@@ -301,7 +301,7 @@ ReadActiveProgramRunProductForReconciliation(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
+    if (schema_version < 3 || schema_version > 5 || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
 
     Statement row(database.get(),
@@ -399,11 +399,11 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
+    if (schema_version < 3 || schema_version > 5 || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),
-        schema_version == 4
+        schema_version >= 4
             ? "SELECT state,owner_epoch,program_run_id,claim_json,"
               "terminal_reference,start_settlement_json,release_intent_json,"
               "reconciliation_required,acquisition_pending_json,reset_phase "
@@ -424,7 +424,7 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     const bool lifecycle_is_exact =
         (schema_version == 3 && row.Text(0) == "terminal_awaiting_reset" &&
          row.IsNull(9)) ||
-        (schema_version == 4 && row.Text(0) == "resetting" && !row.IsNull(9) &&
+        (schema_version >= 4 && row.Text(0) == "resetting" && !row.IsNull(9) &&
          row.Text(9) == "releasing");
     const bool valid =
         lifecycle_is_exact && row.Text(1) == claim.intent.owner_epoch.value() &&
@@ -459,7 +459,7 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if ((schema_version != 3 && schema_version != 4) || metadata.Step())
+    if (schema_version < 3 || schema_version > 5 || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),

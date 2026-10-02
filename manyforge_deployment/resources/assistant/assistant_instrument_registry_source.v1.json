@@ -11,10 +11,10 @@
       "node_id": "inverter"
     },
     {
-      "node_id": "logic.set_bool"
+      "node_id": "logic.set_value"
     },
     {
-      "node_id": "logic.wait_for_bool"
+      "node_id": "logic.wait_for_value"
     },
     {
       "node_id": "motion.follow_cartesian_path"
@@ -202,6 +202,9 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "type": "boolean"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -209,7 +212,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -242,6 +244,9 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "type": "number"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -249,7 +254,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -282,6 +286,9 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "type": "integer"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -289,7 +296,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -332,7 +338,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -375,7 +380,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -408,6 +412,11 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "maxLength": 256,
+                      "pattern": "^[a-z][a-z0-9_.-]*$",
+                      "type": "string"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -415,7 +424,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -458,7 +466,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -501,7 +508,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -534,6 +540,192 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "frame_ref": {
+                          "additionalProperties": false,
+                          "allOf": [
+                            {
+                              "if": {
+                                "properties": {
+                                  "kind": {
+                                    "const": "scene_resource"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ]
+                              },
+                              "then": {
+                                "required": [
+                                  "scene_resource_id"
+                                ]
+                              }
+                            },
+                            {
+                              "if": {
+                                "properties": {
+                                  "kind": {
+                                    "const": "target_frame"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ]
+                              },
+                              "then": {
+                                "required": [
+                                  "frame_role",
+                                  "target_role"
+                                ]
+                              }
+                            },
+                            {
+                              "if": {
+                                "not": {
+                                  "properties": {
+                                    "kind": {
+                                      "const": "target_frame"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ]
+                                }
+                              },
+                              "then": {
+                                "not": {
+                                  "required": [
+                                    "frame_role"
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "if": {
+                                "not": {
+                                  "properties": {
+                                    "kind": {
+                                      "const": "scene_resource"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ]
+                                }
+                              },
+                              "then": {
+                                "not": {
+                                  "required": [
+                                    "scene_resource_id"
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "if": {
+                                "not": {
+                                  "properties": {
+                                    "kind": {
+                                      "const": "target_frame"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ]
+                                }
+                              },
+                              "then": {
+                                "not": {
+                                  "required": [
+                                    "target_role"
+                                  ]
+                                }
+                              }
+                            }
+                          ],
+                          "properties": {
+                            "frame_role": {
+                              "type": "string",
+                              "x-manyforge-semantic-type": "frame_role"
+                            },
+                            "kind": {
+                              "enum": [
+                                "cell_frame",
+                                "target_frame",
+                                "scene_resource"
+                              ],
+                              "type": "string"
+                            },
+                            "scene_resource_id": {
+                              "type": "string",
+                              "x-manyforge-semantic-type": "scene_resource"
+                            },
+                            "target_role": {
+                              "type": "string",
+                              "x-manyforge-semantic-type": "target_role"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "type": "object"
+                        },
+                        "orientation": {
+                          "additionalProperties": false,
+                          "allOf": [
+                            {
+                              "oneOf": [
+                                {
+                                  "required": [
+                                    "xyzw"
+                                  ]
+                                },
+                                {
+                                  "required": [
+                                    "rpy_deg"
+                                  ]
+                                }
+                              ]
+                            }
+                          ],
+                          "properties": {
+                            "rpy_deg": {
+                              "items": {
+                                "type": "number"
+                              },
+                              "maxItems": 3,
+                              "minItems": 3,
+                              "type": "array"
+                            },
+                            "xyzw": {
+                              "items": {
+                                "type": "number"
+                              },
+                              "maxItems": 4,
+                              "minItems": 4,
+                              "type": "array"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "position_m": {
+                          "items": {
+                            "type": "number"
+                          },
+                          "maxItems": 3,
+                          "minItems": 3,
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "frame_ref",
+                        "position_m",
+                        "orientation"
+                      ],
+                      "type": "object"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -541,7 +733,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -574,6 +765,10 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "maxLength": 1000000,
+                      "type": "string"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -581,7 +776,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -614,6 +808,14 @@
                       "maxLength": 4096,
                       "type": "string"
                     },
+                    "initial": {
+                      "items": {
+                        "maxLength": 1000000,
+                        "type": "string"
+                      },
+                      "maxItems": 4096,
+                      "type": "array"
+                    },
                     "key": {
                       "maxLength": 256,
                       "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -621,7 +823,6 @@
                     },
                     "persistence": {
                       "enum": [
-                        "node",
                         "run",
                         "persistent"
                       ],
@@ -899,8 +1100,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -970,8 +1170,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1041,8 +1240,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1081,8 +1279,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1121,8 +1318,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1163,8 +1359,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1203,8 +1398,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1243,8 +1437,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1466,8 +1659,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1505,8 +1697,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -1548,8 +1739,7 @@
                     "runtime_mutability": {
                       "enum": [
                         "immutable",
-                        "before_run",
-                        "between_operations"
+                        "before_run"
                       ],
                       "type": "string"
                     },
@@ -4699,453 +4889,7 @@
             ],
             "type": "object"
           },
-          "s_46e0d3d08937f9d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_4c54ede36e5884d0": {
-            "not": {
-              "$ref": "#/$defs/s_1b98ea2c295cd89c"
-            }
-          },
-          "s_4fd148f19a85870f": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_58ff4ef7a9d69d14": {
-            "not": {
-              "$ref": "#/$defs/s_d848331fe3f4a42e"
-            }
-          },
-          "s_5c50d0aa42183ea4": {
-            "additionalProperties": false,
-            "minProperties": 1,
-            "properties": {
-              "scene_resource_id": {
-                "$ref": "#/$defs/s_239060e26cdf11f6"
-              }
-            },
-            "type": "object"
-          },
-          "s_5e24d9e8298e3fc0": {
-            "not": {
-              "$ref": "#/$defs/s_2c5fb61ff814332a"
-            }
-          },
-          "s_5fe27c220463c259": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_62874ee639d2bbf4": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_752ec40f2f8ea349": {
-            "not": {
-              "$ref": "#/$defs/s_98c400f4811c99d8"
-            }
-          },
-          "s_784e720f1ce83ddf": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "target_frame"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role",
-                    "target_role"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "target_role"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "kind": {
-                "enum": [
-                  "cell_frame",
-                  "target_frame",
-                  "scene_resource"
-                ],
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          "s_7a7c8fbffe8c1502": {
-            "not": {
-              "$ref": "#/$defs/s_46e0d3d08937f9d8"
-            }
-          },
-          "s_8780d18716b767c7": {
-            "not": {
-              "$ref": "#/$defs/s_c4f541583e8cb501"
-            }
-          },
-          "s_901a7dcedf32c9c9": {
-            "not": {
-              "$ref": "#/$defs/s_5fe27c220463c259"
-            }
-          },
-          "s_921a14af5104da5e": {
-            "not": {
-              "$ref": "#/$defs/s_e4a9f43a4d165932"
-            }
-          },
-          "s_97a18d8e4a7b7a70": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9850a7b14b985051": {
-            "not": {
-              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
-            }
-          },
-          "s_98c400f4811c99d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9a0d2d7b25f2ed71": {
-            "additionalProperties": {
-              "$ref": "#/$defs/s_0d781a9233dcea9c"
-            },
-            "properties": {},
-            "type": "object"
-          },
-          "s_a3f660b9cd0c3742": {
-            "not": {
-              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
-            }
-          },
-          "s_a47a9cc21283b82f": {
-            "not": {
-              "$ref": "#/$defs/s_209b5c74cad87057"
-            }
-          },
-          "s_ab38980932f15fa2": {
-            "not": {
-              "$ref": "#/$defs/s_e9b16b9864d776ea"
-            }
-          },
-          "s_ac1edfbbf9af4ae7": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_adc008148d962421": {
-            "additionalProperties": false,
-            "properties": {
-              "pose": {
-                "$ref": "#/$defs/s_3eb46c08a10d222d"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "shape": {
-                "$ref": "#/$defs/s_37246640995e786a"
-              }
-            },
-            "type": "object"
-          },
-          "s_b50417c15ae8053c": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_bd496f5351f68f45": {
+          "s_3eebdde204507495": {
             "additionalProperties": false,
             "allOf": [
               {
@@ -5337,6 +5081,27 @@
                     ]
                   }
                 }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
               }
             ],
             "properties": {
@@ -5359,13 +5124,18 @@
                 "type": "string",
                 "x-manyforge-semantic-type": "scene_resource"
               },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
               "type": {
                 "enum": [
                   "frame_role",
                   "component_body_role",
                   "scene_resource",
                   "runtime_object",
-                  "pose"
+                  "pose",
+                  "cell_frame"
                 ],
                 "type": "string"
               }
@@ -5374,6 +5144,452 @@
               "type"
             ],
             "type": "object"
+          },
+          "s_46e0d3d08937f9d8": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "execution_timeout_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "execution_timeout_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_4c54ede36e5884d0": {
+            "not": {
+              "$ref": "#/$defs/s_1b98ea2c295cd89c"
+            }
+          },
+          "s_4fd148f19a85870f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_58ff4ef7a9d69d14": {
+            "not": {
+              "$ref": "#/$defs/s_d848331fe3f4a42e"
+            }
+          },
+          "s_5c50d0aa42183ea4": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
+          },
+          "s_5e24d9e8298e3fc0": {
+            "not": {
+              "$ref": "#/$defs/s_2c5fb61ff814332a"
+            }
+          },
+          "s_62874ee639d2bbf4": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_752ec40f2f8ea349": {
+            "not": {
+              "$ref": "#/$defs/s_98c400f4811c99d8"
+            }
+          },
+          "s_777a4cb69145acf9": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_784e720f1ce83ddf": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "target_frame"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "cell_frame",
+                  "target_frame",
+                  "scene_resource"
+                ],
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "s_7a7c8fbffe8c1502": {
+            "not": {
+              "$ref": "#/$defs/s_46e0d3d08937f9d8"
+            }
+          },
+          "s_8780d18716b767c7": {
+            "not": {
+              "$ref": "#/$defs/s_c4f541583e8cb501"
+            }
+          },
+          "s_921a14af5104da5e": {
+            "not": {
+              "$ref": "#/$defs/s_e4a9f43a4d165932"
+            }
+          },
+          "s_97a18d8e4a7b7a70": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9850a7b14b985051": {
+            "not": {
+              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
+            }
+          },
+          "s_98c400f4811c99d8": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9a0d2d7b25f2ed71": {
+            "additionalProperties": {
+              "$ref": "#/$defs/s_0d781a9233dcea9c"
+            },
+            "properties": {},
+            "type": "object"
+          },
+          "s_a3f660b9cd0c3742": {
+            "not": {
+              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
+            }
+          },
+          "s_a47a9cc21283b82f": {
+            "not": {
+              "$ref": "#/$defs/s_209b5c74cad87057"
+            }
+          },
+          "s_ab38980932f15fa2": {
+            "not": {
+              "$ref": "#/$defs/s_e9b16b9864d776ea"
+            }
+          },
+          "s_ac1edfbbf9af4ae7": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_adc008148d962421": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "shape": {
+                "$ref": "#/$defs/s_37246640995e786a"
+              }
+            },
+            "type": "object"
+          },
+          "s_b50417c15ae8053c": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_b85f0a93f61c366e": {
+            "not": {
+              "$ref": "#/$defs/s_777a4cb69145acf9"
+            }
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -6064,42 +6280,12 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
-                  },
-                  {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
                   }
                 ],
                 "properties": {
                   "node_id": {
-                    "const": "logic.set_bool"
+                    "const": "logic.set_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
@@ -6109,7 +6295,24 @@
                         "x-manyforge-semantic-type": "blackboard_key"
                       },
                       "value": {
-                        "type": "boolean"
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "$ref": "#/$defs/s_3eb46c08a10d222d"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
                     "type": "object"
@@ -6118,9 +6321,6 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "key": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
                       "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
@@ -6144,7 +6344,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -6156,7 +6356,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -6168,22 +6368,153 @@
                     }
                   },
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
                   }
                 ],
                 "properties": {
                   "node_id": {
-                    "const": "logic.wait_for_bool"
+                    "const": "logic.wait_for_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
-                      "expected_value": {
-                        "type": "boolean"
-                      },
                       "key": {
                         "type": "string",
                         "x-manyforge-semantic-type": "blackboard_key"
+                      },
+                      "operator": {
+                        "enum": [
+                          "==",
+                          "!=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ],
+                        "type": "string"
+                      },
+                      "timeout_s": {
+                        "maximum": 3600.0,
+                        "minimum": 0.01,
+                        "type": "number"
+                      },
+                      "timeout_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
+                      },
+                      "tolerance": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
+                      "value": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
                     "type": "object"
@@ -6192,10 +6523,19 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "expected_value": {
+                      "operator": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "key": {
+                      "timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "timeout_while_held": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "tolerance": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -6569,7 +6909,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "path": {
                         "items": {
@@ -6606,7 +6946,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -7021,7 +7361,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -7050,7 +7390,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -7651,6 +7991,36 @@
                         }
                       ]
                     }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   }
                 ],
                 "properties": {
@@ -7664,6 +8034,13 @@
                         "exclusiveMinimum": 0.0,
                         "maximum": 86400.0,
                         "type": "number"
+                      },
+                      "duration_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       }
                     },
                     "type": "object"
@@ -7673,6 +8050,9 @@
                     "minProperties": 1,
                     "properties": {
                       "duration_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "duration_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -8213,68 +8593,10 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
                   },
                   {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "$ref": "#/$defs/s_bfef448c344240d8"
-                  },
-                  {
-                    "oneOf": [
-                      {
-                        "properties": {
-                          "parameters": {
-                            "required": [
-                              "value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "parameters"
-                        ]
-                      },
-                      {
-                        "properties": {
-                          "value_sources": {
-                            "required": [
-                              "value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "value_sources"
-                        ]
-                      }
-                    ]
+                    "$ref": "#/$defs/s_645dd2fd91d1d036"
                   }
                 ],
                 "properties": {
@@ -8292,7 +8614,7 @@
                     "type": "string"
                   },
                   "node_id": {
-                    "const": "logic.set_bool"
+                    "const": "logic.set_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
@@ -8302,18 +8624,35 @@
                         "x-manyforge-semantic-type": "blackboard_key"
                       },
                       "value": {
-                        "type": "boolean"
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "$ref": "#/$defs/s_3eb46c08a10d222d"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
+                    "required": [
+                      "key"
+                    ],
                     "type": "object"
                   },
                   "value_sources": {
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "key": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
                       "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
@@ -8339,7 +8678,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -8351,7 +8690,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -8363,38 +8702,100 @@
                     }
                   },
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
-                    "oneOf": [
-                      {
-                        "properties": {
-                          "parameters": {
-                            "required": [
-                              "expected_value"
-                            ]
-                          }
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
                         },
-                        "required": [
-                          "parameters"
-                        ]
-                      },
-                      {
-                        "properties": {
-                          "value_sources": {
-                            "required": [
-                              "expected_value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "value_sources"
-                        ]
-                      }
-                    ]
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
-                    "$ref": "#/$defs/s_bfef448c344240d8"
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
+                  },
+                  {
+                    "$ref": "#/$defs/s_645dd2fd91d1d036"
                   }
                 ],
                 "properties": {
@@ -8412,29 +8813,82 @@
                     "type": "string"
                   },
                   "node_id": {
-                    "const": "logic.wait_for_bool"
+                    "const": "logic.wait_for_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
-                      "expected_value": {
-                        "type": "boolean"
-                      },
                       "key": {
                         "type": "string",
                         "x-manyforge-semantic-type": "blackboard_key"
+                      },
+                      "operator": {
+                        "enum": [
+                          "==",
+                          "!=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ],
+                        "type": "string"
+                      },
+                      "timeout_s": {
+                        "maximum": 3600.0,
+                        "minimum": 0.01,
+                        "type": "number"
+                      },
+                      "timeout_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
+                      },
+                      "tolerance": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
+                      "value": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
+                    "required": [
+                      "key"
+                    ],
                     "type": "object"
                   },
                   "value_sources": {
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "expected_value": {
+                      "operator": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "key": {
+                      "timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "timeout_while_held": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "tolerance": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -8851,7 +9305,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "path": {
                         "items": {
@@ -8888,7 +9342,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -9372,7 +9826,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -9401,7 +9855,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -10229,6 +10683,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -10281,6 +10765,13 @@
                         "exclusiveMinimum": 0.0,
                         "maximum": 86400.0,
                         "type": "number"
+                      },
+                      "duration_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       }
                     },
                     "type": "object"
@@ -10290,6 +10781,9 @@
                     "minProperties": 1,
                     "properties": {
                       "duration_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "duration_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -10827,481 +11321,7 @@
             ],
             "type": "object"
           },
-          "s_46e0d3d08937f9d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_4c54ede36e5884d0": {
-            "not": {
-              "$ref": "#/$defs/s_1b98ea2c295cd89c"
-            }
-          },
-          "s_4fd148f19a85870f": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_58ff4ef7a9d69d14": {
-            "not": {
-              "$ref": "#/$defs/s_d848331fe3f4a42e"
-            }
-          },
-          "s_5c50d0aa42183ea4": {
-            "additionalProperties": false,
-            "minProperties": 1,
-            "properties": {
-              "scene_resource_id": {
-                "$ref": "#/$defs/s_239060e26cdf11f6"
-              }
-            },
-            "type": "object"
-          },
-          "s_5e24d9e8298e3fc0": {
-            "not": {
-              "$ref": "#/$defs/s_2c5fb61ff814332a"
-            }
-          },
-          "s_5fe27c220463c259": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_62874ee639d2bbf4": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_752ec40f2f8ea349": {
-            "not": {
-              "$ref": "#/$defs/s_98c400f4811c99d8"
-            }
-          },
-          "s_784e720f1ce83ddf": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "target_frame"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role",
-                    "target_role"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "target_role"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "kind": {
-                "enum": [
-                  "cell_frame",
-                  "target_frame",
-                  "scene_resource"
-                ],
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          "s_7a7c8fbffe8c1502": {
-            "not": {
-              "$ref": "#/$defs/s_46e0d3d08937f9d8"
-            }
-          },
-          "s_8780d18716b767c7": {
-            "not": {
-              "$ref": "#/$defs/s_c4f541583e8cb501"
-            }
-          },
-          "s_901a7dcedf32c9c9": {
-            "not": {
-              "$ref": "#/$defs/s_5fe27c220463c259"
-            }
-          },
-          "s_921a14af5104da5e": {
-            "not": {
-              "$ref": "#/$defs/s_e4a9f43a4d165932"
-            }
-          },
-          "s_97a18d8e4a7b7a70": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9850a7b14b985051": {
-            "not": {
-              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
-            }
-          },
-          "s_98c400f4811c99d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9a0d2d7b25f2ed71": {
-            "additionalProperties": {
-              "$ref": "#/$defs/s_0d781a9233dcea9c"
-            },
-            "properties": {},
-            "type": "object"
-          },
-          "s_a3f660b9cd0c3742": {
-            "not": {
-              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
-            }
-          },
-          "s_a47a9cc21283b82f": {
-            "not": {
-              "$ref": "#/$defs/s_209b5c74cad87057"
-            }
-          },
-          "s_ab38980932f15fa2": {
-            "not": {
-              "$ref": "#/$defs/s_e9b16b9864d776ea"
-            }
-          },
-          "s_ac1edfbbf9af4ae7": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_adc008148d962421": {
-            "additionalProperties": false,
-            "properties": {
-              "pose": {
-                "$ref": "#/$defs/s_3eb46c08a10d222d"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "shape": {
-                "$ref": "#/$defs/s_37246640995e786a"
-              }
-            },
-            "type": "object"
-          },
-          "s_b2a55da16dc33ad5": {
-            "oneOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_b50417c15ae8053c": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_bd496f5351f68f45": {
+          "s_3eebdde204507495": {
             "additionalProperties": false,
             "allOf": [
               {
@@ -11493,6 +11513,27 @@
                     ]
                   }
                 }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
               }
             ],
             "properties": {
@@ -11515,13 +11556,18 @@
                 "type": "string",
                 "x-manyforge-semantic-type": "scene_resource"
               },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
               "type": {
                 "enum": [
                   "frame_role",
                   "component_body_role",
                   "scene_resource",
                   "runtime_object",
-                  "pose"
+                  "pose",
+                  "cell_frame"
                 ],
                 "type": "string"
               }
@@ -11531,13 +11577,13 @@
             ],
             "type": "object"
           },
-          "s_bfef448c344240d8": {
-            "oneOf": [
+          "s_46e0d3d08937f9d8": {
+            "allOf": [
               {
                 "properties": {
                   "parameters": {
                     "required": [
-                      "key"
+                      "execution_timeout_s"
                     ]
                   }
                 },
@@ -11549,7 +11595,7 @@
                 "properties": {
                   "value_sources": {
                     "required": [
-                      "key"
+                      "execution_timeout_s"
                     ]
                   }
                 },
@@ -11558,6 +11604,480 @@
                 ]
               }
             ]
+          },
+          "s_4c54ede36e5884d0": {
+            "not": {
+              "$ref": "#/$defs/s_1b98ea2c295cd89c"
+            }
+          },
+          "s_4fd148f19a85870f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_58ff4ef7a9d69d14": {
+            "not": {
+              "$ref": "#/$defs/s_d848331fe3f4a42e"
+            }
+          },
+          "s_5c50d0aa42183ea4": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
+          },
+          "s_5e24d9e8298e3fc0": {
+            "not": {
+              "$ref": "#/$defs/s_2c5fb61ff814332a"
+            }
+          },
+          "s_62874ee639d2bbf4": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_645dd2fd91d1d036": {
+            "oneOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_752ec40f2f8ea349": {
+            "not": {
+              "$ref": "#/$defs/s_98c400f4811c99d8"
+            }
+          },
+          "s_777a4cb69145acf9": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_784e720f1ce83ddf": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "target_frame"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "cell_frame",
+                  "target_frame",
+                  "scene_resource"
+                ],
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "s_7a7c8fbffe8c1502": {
+            "not": {
+              "$ref": "#/$defs/s_46e0d3d08937f9d8"
+            }
+          },
+          "s_8780d18716b767c7": {
+            "not": {
+              "$ref": "#/$defs/s_c4f541583e8cb501"
+            }
+          },
+          "s_921a14af5104da5e": {
+            "not": {
+              "$ref": "#/$defs/s_e4a9f43a4d165932"
+            }
+          },
+          "s_97a18d8e4a7b7a70": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9850a7b14b985051": {
+            "not": {
+              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
+            }
+          },
+          "s_98c400f4811c99d8": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9a0d2d7b25f2ed71": {
+            "additionalProperties": {
+              "$ref": "#/$defs/s_0d781a9233dcea9c"
+            },
+            "properties": {},
+            "type": "object"
+          },
+          "s_a3f660b9cd0c3742": {
+            "not": {
+              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
+            }
+          },
+          "s_a47a9cc21283b82f": {
+            "not": {
+              "$ref": "#/$defs/s_209b5c74cad87057"
+            }
+          },
+          "s_ab38980932f15fa2": {
+            "not": {
+              "$ref": "#/$defs/s_e9b16b9864d776ea"
+            }
+          },
+          "s_ac1edfbbf9af4ae7": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_adc008148d962421": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "shape": {
+                "$ref": "#/$defs/s_37246640995e786a"
+              }
+            },
+            "type": "object"
+          },
+          "s_b2a55da16dc33ad5": {
+            "oneOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_b50417c15ae8053c": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_b85f0a93f61c366e": {
+            "not": {
+              "$ref": "#/$defs/s_777a4cb69145acf9"
+            }
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -12465,68 +12985,10 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
                   },
                   {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "value"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "$ref": "#/$defs/s_bfef448c344240d8"
-                  },
-                  {
-                    "oneOf": [
-                      {
-                        "properties": {
-                          "parameters": {
-                            "required": [
-                              "value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "parameters"
-                        ]
-                      },
-                      {
-                        "properties": {
-                          "value_sources": {
-                            "required": [
-                              "value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "value_sources"
-                        ]
-                      }
-                    ]
+                    "$ref": "#/$defs/s_645dd2fd91d1d036"
                   }
                 ],
                 "properties": {
@@ -12544,7 +13006,7 @@
                     "type": "string"
                   },
                   "node_id": {
-                    "const": "logic.set_bool"
+                    "const": "logic.set_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
@@ -12554,18 +13016,35 @@
                         "x-manyforge-semantic-type": "blackboard_key"
                       },
                       "value": {
-                        "type": "boolean"
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "$ref": "#/$defs/s_3eb46c08a10d222d"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
+                    "required": [
+                      "key"
+                    ],
                     "type": "object"
                   },
                   "value_sources": {
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "key": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
                       "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
@@ -12591,7 +13070,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -12603,7 +13082,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "expected_value"
+                                "operator"
                               ]
                             }
                           },
@@ -12615,38 +13094,100 @@
                     }
                   },
                   {
-                    "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_s"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
-                    "oneOf": [
-                      {
-                        "properties": {
-                          "parameters": {
-                            "required": [
-                              "expected_value"
-                            ]
-                          }
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
                         },
-                        "required": [
-                          "parameters"
-                        ]
-                      },
-                      {
-                        "properties": {
-                          "value_sources": {
-                            "required": [
-                              "expected_value"
-                            ]
-                          }
-                        },
-                        "required": [
-                          "value_sources"
-                        ]
-                      }
-                    ]
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "timeout_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
-                    "$ref": "#/$defs/s_bfef448c344240d8"
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "tolerance"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "$ref": "#/$defs/s_b85f0a93f61c366e"
+                  },
+                  {
+                    "$ref": "#/$defs/s_645dd2fd91d1d036"
                   }
                 ],
                 "properties": {
@@ -12664,29 +13205,82 @@
                     "type": "string"
                   },
                   "node_id": {
-                    "const": "logic.wait_for_bool"
+                    "const": "logic.wait_for_value"
                   },
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
-                      "expected_value": {
-                        "type": "boolean"
-                      },
                       "key": {
                         "type": "string",
                         "x-manyforge-semantic-type": "blackboard_key"
+                      },
+                      "operator": {
+                        "enum": [
+                          "==",
+                          "!=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ],
+                        "type": "string"
+                      },
+                      "timeout_s": {
+                        "maximum": 3600.0,
+                        "minimum": 0.01,
+                        "type": "number"
+                      },
+                      "timeout_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
+                      },
+                      "tolerance": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
+                      "value": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "x-manyforge-value-type-from-key": "key"
                       }
                     },
+                    "required": [
+                      "key"
+                    ],
                     "type": "object"
                   },
                   "value_sources": {
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
-                      "expected_value": {
+                      "operator": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "key": {
+                      "timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "timeout_while_held": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "tolerance": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "value": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -13103,7 +13697,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "path": {
                         "items": {
@@ -13140,7 +13734,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -13624,7 +14218,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -13653,7 +14247,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_bd496f5351f68f45"
+                        "$ref": "#/$defs/s_3eebdde204507495"
                       },
                       "target_role": {
                         "type": "string",
@@ -14481,6 +15075,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "duration_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -14533,6 +15157,13 @@
                         "exclusiveMinimum": 0.0,
                         "maximum": 86400.0,
                         "type": "number"
+                      },
+                      "duration_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       }
                     },
                     "type": "object"
@@ -14542,6 +15173,9 @@
                     "minProperties": 1,
                     "properties": {
                       "duration_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "duration_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -15079,481 +15713,7 @@
             ],
             "type": "object"
           },
-          "s_46e0d3d08937f9d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "execution_timeout_s"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_4c54ede36e5884d0": {
-            "not": {
-              "$ref": "#/$defs/s_1b98ea2c295cd89c"
-            }
-          },
-          "s_4fd148f19a85870f": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_58ff4ef7a9d69d14": {
-            "not": {
-              "$ref": "#/$defs/s_d848331fe3f4a42e"
-            }
-          },
-          "s_5c50d0aa42183ea4": {
-            "additionalProperties": false,
-            "minProperties": 1,
-            "properties": {
-              "scene_resource_id": {
-                "$ref": "#/$defs/s_239060e26cdf11f6"
-              }
-            },
-            "type": "object"
-          },
-          "s_5e24d9e8298e3fc0": {
-            "not": {
-              "$ref": "#/$defs/s_2c5fb61ff814332a"
-            }
-          },
-          "s_5fe27c220463c259": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_62874ee639d2bbf4": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "target_reference"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_752ec40f2f8ea349": {
-            "not": {
-              "$ref": "#/$defs/s_98c400f4811c99d8"
-            }
-          },
-          "s_784e720f1ce83ddf": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "target_frame"
-                    }
-                  },
-                  "required": [
-                    "kind"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role",
-                    "target_role"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "kind": {
-                        "const": "target_frame"
-                      }
-                    },
-                    "required": [
-                      "kind"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "target_role"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "kind": {
-                "enum": [
-                  "cell_frame",
-                  "target_frame",
-                  "scene_resource"
-                ],
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          "s_7a7c8fbffe8c1502": {
-            "not": {
-              "$ref": "#/$defs/s_46e0d3d08937f9d8"
-            }
-          },
-          "s_8780d18716b767c7": {
-            "not": {
-              "$ref": "#/$defs/s_c4f541583e8cb501"
-            }
-          },
-          "s_901a7dcedf32c9c9": {
-            "not": {
-              "$ref": "#/$defs/s_5fe27c220463c259"
-            }
-          },
-          "s_921a14af5104da5e": {
-            "not": {
-              "$ref": "#/$defs/s_e4a9f43a4d165932"
-            }
-          },
-          "s_97a18d8e4a7b7a70": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "velocity_scale"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9850a7b14b985051": {
-            "not": {
-              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
-            }
-          },
-          "s_98c400f4811c99d8": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_9a0d2d7b25f2ed71": {
-            "additionalProperties": {
-              "$ref": "#/$defs/s_0d781a9233dcea9c"
-            },
-            "properties": {},
-            "type": "object"
-          },
-          "s_a3f660b9cd0c3742": {
-            "not": {
-              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
-            }
-          },
-          "s_a47a9cc21283b82f": {
-            "not": {
-              "$ref": "#/$defs/s_209b5c74cad87057"
-            }
-          },
-          "s_ab38980932f15fa2": {
-            "not": {
-              "$ref": "#/$defs/s_e9b16b9864d776ea"
-            }
-          },
-          "s_ac1edfbbf9af4ae7": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "max_tcp_linear_speed_mps"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_adc008148d962421": {
-            "additionalProperties": false,
-            "properties": {
-              "pose": {
-                "$ref": "#/$defs/s_3eb46c08a10d222d"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "shape": {
-                "$ref": "#/$defs/s_37246640995e786a"
-              }
-            },
-            "type": "object"
-          },
-          "s_b2a55da16dc33ad5": {
-            "oneOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "shape"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_b50417c15ae8053c": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "translation_tol_m"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
-          "s_bd496f5351f68f45": {
+          "s_3eebdde204507495": {
             "additionalProperties": false,
             "allOf": [
               {
@@ -15745,6 +15905,27 @@
                     ]
                   }
                 }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
               }
             ],
             "properties": {
@@ -15767,13 +15948,18 @@
                 "type": "string",
                 "x-manyforge-semantic-type": "scene_resource"
               },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
               "type": {
                 "enum": [
                   "frame_role",
                   "component_body_role",
                   "scene_resource",
                   "runtime_object",
-                  "pose"
+                  "pose",
+                  "cell_frame"
                 ],
                 "type": "string"
               }
@@ -15783,13 +15969,13 @@
             ],
             "type": "object"
           },
-          "s_bfef448c344240d8": {
-            "oneOf": [
+          "s_46e0d3d08937f9d8": {
+            "allOf": [
               {
                 "properties": {
                   "parameters": {
                     "required": [
-                      "key"
+                      "execution_timeout_s"
                     ]
                   }
                 },
@@ -15801,7 +15987,7 @@
                 "properties": {
                   "value_sources": {
                     "required": [
-                      "key"
+                      "execution_timeout_s"
                     ]
                   }
                 },
@@ -15810,6 +15996,480 @@
                 ]
               }
             ]
+          },
+          "s_4c54ede36e5884d0": {
+            "not": {
+              "$ref": "#/$defs/s_1b98ea2c295cd89c"
+            }
+          },
+          "s_4fd148f19a85870f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_58ff4ef7a9d69d14": {
+            "not": {
+              "$ref": "#/$defs/s_d848331fe3f4a42e"
+            }
+          },
+          "s_5c50d0aa42183ea4": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
+          },
+          "s_5e24d9e8298e3fc0": {
+            "not": {
+              "$ref": "#/$defs/s_2c5fb61ff814332a"
+            }
+          },
+          "s_62874ee639d2bbf4": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "target_reference"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_645dd2fd91d1d036": {
+            "oneOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_752ec40f2f8ea349": {
+            "not": {
+              "$ref": "#/$defs/s_98c400f4811c99d8"
+            }
+          },
+          "s_777a4cb69145acf9": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_784e720f1ce83ddf": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "target_frame"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "cell_frame",
+                  "target_frame",
+                  "scene_resource"
+                ],
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "s_7a7c8fbffe8c1502": {
+            "not": {
+              "$ref": "#/$defs/s_46e0d3d08937f9d8"
+            }
+          },
+          "s_8780d18716b767c7": {
+            "not": {
+              "$ref": "#/$defs/s_c4f541583e8cb501"
+            }
+          },
+          "s_921a14af5104da5e": {
+            "not": {
+              "$ref": "#/$defs/s_e4a9f43a4d165932"
+            }
+          },
+          "s_97a18d8e4a7b7a70": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "velocity_scale"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9850a7b14b985051": {
+            "not": {
+              "$ref": "#/$defs/s_97a18d8e4a7b7a70"
+            }
+          },
+          "s_98c400f4811c99d8": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_9a0d2d7b25f2ed71": {
+            "additionalProperties": {
+              "$ref": "#/$defs/s_0d781a9233dcea9c"
+            },
+            "properties": {},
+            "type": "object"
+          },
+          "s_a3f660b9cd0c3742": {
+            "not": {
+              "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
+            }
+          },
+          "s_a47a9cc21283b82f": {
+            "not": {
+              "$ref": "#/$defs/s_209b5c74cad87057"
+            }
+          },
+          "s_ab38980932f15fa2": {
+            "not": {
+              "$ref": "#/$defs/s_e9b16b9864d776ea"
+            }
+          },
+          "s_ac1edfbbf9af4ae7": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "max_tcp_linear_speed_mps"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_adc008148d962421": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "shape": {
+                "$ref": "#/$defs/s_37246640995e786a"
+              }
+            },
+            "type": "object"
+          },
+          "s_b2a55da16dc33ad5": {
+            "oneOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "shape"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_b50417c15ae8053c": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "translation_tol_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_b85f0a93f61c366e": {
+            "not": {
+              "$ref": "#/$defs/s_777a4cb69145acf9"
+            }
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -16589,6 +17249,262 @@
             ],
             "type": "object"
           },
+          "s_3eebdde204507495": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "component_body_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "collision_body_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "frame_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "pose"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "pose"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "runtime_object"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "runtime_object_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "component_body_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "collision_body_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "pose"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "pose"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "runtime_object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "runtime_object_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "collision_body_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "collision_body_role"
+              },
+              "frame_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-scope-parameter": "target_role",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "pose": {
+                "$ref": "#/$defs/s_c0927a2b2371dcad"
+              },
+              "runtime_object_id": {
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
+              "type": {
+                "enum": [
+                  "frame_role",
+                  "component_body_role",
+                  "scene_resource",
+                  "runtime_object",
+                  "pose",
+                  "cell_frame"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
           "s_46e0d3d08937f9d8": {
             "allOf": [
               {
@@ -16815,34 +17731,6 @@
               "$ref": "#/$defs/s_2c5fb61ff814332a"
             }
           },
-          "s_5fe27c220463c259": {
-            "allOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "key"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
           "s_62874ee639d2bbf4": {
             "allOf": [
               {
@@ -16875,6 +17763,34 @@
             "not": {
               "$ref": "#/$defs/s_98c400f4811c99d8"
             }
+          },
+          "s_777a4cb69145acf9": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_784e720f1ce83ddf": {
             "additionalProperties": false,
@@ -17013,11 +17929,6 @@
           "s_8780d18716b767c7": {
             "not": {
               "$ref": "#/$defs/s_c4f541583e8cb501"
-            }
-          },
-          "s_901a7dcedf32c9c9": {
-            "not": {
-              "$ref": "#/$defs/s_5fe27c220463c259"
             }
           },
           "s_921a14af5104da5e": {
@@ -17181,235 +18092,10 @@
               }
             ]
           },
-          "s_bd496f5351f68f45": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "component_body_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "collision_body_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "frame_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "pose"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "pose"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "runtime_object"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "runtime_object_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "component_body_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "collision_body_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "frame_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "pose"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "pose"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "runtime_object"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "runtime_object_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "collision_body_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "collision_body_role"
-              },
-              "frame_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-scope-parameter": "target_role",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "pose": {
-                "$ref": "#/$defs/s_c0927a2b2371dcad"
-              },
-              "runtime_object_id": {
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "type": {
-                "enum": [
-                  "frame_role",
-                  "component_body_role",
-                  "scene_resource",
-                  "runtime_object",
-                  "pose"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
+          "s_b85f0a93f61c366e": {
+            "not": {
+              "$ref": "#/$defs/s_777a4cb69145acf9"
+            }
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -18275,37 +18961,7 @@
             "additionalProperties": false,
             "allOf": [
               {
-                "$ref": "#/$defs/s_901a7dcedf32c9c9"
-              },
-              {
-                "not": {
-                  "allOf": [
-                    {
-                      "properties": {
-                        "parameters": {
-                          "required": [
-                            "value"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "parameters"
-                      ]
-                    },
-                    {
-                      "properties": {
-                        "value_sources": {
-                          "required": [
-                            "value"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "value_sources"
-                      ]
-                    }
-                  ]
-                }
+                "$ref": "#/$defs/s_b85f0a93f61c366e"
               },
               {
                 "anyOf": [
@@ -18324,7 +18980,7 @@
             ],
             "properties": {
               "expected_node_id": {
-                "const": "logic.set_bool"
+                "const": "logic.set_value"
               },
               "instance_id": {
                 "oneOf": [
@@ -18349,7 +19005,46 @@
                     "x-manyforge-semantic-type": "blackboard_key"
                   },
                   "value": {
-                    "type": "boolean"
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "frame_ref": {
+                            "$ref": "#/$defs/s_784e720f1ce83ddf"
+                          },
+                          "orientation": {
+                            "$ref": "#/$defs/s_e2cd150d27b9cb36"
+                          },
+                          "position_m": {
+                            "items": {
+                              "type": "number"
+                            },
+                            "maxItems": 3,
+                            "minItems": 3,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "frame_ref",
+                          "position_m",
+                          "orientation"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "x-manyforge-value-type-from-key": "key"
                   }
                 },
                 "type": "object"
@@ -18358,9 +19053,6 @@
                 "additionalProperties": false,
                 "minProperties": 1,
                 "properties": {
-                  "key": {
-                    "$ref": "#/$defs/s_239060e26cdf11f6"
-                  },
                   "value": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   }
@@ -18384,7 +19076,7 @@
                       "properties": {
                         "parameters": {
                           "required": [
-                            "expected_value"
+                            "operator"
                           ]
                         }
                       },
@@ -18396,7 +19088,7 @@
                       "properties": {
                         "value_sources": {
                           "required": [
-                            "expected_value"
+                            "operator"
                           ]
                         }
                       },
@@ -18408,7 +19100,97 @@
                 }
               },
               {
-                "$ref": "#/$defs/s_901a7dcedf32c9c9"
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "timeout_s"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "timeout_s"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "timeout_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "timeout_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "tolerance"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "tolerance"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "$ref": "#/$defs/s_b85f0a93f61c366e"
               },
               {
                 "anyOf": [
@@ -18427,7 +19209,7 @@
             ],
             "properties": {
               "expected_node_id": {
-                "const": "logic.wait_for_bool"
+                "const": "logic.wait_for_value"
               },
               "instance_id": {
                 "oneOf": [
@@ -18447,12 +19229,53 @@
               "parameters": {
                 "additionalProperties": false,
                 "properties": {
-                  "expected_value": {
-                    "type": "boolean"
-                  },
                   "key": {
                     "type": "string",
                     "x-manyforge-semantic-type": "blackboard_key"
+                  },
+                  "operator": {
+                    "enum": [
+                      "==",
+                      "!=",
+                      "<",
+                      "<=",
+                      ">",
+                      ">="
+                    ],
+                    "type": "string"
+                  },
+                  "timeout_s": {
+                    "maximum": 3600.0,
+                    "minimum": 0.01,
+                    "type": "number"
+                  },
+                  "timeout_while_held": {
+                    "enum": [
+                      "count",
+                      "pause"
+                    ],
+                    "type": "string"
+                  },
+                  "tolerance": {
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "x-manyforge-value-type-from-key": "key"
                   }
                 },
                 "type": "object"
@@ -18461,10 +19284,19 @@
                 "additionalProperties": false,
                 "minProperties": 1,
                 "properties": {
-                  "expected_value": {
+                  "operator": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
-                  "key": {
+                  "timeout_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "timeout_while_held": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "tolerance": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "value": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   }
                 },
@@ -18867,7 +19699,7 @@
                     "type": "number"
                   },
                   "offset_reference": {
-                    "$ref": "#/$defs/s_bd496f5351f68f45"
+                    "$ref": "#/$defs/s_3eebdde204507495"
                   },
                   "path": {
                     "items": {
@@ -18904,7 +19736,7 @@
                     "type": "string"
                   },
                   "target_reference": {
-                    "$ref": "#/$defs/s_bd496f5351f68f45"
+                    "$ref": "#/$defs/s_3eebdde204507495"
                   },
                   "target_role": {
                     "type": "string",
@@ -19377,7 +20209,7 @@
                     "type": "number"
                   },
                   "offset_reference": {
-                    "$ref": "#/$defs/s_bd496f5351f68f45"
+                    "$ref": "#/$defs/s_3eebdde204507495"
                   },
                   "per_joint_dynamics_limits": {
                     "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -19406,7 +20238,7 @@
                     "type": "string"
                   },
                   "target_reference": {
-                    "$ref": "#/$defs/s_bd496f5351f68f45"
+                    "$ref": "#/$defs/s_3eebdde204507495"
                   },
                   "target_role": {
                     "type": "string",
@@ -20301,6 +21133,36 @@
                 }
               },
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "duration_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "duration_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "anyOf": [
                   {
                     "required": [
@@ -20341,6 +21203,13 @@
                     "exclusiveMinimum": 0.0,
                     "maximum": 86400.0,
                     "type": "number"
+                  },
+                  "duration_while_held": {
+                    "enum": [
+                      "count",
+                      "pause"
+                    ],
+                    "type": "string"
                   }
                 },
                 "type": "object"
@@ -20350,6 +21219,9 @@
                 "minProperties": 1,
                 "properties": {
                   "duration_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "duration_while_held": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   }
                 },

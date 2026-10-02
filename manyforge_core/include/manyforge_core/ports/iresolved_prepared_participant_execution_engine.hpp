@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/runtime_participant_policy.hpp>
+#include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execute_request.hpp>
@@ -23,7 +23,7 @@ class CoordinatedMotionPreparation;
 /// Complete owner-issued authority for preparing one motion participant.
 ///
 /// The addressed Kernel mints operation/participant/goal identity and owns the
-/// sealed binding, readiness, runtime policy, and ordinary Stop plan. The
+/// sealed binding, readiness, and ordinary Stop plan. The
 /// subordinate motion engine owns planning and validation evidence. Neither
 /// side can construct a prepared participant without the other's exact facts.
 struct ResolvedPreparedMotionExecutionRequestDTO final {
@@ -31,7 +31,6 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   OperationRevision operation_revision;
   RuntimeParticipantBinding binding;
   RuntimeParticipantStopReadiness stop_readiness;
-  RuntimeParticipantPolicySelection runtime_policy;
   std::optional<double> requested_tcp_linear_speed_mps;
   double deployment_maximum_tcp_linear_speed_mps{};
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
@@ -44,7 +43,7 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
 };
 
 /// Owner-minted authority for one fresh Resume of an already-dispatched
-/// participant.  Stable binding/readiness/runtime-policy facts remain sealed
+/// participant.  Stable binding/readiness facts remain sealed
 /// in the resident preparation session; these are the only facts that change
 /// for the new immutable participant and controller goal.
 struct ResolvedPreparedMotionResumeRequestDTO final {

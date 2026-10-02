@@ -1,0 +1,77 @@
+# Executable specification of Program value paths: the keys of a node's
+# `value_sources` (docs/authoring/EXPRESSIONS.md section 9). The Python
+# validator (manyforge_behavior/tests/test_value_path.py), the C++ Program
+# contract (manyforge_deployment/test/test_program_value_path.cpp) and the
+# Composer editor run every case.
+#
+# Grammar (one spelling per path; there is no normalization):
+#   path    = name *( "." name / "[" index "]" )
+#   name    = %x61-7A *( %x61-7A / DIGIT / "_" / "-" )   ; a-z first
+#   index   = "0" / %x31-39 *DIGIT                        ; no leading zeros
+# Bounds: at most `max_length` characters, `max_segments` segments (the first
+# name included), `max_name_length` characters per name and `max_index_digits`
+# digits per index.
+#
+# `valid` cases give the path and its segments; formatting the segments must
+# give the path back. `invalid` cases give the path and the refusal code.
+# Every scalar is text; an index segment is written {index: "<digits>"}.
+schema: manyforge.value_path_conformance.v1
+
+limits:
+  max_length: "1024"
+  max_segments: "33"
+  max_name_length: "256"
+  max_index_digits: "9"
+
+valid:
+  - path: goal
+    segments: [{name: goal}]
+  - path: goal.position_m
+    segments: [{name: goal}, {name: position_m}]
+  - path: goal.position_m[2]
+    segments: [{name: goal}, {name: position_m}, {index: "2"}]
+  - path: goal.orientation.rpy_deg[0]
+    segments: [{name: goal}, {name: orientation}, {name: rpy_deg}, {index: "0"}]
+  - path: target_reference.pose
+    segments: [{name: target_reference}, {name: pose}]
+  - path: waypoints[10].position_m[1]
+    segments: [{name: waypoints}, {index: "10"}, {name: position_m}, {index: "1"}]
+  - path: grid[0][1]
+    segments: [{name: grid}, {index: "0"}, {index: "1"}]
+  - path: a-b_c9.d
+    segments: [{name: a-b_c9}, {name: d}]
+  - path: x[999999999]
+    segments: [{name: x}, {index: "999999999"}]
+  - path: a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z.aa.bb.cc.dd.ee.ff.gg
+    segments: [{name: a}, {name: b}, {name: c}, {name: d}, {name: e}, {name: f}, {name: g}, {name: h}, {name: i}, {name: j}, {name: k}, {name: l}, {name: m}, {name: n}, {name: o}, {name: p}, {name: q}, {name: r}, {name: s}, {name: t}, {name: u}, {name: v}, {name: w}, {name: x}, {name: y}, {name: z}, {name: aa}, {name: bb}, {name: cc}, {name: dd}, {name: ee}, {name: ff}, {name: gg}]
+  - path: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    segments: [{name: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}]
+
+invalid:
+  - {path: "", code: path_empty}
+  - {path: ".goal", code: path_name_invalid}
+  - {path: "[0]", code: path_name_invalid}
+  - {path: "Goal", code: path_name_invalid}
+  - {path: "9goal", code: path_name_invalid}
+  - {path: "_goal", code: path_name_invalid}
+  - {path: "goal.", code: path_name_invalid}
+  - {path: "goal..x", code: path_name_invalid}
+  - {path: "goal.X", code: path_name_invalid}
+  - {path: "goal.pos ition", code: path_syntax_invalid}
+  - {path: "goal.position_m[]", code: path_index_invalid}
+  - {path: "goal.position_m[01]", code: path_index_invalid}
+  - {path: "goal.position_m[-1]", code: path_index_invalid}
+  - {path: "goal.position_m[+1]", code: path_index_invalid}
+  - {path: "goal.position_m[1", code: path_index_invalid}
+  - {path: "goal.position_m[1a]", code: path_index_invalid}
+  - {path: "goal.position_m[ 1]", code: path_index_invalid}
+  - {path: "x[1000000000]", code: path_index_invalid}
+  - {path: "goal.position_m]", code: path_syntax_invalid}
+  - {path: "goal[0]x", code: path_syntax_invalid}
+  - {path: "goal/position_m", code: path_syntax_invalid}
+  - {path: "goal.position_m.0", code: path_name_invalid}
+  - {path: "perception.grasp_plané", code: path_syntax_invalid}
+  - {path: "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z.aa.bb.cc.dd.ee.ff.gg.hh", code: path_too_deep}
+  - {path: "a[0][1][2][3][4][5][6][7][8][9][10][11][12][13][14][15][16][17][18][19][20][21][22][23][24][25][26][27][28][29][30][31][32]", code: path_too_deep}
+  - {path: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", code: path_name_invalid}
+  - {path: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", code: path_too_long}

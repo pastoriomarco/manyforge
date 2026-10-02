@@ -1,0 +1,243 @@
+{
+  "api_version": "manyforge.scenario.project.v1",
+  "content": {
+    "assignment_present": true,
+    "deployment_present": true,
+    "program_present": true
+  },
+  "description": "Editable development workbench for the UR5e + Lite6 wall cell. Started as a copy of the generated ur5e_lite6_wall_grouped qualification Scenario.",
+  "members": {
+    "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
+    "deployment.yaml": "sha256:9684fda33f4e2716acd3e0a752176e337a7882740ee8015423e4cd33d9d57d0c",
+    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "program.yaml": "sha256:dac720cd9c803005708a14dad6b2273b7c8208313c6360b167b7aed2b1a2bc2e"
+  },
+  "name": "ur5e_lite6_wall_workbench",
+  "saved_status": {
+    "checked_content_digest": "sha256:e13ad6ddf26c96d39742a4a071c41b0dc561594b1ce6de7ddf256f24ee6d40c1",
+    "last_known_status": "unknown",
+    "manyforge_version": "0.1.0"
+  },
+  "scenario_id": "ur5e_lite6_wall_workbench",
+  "source_snapshot": {
+    "entries": [
+      {
+        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:ac91231b9338ecc99dc4f318854f3288d427dbf7d36d5f1a916b7cdb00e0ee8b",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl"
+      },
+      {
+        "content_digest": "sha256:2945b39ecc4154da30d1ebe5a9b380e742a379fb0902148f2e286672f46ee1db",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link2.stl"
+      },
+      {
+        "content_digest": "sha256:9af8b412d1f9bc5714be78f4473f28f4ffa91caa0455f215e24e132c8ef433cd",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link3.stl"
+      },
+      {
+        "content_digest": "sha256:17ff580ba7a4477c120374b2e6396940bab2cdc8fad07a34af9ae44b08ee1515",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link4.stl"
+      },
+      {
+        "content_digest": "sha256:f69ec2478819438078db12412597d51bb815acb66d0e1aaa57d4d0f93630fc9c",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link5.stl"
+      },
+      {
+        "content_digest": "sha256:6c2492bd20f3b7216626f00f7e8b63cda12e3faec9b64c6216d1d53022f2ee18",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link6.stl"
+      },
+      {
+        "content_digest": "sha256:728a2e960227fe8b781e7220e0c9a171e2f746524c5db7875bb15b3a2ce2ff92",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link_base.stl"
+      },
+      {
+        "content_digest": "sha256:41d28af66c2fbd6a93b9fb5f9cfceb3c1de1f021928006871ae4e9d813f8459a",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link1.stl"
+      },
+      {
+        "content_digest": "sha256:d082d23629f1fe619bfc664208039e177cf774a6f953c2c1722aec20edd73ca4",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link2.stl"
+      },
+      {
+        "content_digest": "sha256:ff11c8164bb932cfdfedf27f875e5d5bd3ae13df128c44809da1bf15b712d759",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link3.stl"
+      },
+      {
+        "content_digest": "sha256:902ef2e6c6f66f0fa72b8b7e242ea75ea85af7dfd35581997ceaf475e25a4954",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link4.stl"
+      },
+      {
+        "content_digest": "sha256:3e0c201146a4444a08493d83a273f81b0298a723186a2bb27ede21c574237a41",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link5.stl"
+      },
+      {
+        "content_digest": "sha256:36a7bad22997a0938884485997f026b602bd952674a22d3a8e47cc160cde70d8",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link6.stl"
+      },
+      {
+        "content_digest": "sha256:84f69488a1de60c76c23f83b1759ed76e9235bd56b4b98b4c997c24c18ba7b42",
+        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
+      },
+      {
+        "content_digest": "sha256:c205bbe075021433ac03ead6e322d8567b65c8fc98d61a057faffec76b51c787",
+        "source_id": "component:lite6_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "source_id": "component:lite6_robot:urdf"
+      },
+      {
+        "content_digest": "sha256:5fb9e5659c735e48eb55269da431cf61b3b7a6745922c1932a7adefb1db86dc3",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger.dae"
+      },
+      {
+        "content_digest": "sha256:f39a50be121122fc1c53c588a762ad1da8a0f64d39bc6f299cbe9b0597e7257b",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger.stl"
+      },
+      {
+        "content_digest": "sha256:785ec7a83b4fc6357c211a39bb117833b1cfd4e9bccbef2efc7f35aeb2fdb92e",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger_tip.dae"
+      },
+      {
+        "content_digest": "sha256:9d90031cd99106a8be63609f8ff78580638d91cc4167bf66c09198329f2e65cf",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_finger_tip.stl"
+      },
+      {
+        "content_digest": "sha256:2df009ef28868c90a4904370f5f4995c74ec84e0b8ca1371044e0ea669edcd71",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_inner_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:f250a3fea49be4d1bb2383d9980172c59fc44031193ef2293ca540f756f6c1e6",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:1b82214363d9548f3562be70e25cd23217a304c72ccd37bc1551cf1a3a64029d",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:b7ec787f57a7db5b2b14e64ffbedaac28739e38f14aac8afa8b575bac941feb7",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/left_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:3b2245b5537eb596d7f8a4c64b12e3aedea46e365fc589019184d3b4200e664f",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger.dae"
+      },
+      {
+        "content_digest": "sha256:1d018fa2f0b50aca5941778d78810b211b1abfc8637c7953451d76d4833ba6f8",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger.stl"
+      },
+      {
+        "content_digest": "sha256:568371d25ddbcee8e432c0610bdcc7afcd1393d48d973eed92168e353eb4edf5",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger_tip.dae"
+      },
+      {
+        "content_digest": "sha256:126f1559f2f7dca62449a6ca926c609fbdaa93ca66df805ff7c069bb206e3d10",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_finger_tip.stl"
+      },
+      {
+        "content_digest": "sha256:4cc6de99e177773ba755805b58b67537c3af24b2fd8f3a1bf4bbced87d6240a5",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_inner_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:c936d951ede875b91c180bd41d45b22ae23f8a39d9c3e09e29066453a8e863ef",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:532b6f6f8794883ff34995701036ca392461f26127757f92003db127693bc57c",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_knuckle.dae"
+      },
+      {
+        "content_digest": "sha256:d151fb38f59748f1e6e627312e2ede96f2c98ba267bf722091665b20c78e7a8d",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/right_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:761a79d586a48d367d60f146ca77ef7d2821ad790f7b1b1c93b061ac59799267",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/robotiq_base.dae"
+      },
+      {
+        "content_digest": "sha256:ede5cd7d7846c051b88645f33d6bbb5ed9b36bbef404a19a46557639bfab7060",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/robotiq_2f_85/robotiq_base.stl"
+      },
+      {
+        "content_digest": "sha256:9a145e0d46f2130afdf2a2e8825a00a929870c4c3d6d8e4d1adc5f04db3aac1b",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/base.stl"
+      },
+      {
+        "content_digest": "sha256:2e7423cab807c34160ec4f770daee5e747d70e777eb01b7beeace2b8c5751816",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/forearm.stl"
+      },
+      {
+        "content_digest": "sha256:ceb92532177daa77682f5fbd628e01c2137d168f949a7a706ce1dabe9f002387",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/shoulder.stl"
+      },
+      {
+        "content_digest": "sha256:ee893044caf00075cb55b4cf666d1f1311c7979786212a501009f33bee945209",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/upperarm.stl"
+      },
+      {
+        "content_digest": "sha256:f8c9f9337b6fd98c75f052e96de10e14a107ddb6874ba6b904e546f8a4e4f43a",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist1.stl"
+      },
+      {
+        "content_digest": "sha256:2964a63f60ce3e3cf3ad55bcf190d7876d50e373cb64b70a57cea5885eaf3c86",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist2.stl"
+      },
+      {
+        "content_digest": "sha256:83b3666b4ae2badd54af0d2c25a921682ecbc29e849eec646c3ed55fb74c78a3",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/collision/wrist3.stl"
+      },
+      {
+        "content_digest": "sha256:c30e4d7228ef633dca2a02c26df2316741f6642cb6333e8289dba6e6d0b22819",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/base.dae"
+      },
+      {
+        "content_digest": "sha256:04694bf57dac46e9b8bc7c30f2eec75a1bc762e1f1a879ea30c944f24cacbad8",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/forearm.dae"
+      },
+      {
+        "content_digest": "sha256:c581bfa55b86061d9b99d315ed53817b6b693e6a500643bbf9bbb783322d585d",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/shoulder.dae"
+      },
+      {
+        "content_digest": "sha256:c040a05bb224f14cfab6aa6704d70cbb773ada940eca9a3e34e6ce486c4c4c29",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/upperarm.dae"
+      },
+      {
+        "content_digest": "sha256:a07a3d96d2540f9be12e4a07bcb8577d9f1e36005920c396a407804343a3b588",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist1.dae"
+      },
+      {
+        "content_digest": "sha256:982fa42933c6f81629882ad7975e9ba5dac5d474a6b56694e233708376cf840e",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist2.dae"
+      },
+      {
+        "content_digest": "sha256:7a7664ac4adcd53b0870fe6a2b8b975693d846dd4d07a5f44194c7d16f4890ba",
+        "source_id": "component:ur5e_robot:resource:package://manyforge_example_models/models/ur5e_robotiq_2f_85/meshes/ur5e/visual/wrist3.dae"
+      },
+      {
+        "content_digest": "sha256:dc37cb5103e84652bb904a4a641175b49d097bc21eb75cde8b617a686b7792ed",
+        "source_id": "component:ur5e_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:16318e983ff913c4e1f5854929e2dc72dbc83767dc780b16adedc3564525bc0a",
+        "source_id": "component:ur5e_robot:urdf"
+      }
+    ],
+    "schema_version": "manyforge.scenario.source_snapshot.v1"
+  }
+}

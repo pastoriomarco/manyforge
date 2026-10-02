@@ -852,6 +852,116 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
   }
 }
 
+namespace {
+
+CanonicalValue CommittedApplyRecord(const std::string &apply_id,
+                                    const char digest,
+                                    const std::string &scenario_id,
+                                    const bool committed,
+                                    const CanonicalValue &active) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"apply_id", CanonicalValue(apply_id)},
+      {"apply_generation", CanonicalValue(1.0)},
+      {"committed", CanonicalValue(committed)},
+      {"terminal_state", CanonicalValue(committed ? "succeeded" : "failed")},
+      {"incomplete", CanonicalValue(false)},
+      {"intent_digest", CanonicalValue(Digest(digest))},
+      {"prepared_activation", CanonicalValue(CanonicalValue::Object{
+          {"schema_version",
+           CanonicalValue("manyforge.prepared_activation_input.v4")},
+          {"retained_bundle_id", Member(active, "retained_bundle_id")},
+          {"graph_revision", Member(active, "graph_revision")},
+          {"scenario_id", CanonicalValue(scenario_id)},
+          {"program_id", CanonicalValue(nullptr)},
+          {"program_revision", CanonicalValue(nullptr)},
+          {"program_outcome", CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("no_program")},
+          })},
+      })},
+  });
+}
+
+CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
+                                       const double publication_generation,
+                                       const bool include_older_apply) {
+  PublishHealthySources(directory, "open");
+  auto payload = ManagerPayload();
+  auto active = Member(payload, "active");
+  active = WithField(active, "publication", CanonicalValue(CanonicalValue::Object{
+      {"publication_generation", CanonicalValue(publication_generation)},
+      {"transaction", CanonicalValue(CanonicalValue::Object{
+          {"kind", CanonicalValue("named_apply")},
+          {"apply_id", CanonicalValue("apply.new")},
+          {"apply_generation", CanonicalValue(1.0)},
+      })},
+  }));
+  CanonicalValue::Array records{
+      CommittedApplyRecord("apply.new", 'd', "cell_pick", true, active),
+      CommittedApplyRecord("apply.refused", 'e', "cell_pick", false, active),
+  };
+  if (include_older_apply) {
+    records.push_back(
+        CommittedApplyRecord("apply.old", 'c', "other_cell", true, active));
+  }
+  payload = WithField(payload, "active", active);
+  payload = WithField(payload, "apply", CanonicalValue(CanonicalValue::Object{
+      {"records", CanonicalValue(std::move(records))},
+  }));
+  AtomicSourceSnapshotChannel manager(directory.publications(),
+                                      "manager-source.json");
+  static_cast<void>(manager.Publish(
+      "component_manager", "component-manager." + std::string(kCellId),
+      "manager.epoch.1", 2, payload));
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  return core.CommittedScenarioActivation();
+}
+
+} // namespace
+
+TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
+  TemporaryDirectory directory;
+  const auto activation = CommittedActivationCore(directory, 3.0, true);
+  EXPECT_EQ(Text(activation, "schema_version"),
+            "manyforge.committed_scenario_activation.v1");
+  EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
+  EXPECT_EQ(Text(activation, "apply_id"), "apply.new");
+  EXPECT_EQ(std::get<double>(Member(activation, "apply_generation").storage()),
+            1.0);
+  EXPECT_EQ(Text(activation, "scenario_id"), "cell_pick");
+  EXPECT_EQ(std::get<double>(Member(activation, "publication_generation").storage()),
+            3.0);
+  // A Scenario without a Program declares nothing; it is still an activation.
+  EXPECT_TRUE(Member(activation, "program").is_null());
+  // Only Applies that published a configuration, in digest order, each
+  // named by its Apply identity; a refused Apply never published one and is
+  // not part of the history.
+  const auto &committed = Array(activation, "committed_applies");
+  ASSERT_EQ(committed.size(), 2U);
+  EXPECT_EQ(Text(committed[0], "record_digest"), Digest('c'));
+  EXPECT_EQ(Text(committed[0], "scenario_id"), "other_cell");
+  EXPECT_EQ(Text(committed[0], "apply_id"), "apply.old");
+  EXPECT_EQ(std::get<double>(Member(committed[0], "apply_generation").storage()),
+            1.0);
+  EXPECT_EQ(Text(committed[1], "record_digest"), Digest('d'));
+  EXPECT_EQ(Text(committed[1], "scenario_id"), "cell_pick");
+  EXPECT_EQ(Text(committed[1], "apply_id"), "apply.new");
+  EXPECT_EQ(std::get<double>(Member(committed[1], "apply_generation").storage()),
+            1.0);
+  EXPECT_EQ(committed[0].as_object().size(), 4U);
+  EXPECT_EQ(committed[1].as_object().size(), 4U);
+}
+
+TEST(HeadlessApiCore, CommittedActivationRefusesAHistoryThatMissesAPublication) {
+  TemporaryDirectory directory;
+  try {
+    // Three publications (bootstrap and two Applies) but one committed Apply.
+    static_cast<void>(CommittedActivationCore(directory, 3.0, false));
+    FAIL() << "an incomplete publication history was reported";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "program_activation_history_incomplete");
+  }
+}
+
 TEST(HeadlessApiCore,
      IdleOperationSnapshotReconcilesOnlyImplementedAlarmDomains) {
   TemporaryDirectory directory;

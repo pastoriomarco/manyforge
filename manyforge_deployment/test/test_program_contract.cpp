@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -37,6 +38,7 @@ using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::FilesystemProgramRepository;
 using manyforge::deployment::FilesystemVerifiedProgramSource;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
+using manyforge::deployment::parse_strict_json_model_yaml;
 using manyforge::deployment::ProgramContractError;
 using manyforge::deployment::RetainedBundle;
 using manyforge::deployment::verify_program_binding_contract;
@@ -180,29 +182,35 @@ text_array(const std::vector<std::string> &values) {
       {"children", CanonicalValue(std::move(children))},
   };
   if (!options.value_source_kind.empty()) {
-    if (options.duplicate_value_source_parameter) {
-      tree_parameters.emplace_back("velocity_scale", CanonicalValue(0.5));
-      for (auto &[name, value] : tree) {
-        if (name == "parameters") {
-          value = CanonicalValue(tree_parameters);
-          break;
-        }
-      }
-    }
+    // A timer whose duration comes from a declared Program value.
     CanonicalValue::Object source{
         {"kind", CanonicalValue(options.value_source_kind)}};
-    if (options.value_source_kind == "program_parameter") {
-      source.emplace_back("reference", CanonicalValue("velocity_scale"));
-    } else if (options.value_source_kind == "blackboard_key") {
-      source.emplace_back("reference", CanonicalValue("cycle.velocity_scale"));
+    if (options.value_source_kind == "program_parameter" ||
+        options.value_source_kind == "blackboard_key") {
+      source.emplace_back("reference", CanonicalValue("wait_s"));
     } else if (options.value_source_kind == "blackboard_field") {
-      source.emplace_back("reference", CanonicalValue("perception.grasp_plan"));
-      source.emplace_back("field", CanonicalValue("approach_pose"));
+      source.emplace_back("reference", CanonicalValue("plan"));
+      source.emplace_back("field", CanonicalValue("wait_s"));
     }
-    tree.emplace_back(
-        "value_sources",
-        CanonicalValue(CanonicalValue::Object{
-            {"velocity_scale", CanonicalValue(std::move(source))}}));
+    CanonicalValue::Object timer_parameters;
+    if (options.duplicate_value_source_parameter) {
+      timer_parameters.emplace_back("duration_s", CanonicalValue(0.5));
+    }
+    for (auto &[name, value] : tree) {
+      if (name == "children") {
+        value = CanonicalValue(CanonicalValue::Array{
+            CanonicalValue(CanonicalValue::Object{
+                {"node_id", CanonicalValue("timer")},
+                {"instance_id", CanonicalValue("wait")},
+                {"parameters", CanonicalValue(std::move(timer_parameters))},
+                {"value_sources",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"duration_s", CanonicalValue(std::move(source))}})},
+                {"children", CanonicalValue(CanonicalValue::Array{})},
+            })});
+        break;
+      }
+    }
   }
   if (options.include_node_policy || options.explicit_default_node_policy) {
     const bool defaults = options.explicit_default_node_policy;
@@ -284,6 +292,39 @@ text_array(const std::vector<std::string> &values) {
                                    {"robot_id", CanonicalValue("legacy_robot")},
                                    {"group_id", CanonicalValue("legacy_group")},
                                }));
+  }
+  if (!options.value_source_kind.empty()) {
+    root.emplace_back(
+        "parameters",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"parameter_id", CanonicalValue("wait_s")},
+            {"type", CanonicalValue("float64")},
+            {"default", CanonicalValue(0.5)},
+            {"runtime_mutability", CanonicalValue("before_run")},
+        })}));
+    const auto key = [](std::string name, std::string type) {
+      return CanonicalValue::Object{
+          {"key", CanonicalValue(std::move(name))},
+          {"type", CanonicalValue(std::move(type))},
+          {"access", CanonicalValue("read_write")},
+          {"persistence", CanonicalValue("run")},
+      };
+    };
+    auto plan = key("plan", "pick_planning_result");
+    plan.emplace_back(
+        "fields",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"field", CanonicalValue("wait_s")},
+            {"type", CanonicalValue("float64")},
+        })}));
+    root.emplace_back(
+        "blackboard",
+        CanonicalValue(CanonicalValue::Object{
+            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+            {"keys", CanonicalValue(CanonicalValue::Array{
+                         CanonicalValue(std::move(plan)),
+                         CanonicalValue(key("wait_s", "float64"))})},
+        }));
   }
   if (options.include_contact_grasp) {
     root.emplace_back(
@@ -976,7 +1017,7 @@ TEST(ProgramContractTest, SealsClosedProgramValueSourceForms) {
   }
 }
 
-TEST(ProgramContractTest, RejectsMalformedOrMultiplySuppliedValueSource) {
+TEST(ProgramContractTest, RejectsMalformedValueSourceAndKeepsLiterals) {
   ScopedTrustedRoot root;
   const auto bundle = make_bundle(root.path());
 
@@ -988,14 +1029,14 @@ TEST(ProgramContractTest, RejectsMalformedOrMultiplySuppliedValueSource) {
           *bundle)),
       ProgramContractError);
 
-  ProgramOptions duplicate = valid_options(*bundle);
-  duplicate.value_source_kind = "program_parameter";
-  duplicate.duplicate_value_source_parameter = true;
-  EXPECT_THROW(
-      static_cast<void>(verify_program_binding_contract(
-          canonical_json(with_program_revision(make_program_root(duplicate))),
-          *bundle)),
-      ProgramContractError);
+  // A literal stays beside its whole-value source: it is what "Type values"
+  // restores when the source is removed.
+  ProgramOptions kept_literal = valid_options(*bundle);
+  kept_literal.value_source_kind = "program_parameter";
+  kept_literal.duplicate_value_source_parameter = true;
+  EXPECT_NO_THROW(static_cast<void>(verify_program_binding_contract(
+      canonical_json(with_program_revision(make_program_root(kept_literal))),
+      *bundle)));
 }
 
 [[nodiscard]] CanonicalValue
@@ -1418,9 +1459,458 @@ TEST(ProgramContractTest,
     FAIL() << "dynamic target selected an execution scope";
   } catch (const ProgramContractError &error) {
     EXPECT_NE(std::string(error.what())
-                  .find("effect scope/condition requires a literal parameter"),
+                  .find("cannot dynamically select runtime/binding semantics"),
               std::string::npos);
   }
+}
+
+
+[[nodiscard]] CanonicalValue
+key_typed_program(const ProgramOptions &options, CanonicalValue tree,
+                  CanonicalValue::Array extra_keys = {}) {
+  const auto key = [](std::string name, std::string type) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"key", CanonicalValue(std::move(name))},
+        {"type", CanonicalValue(std::move(type))},
+        {"access", CanonicalValue("read_write")},
+        {"persistence", CanonicalValue("run")},
+    });
+  };
+  const auto parameter = [](std::string name, std::string type,
+                            CanonicalValue value) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"parameter_id", CanonicalValue(std::move(name))},
+        {"type", CanonicalValue(std::move(type))},
+        {"default", std::move(value)},
+        {"runtime_mutability", CanonicalValue("before_run")},
+    });
+  };
+  auto members = make_program_root(options).as_object();
+  replace_member(members, "tree", std::move(tree));
+  members.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys", CanonicalValue([&] {
+             CanonicalValue::Array keys{
+                 key("count", "int64"), key("limit", "int64"),
+                 key("place", "stored_pose"), key("ratio", "float64")};
+             for (auto &extra : extra_keys) {
+               keys.push_back(std::move(extra));
+             }
+             return keys;
+           }())},
+      }));
+  members.emplace_back(
+      "parameters",
+      CanonicalValue(CanonicalValue::Array{
+          parameter("start", "int64", CanonicalValue(1.0)),
+          parameter("scale", "float64", CanonicalValue(0.5))}));
+  return with_program_revision(CanonicalValue(std::move(members)));
+}
+
+[[nodiscard]] CanonicalValue::Object
+key_typed_node(std::string node_id, CanonicalValue::Object parameters) {
+  return CanonicalValue::Object{
+      {"node_id", CanonicalValue(std::move(node_id))},
+      {"instance_id", CanonicalValue("typed")},
+      {"parameters", CanonicalValue(std::move(parameters))},
+      {"children", CanonicalValue(CanonicalValue::Array{})},
+  };
+}
+
+TEST(ProgramContractTest, TypesKeyValueParametersByTheirLiteralKey) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto options = valid_options(*bundle);
+  const auto verify = [&](const CanonicalValue::Object &node) {
+    return verify_program_binding_contract(
+        canonical_json(key_typed_program(options, CanonicalValue(node))),
+        *bundle);
+  };
+  const auto rejects = [&](const CanonicalValue::Object &node,
+                           std::string_view reason) {
+    try {
+      static_cast<void>(verify(node));
+      ADD_FAILURE() << "accepted: " << reason;
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+
+  auto set_count = key_typed_node(
+      "logic.set_value", {{"key", CanonicalValue("count")},
+                          {"value", CanonicalValue(3.0)}});
+  EXPECT_NO_THROW(static_cast<void>(verify(set_count)));
+
+  auto fractional = set_count;
+  mutate_object_member(fractional, "parameters", [](auto &parameters) {
+    replace_member(parameters, "value", CanonicalValue(2.5));
+  });
+  rejects(fractional, "literal does not match key type 'int64'");
+
+  auto boolean = set_count;
+  mutate_object_member(boolean, "parameters", [](auto &parameters) {
+    replace_member(parameters, "value", CanonicalValue(true));
+  });
+  rejects(boolean, "literal does not match key type 'int64'");
+
+  const auto sourced = [&](std::string kind, std::string reference) {
+    auto node = set_count;
+    mutate_object_member(node, "parameters", [](auto &parameters) {
+      erase_member(parameters, "value");
+    });
+    node.emplace_back(
+        "value_sources",
+        CanonicalValue(CanonicalValue::Object{
+            {"value", CanonicalValue(CanonicalValue::Object{
+                          {"kind", CanonicalValue(std::move(kind))},
+                          {"reference", CanonicalValue(std::move(reference))},
+                      })}}));
+    return node;
+  };
+  EXPECT_NO_THROW(static_cast<void>(verify(sourced("program_parameter", "start"))));
+  EXPECT_NO_THROW(static_cast<void>(verify(sourced("blackboard_key", "limit"))));
+  rejects(sourced("program_parameter", "scale"),
+          "source type 'float64' does not match the 'int64' type of key 'count'");
+  rejects(sourced("blackboard_key", "ratio"),
+          "source type 'float64' does not match the 'int64' type of key 'count'");
+  rejects(sourced("blackboard_key", "absent"), "names no blackboard key");
+
+  auto dynamic_key = set_count;
+  mutate_object_member(dynamic_key, "parameters", [](auto &parameters) {
+    erase_member(parameters, "key");
+  });
+  dynamic_key.emplace_back(
+      "value_sources",
+      CanonicalValue(CanonicalValue::Object{
+          {"key", CanonicalValue(CanonicalValue::Object{
+                      {"kind", CanonicalValue("program_parameter")},
+                      {"reference", CanonicalValue("start")},
+                  })}}));
+  rejects(dynamic_key, "requires a literal key parameter: key");
+
+  auto undeclared = set_count;
+  mutate_object_member(undeclared, "parameters", [](auto &parameters) {
+    replace_member(parameters, "key", CanonicalValue("missing"));
+  });
+  rejects(undeclared, "names no declared blackboard key: value");
+
+  rejects(key_typed_node("logic.check_value",
+                         {{"key", CanonicalValue("place")},
+                          {"value", CanonicalValue(1.0)}}),
+          "blackboard key type 'stored_pose' is not admitted by the node");
+}
+
+[[nodiscard]] CanonicalValue expression(std::string text) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("expression")},
+      {"expression", CanonicalValue(std::move(text))},
+  });
+}
+
+[[nodiscard]] CanonicalValue computed_key(std::string name, std::string text,
+                                          CanonicalValue::Object extra = {}) {
+  CanonicalValue::Object row{
+      {"key", CanonicalValue(std::move(name))},
+      {"type", CanonicalValue("int64")},
+      {"access", CanonicalValue("read")},
+      {"persistence", CanonicalValue("run")},
+      {"expression", CanonicalValue(std::move(text))},
+  };
+  for (auto &[field, value] : extra) {
+    bool replaced = false;
+    for (auto &[existing, current] : row) {
+      if (existing == field) {
+        current = value;
+        replaced = true;
+      }
+    }
+    if (!replaced) {
+      row.emplace_back(field, value);
+    }
+  }
+  return CanonicalValue(std::move(row));
+}
+
+TEST(ProgramContractTest, ChecksPathKeyedValueSourcesAndFieldExpressions) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto options = valid_options(*bundle);
+  const auto node = [](std::string key, CanonicalValue value,
+                       CanonicalValue::Object sources) {
+    auto result = key_typed_node(
+        "logic.set_value",
+        {{"key", CanonicalValue(std::move(key))}, {"value", std::move(value)}});
+    result.emplace_back("value_sources", CanonicalValue(std::move(sources)));
+    return result;
+  };
+  const auto verify = [&](const CanonicalValue::Object &tree) {
+    return verify_program_binding_contract(
+        canonical_json(key_typed_program(options, CanonicalValue(tree))),
+        *bundle);
+  };
+  const auto rejects = [&](const CanonicalValue::Object &tree,
+                           std::string_view reason) {
+    try {
+      static_cast<void>(verify(tree));
+      ADD_FAILURE() << "accepted: " << reason;
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+  const CanonicalValue pose(CanonicalValue::Object{
+      {"frame_ref",
+       CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("cell_frame")}})},
+      {"position_m", CanonicalValue(CanonicalValue::Array{
+                         CanonicalValue(0.1), CanonicalValue(0.2),
+                         CanonicalValue(0.3)})},
+      {"orientation",
+       CanonicalValue(CanonicalValue::Object{
+           {"rpy_deg", CanonicalValue(CanonicalValue::Array{
+                           CanonicalValue(0.0), CanonicalValue(0.0),
+                           CanonicalValue(0.0)})}})},
+  });
+
+  EXPECT_NO_THROW(static_cast<void>(verify(node(
+      "count", CanonicalValue(1.0), {{"value", expression("key.count + param.start")}}))));
+  rejects(node("count", CanonicalValue(1.0), {{"value", expression("key.count / 2")}}),
+          "value_sources.value.expression: destination_type_mismatch");
+  rejects(node("count", CanonicalValue(1.0), {{"value", expression("key.absent")}}),
+          "unknown_name at character 0: key.absent is not declared");
+  EXPECT_NO_THROW(static_cast<void>(verify(node(
+      "place", pose,
+      {{"value.orientation.rpy_deg[2]", expression("param.scale * 90")},
+       {"value.position_m[2]", expression("param.scale")}}))));
+  // As in Python: a path names a value of the literal before its schema.
+  rejects(node("place", pose,
+               {{"value.orientation.xyzw[0]", expression("1.0")}}),
+          "names no value in the node's parameters");
+  rejects(node("place", pose, {{"value.frame_ref.kind", expression("\"x\"")}}),
+          "nested text, choice and identifier fields stay literal");
+  rejects(node("count", CanonicalValue(1.0), {{"value.x", expression("1")}}),
+          "int64 values have no fields");
+  rejects(node("count", CanonicalValue(1.0), {{"absent", expression("1")}}),
+          "supplies unknown catalog parameter 'absent'");
+  rejects(node("count", CanonicalValue(1.0), {{"value[01]", expression("1")}}),
+          "path_index_invalid");
+  rejects(node("place", pose,
+               {{"value", CanonicalValue(CanonicalValue::Object{
+                              {"kind", CanonicalValue("blackboard_key")},
+                              {"reference", CanonicalValue("place")}})},
+                {"value.position_m[0]", expression("1.0")}}),
+          "overlaps the value_sources entry 'value'");
+}
+
+[[nodiscard]] CanonicalValue load_conformance(const char *path) {
+  std::ifstream stream(path, std::ios::binary);
+  const std::string text((std::istreambuf_iterator<char>(stream)),
+                         std::istreambuf_iterator<char>());
+  return parse_strict_json_model_yaml(text).root();
+}
+
+// The value-source refusals shared with the Python Program validator
+// (manyforge_behavior/tests/test_program_expressions.py).
+[[nodiscard]] const CanonicalValue::Object &value_source_conformance() {
+  static const CanonicalValue root =
+      load_conformance(MANYFORGE_VALUE_SOURCE_CONFORMANCE);
+  return root.as_object();
+}
+
+[[nodiscard]] const CanonicalValue &
+conformance_member(const CanonicalValue::Object &object, std::string_view name) {
+  for (const auto &[key, value] : object) {
+    if (key == name) {
+      return value;
+    }
+  }
+  throw std::logic_error("conformance entry lacks " + std::string(name));
+}
+
+[[nodiscard]] CanonicalValue
+conformance_program(const ProgramOptions &options,
+                    const CanonicalValue::Object &test_case) {
+  const auto &file = value_source_conformance();
+  auto node = conformance_member(
+                  conformance_member(file, "nodes").as_object(),
+                  conformance_member(test_case, "node").as_string())
+                  .as_object();
+  for (const auto &[key, value] : test_case) {
+    if (key != "parameters") {
+      continue;
+    }
+    mutate_object_member(node, "parameters", [&](auto &parameters) {
+      for (const auto &[name, literal] : value.as_object()) {
+        erase_member(parameters, name);
+        parameters.emplace_back(name, literal);
+      }
+    });
+  }
+  node.emplace_back("value_sources",
+                    conformance_member(test_case, "value_sources"));
+  node.emplace_back("children", CanonicalValue(CanonicalValue::Array{}));
+  auto members = make_program_root(options).as_object();
+  replace_member(members, "tree", CanonicalValue(std::move(node)));
+  members.emplace_back("parameters", conformance_member(file, "parameters"));
+  members.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys", conformance_member(file, "blackboard_keys")},
+      }));
+  return with_program_revision(CanonicalValue(std::move(members)));
+}
+
+TEST(ProgramContractTest, RefusesTheSharedValueSourceConformanceCases) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto options = valid_options(*bundle);
+  const auto &file = value_source_conformance();
+  const auto verify = [&](const CanonicalValue &test_case) {
+    return verify_program_binding_contract(
+        canonical_json(conformance_program(options, test_case.as_object())),
+        *bundle);
+  };
+  for (const auto &test_case : conformance_member(file, "accepted").as_array()) {
+    SCOPED_TRACE(conformance_member(test_case.as_object(), "name").as_string());
+    EXPECT_NO_THROW(static_cast<void>(verify(test_case)));
+  }
+  std::size_t refused = 0U;
+  for (const auto &test_case : conformance_member(file, "refused").as_array()) {
+    const auto &reason =
+        conformance_member(test_case.as_object(), "reason").as_string();
+    SCOPED_TRACE(conformance_member(test_case.as_object(), "name").as_string());
+    try {
+      static_cast<void>(verify(test_case));
+      ADD_FAILURE() << "accepted: " << reason;
+    } catch (const ProgramContractError &error) {
+      ++refused;
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  }
+  EXPECT_GT(refused, 0U);
+}
+
+// The pose-value refusals shared with the Python Program validator
+// (manyforge_behavior/tests/test_program_expressions.py).
+[[nodiscard]] CanonicalValue
+pose_conformance_program(const ProgramOptions &options,
+                         const CanonicalValue::Object &file,
+                         const CanonicalValue::Object &test_case) {
+  auto node = conformance_member(file, "node").as_object();
+  CanonicalValue::Array keys =
+      conformance_member(file, "blackboard_keys").as_array();
+  for (const auto &[name, value] : test_case) {
+    if (name == "value") {
+      mutate_object_member(node, "parameters", [&](auto &parameters) {
+        replace_member(parameters, "value", value);
+      });
+    } else if (name == "keys") {
+      keys.insert(keys.end(), value.as_array().begin(), value.as_array().end());
+    }
+  }
+  std::sort(keys.begin(), keys.end(), [](const auto &left, const auto &right) {
+    return conformance_member(left.as_object(), "key").as_string() <
+           conformance_member(right.as_object(), "key").as_string();
+  });
+  node.emplace_back("children", CanonicalValue(CanonicalValue::Array{}));
+  auto members = make_program_root(options).as_object();
+  replace_member(members, "tree",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"node_id", CanonicalValue("sequence")},
+                     {"instance_id", CanonicalValue("root")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"children", CanonicalValue(CanonicalValue::Array{
+                                      CanonicalValue(std::move(node))})},
+                 }));
+  members.emplace_back("scene", conformance_member(file, "scene"));
+  members.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys", CanonicalValue(std::move(keys))},
+      }));
+  return with_program_revision(CanonicalValue(std::move(members)));
+}
+
+TEST(ProgramContractTest, RefusesTheSharedPoseValueConformanceCases) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto options = valid_options(*bundle);
+  static const CanonicalValue file =
+      load_conformance(MANYFORGE_POSE_VALUE_CONFORMANCE);
+  const auto verify = [&](const CanonicalValue &test_case) {
+    return verify_program_binding_contract(
+        canonical_json(pose_conformance_program(options, file.as_object(),
+                                                test_case.as_object())),
+        *bundle);
+  };
+  for (const auto &test_case :
+       conformance_member(file.as_object(), "accepted").as_array()) {
+    SCOPED_TRACE(conformance_member(test_case.as_object(), "name").as_string());
+    EXPECT_NO_THROW(static_cast<void>(verify(test_case)));
+  }
+  std::size_t refused = 0U;
+  for (const auto &test_case :
+       conformance_member(file.as_object(), "refused").as_array()) {
+    const auto &reason =
+        conformance_member(test_case.as_object(), "reason").as_string();
+    SCOPED_TRACE(conformance_member(test_case.as_object(), "name").as_string());
+    try {
+      static_cast<void>(verify(test_case));
+      ADD_FAILURE() << "accepted: " << reason;
+    } catch (const ProgramContractError &error) {
+      ++refused;
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  }
+  EXPECT_GT(refused, 0U);
+}
+
+TEST(ProgramContractTest, ChecksComputedKeysAndRefusesTheirCycles) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto options = valid_options(*bundle);
+  const auto tree = CanonicalValue(key_typed_node(
+      "logic.set_value",
+      {{"key", CanonicalValue("count")}, {"value", CanonicalValue(1.0)}}));
+  const auto verify = [&](CanonicalValue::Array keys) {
+    return verify_program_binding_contract(
+        canonical_json(key_typed_program(options, tree, std::move(keys))),
+        *bundle);
+  };
+  const auto rejects = [&](CanonicalValue::Array keys, std::string_view reason) {
+    try {
+      static_cast<void>(verify(std::move(keys)));
+      ADD_FAILURE() << "accepted: " << reason;
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+
+  EXPECT_NO_THROW(static_cast<void>(verify(
+      {computed_key("z_next", "key.count + param.start"),
+       computed_key("z_twice", "key.z_next * 2")})));
+  rejects({computed_key("z_a", "key.z_b + 1"), computed_key("z_b", "key.z_a + 1")},
+          "computed keys read each other in a cycle: z_a -> z_b -> z_a");
+  rejects({computed_key("z_self", "key.z_self")},
+          "cycle: z_self -> z_self");
+  rejects({computed_key("z_next", "1", {{"initial", CanonicalValue(1.0)}})},
+          "a computed key has no initial value");
+  rejects({computed_key("z_next", "1",
+                        {{"persistence", CanonicalValue("persistent")}})},
+          "a computed key cannot be persistent");
+  rejects({computed_key("z_next", "1", {{"access", CanonicalValue("read_write")}})},
+          "declare access read");
+  rejects({computed_key("z_next", "1", {{"type", CanonicalValue("stored_pose")}})},
+          "a computed key must be bool, int64, float64 or string");
+  rejects({computed_key("z_next", "param.unknown")},
+          "expression: unknown_name at character 0");
 }
 
 } // namespace

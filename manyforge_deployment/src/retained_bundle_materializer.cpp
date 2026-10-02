@@ -34,7 +34,6 @@
 #include "manyforge_deployment/model_source.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 #include "manyforge_deployment/runtime_contract_registry.hpp"
-#include "manyforge_deployment/runtime_policy_codec.hpp"
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
@@ -1358,16 +1357,6 @@ prepare_planning_collision_product_before_store(
                     .applicability()
                     .stop_evidence_policies(),
                 "Stop-evidence policy");
-          } else if constexpr (std::is_same_v<
-                                   Record,
-                                   core::RuntimePolicyCatalogRecordRefDTO>) {
-            const auto requalified = resolve_and_qualify_runtime_policy(
-                typed_reference, typed_reference.content_addressed_store_key,
-                catalog_bytes);
-            require_exact_requalified_catalog_record(
-                requalified,
-                qualified.compiler_ir().applicability().runtime_policies(),
-                "runtime policy");
           } else if constexpr (std::is_same_v<
                                    Record,
                                    core::ContactPolicyCatalogRecordRefDTO>) {

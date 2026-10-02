@@ -175,7 +175,7 @@ Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
                  {{"reason", "prepared_command_participant_missing"}}});
   }
   const auto verified = VerifyPreparedOperationParticipant(
-      *request.participant, request.binding, request.stop_readiness, nullptr,
+      *request.participant, request.binding, request.stop_readiness,
       request.retained_default_stop_limits, request.stop_node_category);
   if (!verified.ok()) {
     return Result<std::uint64_t>::Err(verified.error());

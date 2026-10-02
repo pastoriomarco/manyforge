@@ -18,7 +18,14 @@ from typing import Any, Mapping
 
 _SCALAR_TYPES = {"string", "float", "int", "bool"}
 _COMPOSITE_TYPES = {"object", "array", "enum"}
-_ALLOWED_SCHEMA_TYPES = _SCALAR_TYPES | _COMPOSITE_TYPES
+# A ``key_value`` holds a value of one Program value type from the closed
+# ``value_types``. With ``value_type_from_key`` its type is exactly the declared
+# type of the blackboard key named by that parameter; without it the value (or
+# its value source) carries one of the admitted types.
+_KEY_VALUE_TYPE = "key_value"
+_ALLOWED_SCHEMA_TYPES = _SCALAR_TYPES | _COMPOSITE_TYPES | {_KEY_VALUE_TYPE}
+KEY_VALUE_TYPES = ("bool", "float64", "int64", "stored_pose", "string", "string_list")
+_KEY_VALUE_ONLY_KEYS = {"value_type_from_key", "value_types"}
 _ALLOWED_INLINE_SCHEMA_KEYS = {
     "type",
     "description",
@@ -40,6 +47,8 @@ _ALLOWED_INLINE_SCHEMA_KEYS = {
     "requires_current_value",
     "semantic_type",
     "semantic_scope_parameter",
+    "value_type_from_key",
+    "value_types",
 }
 _NUMERIC_CONSTRAINT_KEYS = {
     "min_inclusive",
@@ -150,6 +159,8 @@ class CatalogSchema:
     requires_current_value: bool = False
     semantic_type: str | None = None
     semantic_scope_parameter: str | None = None
+    value_type_from_key: str | None = None
+    value_types: tuple[str, ...] = ()
 
     def is_ref(self) -> bool:
         return self.ref is not None
@@ -250,6 +261,13 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
     if schema_type not in _ALLOWED_SCHEMA_TYPES:
         allowed = ", ".join(sorted(_ALLOWED_SCHEMA_TYPES))
         raise CatalogSchemaError(f"{path}: type must be one of: {allowed}")
+    if schema_type == _KEY_VALUE_TYPE:
+        return _parse_key_value_schema(raw_schema, path=path)
+    present_key_value_keys = sorted(_KEY_VALUE_ONLY_KEYS & set(raw_schema))
+    if present_key_value_keys:
+        raise CatalogSchemaError(
+            f"{path}: {present_key_value_keys} require type={_KEY_VALUE_TYPE}"
+        )
 
     constraints = raw_schema.get("constraints", {})
     if constraints is None:
@@ -426,6 +444,58 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
     )
 
 
+def _parse_key_value_schema(raw_schema: Mapping[str, Any], *, path: str) -> CatalogSchema:
+    unknown = sorted(set(raw_schema) - {"type", "description", *_KEY_VALUE_ONLY_KEYS})
+    if unknown:
+        raise CatalogSchemaError(f"{path}: {_KEY_VALUE_TYPE} forbids schema keys {unknown}")
+    key_parameter = raw_schema.get("value_type_from_key")
+    if key_parameter is not None and (
+        not isinstance(key_parameter, str) or _PORTABLE_ID_RE.fullmatch(key_parameter) is None
+    ):
+        raise CatalogSchemaError(
+            f"{path}.value_type_from_key must be a portable parameter ID"
+        )
+    value_types = _string_tuple(raw_schema.get("value_types"), path=f"{path}.value_types")
+    if not value_types or not set(value_types) <= set(KEY_VALUE_TYPES):
+        raise CatalogSchemaError(
+            f"{path}.value_types must be a non-empty subset of {list(KEY_VALUE_TYPES)}"
+        )
+    if list(value_types) != sorted(value_types):
+        raise CatalogSchemaError(f"{path}.value_types must be sorted")
+    return CatalogSchema(
+        schema_type=_KEY_VALUE_TYPE,
+        description=_optional_string(raw_schema, "description", path),
+        value_type_from_key=key_parameter,
+        value_types=value_types,
+    )
+
+
+def _key_value_matches(
+    value_type: str,
+    value: Any,
+    registry: CatalogSchemaRegistry,
+) -> bool:
+    if value_type == "bool":
+        return isinstance(value, bool)
+    if value_type == "int64":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and -(1 << 63) <= value < 1 << 63
+        )
+    if value_type == "float64":
+        return _is_number(value) and math.isfinite(float(value))
+    if value_type == "string":
+        return isinstance(value, str)
+    if value_type == "string_list":
+        return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
+    return not validate_value(
+        CatalogSchema(ref="#/schema_types/stored_pose"),
+        value,
+        registry=registry,
+    )
+
+
 def validate_value(
     schema: CatalogSchema,
     value: Any,
@@ -514,6 +584,9 @@ def _validate_schema(
         if schema.items is None:
             raise CatalogSchemaError(f"{path}: array schemas require items")
         _validate_schema(schema.items, registry, path=f"{path}.items", stack=stack)
+    elif schema.schema_type == _KEY_VALUE_TYPE:
+        if "stored_pose" in schema.value_types:
+            registry.resolve(CatalogSchema(ref="#/schema_types/stored_pose"), stack=stack)
     elif schema.schema_type in _SCALAR_TYPES | {"enum"}:
         if schema.properties:
             raise CatalogSchemaError(
@@ -557,6 +630,21 @@ def _validate_value(
     elif schema_type == "bool":
         if not isinstance(value, bool):
             issues.append(_issue(path, "must be a boolean", schema_type))
+    elif schema_type == _KEY_VALUE_TYPE:
+        # Context-free check against the closed union; the Program validator
+        # and the node-attempt resolver narrow it to the named key's type.
+        if not any(
+            _key_value_matches(value_type, value, registry)
+            for value_type in schema.value_types
+        ):
+            issues.append(
+                _issue(
+                    path,
+                    "must be a value of one of the key types: "
+                    + ", ".join(schema.value_types),
+                    schema_type,
+                )
+            )
     elif schema_type == "enum":
         if not isinstance(value, str) or value not in schema.enum_values:
             issues.append(
@@ -717,6 +805,25 @@ def _to_json_schema(
         result["type"] = "integer"
     elif schema_type == "bool":
         result["type"] = "boolean"
+    elif schema_type == _KEY_VALUE_TYPE:
+        json_types = {
+            "bool": {"type": "boolean"},
+            "float64": {"type": "number"},
+            "int64": {"type": "integer"},
+            "string": {"type": "string"},
+            "string_list": {"type": "array", "items": {"type": "string"}},
+        }
+        result["anyOf"] = [
+            (
+                _to_json_schema(CatalogSchema(ref="#/schema_types/stored_pose"), registry)
+                if value_type == "stored_pose"
+                else dict(json_types[value_type])
+            )
+            for value_type in schema.value_types
+        ]
+        if schema.value_type_from_key is not None:
+            result["x-manyforge-value-type-from-key"] = schema.value_type_from_key
+        return result
     elif schema_type == "enum":
         result["type"] = "string"
         result["enum"] = list(schema.enum_values)

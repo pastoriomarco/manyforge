@@ -60,6 +60,24 @@ struct NamedTargetDTO {
 using ReferenceIdentityDTO = std::variant<std::monostate, FrameRoleId, CollisionBodyRoleId,
                                           SceneResourceId, RuntimeObjectId>;
 
+/// Exact robot qualifier for a frame-role reference. The portable target role
+/// is the Program authoring identity; the controllable component and command
+/// target are its exact Program-Binding resolution, verified by the owner that
+/// admits the reference. Absence means the moving participant's own target, so
+/// an own-robot frame never aliases an identically named frame on another robot.
+struct ReferenceTargetDTO {
+  TargetRoleId target_role_id;
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+
+  [[nodiscard]] bool complete() const noexcept {
+    return !target_role_id.empty() && !controllable_component_id.empty() &&
+           !command_target_id.empty();
+  }
+
+  friend bool operator==(const ReferenceTargetDTO&, const ReferenceTargetDTO&) = default;
+};
+
 /// Portable, target-scoped reference or inline base-frame pose (spec §4.4).
 /// The enum and strong identity are deliberately redundant so malformed wire
 /// values cannot reinterpret a frame role as a scene resource.
@@ -70,10 +88,14 @@ struct ReferenceDTO {
     kSceneResource,
     kRuntimeObject,
     kPose,
+    /// The retained cell frame. Carries no identity and no pose.
+    kCellFrame,
   };
   Type type{Type::kPose};
   ReferenceIdentityDTO id;
   std::optional<Pose3DTO> pose;
+  /// Only valid for `kFrameRole`: names the robot that owns the frame role.
+  std::optional<ReferenceTargetDTO> target;
 
   ReferenceDTO() = default;
   ReferenceDTO(Type selected_type, std::string selected_id) : type(selected_type) {
@@ -91,16 +113,23 @@ struct ReferenceDTO {
         id = RuntimeObjectId(std::move(selected_id));
         break;
       case Type::kPose:
+      case Type::kCellFrame:
         id = std::monostate{};
         break;
     }
   }
+  ReferenceDTO(FrameRoleId frame_role_id, ReferenceTargetDTO robot)
+      : type(Type::kFrameRole), id(std::move(frame_role_id)), target(std::move(robot)) {}
   explicit ReferenceDTO(Pose3DTO inline_pose)
       : type(Type::kPose), id(std::monostate{}), pose(std::move(inline_pose)) {}
   friend bool operator==(const ReferenceDTO&, const ReferenceDTO&) = default;
 };
 
 [[nodiscard]] inline bool reference_identity_matches_type(const ReferenceDTO& reference) noexcept {
+  if (reference.target.has_value() &&
+      (reference.type != ReferenceDTO::Type::kFrameRole || !reference.target->complete())) {
+    return false;
+  }
   switch (reference.type) {
     case ReferenceDTO::Type::kFrameRole:
       return std::holds_alternative<FrameRoleId>(reference.id) &&
@@ -115,6 +144,7 @@ struct ReferenceDTO {
       return std::holds_alternative<RuntimeObjectId>(reference.id) &&
              !std::get<RuntimeObjectId>(reference.id).empty();
     case ReferenceDTO::Type::kPose:
+    case ReferenceDTO::Type::kCellFrame:
       return std::holds_alternative<std::monostate>(reference.id);
   }
   return false;

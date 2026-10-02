@@ -246,7 +246,7 @@ static_assert(!std::is_default_constructible_v<
       deployment.applicability_inputs().value().site_overlay_ref,
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {},
       {}, {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));

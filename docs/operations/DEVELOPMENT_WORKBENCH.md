@@ -53,9 +53,18 @@ Run every command from the repository root.
    with no project for an empty authoring workspace:
 
    ```bash
-   ./scripts/compose-dev.sh start --project examples/ur5e_lite6_wall_grouped.scenario
+   ./scripts/compose-dev.sh start --project examples/ur5e_lite6_wall_workbench.scenario
    ./scripts/compose-dev.sh start
    ```
+
+   `examples/ur5e_lite6_wall_workbench.scenario` is the editable everyday
+   UR5e + Lite6 Scenario; edit and Save it in Composer. It has its own
+   Scenario ID, so its stored persistent values and Applies are separate from
+   other Scenarios. Do not edit or Save
+   `examples/ur5e_lite6_wall_grouped.scenario` in Composer: it is a generated
+   qualification fixture that tests check byte for byte. Change it only through
+   its generator, `scripts/qualification/generate_ui6i_dual_robot_scenario.py
+   --update` (with the built Deployment and Program revision tools).
 
    The project must be a folder containing `scenario.yaml` inside the
    repository's `examples/` folder, the only root startup accepts. Keep the terminal output: if a start fails,
@@ -141,8 +150,23 @@ Composer settings (viewer display toggles, tree editor link style and start
 direction, Motion panel layout and confirmations, and profiles; the gear at
 the top right) are installation-specific and survive stop/start. They are kept in
 `.manyforge-dev/state/composer/settings.json`, mounted into the workbench as
-`/var/lib/manyforge/composer` (`MANYFORGE_STATE_DIR=/var/lib/manyforge`). Only
-that folder persists; all other runtime state still resets with the container.
+`/var/lib/manyforge/composer` (`MANYFORGE_STATE_DIR=/var/lib/manyforge`).
+Values of `persistent` blackboard keys are owned by the Program runner and kept
+beside them in `.manyforge-dev/state/program-runner/persistent-keys.json`
+(mounted as `/var/lib/manyforge/program-runner`). Only these two folders
+persist; all other runtime state still resets with the container.
+Stored values survive `stop`/`start` while the applied Program still declares
+their key persistent with the same type and fields; a value whose key a
+committed Apply removed or restructured is dropped with a notice. The
+workbench Manager's state resets with the container, so the first Apply after
+a start begins a new publication history; the stored values are simply checked
+against that Program. A committed Apply the Program runner never observed
+keeps the values and is reported as `applied_program_not_observed` on the
+stored-values page and in the run audit: it is a defect to investigate. A
+register file written in another format is refused by name
+(`persistent_key_register_version_unsupported`) and never rewritten; resetting
+the register is a deliberate operator step: move the old file aside before the
+next start.
 An unreadable settings file is never overwritten silently: Composer uses the
 defaults, keeps settings read-only and offers a reset that keeps the file as a
 `settings.json.bak-<time>` backup.

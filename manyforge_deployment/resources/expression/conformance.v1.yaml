@@ -1,0 +1,819 @@
+# Executable specification of the Program expression engine
+# (docs/authoring/EXPRESSIONS.md). The C++ test
+# (manyforge_deployment/test/test_expression.cpp) and the Python binding test
+# (manyforge_headless_api/tests/test_expression_engine.py) both run every case.
+#
+# Every scalar is read as text and interpreted by its declared type, so both
+# runners agree exactly:
+# - environment types: bool | int64 | float64 | string | pose, or a mapping of
+#   record field names to types;
+# - values: bool `true`/`false`, decimal int64, float64 text (strtod/float()),
+#   string text, pose {position_m: [x, y, z], orientation: {rpy_deg: [...]}
+#   or {xyzw: [...]}}, record mapping;
+# - a case uses the top-level environment and values unless it replaces them;
+# - `result` is interpreted by the case `destination`; floats compare exactly
+#   unless `tolerance` is given;
+# - `error` names the phase (parse, check or evaluate) and code, and optionally
+#   position/length (Unicode code points) and name; for check it is the first
+#   diagnostic, and `diagnostic_count` optionally fixes their number;
+# - `limits` narrows the approved limits for one case.
+schema: manyforge.expression_conformance.v1
+
+environment:
+  parameters:
+    tube_length: float64
+    grasp_offset: float64
+    columns: int64
+    rows: int64
+    pitch_x: float64
+    pitch_y: float64
+    layer_height: float64
+    slow_speed: float64
+    normal_speed: float64
+    limit: float64
+    approach_angle_deg: float64
+    name: string
+    enabled: bool
+    goal: pose
+    zero: int64
+    zero_f: float64
+    big: int64
+    small: int64
+    huge: float64
+    neg: int64
+  keys:
+    index: int64
+    measured_force: float64
+    override_enabled: bool
+    fragile: bool
+    label: string
+    missing: float64
+    part_pose: pose
+    identity_pose: pose
+    gimbal_pose: pose
+    yaw_pose: pose
+    wrapped_pose: pose
+    perception:
+      level: int64
+      grasp_plan:
+        score: float64
+    perception.grasp_plan:
+      score: float64
+      approach_pose: pose
+
+values:
+  parameters:
+    tube_length: "0.2"
+    grasp_offset: "0.01"
+    columns: "4"
+    rows: "3"
+    pitch_x: "0.05"
+    pitch_y: "0.04"
+    layer_height: "0.1"
+    slow_speed: "0.1"
+    normal_speed: "0.5"
+    limit: "10.0"
+    approach_angle_deg: "90.0"
+    name: lite6_arm
+    enabled: "true"
+    goal:
+      position_m: ["0.3", "0.1", "0.0"]
+      orientation: {rpy_deg: ["10", "20", "30"]}
+    zero: "0"
+    zero_f: "0.0"
+    big: "9223372036854775807"
+    small: "-9223372036854775808"
+    huge: "1e308"
+    neg: "-7"
+  keys:
+    index: "7"
+    measured_force: "12.5"
+    override_enabled: "false"
+    fragile: "true"
+    label: tray
+    part_pose:
+      position_m: ["0.1", "0.2", "0.3"]
+      orientation: {xyzw: ["0", "0", "0.7071067811865476", "0.7071067811865476"]}
+    identity_pose:
+      position_m: ["0", "0", "0"]
+      orientation: {xyzw: ["0", "0", "0", "1"]}
+    gimbal_pose:
+      position_m: ["0", "0", "0"]
+      orientation: {xyzw: ["0", "0.7071067811865476", "0", "0.7071067811865476"]}
+    yaw_pose:
+      position_m: ["0", "0", "0"]
+      orientation: {xyzw: ["0", "0", "-0.9961946980917455", "0.08715574274765814"]}
+    wrapped_pose:
+      position_m: ["0", "0", "0"]
+      orientation: {rpy_deg: ["0", "0", "190"]}
+    perception:
+      level: "2"
+      grasp_plan:
+        score: "1.0"
+    perception.grasp_plan:
+      score: "0.75"
+      approach_pose:
+        position_m: ["0.4", "0.5", "0.6"]
+        orientation: {rpy_deg: ["180", "0", "0"]}
+
+cases:
+  # ------------------------------------------------------------- literals
+  - {id: int_literal, expression: "42", destination: int64, result: "42"}
+  - {id: int_zero, expression: "0", destination: int64, result: "0"}
+  - {id: int_max, expression: "9223372036854775807", destination: int64, result: "9223372036854775807"}
+  - id: int_literal_out_of_range
+    expression: "9223372036854775808"
+    error: {phase: parse, code: integer_literal_out_of_range, position: "0", length: "19"}
+  - {id: float_literal, expression: "0.25", destination: float64, result: "0.25"}
+  - {id: float_exponent, expression: "1e-3", destination: float64, result: "0.001"}
+  - {id: float_point_zero, expression: "2.0", destination: float64, result: "2.0"}
+  - {id: float_upper_exponent, expression: "1E3", destination: float64, result: "1000.0"}
+  - {id: float_signed_exponent, expression: "2.5e+2", destination: float64, result: "250.0"}
+  - id: float_literal_overflow
+    expression: "1e400"
+    error: {phase: parse, code: float_literal_out_of_range, position: "0", length: "5"}
+  - id: float_literal_underflow
+    expression: "1e-400"
+    error: {phase: parse, code: float_literal_out_of_range, position: "0", length: "6"}
+  - id: leading_zero
+    expression: "01"
+    error: {phase: parse, code: invalid_number, position: "0", length: "2"}
+  - id: trailing_point
+    expression: "1."
+    error: {phase: parse, code: invalid_number, position: "0", length: "2"}
+  - id: leading_point
+    expression: ".5"
+    error: {phase: parse, code: invalid_character, position: "0", length: "1"}
+  - id: two_points
+    expression: "1.5.2"
+    error: {phase: parse, code: invalid_number, position: "0", length: "4"}
+  - id: empty_exponent
+    expression: "1e"
+    error: {phase: parse, code: invalid_number, position: "0", length: "2"}
+  - id: signed_empty_exponent
+    expression: "1e+ 2"
+    error: {phase: parse, code: invalid_number, position: "0", length: "4"}
+  - id: number_glued_to_name
+    expression: "2abc"
+    error: {phase: parse, code: invalid_number, position: "0", length: "2"}
+  - id: digit_separator
+    expression: "1_000"
+    error: {phase: parse, code: invalid_number, position: "0", length: "2"}
+  - {id: true_literal, expression: "true", destination: bool, result: "true"}
+  - {id: false_literal, expression: "false", destination: bool, result: "false"}
+  - {id: string_literal, expression: '"lite6_arm"', destination: string, result: lite6_arm}
+  - {id: string_quote_escape, expression: '"a\"b"', destination: string, result: 'a"b'}
+  - {id: string_backslash_escape, expression: '"a\\b"', destination: string, result: 'a\b'}
+  - {id: string_empty, expression: '""', destination: string, result: ""}
+  - {id: string_non_ascii, expression: '"日本é"', destination: string, result: "日本é"}
+  - id: string_other_escape
+    expression: '"a\nb"'
+    error: {phase: parse, code: invalid_escape, position: "2", length: "2"}
+  - id: string_unterminated
+    expression: '"abc'
+    error: {phase: parse, code: unterminated_string, position: "0", length: "4"}
+  - id: string_unterminated_escape
+    expression: '"abc\'
+    error: {phase: parse, code: unterminated_string, position: "0", length: "5"}
+  - id: string_control_character
+    expression: "\"a\tb\""
+    error: {phase: parse, code: invalid_character, position: "2", length: "1"}
+  - id: empty_text
+    expression: ""
+    error: {phase: parse, code: unexpected_end, position: "0", length: "0"}
+  - id: blank_text
+    expression: "   "
+    error: {phase: parse, code: unexpected_end, position: "3", length: "0"}
+  - {id: whitespace_kinds, expression: "\t1\n+\r2 ", destination: int64, result: "3"}
+
+  # ------------------------------------------------------ operators, precedence
+  - {id: add_int, expression: "1 + 2", destination: int64, result: "3"}
+  - {id: multiply_before_add, expression: "1 + 2 * 3", destination: int64, result: "7"}
+  - {id: parentheses, expression: "(1 + 2) * 3", destination: int64, result: "9"}
+  - {id: subtract_left_to_right, expression: "10 - 4 - 3", destination: int64, result: "3"}
+  - {id: divide_left_to_right, expression: "8 / 4 / 2", destination: float64, result: "1.0"}
+  - {id: multiply_remainder_same_level, expression: "2 * 3 % 4", destination: int64, result: "2"}
+  - {id: remainder, expression: "7 % 3", destination: int64, result: "1"}
+  - {id: remainder_zero_dividend, expression: "0 % 5", destination: int64, result: "0"}
+  - {id: divide_is_float, expression: "7 / 2", destination: float64, result: "3.5"}
+  - {id: divide_exact_is_float, expression: "6 / 3", destination: float64, result: "2.0"}
+  - id: divide_never_int
+    expression: "6 / 3"
+    destination: int64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "5"}
+  - {id: unary_minus_binds_tighter, expression: "-2 * 3", destination: int64, result: "-6"}
+  - {id: double_negation, expression: "- -3", destination: int64, result: "3"}
+  - {id: negate_float, expression: "-2.5 + 0.25", destination: float64, result: "-2.25"}
+  - {id: not, expression: "!true", destination: bool, result: "false"}
+  - {id: double_not, expression: "!!true", destination: bool, result: "true"}
+  - {id: mixed_add, expression: "1 + 2.5", destination: float64, result: "3.5"}
+  - {id: mixed_multiply, expression: "2 * 1.5", destination: float64, result: "3.0"}
+  - {id: less, expression: "1 < 2", destination: bool, result: "true"}
+  - {id: less_equal, expression: "2 <= 2", destination: bool, result: "true"}
+  - {id: greater, expression: "3 > 4", destination: bool, result: "false"}
+  - {id: greater_equal_mixed, expression: "3 >= 3.0", destination: bool, result: "true"}
+  - {id: mixed_less_exact, expression: "9007199254740993 > 9007199254740992.0", destination: bool, result: "true"}
+  - {id: mixed_equal_exact, expression: "9007199254740993 == 9007199254740992.0", destination: bool, result: "false"}
+  - {id: mixed_equal, expression: "1 == 1.0", destination: bool, result: "true"}
+  - {id: float_equal_exact, expression: "0.1 + 0.2 == 0.3", destination: bool, result: "false"}
+  - {id: float_tolerance_idiom, expression: "abs(0.1 + 0.2 - 0.3) <= 1e-9", destination: bool, result: "true"}
+  - {id: bool_equal, expression: "true == false", destination: bool, result: "false"}
+  - {id: bool_not_equal, expression: "true != false", destination: bool, result: "true"}
+  - {id: string_equal, expression: '"a" == "a"', destination: bool, result: "true"}
+  - {id: string_not_equal, expression: '"a" != "b"', destination: bool, result: "true"}
+  - {id: relational_before_equality, expression: "1 < 2 == true", destination: bool, result: "true"}
+  - {id: equality_left_to_right, expression: "1 == 1 == true", destination: bool, result: "true"}
+  - {id: and_before_or, expression: "true || false && false", destination: bool, result: "true"}
+  - {id: grouped_or, expression: "(true || false) && false", destination: bool, result: "false"}
+  - {id: mixed_precedence, expression: "1 + 2 < 4 && 3 * 2 == 6", destination: bool, result: "true"}
+  - {id: conditional_true, expression: "true ? 1 : 2", destination: int64, result: "1"}
+  - {id: conditional_mixed_else, expression: "false ? 1 : 2.5", destination: float64, result: "2.5"}
+  - {id: conditional_mixed_then_is_float, expression: "true ? 1 : 2.5", destination: float64, result: "1.0"}
+  - id: conditional_mixed_is_not_int
+    expression: "true ? 1 : 2.5"
+    destination: int64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "14"}
+  - {id: conditional_nested_then, expression: "true ? false ? 1 : 2 : 3", destination: int64, result: "2"}
+  - {id: conditional_right_to_left, expression: "false ? 1 : true ? 2 : 3", destination: int64, result: "2"}
+  - {id: conditional_lowest, expression: "1 < 2 ? 3 : 4", destination: int64, result: "3"}
+  - {id: conditional_below_or, expression: "true || false ? 1 : 2", destination: int64, result: "1"}
+  - {id: conditional_strings, expression: 'key.fragile ? "slow" : "fast"', destination: string, result: slow}
+  - {id: or_stops_early, expression: "key.fragile || key.missing > 0", destination: bool, result: "true"}
+  - {id: and_stops_early, expression: "key.override_enabled && key.missing > 0", destination: bool, result: "false"}
+  - {id: conditional_skips_branch, expression: "key.override_enabled ? key.missing : 2.0", destination: float64, result: "2.0"}
+  - {id: conditional_runtime_mixed, expression: "key.fragile ? 1 : key.missing", destination: float64, result: "1.0"}
+  - {id: division_guard_idiom, expression: "param.zero != 0 && 10 / param.zero > 1", destination: bool, result: "false"}
+  - id: and_reads_missing
+    expression: "key.fragile && key.missing > 0"
+    destination: bool
+    error: {phase: evaluate, code: missing_value, position: "15", length: "11", name: key.missing}
+
+  # -------------------------------------------- division, overflow, finiteness
+  - id: constant_division_by_zero
+    expression: "1 / 0"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "0", length: "5"}
+  - id: constant_float_division_by_zero
+    expression: "1.0 / 0.0"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "0", length: "9"}
+  - id: constant_negative_zero_divisor
+    expression: "1.0 / -0.0"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "0", length: "10"}
+  - id: constant_remainder_by_zero
+    expression: "1 % 0"
+    destination: int64
+    error: {phase: check, code: division_by_zero, position: "0", length: "5"}
+  - id: constant_part_fails
+    expression: "key.index + 1 / 0"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "12", length: "5"}
+  - id: unreachable_constant_part_fails
+    expression: "false && 1 / 0 > 0"
+    destination: bool
+    error: {phase: check, code: division_by_zero, position: "9", length: "5"}
+  - id: constant_branch_fails
+    expression: "key.fragile ? 1 / 0 : 2.0"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "14", length: "5"}
+  - id: parenthesized_constant_fails
+    expression: "key.index * (2 / 0)"
+    destination: float64
+    error: {phase: check, code: division_by_zero, position: "13", length: "5"}
+  - id: runtime_division_by_zero
+    expression: "key.index / param.zero"
+    destination: float64
+    error: {phase: evaluate, code: division_by_zero, position: "0", length: "22"}
+  - id: runtime_float_division_by_zero
+    expression: "key.index / param.zero_f"
+    destination: float64
+    error: {phase: evaluate, code: division_by_zero, position: "0", length: "24"}
+  - id: runtime_remainder_by_zero
+    expression: "key.index % param.zero"
+    destination: int64
+    error: {phase: evaluate, code: division_by_zero, position: "0", length: "22"}
+  - id: runtime_add_overflow
+    expression: "param.big + 1"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "13"}
+  - id: runtime_subtract_overflow
+    expression: "param.small - 1"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "15"}
+  - id: runtime_multiply_overflow
+    expression: "param.big * 2"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "13"}
+  - id: runtime_negate_overflow
+    expression: "-param.small"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "12"}
+  - id: runtime_multiply_minus_one_overflow
+    expression: "param.small * -1"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "16"}
+  - id: runtime_abs_overflow
+    expression: "abs(param.small)"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "16"}
+  - {id: int_min_by_subtraction, expression: "-9223372036854775807 - 1", destination: int64, result: "-9223372036854775808"}
+  - {id: int_min_parameter, expression: "param.small", destination: int64, result: "-9223372036854775808"}
+  - id: constant_overflow
+    expression: "9223372036854775807 + 1"
+    destination: int64
+    error: {phase: check, code: integer_overflow, position: "0", length: "23"}
+  - id: constant_overflow_below_min
+    expression: "-9223372036854775807 - 2"
+    destination: int64
+    error: {phase: check, code: integer_overflow, position: "0", length: "24"}
+  - id: runtime_non_finite
+    expression: "param.huge * 10"
+    destination: float64
+    error: {phase: evaluate, code: non_finite_result, position: "0", length: "15"}
+  - id: constant_non_finite
+    expression: "1e308 * 10"
+    destination: float64
+    error: {phase: check, code: non_finite_result, position: "0", length: "10"}
+  - id: constant_non_finite_sum
+    expression: "1e308 + 1e308"
+    destination: float64
+    error: {phase: check, code: non_finite_result, position: "0", length: "13"}
+  - id: runtime_non_finite_division
+    expression: "param.huge / 0.1"
+    destination: float64
+    error: {phase: evaluate, code: non_finite_result, position: "0", length: "16"}
+  - id: runtime_negative_remainder
+    expression: "param.neg % 3"
+    destination: int64
+    error: {phase: evaluate, code: negative_remainder_operand, position: "0", length: "13"}
+  - id: constant_negative_remainder_divisor
+    expression: "7 % -3"
+    destination: int64
+    error: {phase: check, code: negative_remainder_operand, position: "0", length: "6"}
+  - id: remainder_needs_ints
+    expression: "7.0 % 2"
+    destination: int64
+    error: {phase: check, code: type_mismatch, position: "0", length: "7"}
+
+  # --------------------------------------------------------------- functions
+  - {id: abs_float, expression: "abs(-0.02)", destination: float64, result: "0.02"}
+  - {id: abs_int, expression: "abs(-3)", destination: int64, result: "3"}
+  - {id: abs_int_to_float_destination, expression: "abs(3)", destination: float64, result: "3.0"}
+  - {id: min_int, expression: "min(3, 7)", destination: int64, result: "3"}
+  - {id: max_int, expression: "max(3, 7)", destination: int64, result: "7"}
+  - {id: min_mixed, expression: "min(3, 2.5)", destination: float64, result: "2.5"}
+  - {id: min_mixed_int_wins, expression: "min(2, 2.5)", destination: float64, result: "2.0"}
+  - {id: max_mixed_equal, expression: "max(1, 1.0)", destination: float64, result: "1.0"}
+  - id: min_mixed_is_float
+    expression: "min(2, 2.5)"
+    destination: int64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "11"}
+  - {id: clamp_above, expression: "clamp(1.4, 0, 1)", destination: float64, result: "1.0"}
+  - {id: clamp_below, expression: "clamp(-1, 0, 10)", destination: int64, result: "0"}
+  - {id: clamp_inside, expression: "clamp(5, 0, 10)", destination: int64, result: "5"}
+  - {id: clamp_inside_float, expression: "clamp(0.5, 0, 1)", destination: float64, result: "0.5"}
+  - {id: clamp_equal_bounds, expression: "clamp(3, 2, 2)", destination: int64, result: "2"}
+  - id: constant_clamp_inverted
+    expression: "clamp(1, 2, 1)"
+    destination: int64
+    error: {phase: check, code: clamp_bounds_inverted, position: "0", length: "14"}
+  - id: runtime_clamp_inverted
+    expression: "clamp(key.index, 5, 1)"
+    destination: int64
+    error: {phase: evaluate, code: clamp_bounds_inverted, position: "0", length: "22"}
+  - {id: floor_positive, expression: "floor(2.7)", destination: int64, result: "2"}
+  - {id: floor_negative, expression: "floor(-2.2)", destination: int64, result: "-3"}
+  - {id: floor_int, expression: "floor(5)", destination: int64, result: "5"}
+  - {id: ceil_positive, expression: "ceil(2.1)", destination: int64, result: "3"}
+  - {id: ceil_negative, expression: "ceil(-2.1)", destination: int64, result: "-2"}
+  - {id: round_half_up, expression: "round(2.5)", destination: int64, result: "3"}
+  - {id: round_half_away, expression: "round(-2.5)", destination: int64, result: "-3"}
+  - {id: round_down, expression: "round(2.4)", destination: int64, result: "2"}
+  - {id: floor_int_min, expression: "floor(-9223372036854775808.0)", destination: int64, result: "-9223372036854775808"}
+  - id: floor_out_of_range
+    expression: "floor(9223372036854775808.0)"
+    destination: int64
+    error: {phase: check, code: integer_overflow, position: "0", length: "28"}
+  - id: round_runtime_out_of_range
+    expression: "round(param.huge)"
+    destination: int64
+    error: {phase: evaluate, code: integer_overflow, position: "0", length: "17"}
+  - {id: sqrt, expression: "sqrt(9)", destination: float64, result: "3.0"}
+  - {id: sqrt_irrational, expression: "sqrt(2)", destination: float64, result: "1.4142135623730951"}
+  - {id: sqrt_zero, expression: "sqrt(0)", destination: float64, result: "0.0"}
+  - id: constant_sqrt_negative
+    expression: "sqrt(-1)"
+    destination: float64
+    error: {phase: check, code: sqrt_of_negative, position: "0", length: "8"}
+  - id: runtime_sqrt_negative
+    expression: "sqrt(param.neg)"
+    destination: float64
+    error: {phase: evaluate, code: sqrt_of_negative, position: "0", length: "15"}
+  - {id: cos_zero, expression: "cos(0)", destination: float64, result: "1.0"}
+  - {id: sin_zero, expression: "sin(0)", destination: float64, result: "0.0"}
+  - {id: tan_zero, expression: "tan(0)", destination: float64, result: "0.0"}
+  - {id: sin_right_angle, expression: "sin(rad(90))", destination: float64, result: "1.0"}
+  - {id: atan2_diagonal, expression: "atan2(1, 1)", destination: float64, result: "0.7853981633974483"}
+  - {id: atan2_negative_x, expression: "atan2(0, -1)", destination: float64, result: "3.141592653589793"}
+  - {id: atan2_origin, expression: "atan2(0, 0)", destination: float64, result: "0.0"}
+  - {id: deg, expression: "deg(3.141592653589793)", destination: float64, result: "180.0"}
+  - {id: rad, expression: "rad(90)", destination: float64, result: "1.5707963267948966"}
+  - id: deg_non_finite
+    expression: "deg(1e308)"
+    destination: float64
+    error: {phase: check, code: non_finite_result, position: "0", length: "10"}
+  - id: function_needs_numbers
+    expression: "abs(true)"
+    destination: float64
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: function_string_argument
+    expression: 'sqrt("4")'
+    destination: float64
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: too_few_arguments
+    expression: "min(1)"
+    error: {phase: parse, code: wrong_argument_count, position: "0", length: "6", name: min}
+  - id: too_many_arguments
+    expression: "abs(1, 2)"
+    error: {phase: parse, code: wrong_argument_count, position: "0", length: "9", name: abs}
+  - id: no_arguments
+    expression: "sin()"
+    error: {phase: parse, code: wrong_argument_count, position: "0", length: "5", name: sin}
+  - id: clamp_two_arguments
+    expression: "clamp(1, 2)"
+    error: {phase: parse, code: wrong_argument_count, position: "0", length: "11", name: clamp}
+  - id: unknown_function
+    expression: "foo(1)"
+    error: {phase: parse, code: unknown_function, position: "0", length: "3", name: foo}
+  - id: function_names_are_case_sensitive
+    expression: "ABS(1)"
+    error: {phase: parse, code: unknown_function, position: "0", length: "3", name: ABS}
+  - id: function_not_called
+    expression: "abs + 1"
+    error: {phase: parse, code: invalid_name, position: "0", length: "3", name: abs}
+
+  # ------------------------------------------------------------- type rules
+  - id: bool_plus_int
+    expression: "true + 1"
+    destination: int64
+    error: {phase: check, code: type_mismatch, position: "0", length: "8"}
+  - id: no_string_concatenation
+    expression: '"a" + "b"'
+    destination: string
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: bool_equals_number
+    expression: "1 == true"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: string_equals_number
+    expression: '"1" == 1'
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "8"}
+  - id: string_ordering
+    expression: '"a" < "b"'
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: bool_ordering
+    expression: "true < false"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "12"}
+  - id: chained_relational
+    expression: "1 < 2 < 3"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: not_number
+    expression: "!1"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "2"}
+  - id: negate_bool
+    expression: "-true"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "5"}
+  - id: and_number
+    expression: "1 && true"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: or_number
+    expression: "false || 0"
+    destination: bool
+    error: {phase: check, code: type_mismatch, position: "0", length: "10"}
+  - id: numeric_condition
+    expression: "1 ? 2 : 3"
+    destination: int64
+    error: {phase: check, code: type_mismatch, position: "0", length: "9"}
+  - id: branch_types_differ
+    expression: 'true ? 1 : "a"'
+    destination: int64
+    error: {phase: check, code: type_mismatch, position: "0", length: "14"}
+  - id: nested_error_reported_once
+    expression: "(true + 1) * 2"
+    destination: int64
+    diagnostic_count: "1"
+    error: {phase: check, code: type_mismatch, position: "1", length: "8"}
+  - id: int_to_bool_destination
+    expression: "1"
+    destination: bool
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "1"}
+  - id: bool_to_float_destination
+    expression: "key.measured_force > param.limit"
+    destination: float64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "32"}
+  - id: float_to_int_destination
+    expression: "1.5"
+    destination: int64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "3"}
+  - id: int_to_string_destination
+    expression: "1"
+    destination: string
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "1"}
+  - id: string_to_float_destination
+    expression: "param.name"
+    destination: float64
+    error: {phase: check, code: destination_type_mismatch, position: "0", length: "10"}
+  - {id: int_widens_to_float_destination, expression: "key.index + 1", destination: float64, result: "8.0"}
+
+  # ------------------------------------------------------------------ names
+  - {id: parameter, expression: "param.tube_length", destination: float64, result: "0.2"}
+  - {id: key, expression: "key.index", destination: int64, result: "7"}
+  - {id: string_parameter, expression: "param.name", destination: string, result: lite6_arm}
+  - {id: string_key_compare, expression: 'key.label == "tray"', destination: bool, result: "true"}
+  - {id: bool_parameter, expression: "param.enabled", destination: bool, result: "true"}
+  - {id: worked_grasp_height, expression: "-param.tube_length / 2 + param.grasp_offset", destination: float64, result: "-0.09000000000000001"}
+  - {id: worked_palletizing_column, expression: "(key.index % param.columns) * param.pitch_x", destination: float64, result: "0.15000000000000002"}
+  - {id: worked_palletizing_row, expression: "floor(key.index / param.columns) % param.rows * param.pitch_y", destination: float64, result: "0.04"}
+  - {id: worked_palletizing_layer, expression: "floor(key.index / (param.columns * param.rows)) * param.layer_height", destination: float64, result: "0.0"}
+  - {id: worked_counter, expression: "key.index + 1", destination: int64, result: "8"}
+  - {id: worked_approach, expression: "key.part_pose.z + 0.02", destination: float64, result: "0.32"}
+  - {id: worked_speed, expression: "key.fragile ? param.slow_speed : param.normal_speed", destination: float64, result: "0.1"}
+  - {id: worked_force_check, expression: "key.measured_force > param.limit && !key.override_enabled", destination: bool, result: "true"}
+  - {id: worked_angle, expression: "rad(param.approach_angle_deg)", destination: float64, result: "1.5707963267948966"}
+  - {id: longest_key_name_wins, expression: "key.perception.grasp_plan.score", destination: float64, result: "0.75"}
+  - {id: record_field, expression: "key.perception.level", destination: int64, result: "2"}
+  - {id: record_pose_field, expression: "key.perception.grasp_plan.approach_pose.z", destination: float64, result: "0.6"}
+  - {id: record_pose_roll, expression: "key.perception.grasp_plan.approach_pose.roll", destination: float64, result: "180.0"}
+  - id: unknown_key
+    expression: "key.nope"
+    destination: float64
+    error: {phase: check, code: unknown_name, position: "0", length: "8", name: key.nope}
+  - id: key_is_not_parameter
+    expression: "param.index"
+    destination: int64
+    error: {phase: check, code: unknown_name, position: "0", length: "11", name: param.index}
+  - id: every_unknown_name_reported
+    expression: "key.nope + param.nope"
+    destination: float64
+    diagnostic_count: "2"
+    error: {phase: check, code: unknown_name, position: "0", length: "8", name: key.nope}
+  - id: scalar_has_no_field
+    expression: "key.index.x"
+    destination: float64
+    error: {phase: check, code: unknown_field, position: "0", length: "11", name: key.index.x}
+  - id: unknown_pose_field
+    expression: "key.part_pose.w"
+    destination: float64
+    error: {phase: check, code: unknown_field, position: "0", length: "15", name: key.part_pose.w}
+  - id: pose_field_has_no_field
+    expression: "key.part_pose.x.y"
+    destination: float64
+    error: {phase: check, code: unknown_field, position: "0", length: "17", name: key.part_pose.x.y}
+  - id: unknown_record_field_after_longest_match
+    expression: "key.perception.grasp_plan.nope"
+    destination: float64
+    error: {phase: check, code: unknown_field, position: "0", length: "30", name: key.perception.grasp_plan.nope}
+  - id: whole_pose_is_not_a_value
+    expression: "key.part_pose"
+    destination: float64
+    error: {phase: check, code: type_mismatch, position: "0", length: "13", name: key.part_pose}
+  - id: whole_pose_comparison
+    expression: "key.part_pose == key.part_pose"
+    destination: bool
+    diagnostic_count: "2"
+    error: {phase: check, code: type_mismatch, position: "0", length: "13", name: key.part_pose}
+  - id: whole_nested_pose
+    expression: "key.perception.grasp_plan.approach_pose"
+    destination: float64
+    error: {phase: check, code: type_mismatch, position: "0", length: "39", name: key.perception.grasp_plan.approach_pose}
+  - id: whole_record
+    expression: "key.perception.grasp_plan"
+    destination: float64
+    error: {phase: check, code: type_mismatch, position: "0", length: "25", name: key.perception.grasp_plan}
+  - id: key_without_value
+    expression: "key.missing + 1"
+    destination: float64
+    error: {phase: evaluate, code: missing_value, position: "0", length: "11", name: key.missing}
+  - id: bare_param
+    expression: "param"
+    error: {phase: parse, code: invalid_name, position: "0", length: "5", name: param}
+  - id: bare_key
+    expression: "key + 1"
+    error: {phase: parse, code: invalid_name, position: "0", length: "3", name: key}
+  - id: key_trailing_dot
+    expression: "key."
+    error: {phase: parse, code: invalid_name, position: "0", length: "4"}
+  - id: key_double_dot
+    expression: "key..a"
+    error: {phase: parse, code: invalid_name, position: "0", length: "4"}
+  - id: key_digit_name
+    expression: "key.1a"
+    error: {phase: parse, code: invalid_name, position: "0", length: "4"}
+  - id: spaced_name
+    expression: "key . index"
+    error: {phase: parse, code: invalid_character, position: "4", length: "1"}
+  - id: undeclared_identifier
+    expression: "foo"
+    error: {phase: parse, code: invalid_name, position: "0", length: "3", name: foo}
+  - id: other_prefix
+    expression: "foo.bar"
+    error: {phase: parse, code: invalid_name, position: "0", length: "7", name: foo.bar}
+  - id: prefix_is_case_sensitive
+    expression: "Param.tube_length"
+    error: {phase: parse, code: invalid_name, position: "0", length: "17", name: Param.tube_length}
+  - id: key_named_like_literal
+    expression: "key.true"
+    destination: bool
+    error: {phase: check, code: unknown_name, position: "0", length: "8", name: key.true}
+  - id: name_then_call
+    expression: "key.index(1)"
+    error: {phase: parse, code: unexpected_token, position: "9", length: "1"}
+
+  # -------------------------------------------------------------- pose fields
+  - {id: pose_x, expression: "param.goal.x", destination: float64, result: "0.3"}
+  - {id: pose_y, expression: "param.goal.y", destination: float64, result: "0.1"}
+  - {id: pose_z, expression: "param.goal.z", destination: float64, result: "0.0"}
+  - {id: rpy_pose_roll_is_stored, expression: "param.goal.roll", destination: float64, result: "10.0"}
+  - {id: rpy_pose_pitch_is_stored, expression: "param.goal.pitch", destination: float64, result: "20.0"}
+  - {id: rpy_pose_yaw_is_stored, expression: "param.goal.yaw", destination: float64, result: "30.0"}
+  - {id: rpy_pose_qx, expression: "param.goal.qx", destination: float64, result: "0.03813457647485015", tolerance: "1e-15"}
+  - {id: rpy_pose_qy, expression: "param.goal.qy", destination: float64, result: "0.189307857412", tolerance: "1e-15"}
+  - {id: rpy_pose_qz, expression: "param.goal.qz", destination: float64, result: "0.23929833774473033", tolerance: "1e-15"}
+  - {id: rpy_pose_qw, expression: "param.goal.qw", destination: float64, result: "0.9515485246437886", tolerance: "1e-15"}
+  - {id: rpy_pose_not_wrapped, expression: "key.wrapped_pose.yaw", destination: float64, result: "190.0"}
+  - {id: xyzw_pose_qx_is_stored, expression: "key.part_pose.qx", destination: float64, result: "0.0"}
+  - {id: xyzw_pose_qz_is_stored, expression: "key.part_pose.qz", destination: float64, result: "0.7071067811865476"}
+  - {id: xyzw_pose_qw_is_stored, expression: "key.part_pose.qw", destination: float64, result: "0.7071067811865476"}
+  - {id: xyzw_pose_roll, expression: "key.part_pose.roll", destination: float64, result: "0.0"}
+  - {id: xyzw_pose_pitch, expression: "key.part_pose.pitch", destination: float64, result: "0.0"}
+  - {id: xyzw_pose_yaw, expression: "key.part_pose.yaw", destination: float64, result: "90.0", tolerance: "1e-9"}
+  - {id: xyzw_pose_yaw_wrapped, expression: "key.yaw_pose.yaw", destination: float64, result: "-170.0", tolerance: "1e-9"}
+  - {id: identity_pose_yaw, expression: "key.identity_pose.yaw", destination: float64, result: "0.0"}
+  - {id: gimbal_pose_pitch, expression: "key.gimbal_pose.pitch", destination: float64, result: "90.0", tolerance: "1e-5"}
+  - {id: pose_trigonometry, expression: "sin(rad(key.part_pose.yaw))", destination: float64, result: "1.0", tolerance: "1e-12"}
+  - {id: pose_position, expression: "key.part_pose.x + key.part_pose.y", destination: float64, result: "0.30000000000000004"}
+  - id: non_unit_quaternion_value
+    expression: "key.part_pose.x"
+    destination: float64
+    values:
+      keys:
+        part_pose:
+          position_m: ["0", "0", "0"]
+          orientation: {xyzw: ["0", "0", "0", "2"]}
+    error: {phase: evaluate, code: invalid_value, position: "0", length: "15", name: key.part_pose}
+  - id: non_finite_value
+    expression: "key.measured_force"
+    destination: float64
+    values:
+      keys:
+        measured_force: "inf"
+    error: {phase: evaluate, code: invalid_value, position: "0", length: "18", name: key.measured_force}
+  - id: record_value_missing_field
+    expression: "key.perception.grasp_plan.score"
+    destination: float64
+    values:
+      keys:
+        perception.grasp_plan:
+          score: "0.5"
+    error: {phase: evaluate, code: invalid_value, position: "0", length: "31", name: key.perception.grasp_plan}
+
+  # ------------------------------------------------------ characters, syntax
+  - id: unknown_character
+    expression: "1 @ 2"
+    error: {phase: parse, code: invalid_character, position: "2", length: "1"}
+  - id: single_equals
+    expression: "1 = 2"
+    error: {phase: parse, code: invalid_character, position: "2", length: "1"}
+  - id: single_ampersand
+    expression: "true & false"
+    error: {phase: parse, code: invalid_character, position: "5", length: "1"}
+  - id: single_bar
+    expression: "true | false"
+    error: {phase: parse, code: invalid_character, position: "5", length: "1"}
+  - id: non_ascii_outside_string
+    expression: "1 + é"
+    error: {phase: parse, code: invalid_character, position: "4", length: "1"}
+  - id: position_counts_code_points
+    expression: '"日本" @'
+    error: {phase: parse, code: invalid_character, position: "5", length: "1"}
+  - id: embedded_nul
+    expression: "1\0"
+    error: {phase: parse, code: invalid_character, position: "1", length: "1"}
+  - id: missing_operand
+    expression: "1 +"
+    error: {phase: parse, code: unexpected_end, position: "3", length: "0"}
+  - id: unclosed_parenthesis
+    expression: "(1"
+    error: {phase: parse, code: unexpected_end, position: "2", length: "0"}
+  - id: extra_parenthesis
+    expression: "1)"
+    error: {phase: parse, code: unexpected_token, position: "1", length: "1"}
+  - id: missing_operator
+    expression: "1 2"
+    error: {phase: parse, code: unexpected_token, position: "2", length: "1"}
+  - id: empty_parentheses
+    expression: "()"
+    error: {phase: parse, code: unexpected_token, position: "1", length: "1"}
+  - id: trailing_comma
+    expression: "abs(1,)"
+    error: {phase: parse, code: unexpected_token, position: "6", length: "1"}
+  - id: leading_comma
+    expression: "abs(,1)"
+    error: {phase: parse, code: unexpected_token, position: "4", length: "1"}
+  - id: conditional_without_else
+    expression: "true ? 1"
+    error: {phase: parse, code: unexpected_end, position: "8", length: "0"}
+  - id: conditional_missing_colon
+    expression: "true ? 1 2"
+    error: {phase: parse, code: unexpected_token, position: "9", length: "1"}
+  - id: leading_binary_operator
+    expression: "* 2"
+    error: {phase: parse, code: unexpected_token, position: "0", length: "1"}
+  - id: no_unary_plus
+    expression: "+1"
+    error: {phase: parse, code: unexpected_token, position: "0", length: "1"}
+  - id: no_assignment
+    expression: "key.index == 1 == = 2"
+    error: {phase: parse, code: invalid_character, position: "18", length: "1"}
+
+  # ------------------------------------------------------------------ limits
+  - id: text_at_limit
+    expression: "12345678"
+    limits: {text_length: "8"}
+    destination: int64
+    result: "12345678"
+  - id: text_too_long
+    expression: "123456789"
+    limits: {text_length: "8"}
+    error: {phase: parse, code: text_too_long, position: "8", length: "1"}
+  - id: text_length_counts_code_points
+    expression: '"日本語"'
+    limits: {text_length: "4"}
+    error: {phase: parse, code: text_too_long, position: "4", length: "1"}
+  - id: nesting_at_limit
+    expression: "((1))"
+    limits: {nesting_depth: "2"}
+    destination: int64
+    result: "1"
+  - id: nesting_too_deep
+    expression: "(((1)))"
+    limits: {nesting_depth: "2"}
+    error: {phase: parse, code: nesting_too_deep, position: "3", length: "1"}
+  - id: unary_nesting_too_deep
+    expression: "--1"
+    limits: {nesting_depth: "1"}
+    error: {phase: parse, code: nesting_too_deep, position: "2", length: "1"}
+  - id: call_nesting_too_deep
+    expression: "abs(abs(1))"
+    limits: {nesting_depth: "1"}
+    error: {phase: parse, code: nesting_too_deep, position: "8", length: "1"}
+  - id: conditional_nesting_too_deep
+    expression: "true ? true ? 1 : 2 : 3"
+    limits: {nesting_depth: "1"}
+    error: {phase: parse, code: nesting_too_deep, position: "14", length: "1"}
+  - id: tokens_at_limit
+    expression: "1 + 2"
+    limits: {tokens: "3"}
+    destination: int64
+    result: "3"
+  - id: too_many_tokens
+    expression: "1 + 2 + 3"
+    limits: {tokens: "3"}
+    error: {phase: parse, code: too_many_tokens, position: "6", length: "1"}
+  - id: syntax_nodes_at_limit
+    expression: "1 + 2"
+    limits: {syntax_nodes: "3"}
+    destination: int64
+    result: "3"
+  - id: syntax_tree_too_large
+    expression: "-1 + 2"
+    limits: {syntax_nodes: "3"}
+    error: {phase: parse, code: syntax_tree_too_large, position: "0", length: "6"}
+  - id: evaluation_steps_at_limit
+    expression: "key.index + 1"
+    limits: {evaluation_steps: "3"}
+    destination: int64
+    result: "8"
+  - id: evaluation_step_limit
+    expression: "key.index + 1 + 1"
+    limits: {evaluation_steps: "3"}
+    destination: int64
+    error: {phase: evaluate, code: evaluation_step_limit, position: "12", length: "1"}
+  - id: constant_evaluation_step_limit
+    expression: "1 + 1 + 1"
+    limits: {evaluation_steps: "3"}
+    destination: int64
+    error: {phase: check, code: evaluation_step_limit, position: "4", length: "1"}
+  - id: short_circuit_saves_steps
+    expression: "key.fragile || key.fragile && key.fragile"
+    limits: {evaluation_steps: "2"}
+    destination: bool
+    result: "true"

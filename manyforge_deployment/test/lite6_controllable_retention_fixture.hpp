@@ -12,7 +12,6 @@
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
-#include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -66,7 +65,6 @@ struct Lite6ControllableRetentionFixture final {
   std::optional<QualifiedProviderManifest> planner_provider_manifest;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
   std::optional<QualifiedRuntimeProfile> ros2_control_execution_runtime_profile;
-  std::optional<QualifiedRuntimePolicy> native_runtime_policy;
 
   [[nodiscard]] std::span<const BuildQualifiedStructuralModelPreparation>
   structural_preparations() const noexcept {
@@ -367,7 +365,6 @@ struct QualifiedControlCatalog final {
   std::optional<QualifiedProviderManifest> planner_provider;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
   std::optional<QualifiedRuntimeProfile> ros2_control_execution_runtime_profile;
-  std::optional<QualifiedRuntimePolicy> native_runtime_policy;
   /// Aggregate arm/tool fixtures retain a goal-cancel policy for the gripper
   /// when the arm selects the independently qualified controlled-Stop policy.
   std::optional<QualifiedStopEvidencePolicy> gripper_stop;
@@ -704,39 +701,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   } else {
     native_execution_runtime_profile =
         std::move(qualified_execution_runtime_profile);
-  }
-
-  std::optional<QualifiedRuntimePolicy> native_runtime_policy;
-  std::optional<std::string> native_runtime_policy_bytes;
-  if (native_motion) {
-    native_runtime_policy_bytes = revisioned_document(
-        CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(core::kRuntimePolicyApiVersion))},
-            {"runtime_policy_id", CanonicalValue("lite6.native.motion")},
-            {"description",
-             CanonicalValue("Qualified Lite6 native motion policy")},
-            {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
-            {"open_loop_grasp_acknowledgements",
-             CanonicalValue(CanonicalValue::Array{})},
-        }),
-        "catalog-record-revision/runtime_policy",
-        core::kRuntimePolicyApiVersion, "runtime_policy_revision");
-    const core::ContentDigest policy_digest(
-        sha256_digest(*native_runtime_policy_bytes));
-    const core::ContentAddressedStoreKey policy_key(
-        catalog_key("runtime_policy", policy_digest.value()));
-    const core::RuntimePolicyCatalogRecordRefDTO policy_ref{
-        core::RuntimePolicyId("lite6.native.motion"),
-        core::RuntimePolicyRevision(revision_from_document(
-            *native_runtime_policy_bytes, "runtime_policy_revision")),
-        core::SchemaId(std::string(core::kRuntimePolicyApiVersion)),
-        schema_revision_for(core::CatalogRecordKind::kRuntimePolicy),
-        policy_digest,
-        policy_key,
-    };
-    native_runtime_policy = resolve_and_qualify_runtime_policy(
-        policy_ref, policy_key, *native_runtime_policy_bytes);
   }
 
   CanonicalValue::Array target_capabilities{
@@ -1426,12 +1390,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                          *ros2_control_execution_runtime_profile_bytes,
                          *ros2_control_execution_runtime_profile));
   }
-  if (native_runtime_policy.has_value() &&
-      native_runtime_policy_bytes.has_value()) {
-    artifacts.push_back(
-        catalog_artifact("catalog://runtime_policy/lite6.native.motion",
-                         *native_runtime_policy_bytes, *native_runtime_policy));
-  }
   artifacts.push_back(catalog_artifact(
       "catalog://stop_policy/" + stop_policy_id, stop_bytes, stop));
 
@@ -1453,7 +1411,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       std::move(planner_provider),
       std::move(native_execution_runtime_profile),
       std::move(ros2_control_execution_runtime_profile),
-      std::move(native_runtime_policy),
       std::nullopt,
   };
 }
@@ -2368,7 +2325,6 @@ make_applicability_inputs(
     const QualifiedProviderManifest &provider,
     std::span<const QualifiedCapabilityDefinition> planner_capabilities,
     const QualifiedProviderManifest *planner_provider,
-    const QualifiedRuntimePolicy *runtime_policy,
     const AssistantOverlayFixture *assistant_overlay,
     const bool composer_draft_enabled = false, const bool stoppable = false,
     const bool qualified_motion_controlled_stop = false,
@@ -2526,7 +2482,7 @@ make_applicability_inputs(
       {"capability_provider_bindings",
        CanonicalValue(std::move(capability_provider_bindings))},
   };
-  if (stoppable || runtime_policy != nullptr) {
+  if (stoppable) {
     CanonicalValue::Array stop_stage_parameters;
     if (stoppable) {
       for (const auto &binding : graph.graph().control_bindings) {
@@ -2629,27 +2585,10 @@ make_applicability_inputs(
         }
       }
     }
-    CanonicalValue::Array retained_policy_records;
-    if (runtime_policy != nullptr) {
-      const auto &reference = runtime_policy->reference();
-      retained_policy_records.emplace_back(CanonicalValue::Object{
-          {"record_kind", CanonicalValue("runtime_policy")},
-          {"record_id", CanonicalValue(reference.record_id.value())},
-          {"record_revision",
-           CanonicalValue(reference.record_revision.value())},
-          {"schema_id", CanonicalValue(reference.schema_id.value())},
-          {"schema_revision",
-           CanonicalValue(reference.schema_revision.value())},
-          {"content_digest", CanonicalValue(reference.content_digest.value())},
-          {"content_addressed_store_key",
-           CanonicalValue(reference.content_addressed_store_key.value())},
-      });
-    }
     root_members.emplace_back(
         "policies",
         CanonicalValue(CanonicalValue::Object{
-            {"retained_policy_records",
-             CanonicalValue(std::move(retained_policy_records))},
+            {"retained_policy_records", CanonicalValue(CanonicalValue::Array{})},
             {"stop_stage_parameters",
              CanonicalValue(std::move(stop_stage_parameters))},
             {"commissioned_stop_interfaces",
@@ -2825,9 +2764,6 @@ make_lite6_controllable_retention_fixture(
       !gripper_only && catalog.planner_provider.has_value()
           ? &*catalog.planner_provider
           : nullptr,
-      catalog.native_runtime_policy.has_value()
-          ? &*catalog.native_runtime_policy
-          : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
       composer_draft_enabled, stoppable, qualified_motion_controlled_stop,
       stop_timings);
@@ -2876,9 +2812,6 @@ make_lite6_controllable_retention_fixture(
   if (catalog.ros2_control_execution_runtime_profile.has_value()) {
     catalog_records.push_back(
         catalog.ros2_control_execution_runtime_profile->reference());
-  }
-  if (catalog.native_runtime_policy.has_value()) {
-    catalog_records.push_back(catalog.native_runtime_policy->reference());
   }
   CanonicalValue::Object deployment_graph = graph.normalized_root().as_object();
   deployment_graph.erase(
@@ -3000,10 +2933,6 @@ make_lite6_controllable_retention_fixture(
   if (catalog.gripper_stop.has_value()) {
     stop_policies.push_back(*catalog.gripper_stop);
   }
-  std::vector<QualifiedRuntimePolicy> runtime_policies;
-  if (catalog.native_runtime_policy.has_value()) {
-    runtime_policies.push_back(*catalog.native_runtime_policy);
-  }
   std::map<std::pair<std::string, std::string>, BuildQualifiedValueSchemaEntry>
       selected_value_schema_map;
   const auto &applicability_inputs = deployment.applicability_inputs().value();
@@ -3032,7 +2961,7 @@ make_lite6_controllable_retention_fixture(
   }
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), runtime_profiles,
-      runtime_policies, command_schemas, capabilities, contracts, topologies,
+      command_schemas, capabilities, contracts, topologies,
       providers, stop_policies, selected_value_schemas,
       std::span<const QualifiedCommissioningEvidenceRef>{}, overlay);
   auto qualified = qualify_deployment_for_retention(
@@ -3057,7 +2986,6 @@ make_lite6_controllable_retention_fixture(
       std::move(catalog.planner_provider),
       std::move(catalog.native_execution_runtime_profile),
       std::move(catalog.ros2_control_execution_runtime_profile),
-      std::move(catalog.native_runtime_policy),
   };
 }
 

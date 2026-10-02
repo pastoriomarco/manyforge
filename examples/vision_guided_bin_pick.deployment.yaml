@@ -31,7 +31,7 @@
           "response_mode": "json_object"
         },
         "template_text": "You are selecting the next object for a pick-and-place cycle. Inspect the attached scene snapshot and choose exactly one target: the left object (`left_part`) or the right object (`right_part`). Prefer a target that is clearly visible and isolated. Return JSON only with: - `pick_left_bin`: boolean - `selected_object_id`: string, one of `left_part` or `right_part` - `confidence`: number from 0.0 to 1.0 - `reason`: short string",
-        "variable_ids": [],
+        "variables": {},
         "version": "1"
       }
     },
@@ -1113,15 +1113,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
-        "content_digest": "sha256:ec5f7b899880c44962bf4e10a657255286fbf6ff0b0bcdf17e179a1028085760",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
@@ -1163,7 +1154,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-  "deployment_revision": "sha256:feeebd93d855967b52f0afdcd811d8c51177662dc6c97733e13ca0d8a0ce786c",
+  "deployment_revision": "sha256:58b9784e02d1710e029396de1f803c4d8a7fb9a646efe5e66aa4c39a890483f0",
   "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {
@@ -2160,17 +2151,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
-        "content_digest": "sha256:ec5f7b899880c44962bf4e10a657255286fbf6ff0b0bcdf17e179a1028085760",
-        "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",

@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.3.0
+content_version: 2.4.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:3d5fa47c2dacc69fe56e2ec91e828897f0ac2a6c77f22a50a4acdd45edf41353
+catalog_digest: sha256:6e62827057b520c2869f4aca330a002b6f737f4482299ca2ad222371cf06d6a2
 schema_types:
   coordinate_position:
     type: object
@@ -197,12 +197,22 @@ schema_types:
         - scene_resource
         - runtime_object
         - pose
+        - cell_frame
       frame_role_id:
         type: string
         semantic_type: frame_role
         semantic_scope_parameter: target_role
         required_when:
           type: frame_role
+        allowed_when:
+          type: frame_role
+        description: A frame role of target_role when it is named, otherwise of the
+          moving robot (the node's target_role).
+      target_role:
+        type: string
+        semantic_type: target_role
+        description: The robot that owns frame_role_id; absent means the moving robot.
+          Another robot's frame is sampled once when the motion is admitted.
         allowed_when:
           type: frame_role
       collision_body_role_id:
@@ -363,43 +373,23 @@ schema_types:
         items:
           type: float
         length: 3
-  value_source:
+  pose_offset:
     type: object
     additional_properties: false
     required:
-    - kind
-    - reference
+    - position_m
+    - rpy_deg
     properties:
-      kind:
-        type: enum
-        values:
-        - program_parameter
-        - blackboard_key
-        - blackboard_field
-      reference:
-        type: string
-      field:
-        type: string
-        required_when:
-          kind: blackboard_field
-        allowed_when:
-          kind: blackboard_field
-  template_variable_binding:
-    type: object
-    additional_properties: false
-    required:
-    - variable_id
-    - source
-    properties:
-      variable_id:
-        type: string
-      source:
-        schema_ref: '#/schema_types/value_source'
-  template_variable_bindings:
-    type: array
-    max_items: 256
-    items:
-      schema_ref: '#/schema_types/template_variable_binding'
+      position_m:
+        type: array
+        items:
+          type: float
+        length: 3
+      rpy_deg:
+        type: array
+        items:
+          type: float
+        length: 3
   pick_synthesis:
     type: object
     additional_properties: false
@@ -740,7 +730,13 @@ entries:
 - id: timer
   name: Timer
   category: control_flow
-  description: Wait for a bounded duration using the orchestration clock.
+  description: 'Delay for duration_s seconds of Program time, then succeed. Program
+    time is monotonic and stands still while the Program is halted; Execute after
+    Halt continues the same delay. By default (duration_while_held: pause) time the
+    node itself is held by an operator Stop does not count and the delay resumes with
+    the remaining time; with duration_while_held: count held time counts too. A node
+    whose stop policy keeps it running during a Stop keeps counting. Program Stop
+    and Reset end the delay.'
   stability: stable
   tags:
   - control_flow
@@ -759,6 +755,14 @@ entries:
       constraints:
         min_exclusive: 0.0
         max_inclusive: 86400.0
+  - id: duration_while_held
+    required: false
+    default: pause
+    schema:
+      type: enum
+      values:
+      - count
+      - pause
   required_capabilities: []
   execution:
     blocking: true
@@ -766,7 +770,6 @@ entries:
     owner_api: orchestration.clock
   outcomes:
     success: elapsed
-    failure: timer_failed
     interrupted: cancelled
   runners:
     py_trees:
@@ -1870,10 +1873,60 @@ entries:
       implementation_id: scene_detach_carried_object_v1
   observability:
     event_family: manyforge.program.node
-- id: logic.check_bool
-  name: Check boolean
+- id: scene.get_object_pose
+  name: Get object pose
+  category: scene
+  description: Write one scene resource's current pose to a pose key, expressed in
+    frame (the cell frame when absent); another frame is resolved once by the cell
+    frame resolver.
+  stability: stable
+  tags:
+  - scene
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
+  - id: frame
+    required: false
+    schema_ref: '#/schema_types/pose_frame_ref'
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  required_capabilities:
+  - capability_id: scene.object.query
+    scope: cell_global
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: stored_pose
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: scene.query
+  outcomes:
+    success: pose_resolved
+    failure: pose_unavailable
+  runners:
+    py_trees:
+      implementation_id: scene_get_object_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: logic.check_condition
+  name: Check condition
   category: logic
-  description: Compare one literal or typed-source boolean with an expected value.
+  description: Succeed when one boolean condition is true; fail when it is false.
   stability: stable
   tags:
   - logic
@@ -1885,11 +1938,7 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: actual_value
-    required: true
-    schema:
-      type: bool
-  - id: expected_value
+  - id: condition
     required: true
     schema:
       type: bool
@@ -1902,17 +1951,17 @@ entries:
     cancellable: false
     owner_api: orchestration.blackboard
   outcomes:
-    success: matched
-    failure: not_matched
+    success: condition_true
+    failure: condition_false
   runners:
     py_trees:
-      implementation_id: logic_check_bool_v1
+      implementation_id: logic_check_condition_v1
   observability:
     event_family: manyforge.program.node
-- id: logic.set_bool
-  name: Set boolean
+- id: logic.set_value
+  name: Set value
   category: logic
-  description: Set one declared blackboard boolean.
+  description: Write one declared blackboard key with a value of the key's type.
   stability: stable
   tags:
   - logic
@@ -1932,13 +1981,28 @@ entries:
   - id: value
     required: true
     schema:
-      type: bool
+      type: key_value
+      value_type_from_key: key
+      value_types:
+      - bool
+      - float64
+      - int64
+      - stored_pose
+      - string
   required_capabilities: []
   blackboard:
     reads: []
     writes:
     - key_parameter: key
       value_type: bool
+    - key_parameter: key
+      value_type: float64
+    - key_parameter: key
+      value_type: int64
+    - key_parameter: key
+      value_type: stored_pose
+    - key_parameter: key
+      value_type: string
   execution:
     blocking: false
     cancellable: false
@@ -1948,13 +2012,13 @@ entries:
     failure: write_failed
   runners:
     py_trees:
-      implementation_id: logic_set_bool_v1
+      implementation_id: logic_set_value_v1
   observability:
     event_family: manyforge.program.node
-- id: logic.wait_for_bool
-  name: Wait for boolean
+- id: logic.check_value
+  name: Check value
   category: logic
-  description: Wait until one declared blackboard boolean matches.
+  description: Compare one declared blackboard key with a value of the key's type.
   stability: stable
   tags:
   - logic
@@ -1971,15 +2035,148 @@ entries:
     schema:
       type: string
       semantic_type: blackboard_key
-  - id: expected_value
+  - id: operator
+    required: false
+    default: ==
+    schema:
+      type: enum
+      values:
+      - ==
+      - '!='
+      - <
+      - <=
+      - '>'
+      - '>='
+  - id: value
     required: true
     schema:
-      type: bool
+      type: key_value
+      value_type_from_key: key
+      value_types:
+      - bool
+      - float64
+      - int64
+      - string
+  - id: tolerance
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
   required_capabilities: []
   blackboard:
     reads:
     - key_parameter: key
       value_type: bool
+      missing_key: failure
+    - key_parameter: key
+      value_type: float64
+      missing_key: failure
+    - key_parameter: key
+      value_type: int64
+      missing_key: failure
+    - key_parameter: key
+      value_type: string
+      missing_key: failure
+    writes: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: orchestration.blackboard
+  outcomes:
+    success: matched
+    failure: not_matched
+  runners:
+    py_trees:
+      implementation_id: logic_check_value_v1
+  observability:
+    event_family: manyforge.program.node
+- id: logic.wait_for_value
+  name: Wait for value
+  category: logic
+  description: 'Wait until one declared blackboard key compares true. Without timeout_s
+    it waits until the value matches or the run ends; a supplied timeout_s is positive
+    and bounds the wait, counting Program time from the start of the attempt. Program
+    time is monotonic and stands still while the Program is halted; Execute after
+    Halt continues the same wait. By default (timeout_while_held: pause) time the
+    node itself is held by an operator Stop does not count and the wait resumes with
+    the remaining time; with timeout_while_held: count held time counts too. A node
+    whose stop policy keeps it running during a Stop keeps counting. Program Stop
+    and Reset end the wait; an operator Stop holds it according to the node''s stop
+    policy.'
+  stability: stable
+  tags:
+  - logic
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: operator
+    required: false
+    default: ==
+    schema:
+      type: enum
+      values:
+      - ==
+      - '!='
+      - <
+      - <=
+      - '>'
+      - '>='
+  - id: value
+    required: true
+    schema:
+      type: key_value
+      value_type_from_key: key
+      value_types:
+      - bool
+      - float64
+      - int64
+      - string
+  - id: tolerance
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: timeout_s
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.01
+        max_inclusive: 3600.0
+  - id: timeout_while_held
+    required: false
+    default: pause
+    schema:
+      type: enum
+      values:
+      - count
+      - pause
+  required_capabilities: []
+  blackboard:
+    reads:
+    - key_parameter: key
+      value_type: bool
+      missing_key: wait
+    - key_parameter: key
+      value_type: float64
+      missing_key: wait
+    - key_parameter: key
+      value_type: int64
+      missing_key: wait
+    - key_parameter: key
+      value_type: string
       missing_key: wait
     writes: []
   execution:
@@ -1992,7 +2189,7 @@ entries:
     interrupted: cancelled
   runners:
     py_trees:
-      implementation_id: logic_wait_for_bool_v1
+      implementation_id: logic_wait_for_value_v1
   observability:
     event_family: manyforge.program.node
 - id: io.set_output
@@ -2089,6 +2286,51 @@ entries:
   runners:
     py_trees:
       implementation_id: io_get_input_v1
+  observability:
+    event_family: manyforge.program.node
+- id: io.check_input
+  name: Check input
+  category: io
+  description: Read one semantic input resource once and compare it with an expected
+    value.
+  stability: stable
+  tags:
+  - io
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: resource_role
+    required: true
+    schema:
+      type: string
+      semantic_type: resource_role
+  - id: expected_value
+    required: true
+    schema:
+      type: bool
+  required_capabilities:
+  - capability_id: io.gpio.get_input
+    scope: target_binding
+    target_parameter: target_role
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: kernel.command_target
+  outcomes:
+    success: matched
+    failure: not_matched
+  runners:
+    py_trees:
+      implementation_id: io_check_input_v1
   observability:
     event_family: manyforge.program.node
 - id: io.wait_for_input
@@ -2281,8 +2523,11 @@ entries:
 - id: gripper.wait_for_status
   name: Wait for gripper status
   category: gripper
-  description: Wait for the captured gripper command and source, with a bounded timeout.
-    Grasp confirmation is an explicit operator statement, never inferred from movement.
+  description: 'Wait for the captured gripper command and source, with a bounded timeout
+    counted in Program time, which stands still while the Program is halted. By default
+    (timeout_while_held: pause) time the node itself is held by an operator Stop does
+    not count toward the timeout; with timeout_while_held: count it does. Grasp confirmation
+    is an explicit operator statement, never inferred from movement.'
   stability: stable
   tags:
   - gripper
@@ -2316,6 +2561,14 @@ entries:
       constraints:
         min_inclusive: 0.01
         max_inclusive: 3600.0
+  - id: timeout_while_held
+    required: false
+    default: pause
+    schema:
+      type: enum
+      values:
+      - count
+      - pause
   required_capabilities:
   - capability_id: tool.gripper.feedback
     scope: target_binding
@@ -2354,6 +2607,7 @@ entries:
   outcomes:
     success: matched
     failure: unavailable_stale_failed_or_timeout
+    interrupted: cancelled
   runners:
     py_trees:
       implementation_id: gripper_wait_for_status_v1
@@ -2416,7 +2670,9 @@ entries:
 - id: geometry.check_pose_distance
   name: Check pose distance
   category: geometry
-  description: Compare two declared pose values with portable thresholds.
+  description: Compare two pose keys with translation and rotation thresholds. Pose
+    B is first expressed in pose A's frame (read once from the cell frame resolver
+    when the frames differ), then compared.
   stability: stable
   tags:
   - geometry
@@ -2461,7 +2717,7 @@ entries:
       missing_key: failure
     writes: []
   execution:
-    blocking: false
+    blocking: true
     cancellable: false
     owner_api: geometry.compare
   outcomes:
@@ -2470,6 +2726,111 @@ entries:
   runners:
     py_trees:
       implementation_id: geometry_check_pose_distance_v1
+  observability:
+    event_family: manyforge.program.node
+- id: geometry.offset_pose
+  name: Offset pose
+  category: geometry
+  description: Apply a translation and RPY offset to one pose and write the result
+    in the pose's own frame. Without offset_frame the offset is measured along the
+    pose's own axes; with it, along that declared frame's axes (its orientation is
+    read once from the cell frame resolver when the frames differ).
+  stability: stable
+  tags:
+  - geometry
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  - id: offset
+    required: true
+    schema_ref: '#/schema_types/pose_offset'
+  - id: offset_frame
+    required: false
+    schema_ref: '#/schema_types/pose_frame_ref'
+  - id: output_key
+    required: true
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: stored_pose
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: geometry.compare
+  outcomes:
+    success: pose_written
+    failure: offset_failed
+  runners:
+    py_trees:
+      implementation_id: geometry_offset_pose_v1
+  observability:
+    event_family: manyforge.program.node
+- id: geometry.check_pose_bounds
+  name: Check pose bounds
+  category: geometry
+  description: Succeed when one pose lies inside an axis-aligned box stated in frame_ref.
+    The pose is first expressed in frame_ref (read once from the cell frame resolver
+    when the frames differ), then compared.
+  stability: stable
+  tags:
+  - geometry
+  - blackboard
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: pose
+    required: true
+    schema_ref: '#/schema_types/stored_pose'
+  - id: frame_ref
+    required: true
+    schema_ref: '#/schema_types/pose_frame_ref'
+  - id: min_position_m
+    required: true
+    schema:
+      type: array
+      items:
+        type: float
+      length: 3
+  - id: max_position_m
+    required: true
+    schema:
+      type: array
+      items:
+        type: float
+      length: 3
+  - id: inclusive
+    required: false
+    default: true
+    schema:
+      type: bool
+  required_capabilities: []
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: geometry.compare
+  outcomes:
+    success: within_bounds
+    failure: outside_bounds
+  runners:
+    py_trees:
+      implementation_id: geometry_check_pose_bounds_v1
   observability:
     event_family: manyforge.program.node
 - id: kernel.stop_operation
@@ -2877,8 +3238,19 @@ entries:
       type: string
   - id: template_variables
     required: false
-    default: []
-    schema_ref: '#/schema_types/template_variable_bindings'
+    default: {}
+    schema:
+      type: object
+      description: Prompt-template variable values by variable ID; each value is literal
+        or comes from a value source at template_variables.<variable_id>.
+      additional_properties:
+        type: key_value
+        value_types:
+        - bool
+        - float64
+        - int64
+        - string
+        - string_list
   - id: scene_attachment
     required: false
     default: none

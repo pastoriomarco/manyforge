@@ -28,8 +28,8 @@
             "fallback",
             "gripper.command_position",
             "inverter",
-            "logic.set_bool",
-            "logic.wait_for_bool",
+            "logic.set_value",
+            "logic.wait_for_value",
             "motion.follow_cartesian_path",
             "motion.move_to_joint_target",
             "motion.move_to_pose",
@@ -1199,15 +1199,6 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
-        "content_digest": "sha256:4c2013c2ef7c65b5c3549282fcb3074cdf0d58230636c7a15a76b0cd92acdd33",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_assistant",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      },
-      {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
         "content_digest": "sha256:f231d8f52a7858c2ebbf4c1334650aeb973407ac780d2c4fbd194df0209e4cea",
         "record_id": "manyforge.ros2_control_execution_runtime",
@@ -1253,7 +1244,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:13c689c8a2db23a9631825c15f093e4cda51158f7794315acdfcca9587ed0f27",
+  "deployment_revision": "sha256:61d3306edb6de1b89777268ab682fc6310799d63eaaf5c7eb95c4b73585affbc",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {
@@ -2166,17 +2157,7 @@
     },
     "interrupt_policies": [],
     "interrupt_sources": [],
-    "retained_policy_records": [
-      {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
-        "content_digest": "sha256:4c2013c2ef7c65b5c3549282fcb3074cdf0d58230636c7a15a76b0cd92acdd33",
-        "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_assistant",
-        "record_kind": "runtime_policy",
-        "record_revision": "sha256:149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
-        "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
-      }
-    ],
+    "retained_policy_records": [],
     "stop_stage_parameters": [
       {
         "control_binding_id": "isaac_ur10e_assistant_robot.arm.execution-contact-geometric",

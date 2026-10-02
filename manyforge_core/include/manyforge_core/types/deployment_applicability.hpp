@@ -241,8 +241,8 @@ struct DeploymentApplicabilityInputsDTO final {
   std::vector<StopStageParametersDTO> stop_stage_parameters;
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
   /// Exact deployment-selected policy referents. The closed tagged union
-  /// preserves the strong ID/revision pair; only contact, Stop-evidence, and
-  /// runtime-policy alternatives are legal at this boundary.
+  /// preserves the strong ID/revision pair; only contact and Stop-evidence
+  /// alternatives are legal at this boundary.
   std::vector<CatalogRecordRefDTO> retained_policy_records;
   std::vector<StopTimingSelectionDTO> stop_timing_parameters{};
 

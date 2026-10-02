@@ -731,12 +731,28 @@ template <typename StrongId>
     case ReferenceDTO::Type::kPose:
       type = "pose";
       break;
+    case ReferenceDTO::Type::kCellFrame:
+      type = "cell_frame";
+      break;
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object value{
       {"id", CanonicalValue(std::string(reference_identity_value(*reference)))},
       {"pose", reference->pose.has_value() ? PoseValue(*reference->pose) : CanonicalValue(nullptr)},
-      {"type", CanonicalValue(std::string(type))},
-  });
+  };
+  // Emitted only for robot-qualified frames so unqualified references keep
+  // their established canonical identity.
+  if (reference->target.has_value()) {
+    value.emplace_back(
+        "target",
+        CanonicalValue(CanonicalValue::Object{
+            {"command_target_id", CanonicalValue(reference->target->command_target_id.value())},
+            {"controllable_component_id",
+             CanonicalValue(reference->target->controllable_component_id.value())},
+            {"target_role_id", CanonicalValue(reference->target->target_role_id.value())},
+        }));
+  }
+  value.emplace_back("type", CanonicalValue(std::string(type)));
+  return CanonicalValue(std::move(value));
 }
 
 [[nodiscard]] CanonicalValue ActionSpanValue(const std::optional<ActionSpanDTO>& span) {
@@ -880,7 +896,7 @@ template <typename StrongId>
         {"scene_resource_id", CanonicalValue(binding.scene_resource_id.value())},
     });
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object value{
       {"base_frame_role_id", CanonicalValue(motion.base_frame_role_id.value())},
       {"cache_mode", CanonicalValue(cache_mode)},
       {"contact_policy_id", OptionalIdentity(motion.contact_policy_id)},
@@ -912,7 +928,15 @@ template <typename StrongId>
            {"rotation_tol_rad", CanonicalValue(motion.tolerances.rotation_tol_rad)},
            {"translation_tol_m", CanonicalValue(motion.tolerances.translation_tol_m)},
        })},
-  });
+  };
+  // Emitted only for framed absolute goals so existing intents keep their
+  // established semantic digest.
+  if (motion.goal_frame_reference.has_value()) {
+    value.emplace_back("goal_frame_reference", ReferenceValue(motion.goal_frame_reference));
+    std::sort(value.begin(), value.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+  }
+  return CanonicalValue(std::move(value));
 }
 
 [[nodiscard]] CanonicalValue CapabilityPayloadValue(const CapabilityCommandIntentDTO& command) {
@@ -1095,20 +1119,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
   return CanonicalValue(std::move(result));
 }
 
-[[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(const PreparedRuntimePolicyRefDTO& policy) {
-  const auto& source = policy.source_artifact;
-  return CanonicalValue(CanonicalValue::Object{
-      {"source_artifact",
-       CanonicalValue(CanonicalValue::Object{
-           {"content_addressed_store_key",
-            CanonicalValue(source.content_addressed_store_key.value())},
-           {"content_digest", CanonicalValue(source.content_digest.value())},
-           {"runtime_policy_id", CanonicalValue(source.record_id.value())},
-           {"runtime_policy_revision", CanonicalValue(source.record_revision.value())},
-           {"schema_id", CanonicalValue(source.schema_id.value())},
-           {"schema_revision", CanonicalValue(source.schema_revision.value())}})}});
-}
-
 [[nodiscard]] CanonicalValue PreparedMotionDiagnosticsValue(
     const OperationStateDTO& state,
     const std::span<const PreparedMotionDiagnosticsDTO> diagnostics) {
@@ -1153,11 +1163,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
             "operation_journal_record_invalid",
             "prepared-motion diagnostics contain invalid joint names");
 
-    const auto& source = diagnostic.runtime_policy.source_artifact;
-    Require(!source.record_id.empty() && !source.record_revision.empty() &&
-                !source.schema_id.empty() && !source.schema_revision.empty() &&
-                !source.content_digest.empty() && !source.content_addressed_store_key.empty() &&
-                std::isfinite(diagnostic.deployment_maximum_tcp_linear_speed_mps) &&
+    Require(std::isfinite(diagnostic.deployment_maximum_tcp_linear_speed_mps) &&
                 diagnostic.deployment_maximum_tcp_linear_speed_mps > 0.0 &&
                 std::isfinite(diagnostic.admitted_tcp_linear_speed_mps) &&
                 diagnostic.admitted_tcp_linear_speed_mps > 0.0 &&
@@ -1171,7 +1177,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
                                  diagnostic.deployment_maximum_tcp_linear_speed_mps),
                              diagnostic.deployment_maximum_tcp_linear_speed_mps),
             "operation_journal_record_invalid",
-            "prepared-motion diagnostics contain invalid runtime-policy provenance");
+            "prepared-motion diagnostics contain invalid speed provenance");
 
     CanonicalValue::Array names;
     names.reserve(diagnostic.joint_names.size());
@@ -1235,7 +1241,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
          diagnostic.requested_tcp_linear_speed_mps.has_value()
              ? CanonicalValue(*diagnostic.requested_tcp_linear_speed_mps)
              : CanonicalValue(nullptr)},
-        {"runtime_policy", PreparedRuntimePolicyValue(diagnostic.runtime_policy)},
         {"trajectory_metrics", CanonicalValue(std::move(metric_fields))}});
   }
   return CanonicalValue(std::move(rows));

@@ -1,11 +1,9 @@
 #pragma once
 
 #include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
-#include <manyforge_core/types/runtime_policy.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <memory>
 #include <span>
@@ -25,17 +23,14 @@ struct OrdinaryMotionJerkPolicy final {
                          const OrdinaryMotionJerkPolicy&) = default;
 };
 
-/// Exact private runtime-policy projection for one sealed participant.
+/// Exact private motion policy for one sealed motion participant.
 ///
-/// Deployment independently qualifies the catalog bytes and then supplies the
-/// complete immutable DTO. This seal rechecks the closed shape and exact
-/// binding scope; it performs no catalog lookup and
-/// mints no catalog identity.
+/// Composition seals it against one exact participant binding; Deployment
+/// supplies the optional ordinary-motion jerk profile. It carries no catalog
+/// record and admits no motion-interrupt policy.
 struct RuntimeParticipantPolicySelectionDTO final {
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
-  RuntimePolicyCatalogRecordRefDTO source_artifact;
-  RuntimePolicyDTO policy;
   std::optional<OrdinaryMotionJerkPolicy> ordinary_motion_jerk{};
 
   friend bool operator==(const RuntimeParticipantPolicySelectionDTO&,
@@ -60,17 +55,16 @@ class RuntimeParticipantPolicySelection final {
 
   std::shared_ptr<const RuntimeParticipantPolicySelectionDTO> value_;
 
-  friend Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
-      RuntimePolicyCatalogRecordRefDTO, RuntimePolicyDTO, const RuntimeParticipantBinding&);
+  friend RuntimeParticipantPolicySelection select_runtime_participant_policy(
+      const RuntimeParticipantBinding&);
   friend Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
       const RuntimeParticipantPolicySelection&, const RuntimeParticipantBinding&,
       OrdinaryMotionJerkPolicy);
 };
 
-/// Seal one already-qualified retained runtime policy against one exact
-/// participant binding.
-[[nodiscard]] Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
-    RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
+/// Seal the motion policy of one exact participant binding. Ordinary-motion
+/// jerk shaping stays absent until Deployment applies its profile.
+[[nodiscard]] RuntimeParticipantPolicySelection select_runtime_participant_policy(
     const RuntimeParticipantBinding& participant);
 
 /// Seal the independently compiled ordinary-motion profile against its exact
@@ -89,10 +83,10 @@ class RuntimeParticipantPolicySelection final {
 [[nodiscard]] Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
     double deployment_maximum_tcp_linear_speed_mps, SpeedProfileDTO requested);
 
-/// Require every requested move-scoped interrupt policy to belong to the same
-/// sealed runtime-policy revision. No source lookup or arming occurs here.
-[[nodiscard]] Result<void> validate_runtime_participant_interrupt_policy_selection(
-    const RuntimeParticipantPolicySelection& selection,
+/// No motion-interrupt policy is admitted until a per-robot mechanism is
+/// designed: any requested move-scoped interrupt is refused with reason
+/// `motion_interrupt_policy_not_admitted`. No source lookup or arming occurs.
+[[nodiscard]] Result<void> validate_motion_interrupt_scope_admission(
     std::span<const MotionInterruptScopeDTO> scopes);
 
 }  // namespace manyforge::core

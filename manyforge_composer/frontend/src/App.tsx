@@ -32,6 +32,7 @@ import { activationFailureNotice } from './state/activationNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
+import { appliedCartesianDefaults } from './state/robotControl';
 import {
   nodeEnvironmentRefreshKey,
   refreshViewerModelsOnManagerChange,
@@ -39,7 +40,6 @@ import {
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration } from './utils/programAuthoring';
-import { stricterCartesianDefaults } from './state/robotControl';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
@@ -311,8 +311,7 @@ export default function App() {
     headlessStateSource,
     deploymentUnapplied(deploymentController.workspace),
   );
-  // Manual Cartesian defaults: the Applied Program's, tightened at once by an
-  // unapplied Draft that is stricter (a looser Draft waits for Apply).
+  // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
   const programCartesianDefaults = useMemo(() => {
     if (catalog.status !== 'ready') return null;
@@ -323,14 +322,10 @@ export default function App() {
         maxBlendDeviationRad: configuration.configuration.values.max_blend_deviation_rad,
       } : null;
     };
-    const authoring = programController.state.workspace?.draft.authoring ?? null;
-    return stricterCartesianDefaults(
-      appliedProgram === null
-        ? null
-        : defaults({ parameters: appliedProgram.program.parameters, forest: [appliedProgram.program.tree] }),
-      authoring === null ? null : defaults(authoring),
-    );
-  }, [appliedProgram, catalog, programController.state.workspace?.draft.authoring]);
+    return appliedCartesianDefaults(appliedProgram === null
+      ? null
+      : defaults({ parameters: appliedProgram.program.parameters, forest: [appliedProgram.program.tree] }));
+  }, [appliedProgram, catalog]);
   const robotControl = useRobotControl(
     headlessEnabled,
     programRuntime.cycleState !== null
@@ -342,6 +337,8 @@ export default function App() {
     headlessSnapshot,
     headlessStateSource,
     programCartesianDefaults,
+    programController.state.workspace?.hasUnappliedChanges === true
+      || deploymentUnapplied(deploymentController.workspace),
   );
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({

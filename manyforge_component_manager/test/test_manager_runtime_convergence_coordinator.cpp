@@ -123,7 +123,7 @@ MaterializeRuntimePackage(const std::filesystem::path &root,
             nullptr);
     const auto applicability = deployment::qualify_cell_applicability(
         composition, deployment.applicability_inputs(),
-        std::span<const deployment::QualifiedRuntimeProfile>{}, {}, {}, {}, {},
+        std::span<const deployment::QualifiedRuntimeProfile>{}, {}, {}, {},
         {}, {}, {}, {}, {}, selected_overlay);
     auto compiler = deployment::compile_cell_ir(applicability);
     auto qualified =

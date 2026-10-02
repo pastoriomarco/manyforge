@@ -23,7 +23,6 @@ enum class CatalogRecordKind : std::uint8_t {
   kCapabilityDefinition,
   kContactPolicy,
   kStopEvidencePolicy,
-  kRuntimePolicy,
 };
 
 template <CatalogRecordKind Kind, typename Id, typename Revision>
@@ -73,9 +72,6 @@ using ContactPolicyCatalogRecordRefDTO =
 using StopEvidencePolicyCatalogRecordRefDTO =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kStopEvidencePolicy, StopEvidencePolicyId,
                              StopEvidencePolicyRevision>;
-using RuntimePolicyCatalogRecordRefDTO =
-    TypedCatalogRecordRefDTO<CatalogRecordKind::kRuntimePolicy, RuntimePolicyId,
-                             RuntimePolicyRevision>;
 
 /// Closed tagged union. The selected alternative fixes both record_id and
 /// record_revision types; an ID/revision pair from different registry rows
@@ -85,8 +81,7 @@ using CatalogRecordRefDTO =
                  ComponentTypeCatalogRecordRefDTO, ControlInterfaceContractCatalogRecordRefDTO,
                  ControllerTopologyCatalogRecordRefDTO, ProviderManifestCatalogRecordRefDTO,
                  CommandSchemaCatalogRecordRefDTO, CapabilityDefinitionCatalogRecordRefDTO,
-                 ContactPolicyCatalogRecordRefDTO, StopEvidencePolicyCatalogRecordRefDTO,
-                 RuntimePolicyCatalogRecordRefDTO>;
+                 ContactPolicyCatalogRecordRefDTO, StopEvidencePolicyCatalogRecordRefDTO>;
 
 struct CatalogRecordTypeDescriptor {
   CatalogRecordKind record_kind;
@@ -99,7 +94,7 @@ struct CatalogRecordTypeDescriptor {
                          const CatalogRecordTypeDescriptor&) = default;
 };
 
-inline constexpr std::array<CatalogRecordTypeDescriptor, 11> kCatalogRecordTypeRegistry{{
+inline constexpr std::array<CatalogRecordTypeDescriptor, 10> kCatalogRecordTypeRegistry{{
     {CatalogRecordKind::kModelAsset, "model_asset", "model_asset_id", "model_revision",
      "manyforge.model_asset.v1"},
     {CatalogRecordKind::kRuntimeProfile, "runtime_profile", "runtime_profile_id",
@@ -121,8 +116,6 @@ inline constexpr std::array<CatalogRecordTypeDescriptor, 11> kCatalogRecordTypeR
      "manyforge.contact_policy.v1"},
     {CatalogRecordKind::kStopEvidencePolicy, "stop_evidence_policy", "stop_evidence_policy_id",
      "stop_evidence_policy_revision", "manyforge.stop_evidence_policy.v2"},
-    {CatalogRecordKind::kRuntimePolicy, "runtime_policy", "runtime_policy_id",
-     "runtime_policy_revision", "manyforge.runtime_policy.v1"},
 }};
 
 static_assert(std::variant_size_v<CatalogRecordRefDTO> == kCatalogRecordTypeRegistry.size());

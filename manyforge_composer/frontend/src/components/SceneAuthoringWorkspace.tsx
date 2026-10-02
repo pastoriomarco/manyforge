@@ -14,6 +14,7 @@ import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
 import {
   useExecutionObservationTransport,
   useShellHeadlessState,
@@ -2093,6 +2094,21 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   // Shown execution groups are a Program setting: the checkboxes edit the
   // Draft, and the Motion panel follows the Applied Program after Apply.
   const draftProgram = programController.state.workspace?.draft.authoring ?? null;
+  const draftGroupScopes = useMemo(() => draftProgram === null ? [] : executionGroupScopes(
+    draftProgram.forest, Object.keys(draftProgram.execution_groups ?? {}),
+  ), [draftProgram]);
+  // Robot names come only from the Applied binding, and only while the Draft
+  // is exactly that Applied revision; otherwise the Draft's component roles.
+  const programWorkspace = programController.state.workspace;
+  const appliedSelection = programRuntime.state.applied;
+  const draftBindingAuthoritative = programWorkspace?.applied.matchesDraft === true
+    && appliedSelection !== null
+    && programWorkspace.applied.programRevision === appliedSelection.programRevision
+    && programWorkspace.draft.programRevision === appliedSelection.programRevision;
+  const draftGroupTargetLabels = useMemo(() => executionGroupTargetLabels(
+    draftProgram?.target_roles,
+    draftBindingAuthoritative && appliedSelection !== null ? appliedSelection.programBinding : null,
+  ), [appliedSelection, draftBindingAuthoritative, draftProgram]);
   const appliedHidden = programRuntime.state.applied?.program.viewer?.hidden_execution_groups;
   const appliedViewer = programRuntime.state.applied?.program.viewer;
   const differs = (read: (viewer: ProgramViewerMetadata | undefined) => unknown) => (
@@ -2106,7 +2122,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       || differs((viewer) => viewer?.scene_resource_axes_visibility),
   };
   const draftGroupVisibility: DraftGroupVisibility | null = draftProgram === null ? null : {
-    groupIds: ['all', ...Object.keys(draftProgram.execution_groups ?? {}).sort()],
+    scopes: draftGroupScopes,
+    targetLabels: draftGroupTargetLabels,
     hidden: draftProgram.viewer?.hidden_execution_groups,
     pendingApply: JSON.stringify(draftProgram.viewer?.hidden_execution_groups ?? null)
       !== JSON.stringify(appliedHidden ?? null),
@@ -2206,15 +2223,21 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onObjectAxesVisibleIdsChange={changeObjectAxesVisibleIds}
       onAxesSizesCommit={onAxesSizesCommit}
       robotControlSurface={(
-        <RobotControlPanelView
-          enabled={runtimeEnabled}
-          controller={robotControl}
-          program={programRuntime}
-          draft={programController}
-          sourceFrameNames={sourceFrameNames}
-          controlBasePoseInCell={controlBasePoseInCell}
-          gizmo={gizmo}
-        />
+        <>
+          <DraftScenePreviewNotice
+            shown={programDraftPreview}
+            onShowRuntimeScene={() => setSceneSourceChoice('applied')}
+          />
+          <RobotControlPanelView
+            enabled={runtimeEnabled}
+            controller={robotControl}
+            program={programRuntime}
+            sourceFrameNames={sourceFrameNames}
+            controlBasePoseInCell={controlBasePoseInCell}
+            runtimeScene={facts?.logicalScene ?? null}
+            gizmo={gizmo}
+          />
+        </>
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
       robotMotionActive={robotControlHasActiveOperation(robotControl.state)}
@@ -2243,6 +2266,26 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     </Suspense>
   );
 });
+
+/**
+ * Warn that the viewport shows the unapplied Draft Scene, not the collision
+ * Scene motion is planned against, and offer the runtime Scene instead.
+ */
+export function DraftScenePreviewNotice({
+  shown,
+  onShowRuntimeScene,
+}: {
+  shown: boolean;
+  onShowRuntimeScene: () => void;
+}) {
+  if (!shown) return null;
+  return (
+    <p className="central-inspector-notice notice severity-warning notice-strip" role="status">
+      Showing Draft Scene preview, not the collision scene used for motion.
+      {' '}<button type="button" onClick={onShowRuntimeScene}>Show runtime Scene</button>
+    </p>
+  );
+}
 
 export function SceneAuthoringWorkspace({
   editorTarget,

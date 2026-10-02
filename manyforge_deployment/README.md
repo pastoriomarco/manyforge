@@ -193,10 +193,9 @@ The one human/LLM authoring input for the seven N6 deployments is
 `resources/maintained/maintained_deployment_sources.v1.json`. Its strict check
 pins the three shared model-family sources and their exact frame, group, joint,
 collision-body, root, and source-path meanings; seven historical deployment
-blobs; Program-to-component/target role assignments; and the exact speed/grasp
-restoration records. Those policy records are obligations for I8/I11, not an
-alternative runtime policy source and not a claim that N6 accepts the top-level
-deployment `policies` block.
+blobs; and Program-to-component/target role assignments. It carries no
+policy restoration records: the runtime-policy record (with its open-loop
+grasp acknowledgements) was removed by maintainer decision 8(b), 2026-10-01.
 
 The build target `manyforge_maintained_model_catalog` derives the three shared
 `resources/maintained/model_assets/*.model_asset.json` referents from that one

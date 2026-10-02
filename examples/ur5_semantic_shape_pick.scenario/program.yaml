@@ -142,7 +142,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.3.0"
+    "content_version": "2.4.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -232,33 +232,24 @@
             "output_key": "selection.response",
             "prompt_template_id": "select_scene_object_v1",
             "scene_attachment": "none",
-            "template_variables": [
-              {
-                "source": {
-                  "field": "candidate_object_ids",
-                  "kind": "blackboard_field",
-                  "reference": "selection.context"
-                },
-                "variable_id": "candidate_object_ids"
-              },
-              {
-                "source": {
-                  "field": "scene_context_json",
-                  "kind": "blackboard_field",
-                  "reference": "selection.context"
-                },
-                "variable_id": "scene_context_json"
-              },
-              {
-                "source": {
-                  "field": "selection_request_text",
-                  "kind": "blackboard_field",
-                  "reference": "selection.context"
-                },
-                "variable_id": "selection_request_text"
-              }
-            ],
             "timeout_s": 20.0
+          },
+          "value_sources": {
+            "template_variables.candidate_object_ids": {
+              "field": "candidate_object_ids",
+              "kind": "blackboard_field",
+              "reference": "selection.context"
+            },
+            "template_variables.scene_context_json": {
+              "field": "scene_context_json",
+              "kind": "blackboard_field",
+              "reference": "selection.context"
+            },
+            "template_variables.selection_request_text": {
+              "field": "selection_request_text",
+              "kind": "blackboard_field",
+              "reference": "selection.context"
+            }
           }
         },
         {
@@ -392,7 +383,7 @@
         {
           "children": [],
           "instance_id": "close_gripper",
-          "node_id": "logic.set_bool",
+          "node_id": "logic.set_value",
           "parameters": {
             "key": "gripper_closed",
             "value": true
@@ -520,7 +511,7 @@
         {
           "children": [],
           "instance_id": "open_gripper",
-          "node_id": "logic.set_bool",
+          "node_id": "logic.set_value",
           "parameters": {
             "key": "gripper_closed",
             "value": false

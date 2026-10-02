@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-24 13:29:10 UTC
+  Last regenerated: 2026-10-01 11:19:24 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -6840,6 +6840,21 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "CartesianPathRequest",
         "type": "object"
       },
+      "CellFrameReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "cell_frame",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "CellFrameReferenceRequest",
+        "type": "object"
+      },
       "CommandDurationOptionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6882,10 +6897,21 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "FrameRoleReferenceRequest": {
         "additionalProperties": false,
+        "description": "A frame role of the moving robot, or of `target` when it is named.",
         "properties": {
           "frame_role_id": {
             "title": "Frame Role Id",
             "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ReferenceTargetRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "type": {
             "const": "frame_role",
@@ -7178,6 +7204,35 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Contact Policy Id"
           },
+          "goal_frame_reference": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
+                    "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
+                    "scene_resource": "#/components/schemas/SceneResourceReferenceRequest"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/CellFrameReferenceRequest"
+                  },
+                  {
+                    "$ref": "#/$defs/FrameRoleReferenceRequest"
+                  },
+                  {
+                    "$ref": "#/$defs/SceneResourceReferenceRequest"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Frame Reference"
+          },
           "kind": {
             "const": "motion",
             "title": "Kind",
@@ -7222,6 +7277,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               {
                 "discriminator": {
                   "mapping": {
+                    "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
                     "component_body_role": "#/components/schemas/ComponentBodyRoleReferenceRequest",
                     "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
                     "pose": "#/components/schemas/InlinePoseReferenceRequest",
@@ -7231,6 +7287,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   "propertyName": "type"
                 },
                 "oneOf": [
+                  {
+                    "$ref": "#/$defs/CellFrameReferenceRequest"
+                  },
                   {
                     "$ref": "#/$defs/FrameRoleReferenceRequest"
                   },
@@ -7294,6 +7353,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               {
                 "discriminator": {
                   "mapping": {
+                    "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
                     "component_body_role": "#/components/schemas/ComponentBodyRoleReferenceRequest",
                     "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
                     "pose": "#/components/schemas/InlinePoseReferenceRequest",
@@ -7303,6 +7363,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   "propertyName": "type"
                 },
                 "oneOf": [
+                  {
+                    "$ref": "#/$defs/CellFrameReferenceRequest"
+                  },
                   {
                     "$ref": "#/$defs/FrameRoleReferenceRequest"
                   },
@@ -7674,6 +7737,31 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "w"
         ],
         "title": "QuaternionRequest",
+        "type": "object"
+      },
+      "ReferenceTargetRequest": {
+        "additionalProperties": false,
+        "description": "The robot owning a robot-qualified frame, from the exact Program Binding.",
+        "properties": {
+          "command_target_id": {
+            "title": "Command Target Id",
+            "type": "string"
+          },
+          "controllable_component_id": {
+            "title": "Controllable Component Id",
+            "type": "string"
+          },
+          "target_role_id": {
+            "title": "Target Role Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_role_id",
+          "controllable_component_id",
+          "command_target_id"
+        ],
+        "title": "ReferenceTargetRequest",
         "type": "object"
       },
       "RuntimeObjectReferenceBindingRequest": {

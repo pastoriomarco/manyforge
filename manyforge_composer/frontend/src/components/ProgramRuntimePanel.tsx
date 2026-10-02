@@ -10,12 +10,24 @@ import type {
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
-import { appliedExecutionSelectionRows, shownExecutionGroupIds } from '../state/programExecutionGroups';
+import {
+  appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
+  executionGroupTargetLabels, executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
+  executionSelectionIsQuiescent, type ExecutionGroupFallback, type ExecutionGroupScope,
+} from '../state/programExecutionGroups';
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup } from './ProgramRunSetup';
+import {
+  BlackboardValueEditor,
+  blackboardValueDraft,
+  blackboardValueDraftIssue,
+  blackboardValueEditable,
+  parseBlackboardValueDraft,
+} from './BlackboardValueEditor';
+import { PersistentKeyValuesSection } from './PersistentKeyValues';
 import {
   usePublishWorkbenchNotices,
   type WorkbenchNotice,
@@ -81,28 +93,6 @@ function cycleFailureMessage(failure: Record<string, JsonValue> | null): string 
   return typeof code === 'string' ? code.replaceAll('_', ' ') : null;
 }
 
-function parseRuntimeValue(type: string, source: string): JsonValue {
-  const trimmed = source.trim();
-  if (type === 'string') return source;
-  if (type === 'bool' || type === 'boolean') {
-    if (trimmed === 'true') return true;
-    if (trimmed === 'false') return false;
-    throw new Error('Enter true or false.');
-  }
-  if (/^(u?int)(8|16|32|64)?$/.test(type)) {
-    if (!/^-?\d+$/.test(trimmed)) throw new Error('Enter a whole number.');
-    const value = Number(trimmed);
-    if (!Number.isSafeInteger(value)) throw new Error('Enter a safe whole number.');
-    return value;
-  }
-  if (/^(float|double)(32|64)?$/.test(type)) {
-    const value = Number(trimmed);
-    if (!Number.isFinite(value)) throw new Error('Enter a finite number.');
-    return value;
-  }
-  return JSON.parse(trimmed) as JsonValue;
-}
-
 export function ProgramRuntimePanel({
   enabled,
   controller,
@@ -118,18 +108,33 @@ export function ProgramRuntimePanel({
     materializePromotion,
     promotionMaterializationReason,
     writeRuntimeBlackboard,
+    persistentValues,
+    commandAllowed,
+    commandDisabledReason,
     stageManualResult,
   } = controller;
   const [blackboardKey, setBlackboardKey] = useState('');
-  const [blackboardValue, setBlackboardValue] = useState('');
+  const [blackboardDraft, setBlackboardDraft] = useState('');
+  const [blackboardPoseIssue, setBlackboardPoseIssue] = useState<string | null>(null);
   const [blackboardError, setBlackboardError] = useState<string | null>(null);
+  const [blackboardWritten, setBlackboardWritten] = useState<string | null>(null);
   const [manualOutput, setManualOutput] = useState('null');
   const [manualError, setManualError] = useState<string | null>(null);
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
   const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
-  const writableKeys = (state.applied?.program.blackboard?.keys ?? []).filter(
-    (key) => key.access === 'write' || key.access === 'read_write',
+  const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
+  // Operator writes follow the key's access and use its typed editor; a
+  // computed key always holds its formula's result.
+  const writableKeys = declaredKeys.filter((key) => (
+    (key.access === 'write' || key.access === 'read_write')
+    && key.expression === undefined
+    && blackboardValueEditable(key.type)
+  ));
+  const hasPersistentKeys = declaredKeys.some((key) => key.persistence === 'persistent');
+  const sceneResourceIds = useMemo(
+    () => (state.applied?.program.scene ?? []).map((resource) => resource.scene_resource_id),
+    [state.applied],
   );
   // Live motion of the whole Program, from the owner's group projection
   // (the Kernel's active-operation count is only set while a Stop settles).
@@ -146,10 +151,23 @@ export function ProgramRuntimePanel({
   const hasAdvanced = enabled && (
     controls !== null
     || (state.run !== null && writableKeys.length > 0)
+    || hasPersistentKeys
   );
   const selectedBlackboardKey = writableKeys.find(
     (key) => key.key === blackboardKey,
   ) ?? null;
+  // The backend says when writes are refused (for example after Halt).
+  const blackboardWriteRefusal = commandAllowed('program_runtime_blackboard_write')
+    ? null
+    : commandDisabledReason('program_runtime_blackboard_write')
+      ?? 'writes are allowed only while the run is running or paused on a failure';
+  const blackboardIssue = selectedBlackboardKey === null
+    ? null
+    : blackboardPoseIssue ?? blackboardValueDraftIssue(
+      selectedBlackboardKey.type,
+      blackboardDraft,
+      sceneResourceIds,
+    );
 
   return (
     <section className="panel program-runtime-panel" aria-labelledby="program-runtime-title">
@@ -370,7 +388,7 @@ export function ProgramRuntimePanel({
       {/* Rarely needed tools, kept out of the way; they exist only during a
           run, so the section is shown only when it has content. */}
       {hasAdvanced && <details className="runtime-advanced">
-        <summary>Advanced: runtime overrides, blackboard and audit</summary>
+        <summary>Advanced: runtime overrides, blackboard, stored values and audit</summary>
       {enabled && controls !== null && (
         <section className="runtime-control-section" aria-labelledby="runtime-overrides-title">
           <div className="runtime-control-heading">
@@ -453,9 +471,14 @@ export function ProgramRuntimePanel({
             <select
               value={blackboardKey}
               onChange={(event) => {
+                const key = writableKeys.find((row) => row.key === event.currentTarget.value);
                 setBlackboardKey(event.currentTarget.value);
-                setBlackboardValue('');
+                setBlackboardDraft(key === undefined
+                  ? ''
+                  : blackboardValueDraft(key.type, key.initial, sceneResourceIds));
+                setBlackboardPoseIssue(null);
                 setBlackboardError(null);
+                setBlackboardWritten(null);
               }}
             >
               <option value="">Choose a key</option>
@@ -466,43 +489,79 @@ export function ProgramRuntimePanel({
               ))}
             </select>
           </label>
-          <label className="runtime-control-field">
-            <span>Value{selectedBlackboardKey ? ` (${selectedBlackboardKey.type})` : ''}</span>
-            <input
-              value={blackboardValue}
-              disabled={selectedBlackboardKey === null}
-              onChange={(event) => {
-                setBlackboardValue(event.currentTarget.value);
-                setBlackboardError(null);
+          {selectedBlackboardKey !== null && (
+            <BlackboardValueEditor
+              // Another key starts its own fields: unfinished text of the
+              // previous key's pose is not shown over the new draft.
+              key={selectedBlackboardKey.key}
+              id="runtime-blackboard-value"
+              label={`Value (${selectedBlackboardKey.type})`}
+              type={selectedBlackboardKey.type}
+              draft={blackboardDraft}
+              sceneResourceIds={sceneResourceIds}
+              frameScope={state.applied === null ? undefined : {
+                program: state.applied.program,
+                ...(selectedBlackboardKey.allowed_frames === undefined
+                  ? {}
+                  : { allowedFrames: selectedBlackboardKey.allowed_frames }),
               }}
+              disabled={state.controlPending !== null}
+              onDraftChange={(draft) => {
+                setBlackboardDraft(draft);
+                setBlackboardError(null);
+                setBlackboardWritten(null);
+              }}
+              onInvalidChange={setBlackboardPoseIssue}
             />
-          </label>
-          {blackboardError && <p className="inline-message severity-error">{blackboardError}</p>}
+          )}
+          {blackboardWriteRefusal !== null && (
+            <p className="hint" role="status">
+              Writes are refused now: {blackboardWriteRefusal.replaceAll('_', ' ')}.
+            </p>
+          )}
+          {blackboardIssue !== null && (
+            <p className="inline-message severity-error">{blackboardIssue}</p>
+          )}
+          {blackboardError && (
+            <p className="inline-message severity-error" role="alert">
+              Not written: {blackboardError}
+            </p>
+          )}
+          {blackboardWritten && <p className="hint" role="status">{blackboardWritten}</p>}
           <button
             type="button"
             disabled={
               selectedBlackboardKey === null
+              || blackboardIssue !== null
+              || blackboardWriteRefusal !== null
               || state.controlPending !== null
             }
             onClick={() => {
               if (selectedBlackboardKey === null) return;
-              try {
-                const value = parseRuntimeValue(
-                  selectedBlackboardKey.type,
-                  blackboardValue,
-                );
-                setBlackboardError(null);
-                writeRuntimeBlackboard(selectedBlackboardKey.key, value);
-              } catch (error) {
-                setBlackboardError(
-                  error instanceof Error ? error.message : 'Value is invalid.',
-                );
-              }
+              const { key, type } = selectedBlackboardKey;
+              const value = parseBlackboardValueDraft(type, blackboardDraft, sceneResourceIds);
+              setBlackboardError(null);
+              setBlackboardWritten(null);
+              void writeRuntimeBlackboard(key, value).then((refusal) => {
+                if (refusal === null) setBlackboardWritten(`Wrote ${key}.`);
+                else setBlackboardError(refusal);
+              });
             }}
           >
             Write current-run value
           </button>
         </section>
+      )}
+
+      {enabled && hasPersistentKeys && state.applied !== null && (
+        <PersistentKeyValuesSection
+          scenarioId={state.applied.scenarioId}
+          appliedRevision={state.applied.programRevision}
+          runId={state.run?.capture.programRunId ?? null}
+          sceneResourceIds={sceneResourceIds}
+          frameProgram={state.applied.program}
+          client={persistentValues}
+        />
       )}
 
       {controls !== null && controls.audit.length > 0 && (
@@ -727,6 +786,18 @@ export function deriveTransportGuidance({
   return notices;
 }
 
+/** Operator explanation for an automatically revealed All column. */
+export function executionGroupFallbackMessage(fallback: ExecutionGroupFallback): string {
+  switch (fallback) {
+    case 'uncovered':
+      return 'All is shown because the chosen groups leave some move, gripper or I/O nodes without a visible control.';
+    case 'empty':
+      return 'All is shown because the chosen visibility shows no group.';
+    case 'membership_unavailable':
+      return 'All is shown because group membership is unavailable: the current run was captured from a different Program revision than the Applied Program, so coverage is not inferred.';
+  }
+}
+
 /**
  * Execution groups of the Applied Program and which of them the Motion panel
  * shows: the Applied Program's viewer choice, so hiding a group takes effect
@@ -738,28 +809,48 @@ function useTransportGroups(program: ProgramRuntimeController) {
     () => appliedExecutionSelectionRows(state.applied),
     [state.applied],
   );
+  const capturedRevision = state.run?.capture.programRevision;
+  // Applied membership describes the run only when the run captured that revision.
+  const membershipKnown = state.applied !== null
+    && (capturedRevision === undefined || capturedRevision === state.applied.programRevision);
+  const scopes = useMemo(() => !membershipKnown || state.applied === null ? [] : executionGroupScopes(
+    [state.applied.program.tree], Object.keys(state.applied.program.execution_groups ?? {}),
+  ), [state.applied, membershipKnown]);
+  // Robot names only from the binding of exactly that Applied revision.
+  const targetLabels = useMemo(() => !membershipKnown || state.applied === null ? {}
+    : executionGroupTargetLabels(state.applied.program.target_roles, state.applied.programBinding),
+  [state.applied, membershipKnown]);
   const projectedSelections = state.controls?.executionSelections.groups;
   const selections = projectedSelections !== undefined && projectedSelections.length > 0
     ? projectedSelections
     : appliedSelections;
   const allGroup = selections.find((group) => group.groupId === 'all');
   const namedGroups = selections.filter((group) => group.groupId !== 'all');
-  const groupIds = shownExecutionGroupIds(
+  const display = executionGroupDisplay(
     selections.map((group) => group.groupId),
     state.applied?.program.viewer?.hidden_execution_groups,
+    scopes,
   );
-  const visibleGroups = selections.filter((group) => groupIds.includes(group.groupId));
-  // Only named groups the Program hides: "all" is hidden by default whenever
-  // named groups exist, and is not worth a badge.
+  const visibleGroups = selections.filter((group) => display.shown.includes(group.groupId));
+  // Count deliberately hidden named groups; All is a coverage fallback, not a hidden-group badge.
   const hiddenGroupCount = namedGroups
-    .filter((group) => !groupIds.includes(group.groupId)).length;
-  return { selections, allGroup, visibleGroups, hiddenGroupCount };
+    .filter((group) => !display.shown.includes(group.groupId)).length;
+  const groupTitle = (groupId: string) => {
+    const targets = scopes.find((scope) => scope.groupId === groupId)?.targetRoleIds ?? [];
+    return targets.length === 0 ? groupId
+      : `${groupId}: ${targets.map((id) => targetLabels[id] ?? id).join(', ')}`;
+  };
+  return {
+    selections, allGroup, visibleGroups, hiddenGroupCount, fallback: display.fallback, groupTitle,
+  };
 }
 
 /** The Draft Program's choice of shown execution groups (a Program setting). */
 export interface DraftGroupVisibility {
-  /** The Draft's groups, including "all". */
-  groupIds: string[];
+  /** The Draft's memberships, including "all". Never used for runtime admission. */
+  scopes: ExecutionGroupScope[];
+  /** Target-role labels; robot names only from an authoritative binding. */
+  targetLabels?: Record<string, string>;
   hidden: string[] | undefined;
   /** The Draft's choice differs from the Applied Program's. */
   pendingApply: boolean;
@@ -771,7 +862,8 @@ export interface DraftGroupVisibility {
  * Motion panel settings, shown in the 3D viewer's settings panel. Displayed
  * groups are a Program setting (they take effect with Apply); layout and
  * confirmations are installation settings. Halt and Stop are never hidden or
- * confirmed away.
+ * confirmed away. Checkboxes show the saved preference; an automatically
+ * revealed All is marked, never saved.
  */
 export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility | null }) {
   const composerSettings = useComposerSettings();
@@ -779,35 +871,47 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
   const setPreferences = (change: Partial<ComposerSettings['motionPanel']>) => composerSettings.update(
     (current) => ({ ...current, motionPanel: { ...current.motionPanel, ...change } }),
   );
-  const shown = groups === null ? [] : shownExecutionGroupIds(groups.groupIds, groups.hidden);
+  const groupIds = groups?.scopes.map((scope) => scope.groupId) ?? [];
+  const display = groups === null ? null : executionGroupDisplay(groupIds, groups.hidden, groups.scopes);
+  const preferred = display?.preferred ?? [];
   const toggle = (groupId: string, visible: boolean) => {
     if (groups?.onChange === undefined) return;
-    const next = visible
-      ? shown.filter((id) => id !== groupId).concat(groupId)
-      : shown.filter((id) => id !== groupId);
-    // At least one group stays shown.
-    if (next.length === 0) return;
-    groups.onChange(groups.groupIds.filter((id) => !next.includes(id)));
+    const change = executionGroupVisibilityChange(groupIds, groups.hidden, groups.scopes, groupId, visible);
+    if ('hidden' in change) groups.onChange(change.hidden);
   };
   return (
     <div className="drows">
-      {groups !== null && groups.groupIds.length > 1 && (
+      {groups !== null && groupIds.length > 0 && (
         <fieldset
           aria-label="Displayed groups"
           disabled={groups.onChange === undefined}
         >
           <SettingsSubheading title="Displayed groups" scope="program" />
-          {groups.groupIds.map((groupId) => (
-            <label className="toggle-control" key={groupId}>
+          {groups.scopes.map(({ groupId, hardwareNodeIds, targetRoleIds }) => {
+            const reason = preferred.includes(groupId)
+              ? executionGroupVisibilityUnavailableReason(groups.scopes, preferred.filter((id) => id !== groupId))
+              : null;
+            const automatic = groupId === 'all' && display?.fallback != null;
+            return <label className="toggle-control" key={groupId} title={reason ?? undefined}>
               <input
                 type="checkbox"
-                checked={shown.includes(groupId)}
-                disabled={shown.length === 1 && shown.includes(groupId)}
+                checked={preferred.includes(groupId)}
+                disabled={reason !== null}
                 onChange={(event) => toggle(groupId, event.target.checked)}
               />
               <span title={groupId}>{groupId === 'all' ? 'All groups' : groupId}</span>
-            </label>
-          ))}
+              {automatic && <span className="hint"> (shown automatically)</span>}
+              <span className="hint" title="Move, gripper command and I/O output nodes">
+                {hardwareNodeIds.length} hardware node{hardwareNodeIds.length === 1 ? '' : 's'}
+                {targetRoleIds.length > 0 && ` · ${targetRoleIds.map((id) => groups.targetLabels?.[id] ?? id).join(', ')}`}
+              </span>
+            </label>;
+          })}
+          {display?.fallback != null && (
+            <span className="hint">
+              {executionGroupFallbackMessage(display.fallback)} The saved choice is kept; check All to keep it shown.
+            </span>
+          )}
           {groups.pendingApply && <PendingApplyNote />}
           {groups.onChange === undefined && (
             <span className="hint">The Program Draft cannot be edited right now.</span>
@@ -888,7 +992,7 @@ export function ProgramTransportControls({
   const resetButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
   const {
-    selections, allGroup, visibleGroups, hiddenGroupCount,
+    selections, allGroup, visibleGroups, hiddenGroupCount, fallback: groupFallback, groupTitle,
   } = useTransportGroups(program);
   const selectionGroupPending = (
     groupId: string,
@@ -934,7 +1038,7 @@ export function ProgramTransportControls({
   const fullCellStop = robot.currentStatus?.cellStopAction
     ?? robot.state.status?.cellStopAction
     ?? null;
-  const allMotionQuiesced = allGroup?.state === 'ready' || allGroup?.state === 'held';
+  const allMotionQuiesced = state.runnerAvailable && executionSelectionIsQuiescent(allGroup);
   // Paused on a failed node: Retry retries it and resumes the motion the
   // failure pause stopped (backend), so it replaces Run/Resume meanwhile.
   const failureOffer = state.controls?.recoveryOffer ?? null;
@@ -1104,6 +1208,9 @@ export function ProgramTransportControls({
         <div className="transport-control-layout">
           <section className="transport-motion-panel" aria-label="Motion controls">
             <h3 className="transport-panel-title">Motion</h3>
+            {groupFallback !== null && (
+              <p className="hint" role="status">{executionGroupFallbackMessage(groupFallback)}</p>
+            )}
             <div className="transport-group-grid" aria-label="Motion group controls">
           {visibleGroups.length === 0 && (
             <p className="transport-groups-empty">
@@ -1240,7 +1347,7 @@ export function ProgramTransportControls({
                     aria-label={`Requested velocity ${scaleOutput}`}
                   >{scale?.pending ? '…' : scaleOutput}</output>
                 </label>
-                <span className="transport-group-name" title={group.groupId}>
+                <span className="transport-group-name" title={groupTitle(group.groupId)}>
                   {group.groupId === 'all' ? 'All groups' : group.groupId}
                 </span>
               </section>

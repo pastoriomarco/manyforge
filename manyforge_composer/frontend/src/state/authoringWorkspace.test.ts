@@ -45,6 +45,7 @@ function workspaceSnapshot(
         programRevision: `sha256:${'b'.repeat(64)}`,
         program: { api_version: 'manyforge.program.v2' } as unknown as ProgramDocument,
         diagnostics: [],
+        formulaReferences: { computedKeys: {}, nodes: {} },
       },
       saved: {
         available: true,

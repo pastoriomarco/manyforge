@@ -21,6 +21,29 @@ hardening done before the first tag was granted.
 
 ### Added
 
+- Program node groups can be selected with multiple checkboxes, inherited from
+  a branch, or left in All only, with a shortcut to group creation. Motion-panel
+  settings prevent hiding the last visible control covering any move and show
+  group motion counts and target/component roles. Older layouts reveal All
+  when necessary without changing saved preferences or runtime admission.
+
+- Reset/Halt accept owner-confirmed fully held mixed selections (Ready plus
+  Stopped work). The control parser no longer disconnects on that valid state;
+  partially held, stopping, faulted and unavailable selections remain unsettled.
+
+- Missing Program pose goals use a complete local pose seed, so editing one
+  coordinate or adding a frame can create a valid goal. Merely opening the
+  editor still leaves the Draft unchanged.
+
+- Manual motion may use the Applied configuration while authored edits remain
+  unapplied, with explicit runtime-versus-Draft warnings. Manual-operation
+  progress now updates through bounded existing control-stream deltas. Capturing
+  a move's current pose resolves the Applied robot binding and preserves the
+  observed base frame instead of confusing Program and manual-control roles.
+  Move-to shortcuts use Applied Program goals and runtime-published object
+  positions, never Draft positions. Live progress comes from the native events
+  response's in-memory samples, not the lifecycle-only journal.
+
 - **Contained-Apply workbench evidence preservation**: after an unknown-effect
   or later-phase Apply failure retains runtime restrictions, the simulated
   development workbench can stop with `--keep-evidence`, retain its quiescent

@@ -325,14 +325,6 @@ _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
         "lite6_isaac_commanded_v0"
     ),
 }
-_EXPECTED_OPEN_LOOP_SOURCES: Final = frozenset(
-    {
-        "examples/assistant_modes_scene_authoring.deployment.yaml",
-        "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
-        "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
-        *_I9_DEPLOYMENT_SOURCES,
-    }
-)
 _EXPECTED_ASSISTANT_PROFILES_SOURCE: Final = (
     "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json"
 )
@@ -542,17 +534,20 @@ _EXPECTED_ASSISTANT_REQUEST_CONTRACTS: Final = {
         "tool_call_family": "openai_chat_tools",
     },
 }
+_TEMPLATE_VARIABLE_TYPES: Final = frozenset(
+    {"bool", "float64", "int64", "string", "string_list"}
+)
 _EXPECTED_ASSISTANT_PROMPT_CONTRACTS: Final = {
     ("semantic_shape_selection", "select_scene_object_v1"): {
         "version": "1",
         "template_text_sha256": (
             "f5acfe169fa25ab07f94ec2711cf8872a96a869def7275a9b3be8f46418d83ef"
         ),
-        "variable_ids": (
-            "candidate_object_ids",
-            "scene_context_json",
-            "selection_request_text",
-        ),
+        "variables": {
+            "candidate_object_ids": "string_list",
+            "scene_context_json": "string",
+            "selection_request_text": "string",
+        },
         "response_contract": {
             "response_mode": "tool_call",
             "tool_name": "select_scene_object",
@@ -566,7 +561,7 @@ _EXPECTED_ASSISTANT_PROMPT_CONTRACTS: Final = {
         "template_text_sha256": (
             "8a1f6703c7aadaa2c427c43932a4b7c6bfe45468a02a221f130917a90f5e6314"
         ),
-        "variable_ids": (),
+        "variables": {},
         "response_contract": {"response_mode": "json_object"},
     },
     ("vision_pose_selection", "infer_grasp_pose_v1"): {
@@ -574,7 +569,7 @@ _EXPECTED_ASSISTANT_PROMPT_CONTRACTS: Final = {
         "template_text_sha256": (
             "29888cd8ca46c597e6fae283d3f7e2512092fe9f1a9874781c46da5754516c49"
         ),
-        "variable_ids": (),
+        "variables": {},
         "response_contract": {"response_mode": "json_object"},
     },
 }
@@ -1056,7 +1051,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                     {
                         "version",
                         "template_text",
-                        "variable_ids",
+                        "variables",
                         "response_contract",
                     }
                 ),
@@ -1085,28 +1080,14 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 template["template_text"],
                 path=f"{profile_path}.prompt_templates.{template_id}.template_text",
             )
-            variables = [
-                _identifier(
-                    item,
-                    path=(
-                        f"{profile_path}.prompt_templates.{template_id}"
-                        f".variable_ids[{variable_index}]"
-                    ),
-                )
-                for variable_index, item in enumerate(
-                    _array(
-                        template["variable_ids"],
-                        path=(
-                            f"{profile_path}.prompt_templates.{template_id}"
-                            ".variable_ids"
-                        ),
+            variables_path = f"{profile_path}.prompt_templates.{template_id}.variables"
+            variables = _object(template["variables"], path=variables_path)
+            for variable_id, variable_type in variables.items():
+                _identifier(variable_id, path=f"{variables_path} key")
+                if variable_type not in _TEMPLATE_VARIABLE_TYPES:
+                    raise SourceDescriptionError(
+                        f"{variables_path}.{variable_id} is outside the closed type set"
                     )
-                )
-            ]
-            _canonical_unique(
-                variables,
-                path=f"{profile_path}.prompt_templates.{template_id}.variable_ids",
-            )
             response_path = (
                 f"{profile_path}.prompt_templates.{template_id}.response_contract"
             )
@@ -1142,7 +1123,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 version != expected_template["version"]
                 or hashlib.sha256(template_text.encode("utf-8")).hexdigest()
                 != expected_template["template_text_sha256"]
-                or tuple(variables) != expected_template["variable_ids"]
+                or variables != expected_template["variables"]
                 or response != expected_template["response_contract"]
             ):
                 raise SourceDescriptionError(
@@ -1544,7 +1525,7 @@ def _validate_role_assignment(
     root: Path,
     component_occurrence_id: str,
     path: str,
-) -> tuple[set[str], str, tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...]]:
     row = _exact(
         value,
         required=frozenset(
@@ -1612,57 +1593,7 @@ def _validate_role_assignment(
             raise SourceDescriptionError(
                 f"{path}.target_roles.{role} changes the Program component role"
             )
-    return set(targets), scenario_id, aliases
-
-
-def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str:
-    row = _object(value, path=path)
-    kind = row.get("kind")
-    if kind == "open_loop_grasp_acknowledgement":
-        row = _exact(
-            row,
-            required=frozenset(
-                {
-                    "kind",
-                    "source_field",
-                    "target_role_id",
-                    "allowed",
-                    "scope",
-                    "rationale",
-                    "runtime_acceptance_step",
-                    "tool_acceptance_step",
-                    "acceptance_obligation_id",
-                }
-            ),
-            path=path,
-        )
-        if row["source_field"] != "grasp_risk_policy.open_loop_grasp":
-            raise SourceDescriptionError(
-                f"{path}.source_field is not the historical grasp field"
-            )
-        if row["allowed"] is not True or row["scope"] != "simulation":
-            raise SourceDescriptionError(
-                f"{path} changes the historical open-loop scope"
-            )
-        _text(row["rationale"], path=f"{path}.rationale")
-        if (
-            row["runtime_acceptance_step"] != "I8/P5"
-            or row["tool_acceptance_step"] != "I11/T"
-            or row["acceptance_obligation_id"] != "open_loop_grasp_scope_and_evidence"
-        ):
-            raise SourceDescriptionError(
-                f"{path} changes the deferred grasp owner/acceptance obligation"
-            )
-    else:
-        raise SourceDescriptionError(
-            f"{path}.kind is outside the closed restoration union"
-        )
-    target_role = _identifier(row["target_role_id"], path=f"{path}.target_role_id")
-    if target_role not in target_roles:
-        raise SourceDescriptionError(
-            f"{path}.target_role_id is absent from every Program assignment"
-        )
-    return kind
+    return scenario_id, aliases
 
 
 def validate(source: Path, root: Path) -> None:
@@ -1971,7 +1902,6 @@ def validate(source: Path, root: Path) -> None:
 
     deployment_sources: list[str] = []
     scenario_identifiers: set[str] = set()
-    open_loop_sources: set[str] = set()
     for index, raw_deployment in enumerate(
         _array(top["deployments"], path="$.deployments")
     ):
@@ -1995,7 +1925,6 @@ def validate(source: Path, root: Path) -> None:
             "runtime_restoration_profile_id",
             "component_occurrence_id",
             "program_role_assignments",
-            "policy_restoration_inputs",
         }
         if is_i9:
             deployment_fields.update(
@@ -2124,9 +2053,8 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path}.program_role_assignments must not be empty"
             )
-        all_target_roles: set[str] = set()
         for assignment_index, assignment in enumerate(assignment_rows):
-            target_roles, scenario_id, scenario_aliases = _validate_role_assignment(
+            scenario_id, scenario_aliases = _validate_role_assignment(
                 assignment,
                 root=root,
                 component_occurrence_id=occurrence,
@@ -2139,24 +2067,6 @@ def validate(source: Path, root: Path) -> None:
                         f"duplicates scenario identifier {identifier!r}"
                     )
                 scenario_identifiers.add(identifier)
-            all_target_roles.update(target_roles)
-        policy_rows = _array(
-            row["policy_restoration_inputs"], path=f"{path}.policy_restoration_inputs"
-        )
-        kinds: list[str] = []
-        for policy_index, policy in enumerate(policy_rows):
-            kind = _validate_policy(
-                policy,
-                target_roles=all_target_roles,
-                path=f"{path}.policy_restoration_inputs[{policy_index}]",
-            )
-            kinds.append(kind)
-        if len(kinds) != len(set(kinds)):
-            raise SourceDescriptionError(
-                f"{path} contains a duplicate runtime-policy kind"
-            )
-        if "open_loop_grasp_acknowledgement" in kinds:
-            open_loop_sources.add(deployment_source)
 
     if deployment_sources != sorted(deployment_sources) or len(
         set(deployment_sources)
@@ -2167,10 +2077,6 @@ def validate(source: Path, root: Path) -> None:
     if set(deployment_sources) != _EXPECTED_DEPLOYMENT_SOURCES:
         raise SourceDescriptionError(
             "the exact twelve maintained Deployment inputs are incomplete"
-        )
-    if open_loop_sources != _EXPECTED_OPEN_LOOP_SOURCES:
-        raise SourceDescriptionError(
-            "the exact eight historical open-loop inputs are incomplete"
         )
 
 

@@ -150,7 +150,7 @@ RetainedNativeCellRuntimeInput EmptyCellInput() {
       .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
       .engine = engine,
       .stop_execution_port = nullptr,
-      .runtime_policy = {},
+      .participant_policy = {},
       .prepared_motion_engine = nullptr,
       .default_operator_stop_profile = {},
       .default_fault_stop_profile = {},

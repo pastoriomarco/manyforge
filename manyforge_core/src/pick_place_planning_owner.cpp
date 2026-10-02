@@ -129,6 +129,25 @@ template <typename T>
   return found == binding.frame_bindings.end() || found->frame_role_id != role ? nullptr : &*found;
 }
 
+/// The carrier frame is a frame role of the tool target: an unresolved one is
+/// named with that target's role, so it never reads as a frame of the arm
+/// (spec 210 §4.4).
+template <typename T>
+[[nodiscard]] Result<T> carrier_frame_unresolved(std::string reason,
+                                                 const RuntimeParticipantBindingDTO& carrier,
+                                                 const FrameRoleId& carrier_frame_role_id) {
+  auto error = planning_error<T>(std::move(reason),
+                                 "carrier frame role is absent from the exact tool binding",
+                                 ErrorCode::kMissingReference)
+                   .error();
+  error.details.emplace("reference_type", "frame_role");
+  error.details.emplace("reference_id", carrier_frame_role_id.value());
+  if (!carrier.target_role_id.empty()) {
+    error.details.emplace("target_role_id", carrier.target_role_id.value());
+  }
+  return Result<T>::Err(std::move(error));
+}
+
 [[nodiscard]] bool exact_frame_receipt(const SceneFrameResolutionReceiptDTO& receipt,
                                        const ProjectionLeaseBindingDTO& projection_binding,
                                        const RuntimeParticipantBindingDTO& binding,
@@ -164,13 +183,25 @@ template <typename T>
       [](const ProgramContactGraspBindingDTO& candidate, const ContactPolicyId& selected) {
         return candidate.contact_policy_id < selected;
       });
-  if (policy == arm_binding.contact_grasp_bindings.end() ||
-      policy->contact_policy_id != policy_id || policy->runtime_object_id != runtime_object_id) {
-    return planning_error<std::vector<CollisionBodyRoleId>>(
-        "pick_contact_grasp_template_unresolved",
-        "pick contact policy does not resolve the selected Program runtime "
-        "object",
-        ErrorCode::kMissingReference);
+  const bool policy_bound =
+      policy != arm_binding.contact_grasp_bindings.end() && policy->contact_policy_id == policy_id;
+  if (!policy_bound || policy->runtime_object_id != runtime_object_id) {
+    // One reason for both causes. The message says which one happened; the
+    // details name the selected runtime object as the one reference and carry
+    // the contact policy beside it (spec 210 §4.4, §5.3).
+    auto unresolved =
+        planning_error<std::vector<CollisionBodyRoleId>>(
+            "pick_contact_grasp_template_unresolved",
+            policy_bound ? "pick contact policy is bound to a runtime object other than the "
+                           "selected Program runtime object"
+                         : "pick contact policy is absent from the exact arm contact-grasp "
+                           "bindings",
+            ErrorCode::kMissingReference)
+            .error();
+    unresolved.details.emplace("reference_type", "runtime_object");
+    unresolved.details.emplace("reference_id", runtime_object_id.value());
+    unresolved.details.emplace("contact_policy_id", policy_id.value());
+    return Result<std::vector<CollisionBodyRoleId>>::Err(std::move(unresolved));
   }
   std::vector<CollisionBodyRoleId> roles;
   for (const auto& body : policy->allowed_body_bindings) {
@@ -239,17 +270,21 @@ struct ResolvedPickOffsetBases final {
           "pick_offset_reference_invalid",
           "pick offset reference is malformed or has mismatched typed identity");
     }
-    if (selected->type == ReferenceDTO::Type::kFrameRole &&
+    if (selected->type == ReferenceDTO::Type::kFrameRole && !selected->target.has_value() &&
         std::get<FrameRoleId>(selected->id) == tcp_frame_role_id) {
       basis.use_candidate_tcp_orientation = true;
       return Result<void>::Ok();
     }
     if (selected->type == ReferenceDTO::Type::kRuntimeObject) {
       if (std::get<RuntimeObjectId>(selected->id) != intent.selected_runtime_object_id) {
-        return planning_error<void>(
+        auto unbound = planning_error<void>(
             "pick_offset_runtime_object_unbound",
             "pick offset reference names a runtime object other than the exact selected object",
             ErrorCode::kMissingReference);
+        auto error = unbound.error();
+        error.details.emplace("reference_type", "runtime_object");
+        error.details.emplace("reference_id", std::get<RuntimeObjectId>(selected->id).value());
+        return Result<void>::Err(std::move(error));
       }
       requires_runtime_object_binding = true;
     }
@@ -474,9 +509,8 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     return Result<PickPlacePlanningResultDTO>::Err(carrier.error());
   }
   if (find_frame(carrier.value(), intent.carrier_frame_role_id) == nullptr) {
-    return planning_error<PickPlacePlanningResultDTO>(
-        "pick_carrier_frame_unresolved", "carrier frame role is absent from the exact tool binding",
-        ErrorCode::kMissingReference);
+    return carrier_frame_unresolved<PickPlacePlanningResultDTO>(
+        "pick_carrier_frame_unresolved", carrier.value(), intent.carrier_frame_role_id);
   }
   auto roles = touch_roles(arm.value(), carrier.value(), *descend_motion->contact_policy_id,
                            intent.selected_runtime_object_id);
@@ -645,9 +679,8 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
     return Result<PickPlacePlanningResultDTO>::Err(carrier.error());
   }
   if (find_frame(carrier.value(), intent.carrier_frame_role_id) == nullptr) {
-    return planning_error<PickPlacePlanningResultDTO>(
-        "place_carrier_frame_unresolved",
-        "carrier frame role is absent from the exact tool binding", ErrorCode::kMissingReference);
+    return carrier_frame_unresolved<PickPlacePlanningResultDTO>(
+        "place_carrier_frame_unresolved", carrier.value(), intent.carrier_frame_role_id);
   }
 
   const ProjectionLeaseId predecessor_lease("pick-place:" + intent.sequence_id + ":predecessor");

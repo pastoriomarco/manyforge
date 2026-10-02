@@ -78,6 +78,11 @@ struct MotionParticipantIntentDTO final {
   /// resolves and validates these rows against the exact Program Binding and
   /// retained logical scene; equal spelling is never treated as proof.
   std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings{};
+  /// Absolute pose/Cartesian goal expressed in this frame instead of the
+  /// moving target's base frame. Resolved once at admission through the same
+  /// cell reference resolver as relative targets. Forbidden for relative or
+  /// joint/named motion and for inline poses.
+  std::optional<ReferenceDTO> goal_frame_reference{};
   friend bool operator==(const MotionParticipantIntentDTO&,
                          const MotionParticipantIntentDTO&) = default;
 };

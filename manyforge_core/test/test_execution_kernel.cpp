@@ -2486,7 +2486,7 @@ class ExecutionKernelTest : public ::testing::Test {
 
   /// Helper: execute and wait for async completion.
   Result<uint64_t> execute_sync(const ExecuteRequestDTO& req) {
-    if (req.target_mode == MotionTargetModeDTO::kRelative) {
+    if (req.target_mode == MotionTargetModeDTO::kRelative || req.goal_frame_reference.has_value()) {
       auto controlled = testing::make_test_controlled_state(
           req.binding, context.current_state_value.positions_rad,
           context.current_state_value.velocities_rad_s.empty()
@@ -3062,6 +3062,29 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_PoseReference_ResolvesToPoseGoa
 
   auto result = execute_sync(req);
   ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
+  const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.x_m, 0.25);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.y_m, -0.15);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.z_m, 0.3);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.orientation.w, 1.0);
+}
+
+TEST_F(ExecutionKernelTest, Execute_AbsolutePoseInGoalFrame_ResolvesFromAdmissionContext) {
+  ExecuteRequestDTO req = make_test_request("framed_absolute_pose");
+  req.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+  PoseGoalDTO framed_goal;
+  framed_goal.goal.position_m = {0.0, 0.0, 0.1};
+  framed_goal.goal.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = framed_goal;
+
+  Pose3DTO frame_in_base;
+  frame_in_base.position_m = {0.25, -0.15, 0.2};
+  frame_in_base.orientation = {0.0, 0.0, 0.0, 1.0};
+  context.next_reference_pose = Result<Pose3DTO>::Ok(frame_in_base);
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
   const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
   EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.x_m, 0.25);

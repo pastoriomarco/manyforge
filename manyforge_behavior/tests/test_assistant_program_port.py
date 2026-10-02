@@ -103,11 +103,11 @@ def _assistant_projection() -> dict[str, Any]:
                     "Select for {{selection_request_text}} from "
                     "{{candidate_object_ids}} using {{scene_context_json}}"
                 ),
-                "variable_ids": [
-                    "candidate_object_ids",
-                    "scene_context_json",
-                    "selection_request_text",
-                ],
+                "variables": {
+                    "candidate_object_ids": "string_list",
+                    "scene_context_json": "string",
+                    "selection_request_text": "string",
+                },
                 "version": "1",
             }
         ],
@@ -145,7 +145,7 @@ def _vision_assistant_projection(template_id: str) -> dict[str, Any]:
             "prompt_template_id": template_id,
             "response_contract": {"response_mode": "json_object"},
             "template_text": "Return one bounded vision result.",
-            "variable_ids": [],
+            "variables": {},
             "version": "1",
         }
     ]
@@ -405,48 +405,19 @@ def _query_inputs(
         parameters={
             "model_endpoint_alias": "selection_model",
             "prompt_template_id": "select_scene_object_v1",
-            "template_variables": [
-                {
-                    "variable_id": "candidate_object_ids",
-                    "source": {
-                        "kind": "blackboard_field",
-                        "reference": "selection.context",
-                        "field": "candidate_object_ids",
-                    },
-                },
-                {
-                    "variable_id": "scene_context_json",
-                    "source": {
-                        "kind": "blackboard_field",
-                        "reference": "selection.context",
-                        "field": "scene_context_json",
-                    },
-                },
-                {
-                    "variable_id": "selection_request_text",
-                    "source": {
-                        "kind": "blackboard_field",
-                        "reference": "selection.context",
-                        "field": "selection_request_text",
-                    },
-                },
-            ],
+            "template_variables": {
+                name: selection_context[name]
+                for name in (
+                    "candidate_object_ids",
+                    "scene_context_json",
+                    "selection_request_text",
+                )
+            },
             "scene_attachment": "none",
             "output_key": "selection.response",
             "timeout_s": timeout_s,
             "min_confidence": 0.7,
             "retry_on_parse_failure": retry_on_parse_failure,
-        },
-        embedded_values={
-            "/template_variables/0/source": selection_context[
-                "candidate_object_ids"
-            ],
-            "/template_variables/1/source": selection_context[
-                "scene_context_json"
-            ],
-            "/template_variables/2/source": selection_context[
-                "selection_request_text"
-            ],
         },
     )
 
@@ -621,6 +592,40 @@ def test_bind_requires_model_contract_only_for_programs_that_query_models() -> N
                     assistant_projection=_assistant_projection(),
                 )
             )
+    finally:
+        port.close()
+
+
+@pytest.mark.parametrize(
+    ("variables", "message"),
+    [
+        (
+            {"candidate_object_ids": "string_list", "scene_context_json": "string"},
+            "differ from the variables of its prompt template",
+        ),
+        (
+            {
+                "candidate_object_ids": "string_list",
+                "scene_context_json": "string",
+                "selection_request_text": "int64",
+            },
+            "'selection_request_text' is not the int64 value",
+        ),
+    ],
+)
+def test_bind_matches_query_template_variables_to_the_template_types(
+    variables, message
+) -> None:
+    projection = _assistant_projection()
+    projection["prompt_templates"][0]["variables"] = variables
+    port = ProgramAssistantPort(
+        _ModelTransport(),
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=_AuditSink(),
+    )
+    try:
+        with pytest.raises(ProgramAssistantPortError, match=message):
+            port.bind(_context(_program(), assistant_projection=projection))
     finally:
         port.close()
 

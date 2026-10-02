@@ -342,7 +342,6 @@ struct DecodedDeployment final {
     case core::CatalogRecordKind::kCapabilityDefinition:
     case core::CatalogRecordKind::kContactPolicy:
     case core::CatalogRecordKind::kStopEvidencePolicy:
-    case core::CatalogRecordKind::kRuntimePolicy:
       break;
     }
   }

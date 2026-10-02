@@ -2,7 +2,7 @@
   "api_version": "manyforge.program.v2",
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.3.0"
+    "content_version": "2.4.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -44,254 +44,122 @@
     {
       "children": [
         {
-          "node_id": "sequence",
-          "instance_id": "sequence",
-          "parameters": {},
-          "children": [
-            {
-              "children": [],
-              "execution_groups": [
-                "robot_group"
-              ],
-              "instance_id": "lite6_joint_motion",
-              "node_id": "motion.move_to_joint_target",
-              "parameters": {
-                "base_frame_role": "base",
-                "execution_timeout_s": 30,
-                "goal": [
-                  {
-                    "joint_name": "joint1",
-                    "position_rad": -0.1
-                  },
-                  {
-                    "joint_name": "joint2",
-                    "position_rad": -0.75
-                  },
-                  {
-                    "joint_name": "joint3",
-                    "position_rad": 0.95
-                  },
-                  {
-                    "joint_name": "joint4",
-                    "position_rad": 0
-                  },
-                  {
-                    "joint_name": "joint5",
-                    "position_rad": 1.57
-                  },
-                  {
-                    "joint_name": "joint6",
-                    "position_rad": 0
-                  }
-                ],
-                "planning_timeout_s": 10,
-                "target_role": "lite6_arm",
-                "tcp_frame_role": "tcp"
+          "children": [],
+          "execution_groups": [
+            "robot_group"
+          ],
+          "instance_id": "lite6_joint_motion",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.3
               },
-              "value_sources": {
-                "acceleration_scale": {
-                  "kind": "program_parameter",
-                  "reference": "acceleration_scale"
-                },
-                "max_tcp_linear_speed_mps": {
-                  "kind": "program_parameter",
-                  "reference": "max_tcp_linear_speed_mps"
-                },
-                "translation_tol_m": {
-                  "kind": "program_parameter",
-                  "reference": "translation_tol_m"
-                },
-                "velocity_scale": {
-                  "kind": "program_parameter",
-                  "reference": "velocity_scale"
-                }
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.55
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 1.05
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.35
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
               }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "lite6_arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
             },
-            {
-              "node_id": "motion.move_to_joint_target",
-              "instance_id": "lite6_joint_motion_2",
-              "parameters": {
-                "base_frame_role": "base",
-                "execution_timeout_s": 30,
-                "goal": [
-                  {
-                    "joint_name": "joint1",
-                    "position_rad": 0.3
-                  },
-                  {
-                    "joint_name": "joint2",
-                    "position_rad": -0.55
-                  },
-                  {
-                    "joint_name": "joint3",
-                    "position_rad": 1.05
-                  },
-                  {
-                    "joint_name": "joint4",
-                    "position_rad": 0
-                  },
-                  {
-                    "joint_name": "joint5",
-                    "position_rad": 1.35
-                  },
-                  {
-                    "joint_name": "joint6",
-                    "position_rad": 0
-                  }
-                ],
-                "planning_timeout_s": 10,
-                "target_role": "lite6_arm",
-                "tcp_frame_role": "tcp"
-              },
-              "value_sources": {
-                "acceleration_scale": {
-                  "kind": "program_parameter",
-                  "reference": "acceleration_scale"
-                },
-                "max_tcp_linear_speed_mps": {
-                  "kind": "program_parameter",
-                  "reference": "max_tcp_linear_speed_mps"
-                },
-                "translation_tol_m": {
-                  "kind": "program_parameter",
-                  "reference": "translation_tol_m"
-                },
-                "velocity_scale": {
-                  "kind": "program_parameter",
-                  "reference": "velocity_scale"
-                }
-              },
-              "execution_groups": [
-                "robot_group"
-              ],
-              "children": []
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
             }
-          ]
+          }
         },
         {
-          "node_id": "sequence",
-          "instance_id": "sequence_2",
-          "parameters": {},
-          "children": [
-            {
-              "children": [],
-              "execution_groups": [
-                "robot_group"
-              ],
-              "instance_id": "ur5e_joint_motion",
-              "node_id": "motion.move_to_joint_target",
-              "parameters": {
-                "base_frame_role": "base",
-                "execution_timeout_s": 30,
-                "goal": [
-                  {
-                    "joint_name": "shoulder_pan_joint",
-                    "position_rad": -0.25
-                  },
-                  {
-                    "joint_name": "shoulder_lift_joint",
-                    "position_rad": -1.43
-                  },
-                  {
-                    "joint_name": "elbow_joint",
-                    "position_rad": 1
-                  },
-                  {
-                    "joint_name": "wrist_1_joint",
-                    "position_rad": -1.4
-                  },
-                  {
-                    "joint_name": "wrist_2_joint",
-                    "position_rad": -1.57
-                  },
-                  {
-                    "joint_name": "wrist_3_joint",
-                    "position_rad": 0.25
-                  }
-                ],
-                "planning_timeout_s": 10,
-                "target_role": "ur5e_arm",
-                "tcp_frame_role": "tcp"
+          "children": [],
+          "execution_groups": [
+            "robot_group"
+          ],
+          "instance_id": "ur5e_joint_motion",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "shoulder_pan_joint",
+                "position_rad": -0.45
               },
-              "value_sources": {
-                "acceleration_scale": {
-                  "kind": "program_parameter",
-                  "reference": "acceleration_scale"
-                },
-                "max_tcp_linear_speed_mps": {
-                  "kind": "program_parameter",
-                  "reference": "max_tcp_linear_speed_mps"
-                },
-                "translation_tol_m": {
-                  "kind": "program_parameter",
-                  "reference": "translation_tol_m"
-                },
-                "velocity_scale": {
-                  "kind": "program_parameter",
-                  "reference": "velocity_scale"
-                }
+              {
+                "joint_name": "shoulder_lift_joint",
+                "position_rad": -1.35
+              },
+              {
+                "joint_name": "elbow_joint",
+                "position_rad": 1.2
+              },
+              {
+                "joint_name": "wrist_1_joint",
+                "position_rad": -1.4
+              },
+              {
+                "joint_name": "wrist_2_joint",
+                "position_rad": -1.57
+              },
+              {
+                "joint_name": "wrist_3_joint",
+                "position_rad": 0.25
               }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "ur5e_arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
             },
-            {
-              "node_id": "motion.move_to_joint_target",
-              "instance_id": "ur5e_joint_motion_2",
-              "parameters": {
-                "base_frame_role": "base",
-                "execution_timeout_s": 30,
-                "goal": [
-                  {
-                    "joint_name": "shoulder_pan_joint",
-                    "position_rad": -0.45
-                  },
-                  {
-                    "joint_name": "shoulder_lift_joint",
-                    "position_rad": -1.35
-                  },
-                  {
-                    "joint_name": "elbow_joint",
-                    "position_rad": 1.2
-                  },
-                  {
-                    "joint_name": "wrist_1_joint",
-                    "position_rad": -1.4
-                  },
-                  {
-                    "joint_name": "wrist_2_joint",
-                    "position_rad": -1.57
-                  },
-                  {
-                    "joint_name": "wrist_3_joint",
-                    "position_rad": 0.25
-                  }
-                ],
-                "planning_timeout_s": 10,
-                "target_role": "ur5e_arm",
-                "tcp_frame_role": "tcp"
-              },
-              "value_sources": {
-                "acceleration_scale": {
-                  "kind": "program_parameter",
-                  "reference": "acceleration_scale"
-                },
-                "max_tcp_linear_speed_mps": {
-                  "kind": "program_parameter",
-                  "reference": "max_tcp_linear_speed_mps"
-                },
-                "translation_tol_m": {
-                  "kind": "program_parameter",
-                  "reference": "translation_tol_m"
-                },
-                "velocity_scale": {
-                  "kind": "program_parameter",
-                  "reference": "velocity_scale"
-                }
-              },
-              "execution_groups": [
-                "robot_group"
-              ],
-              "children": []
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
             }
-          ]
+          }
         }
       ],
       "instance_id": "paired_joint_motion",
@@ -356,36 +224,7 @@
       "type": "float64"
     }
   ],
-  "positions": {
-    "sequence": {
-      "x": 384,
-      "y": 175
-    },
-    "paired_joint_motion": {
-      "x": 72,
-      "y": 333
-    },
-    "lite6_joint_motion": {
-      "x": 696,
-      "y": 96
-    },
-    "ur5e_joint_motion": {
-      "x": 696,
-      "y": 412
-    },
-    "sequence_2": {
-      "x": 384,
-      "y": 491
-    },
-    "lite6_joint_motion_2": {
-      "x": 696,
-      "y": 254
-    },
-    "ur5e_joint_motion_2": {
-      "x": 696,
-      "y": 570
-    }
-  },
+  "positions": {},
   "program_id": "ur5e_lite6_wall_grouped",
   "program_profile": "composable-cell-v1",
   "scene": [

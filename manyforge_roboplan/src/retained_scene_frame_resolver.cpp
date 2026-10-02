@@ -1,12 +1,15 @@
 #include <cmath>
+#include <functional>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/kinematic_state_view_provider.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -29,6 +32,129 @@ template <typename T>
   return core::Result<T>::Err(core::ErrorDTO{core::kErrorAmbiguousReference,
                                              std::move(message),
                                              {{"reason", std::move(reason)}}});
+}
+
+/// Stable wire name of one ReferenceDTO kind (spec 210 §4.4).
+[[nodiscard]] const char *
+reference_type_name(const core::ReferenceDTO::Type type) noexcept {
+  switch (type) {
+  case core::ReferenceDTO::Type::kFrameRole:
+    return "frame_role";
+  case core::ReferenceDTO::Type::kComponentBodyRole:
+    return "component_body_role";
+  case core::ReferenceDTO::Type::kSceneResource:
+    return "scene_resource";
+  case core::ReferenceDTO::Type::kRuntimeObject:
+    return "runtime_object";
+  case core::ReferenceDTO::Type::kPose:
+    return "pose";
+  case core::ReferenceDTO::Type::kCellFrame:
+    return "cell_frame";
+  }
+  return "pose";
+}
+
+/// The complete identity of the one reference a failure is about (spec 210
+/// §5.3). `target_role_id` is set only for a robot-qualified frame role.
+struct ReferenceIdentity final {
+  std::string reference_type;
+  std::string reference_id;
+  std::string target_role_id;
+};
+
+/// A requested reference. A cell frame is identified by the resolver's cell;
+/// an inline pose has no id.
+[[nodiscard]] ReferenceIdentity
+reference_identity(const core::ReferenceDTO &reference,
+                   const core::CellId &cell_id) {
+  return {reference_type_name(reference.type),
+          reference.type == core::ReferenceDTO::Type::kCellFrame
+              ? cell_id.value()
+              : std::string(core::reference_identity_value(reference)),
+          reference.target.has_value()
+              ? reference.target->target_role_id.value()
+              : std::string{}};
+}
+
+/// One resolved or scene frame: the cell frame by its cell, every model frame
+/// by its frame role. `target_role_id` qualifies a frame of a declared
+/// Program target, such as the moving target's own base frame.
+template <typename Frame>
+[[nodiscard]] ReferenceIdentity
+frame_identity(const Frame &frame,
+               const core::TargetRoleId *target_role_id = nullptr) {
+  if constexpr (requires { frame.cell_id; }) {
+    return {"cell_frame", frame.cell_id.value(), {}};
+  } else if constexpr (requires { frame.controllable_component_id; }) {
+    return {"frame_role", frame.frame_role_id.value(),
+            target_role_id != nullptr ? target_role_id->value()
+                                      : std::string{}};
+  } else {
+    // A passive model frame belongs to no Program target.
+    return {"frame_role", frame.frame_role_id.value(), {}};
+  }
+}
+
+template <typename... Frames>
+[[nodiscard]] ReferenceIdentity
+frame_identity(const std::variant<Frames...> &frame,
+               const core::TargetRoleId *target_role_id = nullptr) {
+  return std::visit(
+      [&](const auto &selected) {
+        return frame_identity(selected, target_role_id);
+      },
+      frame);
+}
+
+/// The moving target's own base frame, named with that target's role so a
+/// base-frame failure is never read as a frame of another robot.
+[[nodiscard]] ReferenceIdentity
+base_frame_identity(const core::ResolvedExecutionBindingDTO &binding) {
+  return frame_identity(binding.base_frame, &binding.target_role_id);
+}
+
+/// One runtime-object binding of a capture, by its runtime-object key.
+[[nodiscard]] ReferenceIdentity
+runtime_object_identity(const core::RuntimeObjectId &runtime_object_id) {
+  return {reference_type_name(core::ReferenceDTO::Type::kRuntimeObject),
+          runtime_object_id.value(),
+          {}};
+}
+
+/// Attaches `about` to a failure. Attribution is opt-in (spec 210 §5.3): only
+/// a site that knows which one reference failed passes its identity, so every
+/// other failure, including any new one, names no reference. The identity is
+/// written whole and never mixed with another reference's fields.
+[[nodiscard]] core::ErrorDTO about_reference(core::ErrorDTO error,
+                                             const ReferenceIdentity &about) {
+  error.details["reference_type"] = about.reference_type;
+  error.details["reference_id"] = about.reference_id;
+  if (about.target_role_id.empty()) {
+    error.details.erase("target_role_id");
+  } else {
+    error.details["target_role_id"] = about.target_role_id;
+  }
+  return error;
+}
+
+template <typename T>
+[[nodiscard]] core::Result<T> resolution_error(std::string reason,
+                                               std::string message,
+                                               const ReferenceIdentity &about) {
+  return core::Result<T>::Err(about_reference(
+      resolution_error<T>(std::move(reason), std::move(message)).error(),
+      about));
+}
+
+template <typename T>
+[[nodiscard]] core::Result<T>
+ambiguous_resolution_error(std::string reason, std::string message,
+                           const ReferenceIdentity &about) {
+  return core::Result<T>::Err(
+      about_reference(ambiguous_resolution_error<T>(std::move(reason),
+                                                    std::move(message))
+                          .error(),
+                      about));
 }
 
 [[nodiscard]] double
@@ -195,12 +321,9 @@ public:
   };
 
   Impl(collision::ManyForgeCollisionEngine::SharedModelPtr model,
-       RetainedSceneFrameResolverInput input,
-       std::vector<Source> sources,
-       std::unique_ptr<core::ImmutableKinematicStateViewProvider> view_provider)
+       RetainedSceneFrameResolverInput input, std::vector<Source> sources)
       : model_(std::move(model)), input_(std::move(input)),
-        sources_(std::move(sources)), view_provider_(std::move(view_provider)) {
-  }
+        sources_(std::move(sources)) {}
 
   [[nodiscard]] const Source *FindSource(const SourceKey &key) const noexcept {
     const auto found = std::lower_bound(
@@ -215,6 +338,80 @@ public:
                    found->context.control_binding_revision != key.second
                ? nullptr
                : &*found;
+  }
+
+  /// A robot is local only when this resolver owns at least one live state
+  /// source for it.
+  [[nodiscard]] bool
+  HostsRobot(const core::ControllableComponentId &component_id) const {
+    return std::any_of(sources_.begin(), sources_.end(),
+                       [&](const Source &source) {
+                         return source.context.controllable_component_id ==
+                                component_id;
+                       });
+  }
+
+  /// An object carried by a robot hosted elsewhere is refused by name, the
+  /// same as a frame of that robot. `about` is the requested reference the
+  /// object was reached through.
+  [[nodiscard]] core::Result<void>
+  RequireLocalCarrier(const core::SceneFrameRefDTO &carrier,
+                      const ReferenceIdentity &about) const {
+    const auto *component =
+        std::get_if<core::ComponentSceneFrameRefDTO>(&carrier);
+    if (component == nullptr ||
+        HostsRobot(component->controllable_component_id)) {
+      return core::Result<void>::Ok();
+    }
+    return core::Result<void>::Err(
+        resolution_error<core::ResolvedFrameDTO>(
+            "program_reference_robot_not_local",
+            "carried scene resource is held by a robot that is not hosted by "
+            "this cell resolver",
+            about)
+            .error());
+  }
+
+  /// Resolve one robot-qualified frame role through the cell-wide retained
+  /// target map. A robot hosted elsewhere is refused by name. A failure to
+  /// find the frame names `about`; a malformed reference names nothing.
+  [[nodiscard]] core::Result<core::ResolvedFrameDTO>
+  RobotFrame(const core::ReferenceTargetDTO &target,
+             const core::FrameRoleId &frame_role_id,
+             const ReferenceIdentity &about) const {
+    if (!target.complete() || frame_role_id.empty()) {
+      return resolution_error<core::ResolvedFrameDTO>(
+          "program_reference_shape_invalid",
+          "robot-qualified frame reference is incomplete");
+    }
+    if (!HostsRobot(target.controllable_component_id)) {
+      return resolution_error<core::ResolvedFrameDTO>(
+          "program_reference_robot_not_local",
+          "frame reference names a robot that is not hosted by this cell "
+          "resolver",
+          about);
+    }
+    const RetainedTargetSceneFrameInput *selected = nullptr;
+    for (const auto &candidate : input_.target_frames) {
+      if (candidate.controllable_component_id !=
+              target.controllable_component_id ||
+          candidate.command_target_id != target.command_target_id ||
+          candidate.target_frame_role_id != frame_role_id) {
+        continue;
+      }
+      if (selected != nullptr) {
+        return ambiguous_resolution_error<core::ResolvedFrameDTO>(
+            "program_reference_robot_frame_ambiguous",
+            "robot frame role maps to multiple retained frames", about);
+      }
+      selected = &candidate;
+    }
+    if (selected == nullptr) {
+      return resolution_error<core::ResolvedFrameDTO>(
+          "program_reference_robot_frame_missing",
+          "robot frame role is absent from the retained target map", about);
+    }
+    return core::Result<core::ResolvedFrameDTO>::Ok(selected->frame);
   }
 
   [[nodiscard]] core::Result<void>
@@ -274,9 +471,11 @@ public:
     return core::Result<void>::Ok();
   }
 
+  /// `publications` is the call's one coherent state capture; the query and
+  /// the view built from it read the same publication of every source.
   [[nodiscard]] core::Result<core::KinematicStatePathQueryDTO>
-  BuildQuery(const core::KinematicFramePathDTO &path,
-             const std::int64_t now_ns) const {
+  BuildQuery(const core::KinematicFramePathDTO &path, const std::int64_t now_ns,
+             const core::IObservedStateProvider &publications) const {
     std::map<core::ResourceId, const Source *> selected_sources;
     std::map<core::ControlDomainId,
              core::KinematicActiveControlConfigurationExpectationDTO>
@@ -337,7 +536,7 @@ public:
             "kinematic_state_source_ambiguous",
             "one frame resource resolves to multiple observed-state sources");
       }
-      const auto current = source->provider->publication_at(
+      const auto current = publications.publication_at(
           source->context.control_binding_id,
           source->context.control_binding_revision, now_ns);
       if (!current.ok()) {
@@ -386,7 +585,139 @@ public:
   collision::ManyForgeCollisionEngine::SharedModelPtr model_;
   RetainedSceneFrameResolverInput input_;
   std::vector<Source> sources_;
-  std::unique_ptr<core::ImmutableKinematicStateViewProvider> view_provider_;
+};
+
+/// One coherent read of the resolver's live state at one evaluation time.
+/// Each control binding is read at most once; every frame-path query and
+/// view built from this capture sees that same publication, so two frames of
+/// one robot (or a carrier and its robot) can never mix samples. Freshness is
+/// still validated per publication at the capture time by the view provider,
+/// and the retained receiver-time skew budget holds across every contributor
+/// of the capture, so independently fresh robots must also agree in time.
+class RetainedSceneFrameResolver::StateCapture final
+    : public core::IObservedStateProvider {
+public:
+  StateCapture(std::shared_ptr<const Impl> impl, const std::int64_t at_ns)
+      : impl_(std::move(impl)), at_ns_(at_ns) {}
+
+  [[nodiscard]] static std::shared_ptr<const StateCapture>
+  Create(std::shared_ptr<const Impl> impl, const std::int64_t at_ns) {
+    auto capture = std::make_shared<StateCapture>(std::move(impl), at_ns);
+    std::vector<core::KinematicObservedStateSourceBinding> bindings;
+    bindings.reserve(capture->impl_->sources_.size());
+    for (const auto &source : capture->impl_->sources_) {
+      // Non-owning: the view provider is owned by this capture.
+      bindings.push_back(
+          {source.context.control_binding_id,
+           source.context.control_binding_revision,
+           std::shared_ptr<const core::IObservedStateProvider>(
+               std::shared_ptr<const void>{}, capture.get())});
+    }
+    capture->views_ = std::make_unique<core::ImmutableKinematicStateViewProvider>(
+        std::move(bindings));
+    return capture;
+  }
+
+  [[nodiscard]] std::int64_t at_ns() const noexcept { return at_ns_; }
+
+  /// Admits one reading received over [earliest_ns, latest_ns] into this
+  /// capture; refused when the capture would exceed the retained skew budget.
+  [[nodiscard]] core::Result<void>
+  AdmitReceived(const std::int64_t earliest_ns,
+                const std::int64_t latest_ns) const {
+    const std::int64_t earliest =
+        received_.has_value() ? std::min(received_->first, earliest_ns)
+                              : earliest_ns;
+    const std::int64_t latest =
+        received_.has_value() ? std::max(received_->second, latest_ns)
+                              : latest_ns;
+    if (latest - earliest > impl_->input_.maximum_receiver_time_skew_ns) {
+      return core::Result<void>::Err(core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "Observed-state sources of one coherent capture exceed the "
+          "retained coherence budget",
+          {{"reason", "kinematic_receiver_time_skew_exceeded"}}});
+    }
+    received_.emplace(earliest, latest);
+    return core::Result<void>::Ok();
+  }
+
+  /// Builds one frame-path view from this capture and admits its readings.
+  [[nodiscard]] core::Result<core::KinematicStatePathViewDTO>
+  View(const core::KinematicStatePathQueryDTO &query) const {
+    auto view = views_->current_kinematic_state_path(query, at_ns_);
+    if (!view.ok() || !view.value().earliest_received_timestamp_ns.has_value() ||
+        !view.value().latest_received_timestamp_ns.has_value()) {
+      return view;
+    }
+    if (auto admitted =
+            AdmitReceived(*view.value().earliest_received_timestamp_ns,
+                          *view.value().latest_received_timestamp_ns);
+        !admitted.ok()) {
+      return core::Result<core::KinematicStatePathViewDTO>::Err(
+          admitted.error());
+    }
+    return view;
+  }
+
+  [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
+  current_state(const core::ObservedStateQueryContextDTO &,
+                std::int64_t) const override {
+    return core::Result<core::ObservedStateSnapshotDTO>::Err(
+        resolution_error<core::ObservedStateSnapshotDTO>(
+            "coherent_state_capture_read_unsupported",
+            "a coherent frame capture serves only time-bound publications")
+            .error());
+  }
+
+  [[nodiscard]] core::Result<core::ObservedStatePublicationDTO>
+  publication(const core::ControlBindingId &,
+              const core::ControlBindingRevision &) const override {
+    return core::Result<core::ObservedStatePublicationDTO>::Err(
+        resolution_error<core::ObservedStatePublicationDTO>(
+            "coherent_state_capture_read_unsupported",
+            "a coherent frame capture serves only time-bound publications")
+            .error());
+  }
+
+  [[nodiscard]] core::Result<core::ObservedStatePublicationDTO>
+  publication_at(const core::ControlBindingId &control_binding_id,
+                 const core::ControlBindingRevision &control_binding_revision,
+                 const std::int64_t now_ns) const override {
+    using PublicationResult = core::Result<core::ObservedStatePublicationDTO>;
+    if (now_ns != at_ns_) {
+      return PublicationResult::Err(
+          resolution_error<core::ObservedStatePublicationDTO>(
+              "coherent_state_capture_time_mismatch",
+              "a coherent frame capture is read at its own evaluation time")
+              .error());
+    }
+    const SourceKey key{control_binding_id, control_binding_revision};
+    if (const auto found = publications_.find(key);
+        found != publications_.end()) {
+      return found->second;
+    }
+    const auto *source = impl_->FindSource(key);
+    if (source == nullptr) {
+      return PublicationResult::Err(
+          resolution_error<core::ObservedStatePublicationDTO>(
+              "kinematic_state_source_unavailable",
+              "Required observed-state source is unavailable")
+              .error());
+    }
+    return publications_
+        .emplace(key, source->provider->publication_at(
+                          control_binding_id, control_binding_revision, at_ns_))
+        .first->second;
+  }
+
+private:
+  std::shared_ptr<const Impl> impl_;
+  std::int64_t at_ns_;
+  std::unique_ptr<core::ImmutableKinematicStateViewProvider> views_;
+  mutable std::map<SourceKey, core::Result<core::ObservedStatePublicationDTO>>
+      publications_;
+  mutable std::optional<std::pair<std::int64_t, std::int64_t>> received_;
 };
 
 std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
@@ -454,18 +785,13 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
   }
 
   std::vector<Impl::Source> sources;
-  std::vector<core::KinematicObservedStateSourceBinding> provider_bindings;
   for (auto &input_source : input.state_sources) {
     if (!input_source.provider) {
       throw std::invalid_argument(
           "retained scene-frame state provider is missing");
     }
-    sources.push_back(
-        {input_source.context, input_source.publication_source,
-         input_source.provider});
-    provider_bindings.push_back({input_source.context.control_binding_id,
-                                 input_source.context.control_binding_revision,
-                                 std::move(input_source.provider)});
+    sources.push_back({input_source.context, input_source.publication_source,
+                       std::move(input_source.provider)});
   }
   std::sort(sources.begin(), sources.end(),
             [](const auto &left, const auto &right) {
@@ -483,13 +809,9 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
           "retained scene-frame state source is duplicated");
     }
   }
-  auto view_provider =
-      std::make_unique<core::ImmutableKinematicStateViewProvider>(
-          std::move(provider_bindings));
   return std::shared_ptr<RetainedSceneFrameResolver>(
       new RetainedSceneFrameResolver(std::make_shared<Impl>(
-          std::move(shared_model), std::move(input), std::move(sources),
-          std::move(view_provider))));
+          std::move(shared_model), std::move(input), std::move(sources))));
 }
 
 RetainedSceneFrameResolver::RetainedSceneFrameResolver(
@@ -579,9 +901,16 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
         (index != 0U &&
          capture.runtime_object_bindings[index - 1U].runtime_object_id ==
              binding.runtime_object_id)) {
-      return fail(
-          "runtime_object_binding_invalid",
-          "Runtime-object reference binding is missing, duplicated, or stale");
+      constexpr const char *kMessage =
+          "Runtime-object reference binding is missing, duplicated, or stale";
+      // The failing binding is known by its runtime-object key; a binding
+      // without one names nothing.
+      if (binding.runtime_object_id.empty()) {
+        return fail("runtime_object_binding_invalid", kMessage);
+      }
+      return resolution_error<core::ProgramFrameResolutionContextDTO>(
+          "runtime_object_binding_invalid", kMessage,
+          runtime_object_identity(binding.runtime_object_id));
     }
   }
 
@@ -590,15 +919,29 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
     core::KinematicStatePathViewDTO view;
   };
   std::vector<CapturedPath> captured_paths;
+  // Every requested frame path is read from one coherent capture, which also
+  // holds the selected start publication.
+  const auto state = StateCapture::Create(impl_, capture.captured_at_ns);
+  if (auto admitted = state->AdmitReceived(
+          capture.observed_start_publication.received_timestamp_ns,
+          capture.observed_start_publication.received_timestamp_ns);
+      !admitted.ok()) {
+    return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
+        admitted.error());
+  }
+  // Finding a frame's retained path is about `owner`, the reference the
+  // frame belongs to; reading its state is about the capture and names none.
   const auto capture_resolved_frame =
-      [&](const core::ResolvedFrameDTO &frame) -> core::Result<void> {
+      [&](const core::ResolvedFrameDTO &frame,
+          const ReferenceIdentity &owner) -> core::Result<void> {
     if (const auto *cell = std::get_if<core::ResolvedCellFrameDTO>(&frame);
         cell != nullptr) {
       if (cell->cell_id != impl_->input_.cell_id ||
           cell->compiled_frame_name != impl_->input_.compiled_cell_frame_name) {
         return core::Result<void>::Err(
-            fail("program_reference_cell_frame_mismatch",
-                 "Program reference names a foreign cell frame")
+            resolution_error<core::Pose3DTO>(
+                "program_reference_cell_frame_mismatch",
+                "Program reference names a foreign cell frame", owner)
                 .error());
       }
       return core::Result<void>::Ok();
@@ -612,15 +955,17 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
         return core::Result<void>::Err(
             ambiguous_resolution_error<core::Pose3DTO>(
                 "program_reference_frame_path_ambiguous",
-                "Program reference maps to multiple retained frame paths")
+                "Program reference maps to multiple retained frame paths",
+                owner)
                 .error());
       }
       selected = &path;
     }
     if (selected == nullptr) {
       return core::Result<void>::Err(
-          fail("program_reference_frame_path_missing",
-               "Program reference has no retained compiler frame path")
+          resolution_error<core::Pose3DTO>(
+              "program_reference_frame_path_missing",
+              "Program reference has no retained compiler frame path", owner)
               .error());
     }
     if (std::any_of(
@@ -628,12 +973,11 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
             [&](const auto &existing) { return existing.path == *selected; })) {
       return core::Result<void>::Ok();
     }
-    auto query = impl_->BuildQuery(*selected, capture.captured_at_ns);
+    auto query = impl_->BuildQuery(*selected, capture.captured_at_ns, *state);
     if (!query.ok()) {
       return core::Result<void>::Err(query.error());
     }
-    auto view = impl_->view_provider_->current_kinematic_state_path(
-        query.value(), capture.captured_at_ns);
+    auto view = state->View(query.value());
     if (!view.ok()) {
       return core::Result<void>::Err(view.error());
     }
@@ -649,7 +993,8 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
     return core::Result<void>::Ok();
   };
 
-  const auto frame_for_role = [&](const core::FrameRoleId &role)
+  const auto frame_for_role = [&](const core::FrameRoleId &role,
+                                  const ReferenceIdentity &about)
       -> core::Result<core::ResolvedFrameDTO> {
     const core::ProgramFrameRoleBindingDTO *selected = nullptr;
     for (const auto &candidate : capture.binding.frame_role_bindings) {
@@ -659,14 +1004,14 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
       if (selected != nullptr) {
         return ambiguous_resolution_error<core::ResolvedFrameDTO>(
             "program_frame_role_ambiguous",
-            "Program frame role maps to multiple retained frames");
+            "Program frame role maps to multiple retained frames", about);
       }
       selected = &candidate;
     }
     if (selected == nullptr) {
       return resolution_error<core::ResolvedFrameDTO>(
           "program_frame_role_missing",
-          "Program frame role is absent from the exact binding");
+          "Program frame role is absent from the exact binding", about);
     }
     return core::Result<core::ResolvedFrameDTO>::Ok(
         core::ResolvedComponentModelFrameDTO{
@@ -676,13 +1021,16 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
   };
 
   const auto capture_carrier_for_resource =
-      [&](const core::SceneResourceId &resource_id) -> core::Result<void> {
+      [&](const core::SceneResourceId &resource_id,
+          const ReferenceIdentity &about) -> core::Result<void> {
     const auto *object = find_scene_object(*capture.logical_scene, resource_id);
     if (object == nullptr) {
       return core::Result<void>::Err(
-          fail("program_scene_resource_missing",
-               "Program reference names a scene resource absent from the "
-               "retained snapshot")
+          resolution_error<core::Pose3DTO>(
+              "program_scene_resource_missing",
+              "Program reference names a scene resource absent from the "
+              "retained snapshot",
+              about)
               .error());
     }
     const auto *carried =
@@ -697,9 +1045,15 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
             carried->carried_object_attachment_revision ||
         attachment->scene_resource_id != resource_id) {
       return core::Result<void>::Err(
-          fail("program_scene_attachment_mismatch",
-               "Carried scene resource has no exact retained attachment")
+          resolution_error<core::Pose3DTO>(
+              "program_scene_attachment_mismatch",
+              "Carried scene resource has no exact retained attachment", about)
               .error());
+    }
+    if (auto local =
+            impl_->RequireLocalCarrier(attachment->carrier_frame_ref, about);
+        !local.ok()) {
+      return local;
     }
     const core::KinematicFramePathDTO *selected = nullptr;
     for (const auto &path : impl_->input_.frame_paths) {
@@ -711,59 +1065,50 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
         return core::Result<void>::Err(
             ambiguous_resolution_error<core::Pose3DTO>(
                 "program_scene_carrier_ambiguous",
-                "Carried scene resource maps to multiple carrier paths")
+                "Carried scene resource maps to multiple carrier paths", about)
                 .error());
       }
       selected = &path;
     }
     if (selected == nullptr) {
       return core::Result<void>::Err(
-          fail("program_scene_carrier_missing",
-               "Carried scene resource has no retained carrier path")
+          resolution_error<core::Pose3DTO>(
+              "program_scene_carrier_missing",
+              "Carried scene resource has no retained carrier path", about)
               .error());
     }
-    return capture_resolved_frame(selected->terminal_frame);
+    return capture_resolved_frame(selected->terminal_frame, about);
   };
 
-  if (auto base = capture_resolved_frame(capture.binding.base_frame);
+  if (auto base = capture_resolved_frame(capture.binding.base_frame,
+                                         base_frame_identity(capture.binding));
       !base.ok()) {
     return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
         base.error());
   }
-  for (const auto &reference : capture.requested_references) {
-    if (!core::reference_identity_matches_type(reference) ||
-        (reference.type == core::ReferenceDTO::Type::kPose) !=
-            reference.pose.has_value()) {
-      return fail(
-          "program_reference_shape_invalid",
-          "Program reference has an invalid typed identity or pose payload");
-    }
+  // Each lookup of a requested reference names that reference when it
+  // fails; a capture or context failure met on the way names none.
+  const auto capture_reference =
+      [&](const core::ReferenceDTO &reference) -> core::Result<void> {
+    const auto about = reference_identity(reference, impl_->input_.cell_id);
     switch (reference.type) {
     case core::ReferenceDTO::Type::kFrameRole: {
-      auto frame = frame_for_role(std::get<core::FrameRoleId>(reference.id));
+      const auto &role = std::get<core::FrameRoleId>(reference.id);
+      auto frame = reference.target.has_value()
+                       ? impl_->RobotFrame(*reference.target, role, about)
+                       : frame_for_role(role, about);
       if (!frame.ok()) {
-        return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
-            frame.error());
+        return core::Result<void>::Err(frame.error());
       }
-      if (auto captured = capture_resolved_frame(frame.value());
-          !captured.ok()) {
-        return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
-            captured.error());
-      }
-      break;
+      return capture_resolved_frame(frame.value(), about);
     }
     case core::ReferenceDTO::Type::kComponentBodyRole:
     case core::ReferenceDTO::Type::kPose:
-      break;
-    case core::ReferenceDTO::Type::kSceneResource: {
-      auto captured = capture_carrier_for_resource(
-          std::get<core::SceneResourceId>(reference.id));
-      if (!captured.ok()) {
-        return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
-            captured.error());
-      }
-      break;
-    }
+    case core::ReferenceDTO::Type::kCellFrame:
+      return core::Result<void>::Ok();
+    case core::ReferenceDTO::Type::kSceneResource:
+      return capture_carrier_for_resource(
+          std::get<core::SceneResourceId>(reference.id), about);
     case core::ReferenceDTO::Type::kRuntimeObject: {
       const auto &runtime_id = std::get<core::RuntimeObjectId>(reference.id);
       const auto selected =
@@ -774,16 +1119,28 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
                            });
       if (selected == capture.runtime_object_bindings.end() ||
           selected->runtime_object_id != runtime_id) {
-        return fail("program_runtime_object_missing",
-                    "Program runtime-object key has no admission binding");
+        return core::Result<void>::Err(
+            resolution_error<core::Pose3DTO>(
+                "program_runtime_object_missing",
+                "Program runtime-object key has no admission binding", about)
+                .error());
       }
-      auto captured = capture_carrier_for_resource(selected->scene_resource_id);
-      if (!captured.ok()) {
-        return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
-            captured.error());
-      }
-      break;
+      return capture_carrier_for_resource(selected->scene_resource_id, about);
     }
+    }
+    return core::Result<void>::Ok();
+  };
+  for (const auto &reference : capture.requested_references) {
+    if (!core::reference_identity_matches_type(reference) ||
+        (reference.type == core::ReferenceDTO::Type::kPose) !=
+            reference.pose.has_value()) {
+      return fail(
+          "program_reference_shape_invalid",
+          "Program reference has an invalid typed identity or pose payload");
+    }
+    if (auto captured = capture_reference(reference); !captured.ok()) {
+      return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
+          captured.error());
     }
   }
 
@@ -844,9 +1201,16 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
   if (reference.type == core::ReferenceDTO::Type::kPose) {
     return core::Result<core::Pose3DTO>::Ok(*reference.pose);
   }
+  // Each lookup of the requested reference names it when it fails; the base
+  // frame's lookup names the base frame. A context or state failure met on
+  // the way names no reference (spec 210 §4.4).
+  const auto about = reference_identity(reference, impl_->input_.cell_id);
 
+  // Finding a frame's captured view is about `owner`, the reference the
+  // frame belongs to; evaluating the view names none.
   const auto pose_in_cell_for_frame =
-      [&](const core::ResolvedFrameDTO &frame) -> core::Result<core::Pose3DTO> {
+      [&](const core::ResolvedFrameDTO &frame,
+          const ReferenceIdentity &owner) -> core::Result<core::Pose3DTO> {
     if (const auto *cell = std::get_if<core::ResolvedCellFrameDTO>(&frame);
         cell != nullptr) {
       if (cell->cell_id == impl_->input_.cell_id &&
@@ -855,7 +1219,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       }
       return resolution_error<core::Pose3DTO>(
           "program_reference_cell_frame_mismatch",
-          "Program reference names a foreign cell frame");
+          "Program reference names a foreign cell frame", owner);
     }
     const auto found = std::lower_bound(
         context.kinematic_paths.begin(), context.kinematic_paths.end(),
@@ -868,7 +1232,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
         found->terminal_frame != frame) {
       return resolution_error<core::Pose3DTO>(
           "program_reference_frame_view_missing",
-          "Program reference has no captured immutable frame view");
+          "Program reference has no captured immutable frame view", owner);
     }
     const auto index = static_cast<std::size_t>(
         std::distance(context.kinematic_paths.begin(), found));
@@ -879,11 +1243,12 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
           "program_reference_frame_view_invalid",
           "Program reference frame view is internally inconsistent");
     }
-    auto resolved = resolve_scene_frame(
+    auto resolved = ResolveFrameWithCandidateState(
         *scene_reference,
         core::SceneFrameResolutionContextDTO{
             context.projection_binding, context.logical_scene, *found,
-            context.kinematic_state_path_views[index]});
+            context.kinematic_state_path_views[index]},
+        nullptr);
     if (!resolved.ok()) {
       return core::Result<core::Pose3DTO>::Err(resolved.error());
     }
@@ -891,7 +1256,8 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
         resolved.value().frame_pose_in_cell);
   };
 
-  auto base_in_cell = pose_in_cell_for_frame(context.binding.base_frame);
+  auto base_in_cell = pose_in_cell_for_frame(
+      context.binding.base_frame, base_frame_identity(context.binding));
   if (!base_in_cell.ok()) {
     return base_in_cell;
   }
@@ -906,14 +1272,14 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       if (selected != nullptr) {
         return ambiguous_resolution_error<core::ResolvedFrameDTO>(
             "program_frame_role_ambiguous",
-            "Program frame role maps to multiple retained frames");
+            "Program frame role maps to multiple retained frames", about);
       }
       selected = &candidate;
     }
     if (selected == nullptr) {
       return resolution_error<core::ResolvedFrameDTO>(
           "program_frame_role_missing",
-          "Program frame role is absent from the exact binding");
+          "Program frame role is absent from the exact binding", about);
     }
     return core::Result<core::ResolvedFrameDTO>::Ok(
         core::ResolvedComponentModelFrameDTO{
@@ -952,14 +1318,15 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       return resolution_error<core::Pose3DTO>(
           "program_scene_resource_missing",
           "Program reference names a scene resource absent from the retained "
-          "snapshot");
+          "snapshot",
+          about);
     }
     if (const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
             &object->placement)) {
       if (fixed->cell_id != impl_->input_.cell_id) {
         return resolution_error<core::Pose3DTO>(
             "program_scene_resource_cell_mismatch",
-            "Scene resource is fixed in a foreign cell");
+            "Scene resource is fixed in a foreign cell", about);
       }
       return core::Result<core::Pose3DTO>::Ok(fixed->pose_in_cell);
     }
@@ -973,7 +1340,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
         attachment->scene_resource_id != resource_id) {
       return resolution_error<core::Pose3DTO>(
           "program_scene_attachment_mismatch",
-          "Carried scene resource has no exact retained attachment");
+          "Carried scene resource has no exact retained attachment", about);
     }
     const core::ResolvedFrameDTO *carrier = nullptr;
     for (const auto &path : context.kinematic_paths) {
@@ -984,16 +1351,17 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       if (carrier != nullptr) {
         return ambiguous_resolution_error<core::Pose3DTO>(
             "program_scene_carrier_ambiguous",
-            "Carried scene resource maps to multiple captured carrier frames");
+            "Carried scene resource maps to multiple captured carrier frames",
+            about);
       }
       carrier = &path.terminal_frame;
     }
     if (carrier == nullptr) {
       return resolution_error<core::Pose3DTO>(
           "program_scene_carrier_missing",
-          "Carried scene resource has no captured carrier frame");
+          "Carried scene resource has no captured carrier frame", about);
     }
-    auto carrier_pose = pose_in_cell_for_frame(*carrier);
+    auto carrier_pose = pose_in_cell_for_frame(*carrier, about);
     if (!carrier_pose.ok()) {
       return carrier_pose;
     }
@@ -1006,13 +1374,19 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
                                        "Program reference type is invalid");
   switch (reference.type) {
   case core::ReferenceDTO::Type::kFrameRole: {
-    auto frame = frame_for_role(std::get<core::FrameRoleId>(reference.id));
+    const auto &role = std::get<core::FrameRoleId>(reference.id);
+    auto frame = reference.target.has_value()
+                     ? impl_->RobotFrame(*reference.target, role, about)
+                     : frame_for_role(role);
     if (!frame.ok()) {
       return core::Result<core::Pose3DTO>::Err(frame.error());
     }
-    target_in_cell = pose_in_cell_for_frame(frame.value());
+    target_in_cell = pose_in_cell_for_frame(frame.value(), about);
     break;
   }
+  case core::ReferenceDTO::Type::kCellFrame:
+    target_in_cell = core::Result<core::Pose3DTO>::Ok(core::Pose3DTO{});
+    break;
   case core::ReferenceDTO::Type::kComponentBodyRole: {
     const auto &role = std::get<core::CollisionBodyRoleId>(reference.id);
     const core::ProgramCollisionBodyRoleBindingDTO *selected = nullptr;
@@ -1023,7 +1397,8 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       if (selected != nullptr) {
         return ambiguous_resolution_error<core::Pose3DTO>(
             "program_component_body_role_ambiguous",
-            "Program component-body role maps to multiple retained bodies");
+            "Program component-body role maps to multiple retained bodies",
+            about);
       }
       selected = &candidate;
     }
@@ -1031,12 +1406,14 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
         selected->compiled_collision_body_names.empty()) {
       return resolution_error<core::Pose3DTO>(
           "program_component_body_role_missing",
-          "Program component-body role is absent from the exact binding");
+          "Program component-body role is absent from the exact binding",
+          about);
     }
     if (selected->compiled_collision_body_names.size() != 1U) {
       return ambiguous_resolution_error<core::Pose3DTO>(
           "program_component_body_role_spatially_ambiguous",
-          "Program component-body role does not identify one spatial body");
+          "Program component-body role does not identify one spatial body",
+          about);
     }
     auto coordinates = start_coordinates();
     if (!coordinates.ok()) {
@@ -1065,7 +1442,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
         selected->runtime_object_id != runtime_id) {
       return resolution_error<core::Pose3DTO>(
           "program_runtime_object_missing",
-          "Program runtime-object key has no admission binding");
+          "Program runtime-object key has no admission binding", about);
     }
     target_in_cell = scene_resource_pose(selected->scene_resource_id);
     break;
@@ -1084,6 +1461,8 @@ core::Result<core::ResolvedSceneFramePoseDTO>
 RetainedSceneFrameResolver::resolve_scene_frame(
     const core::SceneFrameRefDTO &reference,
     const core::SceneFrameResolutionContextDTO &context) const {
+  // The frame's retained path is already chosen by its context: every
+  // failure here is about the context or its state, and names no reference.
   return ResolveFrameWithCandidateState(reference, context, nullptr);
 }
 
@@ -1257,8 +1636,15 @@ RetainedSceneFrameResolver::Resolve(
     return resolution_error<core::ResolvedSceneFramePoseDTO>(
         "scene_frame_query_mismatch", "scene-frame query is invalid");
   }
+  if (now_ns < 0) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "scene_frame_query_mismatch",
+        "scene-frame query differs from the active retained projection");
+  }
   return ResolveWithCandidateState(query.selector, query.projection_binding,
-                                   std::move(logical_scene), now_ns, nullptr);
+                                   std::move(logical_scene),
+                                   *StateCapture::Create(impl_, now_ns),
+                                   nullptr, nullptr);
 }
 
 core::Result<core::ResolvedSceneFramePoseDTO>
@@ -1271,9 +1657,171 @@ RetainedSceneFrameResolver::ResolveCandidate(
         "candidate_scene_frame_query_mismatch",
         "candidate scene-frame query is invalid");
   }
+  if (now_ns < 0) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "scene_frame_query_mismatch",
+        "scene-frame query differs from the active retained projection");
+  }
   return ResolveWithCandidateState(query.selector, query.projection_binding,
-                                   std::move(logical_scene), now_ns,
-                                   &query.predicted_state);
+                                   std::move(logical_scene),
+                                   *StateCapture::Create(impl_, now_ns),
+                                   &query.predicted_state, nullptr);
+}
+
+core::Result<RetainedSceneFrameTransform>
+RetainedSceneFrameResolver::ResolveFrameTransform(
+    const RetainedSceneFrameTransformQuery &query,
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+    const std::int64_t now_ns) const {
+  using TransformResult = core::Result<RetainedSceneFrameTransform>;
+  if (!query.projection_binding.valid() || !logical_scene ||
+      !logical_scene->locally_valid() ||
+      logical_scene->revision !=
+          query.projection_binding.projection_revision.scene_revision ||
+      query.projection_binding.projection_revision.retained_bundle_id !=
+          impl_->input_.retained_bundle_id ||
+      query.projection_binding.projection_revision.graph_revision !=
+          impl_->input_.graph_revision ||
+      logical_scene->cell_id != impl_->input_.cell_id || now_ns < 0) {
+    return resolution_error<RetainedSceneFrameTransform>(
+        "frame_transform_query_mismatch",
+        "frame transform differs from the active retained projection");
+  }
+  const auto &pose = query.pose_in_source_frame;
+  if (!std::isfinite(pose.position_m.x_m) ||
+      !std::isfinite(pose.position_m.y_m) ||
+      !std::isfinite(pose.position_m.z_m) ||
+      !std::isfinite(pose.orientation.x) || !std::isfinite(pose.orientation.y) ||
+      !std::isfinite(pose.orientation.z) || !std::isfinite(pose.orientation.w)) {
+    return TransformResult::Err(
+        core::ErrorDTO{core::kErrorInvalidRequest,
+                       "frame transform pose must be finite",
+                       {{"reason", "frame_transform_pose_invalid"}}});
+  }
+  std::vector<core::ContentDigest> evidence;
+  // Source and target are resolved from one coherent capture: a robot crossed
+  // by both frame paths contributes one publication to both.
+  const auto state = StateCapture::Create(impl_, now_ns);
+  // `reference` is the requested frame `selector` is resolved for.
+  const auto resolve_frame =
+      [&](const core::SceneFrameRefDTO &selector,
+          const core::ReferenceDTO &reference) -> core::Result<core::Pose3DTO> {
+    auto resolved =
+        ResolveWithCandidateState(selector, query.projection_binding,
+                                  logical_scene, *state, nullptr, &reference);
+    if (!resolved.ok()) {
+      return core::Result<core::Pose3DTO>::Err(resolved.error());
+    }
+    evidence.push_back(resolved.value().resolution_evidence_digest);
+    return core::Result<core::Pose3DTO>::Ok(
+        resolved.value().frame_pose_in_cell);
+  };
+  // Each lookup of a requested frame names that frame when it fails; a
+  // context or state failure met on the way names none (spec 210 §4.4).
+  const auto frame_in_cell =
+      [&](const core::ReferenceDTO &reference) -> core::Result<core::Pose3DTO> {
+    const auto about = reference_identity(reference, impl_->input_.cell_id);
+    const auto unsupported = [&] {
+      return core::Result<core::Pose3DTO>::Err(about_reference(
+          core::ErrorDTO{
+              core::kErrorInvalidRequest,
+              "frame transform supports the cell frame, robot-qualified frame "
+              "roles and scene resources",
+              {{"reason", "frame_transform_reference_unsupported"}}},
+          about));
+    };
+    if (!core::reference_identity_matches_type(reference) ||
+        reference.pose.has_value()) {
+      return unsupported();
+    }
+    switch (reference.type) {
+    case core::ReferenceDTO::Type::kCellFrame:
+      return core::Result<core::Pose3DTO>::Ok(core::Pose3DTO{});
+    case core::ReferenceDTO::Type::kFrameRole: {
+      if (!reference.target.has_value()) {
+        return unsupported();
+      }
+      auto frame = impl_->RobotFrame(
+          *reference.target, std::get<core::FrameRoleId>(reference.id), about);
+      if (!frame.ok()) {
+        return core::Result<core::Pose3DTO>::Err(frame.error());
+      }
+      const auto selector = scene_reference_for(frame.value());
+      if (!selector.has_value()) {
+        return unsupported();
+      }
+      return resolve_frame(*selector, reference);
+    }
+    case core::ReferenceDTO::Type::kSceneResource: {
+      const auto &resource_id = std::get<core::SceneResourceId>(reference.id);
+      const auto *object = find_scene_object(*logical_scene, resource_id);
+      if (object == nullptr) {
+        return resolution_error<core::Pose3DTO>(
+            "program_scene_resource_missing",
+            "frame transform names a scene resource absent from the retained "
+            "snapshot",
+            about);
+      }
+      if (const auto *fixed =
+              std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+                  &object->placement)) {
+        if (fixed->cell_id != impl_->input_.cell_id) {
+          return resolution_error<core::Pose3DTO>(
+              "program_scene_resource_cell_mismatch",
+              "Scene resource is fixed in a foreign cell", about);
+        }
+        return core::Result<core::Pose3DTO>::Ok(fixed->pose_in_cell);
+      }
+      const auto &carried =
+          std::get<core::CarriedSceneObjectPlacementDTO>(object->placement);
+      const auto *attachment =
+          find_attachment(*logical_scene, carried.carried_object_attachment_id);
+      if (attachment == nullptr ||
+          attachment->carried_object_attachment_revision !=
+              carried.carried_object_attachment_revision ||
+          attachment->scene_resource_id != resource_id) {
+        return resolution_error<core::Pose3DTO>(
+            "program_scene_attachment_mismatch",
+            "Carried scene resource has no exact retained attachment", about);
+      }
+      if (auto local =
+              impl_->RequireLocalCarrier(attachment->carrier_frame_ref, about);
+          !local.ok()) {
+        return core::Result<core::Pose3DTO>::Err(local.error());
+      }
+      auto carrier = resolve_frame(attachment->carrier_frame_ref, reference);
+      if (!carrier.ok()) {
+        return carrier;
+      }
+      return core::Result<core::Pose3DTO>::Ok(core::multiply_poses(
+          carrier.value(), attachment->pose_in_carrier_frame));
+    }
+    case core::ReferenceDTO::Type::kComponentBodyRole:
+    case core::ReferenceDTO::Type::kRuntimeObject:
+    case core::ReferenceDTO::Type::kPose:
+      return unsupported();
+    }
+    return unsupported();
+  };
+
+  auto source_in_cell = frame_in_cell(query.source_frame);
+  if (!source_in_cell.ok()) {
+    return TransformResult::Err(source_in_cell.error());
+  }
+  auto target_in_cell = frame_in_cell(query.target_frame);
+  if (!target_in_cell.ok()) {
+    return TransformResult::Err(target_in_cell.error());
+  }
+  std::sort(evidence.begin(), evidence.end());
+  evidence.erase(std::unique(evidence.begin(), evidence.end()),
+                 evidence.end());
+  return TransformResult::Ok(RetainedSceneFrameTransform{
+      core::multiply_poses(
+          core::inverse_pose(target_in_cell.value()),
+          core::multiply_poses(source_in_cell.value(),
+                               query.pose_in_source_frame)),
+      source_in_cell.value(), target_in_cell.value(), query.projection_binding,
+      now_ns, std::move(evidence)});
 }
 
 core::Result<core::ResolvedSceneFramePoseDTO>
@@ -1281,8 +1829,17 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
     const core::SceneFrameResolutionSelectorDTO &selector,
     const core::ProjectionLeaseBindingDTO &projection_binding,
     std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
-    const std::int64_t now_ns,
-    const core::ControlledStateDTO *predicted_state) const {
+    const StateCapture &capture,
+    const core::ControlledStateDTO *predicted_state,
+    const core::ReferenceDTO *requested_reference) const {
+  // Only finding the selected frame's retained path is about one reference:
+  // the requested reference it is resolved for, else the selected frame.
+  const auto about = [&] {
+    return requested_reference != nullptr
+               ? reference_identity(*requested_reference, impl_->input_.cell_id)
+               : frame_identity(selector);
+  };
+  const std::int64_t now_ns = capture.at_ns();
   if (!core::SceneFrameResolutionQueryDTO{selector, projection_binding}
            .valid() ||
       !logical_scene || !logical_scene->locally_valid() ||
@@ -1315,14 +1872,16 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
             if (selected != nullptr) {
               return resolution_error<core::SceneFrameRefDTO>(
                   "scene_frame_reference_ambiguous",
-                  "target carrier frame is ambiguous in retained model map");
+                  "target carrier frame is ambiguous in retained model map",
+                  about());
             }
             selected = &candidate;
           }
           if (selected == nullptr) {
             return resolution_error<core::SceneFrameRefDTO>(
                 "scene_frame_reference_missing",
-                "target carrier frame is absent from retained model map");
+                "target carrier frame is absent from retained model map",
+                about());
           }
           return core::Result<core::SceneFrameRefDTO>::Ok(
               core::ComponentSceneFrameRefDTO{
@@ -1346,14 +1905,14 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
     if (path != nullptr) {
       return resolution_error<core::ResolvedSceneFramePoseDTO>(
           "scene_frame_reference_ambiguous",
-          "scene-frame reference maps to multiple retained paths");
+          "scene-frame reference maps to multiple retained paths", about());
     }
     path = &candidate;
   }
   if (path == nullptr) {
     return resolution_error<core::ResolvedSceneFramePoseDTO>(
         "scene_frame_reference_missing",
-        "scene-frame reference has no retained compiler path");
+        "scene-frame reference has no retained compiler path", about());
   }
   std::vector<core::ComponentAttachmentRevision> attachment_revisions;
   for (const auto &segment : path->segments) {
@@ -1382,13 +1941,12 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
   attachment_revisions.erase(
       std::unique(attachment_revisions.begin(), attachment_revisions.end()),
       attachment_revisions.end());
-  auto state_query = impl_->BuildQuery(*path, now_ns);
+  auto state_query = impl_->BuildQuery(*path, now_ns, capture);
   if (!state_query.ok()) {
     return core::Result<core::ResolvedSceneFramePoseDTO>::Err(
         state_query.error());
   }
-  auto state_view = impl_->view_provider_->current_kinematic_state_path(
-      state_query.value(), now_ns);
+  auto state_view = capture.View(state_query.value());
   if (!state_view.ok()) {
     return core::Result<core::ResolvedSceneFramePoseDTO>::Err(
         state_view.error());

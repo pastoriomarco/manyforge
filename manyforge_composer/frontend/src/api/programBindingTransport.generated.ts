@@ -9,7 +9,7 @@ const KINDS = new Set<CatalogRecordKind>([
   'model_asset', 'runtime_profile', 'component_type',
   'control_interface_contract', 'controller_topology', 'provider_manifest',
   'command_schema', 'capability_definition', 'contact_policy',
-  'stop_evidence_policy', 'runtime_policy',
+  'stop_evidence_policy',
 ]);
 const FIELDS = {
   binding: ['api_version', 'program_binding_id', 'program_id', 'program_revision', 'retained_bundle_id', 'graph_revision', 'node_environment', 'component_role_bindings', 'target_role_bindings', 'node_policies', 'contact_grasp_bindings', 'provenance'],

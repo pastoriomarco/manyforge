@@ -65,7 +65,7 @@ def test_roboplan_05_inventory_retains_historical_patch_identity() -> None:
 
     # The 0.5 series is an exact historical acceptance input after E1, not the
     # selected production manifest. Keep its frozen identity without reading
-    # third_party/roboplan, which now contains only the selected 0.6 patches.
+    # third_party/roboplan, which now contains only the selected patch series.
     assert len(_MODULE.ROBOPLAN_05_PATCH_DIGESTS) == 7
     assert len(_MODULE.ROBOPLAN_05_PATCH_MANIFEST_SHA256) == 64
     assert all(

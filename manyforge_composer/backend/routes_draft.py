@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -31,6 +31,7 @@ from .draft_session import (
     draft_applicability,
 )
 from .authoring_forest import AuthoringForestError, derive_candidate, from_program
+from .expression_check import ExpressionCheckRefusal, check_draft_expression
 from .authoring_identity import thaw_json
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
@@ -180,6 +181,14 @@ class NewDraftRequest(_LocalDraftFence):
 class ValidateProgramSourceRequest(BaseModel):
     model_config = _DTO_CONFIG
     authoring: dict[str, Any]
+
+
+class ExpressionCheckRequest(BaseModel):
+    model_config = _DTO_CONFIG
+    # Longer text is still checked, so the engine reports text_too_long.
+    expression: str = Field(max_length=65_536)
+    destination_type: Literal["bool", "int64", "float64", "string"]
+    exclude_computed_key: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class SaveDraftRequest(_LocalDraftFence):
@@ -487,6 +496,10 @@ def _observed_move_arguments(
         raise DraftSessionError(
             "draft_arguments_invalid", "Save observed move arguments are invalid"
         )
+    # Every observed_move_* refusal in this resolver is raised before
+    # mutate_draft prepares (prepare_mutation) or installs any Draft change and
+    # before any authoring claim, so each one is a proven no-effect refusal by
+    # code, whatever its HTTP status; the client releases its edit lock on it.
     if state.headless_client is None:
         raise DraftSessionError(
             "observed_move_unavailable",
@@ -497,7 +510,14 @@ def _observed_move_arguments(
         targets_projection = state.headless_client.execution_targets()
         control_projection = state.headless_client.execution_control_state()
     except HeadlessClientError as error:
-        raise headless_client_http_exception(error) from error
+        # A failed read of the robot pose is named, not passed through as a bare
+        # owner error: nothing has been prepared yet, so it is a no-effect refusal.
+        raise DraftSessionError(
+            "observed_move_unavailable",
+            f"current pose/joints could not be read: {error}",
+            status_code=503,
+            detail={"headless_code": error.code},
+        ) from error
     targets = targets_projection.get("targets")
     control = control_projection.get("control_state")
     # execution_targets.v3 / execution_control_state.v6 (H1a-IF.2): motion
@@ -508,6 +528,7 @@ def _observed_move_arguments(
             "command_target_id": target.get("command_target_id"),
             "operation_capability_id": target.get("operation_capability_id"),
             "target_role_id": target["command"].get("target_role_id"),
+            "command": target["command"],
         }
         for component in (targets.get("components", []) if isinstance(targets, dict) else [])
         if isinstance(component, dict)
@@ -530,24 +551,121 @@ def _observed_move_arguments(
     expected_node_id = (
         "motion.move_to_joint_target" if observed_kind == "joint" else "motion.move_to_pose"
     )
-    node_target_role = node.get("parameters", {}).get("target_role")
-    if node.get("node_id") != expected_node_id or type(node_target_role) is not str:
+    if node.get("node_id") != expected_node_id:
         raise DraftSessionError(
-            "observed_move_target_mismatch",
-            "selected move does not address an observed motion target",
+            "observed_move_node_unsupported",
+            ("current joints can only be captured into a Move to joint target node"
+             if observed_kind == "joint" else
+             "current robot pose can only be captured into a Move to pose node"),
             status_code=409,
         )
+    # Every refusal below is raised before any Draft change is prepared. The
+    # checks run from the Draft itself outward to the runtime owner, so each
+    # refusal names the first thing the operator has to correct.
+    parameters = node.get("parameters", {})
+    node_target_role = parameters.get("target_role")
+    if type(node_target_role) is not str:
+        raise DraftSessionError(
+            "observed_move_role_missing",
+            "the selected move has no target role; choose the robot target role first",
+            status_code=409,
+        )
+    frame_fields = (
+        (("base_frame_role", "base"), ("tcp_frame_role", "TCP"))
+        if observed_kind == "tcp_pose" else ()
+    )
+    for field, label in frame_fields:
+        if type(parameters.get(field)) is not str:
+            raise DraftSessionError(
+                "observed_move_role_missing",
+                f"the selected move has no {label} frame role; choose it before "
+                "capturing the current robot pose",
+                status_code=409,
+            )
+    applied, unavailable = _applied_context(state)
+    if applied is None and unavailable is not None:
+        raise DraftSessionError(
+            "observed_move_unavailable",
+            f"current pose/joints could not be read: {unavailable['message']}",
+            status_code=409,
+        )
+    if applied is None or not applied.binding_document:
+        raise DraftSessionError(
+            "observed_move_target_unbound",
+            "no Program with robot target bindings is Applied; Apply the Program first",
+            status_code=409,
+        )
+    identity = targets_projection.get("identity")
+    if not isinstance(identity, dict):
+        raise DraftSessionError(
+            "observed_move_unavailable",
+            "the execution owner publishes no configuration identity",
+            status_code=409,
+        )
+    # The Applied binding is only meaningful for the configuration it was
+    # compiled against, so check that before trusting any of its roles.
+    if any(applied.binding_document.get(key) != identity.get(key)
+           for key in ("graph_revision", "retained_bundle_id")):
+        raise DraftSessionError(
+            "observed_move_configuration_changed",
+            "the Applied configuration changed: the Applied Program binding belongs to a "
+            "different configuration than the current execution owner; Apply the Program again",
+            status_code=409,
+        )
+    bound_targets = [row for row in applied.binding_document["target_role_bindings"]
+                     if row["target_role_id"] == node_target_role]
+    if len(bound_targets) != 1:
+        raise DraftSessionError(
+            "observed_move_target_unbound",
+            f"target role {node_target_role!r} is not bound in the Applied Program",
+            status_code=409,
+        )
+    bound = bound_targets[0]
     matching_direct = [
         row for row in direct_rows
-        if row.get("target_role_id") == node_target_role
+        if row["controllable_component_id"] == bound["controllable_component_id"]
+        and row["command_target_id"] == bound["command_target_id"]
+        and row["operation_capability_id"] == "execution.trajectory.execute"
     ]
     if len(matching_direct) != 1:
         raise DraftSessionError(
-            "observed_move_target_mismatch",
-            "selected move target role is not unique in the current execution owner",
+            "observed_move_target_unavailable",
+            ("the bound robot target is unavailable in the current execution owner"
+             if not matching_direct else
+             "the execution owner publishes more than one matching robot target"),
             status_code=409,
         )
     direct = matching_direct[0]
+    frame_ref = None
+    if observed_kind == "tcp_pose":
+        command = direct["command"]
+        bound_frames = {row["frame_role_id"]: row["compiled_frame_name"]
+                        for row in bound["frame_role_bindings"]}
+        manual_frames = {row["frame_role_id"]: row["compiled_frame_name"]
+                         for row in command["target_descriptor"]["frames"]}
+        for field, label in frame_fields:
+            role = parameters[field]
+            requested = bound_frames.get(role)
+            if requested is None:
+                raise DraftSessionError(
+                    "observed_move_target_unbound",
+                    f"{label} frame role {role!r} is not bound for target role "
+                    f"{node_target_role!r} in the Applied Program",
+                    status_code=409,
+                )
+            observed_frame = manual_frames.get(command.get(f"{field}_id"))
+            if requested != observed_frame:
+                raise DraftSessionError(
+                    "observed_move_frame_mismatch",
+                    (f"{label} frame role {role!r} resolves to {requested!r}, but the robot "
+                     f"reports its current pose with {label} frame {observed_frame!r}; "
+                     f"choose the robot's {label} frame role to capture its current pose"
+                     if observed_frame is not None else
+                     f"the robot target does not report a {label} frame for its current pose"),
+                    status_code=409,
+                )
+        frame_ref = {"kind": "target_frame", "target_role": node_target_role,
+                     "frame_role": parameters["base_frame_role"]}
     matching_observed = [
         row.get("observed") for row in observed_rows
         if row.get("controllable_component_id") == direct.get("controllable_component_id")
@@ -581,7 +699,8 @@ def _observed_move_arguments(
             "positions_rad": deepcopy(observed.get("positions_rad")),
         }
         if observed_kind == "joint"
-        else {"current_tcp_pose": deepcopy(observed.get("current_tcp_pose"))}
+        else {"current_tcp_pose": deepcopy(observed.get("current_tcp_pose")),
+              "frame_ref": frame_ref}
     )
     if observed_kind == "joint":
         names = resolved_observation["source_joint_names"]
@@ -1181,6 +1300,36 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.get("/api/program/workspace")
     def read_workspace() -> dict[str, Any]:
         return _workspace(state)
+
+    @router.post("/api/program/draft/expression-check")
+    def check_expression(body: ExpressionCheckRequest) -> dict[str, Any]:
+        # Pure check against the current Draft's declarations; no Draft change.
+        draft = state.draft_session.snapshot()
+        if not draft["program_loaded"]:
+            raise HTTPException(status_code=404, detail={
+                "code": "composer_draft_unavailable",
+                "message": "Composer has no loaded Program Draft",
+            })
+        try:
+            return check_draft_expression(
+                draft["authoring"],
+                state.node_catalog,
+                expression=body.expression,
+                destination_type=body.destination_type,
+                exclude_computed_key=body.exclude_computed_key,
+            )
+        except ProgramValidationError as error:
+            raise HTTPException(status_code=409, detail={
+                "code": "expression_environment_invalid",
+                "message": (
+                    "the Draft's parameter or key declarations are invalid: "
+                    f"{error}"
+                ),
+            }) from error
+        except ExpressionCheckRefusal as error:
+            raise HTTPException(status_code=422, detail={
+                "code": error.code, "message": str(error),
+            }) from error
 
     @router.post("/api/program/draft/mutations")
     def mutate_draft(body: DraftMutationRequest) -> dict[str, Any]:

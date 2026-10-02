@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Final, Literal
 
 
@@ -21,6 +22,70 @@ def boolean_condition_matches(value: object, *, expected: bool) -> bool:
     if type(expected) is not bool:
         raise TypeError("expected must be a bool")
     return type(value) is bool and value is expected
+
+
+EQUALITY_OPERATORS: Final = frozenset({"==", "!="})
+ORDERING_OPERATORS: Final = frozenset({"<", "<=", ">", ">="})
+
+
+def comparison_supported(
+    value_type: str,
+    operator: str,
+    *,
+    has_tolerance: bool,
+) -> str | None:
+    """Return why a key type cannot use an operator/tolerance, else None."""
+    numeric = value_type in {"int64", "float64"}
+    if value_type not in {"bool", "float64", "int64", "string"}:
+        return f"{value_type} keys cannot be compared; use Check pose distance for poses"
+    if operator not in EQUALITY_OPERATORS | ORDERING_OPERATORS:
+        return f"operator {operator!r} is unsupported"
+    if not numeric and operator not in EQUALITY_OPERATORS:
+        return f"{value_type} keys support only == and !="
+    if has_tolerance and (not numeric or operator not in EQUALITY_OPERATORS):
+        return "tolerance applies only to == and != on numeric keys"
+    return None
+
+
+def compare_values(
+    actual: object,
+    operator: str,
+    expected: object,
+    *,
+    value_type: str,
+    tolerance: float | None = None,
+) -> bool:
+    """Compare one typed key value; mismatched types raise instead of coercing."""
+    reason = comparison_supported(value_type, operator, has_tolerance=tolerance is not None)
+    if reason is not None:
+        raise ValueError(reason)
+    if value_type in {"bool", "string"}:
+        kind = bool if value_type == "bool" else str
+        if type(actual) is not kind or type(expected) is not kind:
+            raise TypeError(f"compared values are not both {value_type}")
+        return (actual == expected) is (operator == "==")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in (actual, expected)
+    ):
+        raise TypeError("compared values are not both finite numbers")
+    if value_type == "int64" and (type(actual) is not int or type(expected) is not int):
+        raise TypeError("compared values are not both int64")
+    if operator in EQUALITY_OPERATORS:
+        equal = (
+            actual == expected
+            if tolerance is None
+            else abs(float(actual) - float(expected)) <= tolerance
+        )
+        return equal is (operator == "==")
+    return {
+        "<": actual < expected,
+        "<=": actual <= expected,
+        ">": actual > expected,
+        ">=": actual >= expected,
+    }[operator]
 
 
 def detect_boolean_edge(

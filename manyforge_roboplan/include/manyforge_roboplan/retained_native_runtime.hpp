@@ -251,12 +251,6 @@ struct RetainedNativeRuntimeInput final {
   /// Optional configuration-fence interlock owned by the surrounding managed
   /// execution process. It must outlive this runtime composition.
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
-  /// Exact Deployment-qualified retained runtime policy. Absence is
-  /// observable and keeps motion admission closed.
-  std::optional<core::RuntimePolicyDTO> runtime_policy{};
-  /// Exact retained catalog artifact that supplied `runtime_policy`.
-  std::optional<core::RuntimePolicyCatalogRecordRefDTO>
-      runtime_policy_source_artifact{};
   /// Optional product-selected state authority. Empty preserves the native
   /// predicted-state channel. A controller-backed simulation supplies its
   /// exact commanded source set here before constructing the sole writer.
@@ -388,9 +382,10 @@ struct RetainedNativeRuntime final
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
   std::optional<RetainedGripperPositionLimits> gripper_position_limits;
-  /// Exact Deployment-selected non-speed runtime policy sealed against this
-  /// motion target. It carries interrupt/acknowledgement/jerk semantics only.
-  std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
+  /// Exact non-speed motion policy sealed against this motion target. It
+  /// carries the Deployment-selected ordinary-motion jerk profile only.
+  std::optional<core::RuntimeParticipantPolicySelection>
+      motion_participant_policy;
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits;
 

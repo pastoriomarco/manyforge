@@ -624,18 +624,6 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
                 &entry);
-    } else if (entry.record_kind() == core::CatalogRecordKind::kRuntimePolicy) {
-      ++qualified_count;
-      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
-      ASSERT_NE(entry.compiled_schema(), nullptr);
-      EXPECT_EQ(
-          entry.compiled_schema()->schema_revision().value(),
-          "sha256:"
-          "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4");
-      EXPECT_EQ(registry.find_qualified_catalog_schema(
-                    entry.record_kind(), entry.schema_id(),
-                    entry.compiled_schema()->schema_revision()),
-                &entry);
     } else if (entry.record_kind() == core::CatalogRecordKind::kContactPolicy) {
       ++qualified_count;
       EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
@@ -673,7 +661,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                                        "0000000000000000000000000")),
               nullptr);
   }
-  EXPECT_EQ(qualified_count, 11U);
+  EXPECT_EQ(qualified_count, 10U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             sha256_digest(canonical_json(registry.normalized_projection())));
   EXPECT_NE(
@@ -1077,7 +1065,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 20U);
+  EXPECT_EQ(parsed_count, 19U);
 }
 
 TEST(ClosedSchema,
@@ -1237,7 +1225,6 @@ TEST(ClosedSchema,
         built.record_kind() == core::CatalogRecordKind::kModelAsset ||
         built.record_kind() == core::CatalogRecordKind::kProviderManifest ||
         built.record_kind() == core::CatalogRecordKind::kRuntimeProfile ||
-        built.record_kind() == core::CatalogRecordKind::kRuntimePolicy ||
         built.record_kind() == core::CatalogRecordKind::kStopEvidencePolicy) {
       EXPECT_EQ(projected.as_object().size(), 5U);
       EXPECT_EQ(
@@ -1298,12 +1285,6 @@ TEST(ClosedSchema,
             "sha256:"
             "c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
         expected_path = "catalog/manyforge.runtime_profile.v1.yaml";
-      } else if (built.record_kind() ==
-                 core::CatalogRecordKind::kRuntimePolicy) {
-        expected_revision =
-            "sha256:"
-            "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4";
-        expected_path = "catalog/manyforge.runtime_policy.v1.yaml";
       } else {
         expected_revision =
             "sha256:"
@@ -1350,7 +1331,6 @@ TEST(ClosedSchema,
       "catalog/manyforge.model_asset.v1.yaml",
       "catalog/manyforge.provider_manifest.v1.yaml",
       "catalog/manyforge.runtime_profile.v1.yaml",
-      "catalog/manyforge.runtime_policy.v1.yaml",
       "catalog/manyforge.stop_evidence_policy.v2.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",

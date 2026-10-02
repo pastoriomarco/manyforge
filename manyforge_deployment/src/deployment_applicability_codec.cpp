@@ -1518,8 +1518,7 @@ parse_retained_policy_records(const CanonicalValue::Object &policies) {
   for (const auto &record : result) {
     const auto kind = core::catalog_record_kind(record);
     if (kind != core::CatalogRecordKind::kContactPolicy &&
-        kind != core::CatalogRecordKind::kStopEvidencePolicy &&
-        kind != core::CatalogRecordKind::kRuntimePolicy) {
+        kind != core::CatalogRecordKind::kStopEvidencePolicy) {
       fail("$.policies.retained_policy_records",
            "record kind '" + std::string(core::to_string(kind)) +
                "' is outside the closed policy-family set");

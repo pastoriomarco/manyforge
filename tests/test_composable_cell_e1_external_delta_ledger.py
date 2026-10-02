@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -51,14 +53,31 @@ def test_current_patch_identity_cannot_drift_silently() -> None:
         )
 
 
-def test_retired_patch_remains_bound_to_its_exact_historical_blob() -> None:
+@pytest.mark.parametrize(
+    ("delta_id", "retired_path"),
+    (
+        (
+            "roboplan_patch_0004_build_helper_arguments",
+            "third_party/roboplan/patches/0004-configurable-source-build-cmake-arguments.patch",
+        ),
+        (
+            "roboplan_patch_0005_scene_scratch_construction",
+            "third_party/roboplan/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch",
+        ),
+    ),
+)
+def test_retired_patch_remains_bound_to_its_exact_historical_blob(
+    delta_id: str, retired_path: str
+) -> None:
     ledger = copy.deepcopy(_load())
-    delta = next(
-        row
-        for row in ledger["deltas"]
-        if row["id"] == "roboplan_patch_0004_build_helper_arguments"
+    delta = next(row for row in ledger["deltas"] if row["id"] == delta_id)
+    source = next(
+        source
+        for source in delta["local_sources"]
+        if source["kind"] == "historical_git_path" and source["path"] == retired_path
     )
-    delta["local_sources"][0]["blob"] = "0" * 40
+    assert not (_REPO_ROOT / retired_path).exists()
+    source["blob"] = "0" * 40
 
     with pytest.raises(verifier.LedgerError, match="blob mismatch"):
         verifier.validate(
@@ -151,31 +170,63 @@ def test_source_closure_digest_binds_license_and_exact_sources() -> None:
         )
 
 
+def _selected_roboplan_source_ids() -> set[str]:
+    """Return the RoboPlan source ids the image and setup verifiers select."""
+
+    selected: set[str] = set()
+    for name in ("Dockerfile", "Dockerfile.ros-jazzy-full"):
+        source = (_REPO_ROOT / name).read_text(encoding="utf-8")
+        selected.update(re.findall(r"ROBOPLAN_SOURCE_ID=(roboplan_[0-9a-z_]+)", source))
+        selected.update(re.findall(r"--source-id (roboplan_[0-9a-z_]+)", source))
+    setup = (_REPO_ROOT / "scripts/setup-docker.sh").read_text(encoding="utf-8")
+    selected.update(re.findall(r"--source-id (roboplan_[0-9a-z_]+)", setup))
+    return selected
+
+
 def test_selected_patch_manifest_and_ledger_name_exactly_one_series() -> None:
     manifest: dict[str, str] = {}
     for line in (_PATCH_ROOT / "patches.sha256").read_text(
         encoding="utf-8"
     ).splitlines():
         digest, relative = line.split()
-        manifest[f"third_party/roboplan/{relative}"] = digest
+        path = f"third_party/roboplan/{relative}"
+        assert path not in manifest
+        manifest[path] = digest
+    assert manifest
+    for path, digest in manifest.items():
+        assert hashlib.sha256((_REPO_ROOT / path).read_bytes()).hexdigest() == digest
 
-    expected = {
-        "third_party/roboplan/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184",
-        "third_party/roboplan/patches/0006-bound-roboplan-060-toppra-output-samples.patch": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a",
-        "third_party/roboplan/patches/0008-initialize-roboplan-060-dynotree-variant-state.patch": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd",
-        "third_party/roboplan/patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858",
-    }
-    assert manifest == expected
+    # The checked-in patch directory carries only the applied series.
     assert {
         f"third_party/roboplan/patches/{path.name}"
         for path in (_PATCH_ROOT / "patches").glob("*.patch")
-    } == set(expected)
+    } == set(manifest)
 
-    ledger_sources = {
-        source["path"]: source["sha256"]
-        for delta in _load()["deltas"]
-        for source in delta["local_sources"]
-        if source["kind"] == "repository_path"
-        and source["path"].startswith("third_party/roboplan/patches/")
+    ledger = _load()
+    selected_source_ids = _selected_roboplan_source_ids()
+    assert len(selected_source_ids) == 1
+    frozen_source_ids = {source["id"] for source in ledger["frozen_sources"]}
+    assert selected_source_ids <= frozen_source_ids
+    roboplan_source_ids = {
+        source_id for source_id in frozen_source_ids if source_id.startswith("roboplan_")
     }
-    assert ledger_sources == expected
+
+    ledger_sources: dict[str, str] = {}
+    retired_paths: set[str] = set()
+    for delta in ledger["deltas"]:
+        for source in delta["local_sources"]:
+            if not source["path"].startswith("third_party/roboplan/patches/"):
+                continue
+            if source["kind"] == "historical_git_path":
+                retired_paths.add(source["path"])
+                continue
+            assert source["kind"] == "repository_path"
+            assert source["path"] not in ledger_sources
+            ledger_sources[source["path"]] = source["sha256"]
+            assert (
+                set(delta["source_identity_refs"]) & roboplan_source_ids
+                == selected_source_ids
+            )
+    assert ledger_sources == manifest
+    assert retired_paths
+    assert retired_paths.isdisjoint(manifest)

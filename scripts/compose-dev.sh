@@ -147,10 +147,13 @@ case "$command" in
     image_key=${image_id#sha256:}
     cache_root="$cache_base/images/$image_key"
     mkdir -p "$cache_root/build" "$cache_root/node_modules"
-    # Installation Composer settings survive stop/start. Only this folder is
+    # Installation Composer settings and the Program runner's persistent
+    # blackboard values survive stop/start (values are checked against the
+    # applied Program; see DEVELOPMENT_WORKBENCH.md). Only these folders are
     # persistent; all other runtime state still resets with the container.
     composer_state="$cache_base/state/composer"
-    mkdir -p "$composer_state"
+    runner_state="$cache_base/state/program-runner"
+    mkdir -p "$composer_state" "$runner_state"
     serve_args=(serve)
     if [[ -n "$project" ]]; then
       serve_args+=(--project "$project")
@@ -166,6 +169,7 @@ case "$command" in
       -v "$repo_root:/workspace" \
       -v "$cache_root:/runner" \
       -v "$composer_state:/var/lib/manyforge/composer" \
+      -v "$runner_state:/var/lib/manyforge/program-runner" \
       -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
       -w /workspace \
       "$image_id" \

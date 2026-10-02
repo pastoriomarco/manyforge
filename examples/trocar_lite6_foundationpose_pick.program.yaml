@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:3606af6f0a7b88bb8384890c195012b1e0af7250e07e35ba079bbc7c94dc6230
+program_revision: sha256:4a83ca284cea69ff41ce802720ac145e2fa432356bce3cdab6698baa6454be99
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: >-
@@ -10,7 +10,7 @@ description: >-
   sequence using the physical lite-gripper and typed simulator lifecycle.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [isaac-sim]
   assistant: forbidden

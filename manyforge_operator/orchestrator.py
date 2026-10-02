@@ -258,6 +258,10 @@ class NativeLauncherConfig:
         return self.program_runner_state_root / "program-cycle.sqlite3"
 
     @property
+    def persistent_key_register(self) -> Path:
+        return self.program_runner_state_root / "persistent-keys.json"
+
+    @property
     def artifact_root(self) -> Path:
         return self.instance_root / "artifacts"
 
@@ -434,6 +438,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(config.execution_run_root),
             "--cycle-journal-path",
             str(config.program_cycle_journal),
+            "--persistent-key-register-path",
+            str(config.persistent_key_register),
             "--manager-liveness-socket",
             str(program_runner_liveness_socket),
             "--cell-id",

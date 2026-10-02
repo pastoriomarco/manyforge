@@ -24,8 +24,10 @@ from .native import (
     strict_json_object,
 )
 from .program_binding_transport import ProgramBindingTransportError
+from .program_runner_client import persistent_values_path
 from .program_binding_projection import (
     validate_applied_program_selection,
+    validate_committed_scenario_activation,
 )
 from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
@@ -652,6 +654,16 @@ class HeadlessHttpClient:
     def program_applied_status(self) -> dict[str, Any]:
         return self.request("GET", "/api/program/applied/status")
 
+    def committed_scenario_activation(self) -> dict[str, Any]:
+        projection = self.request("GET", "/api/program/committed-activation")
+        try:
+            return validate_committed_scenario_activation(projection)
+        except (ProgramBindingTransportError, TypeError, ValueError) as error:
+            raise HeadlessClientError(
+                "program_activation_invalid",
+                "headless API returned an invalid committed Scenario activation",
+            ) from error
+
     def program_scene_prepare(self, body: Mapping[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/program/scene-preparations", body=body)
         if (
@@ -827,6 +839,16 @@ class HeadlessHttpClient:
             "POST",
             f"{self._program_run_path(program_run_id)}/{suffix}",
             body=body,
+        )
+
+    def program_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+        return self.request("GET", persistent_values_path(scenario_id))
+
+    def program_persistent_value_action(
+        self, scenario_id: str, action: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", persistent_values_path(scenario_id, action), body=body
         )
 
     def viewer_model_urdf(self) -> ViewerModelAsset:

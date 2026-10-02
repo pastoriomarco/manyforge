@@ -165,6 +165,7 @@ public:
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
+    request.goal_frame_reference = motion->goal_frame_reference;
     request.contact_policy_id = motion->contact_policy_id.has_value()
                                     ? motion->contact_policy_id->value()
                                     : std::string{};

@@ -231,7 +231,7 @@ struct CatalogFixture final {
   std::string_view family;
 };
 
-constexpr std::array<CatalogFixture, 11> kAllCatalogKinds{{
+constexpr std::array<CatalogFixture, 10> kAllCatalogKinds{{
     {"model_asset", "model", "manyforge.model_asset.v1"},
     {"runtime_profile", "runtime", "manyforge.runtime_profile.v1"},
     {"component_type", "component", "manyforge.component_type.v1"},
@@ -244,7 +244,6 @@ constexpr std::array<CatalogFixture, 11> kAllCatalogKinds{{
      "manyforge.capability_definition.v1"},
     {"contact_policy", "contact", "manyforge.contact_policy.v1"},
     {"stop_evidence_policy", "stop", "manyforge.stop_evidence_policy.v2"},
-    {"runtime_policy", "runtime_policy", "manyforge.runtime_policy.v1"},
 }};
 
 void expect_compute_error(std::string authored,
@@ -550,16 +549,16 @@ TEST(DeploymentArtifactCodec,
 }
 
 TEST(DeploymentArtifactCodec,
-     RetainsAllElevenQualifiedCatalogReferenceVariants) {
-  constexpr std::array<std::size_t, 11> kQualifiedIndices{
-      0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U};
+     RetainsAllTenQualifiedCatalogReferenceVariants) {
+  constexpr std::array<std::size_t, 10> kQualifiedIndices{
+      0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U};
   std::string records;
   for (const std::size_t index : kQualifiedIndices) {
     const auto &row = kAllCatalogKinds[index];
     if (!records.empty()) {
       records.push_back(',');
     }
-    const char digit = "123456789ab"[index];
+    const char digit = "123456789a"[index];
     records += "{\"record_kind\":\"" + std::string(row.kind) +
                "\",\"record_id\":\"" + std::string(row.id) +
                "\",\"record_revision\":\"sha256:" + std::string(64U, digit) +

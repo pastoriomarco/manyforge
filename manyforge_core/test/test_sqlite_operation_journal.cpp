@@ -666,7 +666,7 @@ TEST(SqliteOperationJournalTest, CorruptV11CaptureOrderCannotCommitTheSchemaUpgr
 }
 
 TEST(SqliteOperationJournalTest,
-     PreparedMotionStateRetainsBoundedMetricsAndExactRuntimePolicyProvenance) {
+     PreparedMotionStateRetainsBoundedMetricsAndExactSpeedProvenance) {
   ScopedTemporaryDirectory directory;
   SqliteOperationJournal journal(directory.path() / "operation.sqlite3", CellId("cell.test"));
   const RequestOwnerEpoch epoch("execution-host.prepared.1");
@@ -690,12 +690,6 @@ TEST(SqliteOperationJournalTest,
           0.15,
           CartesianFidelityMetricsDTO{0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01,
                                       0.005, 2U}},
-      PreparedRuntimePolicyRefDTO{
-          RuntimePolicyCatalogRecordRefDTO{
-              RuntimePolicyId("manyforge.runtime_motion.cell"),
-              RuntimePolicyRevision(Digest('2').value()), SchemaId("manyforge.runtime_policy.v1"),
-              SchemaRevision(Digest('3').value()), Digest('4'),
-              ContentAddressedStoreKey("catalog/runtime-policy/cell/record")}},
       0.25,
       0.15,
       0.15}};
@@ -731,11 +725,7 @@ TEST(SqliteOperationJournalTest,
   EXPECT_NE(payload.find("\"certified_max_translation_error_m\":0.0015"), std::string::npos);
   EXPECT_NE(payload.find("\"accepted_max_blend_deviation_rad\":0.005"), std::string::npos);
   EXPECT_NE(payload.find("\"planning_attempt_count\":2"), std::string::npos);
-  EXPECT_NE(payload.find("\"runtime_policy_id\":\"manyforge.runtime_motion.cell\""),
-            std::string::npos);
-  EXPECT_NE(payload.find("\"content_addressed_store_key\":"
-                         "\"catalog/runtime-policy/cell/record\""),
-            std::string::npos);
+  EXPECT_EQ(payload.find("\"runtime_policy\""), std::string::npos);
   EXPECT_NE(payload.find("\"requested_tcp_linear_speed_mps\":0.25"), std::string::npos);
   EXPECT_NE(payload.find("\"deployment_maximum_tcp_linear_speed_mps\":0.15"),
             std::string::npos);
@@ -1154,6 +1144,46 @@ TEST(SqliteOperationJournalTest, LaterSnapshotsCannotChangeCapturedProgramOrigin
       EXPECT_FALSE(journal.RecordOperationState(epoch, changed, nullptr, "changed-origin").ok());
     }
   }
+}
+
+TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQualifier) {
+  ScopedTemporaryDirectory temporary;
+  const RequestOwnerEpoch epoch("execution-host.goal-frame");
+  SqliteOperationJournal journal(temporary.path() / "goal-frame.sqlite3", CellId("cell.1"), 8U);
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 4U, inventory).ok());
+  auto intent = CommandIntent("goal-frame-motion", epoch.value());
+  Pose3DTO goal;
+  goal.position_m = {0.1, 0.2, 0.3};
+  goal.orientation.w = 1.0;
+  MotionParticipantIntentDTO motion{MoveId("move.framed"), FrameRoleId("base"),
+                                    FrameRoleId("tcp"),    TolerancesDTO{0.01, 0.001, 0.01},
+                                    SpeedProfileDTO{},     TimeoutsDTO{},
+                                    CacheMode::kDefault,   PlanningProfileDTO::kBalanced,
+                                    MotionTargetModeDTO::kAbsolute,
+                                    std::nullopt,          std::nullopt,
+                                    PoseGoalDTO{goal},     std::nullopt,
+                                    {},                    {}};
+  motion.goal_frame_reference =
+      ReferenceDTO(FrameRoleId("tcp"),
+                   ReferenceTargetDTO{TargetRoleId("peer_arm"),
+                                      ControllableComponentId("robot.2"), CommandTargetId("arm")});
+  intent.participants.front().payload = motion;
+  const auto state =
+      OperationState("operation.goal-frame", OperationStateKind::kExecuting, 10);
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+  const auto events = journal.ReadEvents(epoch, 0U, 1U);
+  ASSERT_TRUE(events.ok()) << events.error().message;
+  ASSERT_EQ(events.value().events.size(), 1U);
+  const auto& payload = events.value().events.front().payload_json;
+  EXPECT_NE(payload.find("\"target_mode\":\"absolute\""), std::string::npos);
+  EXPECT_NE(payload.find("\"goal_frame_reference\":{\"id\":\"tcp\",\"pose\":null,"
+                         "\"target\":{\"command_target_id\":\"arm\","
+                         "\"controllable_component_id\":\"robot.2\","
+                         "\"target_role_id\":\"peer_arm\"},\"type\":\"frame_role\"}"),
+            std::string::npos)
+      << payload;
 }
 
 TEST(SqliteOperationJournalTest,

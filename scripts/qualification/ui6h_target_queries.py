@@ -196,7 +196,7 @@ def check_skill_authoring():
                 "name": "Skill example",
                 "catalog": {
                     "api_version": "manyforge.node_catalog.v2",
-                    "content_version": "2.3.0",
+                    "content_version": "2.4.0",
                 },
                 "component_roles": artifact["component_roles"],
                 "target_roles": artifact["target_roles"],

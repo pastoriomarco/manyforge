@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
+import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
@@ -524,6 +525,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     socketActive: false,
   };
   private readonly shellListeners = new Set<Listener>();
+  private operationProgress: readonly OperationProgressSample[] = EMPTY_OPERATION_PROGRESS;
+  private readonly operationProgressListeners = new Set<Listener>();
+  readonly getOperationProgress = () => this.operationProgress;
+  readonly subscribeOperationProgress = (listener: Listener) => {
+    this.operationProgressListeners.add(listener);
+    return () => this.operationProgressListeners.delete(listener);
+  };
   private readonly viewerListeners = new Set<Listener>();
   private readonly executionObservationListeners = new Set<Listener>();
   private readonly observationTransportListeners = new Set<Listener>();
@@ -985,6 +993,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.stopObservationConnection('Composer client unmounted');
     this.cancelStatePublications();
     this.shellListeners.clear();
+    this.operationProgressListeners.clear();
     this.viewerListeners.clear();
     this.executionObservationListeners.clear();
     this.publishObservationTransportStatus('disabled', null);
@@ -1012,6 +1021,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private clearControlSession(reason: string): void {
+    this.operationProgress = EMPTY_OPERATION_PROGRESS;
+    for (const listener of this.operationProgressListeners) listener();
     this.controlSessionId = null;
     this.controlReceiverIncarnation = null;
     this.controlSnapshotBarrierPending = true;
@@ -1382,7 +1393,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       if (shell === null || typeof shell !== 'object' || Array.isArray(shell)) {
         throw new Error('Control state message omitted its shell.');
       }
-      const shellRecord = shell as Record<string, unknown>;
+      const shellRecord = { ...shell } as Record<string, unknown>;
+      const progressPresent = 'operation_progress' in shellRecord;
+      const progress = progressPresent
+        ? parseOperationProgress(shellRecord.operation_progress) : null;
+      delete shellRecord.operation_progress;
+      const progressOnly = kind === 'delta' && progressPresent
+        && Object.keys(shellRecord).every((name) => name === 'complete');
       let candidate: ComposerHeadlessState;
       let candidateExecutionTargetsWire = this.executionTargetsWire;
       if (kind === 'snapshot') {
@@ -1510,8 +1527,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       }
       this.controlSnapshotBarrierPending = false;
       this.executionTargetsWire = candidateExecutionTargetsWire;
-      const viewerChanged = !sameViewerProjection(this.latest, candidate);
+      const viewerChanged = !progressOnly && !sameViewerProjection(this.latest, candidate);
       this.latest = candidate;
+      if (progress !== null || kind === 'snapshot') {
+        this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
+        for (const listener of this.operationProgressListeners) listener();
+      }
       if (canonicalPositiveU64(record.state_sequence)) {
         socket.send(JSON.stringify({
           schema_version: CONTROL_PROTOCOL_VERSION,
@@ -1525,9 +1546,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.resolveCommandDeliveryFaultAfterResynchronization();
       if (this.controlHeartbeatConfirmed) {
         if (viewerChanged) this.scheduleViewer();
-        // The v2 backend publishes only semantic owner changes; the browser
-        // does not repeat its reduction or second-guess that authority.
-        this.scheduleShell(record.event_class === 'critical');
+        // Progress wakes only its indicator; semantic owner changes retain
+        // the normal shell path without another browser-side reduction.
+        if (!progressOnly) this.scheduleShell(record.event_class === 'critical');
       }
     } catch (reason) {
       this.publishError(

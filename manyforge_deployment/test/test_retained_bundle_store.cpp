@@ -36,7 +36,6 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
-#include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
@@ -317,7 +316,7 @@ class ScopedTrustedRoot final {
       deployment.applicability_inputs().value().external_resources,
       nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {},
       {}, {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
@@ -2525,29 +2524,6 @@ TEST(FilesystemRetainedBundleRepositoryTest,
             bundle->canonical_bytes().size() - 1U)),
         RetainedBundleError);
   }
-}
-
-TEST(RetainedRuntimePolicyTest,
-     RequalifiesTheSoleRetainedPolicyAndKeepsAbsenceObservable) {
-  ScopedTrustedRoot native_root;
-  const auto native =
-      materialize_durable_native_motion_lite6_bundle(native_root.path());
-  FilesystemCatalogArtifactStore native_catalog(native_root.path());
-  const auto selected =
-      resolve_retained_runtime_policy(*native.bundle, native_catalog);
-  ASSERT_TRUE(selected.has_value());
-  ASSERT_TRUE(native.input.native_runtime_policy.has_value());
-  EXPECT_EQ(selected->reference(),
-            native.input.native_runtime_policy->reference());
-  EXPECT_EQ(selected->value(), native.input.native_runtime_policy->value());
-
-  ScopedTrustedRoot passive_root;
-  const auto passive =
-      materialize_durable_controllable_lite6_bundle(passive_root.path());
-  FilesystemCatalogArtifactStore passive_catalog(passive_root.path());
-  EXPECT_FALSE(
-      resolve_retained_runtime_policy(*passive.bundle, passive_catalog)
-          .has_value());
 }
 
 TEST(FilesystemRetentionStoreTest,

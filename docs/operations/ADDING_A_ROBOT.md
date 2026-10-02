@@ -152,9 +152,10 @@ robot_config:
   srdf_path: package://manyforge_example_models/models/my_robot/my_robot.srdf
   package_paths:
     - ..                                # relative to this YAML's directory
-  global_max_tcp_linear_speed_mps: 0.25 # required; deployment-wide
-                                        # ceiling on TCP linear speed
-                                        # for all moves
+  # The former global_max_tcp_linear_speed_mps setting no longer exists.
+  # The TCP speed ceiling is now set per robot in the Deployment:
+  # components[].target_settings.arm.maximum_tcp_linear_speed_mps
+  # (spec 430 §1.2); each move's requested speed is lowered to it.
 
   # Optional: per-joint caps bounding operator-authored Robot Control
   # targets (independent of planned-trajectory limits). Joint names MUST

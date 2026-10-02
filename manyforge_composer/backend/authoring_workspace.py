@@ -88,6 +88,7 @@ _PROGRAM_SNAPSHOT_FIELDS = (
     "programRevision",
     "program",
     "diagnostics",
+    "formulaReferences",
     "saved",
 )
 _PROGRAM_SAVED_FIELDS = ("available", "matchesDraft", "path", "programRevision")
@@ -875,6 +876,7 @@ class AuthoringWorkspace:
                 ),
                 "program": program_document,
                 "diagnostics": program_state["diagnostics"],
+                "formulaReferences": self._program.formula_references(),
                 "saved": {
                     "available": program_state["saved_path"] is not None,
                     "matchesDraft": (

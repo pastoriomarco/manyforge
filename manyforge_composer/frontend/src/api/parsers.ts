@@ -43,6 +43,7 @@ import type {
   DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
   ProgramDraftProjection,
+  ProgramFormulaReferences,
   ProgramDraftApplicability,
   ProgramDraftMeshAssetMetadata,
   FileBrowserEntry,
@@ -67,6 +68,13 @@ import type {
   ManagerDeploymentRecordDiff,
   ProgramUnresolvedReference,
   AppliedProgramStatus,
+  PersistentKeyValue,
+  PersistentKeyValueEdit,
+  PersistentKeyValues,
+  PersistentKeyValuesCleared,
+  ExpressionCheckResult,
+  ExpressionDiagnostic,
+  ExpressionValueType,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerRuntimeProjection,
@@ -345,6 +353,9 @@ import {
   parseProgramBindingTransport,
   ProgramBindingTransportError,
 } from './programBindingTransport.generated';
+import { PROGRAM_AUTHORED_VALUE_TYPES } from '../types/api';
+import { poseFrameOf } from '../utils/programFrames';
+import { overlappingSourcePaths, parseValuePath } from '../utils/valuePaths';
 
 type JsonObject = Record<string, unknown>;
 
@@ -852,26 +863,36 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
 
 function parseProgramValueSource(value: unknown, path: string): ProgramValueSource {
   const record = objectAt(value, path);
-  allowedKeysAt(record, ['kind', 'reference'], ['field'], path);
   const kind = stringAt(record.kind, `${path}.kind`);
-  if (
-    kind !== 'program_parameter'
-    && kind !== 'blackboard_key'
-    && kind !== 'blackboard_field'
-  ) {
+  if (kind === 'expression') {
+    exactKeysAt(record, ['expression', 'kind'], path);
+    return { kind, expression: nonEmptyStringAt(record.expression, `${path}.expression`) };
+  }
+  if (kind === 'blackboard_field') {
+    exactKeysAt(record, ['field', 'kind', 'reference'], path);
+    return {
+      kind,
+      reference: stringAt(record.reference, `${path}.reference`),
+      field: stringAt(record.field, `${path}.field`),
+    };
+  }
+  if (kind !== 'program_parameter' && kind !== 'blackboard_key') {
     return fail(`${path}.kind`, 'a supported Program value-source kind');
   }
-  const result: ProgramValueSource = {
-    kind,
-    reference: stringAt(record.reference, `${path}.reference`),
-  };
-  if (record.field !== undefined) {
-    result.field = stringAt(record.field, `${path}.field`);
+  exactKeysAt(record, ['kind', 'reference'], path);
+  return { kind, reference: stringAt(record.reference, `${path}.reference`) };
+}
+
+function parseProgramValueSources(value: unknown, path: string): Record<string, ProgramValueSource> {
+  const sources = Object.fromEntries(Object.entries(objectAt(value, path)).map(([key, source]) => {
+    if (parseValuePath(key) === null) return fail(`${path}.${key}`, 'keyed by a canonical value path');
+    return [key, parseProgramValueSource(source, `${path}.${key}`)];
+  }));
+  const overlap = overlappingSourcePaths(sources)[0];
+  if (overlap !== undefined) {
+    return fail(`${path}.${overlap[1]}`, `absent while ${overlap[0]} is sourced as a whole`);
   }
-  if ((kind === 'blackboard_field') !== (result.field !== undefined)) {
-    return fail(path, 'a field only and always for blackboard_field');
-  }
-  return result;
+  return sources;
 }
 
 const MODIFICATION_POLICY_VALUES = new Set<ProgramModificationPolicyValue>([
@@ -1039,14 +1060,7 @@ function parseProgramTreeNode(
   );
   const sources = record.value_sources === undefined
     ? undefined
-    : Object.fromEntries(
-        Object.entries(objectAt(record.value_sources, `${path}.value_sources`)).map(
-          ([key, source]) => [
-            key,
-            parseProgramValueSource(source, `${path}.value_sources.${key}`),
-          ],
-        ),
-      );
+    : parseProgramValueSources(record.value_sources, `${path}.value_sources`);
   const node: ProgramTreeNode = {
     node_id: stringAt(record.node_id, `${path}.node_id`),
     instance_id: stringAt(record.instance_id, `${path}.instance_id`),
@@ -1200,12 +1214,8 @@ function parseProgramParameter(
     record.runtime_mutability,
     `${path}.runtime_mutability`,
   );
-  if (
-    runtimeMutability !== 'immutable'
-    && runtimeMutability !== 'before_run'
-    && runtimeMutability !== 'between_operations'
-  ) {
-    return fail(`${path}.runtime_mutability`, 'a supported mutability');
+  if (runtimeMutability !== 'immutable' && runtimeMutability !== 'before_run') {
+    return fail(`${path}.runtime_mutability`, 'immutable or before_run');
   }
   const parameter: ProgramParameterDeclaration = {
     parameter_id: stringAt(record.parameter_id, `${path}.parameter_id`),
@@ -1549,22 +1559,53 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
         allowedKeysAt(
           row,
           ['key', 'type', 'access', 'persistence'],
-          ['fields', 'description'],
+          ['fields', 'description', 'initial', 'expression', 'allowed_frames'],
           rowPath,
         );
+        const type = stringAt(row.type, `${rowPath}.type`);
         const access = stringAt(row.access, `${rowPath}.access`);
         const persistence = stringAt(row.persistence, `${rowPath}.persistence`);
         if (!['read', 'write', 'read_write'].includes(access)) {
           return fail(`${rowPath}.access`, 'a supported access mode');
         }
-        if (!['node', 'run', 'persistent'].includes(persistence)) {
-          return fail(`${rowPath}.persistence`, 'a supported persistence mode');
+        if (persistence !== 'run' && persistence !== 'persistent') {
+          return fail(`${rowPath}.persistence`, 'run or persistent');
+        }
+        const initial = row.initial === undefined
+          ? undefined
+          : jsonValueAt(row.initial, `${rowPath}.initial`);
+        if (initial === null) {
+          return fail(`${rowPath}.initial`, 'omitted instead of null for an empty key');
+        }
+        if (initial !== undefined && !PROGRAM_AUTHORED_VALUE_TYPES.has(type)) {
+          return fail(`${rowPath}.initial`, `omitted: ${type} has no authored value`);
+        }
+        const expression = row.expression === undefined
+          ? undefined
+          : nonEmptyStringAt(row.expression, `${rowPath}.expression`);
+        if (expression !== undefined && (initial !== undefined || persistence === 'persistent')) {
+          return fail(`${rowPath}.expression`, 'absent for a key with initial: or persistent');
+        }
+        const allowedFrames = row.allowed_frames === undefined
+          ? undefined
+          : arrayAt(row.allowed_frames, `${rowPath}.allowed_frames`).map((frame, frameIndex) => {
+            const parsed = poseFrameOf(jsonValueAt(frame, `${rowPath}.allowed_frames[${frameIndex}]`));
+            return parsed ?? fail(
+              `${rowPath}.allowed_frames[${frameIndex}]`,
+              'a cell, target or scene-resource pose frame',
+            );
+          });
+        if (allowedFrames !== undefined && (type !== 'stored_pose' || allowedFrames.length === 0)) {
+          return fail(`${rowPath}.allowed_frames`, 'a non-empty list on a stored_pose key');
         }
         return {
           key: stringAt(row.key, `${rowPath}.key`),
-          type: stringAt(row.type, `${rowPath}.type`),
+          type,
           access: access as 'read' | 'write' | 'read_write',
-          persistence: persistence as 'node' | 'run' | 'persistent',
+          persistence,
+          ...(initial === undefined ? {} : { initial }),
+          ...(expression === undefined ? {} : { expression }),
+          ...(allowedFrames === undefined ? {} : { allowed_frames: allowedFrames }),
           ...(row.fields === undefined
             ? {}
             : {
@@ -2899,6 +2940,68 @@ function parseProgramSavedProjection(
   };
 }
 
+function formulaNamesAt(value: unknown, path: string): string[] {
+  const names = boundedArrayAt(value, path, 512).map((name, index) =>
+    stringAt(name, `${path}[${index}]`));
+  if (
+    names.some((name) => !/^(param|key)\../.test(name))
+    || names.some((name, index) => index > 0 && names[index - 1] >= name)
+  ) {
+    return fail(path, 'sorted unique param. and key. names');
+  }
+  return names;
+}
+
+/** Each reported formula must be one the Draft's authoring holds. */
+function parseProgramFormulaReferences(
+  value: unknown,
+  path: string,
+  authoring: ProgramAuthoringDocument | null,
+): ProgramFormulaReferences {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['computedKeys', 'nodes'], path);
+  const formulaKeys = new Set(
+    (authoring?.blackboard?.keys ?? [])
+      .filter((key) => key.expression !== undefined)
+      .map((key) => key.key),
+  );
+  const computedKeys = Object.fromEntries(
+    Object.entries(objectAt(record.computedKeys, `${path}.computedKeys`)).map(
+      ([key, names]) => {
+        if (!formulaKeys.has(key)) {
+          return fail(`${path}.computedKeys.${key}`, 'a computed key of the Draft');
+        }
+        return [key, formulaNamesAt(names, `${path}.computedKeys.${key}`)];
+      },
+    ),
+  );
+  const sources = new Map<string, Record<string, ProgramValueSource>>();
+  const pending = [...(authoring?.forest ?? [])];
+  for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    sources.set(node.instance_id, node.value_sources ?? {});
+    pending.push(...node.children);
+  }
+  const nodes = Object.fromEntries(
+    Object.entries(objectAt(record.nodes, `${path}.nodes`)).map(
+      ([instanceId, formulas]) => [
+        instanceId,
+        Object.fromEntries(
+          Object.entries(objectAt(formulas, `${path}.nodes.${instanceId}`)).map(
+            ([valuePath, names]) => {
+              const at = `${path}.nodes.${instanceId}.${valuePath}`;
+              if (sources.get(instanceId)?.[valuePath]?.kind !== 'expression') {
+                return fail(at, 'a formula of a Draft node');
+              }
+              return [valuePath, formulaNamesAt(names, at)];
+            },
+          ),
+        ),
+      ],
+    ),
+  );
+  return { computedKeys, nodes };
+}
+
 function parseProgramDraftProjection(
   value: unknown,
   path: string,
@@ -2915,6 +3018,7 @@ function parseProgramDraftProjection(
       'programRevision',
       'program',
       'diagnostics',
+      'formulaReferences',
     ],
     path,
   );
@@ -2963,6 +3067,11 @@ function parseProgramDraftProjection(
     programRevision,
     program,
     diagnostics,
+    formulaReferences: parseProgramFormulaReferences(
+      draft.formulaReferences,
+      `${path}.formulaReferences`,
+      authoring,
+    ),
   };
 }
 
@@ -3229,7 +3338,7 @@ export function parseAuthoringWorkspaceSnapshot(
   const programRecord = objectAt(record.program, `${path}.program`);
   exactKeysAt(programRecord, [
     'draftId', 'draftRevision', 'programLoaded', 'authoring', 'candidateAvailable',
-    'programRevision', 'program', 'diagnostics', 'saved',
+    'programRevision', 'program', 'diagnostics', 'formulaReferences', 'saved',
   ], `${path}.program`);
   const { saved: savedRecord, ...draftFields } = programRecord;
   const programDraft = parseProgramDraftProjection(
@@ -4349,7 +4458,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     if (
       instanceId.length === 0
       || instanceId.length > 512
-      || !['idle', 'running', 'held', 'success', 'failure'].includes(status)
+      || !['idle', 'running', 'held', 'success', 'failure', 'interrupted'].includes(status)
     ) {
       return fail(
         `${path}.node_statuses.${instanceId}`,
@@ -5011,7 +5120,8 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
       || (state === 'running' && heldNodeCount !== 0)
       || (state === 'held' && heldNodeCount !== nodeCount)
-      || (state === 'mixed' && (heldNodeCount === 0 || heldNodeCount === nodeCount))
+      // Ready and stopped nodes may be mixed even when every node is held.
+      || (state === 'mixed' && heldNodeCount === 0)
       // Run and Resume are one release of never-started and stopped work:
       // the owner projects one eligibility for both.
       || startAllowed !== resumeAllowed
@@ -5077,6 +5187,225 @@ export function parseProgramRuntimeControlProjection(
     executionSelections: parseExecutionSelectionControls(record.execution_selections, `${path}.execution_selections`),
     observationOverrideCandidate,
   };
+}
+
+function persistentKeyValueAt(value: unknown, path: string): PersistentKeyValue {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'access', 'has_initial', 'initial', 'key', 'sequence', 'stored', 'type', 'value',
+  ], path);
+  const access = stringAt(record.access, `${path}.access`);
+  if (access !== 'read' && access !== 'write' && access !== 'read_write') {
+    return fail(`${path}.access`, 'a supported access mode');
+  }
+  const hasInitial = booleanAt(record.has_initial, `${path}.has_initial`);
+  const initial = jsonValueAt(record.initial, `${path}.initial`);
+  if (hasInitial === (initial === null)) {
+    return fail(`${path}.initial`, 'a value exactly when has_initial is true');
+  }
+  const stored = booleanAt(record.stored, `${path}.stored`);
+  if (!stored && (record.value !== null || record.sequence !== null)) {
+    return fail(path, 'without a value or sequence when nothing is stored');
+  }
+  return {
+    key: stringAt(record.key, `${path}.key`),
+    type: stringAt(record.type, `${path}.type`),
+    access,
+    initial: initial === null ? undefined : initial,
+    stored,
+    value: jsonValueAt(record.value, `${path}.value`),
+    sequence: stored ? positiveIntegerAt(record.sequence, `${path}.sequence`) : null,
+  };
+}
+
+function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyValueEdit {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'action', 'detail', 'key', 'node_attempt_id', 'node_instance_id', 'program_run_id',
+    'reason', 'request_id', 'scenario_id', 'sequence', 'source_label',
+  ], path);
+  const action = stringAt(record.action, `${path}.action`);
+  if (
+    action !== 'set' && action !== 'reset' && action !== 'clear'
+    && action !== 'dropped' && action !== 'fault'
+  ) {
+    return fail(`${path}.action`, 'set, reset, clear, dropped or fault');
+  }
+  const reason = nullableStringAt(record.reason, `${path}.reason`);
+  if ((reason !== null) !== (action === 'dropped' || action === 'fault')) {
+    return fail(`${path}.reason`, 'a reason exactly for a dropped value or a fault');
+  }
+  return {
+    sequence: positiveIntegerAt(record.sequence, `${path}.sequence`),
+    key: nullableStringAt(record.key, `${path}.key`),
+    action,
+    requestId: nullableStringAt(record.request_id, `${path}.request_id`),
+    sourceLabel: stringAt(record.source_label, `${path}.source_label`),
+    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
+    nodeInstanceId: nullableStringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeAttemptId: nullableStringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    reason,
+    detail: nullableStringAt(record.detail, `${path}.detail`),
+  };
+}
+
+function persistentKeyStorageFaultAt(
+  value: unknown,
+  path: string,
+): PersistentKeyValues['storageFault'] {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'message'], path);
+  return {
+    code: stringAt(record.code, `${path}.code`),
+    message: stringAt(record.message, `${path}.message`),
+  };
+}
+
+function persistentKeyApplyObservationFaultAt(
+  value: unknown,
+  path: string,
+): PersistentKeyValues['applyObservationFault'] {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'record_digests'], path);
+  const recordDigests = arrayAt(record.record_digests, `${path}.record_digests`)
+    .map((digest, index) => digestAt(digest, `${path}.record_digests[${index}]`));
+  if (recordDigests.length === 0) {
+    return fail(`${path}.record_digests`, 'at least one committed Apply');
+  }
+  return { code: stringAt(record.code, `${path}.code`), recordDigests };
+}
+
+export function parsePersistentKeyValues(
+  value: unknown,
+  path = 'persistentKeyValues',
+): PersistentKeyValues {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'apply_observation_fault', 'edits', 'keys', 'program_revision', 'program_run_id',
+    'scenario_id', 'schema_version', 'sequence', 'storage_fault',
+  ], path);
+  if (record.schema_version !== 'manyforge.persistent_key_values.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v1');
+  }
+  return {
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
+    sequence: integerAt(record.sequence, `${path}.sequence`),
+    keys: arrayAt(record.keys, `${path}.keys`)
+      .map((row, index) => persistentKeyValueAt(row, `${path}.keys[${index}]`)),
+    edits: arrayAt(record.edits, `${path}.edits`)
+      .map((row, index) => persistentKeyValueEditAt(row, `${path}.edits[${index}]`)),
+    storageFault: persistentKeyStorageFaultAt(record.storage_fault, `${path}.storage_fault`),
+    applyObservationFault: persistentKeyApplyObservationFaultAt(
+      record.apply_observation_fault,
+      `${path}.apply_observation_fault`,
+    ),
+  };
+}
+
+/** A set or Reset returns the Scenario's values as they are after the edit. */
+export function parsePersistentKeyEdit(value: unknown): PersistentKeyValues {
+  const path = 'persistentKeyEdit';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['action', 'key', 'request_id', 'schema_version', 'values'], path);
+  if (record.schema_version !== 'manyforge.persistent_key_edit.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.persistent_key_edit.v1');
+  }
+  if (record.action !== 'set' && record.action !== 'reset') {
+    return fail(`${path}.action`, 'set or reset');
+  }
+  return parsePersistentKeyValues(record.values, `${path}.values`);
+}
+
+export function parsePersistentKeyValuesCleared(value: unknown): PersistentKeyValuesCleared {
+  const path = 'persistentKeyValuesCleared';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['action', 'removed', 'request_id', 'scenario_id', 'schema_version'], path);
+  if (record.schema_version !== 'manyforge.persistent_key_edit.v1' || record.action !== 'clear') {
+    return fail(path, 'a manyforge.persistent_key_edit.v1 clear result');
+  }
+  return {
+    requestId: stringAt(record.request_id, `${path}.request_id`),
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    removed: integerAt(record.removed, `${path}.removed`),
+  };
+}
+
+const EXPRESSION_VALUE_TYPES: ReadonlySet<string> = new Set(['bool', 'int64', 'float64', 'string']);
+
+function expressionValueTypeAt(value: unknown, path: string): ExpressionValueType {
+  const type = stringAt(value, path);
+  if (!EXPRESSION_VALUE_TYPES.has(type)) return fail(path, 'bool, int64, float64 or string');
+  return type as ExpressionValueType;
+}
+
+function expressionDiagnosticAt(value: unknown, path: string): ExpressionDiagnostic {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'length', 'message', 'name', 'position'], path);
+  const position = record.position === null ? null : integerAt(record.position, `${path}.position`);
+  const length = record.length === null ? null : integerAt(record.length, `${path}.length`);
+  if ((position === null) !== (length === null)) {
+    return fail(path, 'a position and a length together, or neither');
+  }
+  return {
+    code: nonEmptyStringAt(record.code, `${path}.code`),
+    message: nonEmptyStringAt(record.message, `${path}.message`),
+    position,
+    length,
+    name: nullableStringAt(record.name, `${path}.name`),
+  };
+}
+
+function expressionPreviewMatches(type: ExpressionValueType, value: JsonValue): boolean {
+  if (type === 'bool') return typeof value === 'boolean';
+  if (type === 'string') return typeof value === 'string';
+  if (type === 'int64') return typeof value === 'number' && Number.isInteger(value);
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** The backend's check of one formula (POST /api/program/draft/expression-check). */
+export function parseExpressionCheckResult(value: unknown): ExpressionCheckResult {
+  const path = 'expressionCheck';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['diagnostics', 'names', 'preview', 'result_type', 'schema_version'], path);
+  if (record.schema_version !== 'manyforge.expression_check.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.expression_check.v1');
+  }
+  const resultType = record.result_type === null
+    ? null
+    : expressionValueTypeAt(record.result_type, `${path}.result_type`);
+  const diagnostics = arrayAt(record.diagnostics, `${path}.diagnostics`)
+    .map((row, index) => expressionDiagnosticAt(row, `${path}.diagnostics[${index}]`));
+  const previewRecord = objectAt(record.preview, `${path}.preview`);
+  exactKeysAt(previewRecord, ['unavailable_reason', 'value'], `${path}.preview`);
+  const previewValue = jsonValueAt(previewRecord.value, `${path}.preview.value`);
+  const reason = nullableStringAt(
+    previewRecord.unavailable_reason,
+    `${path}.preview.unavailable_reason`,
+  );
+  let preview: ExpressionCheckResult['preview'];
+  if (previewValue !== null && reason === null) {
+    if (resultType === null || !expressionPreviewMatches(resultType, previewValue)) {
+      return fail(`${path}.preview.value`, 'a value of the result type');
+    }
+    preview = { value: previewValue };
+  } else if (previewValue === null && reason !== null && reason !== '') {
+    preview = { unavailableReason: reason };
+  } else {
+    return fail(`${path}.preview`, 'either a value or a non-empty unavailable_reason');
+  }
+  const names = arrayAt(record.names, `${path}.names`).map((row, index) => {
+    const namePath = `${path}.names[${index}]`;
+    const name = objectAt(row, namePath);
+    exactKeysAt(name, ['name', 'type'], namePath);
+    const text = stringAt(name.name, `${namePath}.name`);
+    if (!/^(param|key)\.\S+$/.test(text)) return fail(`${namePath}.name`, 'a param. or key. name');
+    return { name: text, type: nonEmptyStringAt(name.type, `${namePath}.type`) };
+  });
+  return { resultType, diagnostics, preview, names };
 }
 
 export function parseRuntimeOverrideMaterializationResponse(

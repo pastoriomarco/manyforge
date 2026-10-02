@@ -46,6 +46,28 @@ struct RetainedSceneFrameResolverInput final {
   std::int64_t maximum_receiver_time_skew_ns{10'000'000};
 };
 
+/// One "express pose P, given in frame A, in frame B" query. Frames are
+/// `kCellFrame`, robot-qualified `kFrameRole`, or `kSceneResource` references;
+/// every robot frame must belong to a robot hosted by this cell resolver.
+struct RetainedSceneFrameTransformQuery final {
+  core::Pose3DTO pose_in_source_frame;
+  core::ReferenceDTO source_frame;
+  core::ReferenceDTO target_frame;
+  core::ProjectionLeaseBindingDTO projection_binding;
+};
+
+/// Immutable transform answer evaluated from one state sample time.
+struct RetainedSceneFrameTransform final {
+  core::Pose3DTO pose_in_target_frame;
+  core::Pose3DTO source_frame_in_cell;
+  core::Pose3DTO target_frame_in_cell;
+  core::ProjectionLeaseBindingDTO projection_binding;
+  std::int64_t evaluated_at_ns{};
+  /// Resolution evidence of every retained frame path crossed, sorted and
+  /// unique. Empty when both frames are cell-fixed.
+  std::vector<core::ContentDigest> resolution_evidence_digests;
+};
+
 /// Exact retained-graph scene-frame resolver. It builds c1 immutable state
 /// views from direct local providers or the unchanged c2 external provider
 /// seam, then evaluates FK against fresh model scratch only. A command-fenced
@@ -416,6 +438,16 @@ public:
           std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
           std::int64_t now_ns) const;
 
+  /// Express one pose between two cell frames. Both frames are resolved from
+  /// one coherent state capture at `now_ns`: every crossed control binding is
+  /// read once and both frame paths see that same publication, each checked
+  /// under the ordinary freshness rules; planner state is never read.
+  [[nodiscard]] core::Result<RetainedSceneFrameTransform>
+  ResolveFrameTransform(
+      const RetainedSceneFrameTransformQuery &query,
+      std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+      std::int64_t now_ns) const;
+
   /// Resolve one carrier frame against the exact retained predecessor while
   /// replacing only the selected control binding with a predicted terminal
   /// state. All other path state remains owner-issued and immutable.
@@ -426,14 +458,19 @@ public:
 
 private:
   class Impl;
+  class StateCapture;
   explicit RetainedSceneFrameResolver(std::shared_ptr<Impl> impl);
+  /// A failure to find the selected frame's retained path names
+  /// `requested_reference` when the frame is resolved for one, else the
+  /// selected frame; every other failure names no reference.
   [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
   ResolveWithCandidateState(
       const core::SceneFrameResolutionSelectorDTO &selector,
       const core::ProjectionLeaseBindingDTO &projection_binding,
       std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
-      std::int64_t now_ns,
-      const core::ControlledStateDTO *predicted_state) const;
+      const StateCapture &capture,
+      const core::ControlledStateDTO *predicted_state,
+      const core::ReferenceDTO *requested_reference) const;
   [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
   ResolveFrameWithCandidateState(
       const core::SceneFrameRefDTO &reference,

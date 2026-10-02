@@ -4,6 +4,10 @@ import {
   parseCatalogResponse,
   parseAppliedProgramSelection,
   parseAppliedProgramStatus,
+  parsePersistentKeyEdit,
+  parseExpressionCheckResult,
+  parsePersistentKeyValues,
+  parsePersistentKeyValuesCleared,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
   parseDeploymentCandidateOperationResponse,
@@ -61,6 +65,10 @@ import type {
   NewScenarioDocumentInput,
   AppliedProgramSelection,
   AppliedProgramStatus,
+  PersistentKeyValues,
+  PersistentKeyValuesCleared,
+  ExpressionCheckRequest,
+  ExpressionCheckResult,
   AuthoringWorkspaceSnapshot,
   CatalogResponse,
   DraftFenceRequest,
@@ -323,10 +331,46 @@ export class ApiError extends Error {
   }
 }
 
-/** Only for authoring requests; never retry an edit after a refused fence. */
+/**
+ * The named causes for which "Use current robot pose/joints" refuses before any
+ * Draft change: one code per thing the operator has to correct.
+ */
+const OBSERVED_MOVE_REFUSAL_CODES = new Set([
+  'observed_move_node_unsupported',
+  'observed_move_role_missing',
+  'observed_move_configuration_changed',
+  'observed_move_target_unbound',
+  'observed_move_target_unavailable',
+  'observed_move_frame_mismatch',
+  'observed_move_unavailable',
+]);
+
+/** Remedies the owner's message does not already name (it lies outside the Draft). */
+const OBSERVED_MOVE_REFUSAL_GUIDANCE: Readonly<Record<string, string>> = {
+  observed_move_target_unavailable: 'Check that the robot is running in the current configuration.',
+  observed_move_unavailable: 'Wait for the robot to report its current state, then try again.',
+};
+
+/**
+ * Only for authoring requests; never retry an edit after a refused fence.
+ *
+ * A refusal is recognised only by an explicit, named code in the backend's
+ * structured error body, never by a bare status: a 502/503 without such a code
+ * (a proxy or gateway failure, a malformed body) may hide a request that
+ * succeeded before its reply was lost, so it stays unconfirmed.
+ */
 export function authoringRefusalMessage(error: unknown): string | null {
-  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  if (!(error instanceof ApiError)) return null;
   const code = apiErrorCode(error);
+  // The observed-move resolver refuses these before preparing or installing a
+  // Draft mutation; no submission outcome remains to reconcile. The code alone
+  // proves it, whatever the status (an unreachable owner is reported as 503).
+  if (code !== null && OBSERVED_MOVE_REFUSAL_CODES.has(code)) {
+    const guidance = OBSERVED_MOVE_REFUSAL_GUIDANCE[code];
+    if (!guidance) return `Edit not applied: ${error.message}`;
+    return `Edit not applied: ${error.message.replace(/[.\s]*$/, '')}. ${guidance}`;
+  }
+  if (error.status !== 409) return null;
   if (code === 'authoring_not_ready') return 'Edit not applied: authoring is currently unavailable.';
   if (code === 'stale_generation') return 'Edit not applied: backend state changed. Review the current state before trying again.';
   // Preparation runs before any claim or runtime effect, so it is a definite
@@ -386,6 +430,32 @@ const failedAuthoringRequests = new WeakMap<object, AuthoringRequestIdentity>();
 export function failedAuthoringRequest(error: unknown): AuthoringRequestIdentity | null {
   return error !== null && typeof error === 'object'
     ? failedAuthoringRequests.get(error) ?? null : null;
+}
+
+export interface PersistentKeyRequestIdentity {
+  request_id: string;
+  request_owner_epoch: string;
+  source_label: string;
+}
+
+/**
+ * What the operator saw: the live run holding the values and its revision.
+ * Without a run the last admitted edit wins (nothing to name); a resent
+ * request is still refused by its identity.
+ */
+export type PersistentKeyValuesFence =
+  | { program_run_id: string; expected_run_revision: number }
+  | { program_run_id?: never; expected_run_revision?: never };
+
+export type PersistentKeyValueEditBody = PersistentKeyRequestIdentity & PersistentKeyValuesFence & {
+  scenario_id: string;
+  key: string;
+  expected_program_revision: string;
+  value?: JsonValue;
+};
+
+function persistentValuesPath(scenarioId: string, suffix = ''): string {
+  return `/api/program/scenarios/${encodeURIComponent(scenarioId)}/persistent-values${suffix}`;
 }
 
 async function requestJson<T>(
@@ -668,6 +738,16 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ ...fence, mutation, arguments: args }),
       },
+    ),
+    /** Check one formula against the current Draft's parameters and keys; never changes the Draft. */
+    checkExpression: (
+      request: ExpressionCheckRequest,
+      signal?: AbortSignal,
+    ): Promise<ExpressionCheckResult> => requestJson(
+      '/api/program/draft/expression-check',
+      parseExpressionCheckResult,
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
     ),
     openDraft: (
       fence: LocalWorkspaceFenceRequest,
@@ -980,6 +1060,33 @@ export const api = {
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
     appliedStatus: (signal?: AbortSignal): Promise<AppliedProgramStatus> =>
       requestJson('/api/program/applied/status', parseAppliedProgramStatus, signal),
+    persistentValues: (
+      scenarioId: string,
+      signal?: AbortSignal,
+    ): Promise<PersistentKeyValues> => requestJson(
+      persistentValuesPath(scenarioId),
+      parsePersistentKeyValues,
+      signal,
+    ),
+    /** Set one stored value, or Reset it to `initial:` (value omitted). */
+    editPersistentValue: (
+      scenarioId: string,
+      body: PersistentKeyValueEditBody,
+    ): Promise<PersistentKeyValues> => requestJson(
+      persistentValuesPath(scenarioId, 'value' in body ? '' : '/reset'),
+      parsePersistentKeyEdit,
+      undefined,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    clearPersistentValues: (
+      scenarioId: string,
+      body: PersistentKeyRequestIdentity & { scenario_id: string },
+    ): Promise<PersistentKeyValuesCleared> => requestJson(
+      persistentValuesPath(scenarioId, '/clear'),
+      parsePersistentKeyValuesCleared,
+      undefined,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
   },
   manager: {
     status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(

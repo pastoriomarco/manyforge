@@ -223,8 +223,7 @@
   font-size: var(--inspector-label-font-size);
 }
 
-.central-inspector-section .program-property-heading span,
-.central-inspector-section .program-source-summary span {
+.central-inspector-section .program-property-heading span {
   font-size: var(--mf-font-size-058);
 }
 

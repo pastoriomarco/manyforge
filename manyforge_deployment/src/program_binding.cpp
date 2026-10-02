@@ -1084,8 +1084,6 @@ template <typename StrongType>
   MANYFORGE_PARSE_SOURCE_RECORD(kStopEvidencePolicy, "stop_evidence_policy",
                                 StopEvidencePolicyId,
                                 StopEvidencePolicyRevision)
-  MANYFORGE_PARSE_SOURCE_RECORD(kRuntimePolicy, "runtime_policy",
-                                RuntimePolicyId, RuntimePolicyRevision)
 #undef MANYFORGE_PARSE_SOURCE_RECORD
   fail(std::string(path) + ": unknown catalog record kind");
 }

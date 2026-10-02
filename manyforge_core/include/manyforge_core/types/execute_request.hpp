@@ -208,12 +208,16 @@ struct ExecuteRequestDTO {
   PlanningProfileDTO planning_profile = PlanningProfileDTO::kFirstFeasible;
   MotionTargetModeDTO target_mode = MotionTargetModeDTO::kAbsolute;
   /// Required for relative pose/Cartesian targets; forbidden for absolute
-  /// targets and relative joint deltas. Resolution is kernel-owned and
-  /// revision-bound.
+  /// targets (which use goal_frame_reference) and relative joint deltas.
+  /// Resolution is kernel-owned and revision-bound.
   std::optional<ReferenceDTO> target_reference;
   /// Optional coordinate basis for relative pose/Cartesian offsets. Defaults
   /// to target_reference when omitted.
   std::optional<ReferenceDTO> offset_reference;
+  /// Optional frame in which an absolute pose/Cartesian goal is expressed.
+  /// Forbidden with relative targets; resolved to the base frame at admission
+  /// from the same captured context as relative references.
+  std::optional<ReferenceDTO> goal_frame_reference;
   /// Admission-resolved typed blackboard-object bindings used by
   /// `ReferenceDTO::kRuntimeObject`. Empty unless this request names a runtime
   /// object; callers cannot rely on string equality with SceneResourceId.

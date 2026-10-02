@@ -636,7 +636,7 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
                 "prompt_template_id",
                 "response_contract",
                 "template_text",
-                "variable_ids",
+                "variables",
                 "version",
             },
             path=f"prompt templates[{index}]",
@@ -652,13 +652,15 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
             field="prompt template text",
             maximum_bytes=16 * 1024,
         )
-        variable_ids = list(_sequence(row["variable_ids"], field="variable_ids"))
-        if (
-            variable_ids != sorted(set(variable_ids))
-            or any(not isinstance(value, str) or not value for value in variable_ids)
+        variables = _mapping(row["variables"], field="prompt template variables")
+        if list(variables) != sorted(variables) or any(
+            not isinstance(variable_id, str)
+            or not variable_id
+            or variable_type not in TEMPLATE_VARIABLE_TYPES
+            for variable_id, variable_type in variables.items()
         ):
             raise ProgramAssistantPortError(
-                "prompt template variables are not canonical"
+                "prompt template variables are not canonical typed declarations"
             )
         response = dict(
             _mapping(row["response_contract"], field="prompt response_contract")
@@ -743,6 +745,13 @@ def _validate_query_nodes(
     model_transport: ProgramModelTransport,
 ) -> None:
     tree = _mapping(context.program.get("tree"), field="Program tree")
+    program_parameters = {
+        row.get("parameter_id"): row.get("type")
+        for row in _sequence(
+            context.program.get("parameters", ()), field="Program parameters"
+        )
+        if isinstance(row, Mapping)
+    }
     validated_endpoints: set[str] = set()
     for node in _walk_tree(tree):
         if node.get("node_id") != "assistant.query_model":
@@ -761,20 +770,9 @@ def _validate_query_nodes(
             raise ProgramAssistantPortError(
                 "query_model references an unretained endpoint or template"
             ) from exc
-        variable_ids = [
-            _text(
-                _mapping(raw, field="template variable").get("variable_id"),
-                field="template variable_id",
-            )
-            for raw in _sequence(
-                parameters.get("template_variables", ()),
-                field="template_variables",
-            )
-        ]
-        if variable_ids != list(template["variable_ids"]):
-            raise ProgramAssistantPortError(
-                "query_model variables differ from the retained template"
-            )
+        _validate_template_variable_types(
+            node, template["variables"], blackboard, program_parameters
+        )
         output_key = _text(parameters.get("output_key"), field="output_key")
         declaration = blackboard.get(output_key)
         if declaration is None or declaration.get("type") != "model_response":
@@ -840,6 +838,80 @@ def _validate_query_nodes(
                     "the selected site transport"
                 ) from exc
             validated_endpoints.add(endpoint_alias)
+
+
+TEMPLATE_VARIABLE_TYPES: Final = frozenset(
+    {"bool", "float64", "int64", "string", "string_list"}
+)
+
+
+def _template_value_matches(variable_type: str, value: Any) -> bool:
+    if variable_type == "bool":
+        return type(value) is bool
+    if variable_type == "int64":
+        return type(value) is int and -(1 << 63) <= value < 1 << 63
+    if variable_type == "float64":
+        return type(value) in {int, float} and math.isfinite(value)
+    if variable_type == "string":
+        return type(value) is str
+    return isinstance(value, (list, tuple)) and all(type(item) is str for item in value)
+
+
+def _validate_template_variable_types(
+    node: Mapping[str, Any],
+    declared: Mapping[str, str],
+    blackboard: Mapping[str, Mapping[str, Any]],
+    program_parameters: Mapping[str, str],
+) -> None:
+    """Match one query_model's literal and sourced variables to its template.
+
+    Each variable is a literal map entry or a value source at
+    ``template_variables.<variable_id>`` (a source wins over a kept literal).
+    """
+
+    parameters = _mapping(node.get("parameters"), field="query_model parameters")
+    literals = _mapping(
+        parameters.get("template_variables", {}), field="template_variables"
+    )
+    source_types: dict[str, str | None] = {}
+    sources = _mapping(node.get("value_sources", {}), field="value_sources")
+    for path, raw in sources.items():
+        if not path.startswith("template_variables."):
+            continue
+        source = _mapping(raw, field=f"value_sources.{path}")
+        kind = source.get("kind")
+        reference = source.get("reference")
+        if kind == "program_parameter":
+            source_type = program_parameters.get(reference)
+        elif kind == "blackboard_key":
+            source_type = blackboard.get(reference, {}).get("type")
+        elif kind == "blackboard_field":
+            source_type = next(
+                (
+                    row.get("type")
+                    for row in blackboard.get(reference, {}).get("fields", ())
+                    if row.get("field") == source.get("field")
+                ),
+                None,
+            )
+        else:
+            source_type = None
+        source_types[path.removeprefix("template_variables.")] = source_type
+    if set(literals) | set(source_types) != set(declared):
+        raise ProgramAssistantPortError(
+            "query_model template_variables differ from the variables of its "
+            "prompt template"
+        )
+    for variable_id, variable_type in declared.items():
+        if variable_id in source_types:
+            matches = source_types[variable_id] == variable_type
+        else:
+            matches = _template_value_matches(variable_type, literals[variable_id])
+        if not matches:
+            raise ProgramAssistantPortError(
+                f"query_model template variable {variable_id!r} is not the "
+                f"{variable_type} value its prompt template declares"
+            )
 
 
 def _json_schema(
@@ -1526,27 +1598,28 @@ class ProgramAssistantPort:
     @staticmethod
     def _template_variables(
         inputs: OwnerNodeInputs,
+        declared: Mapping[str, str],
     ) -> tuple[dict[str, Any], dict[str, str]]:
+        captured = _mapping(
+            inputs.parameters.get("template_variables", {}),
+            field="template_variables",
+        )
+        if sorted(captured) != list(declared):
+            raise _TaskFailure(
+                "model_template_variables_mismatched",
+                "captured template variables differ from the retained template",
+            )
         raw_values: dict[str, Any] = {}
         prompt_values: dict[str, str] = {}
-        for index, raw in enumerate(
-            _sequence(
-                inputs.parameters.get("template_variables", ()),
-                field="template_variables",
-            )
-        ):
-            binding = _mapping(raw, field=f"template_variables[{index}]")
-            variable_id = _text(binding.get("variable_id"), field="variable_id")
-            source_path = f"/template_variables/{index}/source"
-            if source_path not in inputs.embedded_values:
-                raise ProgramAssistantPortError(
-                    f"template variable {variable_id!r} has no captured value"
-                )
-            if variable_id in raw_values:
-                raise ProgramAssistantPortError("template variables contain duplicates")
-            value = _thaw(inputs.embedded_values[source_path])
+        for variable_id, variable_type in declared.items():
+            value = _thaw(captured[variable_id])
             if isinstance(value, tuple):
                 value = list(value)
+            if not _template_value_matches(variable_type, value):
+                raise _TaskFailure(
+                    "model_template_variables_mismatched",
+                    f"template variable {variable_id!r} is not a {variable_type} value",
+                )
             raw_values[variable_id] = value
             prompt_values[variable_id] = _stringify_template_value(value)
         return raw_values, prompt_values
@@ -1924,12 +1997,9 @@ class ProgramAssistantPort:
         )
         endpoint = context.assistant.endpoints[endpoint_alias]
         template = context.assistant.templates[template_id]
-        raw_variables, prompt_variables = self._template_variables(inputs)
-        if list(raw_variables) != list(template["variable_ids"]):
-            raise _TaskFailure(
-                "model_template_variables_mismatched",
-                "captured template variables differ from the retained template",
-            )
+        raw_variables, prompt_variables = self._template_variables(
+            inputs, template["variables"]
+        )
         output_key = _text(parameters.get("output_key"), field="output_key")
         declaration = context.blackboard[output_key]
         schema_template = _json_schema(declaration, raw_variables)

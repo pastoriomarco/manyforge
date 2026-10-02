@@ -114,6 +114,14 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
         return (self.status is py_trees.common.Status.RUNNING
                 and getattr(self.decorated, "presented_held", False))
 
+    @property
+    def presented_interrupted(self) -> bool:
+        return getattr(self.decorated, "presented_interrupted", False)
+
+    @property
+    def presented_stop_failed(self) -> bool:
+        return getattr(self.decorated, "presented_stop_failed", False)
+
     def observe_while_operator_stop_held(self) -> None:
         # A child-before-parent observation pass has already settled the exact
         # leaf. Propagate/register its result without ticking a new attempt or

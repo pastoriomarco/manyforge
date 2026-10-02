@@ -19,7 +19,7 @@ _KINDS = frozenset({
     "model_asset", "runtime_profile", "component_type",
     "control_interface_contract", "controller_topology", "provider_manifest",
     "command_schema", "capability_definition", "contact_policy",
-    "stop_evidence_policy", "runtime_policy",
+    "stop_evidence_policy",
 })
 _MAX = 4096
 _ROLE_MAX = 4096

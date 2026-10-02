@@ -26,11 +26,24 @@ session.
 | Maximum client-message rate | 64 messages/s per session |
 | Maximum complete snapshot size | 16 MiB |
 | Maximum node-progress publication rate | 20 Hz, newest value only |
+| Maximum manual-operation progress publication rate | 5 Hz, newest value only |
 | History summary page | at most 32 rows; exact payload is detail-only |
 
 Integer transport sequences and monotonic timestamps are positive decimal
 `uint64` strings so JavaScript does not lose precision. These limits are one
 measured product profile, not per-session tuning knobs.
+
+The optional shell fact `operation_progress` is a complete latest-only list
+of executing single-participant manual operations (at most 4096 rows). Each
+row has exactly `owner_epoch`, `operation_id`, `operation_revision` and
+`progress` (finite, 0–1). The native `events` response supplies this list from
+resident in-memory operations, separately from its durable `event_page`:
+progress-only samples do not append journal records. Headless coalesces changes
+on its existing event-pump wake; no extra polling connection or cold-state
+rebuild is involved. An empty list clears prior samples. The browser applies
+samples only to an executing operation with matching owner, ID and revision;
+lifecycle, Pause, Stop and terminal state always take precedence. Unchanged
+progress produces no control publication.
 
 ## Two independent states
 

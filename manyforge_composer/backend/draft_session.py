@@ -11,6 +11,7 @@ import threading
 import uuid
 from typing import Any, Callable, Mapping, NoReturn, TypeVar
 
+from manyforge_behavior.value_path import ValuePathError, parse_value_path
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
@@ -41,7 +42,9 @@ from .authoring_forest import (
     AuthoringForestError,
     derive_candidate,
     empty_authoring,
+    formula_references,
     from_program,
+    program_formula_references,
 )
 from .authoring_identity import freeze_json, thaw_json
 
@@ -238,11 +241,15 @@ class PreparedProgramMutation:
     authoring: Mapping[str, Any]
     program: Program | None
     diagnostics: tuple[Mapping[str, Any], ...]
+    formula_references: Mapping[str, Any]
     changed: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "details", freeze_json(self.details))
         object.__setattr__(self, "authoring", freeze_json(self.authoring))
+        object.__setattr__(
+            self, "formula_references", freeze_json(self.formula_references)
+        )
         object.__setattr__(
             self, "diagnostics", tuple(freeze_json(row) for row in self.diagnostics)
         )
@@ -263,6 +270,7 @@ class PreparedProgramReplacement:
     authoring: Mapping[str, Any] | None
     program: Program | None
     diagnostics: tuple[Mapping[str, Any], ...]
+    formula_references: Mapping[str, Any]
     successor_draft_id: str | None
     successor_revision: int | None
     saved_path: str | None
@@ -278,6 +286,9 @@ class PreparedProgramReplacement:
         )
         object.__setattr__(
             self, "diagnostics", tuple(freeze_json(row) for row in self.diagnostics)
+        )
+        object.__setattr__(
+            self, "formula_references", freeze_json(self.formula_references)
         )
         object.__setattr__(
             self,
@@ -309,6 +320,28 @@ class PreparedProgramSave:
     overwrite: bool
     program: Program
 
+
+
+def _source_root(path: str) -> str:
+    """The parameter a value-source path belongs to (the validator owns the grammar)."""
+
+    try:
+        return str(parse_value_path(path)[0])
+    except ValuePathError as error:
+        _error("draft_arguments_invalid", f"value source {path!r}: {error}")
+
+
+def _without_sources_under(
+    sources: dict[str, Any], parameter_ids: Any
+) -> dict[str, Any]:
+    """Drop every source on, or inside, the named parameters."""
+
+    names = set(parameter_ids)
+    return {
+        path: source
+        for path, source in sources.items()
+        if _source_root(path) not in names
+    }
 
 def _error(
     code: str,
@@ -818,6 +851,7 @@ class ComposerDraftSession:
         self._authoring = from_program(program) if program is not None else None
         self._program = program
         self._diagnostics: list[dict[str, str]] = []
+        self._formula_references = program_formula_references(program)
         self._revision = 1 if program is not None else 0
         self._saved_path = resolved_source
         self._saved_program_revision = (
@@ -867,6 +901,12 @@ class ComposerDraftSession:
                 "saved_program_revision": self._saved_program_revision,
                 "saved_document": deepcopy(self._saved_document),
             }
+
+    def formula_references(self) -> dict[str, Any]:
+        """The names each Draft formula reads; derived, so never retained."""
+
+        with self._lock:
+            return deepcopy(self._formula_references)
 
     def restore_retained_state(
         self, state: dict[str, Any], catalog: NodeCatalog
@@ -1000,6 +1040,11 @@ class ComposerDraftSession:
             authoring=deepcopy(authoring),
             program=program,
             diagnostics=tuple(normalized_diagnostics),
+            formula_references=(
+                formula_references(authoring, catalog)
+                if authoring is not None
+                else program_formula_references(None)
+            ),
             successor_draft_id=draft_id,
             successor_revision=revision,
             saved_path=resolved_saved_path,
@@ -1143,6 +1188,7 @@ class ComposerDraftSession:
                 ),
                 "program": program_document,
                 "diagnostics": deepcopy(self._diagnostics),
+                "formulaReferences": deepcopy(self._formula_references),
             },
             "applicability": applicability,
             "saved": {
@@ -1322,6 +1368,7 @@ class ComposerDraftSession:
             self._authoring = thaw_json(prepared.authoring)
             self._program = prepared.program
             self._diagnostics = [thaw_json(row) for row in prepared.diagnostics]
+            self._formula_references = thaw_json(prepared.formula_references)
             if not prepared.preserve_saved:
                 self._saved_path = prepared.saved_path
                 self._saved_program_revision = prepared.saved_program_revision
@@ -1348,6 +1395,7 @@ class ComposerDraftSession:
             authoring=from_program(program),
             program=program,
             diagnostics=(),
+            formula_references=program_formula_references(program),
             successor_draft_id=f"draft-{uuid.uuid4().hex}",
             successor_revision=1,
             saved_path=str(Path(source_path).resolve()),
@@ -1368,6 +1416,7 @@ class ComposerDraftSession:
             authoring=authoring,
             program=program,
             diagnostics=tuple(diagnostics),
+            formula_references=formula_references(authoring, catalog),
             successor_draft_id=f"draft-{uuid.uuid4().hex}",
             successor_revision=1,
             saved_path=None,
@@ -1385,14 +1434,17 @@ class ComposerDraftSession:
                 raise ValueError("Discard without a Program requires verified empty authoring")
             program, diagnostics = derive_candidate(deepcopy(applied), catalog)
             authoring = deepcopy(applied)
+            references = formula_references(authoring, catalog)
         else:
             program, diagnostics = applied, []
             authoring = from_program(applied)
+            references = program_formula_references(applied)
         return PreparedProgramReplacement(
             kind="discard",
             authoring=authoring,
             program=program,
             diagnostics=tuple(diagnostics),
+            formula_references=references,
             successor_draft_id=None,
             successor_revision=None,
             saved_path=None,
@@ -1657,6 +1709,9 @@ class ComposerDraftSession:
                     self._authoring = saved_authoring
                     self._program = validated_saved
                     self._diagnostics = []
+                    self._formula_references = program_formula_references(
+                        validated_saved
+                    )
                     self._revision += 1
                 return None, self._workspace_snapshot_locked(
                     applied_program_revision=validated_saved.program_revision,
@@ -1681,6 +1736,7 @@ class ComposerDraftSession:
                 self._authoring = saved_authoring
                 self._program = validated_saved
                 self._diagnostics = []
+                self._formula_references = program_formula_references(validated_saved)
                 self._revision += 1
             return result, self._workspace_snapshot_locked(
                 applied_program_revision=validated_saved.program_revision,
@@ -1742,6 +1798,7 @@ class ComposerDraftSession:
             authoring=document,
             program=candidate,
             diagnostics=tuple(diagnostics),
+            formula_references=formula_references(document, catalog),
             changed=document != base_authoring,
         )
 
@@ -1772,6 +1829,7 @@ class ComposerDraftSession:
             self._authoring = thaw_json(prepared.authoring)
             self._program = prepared.program
             self._diagnostics = [thaw_json(row) for row in prepared.diagnostics]
+            self._formula_references = thaw_json(prepared.formula_references)
             self._revision += 1
             return True
 
@@ -2365,7 +2423,7 @@ class ComposerDraftSession:
                 position = pose["position_m"]
                 orientation = pose["orientation"]
                 goal = {
-                    "frame_ref": {"kind": "cell_frame"},
+                    "frame_ref": deepcopy(observed["frame_ref"]),
                     "position_m": [position["x_m"], position["y_m"], position["z_m"]],
                     "orientation": {
                         "xyzw": [
@@ -2403,8 +2461,9 @@ class ComposerDraftSession:
         if arguments["observed_kind"] == "tcp_pose":
             for field in ("target_mode", "target_reference", "offset_reference"):
                 parameters.pop(field, None)
-        value_sources = deepcopy(node.get("value_sources", {}))
-        value_sources.pop("goal", None)
+        value_sources = _without_sources_under(
+            deepcopy(node.get("value_sources", {})), {"goal"}
+        )
         return self._tree_update(
             document,
             {
@@ -3223,8 +3282,13 @@ class ComposerDraftSession:
         incoming_sources = deepcopy(arguments.get("value_sources", {}))
         if merge:
             parameters = merge_param_patch(node.get("parameters", {}), incoming_parameters)
+            # A merged whole literal means "Type values" for that parameter:
+            # existing sources on it or inside it are removed. A merged source
+            # keeps the literal, which is restored when the source is removed.
             value_sources = {
-                **deepcopy(node.get("value_sources", {})),
+                **_without_sources_under(
+                    deepcopy(node.get("value_sources", {})), incoming_parameters
+                ),
                 **incoming_sources,
             }
         else:
@@ -3240,13 +3304,10 @@ class ComposerDraftSession:
                     merge=merge,
                     scene=self._scene(document),
                 )
-        for name in incoming_parameters:
-            value_sources.pop(name, None)
-        for name in incoming_sources:
-            parameters.pop(name, None)
         node["parameters"] = parameters
         if value_sources:
-            node["value_sources"] = value_sources
+            # Object member order carries no meaning; the Program keeps paths sorted.
+            node["value_sources"] = dict(sorted(value_sources.items()))
         else:
             node.pop("value_sources", None)
         return {"updated_instance_id": node["instance_id"]}
@@ -3404,7 +3465,11 @@ class ComposerDraftSession:
             combined_parameters = {**old_parameters, **replacement_parameters}
             combined_sources = {**old_sources, **replacement_sources}
             dropped = sorted(
-                (set(combined_parameters) | set(combined_sources)) - accepted
+                (
+                    set(combined_parameters)
+                    | {_source_root(key) for key in combined_sources}
+                )
+                - accepted
             )
             if mode == "strict" and dropped:
                 _error(
@@ -3422,17 +3487,18 @@ class ComposerDraftSession:
                 if key in accepted
             }
             sources = {
-                key: value for key, value in combined_sources.items() if key in accepted
+                key: value
+                for key, value in {
+                    **_without_sources_under(old_sources, replacement_parameters),
+                    **replacement_sources,
+                }.items()
+                if _source_root(key) in accepted
             }
-        for name in replacement_parameters:
-            sources.pop(name, None)
-        for name in replacement_sources:
-            parameters.pop(name, None)
         previous = node["node_id"]
         node["node_id"] = new_id
         node["parameters"] = parameters
         if sources:
-            node["value_sources"] = sources
+            node["value_sources"] = dict(sorted(sources.items()))
         else:
             node.pop("value_sources", None)
         return {

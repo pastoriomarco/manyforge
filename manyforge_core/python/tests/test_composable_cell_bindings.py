@@ -258,13 +258,6 @@ CATALOG_REF_CASES = (
         "kStopEvidencePolicy",
         "manyforge.stop_evidence_policy.v2",
     ),
-    (
-        "RuntimePolicyCatalogRecordRefDTO",
-        "RuntimePolicyId",
-        "RuntimePolicyRevision",
-        "kRuntimePolicy",
-        "manyforge.runtime_policy.v1",
-    ),
 )
 
 ZERO_DIGEST = "sha256:" + ("0" * 64)
@@ -856,13 +849,13 @@ def test_catalog_record_ref_union_is_exact_typed_and_read_only(case):
 def test_catalog_record_ref_runtime_union_and_registry_are_closed():
     union_members = typing.get_args(core.CatalogRecordRefDTO)
     assert union_members == tuple(core.CatalogRecordRefTypes)
-    assert len(union_members) == len(CATALOG_REF_CASES) == 11
-    assert len(core.CATALOG_RECORD_TYPE_REGISTRY) == 11
+    assert len(union_members) == len(CATALOG_REF_CASES) == 10
+    assert len(core.CATALOG_RECORD_TYPE_REGISTRY) == 10
     assert (
         len(
             {descriptor.record_kind for descriptor in core.CATALOG_RECORD_TYPE_REGISTRY}
         )
-        == 11
+        == 10
     )
 
     invalid_family = _catalog_ref(
@@ -1821,13 +1814,13 @@ target: 0.5
     registry = core.build_qualified_closed_schema_registry()
     assert isinstance(registry, core.BuildQualifiedClosedSchemaRegistry)
     assert isinstance(registry.catalog_schemas, tuple)
-    assert len(registry.catalog_schemas) == 11
+    assert len(registry.catalog_schemas) == 10
     qualified_entries = [
         entry
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 11
+    assert len(qualified_entries) == 10
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kCommandSchema,
@@ -1837,7 +1830,6 @@ target: 0.5
         core.CatalogRecordKind.kControllerTopology,
         core.CatalogRecordKind.kModelAsset,
         core.CatalogRecordKind.kProviderManifest,
-        core.CatalogRecordKind.kRuntimePolicy,
         core.CatalogRecordKind.kRuntimeProfile,
         core.CatalogRecordKind.kStopEvidencePolicy,
     }
@@ -1851,7 +1843,6 @@ target: 0.5
         "catalog/manyforge.controller_topology.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
         "catalog/manyforge.provider_manifest.v1.yaml",
-        "catalog/manyforge.runtime_policy.v1.yaml",
         "catalog/manyforge.runtime_profile.v1.yaml",
         "catalog/manyforge.stop_evidence_policy.v2.yaml",
     }

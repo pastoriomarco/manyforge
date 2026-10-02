@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-26 16:32:47 UTC
+  Last regenerated: 2026-10-01 10:35:04 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -193,6 +193,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/authoring-transactions/reconcile-owner` |  | Reconcile Authoring Owner |
 | `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/settle` |  | Settle Authoring Transaction |
+| `GET` | `/api/program/committed-activation` |  | Program Committed Activation |
 | `POST` | `/api/program/cycle/reset` |  | Program Cycle Reset |
 | `POST` | `/api/program/diagnostics` |  | Program Diagnostic |
 | `GET` | `/api/program/diagnostics/health` |  | Program Diagnostic Health |
@@ -215,6 +216,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/clear` |  | Clear Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/promote` |  | Promote Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/stop` |  | Program Run Stop |
+| `GET` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Program Persistent Values |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Set Program Persistent Value |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/clear` |  | Clear Program Persistent Values |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/reset` |  | Reset Program Persistent Value |
 | `POST` | `/api/program/scene-preparations` |  | Program Scene Prepare |
 | `GET` | `/api/runtime` |  | Runtime |
 | `GET` | `/api/scene` |  | Scene |

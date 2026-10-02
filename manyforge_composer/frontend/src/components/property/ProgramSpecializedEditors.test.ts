@@ -1,3 +1,5 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import type { CatalogJsonSchema } from '../../types/api';
@@ -11,6 +13,7 @@ import {
   completeOrientationTransition,
   jointTargetEditorRows,
   jointTargetTransitionMessage,
+  ProgramSpecializedEditor,
   toggleJointTargetRow,
 } from './ProgramSpecializedEditors';
 
@@ -254,25 +257,54 @@ describe('Program specialized editor transitions', () => {
     )).toBeUndefined();
   });
 
-  it('replaces the orientation variant without carrying its incompatible field', () => {
+  it('converts the orientation variant without carrying its incompatible field', () => {
     const pose = {
       position_m: [0, 0, 0],
-      orientation: { rpy_deg: [10, 20, 30] },
+      orientation: { rpy_deg: [90, 0, 90] },
       frame_ref: { kind: 'cell_frame' },
     };
-    expect(completeOrientationTransition(
-      motionPoseSchema,
-      pose,
-      'xyzw',
-    )).toEqual({
-      ...pose,
-      orientation: { xyzw: [0, 0, 0, 1] },
-    });
+    const converted = completeOrientationTransition(motionPoseSchema, pose, 'xyzw');
+    expect(converted).toMatchObject({ position_m: [0, 0, 0], frame_ref: { kind: 'cell_frame' } });
+    expect(Object.keys(converted?.orientation as object)).toEqual(['xyzw']);
+    ((converted?.orientation as { xyzw: number[] }).xyzw).forEach((component) =>
+      expect(component).toBeCloseTo(0.5, 15));
     expect(completeOrientationTransition(
       motionPoseSchema,
       pose,
       'unsupported',
     )).toBeUndefined();
+  });
+
+  it('keeps a measured quaternion orientation when switching to RPY and back', () => {
+    const measured = [0.0183412, -0.7071123, 0.0192817, 0.7066541];
+    const pose = { position_m: [0.4, -0.1, 0.3], orientation: { xyzw: measured } };
+    const asRpy = completeOrientationTransition(motionPoseSchema, pose, 'rpy_deg');
+    const rpy = (asRpy?.orientation as { rpy_deg: number[] }).rpy_deg;
+    expect(Object.keys(asRpy?.orientation as object)).toEqual(['rpy_deg']);
+    // Backend manyforge_behavior.geometry.xyzw_to_rpy_deg on the same quaternion.
+    [-114.450387380201, -89.91523304804716, 117.49915800287467].forEach((angle, index) =>
+      expect(rpy[index]).toBeCloseTo(angle, 6));
+    const back = completeOrientationTransition(motionPoseSchema, asRpy ?? pose, 'xyzw');
+    const xyzw = (back?.orientation as { xyzw: number[] }).xyzw;
+    const norm = Math.hypot(...measured);
+    const dot = xyzw.reduce((sum, component, index) => sum + component * measured[index] / norm, 0);
+    expect(Math.abs(dot)).toBeCloseTo(1, 12);
+  });
+
+  it('shows the other orientation representation read-only under the edited one', () => {
+    const render = (orientation: Record<string, number[]>) => renderToStaticMarkup(createElement(
+      ProgramSpecializedEditor,
+      {
+        schema: motionPoseSchema,
+        value: { position_m: [0, 0, 0], orientation },
+        disabled: false,
+        onCommit: () => undefined,
+      },
+    ));
+    expect(render({ rpy_deg: [90, 0, 90] }))
+      .toContain('Quaternion xyzw (read-only): x 0.5, y 0.5, z 0.5, w 0.5');
+    expect(render({ xyzw: [0.5, 0.5, 0.5, 0.5] }))
+      .toContain('RPY degrees (read-only): r 90, p 0, y 90');
   });
 
   it('shows every commandable joint and preserves sparse authored order', () => {

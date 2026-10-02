@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { ApiError, api, apiErrorCode } from '../api/client';
+import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type {
   AppliedProgramSelection,
@@ -8,6 +8,7 @@ import type {
   CurrentScenarioResponse,
   JsonValue,
   CycleRecoveryActionId,
+  PersistentKeyValues,
   ProgramRuntimeControlProjection,
   ProgramGroupRuntimeScaleState,
   ProgramCycleStatus,
@@ -477,6 +478,20 @@ export function programRuntimeAfterSnapshot(
     ? retainedControls
     : observedControls;
   return { run, controls };
+}
+
+/**
+ * What one stored-value edit names as seen: the live run holding the values
+ * at its current revision; without a run nothing (the last admitted edit
+ * wins). Null when the run shown here is not the run holding the values.
+ */
+export function persistentValuesFence(
+  current: PersistentKeyValues,
+  run: { capture: { programRunId: string }; runRevision: number } | null,
+): PersistentKeyValuesFence | null {
+  if (current.programRunId === null) return {};
+  if (run === null || run.capture.programRunId !== current.programRunId) return null;
+  return { program_run_id: current.programRunId, expected_run_revision: run.runRevision };
 }
 
 export function useProgramRuntime(
@@ -1407,23 +1422,32 @@ export function useProgramRuntime(
     } satisfies Record<string, JsonValue>;
   }, [state.controlPending, state.controls, state.run]);
 
+  /** Resolves to null when accepted, otherwise to the backend's reason. */
   const performRuntimeControl = useCallback(async (
     pending: string,
     requestId: string,
     commandKind: ExecutionControlCommandKind,
     payload: Record<string, JsonValue>,
     fallback: string,
-  ) => {
-    if (controlSource === null) return;
+  ): Promise<string | null> => {
+    if (controlSource === null) return 'The execution control connection is unavailable.';
     beginControlCommand(pending);
     try {
       await controlSource.sendExecutionCommand(
         commandKind, payload, requestId,
       );
+      // A recovery stays pending until the owner retires its offer.
+      if (mounted.current && !pending.startsWith('recovery:')) {
+        setState((current) => current.controlPending === pending
+          ? { ...current, controlPending: null }
+          : current);
+      }
+      return null;
     } catch (reason) {
       await recordCommandFailure(
         reason, fallback, requestId, 'control', pending,
       );
+      return errorMessage(reason, fallback);
     }
   }, [beginControlCommand, controlSource, recordCommandFailure]);
 
@@ -1520,11 +1544,19 @@ export function useProgramRuntime(
     );
   }, [performRuntimeControl, runtimeControlRequest, workspace]);
 
-  const writeRuntimeBlackboard = useCallback((key: string, value: JsonValue) => {
+  /** Resolves to null when written, otherwise to why the write was refused. */
+  const writeRuntimeBlackboard = useCallback((
+    key: string,
+    value: JsonValue,
+  ): Promise<string | null> => {
     const requestId = identity('program-runtime-blackboard');
     const base = runtimeControlRequest(requestId);
-    if (base === null) return;
-    void performRuntimeControl(
+    if (base === null) {
+      return Promise.resolve(
+        'Not written: the run changed or another control is pending. Review the current state and try again.',
+      );
+    }
+    return performRuntimeControl(
       `blackboard:${key}`,
       requestId,
       'program_runtime_blackboard_write',
@@ -1532,6 +1564,46 @@ export function useProgramRuntime(
       'The runtime blackboard value was rejected.',
     );
   }, [performRuntimeControl, runtimeControlRequest]);
+
+  // Stored persistent values are Scenario state kept by the Program runner:
+  // value edits, not execution commands, so they need no current run. Each
+  // edit names what the operator saw: the live run holding the values at its
+  // current revision; without a run the last admitted edit wins.
+  const currentRun = useRef(state.run);
+  currentRun.current = state.run;
+  const persistentValues = useMemo(() => {
+    const requestIdentity = () => ({
+      request_id: identity('program-persistent-value'),
+      request_owner_epoch: callerEpoch.current,
+      source_label: 'operator_ui',
+    });
+    return {
+      read: (scenarioId: string, signal?: AbortSignal) => (
+        api.programs.persistentValues(scenarioId, signal)
+      ),
+      /** Set a stored value, or Reset it to `initial:` when value is omitted. */
+      edit: (current: PersistentKeyValues, key: string, value?: JsonValue) => {
+        const fence = persistentValuesFence(current, currentRun.current);
+        if (fence === null) {
+          return Promise.reject(new Error(
+            'The run holding these values is not the run shown here. Refresh and try again.',
+          ));
+        }
+        return api.programs.editPersistentValue(current.scenarioId, {
+          ...requestIdentity(),
+          ...fence,
+          scenario_id: current.scenarioId,
+          key,
+          expected_program_revision: current.programRevision,
+          ...(value === undefined ? {} : { value }),
+        });
+      },
+      clear: (current: PersistentKeyValues) => api.programs.clearPersistentValues(
+        current.scenarioId,
+        { ...requestIdentity(), scenario_id: current.scenarioId },
+      ),
+    };
+  }, []);
 
   const stageManualResult = useCallback((
     outcome: 'succeeded' | 'failed',
@@ -1648,6 +1720,12 @@ export function useProgramRuntime(
       (command) => command.commandKind === commandKind && command.allowed,
     ) ?? false)
   ), [deploymentPending, snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
+  /** The backend's reason why a command is currently not allowed, if any. */
+  const commandDisabledReason = useCallback((commandKind: string): string | null => (
+    snapshot?.programCycle.allowedCommands.find(
+      (command) => command.commandKind === commandKind,
+    )?.disabledReason ?? null
+  ), [snapshot]);
   // Execute runs only what is applied: say which Draft still has changes.
   const programPending = state.applied !== null && workspace !== null
     && workspace.draft.programLoaded
@@ -1665,6 +1743,7 @@ export function useProgramRuntime(
     cycleState,
     cycleFailure,
     commandAllowed,
+    commandDisabledReason,
     startBlockedReason,
     active,
     refresh,
@@ -1693,6 +1772,7 @@ export function useProgramRuntime(
     materializePromotion,
     promotionMaterializationReason,
     writeRuntimeBlackboard,
+    persistentValues,
     stageManualResult,
   }), [
     active,
@@ -1701,7 +1781,9 @@ export function useProgramRuntime(
     cycleFailure,
     cycleState,
     commandAllowed,
+    commandDisabledReason,
     startBlockedReason,
+    persistentValues,
     refresh,
     reset,
     run,

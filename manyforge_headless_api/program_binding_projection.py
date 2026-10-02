@@ -182,3 +182,79 @@ def validate_applied_program_selection(
     _text(source.get("source_owner_id"), f"{label}.source.source_owner_id", 256)
     _binding_correspondence(value, label=label)
     return value
+
+
+_COMMITTED_ACTIVATION_FIELDS = frozenset(
+    {
+        "apply_generation",
+        "apply_id",
+        "committed_applies",
+        "program",
+        "publication_generation",
+        "record_digest",
+        "scenario_id",
+        "schema_version",
+    }
+)
+_COMMITTED_APPLY_FIELDS = frozenset(
+    {"apply_generation", "apply_id", "record_digest", "scenario_id"}
+)
+_MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+
+
+def validate_committed_scenario_activation(
+    value: object,
+    *,
+    label: str = "committed_activation",
+) -> dict[str, Any]:
+    """Validate Manager's current committed Scenario activation.
+
+    Publication 1 is the canonical-empty bootstrap and every later one is
+    one committed named Apply, so the committed Applies must account for
+    every publication and include the current one.
+    """
+
+    if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
+        _fail(label, "the closed committed Scenario activation record")
+    if value.get("schema_version") != "manyforge.committed_scenario_activation.v1":
+        _fail(
+            f"{label}.schema_version", "manyforge.committed_scenario_activation.v1"
+        )
+    generation = value.get("publication_generation")
+    if type(generation) is not int or not 2 <= generation <= _MAXIMUM_SAFE_INTEGER:
+        _fail(f"{label}.publication_generation", "an integer of at least 2")
+    current = _committed_apply(value, label)
+    if value.get("program") is not None and not isinstance(value.get("program"), dict):
+        _fail(f"{label}.program", "an object or null")
+    committed = value.get("committed_applies")
+    if not isinstance(committed, list) or len(committed) != generation - 1:
+        _fail(f"{label}.committed_applies", "one record per Apply publication")
+    applies: list[tuple[str, str, str, int]] = []
+    for index, row in enumerate(committed):
+        row_label = f"{label}.committed_applies[{index}]"
+        if not isinstance(row, dict) or set(row) != _COMMITTED_APPLY_FIELDS:
+            _fail(row_label, "the closed committed Apply record")
+        applies.append(_committed_apply(row, row_label))
+    digests = [apply[0] for apply in applies]
+    if digests != sorted(set(digests)):
+        _fail(f"{label}.committed_applies", "unique records in digest order")
+    if current not in applies:
+        _fail(f"{label}.committed_applies", "the current Apply among them")
+    return value
+
+
+def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, str, str, int]:
+    """One committed Apply: record digest, Scenario, and Apply identity."""
+
+    apply_generation = value.get("apply_generation")
+    if (
+        type(apply_generation) is not int
+        or not 1 <= apply_generation <= _MAXIMUM_SAFE_INTEGER
+    ):
+        _fail(f"{label}.apply_generation", "a positive integer")
+    return (
+        _sha256(value.get("record_digest"), f"{label}.record_digest"),
+        _text(value.get("scenario_id"), f"{label}.scenario_id", 256),
+        _text(value.get("apply_id"), f"{label}.apply_id", 256),
+        apply_generation,
+    )

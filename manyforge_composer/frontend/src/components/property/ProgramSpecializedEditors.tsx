@@ -11,12 +11,31 @@ import {
 
 import type { CatalogJsonSchema, JsonValue } from '../../types/api';
 import { firstCatalogSchemaValidationMessage } from '../../utils/catalogSchema';
+import { rpyDegToXyzw, xyzwToRpyDeg } from '../../utils/orientation';
+import {
+  frameKey,
+  offeredFrameChoices,
+  poseFrameOf,
+  type FrameOffer,
+  type FrameScope,
+  type ProgramPoseFrame,
+} from '../../utils/programFrames';
 import type { ProgramSourceJointInventory } from '../../utils/programSourceJoints';
+import { listDeleteMove, type ListMove } from '../../utils/valuePaths';
 import { DraftTextInput } from '../common/DraftInputs';
+import { FrameSelector } from './FrameSelector';
+import { SourceableLeaf, SourceableValue, useValueSources } from './ValueSourceField';
+
+/** Commit one edited value; list edits name how their items moved, so sources move with them. */
+export type ValueCommit = (value: JsonValue, moves?: readonly ListMove[]) => void;
+
+const NUMBER_SCHEMA: CatalogJsonSchema = { type: 'number' };
 
 type JsonObject = Record<string, JsonValue>;
 type SpecializedInvalidReporter = (token: symbol, message: string | null) => void;
 const SpecializedInvalidContext = createContext<SpecializedInvalidReporter>(() => undefined);
+// The Program's declared frames, for every frame field of one value.
+const FrameScopeContext = createContext<FrameScope | null>(null);
 
 function useSpecializedInvalidReporter() {
   const report = useContext(SpecializedInvalidContext);
@@ -58,32 +77,42 @@ function NumberField({
   label,
   value,
   disabled,
+  path,
+  schema = NUMBER_SCHEMA,
   onCommit,
 }: {
   label: string;
   value: number;
   disabled: boolean;
+  /** The value's path when it may come from a source. */
+  path?: string;
+  schema?: CatalogJsonSchema;
   onCommit: (value: number) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
+  const input = (
+    <DraftTextInput
+      type="number"
+      step="any"
+      value={value}
+      disabled={disabled}
+      aria-label={label}
+      validate={(text) => text.trim() !== '' && Number.isFinite(Number(text))
+        ? null
+        : `${label} must be a finite number.`}
+      onInvalidChange={reportInvalid}
+      onCommit={(text) => {
+        const parsed = Number(text);
+        if (Number.isFinite(parsed)) onCommit(parsed);
+      }}
+    />
+  );
   return (
     <label className="program-specialized-number">
       <span>{label}</span>
-      <DraftTextInput
-        type="number"
-        step="any"
-        value={value}
-        disabled={disabled}
-        aria-label={label}
-        validate={(text) => text.trim() !== '' && Number.isFinite(Number(text))
-          ? null
-          : `${label} must be a finite number.`}
-        onInvalidChange={reportInvalid}
-        onCommit={(text) => {
-          const parsed = Number(text);
-          if (Number.isFinite(parsed)) onCommit(parsed);
-        }}
-      />
+      {path === undefined
+        ? input
+        : <SourceableLeaf path={path} schema={schema} label={label}>{input}</SourceableLeaf>}
     </label>
   );
 }
@@ -94,6 +123,7 @@ function VectorEditor({
   labels,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   label: string;
@@ -101,6 +131,8 @@ function VectorEditor({
   labels: string[];
   value: number[];
   disabled: boolean;
+  /** The vector's path when each number may come from a source. */
+  path?: string;
   onCommit: (value: JsonValue) => void;
 }) {
   return (
@@ -113,6 +145,7 @@ function VectorEditor({
             label={`${label} ${axis}`}
             value={value[index] ?? 0}
             disabled={disabled}
+            path={path === undefined ? undefined : `${path}[${index}]`}
             onCommit={(nextValue) => {
               const next = [...value];
               next[index] = nextValue;
@@ -193,21 +226,44 @@ export function completeMotionPoseFrameRemoveTransition(
     : candidate;
 }
 
+/**
+ * Convert a pose orientation to the requested stored form. Undefined means the
+ * representation is unknown or the current orientation cannot be converted.
+ */
+function convertOrientation(orientation: JsonObject, representation: string): JsonObject | undefined {
+  if (representation === 'xyzw') {
+    if (Array.isArray(orientation.xyzw)) return { xyzw: orientation.xyzw };
+    const xyzw = rpyDegToXyzw(numericArray(orientation.rpy_deg));
+    return xyzw && { xyzw };
+  }
+  if (representation === 'rpy_deg') {
+    if (Array.isArray(orientation.rpy_deg)) return { rpy_deg: orientation.rpy_deg };
+    const rpyDeg = xyzwToRpyDeg(numericArray(orientation.xyzw));
+    return rpyDeg && { rpy_deg: rpyDeg };
+  }
+  return undefined;
+}
+
 export function completeOrientationTransition(
   schema: CatalogJsonSchema,
   value: JsonObject,
   representation: string,
 ): JsonObject | undefined {
-  const orientation: JsonObject | undefined = representation === 'xyzw'
-    ? { xyzw: [0, 0, 0, 1] }
-    : representation === 'rpy_deg'
-      ? { rpy_deg: [0, 0, 0] }
-      : undefined;
+  const orientation = convertOrientation(objectValue(value.orientation), representation);
   if (!orientation) return undefined;
   const candidate = { ...value, orientation };
   return firstCatalogSchemaValidationMessage(schema, candidate, 'motion_pose')
     ? undefined
     : candidate;
+}
+
+function formatReadOnlyOrientation(orientation: JsonObject): string {
+  const quaternion = Array.isArray(orientation.xyzw);
+  const axes = quaternion ? ['x', 'y', 'z', 'w'] : ['r', 'p', 'y'];
+  const values = numericArray(quaternion ? orientation.xyzw : orientation.rpy_deg);
+  const decimals = quaternion ? 6 : 4;
+  const text = axes.map((axis, index) => `${axis} ${Number((values[index] ?? 0).toFixed(decimals))}`);
+  return `${quaternion ? 'Quaternion xyzw' : 'RPY degrees'} (read-only): ${text.join(', ')}`;
 }
 
 function FrameReferenceEditor({
@@ -244,6 +300,24 @@ function FrameReferenceEditor({
     if (complete) onCommit(complete);
   };
 
+  const scope = useContext(FrameScopeContext);
+  if (scope !== null) {
+    const kinds = enumStrings(schema.properties?.kind);
+    const offer: FrameOffer = {
+      otherRobots: kinds.includes('target_frame'),
+      cell: kinds.includes('cell_frame'),
+      scene: kinds.includes('scene_resource'),
+    };
+    return (
+      <ScopedFrameReference
+        scope={scope}
+        offer={offer}
+        value={value}
+        disabled={disabled}
+        onCommit={onCommit}
+      />
+    );
+  }
   return (
     <div className="program-variant-editor">
       <label>
@@ -277,20 +351,65 @@ function FrameReferenceEditor({
   );
 }
 
+/** One pose frame chosen from the Program's declared frames. */
+function ScopedFrameReference({
+  scope,
+  offer,
+  value,
+  disabled,
+  onCommit,
+}: {
+  scope: FrameScope;
+  offer: FrameOffer;
+  value: JsonObject;
+  disabled: boolean;
+  onCommit: (value: JsonValue) => void;
+}) {
+  const reportInvalid = useSpecializedInvalidReporter();
+  const frame = poseFrameOf(value);
+  const usable = frame !== null
+    && offeredFrameChoices(scope, offer).some((choice) => choice.key === frameKey(frame));
+  useEffect(() => {
+    reportInvalid(usable ? null : 'Choose a frame this value may use.');
+  }, [reportInvalid, usable]);
+  return (
+    <div className="program-variant-editor">
+      <label>
+        Frame reference
+        <FrameSelector
+          scope={scope}
+          value={frame}
+          offer={offer}
+          disabled={disabled}
+          ariaLabel="Frame reference"
+          onChange={(next) => onCommit(next as unknown as JsonValue)}
+        />
+      </label>
+    </div>
+  );
+}
+
 function MotionPoseEditor({
   schema,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonObject;
   disabled: boolean;
+  path?: string;
   onCommit: (value: JsonValue) => void;
 }) {
+  const sources = useValueSources();
+  // Switching the stored form would drop per-angle formulas and bindings.
+  const orientationSourced = path !== undefined
+    && (sources?.hasSourcesWithin(`${path}.orientation`) ?? false);
   const orientation = objectValue(value.orientation);
   const orientationSchema = schema.properties?.orientation;
   const usesQuaternion = Array.isArray(orientation.xyzw);
+  const counterpart = convertOrientation(orientation, usesQuaternion ? 'rpy_deg' : 'xyzw');
   const frameSchema = schema.properties?.frame_ref;
   const commit = (patch: JsonObject) => onCommit({ ...value, ...patch });
   const frameRequired = schema.required?.includes('frame_ref') ?? false;
@@ -340,6 +459,7 @@ function MotionPoseEditor({
         labels={['x', 'y', 'z']}
         value={numericArray(value.position_m)}
         disabled={disabled}
+        path={path === undefined ? undefined : `${path}.position_m`}
         onCommit={(position) => commit({ position_m: position })}
       />
       <label>
@@ -347,7 +467,10 @@ function MotionPoseEditor({
         <select
           aria-label="Orientation representation"
           value={usesQuaternion ? 'xyzw' : 'rpy_deg'}
-          disabled={disabled}
+          disabled={disabled || orientationSourced}
+          title={orientationSourced
+            ? 'Type roll, pitch and yaw again before changing the stored form.'
+            : undefined}
           onChange={(event) => {
             const next = completeOrientationTransition(schema, value, event.target.value);
             if (next) onCommit(next);
@@ -363,10 +486,13 @@ function MotionPoseEditor({
         labels={usesQuaternion ? ['x', 'y', 'z', 'w'] : ['r', 'p', 'y']}
         value={numericArray(usesQuaternion ? orientation.xyzw : orientation.rpy_deg)}
         disabled={disabled}
+        // A quaternion is typed or bound only with its whole pose.
+        path={path === undefined || usesQuaternion ? undefined : `${path}.orientation.rpy_deg`}
         onCommit={(next) => commit({
           orientation: usesQuaternion ? { xyzw: next } : { rpy_deg: next },
         })}
       />
+      {counterpart && <p className="program-form-hint">{formatReadOnlyOrientation(counterpart)}</p>}
     </div>
   );
 }
@@ -411,15 +537,218 @@ export function completeMotionReferenceTransition(
     : candidate;
 }
 
+const FRAME_REFERENCE_TYPES = ['frame_role', 'cell_frame', 'scene_resource'];
+
+/** The pose frame a motion reference names, or null for a non-frame reference. */
+export function motionReferenceFrame(
+  value: JsonObject,
+  movingTargetRole: string | undefined,
+): ProgramPoseFrame | null {
+  if (value.type === 'cell_frame') return { kind: 'cell_frame' };
+  if (value.type === 'scene_resource' && typeof value.scene_resource_id === 'string') {
+    return { kind: 'scene_resource', scene_resource_id: value.scene_resource_id };
+  }
+  if (value.type !== 'frame_role' || typeof value.frame_role_id !== 'string') return null;
+  const robot = typeof value.target_role === 'string' ? value.target_role : movingTargetRole;
+  return robot === undefined
+    ? null
+    : { kind: 'target_frame', target_role: robot, frame_role: value.frame_role_id };
+}
+
+/**
+ * The motion reference for one chosen frame: the moving robot's own frame
+ * keeps the unqualified form; another robot's frame names that robot.
+ */
+export function motionReferenceForFrame(
+  frame: ProgramPoseFrame,
+  movingTargetRole: string | undefined,
+): JsonObject {
+  if (frame.kind === 'cell_frame') return { type: 'cell_frame' };
+  if (frame.kind === 'scene_resource') {
+    return { type: 'scene_resource', scene_resource_id: frame.scene_resource_id };
+  }
+  return frame.target_role === movingTargetRole
+    ? { type: 'frame_role', frame_role_id: frame.frame_role }
+    : { type: 'frame_role', frame_role_id: frame.frame_role, target_role: frame.target_role };
+}
+
+function ScopedMotionReferenceEditor({
+  schema,
+  scope,
+  value,
+  disabled,
+  path,
+  onCommit,
+}: {
+  schema: CatalogJsonSchema;
+  scope: FrameScope;
+  value: JsonObject;
+  disabled: boolean;
+  path?: string;
+  onCommit: (value: JsonValue) => void;
+}) {
+  const reportInvalid = useSpecializedInvalidReporter();
+  const types = enumStrings(schema.properties?.type);
+  const frameTypes = types.filter((type) => FRAME_REFERENCE_TYPES.includes(type));
+  const currentType = typeof value.type === 'string' ? value.type : '';
+  const choiceOf = (type: string) => FRAME_REFERENCE_TYPES.includes(type) ? 'frame' : type;
+  const [draftChoice, setDraftChoice] = useState(choiceOf(currentType));
+  const [draftField, setDraftField] = useState('');
+  const resetValue = useRef<JsonObject | undefined>(undefined);
+  useEffect(() => {
+    if (resetValue.current === value) return;
+    resetValue.current = value;
+    setDraftChoice(choiceOf(currentType));
+    const field = MOTION_REFERENCE_FIELDS[currentType];
+    setDraftField(field && typeof value[field] === 'string' ? value[field] as string : '');
+    reportInvalid(null);
+  }, [currentType, reportInvalid, value]);
+  const offer: FrameOffer = {
+    otherRobots: frameTypes.includes('frame_role') && schema.properties?.target_role !== undefined,
+    cell: frameTypes.includes('cell_frame'),
+    scene: frameTypes.includes('scene_resource'),
+  };
+  const moving = scope.movingTargetRole;
+  const frame = choiceOf(currentType) === 'frame' ? motionReferenceFrame(value, moving) : null;
+  const frameUsable = frame !== null
+    && offeredFrameChoices(scope, offer).some((choice) => choice.key === frameKey(frame));
+  const commitCandidate = (candidate: JsonObject | undefined) => {
+    const valid = candidate !== undefined
+      && firstCatalogSchemaValidationMessage(schema, candidate, 'motion_reference') === null;
+    reportInvalid(valid ? null : 'Enter the required reference for this variant.');
+    if (valid) onCommit(candidate);
+  };
+  useEffect(() => {
+    if (draftChoice === 'frame' && frame !== null && !frameUsable) {
+      reportInvalid('Choose a frame this reference may use.');
+    }
+  }, [draftChoice, frame, frameUsable, reportInvalid]);
+  const field = MOTION_REFERENCE_FIELDS[draftChoice];
+  return (
+    <div className="program-variant-editor" data-editor="motion-reference">
+      <p className="program-form-hint">
+        Historical frame/object/robot_link id variants are unavailable in the current contract; only these catalog variants can be authored.
+      </p>
+      <label>
+        Reference type
+        <select
+          aria-label="Motion reference type"
+          value={draftChoice}
+          disabled={disabled}
+          onChange={(event) => {
+            const next = event.target.value;
+            setDraftChoice(next);
+            setDraftField('');
+            if (next === 'frame') {
+              reportInvalid('Choose the frame this reference is measured from.');
+            } else {
+              commitCandidate(completeMotionReferenceTransition(schema, next));
+            }
+          }}
+        >
+          {frameTypes.length > 0 && <option value="frame">frame</option>}
+          {types.filter((type) => !frameTypes.includes(type)).map((option) => (
+            <option key={option} value={option}>{option.replaceAll('_', ' ')}</option>
+          ))}
+        </select>
+      </label>
+      {draftChoice === 'frame' && (
+        <label>
+          Frame
+          <FrameSelector
+            scope={scope}
+            value={draftChoice === choiceOf(currentType) ? frame : null}
+            offer={offer}
+            disabled={disabled}
+            ariaLabel="Motion reference frame"
+            onChange={(next) => commitCandidate(motionReferenceForFrame(next, moving))}
+          />
+        </label>
+      )}
+      {field && draftChoice !== 'frame' && (
+        <label>
+          {field.replaceAll('_', ' ')}
+          <DraftTextInput
+            value={draftField}
+            disabled={disabled}
+            aria-label={`Motion reference ${field}`}
+            onCommit={(text) => {
+              setDraftField(text);
+              commitCandidate(completeMotionReferenceTransition(schema, draftChoice, text));
+            }}
+          />
+        </label>
+      )}
+      {draftChoice === 'pose' && (() => {
+        const poseSchema = schema.properties?.pose ?? {};
+        const posePath = path === undefined ? undefined : `${path}.pose`;
+        const editor = (
+          <MotionPoseEditor
+            schema={poseSchema}
+            value={draftChoice === currentType && value.pose
+              ? objectValue(value.pose)
+              : defaultMotionPose(schema.properties?.pose)}
+            disabled={disabled}
+            path={posePath}
+            onCommit={(pose) => onCommit({ type: 'pose', pose })}
+          />
+        );
+        return posePath === undefined
+          ? editor
+          : <SourceableValue path={posePath} schema={poseSchema}>{editor}</SourceableValue>;
+      })()}
+    </div>
+  );
+}
+
 function MotionReferenceEditor({
   schema,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonObject;
   disabled: boolean;
+  path?: string;
+  onCommit: (value: JsonValue) => void;
+}) {
+  const scope = useContext(FrameScopeContext);
+  if (scope !== null) {
+    return (
+      <ScopedMotionReferenceEditor
+        schema={schema}
+        scope={scope}
+        value={value}
+        disabled={disabled}
+        path={path}
+        onCommit={onCommit}
+      />
+    );
+  }
+  return (
+    <UnscopedMotionReferenceEditor
+      schema={schema}
+      value={value}
+      disabled={disabled}
+      path={path}
+      onCommit={onCommit}
+    />
+  );
+}
+
+function UnscopedMotionReferenceEditor({
+  schema,
+  value,
+  disabled,
+  path,
+  onCommit,
+}: {
+  schema: CatalogJsonSchema;
+  value: JsonObject;
+  disabled: boolean;
+  path?: string;
   onCommit: (value: JsonValue) => void;
 }) {
   const reportInvalid = useSpecializedInvalidReporter();
@@ -477,16 +806,24 @@ function MotionReferenceEditor({
           />
         </label>
       )}
-      {draftType === 'pose' && (
-        <MotionPoseEditor
-          schema={schema.properties?.pose ?? {}}
-          value={draftType === currentType && value.pose
-            ? objectValue(value.pose)
-            : defaultMotionPose(schema.properties?.pose)}
-          disabled={disabled}
-          onCommit={(pose) => onCommit({ type: 'pose', pose })}
-        />
-      )}
+      {draftType === 'pose' && (() => {
+        const poseSchema = schema.properties?.pose ?? {};
+        const posePath = path === undefined ? undefined : `${path}.pose`;
+        const editor = (
+          <MotionPoseEditor
+            schema={poseSchema}
+            value={draftType === currentType && value.pose
+              ? objectValue(value.pose)
+              : defaultMotionPose(schema.properties?.pose)}
+            disabled={disabled}
+            path={posePath}
+            onCommit={(pose) => onCommit({ type: 'pose', pose })}
+          />
+        );
+        return posePath === undefined
+          ? editor
+          : <SourceableValue path={posePath} schema={poseSchema}>{editor}</SourceableValue>;
+      })()}
       {field && !draftField.trim() && (
         <p className="program-form-hint">Enter the required reference before this variant is saved.</p>
       )}
@@ -737,38 +1074,53 @@ function CartesianPathEditor({
   schema,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue[];
   disabled: boolean;
-  onCommit: (value: JsonValue) => void;
+  path?: string;
+  onCommit: ValueCommit;
 }) {
+  const itemSchema = schema.items ?? {};
   return (
     <div className="program-specialized-editor" data-editor="cartesian-path">
-      {value.map((waypoint, index) => (
-        <fieldset className="program-waypoint" key={index}>
-          <legend>Waypoint {index + 1}</legend>
+      {value.map((waypoint, index) => {
+        const waypointPath = path === undefined ? undefined : `${path}[${index}]`;
+        const editor = (
           <MotionPoseEditor
-            schema={schema.items ?? {}}
+            schema={itemSchema}
             value={objectValue(waypoint)}
             disabled={disabled}
+            path={waypointPath}
             onCommit={(nextWaypoint) => {
               const next = [...value];
               next[index] = nextWaypoint;
               onCommit(next);
             }}
           />
-          <button
-            type="button"
-            className="text-button"
-            disabled={disabled || value.length <= (schema.minItems ?? 0)}
-            onClick={() => onCommit(value.filter((_, rowIndex) => rowIndex !== index))}
-          >
-            Remove waypoint
-          </button>
-        </fieldset>
-      ))}
+        );
+        return (
+          <fieldset className="program-waypoint" key={index}>
+            <legend>Waypoint {index + 1}</legend>
+            {waypointPath === undefined
+              ? editor
+              : <SourceableValue path={waypointPath} schema={itemSchema}>{editor}</SourceableValue>}
+            <button
+              type="button"
+              className="text-button"
+              disabled={disabled || value.length <= (schema.minItems ?? 0)}
+              onClick={() => onCommit(
+                value.filter((_, rowIndex) => rowIndex !== index),
+                path === undefined ? [] : [listDeleteMove(path, value.length, index)],
+              )}
+            >
+              Remove waypoint
+            </button>
+          </fieldset>
+        );
+      })}
       <button
         type="button"
         className="text-button"
@@ -785,11 +1137,13 @@ function CoordinateEditor({
   schema,
   value,
   disabled,
+  path,
   onCommit,
 }: {
   schema: CatalogJsonSchema;
   value: JsonObject;
   disabled: boolean;
+  path?: string;
   onCommit: (value: JsonValue) => void;
 }) {
   const kinds = enumStrings(schema.properties?.kind);
@@ -827,6 +1181,8 @@ function CoordinateEditor({
         label={`Value (${units})`}
         value={typeof value[valueField] === 'number' ? value[valueField] as number : 0}
         disabled={disabled}
+        path={path === undefined ? undefined : `${path}.${valueField}`}
+        schema={schema.properties?.[valueField] ?? NUMBER_SCHEMA}
         onCommit={(next) => onCommit({ kind, [valueField]: next })}
       />
     </div>
@@ -877,6 +1233,11 @@ function specializedKind(schema: CatalogJsonSchema): string | null {
     schema.type === 'object'
     && coordinateKinds.some((kind) => kind === 'angular_rad' || kind === 'angular_newton_meter')
   ) return 'coordinate';
+  if (
+    schema.type === 'object'
+    && coordinateKinds.includes('cell_frame')
+    && coordinateKinds.includes('target_frame')
+  ) return 'frame-reference';
   return null;
 }
 
@@ -884,19 +1245,30 @@ export function supportsProgramSpecializedEditor(schema: CatalogJsonSchema): boo
   return specializedKind(schema) !== null;
 }
 
+/** Complete local pose seed; opening an editor must not author this value. */
+export function defaultMotionPoseValue(schema: CatalogJsonSchema): JsonObject | undefined {
+  return specializedKind(schema) === 'motion-pose' ? defaultMotionPose(schema) : undefined;
+}
+
 export function ProgramSpecializedEditor({
   schema,
   value,
   disabled,
+  path,
   sourceJointInventory,
+  frameScope,
   onCommit,
   onInvalidChange,
 }: {
   schema: CatalogJsonSchema;
   value: JsonValue;
   disabled: boolean;
+  /** The value's path in a Program node, where its values may come from sources. */
+  path?: string;
   sourceJointInventory?: ProgramSourceJointInventory | null;
-  onCommit: (value: JsonValue) => void;
+  /** The Program's declared frames; without it frame fields are typed as text. */
+  frameScope?: FrameScope;
+  onCommit: ValueCommit;
   onInvalidChange?: (message: string | null) => void;
 }) {
   const [invalid, setInvalid] = useState<Map<symbol, string>>(() => new Map());
@@ -931,17 +1303,21 @@ export function ProgramSpecializedEditor({
       />
     );
   } else if (kind === 'cartesian-path') {
-    content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} onCommit={onCommit} />;
+    content = <CartesianPathEditor schema={schema} value={value as JsonValue[]} disabled={disabled} path={path} onCommit={onCommit} />;
   } else if (kind === 'motion-pose') {
-    content = <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+    content = <MotionPoseEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
   } else if (kind === 'motion-reference') {
-    content = <MotionReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+    content = <MotionReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
   } else if (kind === 'coordinate') {
-    content = <CoordinateEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
+    content = <CoordinateEditor schema={schema} value={objectValue(value)} disabled={disabled} path={path} onCommit={onCommit} />;
+  } else if (kind === 'frame-reference') {
+    content = <FrameReferenceEditor schema={schema} value={objectValue(value)} disabled={disabled} onCommit={onCommit} />;
   }
   return (
     <SpecializedInvalidContext.Provider value={reportInvalid}>
-      {content}
+      <FrameScopeContext.Provider value={frameScope ?? null}>
+        {content}
+      </FrameScopeContext.Provider>
     </SpecializedInvalidContext.Provider>
   );
 }

@@ -145,7 +145,7 @@ static_assert(
       deployment.applicability_inputs().value().external_resources,
       nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
+      composition, deployment.applicability_inputs(), {}, {}, {}, {},
       {}, {}, {}, {}, {}, selected_overlay);
   return compile_cell_ir(applicability);
 }

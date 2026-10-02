@@ -257,7 +257,7 @@
         "children": []
       },
       {
-        "node_id": "logic.set_bool",
+        "node_id": "logic.set_value",
         "instance_id": "set_logical_gripper",
         "parameters": {
           "key": "${param:gripper_state_key}",

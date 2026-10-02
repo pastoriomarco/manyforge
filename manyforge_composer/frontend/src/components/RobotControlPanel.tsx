@@ -4,7 +4,6 @@ import { useRobotControl } from '../hooks/useRobotControl';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
-import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import {
   isCapabilityCommandReceipt,
   manualOperationRequiresRecovery,
@@ -20,10 +19,9 @@ import type {
   RobotControlPhase,
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
-import type { ProgramTreeNode } from '../types/api';
+import type { LogicalSceneProjection, ProgramTreeNode } from '../types/api';
 import {
   boundProgramTargetRoleIds,
-  canonicalProgramPose,
   DEFAULT_MOVE_TO_OPTIONS,
   resolveStoredProgramPose,
 } from '../utils/moveTo';
@@ -32,6 +30,7 @@ import { relativePose, type PoseTuple } from '../utils/poseTransforms';
 import { flattenProgramForest } from '../utils/programAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
 import { OverlayPanel } from './OverlayPanel';
+import { OperationProgress } from './OperationProgress';
 import { GizmoSteps, StepSelect, useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import { ANGULAR_STEP_OPTIONS } from '../utils/gizmo';
@@ -109,18 +108,6 @@ function observedPose(pose: Pose3Value): PoseTuple {
     ],
   };
 }
-
-function cellPoseValue(value: unknown): PoseTuple | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const pose = value as Record<string, unknown>;
-  const frame = pose.frame_ref;
-  if (
-    !frame || typeof frame !== 'object' || Array.isArray(frame)
-    || (frame as Record<string, unknown>).kind !== 'cell_frame'
-  ) return null;
-  return canonicalProgramPose(value);
-}
-
 
 function targetIsTemporary(
   phase: RobotControlPhase,
@@ -311,18 +298,18 @@ export function RobotControlPanelView({
   enabled,
   controller,
   program,
-  draft,
   gizmo: sharedGizmo,
   sourceFrameNames = {},
   controlBasePoseInCell = null,
+  runtimeScene = null,
 }: {
   enabled: boolean;
   controller: RobotControlController;
   program?: ProgramRuntimeController;
-  draft?: ProgramWorkspaceController;
   gizmo?: GizmoController;
   sourceFrameNames?: Readonly<Record<string, string>>;
   controlBasePoseInCell?: PoseTuple | null;
+  runtimeScene?: LogicalSceneProjection | null;
 }) {
   const localGizmo = useGizmoSettings();
   const cardLayout = useCardPanelLayout();
@@ -428,8 +415,10 @@ export function RobotControlPanelView({
   const presentedPose = robotControlHasLocalDraft(state) || observedMotion === null
     ? state.draftPose : observedMotion.currentTcpPose;
   const rpy = rpyDegreesFromQuaternion(presentedPose.orientation);
-  const authoring = draft?.state.workspace?.draft.authoring ?? null;
-  const appliedBinding = program?.state.applied?.programBinding ?? null;
+  const applied = program?.state.applied ?? null;
+  const appliedBinding = applied?.programBinding ?? null;
+  const appliedProgram = applied?.graphRevision === status?.graphRevision
+    && applied?.retainedBundleId === status?.retainedBundleId ? applied?.program : null;
   const moveSources = useMemo<MoveToSource[]>(() => {
     if (status === null || motion === null || observedMotion === null) return [];
     const planningCapabilities = motion.targetDescriptor.contracts
@@ -453,9 +442,16 @@ export function RobotControlPanelView({
     ]);
     const sceneResourcePoses = new Map<string, PoseTuple>();
     if (controlBasePoseInCell !== null) {
-      for (const resource of authoring?.scene ?? []) {
-        const cellPose = cellPoseValue(resource.pose);
-        if (cellPose !== null) {
+      for (const resource of runtimeScene?.snapshot?.objects ?? []) {
+        // Never fall back to authored poses, including for carried objects.
+        // Only the owner-published cell-fixed pose is available here.
+        if (runtimeScene?.access.projection_leases_open
+          && resource.placement.kind === 'cell_fixed') {
+          const pose = resource.placement.pose_in_cell;
+          const cellPose: PoseTuple = {
+            position: [pose.position_m.x, pose.position_m.y, pose.position_m.z],
+            quaternion: pose.orientation_xyzw,
+          };
           sceneResourcePoses.set(
             resource.scene_resource_id,
             relativePose(cellPose, controlBasePoseInCell),
@@ -500,7 +496,7 @@ export function RobotControlPanelView({
         });
       }
     }
-    for (const { node } of flattenProgramForest(authoring?.forest ?? [])) {
+    for (const { node } of flattenProgramForest(appliedProgram ? [appliedProgram.tree] : [])) {
       const programTargetRole = node.parameters.target_role;
       if (typeof programTargetRole !== 'string'
         || !boundTargetRoles.has(programTargetRole)) continue;
@@ -565,7 +561,8 @@ export function RobotControlPanelView({
     return sources;
   }, [
     appliedBinding,
-    authoring,
+    appliedProgram,
+    runtimeScene,
     controlBasePoseInCell,
     motion,
     observedMotion,
@@ -683,6 +680,11 @@ export function RobotControlPanelView({
         ? undefined
         : `Control route: ${displayedTarget.controllableComponentId} / ${displayedTarget.commandTargetId}`}
     >
+      {controller.unappliedChanges && (
+        <p className="central-inspector-notice notice severity-warning notice-strip" role="status">
+          Unapplied changes are not used for motion. Robots use the current runtime Scene and Applied Deployment.
+        </p>
+      )}
       {!enabled && (
         <div className="panel-state">
           <strong>Headless execution is not connected.</strong>
@@ -1319,10 +1321,7 @@ export function RobotControlPanelView({
 
               {state.operation !== null && (
                 <div className="robot-control-operation">
-                  <progress aria-label="Operation progress" max={1} value={state.operation.progress} />
-                  <span>
-                    {state.operation.state.replaceAll('_', ' ')} · {Math.round(state.operation.progress * 100)}%
-                  </span>
+                  <OperationProgress operation={state.operation} ownerEpoch={status?.ownerEpoch} source={controller.controlSource} />
                   {state.operation.resident && !recoveryRequired && <div className="robot-control-operation-actions">
                     <button
                       type="button"

@@ -975,19 +975,6 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "Local scene-authoring fixture uses simulated attach actions without an independent grasp confirmation source.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        }
       ]
     },
     {
@@ -1039,19 +1026,6 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"},
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
-        }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "Isaac Lite6 simulation retains a scoped open-loop grasp acknowledgement while articulated gripper effort, observed state, dwell, contact, and convergence remain separately observable.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
         }
       ]
     },
@@ -1107,19 +1081,6 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "The retained Isaac assistant fixture keeps simulated grasp attachment explicitly scoped and observable; assistant output never grants command admission.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        }
       ]
     },
     {
@@ -1171,19 +1132,6 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"},
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
-        }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "The retained Isaac light-scene fixture keeps simulated grasp attachment explicitly scoped while Robotiq command, observed state, and convergence remain independently visible.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
         }
       ]
     },
@@ -1237,19 +1185,6 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "The collision scenario keeps simulated attachment explicitly scoped while collision surveillance and Kernel Stop evidence remain authoritative and independent.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        }
       ]
     },
     {
@@ -1283,19 +1218,6 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"},
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
-        }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "Native Lite6 preview uses backend-authored gripper state and simulated attach actions without an independent grasp confirmation source.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
         }
       ]
     },
@@ -1337,8 +1259,7 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"}
           }
         }
-      ],
-      "policy_restoration_inputs": []
+      ]
     },
     {
       "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
@@ -1372,19 +1293,6 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"},
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
-        }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "Native Robotiq preview uses simulated gripper state and attach actions without an independent grasp confirmation source.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
         }
       ]
     },
@@ -1420,8 +1328,7 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": []
+      ]
     },
     {
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
@@ -1475,19 +1382,6 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "open_loop_grasp_acknowledgement",
-          "source_field": "grasp_risk_policy.open_loop_grasp",
-          "target_role_id": "gripper",
-          "allowed": true,
-          "scope": "simulation",
-          "rationale": "The FoundationPose fixture keeps simulated grasp attachment explicitly scoped while perception pose freshness, articulated gripper state, and pick/drop effects remain separately observed.",
-          "runtime_acceptance_step": "I8/P5",
-          "tool_acceptance_step": "I11/T",
-          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        }
       ]
     },
     {
@@ -1523,8 +1417,7 @@
             "gripper": {"component_role": "tool", "command_target_id": "gripper"}
           }
         }
-      ],
-      "policy_restoration_inputs": []
+      ]
     },
     {
       "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
@@ -1557,8 +1450,7 @@
             "arm": {"component_role": "robot", "command_target_id": "arm"}
           }
         }
-      ],
-      "policy_restoration_inputs": []
+      ]
     }
   ]
 }

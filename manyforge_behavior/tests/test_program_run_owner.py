@@ -518,6 +518,7 @@ def _fixture(
     interventions: ProgramInterventionRegistry | None = None,
     run_id_factory: Callable[[], str] | None = None,
     maximum_retained_runs: int = 8,
+    program_clock_source: Callable[[], float] = time.monotonic,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
     if context_port is not None:
@@ -583,6 +584,7 @@ def _fixture(
         ports=ports,
         run_id_factory=run_id_factory or (lambda: "program-run-1"),
         maximum_retained_runs=maximum_retained_runs,
+        program_clock_source=program_clock_source,
     )
     return owner, admission, task, scope, events
 
@@ -2908,6 +2910,149 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
     owner.stop(run_id)
 
 
+def _timed_admission(
+    admission: ProgramRunAdmission, node_id: str, **parameters: Any
+) -> ProgramRunAdmission:
+    """One timed leaf that keeps running through an operator Stop, so only
+    the Program clock decides how its time counts."""
+    document = admission.program.to_dict()
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            {
+                "key": "count",
+                "type": "int64",
+                "access": "read_write",
+                "persistence": "run",
+                "initial": 0,
+            }
+        ],
+    }
+    leaf_parameters = (
+        parameters
+        if node_id == "timer"
+        else {"key": "count", "value": 5, **parameters}
+    )
+    document["tree"] = {
+        "node_id": "sequence",
+        "instance_id": "root",
+        "parameters": {},
+        "children": [
+            {
+                "node_id": node_id,
+                "instance_id": "wait",
+                "parameters": leaf_parameters,
+                "children": [],
+                "operator_stop_policy": "continue",
+            }
+        ],
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    return _admission_for_program(
+        admission, program, [row.to_dict() for row in program_node_policies(program)]
+    )
+
+
+def _timed_run(node_id: str, **parameters: Any):
+    now = [100.0]
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        program_clock_source=lambda: now[0],
+    )
+    run_id = owner.start(
+        _timed_admission(admission, node_id, **parameters)
+    ).capture.program_run_id
+    node = owner._runs[run_id].run._authored_nodes["wait"]  # noqa: SLF001
+    return owner, scope, run_id, node, now
+
+
+@pytest.mark.parametrize(
+    ("node_id", "parameters", "terminal"),
+    [
+        ("timer", {"duration_s": 2.0}, ProgramRunState.SUCCEEDED),
+        ("timer", {"duration_s": 2.0, "duration_while_held": "count"},
+         ProgramRunState.SUCCEEDED),
+        ("logic.wait_for_value", {"timeout_s": 2.0}, ProgramRunState.FAILED),
+        ("logic.wait_for_value", {"timeout_s": 2.0, "timeout_while_held": "count"},
+         ProgramRunState.FAILED),
+    ],
+)
+def test_halt_freezes_program_time_and_execute_continues_the_same_attempt(
+    node_id: str, parameters: dict[str, Any], terminal: ProgramRunState
+) -> None:
+    owner, _scope, run_id, node, now = _timed_run(node_id, **parameters)
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    attempt = node._identity  # noqa: SLF001
+    now[0] = 101.0
+
+    assert owner.full_stop(run_id).state is ProgramRunState.FULL_STOPPING
+    now[0] = 150.0
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    now[0] = 400.0  # Halted for 299 s: none of it counts, held or not.
+    resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
+    assert resumed.state is ProgramRunState.RUNNING
+    assert resumed.node_statuses["wait"] == "running"  # never interrupted
+
+    now[0] = 400.9
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    assert node._identity is attempt  # noqa: SLF001
+    now[0] = 401.0
+    finished = owner.advance_once(run_id)
+    assert finished.state is terminal
+    if terminal is ProgramRunState.FAILED:
+        assert node.feedback_message.startswith("wait_timed_out")
+
+
+@pytest.mark.parametrize("node_id", ["timer", "logic.wait_for_value"])
+def test_program_stop_of_a_halted_run_interrupts_its_wait(node_id: str) -> None:
+    parameters = {"duration_s": 2.0} if node_id == "timer" else {"timeout_s": 2.0}
+    owner, _scope, run_id, node, _now = _timed_run(node_id, **parameters)
+    owner.advance_once(run_id)
+    owner.full_stop(run_id)
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+
+    stopped = owner.stop(run_id)
+
+    assert stopped.state is ProgramRunState.STOPPED
+    assert node.outcome == "interrupted"
+    assert stopped.node_statuses["wait"] == "interrupted"
+
+
+def test_a_failure_pause_freezes_program_time_until_it_is_resolved() -> None:
+    owner, _task, _scope, _interventions, run_id, failure = _failure_paused_run()
+    clock = owner._runs[run_id].run.program_clock  # noqa: SLF001
+    assert clock.frozen  # The tree is dormant, like a Halt.
+    owner.resolve_intervention(
+        run_id,
+        node_attempt_id=failure.identity.node_attempt_id,
+        action="retry",
+        result=None,
+    )
+    assert not clock.frozen
+    owner.stop(run_id)
+
+
+def test_an_operator_stop_intervention_keeps_program_time_running() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
+    # The tree keeps ticking; each held node decides how its held time counts.
+    assert not owner._runs[run_id].run.program_clock.frozen  # noqa: SLF001
+    owner.stop(run_id)
+
+
 def test_full_stop_then_execute_keeps_motion_stopped_until_resume() -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     context = _ContextPort([])
@@ -3247,7 +3392,9 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     stopping = owner.stop(started.capture.program_run_id, reason="operator stop")
     assert stopping.state is ProgramRunState.STOPPING
     assert stopping.tree_status == "invalid"
-    assert set(stopping.node_statuses.values()) == {"idle"}
+    # The cancelled running leaf is cancellable: it reports interrupted.
+    assert list(stopping.node_statuses.values()).count("interrupted") == 1
+    assert set(stopping.node_statuses.values()) == {"idle", "interrupted"}
     assert stopping.active_operation_count == 1
     assert events == ["leaf_start", "scope_stop", "leaf_cancel"]
     assert scope.stop_requests == 1
@@ -3261,7 +3408,7 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     stopped = owner.advance_once(started.capture.program_run_id)
     assert stopped.state is ProgramRunState.STOPPED
     assert stopped.tree_status == "invalid"
-    assert set(stopped.node_statuses.values()) == {"idle"}
+    assert stopped.node_statuses == stopping.node_statuses
     assert stopped.active_operation_count == 0
 
     repeated = owner.stop(started.capture.program_run_id)
@@ -3563,3 +3710,121 @@ def test_applied_program_publication_is_complete_run_input() -> None:
         assert "scenario Program, binding, and retained identities disagree" in str(error)
     else:
         raise AssertionError("incoherent Applied publication was admitted")
+
+
+def _timer_with_sourced_duration_admission(
+    admission: ProgramRunAdmission,
+) -> ProgramRunAdmission:
+    """A timer whose `duration_s` comes from an empty key; its failures
+    pause for the operator (recovery policy with intervention)."""
+    document = admission.program.to_dict()
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            {
+                "key": "delay",
+                "type": "float64",
+                "access": "read_write",
+                "persistence": "run",
+            }
+        ],
+    }
+    document["tree"] = {
+        "node_id": "sequence",
+        "instance_id": "root",
+        "parameters": {},
+        "children": [
+            {
+                "node_id": "timer",
+                "instance_id": "wait",
+                "parameters": {},
+                "value_sources": {
+                    "duration_s": {"kind": "blackboard_key", "reference": "delay"}
+                },
+                "recovery_policy": {
+                    "allow_intervention": True,
+                    "allowed_recovery_actions": ["intervention"],
+                    "max_retries": 1,
+                    "allowed_skills": [],
+                    "persistence_ceiling": "session_only",
+                },
+                "children": [],
+            }
+        ],
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    return _admission_for_program(
+        admission, program, [row.to_dict() for row in program_node_policies(program)]
+    )
+
+
+def test_timer_input_failure_pauses_and_operator_retry_re_resolves_inputs() -> None:
+    """The timer declares no `failure` outcome, yet a missing sourced
+    duration is an ordinary node failure: it raises the failure pause, and
+    the operator's Retry starts a fresh attempt that resolves the fixed key."""
+    now = [100.0]
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        interventions=interventions,
+        program_clock_source=lambda: now[0],
+    )
+    run_id = owner.start(
+        _timer_with_sourced_duration_admission(admission)
+    ).capture.program_run_id
+    assert set(admission.environment.catalog.get("timer").outcomes) == {
+        "success",
+        "interrupted",
+    }
+
+    paused = owner.advance_once(run_id)
+
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert paused.node_statuses["wait"] == "failure"
+    assert paused.reason_code == "node_input_unavailable"
+    expected = "missing input duration_s from blackboard_key 'delay': "
+    assert paused.message.startswith(expected)
+    failure = interventions.read(run_id)
+    assert failure is not None
+    assert failure.reason_code == "node_input_unavailable"
+    assert failure.policy_parameter == "recovery_policy"
+    assert failure.message.startswith(expected)
+    diagnostic = owner.take_diagnostic(run_id)
+    assert diagnostic is not None
+    assert diagnostic["state"] == "intervention_required"
+    assert diagnostic["reason_code"] == "node_input_unavailable"
+    assert diagnostic["message"].startswith(expected)
+    # The failure pause stopped the Program's other motion, like any failure.
+    assert scope.stop_requests == 1
+    assert owner._runs[run_id].run.program_clock.frozen  # noqa: SLF001
+
+    # The operator fixes the key, then retries the failed step.
+    owner._runs[run_id].run.value_store.write("delay", 1.0)  # noqa: SLF001
+    owner.retry_failure_pause(
+        run_id,
+        node_attempt_id=failure.identity.node_attempt_id,
+        action=None,
+        request_id="retry.1",
+        reason=None,
+    )
+    resumed = owner.resolve_intervention(
+        run_id,
+        node_attempt_id=failure.identity.node_attempt_id,
+        action="retry",
+        result=None,
+    )
+    assert resumed.state is ProgramRunState.RUNNING
+    owner.advance_once(run_id)  # consumes the Retry decision
+    started = owner.advance_once(run_id)  # the fresh attempt resolves 1.0 s
+    assert started.state is ProgramRunState.RUNNING
+    assert started.node_statuses["wait"] == "running"
+    now[0] += 1.0
+    finished = owner.advance_once(run_id)
+    assert finished.state is ProgramRunState.SUCCEEDED
+    assert finished.node_statuses["wait"] == "success"

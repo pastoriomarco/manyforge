@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-29 12:12:44 UTC
+  Last regenerated: 2026-09-30 22:53:31 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -105,6 +105,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/diagnostics/health` | headless-runtime-client | Program Diagnostic Health |
 | `POST` | `/api/program/discard` | composer-draft | Discard Draft |
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
+| `POST` | `/api/program/draft/expression-check` | composer-draft | Check Expression |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
 | `POST` | `/api/program/draft/runtime-override-promotions` | composer-draft | Materialize Runtime Override |
 | `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
@@ -131,6 +132,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
+| `GET` | `/api/program/scenarios/{scenario_id}/persistent-values` | headless-runtime-client | Program Persistent Values |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values` | headless-runtime-client | Set Program Persistent Value |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/clear` | headless-runtime-client | Clear Program Persistent Values |
+| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/reset` | headless-runtime-client | Reset Program Persistent Value |
 | `POST` | `/api/program/validate` | composer-draft | Validate Program Source |
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |

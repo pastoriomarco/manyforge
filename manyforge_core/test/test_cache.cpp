@@ -5,6 +5,7 @@
 #include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <optional>
+#include <set>
 #include <utility>
 
 namespace manyforge::core {
@@ -433,6 +434,24 @@ TEST(TrajectoryCacheIntentTest,
       std::get<CartesianPathDTO>(rhs.motion).waypoints.back().position_m.x_m);
   EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
+}
+
+TEST(TrajectoryCacheIntentTest, GoalFrameAndReferenceRobotChangeIdentity) {
+  const auto baseline = make_cartesian_request();
+  auto own_frame = baseline;
+  own_frame.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "tcp");
+  auto peer_frame = baseline;
+  peer_frame.goal_frame_reference =
+      ReferenceDTO(FrameRoleId("tcp"),
+                   ReferenceTargetDTO{TargetRoleId("peer_arm"),
+                                      ControllableComponentId("peer"), CommandTargetId("arm")});
+  auto cell_frame = baseline;
+  cell_frame.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
+
+  const std::set<std::string> identities{
+      trajectory_cache_intent_identity(baseline), trajectory_cache_intent_identity(own_frame),
+      trajectory_cache_intent_identity(peer_frame), trajectory_cache_intent_identity(cell_frame)};
+  EXPECT_EQ(identities.size(), 4U);
 }
 
 TEST(TrajectoryCacheIntentTest, ContactPolicyChangesIdentity) {

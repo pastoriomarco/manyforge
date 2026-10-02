@@ -49,6 +49,8 @@ export interface CatalogJsonSchema {
   default?: unknown;
   'x-manyforge-semantic-type'?: string;
   'x-manyforge-semantic-scope-parameter'?: string;
+  /** A `key_value` parameter: its type is the declared type of the key named by this parameter. */
+  'x-manyforge-value-type-from-key'?: string;
 }
 
 export interface CatalogParameter {
@@ -188,11 +190,15 @@ export interface ProgramViewerMetadata {
   hidden_execution_groups?: string[];
 }
 
-export interface ProgramValueSource {
-  kind: 'program_parameter' | 'blackboard_key' | 'blackboard_field';
-  reference: string;
-  field?: string;
-}
+/**
+ * Where one value of a node comes from, keyed in `value_sources` by the
+ * value's path (`utils/valuePaths.ts`). The literal stays in `parameters`
+ * and is restored when the source is removed.
+ */
+export type ProgramValueSource =
+  | { kind: 'program_parameter' | 'blackboard_key'; reference: string }
+  | { kind: 'blackboard_field'; reference: string; field: string }
+  | { kind: 'expression'; expression: string };
 
 export type ProgramModificationPolicyValue =
   | 'forbidden'
@@ -247,12 +253,23 @@ export interface ProgramExecutionGroupDefinition {
   execution_policy: ProgramExecutionPolicy;
 }
 
+/** Program types that accept an authored parameter default or key initial value. */
+export const PROGRAM_AUTHORED_VALUE_TYPES: ReadonlySet<string> = new Set([
+  'bool',
+  'float64',
+  'int64',
+  'scene_resource',
+  'stored_pose',
+  'string',
+  'string_list',
+]);
+
 export interface ProgramParameterDeclaration {
   parameter_id: string;
   type: string;
   default: JsonValue;
   constraints?: Record<string, JsonValue>;
-  runtime_mutability: 'immutable' | 'before_run' | 'between_operations';
+  runtime_mutability: 'immutable' | 'before_run';
   description?: string;
 }
 
@@ -267,11 +284,26 @@ export interface BlackboardFieldDeclaration {
   type: string;
 }
 
+/** A pose frame a Program declares: the cell, a robot's frame role or a Scene object. */
+export type ProgramPoseFrame =
+  | { kind: 'cell_frame' }
+  | { kind: 'target_frame'; target_role: string; frame_role: string }
+  | { kind: 'scene_resource'; scene_resource_id: string };
+
 export interface BlackboardKeyDeclaration {
   key: string;
   type: string;
   access: 'read' | 'write' | 'read_write';
-  persistence: 'node' | 'run' | 'persistent';
+  persistence: 'run' | 'persistent';
+  /** Omitted for a key that is empty until written; never null. */
+  initial?: Exclude<JsonValue, null>;
+  /** A computed key's formula; never with `initial` or `persistent`. */
+  expression?: string;
+  /**
+   * Pose keys only: the declared frames a value may be stated in, non-empty
+   * and in canonical order; omitted allows every declared frame.
+   */
+  allowed_frames?: ProgramPoseFrame[];
   fields?: BlackboardFieldDeclaration[];
   description?: string;
 }
@@ -318,6 +350,18 @@ export interface ProgramAuthoringDiagnostic {
   severity: 'error';
 }
 
+/**
+ * The `param.<id>` and `key.<key>` names each Draft formula reads, sorted, as
+ * the backend's expression engine resolved them. A formula that does not
+ * check is absent; its diagnostics say why.
+ */
+export interface ProgramFormulaReferences {
+  /** Computed keys by key. */
+  computedKeys: Record<string, string[]>;
+  /** Node field formulas by node instance, then value path. */
+  nodes: Record<string, Record<string, string[]>>;
+}
+
 export interface ProgramDraftProjection {
   draftId: string;
   draftRevision: number;
@@ -327,6 +371,7 @@ export interface ProgramDraftProjection {
   programRevision: string | null;
   program: ProgramDocument | null;
   diagnostics: ProgramAuthoringDiagnostic[];
+  formulaReferences: ProgramFormulaReferences;
 }
 
 export interface ProgramDraftApplicability {
@@ -700,7 +745,10 @@ export interface ProgramRunStatus {
   capture: ProgramRunCapture;
   treeStatus: 'invalid' | 'running' | 'success' | 'failure';
   nodeStatusRevision: number;
-  nodeStatuses: Record<string, 'idle' | 'running' | 'held' | 'success' | 'failure'>;
+  nodeStatuses: Record<
+    string,
+    'idle' | 'running' | 'held' | 'success' | 'failure' | 'interrupted'
+  >;
   activeOperationCount: number | null;
   reasonCode: string | null;
   message: string;
@@ -733,6 +781,96 @@ export interface ProgramCycleStatus {
   recoveryOffer: CycleRecoveryOffer | null;
   run: ProgramRunStatus | null;
   runtimeControls: ProgramRuntimeControlProjection | null;
+}
+
+/** The value types a formula can produce (docs/authoring/EXPRESSIONS.md §3). */
+export type ExpressionValueType = 'bool' | 'int64' | 'float64' | 'string';
+
+export interface ExpressionCheckRequest {
+  expression: string;
+  destination_type: ExpressionValueType;
+  /** The computed key being edited, so its own formula is not a cycle. */
+  exclude_computed_key: string | null;
+}
+
+/** One backend finding; position and length count Unicode code points. */
+export interface ExpressionDiagnostic {
+  code: string;
+  message: string;
+  position: number | null;
+  length: number | null;
+  name: string | null;
+}
+
+export interface ExpressionCheckResult {
+  resultType: ExpressionValueType | null;
+  diagnostics: ExpressionDiagnostic[];
+  /** Computed from parameter defaults and key `initial:` values, never a runtime value. */
+  preview: { value: Exclude<JsonValue, null> } | { unavailableReason: string };
+  /** `param.` and `key.` names a formula may use, with their types. */
+  names: Array<{ name: string; type: string }>;
+}
+
+/** One declared persistent key of the Applied Program and its stored value. */
+export interface PersistentKeyValue {
+  key: string;
+  type: string;
+  access: BlackboardKeyDeclaration['access'];
+  /** Undefined for a key without `initial:`; it then starts empty. */
+  initial: Exclude<JsonValue, null> | undefined;
+  /** Whether the Program runner holds a stored value for the key. */
+  stored: boolean;
+  value: JsonValue;
+  sequence: number | null;
+}
+
+/**
+ * One attributed change: an operator request, a write from a run's node, a
+ * value dropped because the committed Program no longer keeps it, or a fault
+ * (a committed Apply the Program runner never observed).
+ */
+export interface PersistentKeyValueEdit {
+  sequence: number;
+  /** Null when a change covers every key of the Scenario. */
+  key: string | null;
+  action: 'set' | 'reset' | 'clear' | 'dropped' | 'fault';
+  requestId: string | null;
+  sourceLabel: string;
+  programRunId: string | null;
+  nodeInstanceId: string | null;
+  nodeAttemptId: string | null;
+  /** Why a value was dropped, or the fault (`applied_program_not_observed`). */
+  reason: string | null;
+  detail: string | null;
+}
+
+/** Stored persistent values of one Scenario, owned by the Program runner. */
+export interface PersistentKeyValues {
+  scenarioId: string;
+  programRevision: string;
+  /** The live run that currently holds the values, if any. */
+  programRunId: string | null;
+  /** Register sequence when read: advances with every stored-value change. */
+  sequence: number;
+  keys: PersistentKeyValue[];
+  edits: PersistentKeyValueEdit[];
+  /**
+   * The stored values could not be brought in line with the committed Apply;
+   * until they are, no stored value is shown or restored.
+   */
+  storageFault: { code: string; message: string } | null;
+  /**
+   * Committed Applies of this Scenario the Program runner never observed.
+   * Values were kept and checked against the current Program; the missed
+   * notification is a defect to find and fix.
+   */
+  applyObservationFault: { code: string; recordDigests: string[] } | null;
+}
+
+export interface PersistentKeyValuesCleared {
+  requestId: string;
+  scenarioId: string;
+  removed: number;
 }
 
 export type RuntimeOverrideStatus = 'staged' | 'active' | 'cleared' | 'stale';

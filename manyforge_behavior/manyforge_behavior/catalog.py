@@ -30,10 +30,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.3.0"
+EXPECTED_CONTENT_VERSION = "2.4.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:3d5fa47c2dacc69fe56e2ec91e828897f0ac2a6c77f22a50a4acdd45edf41353"
+    "sha256:6e62827057b520c2869f4aca330a002b6f737f4482299ca2ad222371cf06d6a2"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -81,6 +81,7 @@ _OWNER_APIS = {
     "planning.pick_sequence",
     "planning.place_sequence",
     "scene.carried_attachment",
+    "scene.query",
     "scene.transaction",
     "simulator.control",
 }
@@ -478,6 +479,28 @@ def _schema_semantic_scope_parameters(
     return frozenset(scopes)
 
 
+def _schema_nests_key_typed_value(
+    schema: CatalogSchema,
+    registry: CatalogSchemaRegistry,
+    *,
+    visited: frozenset[int] = frozenset(),
+) -> bool:
+    resolved = registry.resolve(schema)
+    identity = id(resolved)
+    if identity in visited:
+        return False
+    nested = (*resolved.properties.values(),)
+    if resolved.items is not None:
+        nested = (*nested, resolved.items)
+    if resolved.additional_property_schema is not None:
+        nested = (*nested, resolved.additional_property_schema)
+    return any(
+        registry.resolve(child).value_type_from_key is not None
+        or _schema_nests_key_typed_value(child, registry, visited=visited | {identity})
+        for child in nested
+    )
+
+
 def _schema_enum_values(
     schema: CatalogSchema,
     registry: CatalogSchemaRegistry,
@@ -788,6 +811,12 @@ class NodeCatalog:
                 label=f"{label}.blackboard",
             )
 
+        self._validate_key_value_parameters(
+            parameters,
+            bindings=(*reads, *writes),
+            label=f"{label}.parameters",
+        )
+
         owner_context = None
         if "owner_context" in raw:
             context = _mapping(raw["owner_context"], f"{label}.owner_context")
@@ -813,11 +842,21 @@ class NodeCatalog:
         outcomes: dict[str, str] = {}
         if kind == "leaf":
             outcome_map = _mapping(raw.get("outcomes", {}), f"{label}.outcomes")
-            if outcome_map:
+            # Outcomes describe the leaf's own work. A cancellable leaf
+            # reports `interrupted` when it is stopped (Program Stop, Reset,
+            # cancel, a parent ending it), never `failure`; a non-cancellable
+            # leaf never reports it. `failure` is declared when the leaf's own
+            # work can fail (the timer's wait cannot). Separately, any node,
+            # whatever it declares, fails an attempt whose inputs cannot be
+            # resolved before its work starts (spec 440 §4.6), so no
+            # consumer may refuse or hide that `failure` for lack of a
+            # declared `failure` outcome.
+            interrupted = {"interrupted"} if execution.cancellable else set()
+            if outcome_map or execution.cancellable:
                 _closed(
                     outcome_map,
-                    required={"success", "failure"},
-                    allowed={"success", "failure", "interrupted"},
+                    required={"success", *interrupted},
+                    allowed={"success", "failure", *interrupted},
                     label=f"{label}.outcomes",
                 )
                 outcomes = {
@@ -869,6 +908,54 @@ class NodeCatalog:
             outcomes=MappingProxyType(outcomes),
             event_family=event_family,
         )
+
+    def _validate_key_value_parameters(
+        self,
+        parameters: tuple[CatalogParameter, ...],
+        *,
+        bindings: tuple[CatalogBlackboardBinding, ...],
+        label: str,
+    ) -> None:
+        """A key-typed parameter names one key parameter whose bindings admit
+        exactly the declared value types, so validators never guess a type."""
+
+        parameter_ids = {parameter.id for parameter in parameters}
+        for parameter in parameters:
+            if _schema_nests_key_typed_value(parameter.schema, self._schema_registry):
+                raise CatalogValidationError(
+                    f"{label}.{parameter.id} nests a key-typed value; only a "
+                    "whole parameter may be typed by a key"
+                )
+            if parameter.schema.schema_type != "key_value":
+                if self._schema_registry.resolve(parameter.schema).schema_type == "key_value":
+                    raise CatalogValidationError(
+                        f"{label}.{parameter.id} key_value schema must be inline"
+                    )
+                continue
+            key_parameter = parameter.schema.value_type_from_key
+            if key_parameter is None:
+                raise CatalogValidationError(
+                    f"{label}.{parameter.id} key_value parameter needs value_type_from_key"
+                )
+            if key_parameter not in parameter_ids:
+                raise CatalogValidationError(
+                    f"{label}.{parameter.id}.value_type_from_key references "
+                    f"unknown parameter {key_parameter!r}"
+                )
+            bound_types = {
+                binding.value_type
+                for binding in bindings
+                if binding.key_parameter == key_parameter
+            }
+            if bound_types != set(parameter.schema.value_types):
+                raise CatalogValidationError(
+                    f"{label}.{parameter.id}.value_types must equal the "
+                    f"blackboard binding types of {key_parameter!r}"
+                )
+            if parameter.has_default:
+                raise CatalogValidationError(
+                    f"{label}.{parameter.id} is typed by a key and cannot declare a default"
+                )
 
     def _parse_parameters(
         self,

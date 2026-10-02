@@ -12,7 +12,7 @@ import {
   selectedStatusForState,
   type ManualMotionSettings,
   type RobotControlState,
-  stricterCartesianDefaults,
+  appliedCartesianDefaults,
 } from './robotControl';
 
 import { statusFixture, receiptFixture, readyState, executingState, gripperReceiptFixture } from '../testFixtures/robotControl';
@@ -381,14 +381,11 @@ describe('addressed Robot Control state', () => {
     expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0);
   });
 
-  it('takes the Applied Cartesian defaults; an unapplied Draft only tightens them', () => {
+  it('takes only Applied Cartesian defaults, or manual defaults without a Program', () => {
     const applied = { translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 };
-    expect(stricterCartesianDefaults(applied, null)).toEqual(applied);
-    // A looser Draft waits for Apply; a stricter one applies at once.
-    expect(stricterCartesianDefaults(applied, { translationToleranceM: 0.02, maxBlendDeviationRad: 0.005 }))
-      .toEqual({ translationToleranceM: 0.005, maxBlendDeviationRad: 0.005 });
+    expect(appliedCartesianDefaults(applied)).toEqual(applied);
     // Without an Applied Program the manual defaults stand in for it.
-    expect(stricterCartesianDefaults(null, { translationToleranceM: 0.5, maxBlendDeviationRad: 0.5 }))
+    expect(appliedCartesianDefaults(null))
       .toEqual({ translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 });
   });
 

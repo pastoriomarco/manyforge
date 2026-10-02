@@ -1,1 +1,0 @@
-{"api_version":"manyforge.runtime_policy.v1","description":"Maintained native motion policy for ur10e_robotiq_pick_place_preview","interrupt_policy_ids":[],"open_loop_grasp_acknowledgements":[],"runtime_policy_id":"manyforge.runtime_motion.ur10e_robotiq_pick_place_preview","runtime_policy_revision":"sha256:d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b"}

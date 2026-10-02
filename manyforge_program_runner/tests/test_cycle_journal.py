@@ -49,6 +49,7 @@ def _database_file_identities(path: Path) -> dict[str, tuple[bytes, int, int, in
     [
         "malformed",
         "old_schema",
+        "future_schema",
         "extra_table",
         "weakened_constraint",
         "malformed_row",
@@ -64,10 +65,11 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
         journal = ProgramCycleJournal(path, owner_epoch="runner.old")
         journal.close()
         database = sqlite3.connect(path)
-        if kind == "old_schema":
+        if kind in {"old_schema", "future_schema"}:
             database.execute("PRAGMA ignore_check_constraints=ON")
             database.execute(
-                "UPDATE program_cycle_metadata SET schema_version=1 WHERE singleton=1"
+                "UPDATE program_cycle_metadata SET schema_version=? WHERE singleton=1",
+                (1 if kind == "old_schema" else 6,),
             )
         elif kind == "extra_table":
             database.execute("CREATE TABLE unsupported_old_state(value TEXT)")
@@ -75,7 +77,7 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
             database.execute("PRAGMA writable_schema=ON")
             database.execute(
                 "UPDATE sqlite_schema SET sql=replace(sql,"
-                "' CHECK(schema_version=4)','') "
+                "' CHECK(schema_version=5)','') "
                 "WHERE name='program_cycle_metadata'"
             )
             database.execute("PRAGMA writable_schema=OFF")
@@ -109,7 +111,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
     try:
         assert database.execute(
             "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         assert {
             row[0]
             for row in database.execute(
@@ -121,7 +123,188 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
             "program_cycle_inflight_commands",
             "program_runner_liveness",
             "program_run_history",
+            "program_persistent_value_requests",
         }
+    finally:
+        database.close()
+
+
+def _downgrade_to_v4(path: Path) -> None:
+    """Rewrite a current journal into exactly the version 4 layout."""
+
+    database = sqlite3.connect(path, isolation_level=None)
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute("DROP TABLE program_persistent_value_requests")
+        database.execute(
+            "CREATE TABLE program_cycle_metadata_v4 ( "
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "schema_version INTEGER NOT NULL CHECK(schema_version=4) )"
+        )
+        database.execute("INSERT INTO program_cycle_metadata_v4 VALUES(1,4)")
+        database.execute("DROP TABLE program_cycle_metadata")
+        database.execute(
+            "ALTER TABLE program_cycle_metadata_v4 RENAME TO program_cycle_metadata"
+        )
+        database.execute("COMMIT")
+    finally:
+        database.close()
+
+
+def test_a_version_4_journal_is_upgraded_in_place_without_losing_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="terminal_awaiting_reset",
+        program_run_id="run.1",
+        run_snapshot={
+            "run_revision": 2,
+            "state": "succeeded",
+            "capture": {"program_run_id": "run.1"},
+        },
+        terminal_reference="sha256:" + "b" * 64,
+    )
+    journal.close()
+    _downgrade_to_v4(path)
+
+    upgraded = ProgramCycleJournal(path, owner_epoch="runner.new")
+    try:
+        assert upgraded.read().state == "terminal_awaiting_reset"
+        assert upgraded.read().owner_epoch == "runner.old"
+        assert upgraded.read_run_snapshot("run.1") == {
+            "run_revision": 2,
+            "state": "succeeded",
+            "capture": {"program_run_id": "run.1"},
+        }
+    finally:
+        upgraded.close()
+    # The upgraded file is exactly the current schema: it opens again as such.
+    ProgramCycleJournal(path, owner_epoch="runner.new").close()
+    database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        assert database.execute(
+            "SELECT schema_version FROM program_cycle_metadata"
+        ).fetchone() == (5,)
+    finally:
+        database.close()
+
+
+def _complete_persistent(
+    journal: ProgramCycleJournal,
+    request_id: str,
+    kind: str = "persistent_value_set",
+    outcome: str = "applied",
+) -> str:
+    record = journal.record_request(
+        owner_epoch="composer.epoch.1",
+        request_id=request_id,
+        kind=kind,
+        intent={"request_id": request_id},
+        cycle_generation=1,
+    )
+    if record.disposition != "new":
+        return record.disposition
+    journal.complete_persistent_value_request(
+        owner_epoch="composer.epoch.1", request_id=request_id, outcome=outcome
+    )
+    return "new"
+
+
+def test_completed_persistent_value_requests_are_bounded_and_survive_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(
+        path,
+        owner_epoch="runner.epoch.1",
+        maximum_completed_persistent_value_requests=3,
+    )
+    assert _complete_persistent(journal, "edit.1") == "new"
+    assert _complete_persistent(journal, "edit.2", "persistent_value_reset") == "new"
+    assert (
+        _complete_persistent(
+            journal, "edit.3", "persistent_values_clear", "storage_uncertain"
+        )
+        == "new"
+    )
+    # A resend of a completed request is reported with its action and outcome.
+    resent = journal.record_request(
+        owner_epoch="composer.epoch.1",
+        request_id="edit.3",
+        kind="persistent_values_clear",
+        intent={"request_id": "edit.3"},
+        cycle_generation=1,
+    )
+    assert (resent.disposition, resent.result) == (
+        "completed",
+        {"action": "clear", "outcome": "storage_uncertain"},
+    )
+    # The identity is the journal's request identity: another caller epoch
+    # with the same request id is a different request.
+    assert journal.record_request(
+        owner_epoch="composer.epoch.2",
+        request_id="edit.1",
+        kind="persistent_value_set",
+        intent={"request_id": "edit.1"},
+        cycle_generation=1,
+    ).disposition == "new"
+    journal.cancel_request(owner_epoch="composer.epoch.2", request_id="edit.1")
+    # Only persistent-value requests complete into the table.
+    journal.record_request(
+        owner_epoch="composer.epoch.1",
+        request_id="start.1",
+        kind="start",
+        intent={"request_id": "start.1"},
+        cycle_generation=1,
+    )
+    with pytest.raises(RuntimeError, match="in-flight command is absent"):
+        journal.complete_persistent_value_request(
+            owner_epoch="composer.epoch.1", request_id="start.1", outcome="applied"
+        )
+    journal.cancel_request(owner_epoch="composer.epoch.1", request_id="start.1")
+
+    # A fourth completion trims the oldest identity, by insertion order.
+    assert _complete_persistent(journal, "edit.4") == "new"
+    assert _complete_persistent(journal, "edit.2") == "completed"
+    journal.close()
+
+    reopened = ProgramCycleJournal(path, owner_epoch="runner.epoch.2")
+    try:
+        for request_id in ("edit.2", "edit.3", "edit.4"):
+            assert _complete_persistent(reopened, request_id) == "completed"
+        # The trimmed identity is no longer known; it is a new request.
+        assert _complete_persistent(reopened, "edit.1") == "new"
+    finally:
+        reopened.close()
+
+    database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        assert database.execute(
+            "SELECT request_id,action,outcome FROM program_persistent_value_requests "
+            "ORDER BY position"
+        ).fetchall() == [
+            ("edit.2", "reset", "applied"),
+            ("edit.3", "clear", "storage_uncertain"),
+            ("edit.4", "set", "applied"),
+            ("edit.1", "set", "applied"),
+        ]
+        # The trim is an indexed delete, never a scan of the table.
+        plan = " ".join(
+            str(row[-1])
+            for row in database.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM program_persistent_value_requests "
+                "WHERE position<=?",
+                (1,),
+            )
+        )
+        assert "USING" in plan and "INDEX" in plan, plan
+        assert database.execute(
+            "SELECT COUNT(*) FROM program_cycle_inflight_commands"
+        ).fetchone() == (0,)
     finally:
         database.close()
 
@@ -212,7 +395,7 @@ def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
         reader.execute("BEGIN")
         assert reader.execute(
             "SELECT schema_version FROM program_cycle_metadata"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute("PRAGMA wal_autocheckpoint=0")

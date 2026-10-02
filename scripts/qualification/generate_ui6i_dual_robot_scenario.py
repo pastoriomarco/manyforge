@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import subprocess
 import sys
@@ -29,10 +28,6 @@ GROUPED_PROGRAM_SOURCE: Final = "examples/ur5e_lite6_wall_grouped.program.yaml"
 ISOLATION_PROGRAM_SOURCE: Final = "examples/ur5e_lite6_wall_isolation.program.yaml"
 GROUPED_SCENARIO_SOURCE: Final = "examples/ur5e_lite6_wall_grouped.scenario"
 ISOLATION_SCENARIO_SOURCE: Final = "examples/ur5e_lite6_wall_isolation.scenario"
-RUNTIME_POLICY_SOURCE: Final = (
-    "manyforge_deployment/resources/maintained/catalog/runtime_policy/"
-    "manyforge.runtime_motion.ur5e_lite6_wall.json"
-)
 GRAPH_ID_FIELDS: Final = {
     "runtime_units": "runtime_unit_id",
     "model_instances": "model_instance_id",
@@ -64,29 +59,6 @@ def read_yaml(path: Path) -> dict[str, Any]:
     if type(value) is not dict:
         raise GenerationError(f"{path} must contain an object")
     return value
-
-
-def catalog_reference_for_payload(
-    template: dict[str, Any], document: dict[str, Any], payload: bytes
-) -> dict[str, Any]:
-    result = copy.deepcopy(template)
-    result["record_id"] = document["runtime_policy_id"]
-    result["record_revision"] = document["runtime_policy_revision"]
-    result["content_digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
-    result["content_addressed_store_key"] = (
-        f"catalog/maintained/{result['record_kind']}/{result['record_id']}/"
-        f"{result['record_revision'][7:]}"
-    )
-    return result
-
-
-def record_template(deployment: dict[str, Any], kind: str) -> dict[str, Any]:
-    matches = [
-        row for row in deployment["catalogs"]["records"] if row["record_kind"] == kind
-    ]
-    if not matches:
-        raise GenerationError(f"base Deployment has no {kind} catalog reference")
-    return matches[0]
 
 
 def unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -122,9 +94,7 @@ def cell_bindings(deployment: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def build_deployment(
-    root: Path, *, runtime_policy_ref: dict[str, Any]
-) -> dict[str, Any]:
+def build_deployment(root: Path) -> dict[str, Any]:
     generator_dir = root / "manyforge_deployment/tools"
     sys.path.insert(0, str(generator_dir))
     # pylint: disable-next=import-outside-toplevel
@@ -140,7 +110,6 @@ def build_deployment(
     )
     sources, _, _ = catalog_sources(root, description)
     refs = {key: value[2] for key, value in sources.items()}
-    refs["runtime_policy:ur5e_lite6_wall"] = copy.deepcopy(runtime_policy_ref)
     families = {
         row["model_family_id"]: row for row in description["model_families"]
     }
@@ -332,7 +301,7 @@ def build_deployment(
         "interrupt_config": copy.deepcopy(lite6["policies"]["interrupt_config"]),
         "interrupt_policies": [],
         "interrupt_sources": [],
-        "retained_policy_records": [copy.deepcopy(runtime_policy_ref)],
+        "retained_policy_records": [],
         "stop_stage_parameters": [
             copy.deepcopy(row)
             for candidate in candidates
@@ -377,37 +346,6 @@ def build_deployment(
             "tags": ["dual-robot", "grouped-execution", "lite6", "ur5e"],
         },
     }
-
-
-def build_runtime_policy(
-    root: Path,
-) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
-    generator_dir = root / "manyforge_deployment/tools"
-    sys.path.insert(0, str(generator_dir))
-    # pylint: disable-next=import-outside-toplevel
-    from generate_maintained_deployment_occurrences import (
-        canonical_bytes,
-        revisioned_document,
-    )
-
-    document = revisioned_document(
-        {
-            "api_version": "manyforge.runtime_policy.v1",
-            "runtime_policy_id": "manyforge.runtime_motion.ur5e_lite6_wall",
-            "description": "Maintained native motion policy for ur5e_lite6_wall",
-            "interrupt_policy_ids": [],
-            "open_loop_grasp_acknowledgements": [],
-        },
-        domain="catalog-record-revision/runtime_policy",
-        api_version="manyforge.runtime_policy.v1",
-        revision_field="runtime_policy_revision",
-    )
-    payload = canonical_bytes(document)
-    lite6 = read_json(root / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml")
-    reference = catalog_reference_for_payload(
-        record_template(lite6, "runtime_policy"), document, payload
-    )
-    return document, payload, reference
 
 
 def arm_requirement(source: dict[str, Any], component_role: str) -> dict[str, Any]:
@@ -683,11 +621,9 @@ def main() -> int:
         raise GenerationError("revision tools are unavailable")
     with tempfile.TemporaryDirectory(prefix="manyforge-ui6i-dual-") as directory:
         temporary = Path(directory)
-        _, runtime_policy_bytes, runtime_policy_ref = build_runtime_policy(root)
         outputs = {
-            root / RUNTIME_POLICY_SOURCE: runtime_policy_bytes,
             root / DEPLOYMENT_SOURCE: sealed_deployment(
-                build_deployment(root, runtime_policy_ref=runtime_policy_ref),
+                build_deployment(root),
                 tool=deployment_tool,
                 temporary=temporary,
             ),

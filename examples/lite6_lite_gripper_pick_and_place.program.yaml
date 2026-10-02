@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:c7465c5e7d065976cf439daef4a4e6ae3292f37b8cd03fa9488c5ad3998f1910
+program_revision: sha256:6c6ae1c4beded8dc3611af2a7257b9bcbe6bd7e8a6089821e7c84c699db72f8e
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-
@@ -10,7 +10,7 @@ description: >-
   gripper commands, and carried-object attach/detach sequence.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.3.0
+  content_version: 2.4.0
 compatibility:
   lanes: [manyforge-only]
   assistant: forbidden

@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import logging
 import math
 from pathlib import Path
 from threading import Event, RLock
@@ -36,6 +37,16 @@ from manyforge_behavior.orchestration_ports import (
     NodeAdapterPorts,
     OwnerTaskPort,
     ProgramRunScopeState,
+)
+from manyforge_behavior.orchestration_values import (
+    ProgramValueError,
+    ProgramValueStore,
+    ProgramValueUncertainError,
+)
+from manyforge_behavior.program import (
+    BlackboardKeyDeclaration,
+    Program,
+    ProgramValidationError,
 )
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
@@ -89,10 +100,23 @@ from .models import (
     ProgramSelectionResumeRequest,
     ProgramSelectionStartRequest,
     ProgramManualHandoverRequest,
+    PersistentKeyValueResetRequest,
+    PersistentKeyValueSetRequest,
+    PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
     RuntimeOverrideStageRequest,
+)
+from .persistent_keys import (
+    OPERATOR_WRITABLE_ACCESS,
+    CommittedActivation,
+    PersistentKeyEdit,
+    PersistentKeyReconciliation,
+    PersistentKeyRegister,
+    PersistentKeyRegisterError,
+    PersistentKeyRegisterVersionError,
+    PersistentKeyStorageUncertainError,
 )
 from .runtime_controls import (
     ProgramRuntimeControlError,
@@ -102,7 +126,13 @@ from .runtime_controls import (
 from .diagnostics import ProgramDiagnosticPublisher
 
 
+_LOGGER = logging.getLogger(__name__)
 PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v1"
+PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v1"
+PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v1"
+PERSISTENT_KEY_RECONCILIATION_VERSION: Final = (
+    "manyforge.persistent_key_reconciliation.v1"
+)
 _MAX_INFLIGHT_COMMANDS: Final = 4_096
 
 
@@ -121,6 +151,41 @@ class ProgramRunnerError(RuntimeError):
         self.details = deepcopy(dict(details or {}))
 
 
+def _require_scenario_path(scenario_id: str, request: Any) -> None:
+    if request.scenario_id != scenario_id:
+        raise ProgramRunnerError(
+            "persistent_key_path_invalid",
+            "Scenario identity in path and body must match",
+        )
+
+
+def _persistent_storage_error(error: PersistentKeyRegisterError) -> ProgramRunnerError:
+    return ProgramRunnerError(
+        (
+            "persistent_key_storage_uncertain"
+            if isinstance(error, PersistentKeyStorageUncertainError)
+            else "persistent_key_storage_unavailable"
+        ),
+        str(error),
+    )
+
+
+def _validate_persistent_value(
+    program: Program, declaration: BlackboardKeyDeclaration, value: Any
+) -> None:
+    """Check one value exactly as a run's own write does: access, type,
+    fields, and pose frames and scene resources against the Program."""
+
+    store = ProgramValueStore(
+        program,
+        persistent_commit=lambda _declaration, _value, _metadata: None,
+    )
+    try:
+        store.write(declaration.key, value)
+    except ProgramValueError as error:
+        raise ProgramRunnerError("persistent_key_value_invalid", str(error)) from error
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramRunnerConfig:
     headless_url: str
@@ -135,6 +200,7 @@ class ProgramRunnerConfig:
     maximum_inflight_commands: int = _MAX_INFLIGHT_COMMANDS
     manager_liveness_socket: Path | None = None
     cell_id: str | None = None
+    persistent_key_register_path: Path | None = None
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.headless_url)
@@ -214,6 +280,11 @@ class ProgramRunnerConfig:
             )
         if liveness_enabled and not self.manager_liveness_socket.is_absolute():
             raise ValueError("Manager liveness socket must be a stable absolute path")
+        if (
+            self.persistent_key_register_path is not None
+            and not self.persistent_key_register_path.is_absolute()
+        ):
+            raise ValueError("persistent-key register must be a stable absolute path")
 
 
 @dataclass(slots=True)
@@ -250,6 +321,20 @@ class ProgramRuntime:
         self.config = config
         self.owner_id = config.owner_id
         self.owner_epoch = config.owner_epoch or f"program-runner-{uuid4().hex}"
+        # Opened first: a register this runner cannot read is refused by name
+        # before any other owner resource exists. It is never rewritten here.
+        try:
+            self._persistent_keys = (
+                None
+                if config.persistent_key_register_path is None
+                else PersistentKeyRegister(config.persistent_key_register_path)
+            )
+        except PersistentKeyRegisterVersionError as error:
+            raise ProgramRunnerError(error.code, str(error)) from error
+        except PersistentKeyRegisterError as error:
+            raise ProgramRunnerError(
+                "persistent_key_storage_unavailable", str(error)
+            ) from error
         self._admission = admission_client or (
             None
             if config.execution_run_root is None
@@ -355,6 +440,7 @@ class ProgramRuntime:
             program_run_scope=self._native.scope,
             program_run_context=CompositeProgramRunContextPort(*context_members),
             program_interventions=self._interventions,
+            persistent_keys=self._persistent_keys,
         )
         self._owner_availability = self._build_owner_availability()
         self._owner = ProgramRunOwner(
@@ -1932,13 +2018,18 @@ class ProgramRuntime:
                     node_attempt_id=node_attempt_id,
                     node_id=node_id,
                 )
+            # The TCP is measured relative to the moving robot's base frame,
+            # so the candidate is labelled with that frame, never with the
+            # authored goal's frame (which may be the cell or another frame).
             value = {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": parameters["target_role"],
+                    "frame_role": parameters["base_frame_role"],
+                },
                 "position_m": position_value,
                 "orientation": {"xyzw": orientation_value},
             }
-            authored_goal = parameters.get("goal")
-            if isinstance(authored_goal, Mapping) and "frame_ref" in authored_goal:
-                value["frame_ref"] = deepcopy(authored_goal["frame_ref"])
         if (
             not isinstance(observed.get("source_epoch"), str)
             or not observed["source_epoch"]
@@ -3045,6 +3136,18 @@ class ProgramRuntime:
                     execution_identity,
                     scene_admission_epoch=generation,
                 )
+                persistent_reconciliation: PersistentKeyReconciliation | None = None
+                if self._persistent_keys is not None:
+                    # Backstop for a committed Apply whose notification never
+                    # arrived; the claim excludes any Apply until the run ends.
+                    _activation, _program, persistent_reconciliation = (
+                        self._reconcile_persistent_keys(
+                            self._persistent_keys,
+                            expected_record_digest=applied_after_claim["source"][
+                                "record_digest"
+                            ],
+                        )
+                    )
                 self._kernel.register_program_run_capture(
                     {
                         "schema_version": "manyforge.program_run_execution_capture.v1",
@@ -3076,13 +3179,39 @@ class ProgramRuntime:
                     )
                 started_snapshot = snapshot.to_dict()
                 abort_if_stop_won()
-                with self._runtime_controls_lock:
-                    self._runtime_controls[snapshot.capture.program_run_id] = (
-                        ProgramRuntimeControls(
-                            snapshot.capture.to_dict(),
-                            recovery_fences=recovery_fences,
-                        )
+                controls = ProgramRuntimeControls(
+                    snapshot.capture.to_dict(),
+                    recovery_fences=recovery_fences,
+                )
+                if self._persistent_keys is not None:
+                    # Stored values dropped when this run's committed Program
+                    # no longer fits them are reported, never silent.
+                    dropped = (
+                        ()
+                        if persistent_reconciliation is None
+                        else persistent_reconciliation.dropped
                     )
+                    for notice in (*dropped, *self._persistent_keys.take_notices()):
+                        controls.audit_value(
+                            "persistent_key_value_dropped",
+                            scenario_id=notice.scenario_id,
+                            key=notice.key,
+                            reason=notice.reason,
+                            detail=notice.detail,
+                        )
+                    # A committed Apply of this Scenario that was never
+                    # observed: the values were kept, the defect is shown.
+                    for record_digest in self._persistent_keys.unobserved_applies(
+                        request.scenario_id
+                    ):
+                        controls.audit_value(
+                            "persistent_key_apply_not_observed",
+                            scenario_id=request.scenario_id,
+                            code="applied_program_not_observed",
+                            record_digest=record_digest,
+                        )
+                with self._runtime_controls_lock:
+                    self._runtime_controls[snapshot.capture.program_run_id] = controls
                 result = self._project_run(snapshot.to_dict())
                 capture = result.get("capture")
                 if not isinstance(capture, dict):
@@ -3645,6 +3774,515 @@ class ProgramRuntime:
 
         return self._control_effect(
             request, kind="runtime_blackboard_write", effect=effect
+        )
+
+    # Persistent blackboard values belong to a Scenario, not to one run. While
+    # a run of that Scenario is live its value store owns them, so edits go
+    # through it and stay serialized with node writes; otherwise they go to
+    # the register directly. Either way they are validated and audited, and
+    # admitted like runtime controls: the request identity is journaled while
+    # in flight, and once completed it is kept in the journal's bounded table
+    # of completed persistent-value requests, so a resend is refused by name
+    # and never applied again. A live run also fences the edit by the
+    # revision the operator saw; without a run the last admitted edit wins.
+
+    def _persistent_key_register(self) -> PersistentKeyRegister:
+        if self._closed or not self._started:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is not started"
+            )
+        if self._persistent_keys is None:
+            raise ProgramRunnerError(
+                "persistent_key_register_unavailable",
+                "Program runner has no persistent-key register",
+            )
+        return self._persistent_keys
+
+    def _committed_activation(self) -> tuple[CommittedActivation, Program | None]:
+        """Manager's committed Scenario activation, as Headless projects it."""
+
+        try:
+            projection = self._headless.committed_scenario_activation()
+        except HeadlessClientError as error:
+            raise ProgramRunnerError(
+                "persistent_key_activation_unavailable",
+                f"the committed Scenario activation is unavailable: {error}",
+            ) from error
+        program: Program | None = None
+        if projection["program"] is not None:
+            try:
+                program = Program.from_dict(
+                    deepcopy(projection["program"]), self._environment.catalog
+                )
+            except (KeyError, TypeError, ProgramValidationError) as error:
+                raise ProgramRunnerError(
+                    "persistent_key_program_unavailable",
+                    f"Applied Program cannot be read: {error}",
+                ) from error
+        try:
+            activation = CommittedActivation(
+                record_digest=projection["record_digest"],
+                scenario_id=projection["scenario_id"],
+                declarations={} if program is None else dict(program.blackboard_keys),
+                committed_applies={
+                    row["record_digest"]: row["scenario_id"]
+                    for row in projection["committed_applies"]
+                },
+            )
+        except PersistentKeyRegisterError as error:
+            raise ProgramRunnerError(
+                "persistent_key_activation_unavailable", str(error)
+            ) from error
+        return activation, program
+
+    def _reconcile_persistent_keys(
+        self,
+        register: PersistentKeyRegister,
+        *,
+        expected_record_digest: str | None = None,
+    ) -> tuple[CommittedActivation, Program | None, PersistentKeyReconciliation]:
+        """Make the register follow Manager's current committed activation."""
+
+        activation, program = self._committed_activation()
+        if (
+            expected_record_digest is not None
+            and activation.record_digest != expected_record_digest
+        ):
+            raise ProgramRunnerError(
+                "program_run_applied_selection_stale",
+                "the committed Scenario activation is not the admitted one",
+            )
+        try:
+            reconciliation = register.reconcile(activation)
+        except PersistentKeyRegisterError as error:
+            raise _persistent_storage_error(error) from error
+        for record_digest, scenario_id in reconciliation.unobserved:
+            # Kept values, but a notification path failed: find and fix it.
+            _LOGGER.warning(
+                "applied_program_not_observed: committed Apply %s of Scenario "
+                "%r reached the Program runner only through a later "
+                "reconciliation; stored values were kept",
+                record_digest,
+                scenario_id,
+            )
+        return activation, program, reconciliation
+
+    def reconcile_persistent_values(self) -> dict[str, Any]:
+        """Follow a committed Apply that Headless observed.
+
+        The notification carries nothing: the runner reads the committed
+        activation itself, so a repeated or late notification is a named
+        no-op and a lost one is caught by the next reconciliation.
+        """
+
+        register = self._persistent_key_register()
+        activation, _program, reconciliation = self._reconcile_persistent_keys(
+            register
+        )
+        return {
+            "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
+            "outcome": reconciliation.outcome,
+            "record_digest": activation.record_digest,
+            "scenario_id": activation.scenario_id,
+            "dropped": [
+                {
+                    "scenario_id": notice.scenario_id,
+                    "key": notice.key,
+                    "reason": notice.reason,
+                }
+                for notice in reconciliation.dropped
+            ],
+            "unobserved_applies": [
+                {"record_digest": digest, "scenario_id": scenario}
+                for digest, scenario in reconciliation.unobserved
+            ],
+            "history_changed": reconciliation.history_changed,
+        }
+
+    def _applied_persistent_keys(
+        self,
+        register: PersistentKeyRegister,
+        scenario_id: str,
+        *,
+        tolerate_storage_fault: bool = False,
+    ) -> tuple[
+        Program,
+        dict[str, BlackboardKeyDeclaration],
+        CommittedActivation,
+        dict[str, str] | None,
+    ]:
+        """The Scenario's committed Program, after reconciling stored values.
+
+        With ``tolerate_storage_fault`` a reconciliation that could not be
+        stored is returned as a fault instead of raised.
+        """
+
+        fault: dict[str, str] | None = None
+        try:
+            activation, program, _reconciliation = self._reconcile_persistent_keys(
+                register
+            )
+        except ProgramRunnerError as error:
+            if error.code not in {
+                "persistent_key_storage_unavailable",
+                "persistent_key_storage_uncertain",
+            }:
+                raise
+            if not tolerate_storage_fault:
+                # Whatever the reconciliation's durability, the caller's own
+                # change was not applied: a refusal, never an uncertain edit.
+                raise ProgramRunnerError(
+                    "persistent_key_storage_unavailable",
+                    f"stored values could not follow the committed Apply: {error}",
+                ) from error
+            fault = {"code": error.code, "message": str(error)}
+            activation, program = self._committed_activation()
+        if activation.scenario_id != scenario_id:
+            raise ProgramRunnerError(
+                "persistent_key_scenario_conflict",
+                f"Scenario {scenario_id!r} is not the Applied Scenario",
+            )
+        if program is None:
+            raise ProgramRunnerError(
+                "persistent_key_program_unavailable",
+                f"Applied Scenario {scenario_id!r} has no Program",
+            )
+        return (
+            program,
+            {
+                key: declaration
+                for key, declaration in sorted(program.blackboard_keys.items())
+                if declaration.persistence == "persistent"
+            },
+            activation,
+            fault,
+        )
+
+    def _live_run_id(self, scenario_id: str) -> str | None:
+        """The run whose value store currently holds this Scenario's values."""
+
+        snapshots, _truncated = self._owner.list_snapshots(
+            active_only=True, limit=self.config.maximum_retained_runs
+        )
+        for snapshot in snapshots:
+            capture = snapshot.to_dict()["capture"]
+            if capture["scenario_id"] == scenario_id:
+                return capture["program_run_id"]
+        return None
+
+    def _persistent_values(
+        self,
+        register: PersistentKeyRegister,
+        scenario_id: str,
+        program_revision: str,
+        declarations: Mapping[str, BlackboardKeyDeclaration],
+        activation: CommittedActivation,
+        storage_fault: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        # Read first: it never counts a change the values omit.
+        sequence = register.sequence
+        # Only values the register durably reconciled with this committed
+        # activation are shown, exactly those a run would restore; while a
+        # storage fault is unresolved, none are.
+        reconciled = storage_fault is None and register.activation == {
+            "record_digest": activation.record_digest,
+            "scenario_id": activation.scenario_id,
+        }
+        rows = register.values(scenario_id) if reconciled else {}
+        restorable = register.restore(scenario_id, declarations) if reconciled else {}
+        keys = []
+        for key, declaration in declarations.items():
+            row = rows.get(key) if key in restorable else None
+            keys.append(
+                {
+                    "key": key,
+                    "type": declaration.type,
+                    "access": declaration.access,
+                    "has_initial": declaration.has_initial,
+                    "initial": declaration.initial,
+                    "stored": row is not None,
+                    "value": None if row is None else row["value"],
+                    "sequence": None if row is None else row["sequence"],
+                }
+            )
+        return {
+            "schema_version": PERSISTENT_KEY_VALUES_VERSION,
+            "scenario_id": scenario_id,
+            "program_revision": program_revision,
+            "program_run_id": self._live_run_id(scenario_id),
+            "sequence": sequence,
+            "keys": keys,
+            "edits": register.edits(scenario_id),
+            "storage_fault": None if storage_fault is None else dict(storage_fault),
+            "apply_observation_fault": (
+                {
+                    "code": "applied_program_not_observed",
+                    "record_digests": list(unobserved),
+                }
+                if (unobserved := register.unobserved_applies(scenario_id))
+                else None
+            ),
+        }
+
+    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+        register = self._persistent_key_register()
+        program, declarations, activation, fault = self._applied_persistent_keys(
+            register, scenario_id, tolerate_storage_fault=True
+        )
+        return self._persistent_values(
+            register,
+            scenario_id,
+            program.program_revision,
+            declarations,
+            activation,
+            fault,
+        )
+
+    def set_persistent_value(
+        self, scenario_id: str, request: PersistentKeyValueSetRequest
+    ) -> dict[str, Any]:
+        return self._edit_persistent_value(scenario_id, request, action="set")
+
+    def reset_persistent_value(
+        self, scenario_id: str, request: PersistentKeyValueResetRequest
+    ) -> dict[str, Any]:
+        return self._edit_persistent_value(scenario_id, request, action="reset")
+
+    def _persistent_edit(
+        self,
+        request: Any,
+        *,
+        kind: str,
+        effect: Callable[[PersistentKeyRegister], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Admit one operator value edit like a runtime control (_control_effect)."""
+
+        register = self._persistent_key_register()
+        self._require_manager_current()
+        with self._transition_lock:
+            self._require_manager_current()
+            _admission, journal = self._require_cycle_owner()
+            try:
+                record = journal.record_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    kind=kind,
+                    intent=request.model_dump(mode="json"),
+                    cycle_generation=journal.read().cycle_generation,
+                )
+            except (ValueError, OverflowError) as error:
+                raise ProgramRunnerError(
+                    (
+                        "execution_control_ingress_busy"
+                        if isinstance(error, OverflowError)
+                        else "program_run_request_conflict"
+                    ),
+                    str(error),
+                ) from error
+            if record.disposition == "completed":
+                raise ProgramRunnerError(
+                    "persistent_key_request_replayed",
+                    f"request {request.request_id!r} was already applied; "
+                    "it is never applied again",
+                    details=record.result,
+                )
+            self._require_new_command(record)
+            try:
+                result = effect(register)
+            except ProgramRunnerError as error:
+                if error.code != "persistent_key_storage_uncertain":
+                    self._retain_rejection(
+                        journal,
+                        owner_epoch=request.request_owner_epoch,
+                        request_id=request.request_id,
+                        error=error,
+                    )
+                    raise
+                # Applied, only its durability is unknown: kept as completed,
+                # so a resend is refused like any applied request.
+                journal.complete_persistent_value_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    outcome="storage_uncertain",
+                )
+                raise
+            journal.complete_persistent_value_request(
+                owner_epoch=request.request_owner_epoch,
+                request_id=request.request_id,
+                outcome="applied",
+            )
+            return result
+
+    def _require_persistent_fence(self, scenario_id: str, request: Any) -> str | None:
+        """Return the live run the edit names, refusing one made on a stale view.
+
+        A live run fences the edit by its revision; without one the last
+        admitted edit wins.
+        """
+
+        program_run_id = self._live_run_id(scenario_id)
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "persistent_key_values_stale",
+                "the run holding these values changed; review them and try again",
+                details={
+                    "expected_program_run_id": request.program_run_id,
+                    "current_program_run_id": program_run_id,
+                },
+            )
+        if program_run_id is None:
+            return None
+        try:
+            live = self._owner.read(program_run_id)
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
+        if live.run_revision != request.expected_run_revision:
+            raise ProgramRunnerError(
+                "persistent_key_values_stale",
+                "Program run changed before the edit was admitted",
+                details={
+                    "expected_run_revision": request.expected_run_revision,
+                    "current_run_revision": live.run_revision,
+                },
+            )
+        return program_run_id
+
+    def _edit_persistent_value(
+        self,
+        scenario_id: str,
+        request: PersistentKeyValueResetRequest,
+        *,
+        action: str,
+    ) -> dict[str, Any]:
+        _require_scenario_path(scenario_id, request)
+
+        def effect(register: PersistentKeyRegister) -> dict[str, Any]:
+            program, declarations, activation, _fault = (
+                self._applied_persistent_keys(register, scenario_id)
+            )
+            program_revision = program.program_revision
+            if request.expected_program_revision != program_revision:
+                raise ProgramRunnerError(
+                    "persistent_key_program_stale",
+                    "Applied Program changed; review the key before editing it",
+                )
+            declaration = declarations.get(request.key)
+            if declaration is None:
+                raise ProgramRunnerError(
+                    "persistent_key_not_found",
+                    f"Applied Program declares no persistent key {request.key!r}",
+                )
+            if declaration.access not in OPERATOR_WRITABLE_ACCESS:
+                # Set, Reset and Clear are operator value changes; a key the
+                # Program declares read-only is changed only by the Program.
+                raise ProgramRunnerError(
+                    "persistent_key_access_conflict",
+                    f"blackboard key {request.key!r} is read-only for the operator",
+                )
+            if action == "set":
+                _validate_persistent_value(program, declaration, request.value)
+            program_run_id = self._require_persistent_fence(scenario_id, request)
+            if program_run_id is None:
+                edit = PersistentKeyEdit(request.request_id, request.source_label)
+                try:
+                    if action == "set":
+                        register.commit(
+                            scenario_id, declaration, request.value, edit=edit
+                        )
+                    else:
+                        register.remove(scenario_id, request.key, edit=edit)
+                except PersistentKeyRegisterError as error:
+                    raise _persistent_storage_error(error) from error
+            else:
+                controls = self._controls(program_run_id)
+                controls.require_event_revisions()
+                try:
+                    if action == "set":
+                        self._owner.write_runtime_blackboard(
+                            program_run_id,
+                            key=request.key,
+                            value=request.value,
+                            request_id=request.request_id,
+                        )
+                    else:
+                        self._owner.reset_runtime_blackboard(
+                            program_run_id,
+                            key=request.key,
+                            request_id=request.request_id,
+                        )
+                except ProgramRunOwnerError as error:
+                    if not isinstance(error.__cause__, ProgramValueUncertainError):
+                        raise ProgramRunnerError(
+                            "persistent_key_run_conflict",
+                            f"Program run {program_run_id} refused the edit: {error}",
+                        ) from error
+                    # The run shows the change: advance its revision as an
+                    # accepted edit would, then report the doubt.
+                    self._owner.note_runtime_control_change(program_run_id)
+                    self._notify_control_state_change()
+                    raise ProgramRunnerError(
+                        "persistent_key_storage_uncertain", str(error)
+                    ) from error
+                controls.audit_value(
+                    f"persistent_value_{'written' if action == 'set' else 'reset'}",
+                    key=request.key,
+                    request_id=request.request_id,
+                )
+                self._notify_control_state_change()
+            return {
+                "schema_version": PERSISTENT_KEY_EDIT_VERSION,
+                "request_id": request.request_id,
+                "action": action,
+                "key": request.key,
+                "values": self._persistent_values(
+                    register, scenario_id, program_revision, declarations, activation
+                ),
+            }
+
+        return self._persistent_edit(
+            request, kind=f"persistent_value_{action}", effect=effect
+        )
+
+    def clear_persistent_values(
+        self, scenario_id: str, request: PersistentKeyValuesClearRequest
+    ) -> dict[str, Any]:
+        """Reset every writable key of the Applied Scenario at once.
+
+        Exactly a Reset of each key the Applied Program declares writable:
+        read keys keep their stored values.
+        """
+
+        _require_scenario_path(scenario_id, request)
+
+        def effect(register: PersistentKeyRegister) -> dict[str, Any]:
+            _program, declarations, _activation, _fault = (
+                self._applied_persistent_keys(register, scenario_id)
+            )
+            program_run_id = self._live_run_id(scenario_id)
+            if program_run_id is not None:
+                raise ProgramRunnerError(
+                    "persistent_key_run_conflict",
+                    f"Program run {program_run_id} holds these values; "
+                    "reset keys one by one or clear after the run",
+                )
+            try:
+                removed = register.clear(
+                    scenario_id,
+                    declarations,
+                    edit=PersistentKeyEdit(request.request_id, request.source_label),
+                )
+            except PersistentKeyRegisterError as error:
+                raise _persistent_storage_error(error) from error
+            return {
+                "schema_version": PERSISTENT_KEY_EDIT_VERSION,
+                "request_id": request.request_id,
+                "action": "clear",
+                "scenario_id": scenario_id,
+                "removed": removed,
+            }
+
+        return self._persistent_edit(
+            request, kind="persistent_values_clear", effect=effect
         )
 
     def stage_manual_result(
@@ -5507,6 +6145,8 @@ class ProgramRuntime:
 
 
 __all__ = [
+    "PERSISTENT_KEY_EDIT_VERSION",
+    "PERSISTENT_KEY_VALUES_VERSION",
     "PROGRAM_RUN_INDEX_VERSION",
     "ProgramRunnerConfig",
     "ProgramRunnerError",

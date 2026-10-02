@@ -255,7 +255,9 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
                 limit["max_jerk_rad_s3"], f"{limit_label}.max_jerk_rad_s3"
             )
         normalized_limits.append(normalized_limit)
-    normalized_limits.sort(key=lambda row: row["source_joint_name"])
+    # Keep authored order.  The Deployment compiler pairs each row with the
+    # arm resource of its source joint by name and refuses rows that miss,
+    # repeat, or name a joint the model's arm does not have.
     result: dict[str, Any] = {
         "stop_mode": mode,
         "allow_natural_completion_on_short_path": natural,

@@ -34,7 +34,6 @@
 #include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
 #include "embedded_ros2_control_execution_runtime_configuration_schema.hpp"
-#include "embedded_runtime_policy_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
 #include "embedded_stop_evidence_policy_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -1908,7 +1907,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
     std::string_view relative_path;
     std::string_view descriptor_yaml;
   };
-  const std::array<QualifiedCatalogSchemaSource, 11U> qualified_sources{{
+  const std::array<QualifiedCatalogSchemaSource, 10U> qualified_sources{{
       {core::CatalogRecordKind::kCapabilityDefinition,
        "catalog/manyforge.capability_definition.v1.yaml",
        detail::kEmbeddedCapabilityDefinitionSchema},
@@ -1936,9 +1935,6 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
       {core::CatalogRecordKind::kRuntimeProfile,
        "catalog/manyforge.runtime_profile.v1.yaml",
        detail::kEmbeddedRuntimeProfileSchema},
-      {core::CatalogRecordKind::kRuntimePolicy,
-       "catalog/manyforge.runtime_policy.v1.yaml",
-       detail::kEmbeddedRuntimePolicySchema},
       {core::CatalogRecordKind::kStopEvidencePolicy,
        "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},

@@ -331,7 +331,6 @@ private:
 
 struct QualifiedIndexes final {
   std::map<PairKey, const QualifiedRuntimeProfile *> runtime_profiles;
-  std::map<PairKey, const QualifiedRuntimePolicy *> runtime_policies;
   std::map<PairKey, const QualifiedContactPolicy *> contact_policies;
   std::map<PairKey, const QualifiedCommandSchema *> command_schemas;
   std::map<PairKey, const QualifiedCapabilityDefinition *>
@@ -341,7 +340,6 @@ struct QualifiedIndexes final {
   std::map<PairKey, const QualifiedProviderManifest *> manifests;
   std::map<PairKey, const QualifiedStopEvidencePolicy *> stop_policies;
   std::set<PairKey> required_runtime_profiles;
-  std::set<PairKey> required_runtime_policies;
   std::set<PairKey> required_contact_policies;
   std::set<PairKey> required_capability_definitions;
   std::set<PairKey> required_contracts;
@@ -354,7 +352,6 @@ struct QualifiedIndexes final {
     const CompositionQualifiedCellIr &composition,
     const RevisionVerifiedDeploymentApplicabilityInputs &deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
-    std::span<const QualifiedRuntimePolicy> runtime_policies,
     std::span<const QualifiedContactPolicy> contact_policies,
     std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
@@ -370,13 +367,6 @@ struct QualifiedIndexes final {
                             value.value().runtime_profile_revision);
           },
           "runtime-profile closure"),
-      index_exact_span(
-          runtime_policies,
-          [](const auto &value) {
-            return pair_key(value.value().runtime_policy_id,
-                            value.value().runtime_policy_revision);
-          },
-          "runtime-policy closure"),
       index_exact_span(
           contact_policies,
           [](const auto &value) {
@@ -433,7 +423,6 @@ struct QualifiedIndexes final {
       {},
       {},
       {},
-      {},
   };
 
   const auto &graph = composition.graph();
@@ -441,7 +430,6 @@ struct QualifiedIndexes final {
     result.required_runtime_profiles.insert(
         pair_key(runtime.runtime_profile_id, runtime.runtime_profile_revision));
   }
-  std::size_t selected_runtime_policy_count = 0U;
   for (const auto &retained_policy :
        deployment_inputs.value().retained_policy_records) {
     std::visit(
@@ -449,24 +437,8 @@ struct QualifiedIndexes final {
           using Reference = std::remove_cvref_t<decltype(typed_reference)>;
           const PairKey key = pair_key(typed_reference.record_id,
                                        typed_reference.record_revision);
-          if constexpr (std::is_same_v<
-                            Reference,
-                            core::RuntimePolicyCatalogRecordRefDTO>) {
-            ++selected_runtime_policy_count;
-            if (selected_runtime_policy_count > 1U) {
-              fail("v1 retained applicability selects more than one runtime "
-                   "policy without a closed selector");
-            }
-            const auto selected = result.runtime_policies.find(key);
-            if (selected == result.runtime_policies.end() ||
-                selected->second->reference() != typed_reference) {
-              fail("retained runtime-policy reference is absent or differs "
-                   "from the exact qualified referent");
-            }
-            result.required_runtime_policies.insert(key);
-          } else if constexpr (std::is_same_v<
-                                   Reference,
-                                   core::ContactPolicyCatalogRecordRefDTO>) {
+          if constexpr (std::is_same_v<Reference,
+                                       core::ContactPolicyCatalogRecordRefDTO>) {
             const auto selected = result.contact_policies.find(key);
             if (selected == result.contact_policies.end() ||
                 selected->second->reference() != typed_reference) {
@@ -538,9 +510,6 @@ struct QualifiedIndexes final {
   require_exact_closure(result.runtime_profiles,
                         result.required_runtime_profiles,
                         "runtime-profile closure");
-  require_exact_closure(result.runtime_policies,
-                        result.required_runtime_policies,
-                        "runtime-policy closure");
   require_exact_closure(result.contact_policies,
                         result.required_contact_policies,
                         "contact-policy closure");
@@ -582,27 +551,6 @@ struct QualifiedIndexes final {
                         "control-interface-contract closure");
   require_exact_closure(result.stop_policies, result.required_stop_policies,
                         "Stop-policy closure");
-
-  const auto require_exact_target = [&](const auto &scoped) {
-    const auto target = std::find_if(
-        composition.targets().begin(), composition.targets().end(),
-        [&](const CompositionTargetResolution &candidate) {
-          return candidate.controllable_component_id ==
-                     scoped.controllable_component_id &&
-                 candidate.command_target_id == scoped.command_target_id;
-        });
-    if (target == composition.targets().end()) {
-      fail("runtime policy references a command target absent from the exact "
-           "composed cell");
-    }
-  };
-  for (const auto &key : result.required_runtime_policies) {
-    const auto &policy = result.runtime_policies.at(key)->value();
-    for (const auto &acknowledgement :
-         policy.open_loop_grasp_acknowledgements) {
-      require_exact_target(acknowledgement);
-    }
-  }
   return result;
 }
 
@@ -3146,7 +3094,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
     const CompositionQualifiedCellIr &composition,
     const RevisionVerifiedDeploymentApplicabilityInputs &deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
-    std::span<const QualifiedRuntimePolicy> runtime_policies,
     std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract>
@@ -3163,8 +3110,8 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       qualify_assistant_settings(deployment_inputs.assistant_settings(),
                                  deployment_inputs.value().external_resources);
   const auto indexes = build_qualified_indexes(
-      composition, deployment_inputs, runtime_profiles, runtime_policies,
-      contact_policies, command_schemas, capability_definitions,
+      composition, deployment_inputs, runtime_profiles, contact_policies,
+      command_schemas, capability_definitions,
       control_interface_contracts, controller_topologies, provider_manifests,
       stop_evidence_policies);
   const auto selected_overlay = qualify_selected_overlay(
@@ -3240,8 +3187,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       composition, deployment_inputs, selected_overlay, assistant_settings,
       copy_closure_in_key_order<QualifiedRuntimeProfile>(
           indexes.runtime_profiles, indexes.required_runtime_profiles),
-      copy_closure_in_key_order<QualifiedRuntimePolicy>(
-          indexes.runtime_policies, indexes.required_runtime_policies),
       copy_closure_in_key_order<QualifiedContactPolicy>(
           indexes.contact_policies, indexes.required_contact_policies),
       copy_index_in_key_order<QualifiedCommandSchema>(indexes.command_schemas),

@@ -397,7 +397,7 @@
     { key: 'control_flow', label: 'Control flow', sample: ['sequence', 'Sequence', 'composite'] },
     { key: 'motion', label: 'Motion', sample: ['motion.move_to_pose', 'Move to pose', 'leaf'] },
     { key: 'recovery', label: 'Operation control', sample: ['kernel.stop_operation', 'Stop operation', 'leaf'] },
-    { key: 'logic', label: 'Logic', sample: ['logic.check_bool', 'Check boolean', 'leaf'] },
+    { key: 'logic', label: 'Logic', sample: ['logic.check_condition', 'Check condition', 'leaf'] },
     { key: 'scene', label: 'Scene', sample: ['scene.add_object', 'Add scene object', 'leaf'] },
     { key: 'assistant', label: 'Assistant', sample: ['assistant.query_model', 'Query model', 'leaf'] },
     { key: 'gripper', label: 'Gripper', sample: ['gripper.command_position', 'Command gripper position', 'leaf'] },
@@ -916,7 +916,7 @@
     ['control_flow', 'Control flow', [['sequence', 'Sequence', 'composite', 'ok'], ['fallback', 'Fallback', 'composite', 'ok'], ['parallel', 'Parallel', 'composite', 'ok'], ['inverter', 'Inverter', 'decorator', 'ok'], ['repeat', 'Repeat', 'decorator', 'ok'], ['retry', 'Retry', 'decorator', 'ok'], ['timer', 'Timer', 'leaf', 'warn']]],
     ['motion', 'Motion', [['motion.move_to_joint_target', 'Move to joint target', 'leaf', 'ok'], ['motion.move_to_pose', 'Move to pose', 'leaf', 'ok', 'hover'], ['motion.follow_cartesian_path', 'Follow Cartesian path', 'leaf', 'ok'], ['motion.move_until_signal', 'Move until signal', 'leaf', 'ok']]],
     ['gripper', 'Gripper', [['gripper.command_position', 'Command gripper position', 'leaf', 'ok'], ['gripper.check_status', 'Check gripper status', 'leaf', 'ok'], ['gripper.wait_for_status', 'Wait for gripper status', 'leaf', 'ok']]],
-    ['logic', 'Logic', [['logic.check_bool', 'Check boolean', 'leaf', 'ok'], ['logic.set_bool', 'Set boolean', 'leaf', 'ok']]],
+    ['logic', 'Logic', [['logic.check_condition', 'Check condition', 'leaf', 'ok'], ['logic.set_value', 'Set value', 'leaf', 'ok']]],
     ['recovery', 'Operation control', [['kernel.stop_operation', 'Stop operation', 'leaf', 'ok'], ['kernel.full_stop', 'Full Stop', 'leaf', 'ok'], ['kernel.pause_operation', 'Pause operation', 'leaf', 'ok'], ['kernel.resume_operation', 'Resume operation', 'leaf', 'ok'], ['kernel.reset_operation', 'Reset operation', 'leaf', 'ok'], ['recovery.apply_offered_action', 'Apply offered recovery', 'leaf', 'ok']]],
     ['scene', 'Scene', null],
   ];

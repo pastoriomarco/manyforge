@@ -121,6 +121,18 @@ def _run(command: Sequence[str], *, cwd: Path | None = None) -> None:
         )
 
 
+def _persistent_key_register_path() -> Path:
+    """Installation state beside the Composer settings, owned by the runner."""
+
+    state_dir = os.environ.get("MANYFORGE_STATE_DIR", "").strip()
+    if not state_dir or not Path(state_dir).is_absolute():
+        raise WorkbenchError(
+            "MANYFORGE_STATE_DIR must name the persistent installation state "
+            "directory (scripts/compose-dev.sh sets it)"
+        )
+    return Path(state_dir) / "program-runner" / "persistent-keys.json"
+
+
 def _build_jobs() -> str:
     jobs = os.environ.get("MANYFORGE_DEV_BUILD_JOBS", "").strip()
     if not jobs:
@@ -601,6 +613,8 @@ class Workbench:
                 cell_id,
                 "--owner-id",
                 "program-runner.development-workbench",
+                "--persistent-key-register-path",
+                str(_persistent_key_register_path()),
             ),
         )
         self._spawn(

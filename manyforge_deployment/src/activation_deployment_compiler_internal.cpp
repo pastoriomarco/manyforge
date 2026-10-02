@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iomanip>
 #include <map>
 #include <set>
@@ -237,6 +238,16 @@ source_joints(const ActivationComponentProfile &profile,
   return std::string(component) + "." + std::string(target) + ".control";
 }
 
+// The resource of the index-th source joint of a target's resource role.
+[[nodiscard]] std::string coordinate_resource_id(std::string_view component,
+                                                 std::string_view target,
+                                                 std::size_t index) {
+  std::ostringstream suffix;
+  suffix << std::setw(6) << std::setfill('0') << index;
+  return std::string(component) + "." + std::string(target) + ".coordinate." +
+         suffix.str();
+}
+
 [[nodiscard]] CanonicalValue resource_bindings(
     std::string_view component, std::string_view target,
     const ActivationComponentProfile &profile) {
@@ -244,12 +255,9 @@ source_joints(const ActivationComponentProfile &profile,
   const auto joints = source_joints(profile, role);
   Array result;
   for (std::size_t index = 0; index < joints.size(); ++index) {
-    std::ostringstream suffix;
-    suffix << std::setw(6) << std::setfill('0') << index;
     result.emplace_back(Object{
         {"resource_role_id", CanonicalValue(role)},
-        {"resource_id", CanonicalValue(std::string(component) + "." +
-                                         std::string(target) + ".coordinate." + suffix.str())},
+        {"resource_id", CanonicalValue(coordinate_resource_id(component, target, index))},
     });
   }
   if (result.empty() && target == "gripper") {
@@ -498,8 +506,7 @@ CanonicalValue compile_activation_deployment(
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
-    const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
-    const core::RuntimePolicyCatalogRecordRefDTO &runtime_policy) {
+    const std::vector<QualifiedRuntimeProfile> &runtime_profiles) {
   if (intent.components.size() != component_profiles.size() ||
       intent.components.size() != prepared_models.size()) {
     fail("component/profile/model joins differ in size");
@@ -508,11 +515,6 @@ CanonicalValue compile_activation_deployment(
     fail("component attachments are not yet supported by the authored compiler");
   }
   CatalogSelection catalog(catalog_records);
-  const auto &policy_ref = catalog.require(core::CatalogRecordKind::kRuntimePolicy,
-                                           runtime_policy.record_id.value());
-  if (policy_ref != core::CatalogRecordRefDTO(runtime_policy)) {
-    fail("selected runtime policy differs from the prepared referent");
-  }
   const auto &runtime_ref = catalog.require(
       core::CatalogRecordKind::kRuntimeProfile,
       "manyforge.native_execution_runtime");
@@ -773,24 +775,66 @@ CanonicalValue compile_activation_deployment(
         if (target == "arm") {
           const auto &settings = member(component.target_settings, "arm", "target settings");
           const auto &controlled = member(settings, "controlled_stop", "arm settings");
+          // Authored rows name their source joint; pair them with the arm
+          // resources by that name, never by row position.
+          const auto joints = source_joints(profile, "arm_joints");
+          std::map<std::string, const CanonicalValue *, std::less<>> limit_by_joint;
+          for (const auto &row : array(member(controlled, "per_joint_limits", "controlled stop"),
+                                       "per_joint_limits")) {
+            const auto *name = row.find_object_member("source_joint_name");
+            if (name == nullptr) fail("controlled Stop limit row lacks source_joint_name");
+            const auto &joint = text(*name, "source_joint_name");
+            if (joint.empty()) fail("controlled Stop limit row lacks source_joint_name");
+            if (std::find(joints.begin(), joints.end(), joint) == joints.end()) {
+              fail("controlled Stop limits name unknown arm joint " + joint);
+            }
+            if (!limit_by_joint.emplace(joint, &row).second) {
+              fail("controlled Stop limits repeat joint " + joint);
+            }
+          }
           Array resource_limits;
-          const auto resources = array(member(binding, "resource_bindings", "binding"),
-                                       "resource bindings");
-          const auto joints = array(member(controlled, "per_joint_limits", "controlled stop"),
-                                    "per_joint_limits");
-          if (resources.size() != joints.size()) fail("controlled Stop limits do not cover arm resources");
-          for (std::size_t joint = 0; joint < joints.size(); ++joint) {
-            resource_limits.emplace_back(Object{
-                {"resource_id", member(resources[joint], "resource_id", "resource")},
+          for (const auto &resource : array(member(binding, "resource_bindings", "binding"),
+                                            "resource bindings")) {
+            const auto &resource_id = text(member(resource, "resource_id", "resource"),
+                                           "resource_id");
+            std::size_t index = 0;
+            while (index < joints.size() &&
+                   coordinate_resource_id(component.component_id, target, index) != resource_id) {
+              ++index;
+            }
+            if (index == joints.size()) fail("arm resource " + resource_id + " has no source joint");
+            const auto found = limit_by_joint.find(joints[index]);
+            if (found == limit_by_joint.end()) {
+              fail("controlled Stop limits miss joint " + joints[index]);
+            }
+            const auto &limit = *found->second;
+            Object resource_limit{
+                {"resource_id", CanonicalValue(resource_id)},
                 {"max_deceleration", CanonicalValue(Object{
                     {"coordinate_kind", CanonicalValue("angular_rad_s2")},
-                    {"value_rad_s2", member(joints[joint], "max_deceleration_rad_s2", "limit")},
+                    {"value_rad_s2", member(limit, "max_deceleration_rad_s2", "limit")},
                 })},
                 {"settle_velocity_threshold", CanonicalValue(Object{
                     {"coordinate_kind", CanonicalValue("angular_rad_s")},
-                    {"value_rad_s", member(joints[joint], "settle_velocity_threshold_rad_s", "limit")},
+                    {"value_rad_s", member(limit, "settle_velocity_threshold_rad_s", "limit")},
                 })},
-            });
+            };
+            // An authored jerk limit replaces the derived preset for this
+            // joint; it is never dropped. Rows without it compile unchanged.
+            if (const auto *jerk = limit.find_object_member("max_jerk_rad_s3");
+                jerk != nullptr) {
+              const auto *value = std::get_if<double>(&jerk->storage());
+              if (value == nullptr || !std::isfinite(*value) || *value <= 0.0) {
+                fail("controlled Stop max_jerk_rad_s3 for joint " + joints[index] +
+                     " must be a finite positive number");
+              }
+              resource_limit.emplace_back(
+                  "max_jerk", CanonicalValue(Object{
+                                  {"coordinate_kind", CanonicalValue("angular_rad_s3")},
+                                  {"value_rad_s3", CanonicalValue(*value)},
+                              }));
+            }
+            resource_limits.emplace_back(std::move(resource_limit));
           }
           stage("motion_controlled_stop", false, CanonicalValue(Object{
               {"stop_mode", member(controlled, "stop_mode", "controlled stop")},
@@ -858,8 +902,7 @@ CanonicalValue compile_activation_deployment(
   std::sort(stop_timing.begin(), stop_timing.end(), by("control_binding_id"));
 
   Object policies{
-      {"retained_policy_records",
-       CanonicalValue(Array{catalog_value(policy_ref)})},
+      {"retained_policy_records", CanonicalValue(Array{})},
       {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
       {"stop_timing_parameters", CanonicalValue(std::move(stop_timing))},
       {"commissioned_stop_interfaces", CanonicalValue(Array{})},

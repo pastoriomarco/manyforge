@@ -3,6 +3,7 @@ import { Euler, Quaternion } from 'three';
 import type { ProgramBindingDocument } from '../types/api';
 import {
   boundProgramTargetRoleIds,
+  canonicalProgramPose,
   computeCartesianMoveDraft,
   cartesianMoveOffsetsFromTarget,
   resolveStoredProgramPose,
@@ -122,6 +123,17 @@ describe('stored Move To sources', () => {
     expect(resolveStoredProgramPose({
       goal: { ...goal, frame_ref: { ...goal.frame_ref, target_role: 'other' } },
     }, context)).toBeNull();
+  });
+
+  it('reads stored RPY with the backend intrinsic ZYX convention', () => {
+    // Backend geometry.rpy_deg_to_xyzw([90, 0, 90]) = [0.5, 0.5, 0.5, 0.5].
+    const pose = canonicalProgramPose({
+      position_m: [0, 0, 0],
+      orientation: { rpy_deg: [90, 0, 90] },
+    });
+    for (const [index, expected] of [0.5, 0.5, 0.5, 0.5].entries()) {
+      expect(pose?.quaternion[index]).toBeCloseTo(expected);
+    }
   });
 
   it('resolves relative scene goals using the explicit offset-reference axes', () => {

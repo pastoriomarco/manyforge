@@ -10,7 +10,6 @@
 #include <manyforge_core/types/controller_topology.hpp>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_core/types/provider_manifest.hpp>
-#include <manyforge_core/types/runtime_policy.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
@@ -380,73 +379,6 @@ void register_catalog_record_bindings(py::module_& module) {
 
   module.attr("RUNTIME_PROFILE_API_VERSION") = std::string(kRuntimeProfileApiVersion);
   module.attr("MAX_RUNTIME_PROFILE_ROLE_IDS") = kMaxRuntimeProfileRoleIds;
-
-  py::enum_<OpenLoopGraspEnvironmentDTO>(module, "OpenLoopGraspEnvironmentDTO")
-      .value("kSimulation", OpenLoopGraspEnvironmentDTO::kSimulation)
-      .value("kCommissionedHardware", OpenLoopGraspEnvironmentDTO::kCommissionedHardware);
-
-  py::class_<RuntimeOpenLoopGraspAcknowledgementDTO>(
-      module, "RuntimeOpenLoopGraspAcknowledgementDTO", py::is_final())
-      .def(py::init([](ControllableComponentId controllable_component_id,
-                       CommandTargetId command_target_id, OpenLoopGraspEnvironmentDTO environment,
-                       bool allowed) {
-             return RuntimeOpenLoopGraspAcknowledgementDTO{std::move(controllable_component_id),
-                                                           std::move(command_target_id),
-                                                           environment, allowed};
-           }),
-           py::arg("controllable_component_id"), py::arg("command_target_id"),
-           py::arg("environment"), py::arg("allowed"))
-      .def_readonly("controllable_component_id",
-                    &RuntimeOpenLoopGraspAcknowledgementDTO::controllable_component_id)
-      .def_readonly("command_target_id", &RuntimeOpenLoopGraspAcknowledgementDTO::command_target_id)
-      .def_readonly("environment", &RuntimeOpenLoopGraspAcknowledgementDTO::environment)
-      .def_readonly("allowed", &RuntimeOpenLoopGraspAcknowledgementDTO::allowed)
-      .def(
-          "__eq__",
-          [](const RuntimeOpenLoopGraspAcknowledgementDTO& lhs,
-             const RuntimeOpenLoopGraspAcknowledgementDTO& rhs) { return lhs == rhs; },
-          py::is_operator())
-      .def(
-          "__ne__",
-          [](const RuntimeOpenLoopGraspAcknowledgementDTO& lhs,
-             const RuntimeOpenLoopGraspAcknowledgementDTO& rhs) { return lhs != rhs; },
-          py::is_operator());
-
-  py::class_<RuntimePolicyDTO>(module, "RuntimePolicyDTO", py::is_final())
-      .def(py::init([](RuntimePolicyId runtime_policy_id,
-                       RuntimePolicyRevision runtime_policy_revision,
-                       std::optional<std::string> description,
-                       std::vector<InterruptPolicyId> interrupt_policy_ids,
-                       std::vector<RuntimeOpenLoopGraspAcknowledgementDTO>
-                           open_loop_grasp_acknowledgements) {
-             return RuntimePolicyDTO{
-                 std::move(runtime_policy_id),   std::move(runtime_policy_revision),
-                 std::move(description),         std::move(interrupt_policy_ids),
-                 std::move(open_loop_grasp_acknowledgements)};
-           }),
-           py::arg("runtime_policy_id"), py::arg("runtime_policy_revision"),
-           py::arg("description") = std::nullopt,
-           py::arg("interrupt_policy_ids") = std::vector<InterruptPolicyId>{},
-           py::arg("open_loop_grasp_acknowledgements") =
-               std::vector<RuntimeOpenLoopGraspAcknowledgementDTO>{})
-      .def_readonly("runtime_policy_id", &RuntimePolicyDTO::runtime_policy_id)
-      .def_readonly("runtime_policy_revision", &RuntimePolicyDTO::runtime_policy_revision)
-      .def_readonly("description", &RuntimePolicyDTO::description)
-      .def_readonly("interrupt_policy_ids", &RuntimePolicyDTO::interrupt_policy_ids)
-      .def_readonly("open_loop_grasp_acknowledgements",
-                    &RuntimePolicyDTO::open_loop_grasp_acknowledgements)
-      .def(
-          "__eq__",
-          [](const RuntimePolicyDTO& lhs, const RuntimePolicyDTO& rhs) { return lhs == rhs; },
-          py::is_operator())
-      .def(
-          "__ne__",
-          [](const RuntimePolicyDTO& lhs, const RuntimePolicyDTO& rhs) { return lhs != rhs; },
-          py::is_operator());
-
-  module.attr("RUNTIME_POLICY_API_VERSION") = std::string(kRuntimePolicyApiVersion);
-  module.attr("MAX_RUNTIME_POLICY_RULES") = kMaxRuntimePolicyRules;
-  module.attr("MAX_RUNTIME_POLICY_DESCRIPTION_BYTES") = kMaxRuntimePolicyDescriptionBytes;
 
   py::class_<CapabilityDefinitionDTO>(module, "CapabilityDefinitionDTO", py::is_final())
       .def(py::init([](CapabilityId capability_id, CapabilityDefinitionRevision revision,
@@ -1247,8 +1179,7 @@ void register_catalog_record_bindings(py::module_& module) {
       .value("kCommandSchema", CatalogRecordKind::kCommandSchema)
       .value("kCapabilityDefinition", CatalogRecordKind::kCapabilityDefinition)
       .value("kContactPolicy", CatalogRecordKind::kContactPolicy)
-      .value("kStopEvidencePolicy", CatalogRecordKind::kStopEvidencePolicy)
-      .value("kRuntimePolicy", CatalogRecordKind::kRuntimePolicy);
+      .value("kStopEvidencePolicy", CatalogRecordKind::kStopEvidencePolicy);
 
   py::class_<CatalogRecordTypeDescriptor>(module, "CatalogRecordTypeDescriptor", py::is_final())
       .def_readonly("record_kind", &CatalogRecordTypeDescriptor::record_kind)
@@ -1300,10 +1231,8 @@ void register_catalog_record_bindings(py::module_& module) {
                                                             "ContactPolicyCatalogRecordRefDTO");
   bind_catalog_record_ref<StopEvidencePolicyCatalogRecordRefDTO>(
       module, "StopEvidencePolicyCatalogRecordRefDTO");
-  bind_catalog_record_ref<RuntimePolicyCatalogRecordRefDTO>(module,
-                                                            "RuntimePolicyCatalogRecordRefDTO");
 
-  constexpr std::array<const char*, 11> kRecordRefTypeNames{{
+  constexpr std::array<const char*, 10> kRecordRefTypeNames{{
       "ModelAssetCatalogRecordRefDTO",
       "RuntimeProfileCatalogRecordRefDTO",
       "ComponentTypeCatalogRecordRefDTO",
@@ -1314,7 +1243,6 @@ void register_catalog_record_bindings(py::module_& module) {
       "CapabilityDefinitionCatalogRecordRefDTO",
       "ContactPolicyCatalogRecordRefDTO",
       "StopEvidencePolicyCatalogRecordRefDTO",
-      "RuntimePolicyCatalogRecordRefDTO",
   }};
   py::tuple record_ref_types{kRecordRefTypeNames.size()};
   for (std::size_t index = 0; index < kRecordRefTypeNames.size(); ++index) {
@@ -1351,7 +1279,6 @@ void register_catalog_record_bindings(py::module_& module) {
   bind_catalog_record_ref_helpers<CapabilityDefinitionCatalogRecordRefDTO>(module);
   bind_catalog_record_ref_helpers<ContactPolicyCatalogRecordRefDTO>(module);
   bind_catalog_record_ref_helpers<StopEvidencePolicyCatalogRecordRefDTO>(module);
-  bind_catalog_record_ref_helpers<RuntimePolicyCatalogRecordRefDTO>(module);
 }
 
 }  // namespace manyforge::core::python

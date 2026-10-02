@@ -5,15 +5,21 @@ from types import SimpleNamespace
 import py_trees
 import pytest
 
+from manyforge_behavior.nodes.stop_policy import (
+    OperatorMotionStopSnapshot,
+    OperatorMotionStopState,
+)
 from manyforge_behavior.nodes.v2_owner import GripperStatusWaitAdapter
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
 )
+from manyforge_behavior.program_clock import ProgramClock
 
 
-def _waiter():
-    clock = [10.0]
+def _waiter(clock=None, program_clock=None, timeout_while_held="pause", **adapter_options):
+    clock = clock or [10.0]
+    program_clock = program_clock or ProgramClock(lambda: clock[0])
     scope = (7, 2, "source", "revision", "provider.1", "route.1", 3)
     calls = []
     port = SimpleNamespace(
@@ -33,6 +39,8 @@ def _waiter():
         "target_role": "gripper",
         "expected_state": "grasp_confirmed",
         "timeout_s": 1.0,
+        # The resolver supplies the catalog default `pause` when omitted.
+        "timeout_while_held": timeout_while_held,
     }
     node = GripperStatusWaitAdapter(
         name="wait",
@@ -47,11 +55,12 @@ def _waiter():
             snapshot=lambda **_: SimpleNamespace(
                 parameters=parameters,
                 blackboard={},
-                embedded_values={},
             )
         ),
         port=port,
-        clock=lambda: clock[0],
+        program_clock=program_clock,
+        cancellable=True,
+        **adapter_options,
     )
     return node, clock, port, calls, scope
 
@@ -119,5 +128,97 @@ def test_slow_read_cannot_report_late_success():
         return OwnerInvocationResult(True, metadata={"command_scope": scope})
 
     port.invoke = invoke
+    node.tick_once()
+    assert node.failure_reason_code == "gripper_wait_timeout"
+
+
+def test_stopping_a_running_wait_reports_interrupted_never_failure():
+    node, _, _, calls, _ = _waiter()
+    node.tick_once()
+    assert node.status is py_trees.common.Status.RUNNING
+
+    node.stop(py_trees.common.Status.INVALID)  # Program Stop, Reset or cancel.
+
+    assert node.outcome == "interrupted"
+    assert node.presented_interrupted
+    assert node.interrupted_reason_code == "program_node_interrupted"
+    assert node.failure_reason_code is None
+    assert len(calls) == 1  # Read-only: nothing to cancel at the owner.
+    node.tick_once()  # A fresh attempt starts clean.
+    assert node.outcome is None and node.interrupted_reason_code is None
+
+
+def test_a_finished_wait_is_not_reinterpreted_as_interrupted():
+    node, _, port, _, scope = _waiter()
+    port.result = OwnerInvocationResult(True, metadata={"command_scope": scope})
+    node.tick_once()
+    node.stop(py_trees.common.Status.INVALID)
+    assert node.outcome is None
+    assert node.interrupted_reason_code is None
+
+
+def _held_waiter(timeout_while_held):
+    clock = [10.0]
+    program_clock = ProgramClock(lambda: clock[0])
+    state = OperatorMotionStopState({"wait": ()}, clock=program_clock.now)
+    node, clock, _, _, _ = _waiter(
+        clock,
+        program_clock,
+        timeout_while_held,
+        operator_stop_state=state,
+        operator_stop_hold_scope="wait",
+    )
+    return node, clock, state, program_clock
+
+
+def test_operator_stop_hold_does_not_turn_into_a_timeout_failure():
+    node, clock, state, _ = _held_waiter("pause")
+    node.tick_once()
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"wait"})))
+    clock[0] += 5.0  # Held well past the 1 s timeout; the hold stops ticks.
+    state.publish(OperatorMotionStopSnapshot(2, frozenset()))
+    clock[0] += 0.5
+
+    node.tick_once()
+    assert node.status is py_trees.common.Status.RUNNING
+    assert node.failure_reason_code is None
+    clock[0] += 0.5  # 1 s of unheld waiting: the timeout still bounds it.
+    node.tick_once()
+    assert node.status is py_trees.common.Status.FAILURE
+    assert node.failure_reason_code == "gripper_wait_timeout"
+
+
+def test_held_time_needs_both_the_stop_state_and_its_scope():
+    state = OperatorMotionStopState({"wait": ()})
+    with pytest.raises(ValueError, match="held-time scope"):
+        _waiter(operator_stop_state=state)
+
+
+def test_count_mode_counts_operator_stop_held_time():
+    node, clock, state, _ = _held_waiter("count")
+    node.tick_once()
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"wait"})))
+    clock[0] += 5.0
+    state.publish(OperatorMotionStopSnapshot(2, frozenset()))
+    node.tick_once()
+    assert node.status is py_trees.common.Status.FAILURE
+    assert node.failure_reason_code == "gripper_wait_timeout"
+
+
+@pytest.mark.parametrize("timeout_while_held", ["pause", "count"])
+def test_halted_program_time_never_counts_and_the_same_attempt_continues(
+    timeout_while_held,
+):
+    node, clock, _, program_clock = _held_waiter(timeout_while_held)
+    node.tick_once()
+    attempt = node.attempt_identity
+    program_clock.freeze()  # Halt
+    clock[0] += 60.0
+    program_clock.resume()  # Execute
+    clock[0] += 0.9
+    node.tick_once()
+    assert node.status is py_trees.common.Status.RUNNING
+    assert node.attempt_identity is attempt
+    clock[0] += 0.1
     node.tick_once()
     assert node.failure_reason_code == "gripper_wait_timeout"

@@ -21,15 +21,11 @@ vi.mock('../api/client', async (importOriginal) => ({
   ...await importOriginal<typeof import('../api/client')>(),
   api: apiMock,
   failedAuthoringRequest: apiMock.failedIdentity,
-  isStaleWorkspaceError: (error: unknown) =>
-    error !== null
-    && typeof error === 'object'
-    && (error as { status?: number }).status === 409,
 }));
 
 import { useAuthoringWorkspace } from './useAuthoringWorkspace';
 import { managerApplyRecord } from '../test/managerApplyRecord';
-import { ApiError } from '../api/client';
+import { ApiError, authoringRefusalMessage } from '../api/client';
 import type { ControlTransportStatus } from './useHeadlessState';
 
 type FakeNode = {
@@ -95,6 +91,7 @@ function snapshotFixture(
             : { api_version: 'manyforge.program.v2' }
         ) as unknown as ProgramDocument | null,
         diagnostics: [],
+        formulaReferences: { computedKeys: {}, nodes: {} },
       },
       saved: {
         available: false,
@@ -379,9 +376,66 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.unavailableReason).toBe(null);
     await act(async () => {
       expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError('Applied configuration changed', 409, {
+        detail: { code: 'observed_move_configuration_changed' },
+      }));
+    });
+    expect(latest!.unavailableReason).toBe(null);
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
       latest!.finishMutation(null, new Error('reply lost'));
     });
     await rerender(headlessSnapshot(1));
+    expect(latest!.unavailableReason).toContain('unconfirmed');
+    expect(latest!.beginMutation()).toBe(false);
+  });
+
+  it('releases the guard for a named observed-move refusal reported as 503', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    const message = 'current pose/joints could not be read: execution owner disconnected';
+    const refusal = new ApiError(message, 503, { detail: { code: 'observed_move_unavailable', message } });
+    expect(authoringRefusalMessage(refusal)).toBe(
+      `Edit not applied: ${message}. Wait for the robot to report its current state, then try again.`,
+    );
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, refusal);
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.unavailableReason).toBe(null);
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it.each([
+    ['502 without a body', new ApiError('Bad Gateway', 502, null)],
+    ['503 without a body', new ApiError('Service Unavailable', 503, null)],
+    ['503 with an unknown code', new ApiError('unavailable', 503, { detail: { code: 'headless_unavailable' } })],
+    ['502 with an unstructured detail', new ApiError('bad gateway', 502, { detail: 'upstream failed' })],
+  ])('keeps the guard locked for a bare %s', async (_label, failure) => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, failure);
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.unavailableReason).toContain('unconfirmed');
+    expect(latest!.beginMutation()).toBe(false);
+  });
+
+  it('does not release the submission guard for an unclassified conflict', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError('conflict', 409, {
+        detail: { code: 'component_fault' },
+      }));
+    });
     expect(latest!.unavailableReason).toContain('unconfirmed');
     expect(latest!.beginMutation()).toBe(false);
   });

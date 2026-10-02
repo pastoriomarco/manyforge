@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
+import time
 from typing import Callable, Iterator, Mapping
 
 import py_trees
@@ -34,6 +35,7 @@ class OperatorMotionStopState:
         node_children: Mapping[str, tuple[str, ...]],
         *,
         read_scope: Callable[[], OperatorMotionStopSnapshot] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # The validated Program supplies child-before-parent order. Each edge
         # is retained once; never materialize a descendant set for every node.
@@ -49,6 +51,13 @@ class OperatorMotionStopState:
         self._has_snapshot = False
         self._initial_ready_nodes: frozenset[str] | None = None
         self._held_subtrees: frozenset[str] = frozenset()
+        # Held time per subtree on `clock` (a run passes its Program clock,
+        # which stands still during a Halt), read when a publication starts
+        # or ends that subtree's hold: the moments a hold policy stops or
+        # resumes ticking it. Only consumers that exclude held time read it.
+        self._clock = clock
+        self._held_since: dict[str, float] = {}
+        self._held_total: dict[str, float] = {}
         self._observation_changed = False
         self._observation_error: str | None = None
         # Tree-worker-only traversal guard. Nested held wrappers share one
@@ -118,6 +127,13 @@ class OperatorMotionStopState:
                         child in held_subtrees for child in children
                     ):
                         held_subtrees.add(node_id)
+                now = self._clock()
+                for node_id in self._held_subtrees - held_subtrees:
+                    self._held_total[node_id] = self._held_total.get(
+                        node_id, 0.0
+                    ) + (now - self._held_since.pop(node_id))
+                for node_id in held_subtrees - self._held_subtrees:
+                    self._held_since[node_id] = now
                 self._held_subtrees = frozenset(held_subtrees)
             self._snapshot = snapshot
             self._observation_error = None
@@ -167,6 +183,14 @@ class OperatorMotionStopState:
     def holds_subtree(self, node_instance_id: str) -> bool:
         with self._lock:
             return node_instance_id in self._held_subtrees
+
+    def held_seconds(self, node_instance_id: str) -> float:
+        """Total time this run has held the node's subtree, on `clock`,
+        including a hold still in progress. Callers take differences."""
+        with self._lock:
+            total = self._held_total.get(node_instance_id, 0.0)
+            since = self._held_since.get(node_instance_id)
+            return total if since is None else total + (self._clock() - since)
 
 
 class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
@@ -225,6 +249,14 @@ class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
             and self.decorated.status is py_trees.common.Status.INVALID
             and self._stop_state.holds_subtree(self._node_instance_id)
         )
+
+    @property
+    def presented_interrupted(self) -> bool:
+        return getattr(self.decorated, "presented_interrupted", False)
+
+    @property
+    def presented_stop_failed(self) -> bool:
+        return getattr(self.decorated, "presented_stop_failed", False)
 
     def tick(self) -> Iterator[py_trees.behaviour.Behaviour]:
         if not self._stop_state.holds_subtree(self._node_instance_id):
