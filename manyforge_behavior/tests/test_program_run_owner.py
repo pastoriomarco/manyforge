@@ -17,6 +17,7 @@ from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
+from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
 from manyforge_behavior.node_availability import (
     AvailabilityFact,
     NodeExecutionReadiness,
@@ -52,6 +53,7 @@ from manyforge_behavior.program_run_owner import (
     build_program_run_admission,
 )
 from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
+from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -3532,8 +3534,11 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
         "active_operation_count",
         "reason_code",
         "message",
+        "details",
+        "origin",
     }
-    assert value["schema_version"] == "manyforge.program_run_status.v2"
+    assert value["schema_version"] == "manyforge.program_run_status.v3"
+    assert value["details"] is None and value["origin"] is None
     assert value["node_status_revision"] == 1
     assert value["node_statuses"]
     assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v1")
@@ -3828,3 +3833,259 @@ def test_timer_input_failure_pauses_and_operator_retry_re_resolves_inputs() -> N
     finished = owner.advance_once(run_id)
     assert finished.state is ProgramRunState.SUCCEEDED
     assert finished.node_statuses["wait"] == "success"
+
+
+# One failure, produced once where it happens, reaches every run record
+# (run status, recorded diagnostic, recovery offer) with exact details and
+# origin; a Stop is not a failure and carries neither.
+
+_OWNER_REFUSAL_DETAILS = {
+    "reason": "observed_state_unavailable",
+    "reference_type": "frame",
+    "reference_id": "tool0",
+    "target_role_id": "arm.left",
+    "retryable": False,
+    # Bounded away: an over-long value, a nested value, an unregistered key.
+    "path": "p" * 257,
+    "latch_id": {"nested": "latch.1"},
+    "trace": "owner internals",
+}
+_OWNER_REFUSAL_PROJECTED = {
+    "reason": "observed_state_unavailable",
+    "reference_type": "frame",
+    "reference_id": "tool0",
+    "target_role_id": "arm.left",
+    "retryable": False,
+}
+_OWNER_REFUSAL_MESSAGE = (
+    "addressed observed state is unavailable (observed_state_unavailable; "
+    "reference frame 'tool0' of target role 'arm.left')"
+)
+
+
+class _RefusingTaskPort(_TaskPort):
+    """The motion owner refuses the request before accepting it."""
+
+    def start(
+        self,
+        _node_id: str,
+        _identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts += 1
+        self._events.append("leaf_start")
+        raise KernelOperationAdmissionRejectedError(
+            "operation_rejected",
+            "addressed observed state is unavailable",
+            _OWNER_REFUSAL_DETAILS,
+        )
+
+
+def _recovery_offer(snapshot, interventions, run_id: str, node: str):
+    intervention = interventions.read(run_id)
+    assert intervention is not None
+    controls = ProgramRuntimeControls(snapshot.capture.to_dict())
+    return controls.recovery_offer(
+        cycle_generation=1,
+        owner_epoch="program-runner.epoch.1",
+        intervention=intervention,
+        policy=snapshot.capture.node_policy_by_instance_id[node].recovery_policy,
+    )
+
+
+def _pausing_move(admission: ProgramRunAdmission) -> ProgramRunAdmission:
+    """The example Program whose motion pauses for the operator on failure."""
+    document = admission.program.to_dict()
+    document["tree"]["children"][0]["recovery_policy"] = {
+        "allow_intervention": True,
+        "allowed_recovery_actions": ["intervention"],
+        "max_retries": 1,
+        "allowed_skills": [],
+        "persistence_ceiling": "session_only",
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    return _admission_for_program(
+        admission, program, [row.to_dict() for row in program_node_policies(program)]
+    )
+
+
+def test_input_failure_reaches_status_diagnostic_and_offer_exactly() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        interventions=interventions,
+        program_clock_source=lambda: 100.0,
+    )
+    run_id = owner.start(
+        _timer_with_sourced_duration_admission(admission)
+    ).capture.program_run_id
+
+    paused = owner.advance_once(run_id)
+
+    details = {
+        "input_problem": "missing",
+        "path": "duration_s",
+        "source_kind": "blackboard_key",
+        "source_reference": "delay",
+    }
+    origin = {"kind": "program_node", "node_instance_id": "wait", "owner_api": None}
+    status = paused.to_dict()
+    assert status["schema_version"] == "manyforge.program_run_status.v3"
+    assert status["reason_code"] == "node_input_unavailable"
+    assert (status["details"], status["origin"]) == (details, origin)
+    diagnostic = owner.take_diagnostic(run_id)
+    assert diagnostic["schema_version"] == "manyforge.program_diagnostic.v2"
+    assert diagnostic["reason_code"] == "node_input_unavailable"
+    assert diagnostic["message"] == status["message"]
+    assert (diagnostic["details"], diagnostic["origin"]) == (details, origin)
+    offer = _recovery_offer(paused, interventions, run_id, "wait")
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v3"
+    assert offer["reason_code"] == "node_input_unavailable"
+    assert offer["message"] == status["message"]
+    assert offer["message"].startswith(
+        "missing input duration_s from blackboard_key 'delay': "
+    )
+    assert (offer["details"], offer["origin"]) == (details, origin)
+
+
+def test_owner_refusal_reaches_status_diagnostic_and_offer_exactly() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _RefusingTaskPort(events, OwnerTaskState.ACTIVE),
+        interventions=interventions,
+    )
+    run_id = owner.start(_pausing_move(admission)).capture.program_run_id
+
+    paused = owner.advance_once(run_id)
+
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    origin = {
+        "kind": "owner",
+        "node_instance_id": "move_to_pick",
+        "owner_api": "kernel.operation",
+    }
+    status = paused.to_dict()
+    assert status["reason_code"] == "owner_request_failed"
+    # The message names the owner's cause once; the details travel apart.
+    assert status["message"] == _OWNER_REFUSAL_MESSAGE
+    assert (status["details"], status["origin"]) == (_OWNER_REFUSAL_PROJECTED, origin)
+    diagnostic = owner.take_diagnostic(run_id)
+    assert diagnostic["state"] == "intervention_required"
+    assert diagnostic["message"] == _OWNER_REFUSAL_MESSAGE
+    assert (diagnostic["details"], diagnostic["origin"]) == (
+        _OWNER_REFUSAL_PROJECTED,
+        origin,
+    )
+    offer = _recovery_offer(paused, interventions, run_id, "move_to_pick")
+    assert offer["reason_code"] == "owner_request_failed"
+    assert offer["message"] == _OWNER_REFUSAL_MESSAGE
+    assert (offer["details"], offer["origin"]) == (_OWNER_REFUSAL_PROJECTED, origin)
+
+
+def test_terminal_owner_refusal_keeps_its_details_and_origin() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _RefusingTaskPort(events, OwnerTaskState.ACTIVE),
+    )
+    run_id = owner.start(admission).capture.program_run_id
+
+    failed = owner.advance_once(run_id)
+
+    assert failed.state is ProgramRunState.FAILED
+    origin = {
+        "kind": "owner",
+        "node_instance_id": "move_to_pick",
+        "owner_api": "kernel.operation",
+    }
+    status = failed.to_dict()
+    assert (status["reason_code"], status["message"]) == (
+        "owner_request_failed",
+        _OWNER_REFUSAL_MESSAGE,
+    )
+    assert (status["details"], status["origin"]) == (_OWNER_REFUSAL_PROJECTED, origin)
+    diagnostic = owner.take_diagnostic(run_id)
+    assert diagnostic["state"] == "failed"
+    assert (diagnostic["reason_code"], diagnostic["message"]) == (
+        "owner_request_failed",
+        _OWNER_REFUSAL_MESSAGE,
+    )
+    assert (diagnostic["details"], diagnostic["origin"]) == (
+        _OWNER_REFUSAL_PROJECTED,
+        origin,
+    )
+
+
+def test_success_and_stop_carry_no_failure_details_or_origin() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    succeeded = owner.advance_once(owner.start(admission).capture.program_run_id)
+    assert succeeded.state is ProgramRunState.SUCCEEDED
+    diagnostic = owner.take_diagnostic(succeeded.capture.program_run_id)
+    for record in (succeeded.to_dict(), diagnostic):
+        assert record["reason_code"] is None
+        assert record["details"] is None and record["origin"] is None
+
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    stopped = owner.stop(run_id, reason="operator Stop")
+    while stopped.state is not ProgramRunState.STOPPED:
+        stopped = owner.advance_once(run_id)
+    status = stopped.to_dict()
+    assert status["reason_code"] is None
+    assert status["details"] is None and status["origin"] is None
+
+
+@pytest.mark.parametrize(
+    ("task_state", "final_state"),
+    [
+        (OwnerTaskState.FAILED, ProgramRunState.FAILED),
+        (OwnerTaskState.SUCCEEDED, ProgramRunState.SUCCEEDED),
+    ],
+)
+def test_runner_failure_names_the_program_runner_without_details(
+    task_state: OwnerTaskState, final_state: ProgramRunState
+) -> None:
+    owner, admission, _task, scope, _events = _fixture(initial_task_state=task_state)
+    run_id = owner.start(admission).capture.program_run_id
+
+    def unknown_scope(_program_run_id: str) -> ProgramRunScopeSnapshot:
+        raise RuntimeError("Kernel scope observation timed out")
+
+    scope.observe = unknown_scope
+    snapshot = owner.advance_once(run_id)
+
+    assert snapshot.state is final_state
+    status = snapshot.to_dict()
+    assert status["reason_code"] == "program_run_scope_unknown"
+    assert status["details"] is None
+    # The runner ended the run; a run that ends succeeded did not fail.
+    assert status["origin"] == (
+        None
+        if final_state is ProgramRunState.SUCCEEDED
+        else {"kind": "program_runner", "node_instance_id": None, "owner_api": None}
+    )
+
+
+def test_run_status_refuses_unbounded_or_orphan_failure_fields() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    snapshot = owner.start(admission)
+    origin = {"kind": "owner", "node_instance_id": "n", "owner_api": None}
+    with pytest.raises(ValueError, match="outside their bound"):
+        replace(snapshot, reason_code="x", details={"path": "p" * 257}, origin=origin)
+    with pytest.raises(ValueError, match="origin"):
+        replace(snapshot, reason_code="x", details={"path": "duration_s"})
+    with pytest.raises(ValueError, match="reason code"):
+        replace(snapshot, origin=origin)

@@ -22,6 +22,10 @@ from manyforge_behavior.geometry import (
     normalize_quat,
     rpy_deg_to_xyzw,
 )
+from manyforge_behavior.failure_details import (
+    bounded_failure_details,
+    exception_failure_details,
+)
 from manyforge_behavior.json_scalars import nonnegative_int64
 from manyforge_behavior.kernel_client import (
     ActionSpan,
@@ -48,7 +52,6 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
     describe_owner_failure,
-    owner_failure_details,
 )
 from manyforge_behavior.scene_client import (
     SceneClient,
@@ -146,16 +149,17 @@ def _number(value: object, *, field: str) -> float:
 
 
 def _owner_failure_message(exc: BaseException) -> str:
-    """Return a bounded failure message that keeps the owner's structured cause.
+    """Return a bounded failure message that names the owner's structured cause.
 
     Owner rejections carry the precise cause in ``error.details.reason`` and a
     failed reference in ``reference_type``/``reference_id``; the human message
     alone is often generic (for example "addressed observed state is
-    unavailable"), so both are appended when present.
+    unavailable"), so it names both once. The same bounded details travel
+    separately (`exception_failure_details`).
     """
 
     message = str(exc) or type(exc).__name__
-    return describe_owner_failure(message, owner_failure_details(exc))[:1024]
+    return describe_owner_failure(message, exception_failure_details(exc))[:1024]
 
 
 def _request_identity(prefix: str, *coordinates: str) -> str:
@@ -1808,7 +1812,9 @@ class NativeKernelProgramPort:
         }
 
     @staticmethod
-    def _terminal_error(operation: Mapping[str, Any]) -> tuple[str, str]:
+    def _terminal_error(
+        operation: Mapping[str, Any],
+    ) -> tuple[str, str, Mapping[str, Any] | None]:
         participants = operation.get("participants")
         if isinstance(participants, list):
             for participant in participants:
@@ -1819,11 +1825,15 @@ class NativeKernelProgramPort:
                     code = error.get("code")
                     message = error.get("message")
                     if isinstance(code, str) and code:
-                        return code, describe_owner_failure(
-                            message if isinstance(message, str) else "",
-                            error.get("details"),
-                        ).strip()[:1024]
-        return "operation_failed", "native operation did not succeed"
+                        details = bounded_failure_details(error.get("details"))
+                        return (
+                            code,
+                            describe_owner_failure(
+                                message if isinstance(message, str) else "", details
+                            ).strip()[:1024],
+                            details,
+                        )
+        return "operation_failed", "native operation did not succeed", None
 
     def _recovery_assessment(
         self, operation: Mapping[str, Any], operation_id: str
@@ -1897,13 +1907,14 @@ class NativeKernelProgramPort:
             assessment = self._recovery_assessment(operation, shared.operation_id)
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
-            reason_code, message = self._terminal_error(operation)
+            reason_code, message, details = self._terminal_error(operation)
             snapshot = OwnerTaskSnapshot(
                 task_id=task.task_id,
                 state=OwnerTaskState.FAILED,
                 metadata=metadata,
                 reason_code=reason_code,
                 message=message,
+                details=details,
             )
         else:
             raise ProductionPortError("native operation has an unknown state")
@@ -2803,6 +2814,12 @@ class _NativeKernelControlTaskPort:
                         reason_code=(
                             None if result.get("accepted") is True else "recovery_rejected"
                         ),
+                        details=(
+                            None
+                            if result.get("accepted") is True
+                            or not isinstance(result.get("error"), Mapping)
+                            else bounded_failure_details(result["error"].get("details"))
+                        ),
                     )
                 request = {
                     "request_context": caller,
@@ -3090,15 +3107,12 @@ class _NativeTargetQueryPort:
         except FrameTransformError:
             raise
         except Exception as exc:
-            response = getattr(exc, "response", None)
-            error = response.get("error") if isinstance(response, Mapping) else None
-            details = getattr(exc, "details", None)
-            if not isinstance(details, Mapping):
-                details = error.get("details") if isinstance(error, Mapping) else None
-            reason = details.get("reason") if isinstance(details, Mapping) else None
+            details = exception_failure_details(exc)
+            reason = None if details is None else details.get("reason")
             raise FrameTransformError(
                 reason if isinstance(reason, str) and reason else "frame_transform_failed",
                 _owner_failure_message(exc),
+                details=details,
             ) from exc
 
     def invoke(
@@ -3705,7 +3719,10 @@ class HeadlessSceneProgramPort:
                 except SceneTransactionRejectedError as rejected:
                     self._raise_if_stop_prevented_admission(rejected)
                     return OwnerInvocationResult(
-                        False, reason_code=rejected.code, message=str(rejected)
+                        False,
+                        reason_code=rejected.code,
+                        message=_owner_failure_message(rejected),
+                        details=exception_failure_details(rejected),
                     )
                 if response is None:
                     return None
@@ -4573,6 +4590,7 @@ class HeadlessSceneProgramPort:
                 False,
                 reason_code=reason_code,
                 message=_owner_failure_message(exc),
+                details=exception_failure_details(exc),
             )
 
 

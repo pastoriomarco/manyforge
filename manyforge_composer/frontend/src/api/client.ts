@@ -4,6 +4,7 @@ import {
   parseCatalogResponse,
   parseAppliedProgramSelection,
   parseAppliedProgramStatus,
+  parseApiErrorDto,
   parsePersistentKeyEdit,
   parseExpressionCheckResult,
   parsePersistentKeyValues,
@@ -101,6 +102,7 @@ import type {
   ProgramDraftMeshAssetMetadata,
   SceneUrdfManifest,
   SourceModelProjection,
+  StructuredError,
 } from '../types/api';
 import type {
   AlarmMembership,
@@ -306,28 +308,21 @@ function sameRuntimeScaleSelector(
 
 /** The owner-issued error code carried by an API error, if any. */
 export function apiErrorCode(error: unknown): string | null {
-  if (!(error instanceof ApiError)) return null;
-  const payload = error.payload;
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    return null;
-  }
-  const detail = (payload as Record<string, unknown>).detail;
-  if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) {
-    return null;
-  }
-  const code = (detail as Record<string, unknown>).code;
-  return typeof code === 'string' ? code : null;
+  return error instanceof ApiError ? error.structuredError?.code ?? null : null;
 }
 
 export class ApiError extends Error {
   readonly status: number;
   readonly payload: unknown;
+  /** The refusal's ErrorDTO, when the body carries one (origin is the request). */
+  readonly structuredError: StructuredError | null;
 
   constructor(message: string, status: number, payload: unknown) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.payload = payload;
+    this.structuredError = parseApiErrorDto(payload);
   }
 }
 
@@ -376,8 +371,7 @@ export function authoringRefusalMessage(error: unknown): string | null {
   // Preparation runs before any claim or runtime effect, so it is a definite
   // refusal of this input, never an unconfirmed submission.
   if (code === 'activation_preparation_failed') {
-    const details = ((error.payload as { detail?: { details?: { preparer_detail?: unknown } } })
-      .detail?.details?.preparer_detail);
+    const details = error.structuredError?.details?.preparer_detail;
     const cause = typeof details === 'string'
       ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim() : '';
     return `Not applied: the candidate could not be prepared${cause ? ` (${cause})` : ''}. Correct it and try again.`;
@@ -406,16 +400,8 @@ const STALE_WORKSPACE_CODES = new Set([
  */
 export function isStaleWorkspaceError(error: unknown): boolean {
   if (!(error instanceof ApiError) || error.status !== 409) return false;
-  const payload = error.payload;
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    return false;
-  }
-  const detail = (payload as Record<string, unknown>).detail;
-  if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) {
-    return false;
-  }
-  const code = (detail as Record<string, unknown>).code;
-  return typeof code === 'string' && STALE_WORKSPACE_CODES.has(code);
+  const code = apiErrorCode(error);
+  return code !== null && STALE_WORKSPACE_CODES.has(code);
 }
 
 export type AuthoringRequestIdentity = {

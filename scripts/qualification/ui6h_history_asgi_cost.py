@@ -56,7 +56,7 @@ async def qualify(core, config):
     )
     source._loop = loop
     record_value = {
-        "schema_version": "manyforge.program_diagnostic.v1",
+        "schema_version": "manyforge.program_diagnostic.v2",
         "owner_epoch": "cost.runner",
         **{
             key: "sha256:" + value * 64
@@ -76,6 +76,12 @@ async def qualify(core, config):
         "omitted_blackboard_count": 0,
         "omitted_override_count": 0,
         "delivery_loss_count": 0,
+        "details": None,
+        "origin": {
+            "kind": "program_runner",
+            "node_instance_id": None,
+            "owner_api": None,
+        },
     }
     try:
         async with app.router.lifespan_context(app), httpx.AsyncClient(

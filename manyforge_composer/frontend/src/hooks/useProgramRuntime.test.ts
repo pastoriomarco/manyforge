@@ -18,6 +18,7 @@ import {
   programPendingAfterProjection,
   programRunProjectionKey,
   programRuntimeAfterSnapshot,
+  programCurrentStatusSummary,
   programMotionStopSettled,
   programRuntimeWakeKey,
   programTerminalFailureMessage,
@@ -330,7 +331,17 @@ describe('Program command settlement', () => {
       capture: { programRunId: 'run-background-failure' },
       nodeStatuses: { 'node.move': 'failure' },
       activeOperationCount: 0,
-      reasonCode: 'owner_request_failed',
+      reason: {
+        code: 'owner_request_failed',
+        message: 'planning failed after the Run request had returned',
+        details: {
+          reason: 'frame_role_unresolved',
+          reference_type: 'frame_role',
+          reference_id: 'tool0',
+          target_role_id: 'arm',
+        },
+        origin: { kind: 'owner', nodeInstanceId: 'node.move', ownerApi: 'scene.frames' },
+      },
       message: 'planning failed after the Run request had returned',
     } as unknown as ProgramRunStatus;
     const message = programTerminalFailureMessage(run, null, {
@@ -343,9 +354,44 @@ describe('Program command settlement', () => {
     expect(message).toContain('Program execution failed.');
     expect(message).toContain('run-background-failure: failed, revision 11');
     expect(message).toContain('Run reason: owner_request_failed.');
+    expect(message).toContain(
+      "Run failure details: Reason: frame_role_unresolved; Reference: frame_role 'tool0' "
+      + "of target role 'arm'; Origin: scene.frames for node 'node.move'.",
+    );
     expect(message).toContain('Current nodes: node.move=failure.');
     expect(programTerminalFailureMessage({ ...run, state: 'running' }, null, null))
       .toBeNull();
+  });
+
+  it('summarizes the held node failure carried by the recovery offer', () => {
+    const controls = {
+      recoveryOffer: {
+        recoveryClass: 'node_failure_pause',
+        status: 'action_required',
+        offerRevision: 2,
+        nodeInstanceId: 'wait',
+        operationId: null,
+        actions: [],
+        reason: {
+          code: 'node_input_unavailable',
+          message: "missing input duration_s from blackboard_key 'delay'",
+          details: {
+            input_problem: 'missing',
+            path: 'duration_s',
+            source_kind: 'blackboard_key',
+            source_reference: 'delay',
+          },
+          origin: { kind: 'program_node', nodeInstanceId: 'wait', ownerApi: null },
+        },
+      },
+    } as unknown as ProgramRuntimeControlProjection;
+    const summary = programCurrentStatusSummary(null, controls, null);
+    expect(summary).toContain('Recovery reason: node_input_unavailable.');
+    expect(summary).toContain("Recovery message: missing input duration_s from blackboard_key 'delay'.");
+    expect(summary).toContain(
+      "Recovery failure details: Input: duration_s from blackboard key 'delay' (missing); "
+      + "Origin: node 'wait'.",
+    );
   });
 
   it('keeps selected delivery feedback separate from physical Stop presentation', () => {

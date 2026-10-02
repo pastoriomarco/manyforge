@@ -337,38 +337,43 @@ TEST(EventHistorian, IndexedFiltersFindOlderErrorsAcrossClockDomainsBeforePagina
 
 TEST(EventHistorian, ProgramDiagnosticValuesRemainSearchableButNeverBecomeOwnerIdentities) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "history.sqlite3";
-  const auto event = MakeHistorianEvent(
-      "manyforge.program_runner", "program_failed", "ERROR", 100, "2026-09-08T00:00:00Z",
-      CanonicalValue(CanonicalValue::Object{
-          {"schema_version", CanonicalValue("manyforge.program_diagnostic.v1")},
-          {"program_run_id", CanonicalValue("run.actual")},
-          {"blackboard", CanonicalValue(CanonicalValue::Object{
-                             {"program_run_id", CanonicalValue("run.foreign")}})},
-          {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
-                                    {"operation_id", CanonicalValue("operation.foreign")}})},
-      }));
-  for (const bool reopened : {false, true}) {
-    SqliteEventHistoryStore store(path, 128U);
-    if (!reopened) {
-      EXPECT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+  // Originals recorded before the v2 cutover keep their version and derivation.
+  for (const auto version : kProgramDiagnosticSchemaVersions) {
+    const auto path = directory.path() / (std::string(version) + ".sqlite3");
+    const auto event = MakeHistorianEvent(
+        "manyforge.program_runner", "program_failed", "ERROR", 100, "2026-09-08T00:00:00Z",
+        CanonicalValue(CanonicalValue::Object{
+            {"schema_version", CanonicalValue(std::string(version))},
+            {"program_run_id", CanonicalValue("run.actual")},
+            {"blackboard", CanonicalValue(CanonicalValue::Object{
+                               {"program_run_id", CanonicalValue("run.foreign")}})},
+            {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
+                                      {"operation_id", CanonicalValue("operation.foreign")}})},
+        }));
+    for (const bool reopened : {false, true}) {
+      SqliteEventHistoryStore store(path, 128U);
+      if (!reopened) {
+        EXPECT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+      }
+      HistorianQuery query;
+      query.correlations = {{"program_run_id", "run.actual"}};
+      ASSERT_EQ(store.Query(query).events.size(), 1U);
+      const auto summary_page = store.QuerySummaries(query);
+      const auto& summary = *summary_page.find_object_member("events")
+                                 ->as_array()
+                                 .front()
+                                 .find_object_member("event");
+      EXPECT_EQ(summary.find_object_member("program_run_id")->as_string(), "run.actual");
+      EXPECT_EQ(content_identity::canonical_json(*summary.find_object_member("operation_id")),
+                "null");
+      query.correlations = {{"program_run_id", "run.foreign"}};
+      EXPECT_TRUE(store.Query(query).events.empty());
+      query.correlations = {{"operation_id", "operation.foreign"}};
+      EXPECT_TRUE(store.Query(query).events.empty());
+      query.correlations.clear();
+      query.search = "run.foreign";
+      EXPECT_EQ(store.Query(query).events.size(), 1U);
     }
-    HistorianQuery query;
-    query.correlations = {{"program_run_id", "run.actual"}};
-    ASSERT_EQ(store.Query(query).events.size(), 1U);
-    const auto summary_page = store.QuerySummaries(query);
-    const auto& summary =
-        *summary_page.find_object_member("events")->as_array().front().find_object_member("event");
-    EXPECT_EQ(summary.find_object_member("program_run_id")->as_string(), "run.actual");
-    EXPECT_EQ(content_identity::canonical_json(*summary.find_object_member("operation_id")),
-              "null");
-    query.correlations = {{"program_run_id", "run.foreign"}};
-    EXPECT_TRUE(store.Query(query).events.empty());
-    query.correlations = {{"operation_id", "operation.foreign"}};
-    EXPECT_TRUE(store.Query(query).events.empty());
-    query.correlations.clear();
-    query.search = "run.foreign";
-    EXPECT_EQ(store.Query(query).events.size(), 1U);
   }
 }
 

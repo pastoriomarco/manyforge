@@ -284,6 +284,7 @@ def _owner_task_builder(
     node_id: str,
     port_name: str,
     *,
+    owner_api: str,
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
     require_initial_running: bool = False,
@@ -307,6 +308,7 @@ def _owner_task_builder(
             require_initial_running=require_initial_running,
             operator_stop_state=context.operator_stop_state,
             cancellable=cancellable,
+            owner_api=owner_api,
         )
 
     return build
@@ -350,7 +352,9 @@ class FramedObjectPoseQuery:
                 frame,
             )
         except FrameTransformError as exc:
-            return OwnerInvocationResult(False, reason_code=exc.reason_code, message=str(exc))
+            return OwnerInvocationResult(
+                False, reason_code=exc.reason_code, message=str(exc), details=exc.details
+            )
         return OwnerInvocationResult(True, output=result.pose, metadata=result.metadata)
 
 
@@ -358,6 +362,7 @@ def _owner_invocation_builder(
     node_id: str,
     port_name: str,
     *,
+    owner_api: str,
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
     transform_port: Callable[[OwnerInvocationPort], OwnerInvocationPort] | None = None,
@@ -384,6 +389,7 @@ def _owner_invocation_builder(
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
             cancellable=cancellable,
+            owner_api=owner_api,
         )
         if node_id != "gripper.wait_for_status":
             return OwnerInvocationAdapter(
@@ -532,7 +538,10 @@ def _definition_for(
         return _AdapterDefinition(
             row,
             _owner_invocation_builder(
-                row.node_id, "model_queries", transform_port=FrameHeightQuery
+                row.node_id,
+                "model_queries",
+                owner_api=entry.execution.owner_api,
+                transform_port=FrameHeightQuery,
             ),
             "model_queries",
             None,
@@ -580,6 +589,7 @@ def _definition_for(
             _owner_task_builder(
                 row.node_id,
                 task_port,
+                owner_api=entry.execution.owner_api,
                 output_key_parameter=output_key_parameter,
                 blackboard_read_parameters=blackboard_read_parameters,
                 require_initial_running=row.node_id == "assistant.query_model",
@@ -595,6 +605,7 @@ def _definition_for(
             _owner_invocation_builder(
                 row.node_id,
                 invocation_port,
+                owner_api=entry.execution.owner_api,
                 output_key_parameter=output_key_parameter,
                 blackboard_read_parameters=blackboard_read_parameters,
                 framed_port=(

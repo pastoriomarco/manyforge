@@ -20,6 +20,10 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.failure_details import (
+    NodeFailureOrigin,
+    exception_failure_details,
+)
 from manyforge_behavior.orchestration_values import (
     INPUT_INVALID,
     NodeAttemptInputResolver,
@@ -27,7 +31,6 @@ from manyforge_behavior.orchestration_values import (
     ProgramValueError,
     input_failure_details,
     input_failure_reason,
-    node_input_failure_details,
 )
 
 
@@ -76,6 +79,7 @@ class _AttemptInputs:
     failure_reason_code: str | None = None
     failure_message: str = ""
     failure_details: Mapping[str, Any] | None = None
+    failure_origin: NodeFailureOrigin | None = None
     # The parameter `_apply_attempt` interprets, named by its failure.
     applied_parameter: str | None = None
 
@@ -85,6 +89,7 @@ class _AttemptInputs:
         self.failure_reason_code = None
         self.failure_message = ""
         self.failure_details = None
+        self.failure_origin = None
         if inputs is None:
             return fixed
         try:
@@ -121,7 +126,8 @@ class _AttemptInputs:
             reason = input_failure_reason(exc)
             self.failure_reason_code = reason
             self.failure_message = str(exc)
-            self.failure_details = node_input_failure_details(exc)
+            self.failure_details = exception_failure_details(exc)
+            self.failure_origin = NodeFailureOrigin("program_node")
             self.feedback_message = f"{reason}: {exc}"  # type: ignore[attr-defined]
             return None
         return resolved

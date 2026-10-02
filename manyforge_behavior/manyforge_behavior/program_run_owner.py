@@ -15,6 +15,12 @@ from uuid import uuid4
 
 import py_trees
 
+from manyforge_behavior.failure_details import (
+    failure_origin,
+    failure_wire_fields,
+    require_failure_details,
+    require_failure_origin,
+)
 from manyforge_behavior.node_availability import NodeExecutionReadiness
 from manyforge_behavior.node_availability import AvailabilityFact
 from manyforge_behavior.node_environment import NodeEnvironment
@@ -45,7 +51,8 @@ from manyforge_behavior.program_runtime import (
 from manyforge_behavior.orchestration_values import ProgramValueError
 
 
-PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v2"
+PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v3"
+PROGRAM_DIAGNOSTIC_API: Final = "manyforge.program_diagnostic.v2"
 PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v1"
 APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v2"
 _MAX_RETAINED_RUNS: Final = 4_096
@@ -56,6 +63,8 @@ _NODE_STATUSES: Final = frozenset(
 _FAILURE_PAUSE_UNCONFIRMED: Final = (
     "Stopping the Program's other motion is not confirmed yet."
 )
+# The runner itself ended or paused the run (scope, settlement, runtime).
+_RUNNER_FAILURE: Final = failure_origin("program_runner")
 
 
 class ProgramRunOwnerError(RuntimeError):
@@ -298,6 +307,10 @@ class ProgramRunSnapshot:
     active_operation_count: int | None
     reason_code: str | None
     message: str
+    # Bounded details and origin of a failure; None for any other reason
+    # (a Stop, a success) and when the failure carries none.
+    details: Mapping[str, Any] | None
+    origin: Mapping[str, Any] | None
 
     def __post_init__(self) -> None:
         _text(self.owner_id, field="owner_id")
@@ -343,6 +356,12 @@ class ProgramRunSnapshot:
             or len(self.message.encode("utf-8")) > 4_096
         ):
             raise ValueError("message must be bounded text")
+        object.__setattr__(self, "details", require_failure_details(self.details))
+        object.__setattr__(self, "origin", require_failure_origin(self.origin))
+        if self.origin is not None and self.reason_code is None:
+            raise ValueError("a failure origin requires its reason code")
+        if self.details is not None and self.origin is None:
+            raise ValueError("failure details require their origin")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -358,6 +377,7 @@ class ProgramRunSnapshot:
             "active_operation_count": self.active_operation_count,
             "reason_code": self.reason_code,
             "message": self.message,
+            **failure_wire_fields(self.details, self.origin),
         }
 
 
@@ -373,6 +393,8 @@ class _RunEntry:
     active_operation_count: int | None = 0
     reason_code: str | None = None
     message: str = ""
+    details: Mapping[str, Any] | None = None
+    origin: Mapping[str, Any] | None = None
     pending_diagnostic: dict[str, Any] | None = None
     stop_requested: bool = False
     # A failure pause stops the Program's other motion, like Halt. Set when
@@ -381,9 +403,13 @@ class _RunEntry:
     state_after_stop: ProgramRunState = ProgramRunState.STOPPED
     state_after_stop_reason_code: str | None = None
     state_after_stop_message: str = ""
+    state_after_stop_details: Mapping[str, Any] | None = None
+    state_after_stop_origin: Mapping[str, Any] | None = None
     state_after_finalize: ProgramRunState = ProgramRunState.STOPPED
     state_after_finalize_reason_code: str | None = None
     state_after_finalize_message: str = ""
+    state_after_finalize_details: Mapping[str, Any] | None = None
+    state_after_finalize_origin: Mapping[str, Any] | None = None
     resources_released: bool = False
     reset_containment: ProgramRunScopeSnapshot | None = None
     transition_lock: RLock = field(default_factory=RLock, repr=False)
@@ -466,6 +492,40 @@ class ProgramRunOwner:
             ),
             reason_code=entry.reason_code,
             message=entry.message,
+            details=entry.details,
+            origin=entry.origin,
+        )
+
+    @staticmethod
+    def _set_reason(
+        entry: _RunEntry,
+        reason_code: str | None,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+        origin: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Replace the run's reason; details and origin only describe a failure."""
+
+        entry.reason_code = reason_code
+        entry.message = message
+        entry.details = details
+        entry.origin = origin
+
+    @classmethod
+    def _set_runner_failure(
+        cls, entry: _RunEntry, reason_code: str, message: str
+    ) -> None:
+        cls._set_reason(entry, reason_code, message, origin=_RUNNER_FAILURE)
+
+    @classmethod
+    def _restore_after_stop(cls, entry: _RunEntry) -> None:
+        cls._set_reason(
+            entry,
+            entry.state_after_stop_reason_code,
+            entry.state_after_stop_message,
+            details=entry.state_after_stop_details,
+            origin=entry.state_after_stop_origin,
         )
 
     @staticmethod
@@ -490,16 +550,32 @@ class ProgramRunOwner:
         state_after_finalize: ProgramRunState,
         reason_code: str | None,
         message: str,
+        details: Mapping[str, Any] | None,
+        origin: Mapping[str, Any] | None,
     ) -> None:
         entry.state = ProgramRunState.FINALIZING
         ProgramRunOwner._schedule_program_time(entry, tree_ticks=False)
         entry.state_after_finalize = state_after_finalize
         entry.state_after_finalize_reason_code = reason_code
         entry.state_after_finalize_message = message
+        entry.state_after_finalize_details = details
+        entry.state_after_finalize_origin = origin
         entry.active_operation_count = 0
-        entry.reason_code = reason_code
-        entry.message = message
+        ProgramRunOwner._set_reason(
+            entry, reason_code, message, details=details, origin=origin
+        )
         entry.revision += 1
+
+    @classmethod
+    def _mark_finalizing_after_stop(cls, entry: _RunEntry) -> None:
+        cls._mark_finalizing(
+            entry,
+            state_after_finalize=entry.state_after_stop,
+            reason_code=entry.state_after_stop_reason_code,
+            message=entry.state_after_stop_message,
+            details=entry.state_after_stop_details,
+            origin=entry.state_after_stop_origin,
+        )
 
     def _release_resources(self, program_run_id: str) -> tuple[Exception, ...]:
         errors: list[Exception] = []
@@ -540,14 +616,20 @@ class ProgramRunOwner:
                         entry.reason_code != "program_run_cleanup_failed"
                         or entry.message != message
                     ):
-                        entry.reason_code = "program_run_cleanup_failed"
-                        entry.message = message
+                        self._set_runner_failure(
+                            entry, "program_run_cleanup_failed", message
+                        )
                         entry.revision += 1
                     return self._snapshot(entry)
                 entry.resources_released = True
                 entry.state = entry.state_after_finalize
-                entry.reason_code = entry.state_after_finalize_reason_code
-                entry.message = entry.state_after_finalize_message
+                self._set_reason(
+                    entry,
+                    entry.state_after_finalize_reason_code,
+                    entry.state_after_finalize_message,
+                    details=entry.state_after_finalize_details,
+                    origin=entry.state_after_finalize_origin,
+                )
                 entry.active_operation_count = 0
                 entry.revision += 1
                 return self._snapshot(entry)
@@ -664,13 +746,21 @@ class ProgramRunOwner:
             return record
 
     def _capture_diagnostic(
-        self, entry: _RunEntry, state: str, *, message: str | None = None
+        self,
+        entry: _RunEntry,
+        state: str,
+        *,
+        reason_code: str | None,
+        message: str,
+        details: Mapping[str, Any] | None,
+        origin: Mapping[str, Any] | None,
     ) -> None:
+        """Capture one incident/completion with its exact reason."""
         # Called only on a tree incident/completion transition, not progress.
         # The immutable capture contains references, never a later scene read.
         capture = entry.run.capture
         entry.pending_diagnostic = {
-            "schema_version": "manyforge.program_diagnostic.v1",
+            "schema_version": PROGRAM_DIAGNOSTIC_API,
             "program_run_id": capture.program_run_id,
             "owner_epoch": self._owner_epoch,
             "program_revision": capture.program_revision,
@@ -678,10 +768,9 @@ class ProgramRunOwner:
             "retained_bundle_id": capture.retained_bundle_id,
             "graph_revision": capture.graph_revision,
             "state": state,
-            "reason_code": entry.reason_code,
-            "message": (
-                message if message is not None else entry.message or f"Program {state}"
-            ),
+            "reason_code": reason_code,
+            "message": message or f"Program {state}",
+            **failure_wire_fields(details, origin),
             **entry.run.diagnostic_snapshot(),
         }
 
@@ -1004,8 +1093,7 @@ class ProgramRunOwner:
             port.resolve(intervention.identity, action=action, result=result)
             entry.state = ProgramRunState.RUNNING
             self._schedule_program_time(entry, tree_ticks=True)
-            entry.reason_code = None
-            entry.message = ""
+            self._set_reason(entry, None, "")
             entry.revision += 1
             return self._snapshot(entry)
 
@@ -1105,6 +1193,7 @@ class ProgramRunOwner:
         state_after_stop: ProgramRunState,
         reason_code: str | None,
         message: str,
+        origin: Mapping[str, Any] | None,
         stop_request_id: str | None = None,
         explicit: bool = False,
     ) -> ProgramRunSnapshot:
@@ -1142,8 +1231,14 @@ class ProgramRunOwner:
                         entry.state_after_stop = state_after_stop
                         entry.state_after_stop_reason_code = reason_code
                         entry.state_after_stop_message = message
-                        entry.reason_code = reason_code
-                        entry.message = message
+                        entry.state_after_stop_details = None
+                        # A run that ends succeeded did not fail.
+                        entry.state_after_stop_origin = (
+                            None
+                            if state_after_stop is ProgramRunState.SUCCEEDED
+                            else origin
+                        )
+                        self._restore_after_stop(entry)
                         entry.revision += 1
                     run = entry.run
 
@@ -1202,27 +1297,26 @@ class ProgramRunOwner:
                         entry.node_status_revision += 1
                 if scope_errors:
                     entry.active_operation_count = None
-                    entry.reason_code = "program_run_scope_unknown"
-                    entry.message = "; ".join(
-                        str(error) or type(error).__name__ for error in scope_errors
+                    self._set_runner_failure(
+                        entry,
+                        "program_run_scope_unknown",
+                        "; ".join(
+                            str(error) or type(error).__name__
+                            for error in scope_errors
+                        ),
                     )
                     return self._snapshot(entry)
                 if scope_fields is not None:
                     active_count, settled, scope_reason = scope_fields
                     entry.active_operation_count = active_count
                     if scope_reason is not None:
-                        entry.reason_code = scope_reason
-                        entry.message = "Kernel Program-run scope is unknown"
-                    else:
-                        entry.reason_code = entry.state_after_stop_reason_code
-                        entry.message = entry.state_after_stop_message
-                    if settled:
-                        self._mark_finalizing(
-                            entry,
-                            state_after_finalize=entry.state_after_stop,
-                            reason_code=entry.state_after_stop_reason_code,
-                            message=entry.state_after_stop_message,
+                        self._set_runner_failure(
+                            entry, scope_reason, "Kernel Program-run scope is unknown"
                         )
+                    else:
+                        self._restore_after_stop(entry)
+                    if settled:
+                        self._mark_finalizing_after_stop(entry)
                         finalize = True
                 snapshot = self._snapshot(entry)
             if finalize:
@@ -1245,6 +1339,7 @@ class ProgramRunOwner:
             state_after_stop=ProgramRunState.STOPPED,
             reason_code=None,
             message="",
+            origin=None,
             explicit=True,
         )
 
@@ -1899,10 +1994,16 @@ class ProgramRunOwner:
                             tree_ticks=remaining is None
                             or remaining.policy_parameter == "operator_stop_policy",
                         )
-                        entry.reason_code = (
-                            None if remaining is None else remaining.reason_code
-                        )
-                        entry.message = "" if remaining is None else remaining.message
+                        if remaining is None:
+                            self._set_reason(entry, None, "")
+                        else:
+                            self._set_reason(
+                                entry,
+                                remaining.reason_code,
+                                remaining.message,
+                                details=remaining.details,
+                                origin=remaining.origin,
+                            )
                         entry.revision += 1
             return self.read(program_run_id)
 
@@ -1928,8 +2029,11 @@ class ProgramRunOwner:
                 if entry.revision != captured_revision:
                     return self._snapshot(entry)
                 entry.active_operation_count = None
-                entry.reason_code = "program_full_stop_task_state_unknown"
-                entry.message = str(error) or type(error).__name__
+                self._set_runner_failure(
+                    entry,
+                    "program_full_stop_task_state_unknown",
+                    str(error) or type(error).__name__,
+                )
                 return self._snapshot(entry)
         with self._lock:
             entry = self._entry(program_run_id)
@@ -1940,24 +2044,27 @@ class ProgramRunOwner:
                 return self._snapshot(entry)
             if active:
                 entry.active_operation_count = active
-                entry.reason_code = "program_full_stop_task_observation_pending"
-                entry.message = (
+                # Full Stop progress, not a failure.
+                self._set_reason(
+                    entry,
+                    "program_full_stop_task_observation_pending",
                     "Full Stop settled physically while accepted Program work "
-                    "is still becoming observable"
+                    "is still becoming observable",
                 )
                 return self._snapshot(entry)
             entry.state = ProgramRunState.FULL_STOPPED
             self._schedule_program_time(entry, tree_ticks=False)
             entry.active_operation_count = 0
             if unrecoverable:
-                entry.reason_code = "program_full_stop_resume_unavailable"
-                entry.message = (
+                # What the settled Full Stop allows, not a failure.
+                self._set_reason(
+                    entry,
+                    "program_full_stop_resume_unavailable",
                     "Full Stop settled, but one or more preserved tasks do not "
-                    "offer fresh current-state recovery; Reset remains available"
+                    "offer fresh current-state recovery; Reset remains available",
                 )
             else:
-                entry.reason_code = None
-                entry.message = ""
+                self._set_reason(entry, None, "")
             entry.revision += 1
             return self._snapshot(entry)
 
@@ -1996,8 +2103,7 @@ class ProgramRunOwner:
                     # their attempt and lose no time until Execute.
                     self._schedule_program_time(entry, tree_ticks=False)
                     entry.stop_requested = True
-                    entry.reason_code = None
-                    entry.message = ""
+                    self._set_reason(entry, None, "")
                 elif entry.state is not ProgramRunState.FULL_STOPPING:
                     raise ProgramRunOwnerError(
                         "Full Stop requires a current Program run"
@@ -2021,8 +2127,11 @@ class ProgramRunOwner:
                     if entry.revision != request_revision:
                         return self._snapshot(entry)
                     entry.active_operation_count = None
-                    entry.reason_code = "program_run_scope_unknown"
-                    entry.message = str(error) or type(error).__name__
+                    self._set_runner_failure(
+                        entry,
+                        "program_run_scope_unknown",
+                        str(error) or type(error).__name__,
+                    )
                     return self._snapshot(entry)
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -2030,8 +2139,9 @@ class ProgramRunOwner:
                     return self._snapshot(entry)
                 entry.active_operation_count = active_count
                 if scope_reason is not None:
-                    entry.reason_code = scope_reason
-                    entry.message = "Kernel Program-run scope is unknown"
+                    self._set_runner_failure(
+                        entry, scope_reason, "Kernel Program-run scope is unknown"
+                    )
                 return self._snapshot(entry)
 
     def reconcile_full_stop(self, program_run_id: str) -> ProgramRunSnapshot:
@@ -2057,8 +2167,11 @@ class ProgramRunOwner:
                     if entry.revision != captured_revision:
                         return self._snapshot(entry)
                     entry.active_operation_count = None
-                    entry.reason_code = "program_run_scope_unknown"
-                    entry.message = str(error) or type(error).__name__
+                    self._set_runner_failure(
+                        entry,
+                        "program_run_scope_unknown",
+                        str(error) or type(error).__name__,
+                    )
                     return self._snapshot(entry)
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -2066,8 +2179,9 @@ class ProgramRunOwner:
                     return self._snapshot(entry)
                 entry.active_operation_count = active_count
                 if scope_reason is not None:
-                    entry.reason_code = scope_reason
-                    entry.message = "Kernel Program-run scope is unknown"
+                    self._set_runner_failure(
+                        entry, scope_reason, "Kernel Program-run scope is unknown"
+                    )
                     settled = False
             return (
                 self._complete_full_stop(
@@ -2155,8 +2269,7 @@ class ProgramRunOwner:
                 self._schedule_program_time(entry, tree_ticks=True)
                 entry.stop_requested = False
                 entry.active_operation_count = active_count
-                entry.reason_code = None
-                entry.message = ""
+                self._set_reason(entry, None, "")
                 entry.revision += 1
                 return self._snapshot(entry)
 
@@ -2317,26 +2430,24 @@ class ProgramRunOwner:
                 with self._lock:
                     entry = self._entry(program_run_id)
                     entry.active_operation_count = None
-                    entry.reason_code = "program_run_scope_unknown"
-                    entry.message = str(exc) or type(exc).__name__
+                    self._set_runner_failure(
+                        entry,
+                        "program_run_scope_unknown",
+                        str(exc) or type(exc).__name__,
+                    )
                     return self._snapshot(entry)
             with self._lock:
                 entry = self._entry(program_run_id)
                 active_count, settled, scope_reason = scope_fields
                 entry.active_operation_count = active_count
                 if scope_reason is not None:
-                    entry.reason_code = scope_reason
-                    entry.message = "Kernel Program-run scope is unknown"
-                else:
-                    entry.reason_code = entry.state_after_stop_reason_code
-                    entry.message = entry.state_after_stop_message
-                if entry.state is ProgramRunState.STOPPING and settled:
-                    self._mark_finalizing(
-                        entry,
-                        state_after_finalize=entry.state_after_stop,
-                        reason_code=entry.state_after_stop_reason_code,
-                        message=entry.state_after_stop_message,
+                    self._set_runner_failure(
+                        entry, scope_reason, "Kernel Program-run scope is unknown"
                     )
+                else:
+                    self._restore_after_stop(entry)
+                if entry.state is ProgramRunState.STOPPING and settled:
+                    self._mark_finalizing_after_stop(entry)
                     finalize = True
                 snapshot = self._snapshot(entry)
             if finalize:
@@ -2477,6 +2588,7 @@ class ProgramRunOwner:
                     state_after_stop=ProgramRunState.FAILED,
                     reason_code="program_runtime_failed",
                     message=str(exc) or type(exc).__name__,
+                    origin=_RUNNER_FAILURE,
                 )
 
             status_name = tree_status.name.lower()
@@ -2492,6 +2604,7 @@ class ProgramRunOwner:
                         state_after_stop=ProgramRunState.FAILED,
                         reason_code="program_intervention_state_unknown",
                         message=str(exc) or type(exc).__name__,
+                        origin=_RUNNER_FAILURE,
                     )
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -2517,8 +2630,13 @@ class ProgramRunOwner:
                         tree_ticks=intervention.policy_parameter
                         == "operator_stop_policy",
                     )
-                    entry.reason_code = intervention.reason_code
-                    entry.message = intervention.message
+                    self._set_reason(
+                        entry,
+                        intervention.reason_code,
+                        intervention.message,
+                        details=intervention.details,
+                        origin=intervention.origin,
+                    )
                     entry.revision += 1
                     assessment = intervention.owner_assessment
                     ordinary_stop = (
@@ -2532,12 +2650,15 @@ class ProgramRunOwner:
                     self._capture_diagnostic(
                         entry,
                         "held" if ordinary_stop else "intervention_required",
+                        reason_code=intervention.reason_code,
                         message=(
                             "Program motion stopped and held; Resume Motion replans "
                             "from current state"
                             if ordinary_stop
-                            else None
+                            else intervention.message
                         ),
+                        details=intervention.details,
+                        origin=intervention.origin,
                     )
                     return self._snapshot(entry)
                 if tree_status is py_trees.common.Status.RUNNING:
@@ -2548,10 +2669,11 @@ class ProgramRunOwner:
                 if tree_status is py_trees.common.Status.SUCCESS
                 else ProgramRunState.FAILED
             )
-            terminal_reason_code: str | None = None
-            terminal_message = ""
-            if terminal_state is ProgramRunState.FAILED:
-                terminal_reason_code, terminal_message = run.terminal_failure()
+            terminal_failure = (
+                run.terminal_failure()
+                if terminal_state is ProgramRunState.FAILED
+                else None
+            )
             try:
                 scope_snapshot = self._scope.observe(program_run_id)
                 _active_count, scope_settled, _scope_reason = self._scope_fields(
@@ -2565,6 +2687,7 @@ class ProgramRunOwner:
                     state_after_stop=terminal_state,
                     reason_code="program_run_scope_unknown",
                     message=str(exc) or type(exc).__name__,
+                    origin=_RUNNER_FAILURE,
                 )
             if not scope_settled:
                 return self._begin_stop(
@@ -2573,21 +2696,30 @@ class ProgramRunOwner:
                     state_after_stop=terminal_state,
                     reason_code="program_terminal_scope_not_settled",
                     message=("Program tree terminated before its Kernel scope settled"),
+                    origin=_RUNNER_FAILURE,
                 )
 
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.RUNNING:
-                    self._capture_diagnostic(entry, terminal_state.value)
-                    entry.pending_diagnostic["reason_code"] = terminal_reason_code
-                    entry.pending_diagnostic["message"] = (
-                        terminal_message or f"Program {terminal_state.value}"
+                    terminal = (
+                        {
+                            "reason_code": None,
+                            "message": "",
+                            "details": None,
+                            "origin": None,
+                        }
+                        if terminal_failure is None
+                        else {
+                            "reason_code": terminal_failure.reason_code,
+                            "message": terminal_failure.message,
+                            "details": terminal_failure.details,
+                            "origin": terminal_failure.origin,
+                        }
                     )
+                    self._capture_diagnostic(entry, terminal_state.value, **terminal)
                     self._mark_finalizing(
-                        entry,
-                        state_after_finalize=terminal_state,
-                        reason_code=terminal_reason_code,
-                        message=terminal_message,
+                        entry, state_after_finalize=terminal_state, **terminal
                     )
             return self._reconcile_finalizing(program_run_id)
 
@@ -2884,6 +3016,7 @@ def build_applied_program_run_admission(
 
 __all__ = [
     "APPLIED_PROGRAM_SELECTION_API",
+    "PROGRAM_DIAGNOSTIC_API",
     "PROGRAM_RUN_STATUS_API",
     "PROGRAM_RUN_INPUT_API",
     "ProgramRunAdmission",

@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
 from threading import Barrier, Thread
 
 import pytest
+import rfc8785
 
-from manyforge_program_runner.cycle_journal import ProgramCycleJournal
+from manyforge_program_runner.cycle_journal import (
+    SCHEMA_VERSION,
+    ProgramCycleJournal,
+)
 
 
 def _file_identity(
@@ -69,7 +75,7 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
             database.execute("PRAGMA ignore_check_constraints=ON")
             database.execute(
                 "UPDATE program_cycle_metadata SET schema_version=? WHERE singleton=1",
-                (1 if kind == "old_schema" else 6,),
+                (1 if kind == "old_schema" else 7,),
             )
         elif kind == "extra_table":
             database.execute("CREATE TABLE unsupported_old_state(value TEXT)")
@@ -77,7 +83,7 @@ def test_existing_unsupported_database_is_rejected_without_mutation(
             database.execute("PRAGMA writable_schema=ON")
             database.execute(
                 "UPDATE sqlite_schema SET sql=replace(sql,"
-                "' CHECK(schema_version=5)','') "
+                "' CHECK(schema_version=6)','') "
                 "WHERE name='program_cycle_metadata'"
             )
             database.execute("PRAGMA writable_schema=OFF")
@@ -111,7 +117,7 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
     try:
         assert database.execute(
             "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
         assert {
             row[0]
             for row in database.execute(
@@ -125,6 +131,206 @@ def test_absent_database_creates_only_current_schema_under_existing_parent(
             "program_run_history",
             "program_persistent_value_requests",
         }
+    finally:
+        database.close()
+
+
+def _run_status_v2(program_run_id: str, **changes: object) -> dict[str, object]:
+    """One retained Program-run status v2 record, as versions 4 and 5 kept."""
+
+    return {
+        "schema_version": "manyforge.program_run_status.v2",
+        "owner_id": "program-runner.cell-a",
+        "owner_epoch": "program-runner.epoch.1",
+        "run_revision": 2,
+        "state": "failed",
+        "capture": {"program_run_id": program_run_id},
+        "tree_status": "failure",
+        "node_status_revision": 2,
+        "node_statuses": {"move": "failure"},
+        "active_operation_count": 0,
+        "reason_code": "owner_request_failed",
+        "message": "addressed observed state is unavailable",
+        **changes,
+    }
+
+
+def _run_status_v3(program_run_id: str) -> dict[str, object]:
+    return {
+        **_run_status_v2(program_run_id),
+        "schema_version": "manyforge.program_run_status.v3",
+        "details": None,
+        "origin": None,
+    }
+
+
+def _settlement_reference(settlement: dict[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(rfc8785.dumps(settlement)).hexdigest()
+
+
+def _downgrade_to_v5(path: Path) -> None:
+    """Rewrite a current journal into exactly the version 5 layout."""
+
+    database = sqlite3.connect(path, isolation_level=None)
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            "CREATE TABLE program_cycle_metadata_v5 ( "
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "schema_version INTEGER NOT NULL CHECK(schema_version=5) )"
+        )
+        database.execute("INSERT INTO program_cycle_metadata_v5 VALUES(1,5)")
+        database.execute("DROP TABLE program_cycle_metadata")
+        database.execute(
+            "ALTER TABLE program_cycle_metadata_v5 RENAME TO program_cycle_metadata"
+        )
+        database.execute("COMMIT")
+    finally:
+        database.close()
+
+
+def _v5_journal_with_v2_records(path: Path) -> dict[str, object]:
+    """A version 5 journal retaining v2 history and a settled Start."""
+
+    journal = ProgramCycleJournal(path, owner_epoch="runner.old")
+    journal.retain_run_snapshot(
+        _run_status_v2("run.0", state="succeeded", reason_code=None, message="")
+    )
+    settlement = {
+        "schema_version": "manyforge.program_cycle_start_settlement.v1",
+        "kind": "terminal_effects_settled",
+        "claim": None,
+        "program_run_id": "run.1",
+        "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
+        "terminal_run": _run_status_v2("run.1"),
+    }
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="terminal_awaiting_reset",
+        program_run_id="run.1",
+        run_snapshot=_run_status_v2("run.1"),
+        start_settlement=settlement,
+        terminal_reference=_settlement_reference(settlement),
+    )
+    journal.close()
+    _downgrade_to_v5(path)
+    return settlement
+
+
+def test_a_version_5_journal_carries_retained_run_status_to_v3(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    settlement = _v5_journal_with_v2_records(path)
+
+    upgraded = ProgramCycleJournal(path, owner_epoch="runner.new")
+    try:
+        assert upgraded.read_run_snapshot("run.1") == _run_status_v3("run.1")
+        assert upgraded.read_run_snapshot("run.0") == {
+            **_run_status_v3("run.0"),
+            "state": "succeeded",
+            "reason_code": None,
+            "message": "",
+        }
+        runs, truncated = upgraded.list_run_snapshots(limit=8)
+        assert not truncated
+        assert {run["schema_version"] for run in runs} == {
+            "manyforge.program_run_status.v3"
+        }
+        # The settlement's embedded terminal run is the same v3 record, and
+        # its terminal reference covers the migrated settlement exactly.
+        cycle = upgraded.read()
+        migrated = {**settlement, "terminal_run": _run_status_v3("run.1")}
+        assert cycle.start_settlement == migrated
+        assert cycle.terminal_reference == _settlement_reference(migrated)
+        assert cycle.start_settlement["terminal_run"] == (
+            upgraded.read_run_snapshot("run.1")
+        )
+    finally:
+        upgraded.close()
+    database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        assert database.execute(
+            "SELECT schema_version FROM program_cycle_metadata"
+        ).fetchone() == (6,)
+    finally:
+        database.close()
+
+
+def test_a_version_6_journal_opens_with_its_records_unchanged(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    _v5_journal_with_v2_records(path)
+    ProgramCycleJournal(path, owner_epoch="runner.new").close()
+
+    def stored() -> list[tuple[object, ...]]:
+        database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            return [
+                *database.execute(
+                    "SELECT * FROM program_run_history ORDER BY program_run_id"
+                ),
+                *database.execute(
+                    "SELECT terminal_reference,start_settlement_json "
+                    "FROM program_cycle"
+                ),
+            ]
+        finally:
+            database.close()
+
+    before = stored()
+    ProgramCycleJournal(path, owner_epoch="runner.newer").close()
+    assert stored() == before
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["history_v1", "history_extra_field", "settlement_run", "settlement_reference"],
+)
+def test_a_version_5_journal_with_an_unexpected_record_fails_closed(
+    tmp_path: Path, corruption: str
+) -> None:
+    path = tmp_path / "cycle.sqlite3"
+    _v5_journal_with_v2_records(path)
+    database = sqlite3.connect(path)
+    if corruption.startswith("history"):
+        record = (
+            _run_status_v2("run.0", schema_version="manyforge.program_run_status.v1")
+            if corruption == "history_v1"
+            else _run_status_v2("run.0", details=None)
+        )
+        database.execute(
+            "UPDATE program_run_history SET snapshot_json=? WHERE program_run_id=?",
+            (json.dumps(record), "run.0"),
+        )
+    elif corruption == "settlement_run":
+        settlement = json.loads(
+            database.execute("SELECT start_settlement_json FROM program_cycle")
+            .fetchone()[0]
+        )
+        settlement["terminal_run"] = {"state": "failed"}
+        database.execute(
+            "UPDATE program_cycle SET start_settlement_json=?,terminal_reference=?",
+            (json.dumps(settlement), _settlement_reference(settlement)),
+        )
+    else:
+        database.execute(
+            "UPDATE program_cycle SET terminal_reference=?", ("sha256:" + "c" * 64,)
+        )
+    database.commit()
+    database.close()
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        ProgramCycleJournal(path, owner_epoch="runner.new")
+
+    # The failed migration rolled back: the version 5 journal is unchanged.
+    database = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        assert database.execute(
+            "SELECT schema_version FROM program_cycle_metadata"
+        ).fetchone() == (5,)
     finally:
         database.close()
 
@@ -161,11 +367,7 @@ def test_a_version_4_journal_is_upgraded_in_place_without_losing_state(
         expected_states=("idle_after_reset",),
         state="terminal_awaiting_reset",
         program_run_id="run.1",
-        run_snapshot={
-            "run_revision": 2,
-            "state": "succeeded",
-            "capture": {"program_run_id": "run.1"},
-        },
+        run_snapshot=_run_status_v2("run.1"),
         terminal_reference="sha256:" + "b" * 64,
     )
     journal.close()
@@ -175,11 +377,8 @@ def test_a_version_4_journal_is_upgraded_in_place_without_losing_state(
     try:
         assert upgraded.read().state == "terminal_awaiting_reset"
         assert upgraded.read().owner_epoch == "runner.old"
-        assert upgraded.read_run_snapshot("run.1") == {
-            "run_revision": 2,
-            "state": "succeeded",
-            "capture": {"program_run_id": "run.1"},
-        }
+        # Versions 4 and 5 retained run status v2; it is carried to v3.
+        assert upgraded.read_run_snapshot("run.1") == _run_status_v3("run.1")
     finally:
         upgraded.close()
     # The upgraded file is exactly the current schema: it opens again as such.
@@ -188,7 +387,7 @@ def test_a_version_4_journal_is_upgraded_in_place_without_losing_state(
     try:
         assert database.execute(
             "SELECT schema_version FROM program_cycle_metadata"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
     finally:
         database.close()
 
@@ -395,7 +594,7 @@ def test_read_only_preflight_sees_crash_left_wal_without_mutating_it(
         reader.execute("BEGIN")
         assert reader.execute(
             "SELECT schema_version FROM program_cycle_metadata"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -1106,3 +1305,17 @@ def test_terminal_observation_is_exact_idempotent_and_race_safe(tmp_path) -> Non
         )
     assert journal.read() == terminal
     journal.close()
+
+
+def test_native_settlement_readers_accept_the_current_journal_schema() -> None:
+    """The native host reads this journal directly: its newest accepted schema
+    must be this runner's, or every restart refuses a current journal."""
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "manyforge_roboplan/src/owner_settlement_readers.cpp"
+    ).read_text(encoding="utf-8")
+    assert (
+        f"constexpr int kNewestProgramCycleJournalSchema = {SCHEMA_VERSION};"
+        in source
+    )

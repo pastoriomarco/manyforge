@@ -38,13 +38,20 @@ _REFERENCE_FIELDS = frozenset(
 )
 
 
+# Retained Program diagnostic versions. Originals recorded before a schema
+# cutover keep their recorded version and this producer-only attribution.
+_PROGRAM_DIAGNOSTIC_SCHEMAS = frozenset(
+    ("manyforge.program_diagnostic.v1", "manyforge.program_diagnostic.v2")
+)
+
+
 def causal_references(payload: Any) -> tuple[dict[str, list[str]], bool]:
     """All applicable bounded references, never an arbitrary first sibling."""
     # Values can legitimately be named program_run_id, operation_id, etc.
     # Their names are data, never alternate identities for this capture.
     if (
         isinstance(payload, dict)
-        and payload.get("schema_version") == "manyforge.program_diagnostic.v1"
+        and payload.get("schema_version") in _PROGRAM_DIAGNOSTIC_SCHEMAS
     ):
         payload = {
             key: value

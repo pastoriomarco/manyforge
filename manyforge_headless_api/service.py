@@ -69,6 +69,7 @@ from .models import (
     SkillExpansionRequest,
     StopIntentRequest,
     StopFaultRecoveryIntentRequest,
+    validate_failure_details_and_origin,
 )
 from .cell_admission import CellAdmissionError
 from .component_overview import ComponentOverviewFacts
@@ -85,7 +86,7 @@ from .program_binding_projection import (
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
-PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v2"
+PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v3"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
@@ -1301,9 +1302,11 @@ class HeadlessService:
         expected_fields = {
             "active_operation_count",
             "capture",
+            "details",
             "message",
             "node_status_revision",
             "node_statuses",
+            "origin",
             "owner_epoch",
             "owner_id",
             "reason_code",
@@ -1408,6 +1411,17 @@ class HeadlessService:
                 "program_runner_response_invalid",
                 "Program runner returned an invalid run status",
             )
+        try:
+            validate_failure_details_and_origin(
+                projection["details"], projection["origin"]
+            )
+            if state == "succeeded" and projection["origin"] is not None:
+                raise ValueError("a succeeded run carries no failure origin")
+        except ValueError as exc:
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned invalid run failure details or origin",
+            ) from exc
         roles: list[str] = []
         runner_identity: dict[str, Any] | None = None
         for identity in owner_identities:

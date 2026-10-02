@@ -130,10 +130,17 @@ def test_same_revision_source_order_survives_late_feedback_and_later_terminal_ac
     assert bundle["latency"]["acceptance_to_terminal"]["p99"] == "11"
 
 
-def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit():
+# A retained v1 original keeps its recorded version and attribution rule.
+@pytest.mark.parametrize(
+    "schema_version",
+    ["manyforge.program_diagnostic.v1", "manyforge.program_diagnostic.v2"],
+)
+def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
+    schema_version,
+):
     event = record(1)
     event["event"]["payload"] = {
-        "schema_version": "manyforge.program_diagnostic.v1",
+        "schema_version": schema_version,
         "program_run_id": "run.1",
         "blackboard": {"ready": False, "program_run_id": "foreign.run"},
         "runtime_overrides": {'["move","scale"]': 0.4},

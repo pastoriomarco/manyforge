@@ -9,6 +9,11 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Final, Protocol
 
+from manyforge_behavior.failure_details import (
+    require_failure_details,
+    require_failure_origin,
+)
+
 
 PROGRAM_MOTION_STOP_RECOVERY_CLASSES: Final = frozenset(
     {"ordinary_operator_stop", "stop_fault_intervention"}
@@ -263,6 +268,8 @@ class OwnerTaskSnapshot:
     # False means no settlement proof is carried, not that motion is active.
     # Successful native tasks still cross the exact acknowledgement gate.
     settlement_proven: bool = False
+    # The owner's bounded structured cause (`bounded_failure_details`).
+    details: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -287,6 +294,9 @@ class OwnerTaskSnapshot:
             not isinstance(self.reason_code, str) or not self.reason_code
         ):
             raise ValueError("a failed owner task must carry a reason code")
+        if self.state is OwnerTaskState.SUCCEEDED and self.details is not None:
+            raise ValueError("a successful owner task cannot carry failure details")
+        object.__setattr__(self, "details", require_failure_details(self.details))
         object.__setattr__(self, "output", deepcopy(self.output))
         object.__setattr__(
             self,
@@ -331,6 +341,8 @@ class OwnerInvocationResult:
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     reason_code: str | None = None
     message: str = ""
+    # The owner's bounded structured cause (`bounded_failure_details`).
+    details: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if type(self.succeeded) is not bool:
@@ -347,6 +359,9 @@ class OwnerInvocationResult:
             not isinstance(self.reason_code, str) or not self.reason_code
         ):
             raise ValueError("a failed invocation must carry a reason code")
+        if self.succeeded and self.details is not None:
+            raise ValueError("a successful invocation cannot carry failure details")
+        object.__setattr__(self, "details", require_failure_details(self.details))
         object.__setattr__(self, "output", deepcopy(self.output))
         object.__setattr__(
             self,
@@ -386,13 +401,15 @@ class OwnerInvocationPort(Protocol):
 
 
 def describe_owner_failure(message: str, details: object) -> str:
-    """Append an owner rejection's structured cause to its human message.
+    """Name an owner rejection's structured cause once in its human message.
 
     Owner rejections carry the precise cause in ``details.reason``; a missing
     or ambiguous reference also names the failed reference in
     ``details.reference_type`` and ``details.reference_id`` (and
     ``details.target_role_id`` for another robot's frame). The human message
-    alone is often generic, so these are appended for logs and the Composer.
+    alone is often generic, so it names them too, where the failure is
+    described; the same bounded details travel separately as the failure's
+    ``details`` and are never re-parsed from this text.
     """
 
     if not isinstance(details, Mapping):
@@ -414,28 +431,24 @@ def describe_owner_failure(message: str, details: object) -> str:
     return f"{message} ({'; '.join(notes)})" if notes else message
 
 
-def owner_failure_details(exc: BaseException) -> Mapping[str, Any] | None:
-    """The structured details of an owner rejection, if the error carries any."""
-
-    details = getattr(exc, "details", None)
-    if isinstance(details, Mapping):
-        return details
-    response = getattr(exc, "response", None)
-    error = response.get("error") if isinstance(response, Mapping) else None
-    details = error.get("details") if isinstance(error, Mapping) else None
-    return details if isinstance(details, Mapping) else None
-
-
 class FrameTransformError(RuntimeError):
     """The owner refused or could not answer one frame transform.
 
     ``reason_code`` is the owner's stable reason (for example
-    ``program_reference_robot_not_local``) or ``frame_transform_failed``.
+    ``program_reference_robot_not_local``) or ``frame_transform_failed``;
+    ``details`` the owner's bounded structured cause, if any.
     """
 
-    def __init__(self, reason_code: str, message: str) -> None:
+    def __init__(
+        self,
+        reason_code: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        self.details = require_failure_details(details)
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,10 +580,18 @@ class ProgramInterventionSnapshot:
     owner_port_name: str | None = None
     owner_task_id: str | None = None
     owner_assessment: Mapping[str, Any] | None = None
+    # The failure's bounded details and origin; both None when the
+    # intervention does not describe a failure (an operator Stop).
+    details: Mapping[str, Any] | None = None
+    origin: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, NodeAttemptIdentity):
             raise TypeError("intervention identity is invalid")
+        object.__setattr__(self, "details", require_failure_details(self.details))
+        object.__setattr__(self, "origin", require_failure_origin(self.origin))
+        if self.details is not None and self.origin is None:
+            raise ValueError("intervention failure details require an origin")
         for field_name, maximum_bytes in (
             ("reason_code", 256),
             ("policy_parameter", 256),
@@ -626,6 +647,8 @@ class ProgramInterventionPort(Protocol):
         owner_port_name: str | None = None,
         owner_task_id: str | None = None,
         owner_assessment: Mapping[str, Any] | None = None,
+        details: Mapping[str, Any] | None = None,
+        origin: Mapping[str, Any] | None = None,
     ) -> ProgramInterventionSnapshot: ...
 
     def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
@@ -751,7 +774,6 @@ __all__ = [
     "ProgramRunPortContext",
     "OwnerNodeInputs",
     "describe_owner_failure",
-    "owner_failure_details",
     "FrameTransformError",
     "FrameTransformPort",
     "FrameTransformResult",

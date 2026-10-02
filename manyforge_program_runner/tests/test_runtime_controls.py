@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from manyforge_behavior.failure_details import bounded_failure_details, failure_origin
 from manyforge_program_runner.runtime_controls import (
     ProgramRuntimeControlError,
     ProgramRuntimeControls,
@@ -70,7 +71,22 @@ def _intervention(
         owner_assessment=assessment,
         owner_task_id="operation.1",
         reason_code="motion_intervention",
+        message="motion owner refused the path (path_blocked)",
         policy_parameter=policy_parameter,
+        # A failure pause carries the owner's bounded failure; an operator
+        # Stop is not a failure.
+        details=(
+            None
+            if policy_parameter == "operator_stop_policy"
+            else bounded_failure_details({"reason": "path_blocked"})
+        ),
+        origin=(
+            None
+            if policy_parameter == "operator_stop_policy"
+            else failure_origin(
+                "owner", node_instance_id="move.1", owner_api="kernel.operation"
+            )
+        ),
     )
 
 
@@ -410,6 +426,16 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         policy=_policy(),
     )
     assert offer is not None
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v3"
+    # The held node's own failure is carried unchanged.
+    assert offer["reason_code"] == "motion_intervention"
+    assert offer["message"] == "motion owner refused the path (path_blocked)"
+    assert offer["details"] == {"reason": "path_blocked"}
+    assert offer["origin"] == {
+        "kind": "owner",
+        "node_instance_id": "move.1",
+        "owner_api": "kernel.operation",
+    }
     assert offer["valid_until_ns"] is None
     assert offer["primary_action"] == "acknowledge_and_continue"
     assert all(offer[field] == value for field, value in _fences().items())
@@ -526,6 +552,8 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
         "enabled": False,
         "disabled_reason_code": "operator_stop_requires_owner_recovery",
     }
+    # An operator Stop is not a failure: no details, no origin.
+    assert offer["details"] is None and offer["origin"] is None
     selected = controls.recovery_offer(
         cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention,
         policy=_policy(), selection_revision=3,

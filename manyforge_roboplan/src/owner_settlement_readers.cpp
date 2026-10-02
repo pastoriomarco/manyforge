@@ -21,6 +21,12 @@ namespace core = manyforge::core;
 namespace {
 
 constexpr int kBusyTimeoutMilliseconds = 5000;
+// Program-cycle journal schemas these readers accept. The newest equals
+// `SCHEMA_VERSION` in manyforge_program_runner/cycle_journal.py (a runner test
+// checks this). v5 -> v6 only rewrote retained run-status records to
+// `program_run_status.v3`; the capture and state fields read here are unchanged.
+constexpr int kOldestProgramCycleJournalSchema = 3;
+constexpr int kNewestProgramCycleJournalSchema = 6;
 
 class Statement final {
 public:
@@ -301,7 +307,8 @@ ReadActiveProgramRunProductForReconciliation(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if (schema_version < 3 || schema_version > 5 || metadata.Step())
+    if (schema_version < kOldestProgramCycleJournalSchema ||
+        schema_version > kNewestProgramCycleJournalSchema || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
 
     Statement row(database.get(),
@@ -399,7 +406,8 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if (schema_version < 3 || schema_version > 5 || metadata.Step())
+    if (schema_version < kOldestProgramCycleJournalSchema ||
+        schema_version > kNewestProgramCycleJournalSchema || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),
@@ -459,7 +467,8 @@ ValidateProgramRunnerOwnerReconciliationReadOnly(
     if (!metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     const auto schema_version = metadata.Integer(0);
-    if (schema_version < 3 || schema_version > 5 || metadata.Step())
+    if (schema_version < kOldestProgramCycleJournalSchema ||
+        schema_version > kNewestProgramCycleJournalSchema || metadata.Step())
       throw std::runtime_error("Program-cycle journal schema differs");
     Statement row(
         database.get(),

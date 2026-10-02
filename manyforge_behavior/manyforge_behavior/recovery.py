@@ -7,6 +7,7 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.failure_details import failure_origin
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     NodeAttemptSource,
@@ -85,9 +86,7 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
         if self.decorated.status is not py_trees.common.Status.FAILURE:
             return self.decorated.status
         identity = self._exact_identity()
-        reason = getattr(
-            self.decorated, "failure_reason_code", None
-        ) or "program_node_failed"
+        reason = getattr(self.decorated, "failure_reason_code", None)
         message = getattr(self.decorated, "failure_message", "")
         owner_context = getattr(
             self.decorated, "owner_recovery_context", None
@@ -95,9 +94,16 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
         owner_context = dict(owner_context) if isinstance(owner_context, dict) else {}
         self._recovery_port.require(
             identity,
-            reason_code=reason,
+            reason_code=reason or "program_node_failed",
             message=message,
             policy_parameter="recovery_policy",
+            # A node that names no reason failed by itself (its condition).
+            details=None if reason is None else self.decorated.failure_details,
+            origin=(
+                failure_origin("program_node", node_instance_id=self._node_instance_id)
+                if reason is None
+                else self.decorated.failure_origin.for_node(self._node_instance_id)
+            ),
             **owner_context,
         )
         self._held = True

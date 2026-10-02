@@ -1,3 +1,5 @@
+import { humanizeReasonCode } from '../state/structuredError';
+
 export interface KernelErrorView {
   code: string;
   message: string;
@@ -54,8 +56,7 @@ export function errorPresentationKey(error: KernelErrorView): string {
 }
 
 export function readableErrorCode(code: string): string {
-  const readable = code.trim().replaceAll('_', ' ');
-  return readable || 'Runtime error';
+  return humanizeReasonCode(code) || 'Runtime error';
 }
 
 export function prettyBodyId(bodyId: string): string {

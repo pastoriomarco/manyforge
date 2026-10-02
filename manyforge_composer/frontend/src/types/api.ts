@@ -714,6 +714,29 @@ export type ProgramRunStateName =
   | 'succeeded'
   | 'failed';
 
+/** Where a failure happened (spec error contract `origin`). */
+export interface FailureOrigin {
+  kind: 'program_node' | 'owner' | 'program_runner';
+  nodeInstanceId: string | null;
+  ownerApi: string | null;
+}
+
+/** Bounded flat failure details: one scalar value per registered key. */
+export type FailureDetails = Record<string, string | number | boolean | null>;
+
+/**
+ * One failure as produced at its source: the stable code, the human message
+ * and, when carried, its bounded details and origin. Run records and API
+ * errors map into this one shape; it is for display only and never selects a
+ * recovery action.
+ */
+export interface StructuredError {
+  code: string;
+  message: string;
+  details: FailureDetails | null;
+  origin: FailureOrigin | null;
+}
+
 export interface ProgramRunOwnerIdentity {
   ownerRole: string;
   ownerId: string;
@@ -737,7 +760,7 @@ export interface ProgramRunCapture {
 }
 
 export interface ProgramRunStatus {
-  schemaVersion: 'manyforge.program_run_status.v2';
+  schemaVersion: 'manyforge.program_run_status.v3';
   ownerId: string;
   ownerEpoch: string;
   runRevision: number;
@@ -750,7 +773,11 @@ export interface ProgramRunStatus {
     'idle' | 'running' | 'held' | 'success' | 'failure' | 'interrupted'
   >;
   activeOperationCount: number | null;
-  reasonCode: string | null;
+  /**
+   * Why the run is in its state (a failure, a Stop or a pause), null when the
+   * owner names no reason. Its message is the status `message`.
+   */
+  reason: StructuredError | null;
   message: string;
 }
 
@@ -953,7 +980,7 @@ export interface CycleRecoveryAction {
 }
 
 export interface CycleRecoveryOffer {
-  schemaVersion: 'manyforge.cycle_recovery_offer.v2';
+  schemaVersion: 'manyforge.cycle_recovery_offer.v3';
   offerId: string;
   offerRevision: number;
   generatedAtNs: Nanoseconds;
@@ -987,7 +1014,11 @@ export interface CycleRecoveryOffer {
     disabledReasonCode: string | null;
   };
   primaryAction: CycleRecoveryActionId | null;
-  reasonCode: string;
+  /**
+   * The held node's own failure (or the Stop that holds it). Several nodes can
+   * be held at once, so each offer carries its full reason.
+   */
+  reason: StructuredError;
   evidenceRefs: string[];
   policy: Record<string, JsonValue>;
 }

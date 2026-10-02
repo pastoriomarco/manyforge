@@ -261,7 +261,9 @@ SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
   std::set<std::string> run, operation, condition;
   const auto* schema = StringMember(payload, "schema_version");
   const bool producer_identities_only =
-      schema != nullptr && *schema == "manyforge.program_diagnostic.v1";
+      schema != nullptr &&
+      std::ranges::find(kProgramDiagnosticSchemaVersions, *schema) !=
+          kProgramDiagnosticSchemaVersions.end();
   std::size_t visited = 0U;
   bool complete = true;
   const auto visit = [&](auto &&self, const CanonicalValue &current, std::size_t depth) -> void {

@@ -38,6 +38,7 @@ import {
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunStatus,
+  parseApiErrorDto,
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioDocumentIndexResponse,
@@ -776,7 +777,7 @@ describe('Program product projections', () => {
 
   function runStatus(state = 'running'): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_run_status.v2',
+      schema_version: 'manyforge.program_run_status.v3',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       run_revision: 3,
@@ -807,6 +808,77 @@ describe('Program product projections', () => {
       active_operation_count: 1,
       reason_code: null,
       message: '',
+      details: null,
+      origin: null,
+    };
+  }
+
+  function failedRunStatus(
+    details: unknown,
+    origin: unknown = { kind: 'owner', node_instance_id: 'move', owner_api: 'scene.frames' },
+  ): Record<string, unknown> {
+    return {
+      ...runStatus('failed'),
+      tree_status: 'failure',
+      node_statuses: { root: 'failure', move: 'failure' },
+      reason_code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details,
+      origin,
+    };
+  }
+
+  function recoveryOffer(): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.cycle_recovery_offer.v3',
+      offer_id: digestA,
+      offer_revision: 1,
+      generated_at_ns: 10,
+      valid_until_ns: null,
+      kernel_assessment_revision: 0,
+      control_command_epoch: 0,
+      operation_id: null,
+      operation_revision: null,
+      program_run_id: 'program-run.1',
+      program_binding_id: digestC,
+      node_instance_id: 'move',
+      node_attempt_id: 'move.attempt.1',
+      participants: [],
+      graph_revision: digestB,
+      retained_bundle_id: digestA,
+      cycle_generation: 1,
+      program_generation: 1,
+      deployment_generation: 1,
+      scene_admission_epoch: 1,
+      pose_source_apply_generation: 0,
+      latch_id: null,
+      stop_id: null,
+      stop_generation: null,
+      stop_certificate_id: null,
+      stop_certificate_revision: null,
+      status: 'action_required',
+      recovery_class: 'node_failure_pause',
+      actions: [{
+        action_id: 'reset_cycle',
+        label_key: 'recovery.reset_cycle',
+        requires_confirmation: true,
+        performs_backend_reset: true,
+        enabled: true,
+        disabled_reason_code: null,
+      }],
+      primary_action: null,
+      reason_code: 'node_input_unavailable',
+      message: "missing input duration_s from blackboard_key 'delay'",
+      details: {
+        input_problem: 'missing',
+        path: 'duration_s',
+        source_kind: 'blackboard_key',
+        source_reference: 'delay',
+      },
+      origin: { kind: 'program_node', node_instance_id: 'move', owner_api: null },
+      evidence_refs: [],
+      manual_result: { enabled: false, disabled_reason_code: 'manual_result_not_available' },
+      policy: {},
     };
   }
 
@@ -984,6 +1056,161 @@ describe('Program product projections', () => {
     const status = parseProgramRunStatus(runStatus());
 
     expect(status.capture.programRunId).toBe('program-run.1');
+  });
+
+  it('carries a run failure as one structured error', () => {
+    const status = parseProgramRunStatus(failedRunStatus({
+      reason: 'frame_role_unresolved',
+      reference_type: 'frame_role',
+      reference_id: 'tool0',
+      target_role_id: 'arm',
+      retryable: false,
+    }));
+
+    expect(status.reason).toEqual({
+      code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details: {
+        reason: 'frame_role_unresolved',
+        reference_type: 'frame_role',
+        reference_id: 'tool0',
+        target_role_id: 'arm',
+        retryable: false,
+      },
+      origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'scene.frames' },
+    });
+    expect(status.message).toBe('frame role tool0 is not available');
+    expect(parseProgramRunStatus(runStatus()).reason).toBeNull();
+    const stopped = { ...runStatus('stopped'), reason_code: 'operator_stop', message: 'Stopped' };
+    expect(parseProgramRunStatus(stopped).reason).toEqual({
+      code: 'operator_stop', message: 'Stopped', details: null, origin: null,
+    });
+  });
+
+  it('accepts a retained failed run migrated without details or origin', () => {
+    expect(parseProgramRunStatus(failedRunStatus(null, null)).reason).toEqual({
+      code: 'owner_request_failed',
+      message: 'frame role tool0 is not available',
+      details: null,
+      origin: null,
+    });
+  });
+
+  it('refuses failure details outside their registered bounds', () => {
+    expect(() => parseProgramRunStatus(failedRunStatus({ stack: 'trace' })))
+      .toThrow(/registered failure-detail key/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: { nested: true } })))
+      .toThrow(/scalar failure detail/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: ['a'] })))
+      .toThrow(/scalar failure detail/);
+    expect(() => parseProgramRunStatus(failedRunStatus({ retryable: 2 ** 53 })))
+      .toThrow(/scalar failure detail/);
+    expect(parseProgramRunStatus(failedRunStatus({ retryable: -1.5 }))
+      .reason?.details?.retryable).toBe(-1.5);
+    expect(() => parseProgramRunStatus(failedRunStatus({ reason: 'é'.repeat(129) })))
+      .toThrow(/at most 256 bytes/);
+    expect(parseProgramRunStatus(failedRunStatus({ reason: 'é'.repeat(128) }))
+      .reason?.details?.reason).toBe('é'.repeat(128));
+    expect(() => parseProgramRunStatus(failedRunStatus([]))).toThrow(/an object/);
+    const keys = [
+      'reason', 'reference_type', 'reference_id', 'target_role_id', 'input_problem',
+      'path', 'source_kind', 'source_reference', 'latch_id', 'retryable', 'required_action',
+    ];
+    const large = Object.fromEntries(keys.map((key) => [key, 'x'.repeat(200)]));
+    expect(() => parseProgramRunStatus(failedRunStatus(large)))
+      .toThrow(/at most 2048 bytes/);
+    expect(() => parseProgramRunStatus(failedRunStatus(
+      { retryable: true },
+      null,
+    ))).toThrow(/null unless the record names a failure origin/);
+    expect(() => parseProgramRunStatus({
+      ...runStatus(),
+      origin: { kind: 'program_runner', node_instance_id: null, owner_api: null },
+    })).toThrow(/null when the run names no reason/);
+  });
+
+  it('refuses failure origins outside their kinds', () => {
+    const origin = (value: unknown) => parseProgramRunStatus(failedRunStatus(null, value)).reason?.origin;
+    expect(origin({ kind: 'program_runner', node_instance_id: null, owner_api: null }))
+      .toEqual({ kind: 'program_runner', nodeInstanceId: null, ownerApi: null });
+    expect(origin({ kind: 'owner', node_instance_id: 'move', owner_api: null }))
+      .toEqual({ kind: 'owner', nodeInstanceId: 'move', ownerApi: null });
+    for (const invalid of [
+      { kind: 'program_node', node_instance_id: null, owner_api: null },
+      { kind: 'program_node', node_instance_id: 'move', owner_api: 'kernel.operation' },
+      { kind: 'owner', node_instance_id: null, owner_api: 'kernel.operation' },
+      { kind: 'program_runner', node_instance_id: null, owner_api: 'kernel.operation' },
+      { kind: 'operator', node_instance_id: 'move', owner_api: null },
+    ]) {
+      expect(() => origin(invalid)).toThrow(/origin must be a program_node/);
+    }
+    expect(() => origin({ kind: 'owner', node_instance_id: 'move' })).toThrow(/exactly/);
+    expect(() => origin({ kind: 'owner', node_instance_id: '', owner_api: null }))
+      .toThrow(/nonempty identity/);
+    expect(() => origin({ kind: 'owner', node_instance_id: 'm'.repeat(257), owner_api: null }))
+      .toThrow(/at most 256 bytes/);
+  });
+
+  it('carries the held failure details and origin on the recovery offer', () => {
+    const offer = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: recoveryOffer(),
+    }).recoveryOffer;
+
+    expect(offer?.reason).toEqual({
+      code: 'node_input_unavailable',
+      message: "missing input duration_s from blackboard_key 'delay'",
+      details: {
+        input_problem: 'missing',
+        path: 'duration_s',
+        source_kind: 'blackboard_key',
+        source_reference: 'delay',
+      },
+      origin: { kind: 'program_node', nodeInstanceId: 'move', ownerApi: null },
+    });
+    const withoutMessage = recoveryOffer();
+    delete withoutMessage.message;
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: withoutMessage,
+    })).toThrow(/exactly/);
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), message: 'é'.repeat(2049) },
+    })).toThrow(/at most 4096 bytes/);
+    expect(parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), message: 'é'.repeat(2048) },
+    }).recoveryOffer?.reason.message).toBe('é'.repeat(2048));
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v2' },
+    })).toThrow(/cycle_recovery_offer.v3/);
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: { ...recoveryOffer(), details: { secret: 'x' } },
+    })).toThrow(/registered failure-detail key/);
+  });
+
+  it('exposes a Composer ErrorDTO as a structured error without an origin', () => {
+    expect(parseApiErrorDto({
+      detail: {
+        code: 'activation_preparation_failed',
+        message: 'candidate could not be prepared',
+        details: { preparer_detail: 'bad frame', attempt: 2, nested: { a: 1 } },
+      },
+    })).toEqual({
+      code: 'activation_preparation_failed',
+      message: 'candidate could not be prepared',
+      details: { preparer_detail: 'bad frame', attempt: 2 },
+      origin: null,
+    });
+    expect(parseApiErrorDto({ detail: { code: 'authoring_not_ready' } })).toEqual({
+      code: 'authoring_not_ready', message: '', details: null, origin: null,
+    });
+    expect(parseApiErrorDto({ detail: 'upstream failed' })).toBeNull();
+    expect(parseApiErrorDto({ detail: { message: 'no code' } })).toBeNull();
+    expect(parseApiErrorDto(null)).toBeNull();
   });
 
   it('accepts a node held until Run and refuses unknown node statuses', () => {

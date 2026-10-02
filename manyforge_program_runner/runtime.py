@@ -54,6 +54,7 @@ from manyforge_behavior.production_ports import (
 )
 from manyforge_behavior.program_run_owner import (
     PROGRAM_RESET_STOP_REASON,
+    PROGRAM_RUN_STATUS_API,
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
@@ -991,6 +992,9 @@ class ProgramRuntime:
         terminal = deepcopy(dict(retained))
         terminal.update(
             {
+                # The same Stop presentation an ordinary owner Stop produces:
+                # a Stop is not a failure, so it has no details or origin.
+                "schema_version": PROGRAM_RUN_STATUS_API,
                 "run_revision": revision + 1,
                 "state": "stopped",
                 "tree_status": "invalid",
@@ -1003,6 +1007,8 @@ class ProgramRuntime:
                 "active_operation_count": 0,
                 "reason_code": None,
                 "message": "",
+                "details": None,
+                "origin": None,
             }
         )
         self._record_terminal_snapshot(terminal)

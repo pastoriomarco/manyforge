@@ -39,6 +39,22 @@ it('classifies only exact authoring pre-effect refusals', () => {
   expect(authoringRefusalMessage(new Error('authoring_not_ready'))).toBeNull();
 });
 
+it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
+  const error = new ApiError('refused', 409, { detail: {
+    code: 'stale_generation',
+    message: 'admission moved',
+    details: { expected: 3, current: 4 },
+  } });
+  expect(error.structuredError).toEqual({
+    code: 'stale_generation',
+    message: 'admission moved',
+    details: { expected: 3, current: 4 },
+    origin: null,
+  });
+  expect(new ApiError('Bad Gateway', 502, null).structuredError).toBeNull();
+  expect(new ApiError('failure', 503, { detail: 'upstream unavailable' }).structuredError).toBeNull();
+});
+
 it('classifies a named observed-move refusal by its code, whatever its status', () => {
   const message = 'current pose/joints could not be read: execution owner disconnected';
   for (const status of [502, 503]) {

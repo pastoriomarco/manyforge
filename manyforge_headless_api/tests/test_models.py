@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
+import re
 
 import pytest
 from pydantic import ValidationError
 
+from manyforge_behavior.failure_details import FAILURE_DETAIL_KEYS
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -90,7 +93,7 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
     with pytest.raises(ValidationError):
         ProgramDiagnosticRequest.model_validate(
             {
-                "schema_version": "manyforge.program_diagnostic.v1",
+                "schema_version": "manyforge.program_diagnostic.v2",
                 "program_run_id": "run.1",
                 "owner_epoch": "runner.1",
                 "program_revision": "sha256:" + "a" * 64,
@@ -107,8 +110,38 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
                 "omitted_blackboard_count": 0,
                 "omitted_override_count": 0,
                 "delivery_loss_count": 0,
+                "details": None,
+                "origin": None,
             }
         )
+
+
+_CONTRACT_FAILURE_DETAIL_KEYS = frozenset(
+    {
+        "reason",
+        "reference_type",
+        "reference_id",
+        "target_role_id",
+        "input_problem",
+        "path",
+        "source_kind",
+        "source_reference",
+        "latch_id",
+        "retryable",
+        "required_action",
+    }
+)
+
+
+def test_native_failure_detail_keys_match_the_runtime_constant() -> None:
+    assert len(set(FAILURE_DETAIL_KEYS)) == len(FAILURE_DETAIL_KEYS)
+    assert frozenset(FAILURE_DETAIL_KEYS) == _CONTRACT_FAILURE_DETAIL_KEYS
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "manyforge_headless/src/headless_api_core.cpp"
+    ).read_text(encoding="utf-8")
+    block = source.split("kFailureDetailKeys{", maxsplit=1)[1].split("};", maxsplit=1)[0]
+    assert frozenset(re.findall(r'"([a-z_]+)"', block)) == frozenset(FAILURE_DETAIL_KEYS)
 
 
 def _caller() -> dict[str, object]:

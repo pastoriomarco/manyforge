@@ -137,6 +137,42 @@ TEST(OwnerSettlementReaders,
             core::GraphRevision(std::string(kDigestA)));
 }
 
+TEST(OwnerSettlementReaders,
+     ActiveProgramRunRecoveryReadsTheCurrentJournalSchemaOnly) {
+  // v6 retains run status v3 (with failure details/origin); a newer schema is
+  // not one this reader knows and is refused.
+  const auto journal = [](int schema_version) {
+    TemporaryDatabase fixture;
+    fixture.Exec(
+        "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+        "schema_version INTEGER); INSERT INTO program_cycle_metadata "
+        "VALUES(1," +
+        std::to_string(schema_version) +
+        ");"
+        "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+        "program_run_id TEXT,reconciliation_required INTEGER);"
+        "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
+        "snapshot_json TEXT,terminal INTEGER);"
+        "INSERT INTO program_cycle VALUES(1,'running','run.7',1);"
+        "INSERT INTO program_run_history VALUES('run.7',"
+        "'{\"capture\":{\"graph_revision\":\"" +
+        std::string(kDigestA) +
+        "\",\"program_run_id\":\"run.7\",\"retained_bundle_id\":\"" +
+        std::string(kDigestB) +
+        "\"},\"details\":null,\"origin\":null,"
+        "\"schema_version\":\"manyforge.program_run_status.v3\","
+        "\"state\":\"running\"}',0)");
+    fixture.Close();
+    return ReadActiveProgramRunProductForReconciliation(fixture.path());
+  };
+
+  const auto current = journal(6);
+  ASSERT_TRUE(current.ok());
+  ASSERT_TRUE(current.value().has_value());
+  EXPECT_EQ(current.value()->program_run_id, core::ProgramRunId("run.7"));
+  EXPECT_FALSE(journal(7).ok());
+}
+
 TEST(OwnerSettlementReaders, AbsentProgramJournalHasNoRecoveryProduct) {
   const auto absent = std::filesystem::temp_directory_path() /
                       ("manyforge-absent-program-cycle-" +

@@ -32,6 +32,11 @@ import {
   usePublishWorkbenchNotices,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
+import {
+  formatStructuredError,
+  humanizeReasonCode,
+  structuredErrorText,
+} from '../state/structuredError';
 
 
 interface ProgramRuntimePanelProps {
@@ -90,7 +95,7 @@ function cycleFailureMessage(failure: Record<string, JsonValue> | null): string 
   const message = failure?.message;
   if (typeof message === 'string' && message.length > 0) return message;
   const code = failure?.code;
-  return typeof code === 'string' ? code.replaceAll('_', ' ') : null;
+  return typeof code === 'string' ? humanizeReasonCode(code) : null;
 }
 
 export function ProgramRuntimePanel({
@@ -123,6 +128,7 @@ export function ProgramRuntimePanel({
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
   const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
+  const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
   const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
   // Operator writes follow the key's access and use its typed editor; a
   // computed key always holds its formula's result.
@@ -315,11 +321,14 @@ export function ProgramRuntimePanel({
         <div className="program-feedback" role="status">
           <span>Program motion stopped and held. Resume Motion replans from current state.</span>
         </div>
-      ) : state.run?.reasonCode && (
+      ) : runReason !== null && (
         <div className="program-feedback" role="status">
           <span>
-            {state.run.reasonCode}
-            {state.run.message ? `: ${state.run.message}` : ''}
+            {runReason.title}
+            {runReason.message ? `: ${runReason.message}` : ''}
+            {runReason.rows.map((row) => (
+              <small key={row.label}>{` · ${row.label}: ${row.value}`}</small>
+            ))}
           </span>
         </div>
       )}
@@ -606,9 +615,11 @@ function transportRecoveryFacts(
   const cellFault = fullCellStop?.fault?.state !== 'cleared'
     ? fullCellStop?.fault ?? null : null;
   const recoveryOffer = state.controls?.recoveryOffer;
+  // The held node's own failure first: parallel branches can hold several
+  // nodes, and the run status names only the run's reason.
   const programRecoveryMessage = cycleFailureMessage(cycleFailure)
-    ?? state.run?.message
-    ?? recoveryOffer?.reasonCode.replaceAll('_', ' ')
+    ?? (recoveryOffer == null ? null : structuredErrorText(recoveryOffer.reason))
+    ?? (state.run?.reason ? structuredErrorText(state.run.reason) : state.run?.message)
     ?? 'Review the backend recovery requirements before continuing.';
   const programRecovery = cycleState === 'recovery_required'
     || (state.run?.state === 'intervention_required'
@@ -746,7 +757,7 @@ export function deriveTransportGuidance({
       severity: 'error',
       domain: 'recovery',
       title: 'Cell recovery required',
-      message: `${fault.reasonCode.replaceAll('_', ' ')} · ${
+      message: `${humanizeReasonCode(fault.reasonCode)} · ${
         fault.recoveryStatus.replaceAll('_', ' ')
       }. Motion remains blocked.`,
       busy: robot.stopFaultRecoveryPending,
@@ -1454,7 +1465,7 @@ export function ProgramTransportControls({
           <section className="runtime-detail-group" aria-labelledby="program-stop-fault-title">
             <h4 id="program-stop-fault-title">Stop fault: motion is blocked</h4>
             <p className="inline-message severity-error" role="alert">
-              A stop did not complete cleanly ({fullCellStop.fault.reasonCode.replaceAll('_', ' ')}).
+              A stop did not complete cleanly ({humanizeReasonCode(fullCellStop.fault.reasonCode)}).
               {fullCellStop.fault.recoveryStatus === 'ready'
                 ? ' The cell can be recovered.'
                 : ' The cell stays blocked until the backend confirms it is safe.'}

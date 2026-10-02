@@ -24,6 +24,10 @@ from manyforge_behavior.node_availability import (
     NodeExecutionReadiness,
     project_node_execution_availability,
 )
+from manyforge_behavior.failure_details import (
+    FailureRecord,
+    failure_origin,
+)
 from manyforge_behavior.node_environment import NodeEnvironment
 from manyforge_behavior.orchestration_ports import NodeAdapterPorts, NodeAttemptIdentity
 from manyforge_behavior.orchestration_values import (
@@ -814,8 +818,13 @@ class ExecutableProgramRun:
             },
         }
 
-    def terminal_failure(self) -> tuple[str, str]:
-        """Return the exact focused-owner failure at a failed tree tip."""
+    def terminal_failure(self) -> FailureRecord:
+        """Return the exact failure at a failed tree tip.
+
+        The tip's own reason, message, details and origin, attributed to its
+        authored node instance. A tip that is not one exact authored node, or
+        names no bounded reason, is the runner's generic ``program_tree_failed``.
+        """
 
         with self._lock:
             if self._tree.root.status is not py_trees.common.Status.FAILURE:
@@ -823,17 +832,33 @@ class ExecutableProgramRun:
                     "terminal failure is available only for a failed Program tree"
                 )
             tip = self._tree.tip()
+            node_instance_id = (
+                tip.name
+                if tip is not None and tip.name in self._authored_nodes
+                else None
+            )
             reason_code = getattr(tip, "failure_reason_code", None)
             message = getattr(tip, "failure_message", "")
             if (
-                not isinstance(reason_code, str)
+                node_instance_id is None
+                or not isinstance(reason_code, str)
                 or not reason_code
                 or len(reason_code.encode("utf-8")) > 256
                 or not isinstance(message, str)
                 or len(message.encode("utf-8")) > 4_096
             ):
-                return "program_tree_failed", "Program tree failed"
-            return reason_code, message
+                return FailureRecord(
+                    "program_tree_failed",
+                    "Program tree failed",
+                    None,
+                    failure_origin("program_runner", node_instance_id=node_instance_id),
+                )
+            return FailureRecord(
+                reason_code,
+                message,
+                tip.failure_details,
+                tip.failure_origin.for_node(node_instance_id),
+            )
 
     def stop(self) -> None:
         """Invalidate the tree once, causing active leaves to request cancel."""

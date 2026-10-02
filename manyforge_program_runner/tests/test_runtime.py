@@ -348,7 +348,7 @@ class _Snapshot:
             to_dict=lambda: deepcopy(capture),
         )
         self._value = {
-            "schema_version": "manyforge.program_run_status.v2",
+            "schema_version": "manyforge.program_run_status.v3",
             "owner_id": owner_id,
             "owner_epoch": owner_epoch,
             "run_revision": revision,
@@ -360,6 +360,8 @@ class _Snapshot:
             "active_operation_count": 1 if state in _ACTIVE_STATES else 0,
             "reason_code": None,
             "message": "",
+            "details": None,
+            "origin": None,
         }
 
     @property

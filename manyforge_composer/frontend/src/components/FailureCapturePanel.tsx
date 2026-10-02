@@ -122,7 +122,6 @@ export function FailureCapturePanel({ open }: { open: boolean }) {
       eventRequest.current?.abort();
     };
     // Loading is an explicit read when the view opens, never a poll.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   if (!open) return null;

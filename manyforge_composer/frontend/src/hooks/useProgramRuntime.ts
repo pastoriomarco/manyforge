@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import { failureContextText } from '../state/structuredError';
 import type {
   AppliedProgramSelection,
   AppliedProgramStatus,
@@ -66,13 +67,16 @@ export function programCurrentStatusSummary(
       .slice(0, 6)
       .map(([node, status]) => `${node}=${status}`);
   const recovery = controls?.recoveryOffer ?? null;
+  const runContext = run?.reason ? failureContextText(run.reason) : null;
+  const recoveryContext = recovery === null ? null : failureContextText(recovery.reason);
   return [
     run === null
       ? 'Observed run: none.'
       : [
         `Observed run ${run.capture.programRunId}: ${run.state}, revision ${run.runRevision}, tree ${run.treeStatus}, active operations ${run.activeOperationCount ?? 'unknown'}.`,
-        run.reasonCode === null ? null : `Run reason: ${run.reasonCode}.`,
+        run.reason === null ? null : `Run reason: ${run.reason.code}.`,
         run.message ? `Run message: ${run.message}.` : null,
+        runContext === null ? null : `Run failure details: ${runContext}.`,
         activeNodes.length === 0 ? null : `Current nodes: ${activeNodes.join(', ')}.`,
       ].filter((value): value is string => value !== null).join(' '),
     cycle === null
@@ -82,9 +86,11 @@ export function programCurrentStatusSummary(
       ? 'Observed recovery: none.'
       : [
         `Observed recovery ${recovery.recoveryClass}: ${recovery.status}, offer revision ${recovery.offerRevision}, node ${recovery.nodeInstanceId}, operation ${recovery.operationId}.`,
-        `Recovery reason: ${recovery.reasonCode}.`,
+        `Recovery reason: ${recovery.reason.code}.`,
+        recovery.reason.message ? `Recovery message: ${recovery.reason.message}.` : null,
+        recoveryContext === null ? null : `Recovery failure details: ${recoveryContext}.`,
         `Allowed actions: ${recovery.actions.filter((action) => action.enabled).map((action) => action.actionId).join(', ') || 'none'}.`,
-      ].join(' '),
+      ].filter((value): value is string => value !== null).join(' '),
   ].join(' ');
 }
 

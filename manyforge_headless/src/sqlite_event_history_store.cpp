@@ -161,6 +161,14 @@ constexpr std::string_view kCorrelationNames =
     "'program_run_id','operation_id','action_span_id','node_instance_id','node_attempt_id',"
     "'intervention_session_id','contact_policy_id','incident_id','condition_id','alarm_condition_id',"
     "'activation_id','stop_id','resource_id','source_owner_epoch','phase','parent_node_attempt_id'";
+// SQL list of retained Program diagnostic versions whose correlation
+// attribution is producer-level only.
+const std::string kProgramDiagnosticSchemaList = [] {
+  std::string list;
+  for (const auto version : kProgramDiagnosticSchemaVersions)
+    list += (list.empty() ? "'" : ",'") + std::string(version) + "'";
+  return list;
+}();
 const std::set<std::string> kCorrelationKeys{
     "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
     "intervention_session_id", "contact_policy_id", "incident_id", "condition_id", "alarm_condition_id",
@@ -1212,8 +1220,8 @@ private:
                        std::string(kCorrelationNames) +
                        ") AND length(CAST(value AS BLOB)) BETWEEN 1 AND 1024 "
                        "AND "
-                       "(COALESCE(json_extract(?2,'$.schema_version'),'')!='manyforge."
-                       "program_diagnostic.v1' OR path='$')");
+                       "(COALESCE(json_extract(?2,'$.schema_version'),'') NOT IN (" +
+                       kProgramDiagnosticSchemaList + ") OR path='$')");
     keys.Bind(1, sequence);
     keys.Bind(2, payload_json);
     Require(!keys.Step(), "historian_storage_corrupt", "historian correlation index returned a row");
@@ -1933,7 +1941,7 @@ private:
           all_keys + (producer_only
                           ? "AND "
                             "(COALESCE(json_extract(e.payload_json,'$.schema_version'),'')"
-                            "!='manyforge.program_diagnostic.v1' OR j.path='$')"
+                            " NOT IN (" + kProgramDiagnosticSchemaList + ") OR j.path='$')"
                           : "");
       for (const bool missing : {false, true}) {
         const std::string actual = "SELECT sequence,kind,value FROM historian_event_keys";
@@ -1952,13 +1960,11 @@ private:
       Exec(database_,
            "DELETE FROM historian_event_keys WHERE sequence IN "
            "(SELECT sequence FROM historian_events "
-           "WHERE "
-           "json_extract(payload_json,'$.schema_version')='"
-           "manyforge.program_diagnostic.v1')");
+           "WHERE json_extract(payload_json,'$.schema_version') IN (" +
+               kProgramDiagnosticSchemaList + "))");
       Exec(database_, "INSERT INTO historian_event_keys(sequence,kind,value) " + all_keys +
-                          "AND "
-                          "json_extract(e.payload_json,'$.schema_version')='"
-                          "manyforge.program_diagnostic.v1' AND j.path='$'");
+                          "AND json_extract(e.payload_json,'$.schema_version') IN (" +
+                          kProgramDiagnosticSchemaList + ") AND j.path='$'");
     }
     validate_keys(true);
     try {

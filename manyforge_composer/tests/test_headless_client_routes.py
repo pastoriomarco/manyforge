@@ -212,7 +212,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
     digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
     return {
-        "schema_version": "manyforge.program_run_status.v2",
+        "schema_version": "manyforge.program_run_status.v3",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -245,6 +245,8 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
+        "details": None,
+        "origin": None,
     }
 
 
@@ -897,6 +899,45 @@ def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> No
     finally:
         raw.close()
     assert raised.value.code == "program_applied_selection_invalid"
+
+
+def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
+    failed = {
+        **_program_run_status(state="failed"),
+        "tree_status": "failure",
+        "node_statuses": {"root": "failure"},
+        "reason_code": "owner_request_failed",
+        "message": "frame role tool0 is not available",
+        "details": {
+            "reason": "frame_role_unresolved",
+            "reference_type": "frame_role",
+            "reference_id": "tool0",
+            "target_role_id": "arm",
+        },
+        "origin": {
+            "kind": "owner",
+            "node_instance_id": "root",
+            "owner_api": "scene.frames",
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/program/runs/program-run.1"
+        return httpx.Response(200, json=failed, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        state = ComposerState(headless_client=client)
+        state.authoring_admission = None
+        response = TestClient(create_app(state)).get("/api/program/runs/program-run.1")
+    finally:
+        raw.close()
+    assert response.status_code == 200
+    assert response.json() == failed
 
 
 def _caller() -> dict[str, Any]:

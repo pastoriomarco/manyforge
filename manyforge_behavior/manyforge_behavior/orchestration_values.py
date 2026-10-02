@@ -197,13 +197,6 @@ def input_failure_reason(error: Exception) -> str:
     return NODE_INPUT_UNAVAILABLE
 
 
-def node_input_failure_details(error: Exception) -> Mapping[str, Any] | None:
-    """The input diagnostic an input-resolution error carries, if any."""
-
-    details = getattr(error, "details", None)
-    return details if isinstance(details, Mapping) else None
-
-
 _FIXED_RUNTIME_OVERRIDE_SEMANTICS = frozenset(
     {
         "blackboard_key",
@@ -1528,6 +1521,5 @@ __all__ = [
     "describe_input_failure",
     "input_failure_details",
     "input_failure_reason",
-    "node_input_failure_details",
     "validate_blackboard_value",
 ]

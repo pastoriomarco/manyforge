@@ -36,7 +36,7 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 def _snapshot(*, state: str = "running") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_run_status.v2",
+        "schema_version": "manyforge.program_run_status.v3",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -69,6 +69,8 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
+        "details": None,
+        "origin": None,
     }
 
 

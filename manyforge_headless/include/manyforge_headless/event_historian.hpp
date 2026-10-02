@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -39,6 +40,13 @@ inline constexpr std::string_view kHistorianDetailSchemaVersion =
     "manyforge.historian_detail.v2";
 inline constexpr std::string_view kHistorianCapturePageSchemaVersion =
     "manyforge.historian_capture_page.v1";
+/// Retained Program diagnostic versions. Only their producer-level identity
+/// fields are correlation attribution; blackboard/override values are data.
+/// Ingress accepts only the current version; originals recorded before a
+/// schema cutover keep their recorded version and this derivation.
+inline constexpr std::array<std::string_view, 2>
+    kProgramDiagnosticSchemaVersions{"manyforge.program_diagnostic.v1",
+                                     "manyforge.program_diagnostic.v2"};
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
 /// Minimum interval between the starts of two writer commits. Events that
 /// arrive meanwhile wait in memory and share the next transaction.

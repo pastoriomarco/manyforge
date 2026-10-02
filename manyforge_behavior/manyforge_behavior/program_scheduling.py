@@ -10,7 +10,7 @@ from collections.abc import Callable
 from collections.abc import Collection, Mapping
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Condition, RLock, Thread
 import time
 from typing import Final
@@ -106,6 +106,8 @@ class ProgramInterventionRegistry:
         owner_port_name: str | None = None,
         owner_task_id: str | None = None,
         owner_assessment: Mapping[str, object] | None = None,
+        details: Mapping[str, object] | None = None,
+        origin: Mapping[str, object] | None = None,
     ) -> ProgramInterventionSnapshot:
         record = ProgramInterventionSnapshot(
             identity=identity,
@@ -115,6 +117,8 @@ class ProgramInterventionRegistry:
             owner_port_name=owner_port_name,
             owner_task_id=owner_task_id,
             owner_assessment=owner_assessment,
+            details=details,
+            origin=origin,
         )
         with self._lock:
             run = self._run(identity)
@@ -172,16 +176,7 @@ class ProgramInterventionRegistry:
     ) -> ProgramInterventionSnapshot:
         with self._lock:
             entry = self._entry(identity)
-            current = entry.record
-            updated = ProgramInterventionSnapshot(
-                identity=current.identity,
-                reason_code=current.reason_code,
-                message=current.message,
-                policy_parameter=current.policy_parameter,
-                owner_port_name=current.owner_port_name,
-                owner_task_id=current.owner_task_id,
-                owner_assessment=assessment,
-            )
+            updated = replace(entry.record, owner_assessment=assessment)
             entry.record = updated
             return updated
 

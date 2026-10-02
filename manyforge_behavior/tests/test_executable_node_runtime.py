@@ -2623,8 +2623,8 @@ def test_timer_with_a_missing_or_invalid_sourced_duration_fails_by_name(
         program_clock=ProgramClock(lambda: 100.0),
     )
     assert run.tick_once() is py_trees.common.Status.FAILURE
-    reason, message = run.terminal_failure()
-    assert reason == "node_input_unavailable"
+    failure = run.terminal_failure()
+    assert failure.reason_code == "node_input_unavailable"
     timer = _leaf_node(run, "delay")
     # The timer's catalog declares only success and interrupted; its inputs
     # still fail, before the wait starts, and the run presents that failure.
@@ -2635,13 +2635,20 @@ def test_timer_with_a_missing_or_invalid_sourced_duration_fails_by_name(
     assert timer.outcome == "failure"
     assert run.node_statuses["delay"] == "failure"
     problem = "missing" if initial is None else "invalid"
-    assert dict(timer.failure_details) == {
+    expected_details = {
         "input_problem": problem,
         "path": "duration_s",
         "source_kind": "blackboard_key",
         "source_reference": "delay",
     }
-    assert message.startswith(
+    assert dict(timer.failure_details) == expected_details
+    assert dict(failure.details) == expected_details
+    assert dict(failure.origin) == {
+        "kind": "program_node",
+        "node_instance_id": "delay",
+        "owner_api": None,
+    }
+    assert failure.message.startswith(
         f"{problem} input duration_s from blackboard_key 'delay': "
     )
 
@@ -2706,9 +2713,17 @@ def test_timer_input_failure_exhausts_an_enclosing_retry_by_name() -> None:
     run = _run(program, program_clock=ProgramClock(lambda: 100.0))
     assert run.tick_once() is py_trees.common.Status.RUNNING
     assert run.tick_once() is py_trees.common.Status.FAILURE
-    reason, message = run.terminal_failure()
-    assert reason == "node_input_unavailable"
-    assert message.startswith("missing input duration_s from blackboard_key 'delay'")
+    failure = run.terminal_failure()
+    assert failure.reason_code == "node_input_unavailable"
+    assert failure.message.startswith(
+        "missing input duration_s from blackboard_key 'delay'"
+    )
+    # The exhausted retry presents the timer's own input failure.
+    assert dict(failure.origin) == {
+        "kind": "program_node",
+        "node_instance_id": "delay",
+        "owner_api": None,
+    }
     assert run.node_statuses["again"] == "failure"
     assert run.node_statuses["delay"] == "failure"
 
@@ -2762,15 +2777,24 @@ def test_input_failures_name_the_problem_path_and_source(
     )
     run = _run(program)
     assert _tick_to_end(run) is py_trees.common.Status.FAILURE
-    failed_reason, message = run.terminal_failure()
+    failure = run.terminal_failure()
+    failed_reason, message = failure.reason_code, failure.message
     node = _leaf_node(run, "set_out")
     problem, path, kind, reference = details
     assert failed_reason == reason
-    assert dict(node.failure_details) == {
+    expected_details = {
         "input_problem": problem,
         "path": path,
         "source_kind": kind,
         "source_reference": reference,
+    }
+    assert dict(node.failure_details) == expected_details
+    # The run carries the node's own details, attributed to the node.
+    assert dict(failure.details) == expected_details
+    assert dict(failure.origin) == {
+        "kind": "program_node",
+        "node_instance_id": "set_out",
+        "owner_api": None,
     }
     assert message.startswith(f"{problem} input {path} from {kind} {reference!r}: ")
     assert cause in message
@@ -2865,9 +2889,11 @@ def test_missing_or_invalid_sourced_count_fails_by_name_never_unlimited(
     )
     run = _run(program)
     assert run.tick_once() is py_trees.common.Status.FAILURE
-    reason, message = run.terminal_failure()
-    assert reason == "node_input_unavailable"
-    assert "count" in message or "num_" in message
+    failure = run.terminal_failure()
+    assert failure.reason_code == "node_input_unavailable"
+    assert "count" in failure.message or "num_" in failure.message
+    assert failure.origin["kind"] == "program_node"
+    assert failure.details["source_kind"] == "blackboard_key"
     # The child never ran: the failed attempt had no count at all.
     assert run.value_store.read("done") == 0
 
@@ -2913,7 +2939,7 @@ def test_parallel_missing_or_invalid_sourced_policy_fails_by_name(
     )
     run = _run(program)
     assert run.tick_once() is py_trees.common.Status.FAILURE
-    assert run.terminal_failure()[0] == "node_input_unavailable"
+    assert run.terminal_failure().reason_code == "node_input_unavailable"
     assert run.value_store.read("done") == 0
 
 
@@ -3376,7 +3402,8 @@ def test_expression_failure_fails_the_node_naming_the_expression_and_cause() -> 
     )
     run = _run(program)
     assert _tick_to_end(run) is py_trees.common.Status.FAILURE
-    reason, message = run.terminal_failure()
+    failure = run.terminal_failure()
+    reason, message = failure.reason_code, failure.message
     assert reason == "expression_evaluation_failed"
     assert "'key.count + 1'" in message
     assert "missing_value" in message and "key.count has no value" in message
@@ -3404,7 +3431,8 @@ def test_a_computed_key_that_cannot_be_evaluated_fails_its_reader() -> None:
     )
     run = _run(program)
     assert _tick_to_end(run) is py_trees.common.Status.FAILURE
-    reason, message = run.terminal_failure()
+    failure = run.terminal_failure()
+    reason, message = failure.reason_code, failure.message
     assert reason == "expression_evaluation_failed"
     assert "computed key 'ratio' = '1 / key.divisor'" in message
     assert "division_by_zero" in message
@@ -3464,7 +3492,8 @@ def test_a_node_value_formula_fails_on_a_computed_key_only_when_it_reads_it(
         # The untaken branch never reads `bad`, so its failure does not matter.
         assert run.value_store.read("out") == 0.0
         return
-    reason, message = run.terminal_failure()
+    failure = run.terminal_failure()
+    reason, message = failure.reason_code, failure.message
     assert reason == "expression_evaluation_failed"
     # The reader reports `bad`'s own cause, not merely "has no value".
     assert "key.bad could not be computed" in message

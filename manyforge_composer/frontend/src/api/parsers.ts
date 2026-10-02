@@ -99,6 +99,9 @@ import type {
   ProgramCycleStatus,
   ProgramRunStateName,
   ProgramRunStatus,
+  FailureDetails,
+  FailureOrigin,
+  StructuredError,
   ProgramExecutionSelectionControls,
   CycleRecoveryAction,
   CycleRecoveryActionId,
@@ -4358,6 +4361,154 @@ const PROGRAM_RUN_STATES = new Set<ProgramRunStateName>([
   'failed',
 ]);
 
+/**
+ * Registered failure-detail keys (spec error contract §1.1). A run record
+ * carries no other key; the message already names any other cause.
+ */
+const FAILURE_DETAIL_KEYS: ReadonlySet<string> = new Set([
+  // Owner refusals.
+  'reason', 'reference_type', 'reference_id', 'target_role_id',
+  // Node input failures.
+  'input_problem', 'path', 'source_kind', 'source_reference',
+  // Required ErrorDTO details a run may surface.
+  'latch_id', 'retryable', 'required_action',
+]);
+
+const FAILURE_DETAIL_MAX_ENTRIES = 16;
+const FAILURE_DETAIL_MAX_CANONICAL_BYTES = 2048;
+const FAILURE_TEXT_MAX_BYTES = 256;
+
+function utf8Length(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+function failureDetailsAt(value: unknown, path: string): FailureDetails | null {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  const keys = Object.keys(record).sort();
+  if (keys.length > FAILURE_DETAIL_MAX_ENTRIES) {
+    return fail(path, `at most ${FAILURE_DETAIL_MAX_ENTRIES} failure details`);
+  }
+  const details: FailureDetails = {};
+  for (const key of keys) {
+    const item = record[key];
+    if (!FAILURE_DETAIL_KEYS.has(key)) {
+      return fail(`${path}.${key}`, 'a registered failure-detail key');
+    }
+    if (
+      !(item === null || typeof item === 'boolean'
+        || (typeof item === 'number' && Number.isFinite(item)
+          && (!Number.isInteger(item) || Number.isSafeInteger(item)))
+        || (typeof item === 'string' && utf8Length(item) <= FAILURE_TEXT_MAX_BYTES))
+    ) {
+      return fail(
+        `${path}.${key}`,
+        `a scalar failure detail (text of at most ${FAILURE_TEXT_MAX_BYTES} bytes, safe integers)`,
+      );
+    }
+    details[key] = item;
+  }
+  // Sorted keys and scalar values: JSON.stringify is the RFC 8785 canonical form.
+  if (utf8Length(JSON.stringify(details)) > FAILURE_DETAIL_MAX_CANONICAL_BYTES) {
+    return fail(path, `failure details of at most ${FAILURE_DETAIL_MAX_CANONICAL_BYTES} bytes`);
+  }
+  return details;
+}
+
+const FAILURE_MESSAGE_MAX_BYTES = 4096;
+
+function failureMessageAt(value: unknown, path: string): string {
+  const message = stringAt(value, path);
+  if (utf8Length(message) > FAILURE_MESSAGE_MAX_BYTES) {
+    return fail(path, `a failure message of at most ${FAILURE_MESSAGE_MAX_BYTES} bytes`);
+  }
+  return message;
+}
+
+function failureIdentityAt(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  const text = stringAt(value, path);
+  if (text.length === 0 || utf8Length(text) > FAILURE_TEXT_MAX_BYTES) {
+    return fail(path, `a nonempty identity of at most ${FAILURE_TEXT_MAX_BYTES} bytes`);
+  }
+  return text;
+}
+
+function failureOriginAt(value: unknown, path: string): FailureOrigin | null {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['kind', 'node_instance_id', 'owner_api'], path);
+  const kind = stringAt(record.kind, `${path}.kind`);
+  const nodeInstanceId = failureIdentityAt(
+    record.node_instance_id,
+    `${path}.node_instance_id`,
+  );
+  const ownerApi = failureIdentityAt(record.owner_api, `${path}.owner_api`);
+  if (
+    !(kind === 'program_node' && nodeInstanceId !== null && ownerApi === null)
+    && !(kind === 'owner' && nodeInstanceId !== null)
+    && !(kind === 'program_runner' && ownerApi === null)
+  ) {
+    return fail(
+      path,
+      'a program_node (node, no owner API), owner (node) or program_runner (no owner API) origin',
+    );
+  }
+  return { kind: kind as FailureOrigin['kind'], nodeInstanceId, ownerApi };
+}
+
+/** The bounded `details` and `origin` of one run record (details need an origin). */
+function failureContextAt(
+  record: JsonObject,
+  path: string,
+): Pick<StructuredError, 'details' | 'origin'> {
+  const details = failureDetailsAt(record.details, `${path}.details`);
+  const origin = failureOriginAt(record.origin, `${path}.origin`);
+  if (details !== null && origin === null) {
+    return fail(`${path}.details`, 'null unless the record names a failure origin');
+  }
+  return { details, origin };
+}
+
+/**
+ * The ErrorDTO (`{code, message, details}`) a refused Composer API request
+ * returned in its `detail`, or null when the body carries none. The request
+ * itself is the origin. Details are the code's own key/value payload; only
+ * their scalar values are carried, nested values stay in the raw payload.
+ */
+export function parseApiErrorDto(payload: unknown): StructuredError | null {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  const candidate = (payload as JsonObject).detail;
+  if (
+    candidate === null
+    || typeof candidate !== 'object'
+    || Array.isArray(candidate)
+    || typeof (candidate as JsonObject).code !== 'string'
+    || (candidate as JsonObject).code === ''
+  ) {
+    return null;
+  }
+  const dto = candidate as JsonObject & { code: string };
+  const rawDetails = dto.details;
+  let details: FailureDetails | null = null;
+  if (rawDetails !== null && typeof rawDetails === 'object' && !Array.isArray(rawDetails)) {
+    details = Object.fromEntries(Object.entries(rawDetails as JsonObject)
+      .filter((entry): entry is [string, string | number | boolean | null] => {
+        const item = entry[1];
+        return item === null || typeof item === 'string' || typeof item === 'boolean'
+          || (typeof item === 'number' && Number.isFinite(item));
+      }));
+  }
+  return {
+    code: dto.code,
+    message: typeof dto.message === 'string' ? dto.message : '',
+    details,
+    origin: null,
+  };
+}
+
 export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   const path = 'programRun';
   const record = objectAt(value, path);
@@ -4366,9 +4517,11 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     [
       'active_operation_count',
       'capture',
+      'details',
       'message',
       'node_status_revision',
       'node_statuses',
+      'origin',
       'owner_epoch',
       'owner_id',
       'reason_code',
@@ -4380,8 +4533,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_status.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v2');
+  if (schemaVersion !== 'manyforge.program_run_status.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v3');
   }
   const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
   if (!PROGRAM_RUN_STATES.has(state)) {
@@ -4490,6 +4643,12 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   ) {
     return fail(`${path}.active_operation_count`, 'an integer from 0 through 4096');
   }
+  const reasonCode = nullableStringAt(record.reason_code, `${path}.reason_code`);
+  const message = stringAt(record.message, `${path}.message`);
+  const failureContext = failureContextAt(record, path);
+  if (reasonCode === null && failureContext.origin !== null) {
+    return fail(`${path}.origin`, 'null when the run names no reason');
+  }
   return {
     schemaVersion,
     ownerId,
@@ -4542,8 +4701,10 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     ),
     nodeStatuses,
     activeOperationCount,
-    reasonCode: nullableStringAt(record.reason_code, `${path}.reason_code`),
-    message: stringAt(record.message, `${path}.message`),
+    reason: reasonCode === null
+      ? null
+      : { code: reasonCode, message, ...failureContext },
+    message,
   };
 }
 
@@ -4877,12 +5038,12 @@ function parseCycleRecoveryOffer(
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
     'pose_source_apply_generation', 'latch_id', 'stop_id', 'stop_generation',
     'stop_certificate_id', 'stop_certificate_revision', 'status',
-    'recovery_class', 'actions', 'primary_action', 'reason_code',
-    'evidence_refs', 'manual_result', 'policy',
+    'recovery_class', 'actions', 'primary_action', 'reason_code', 'message',
+    'details', 'origin', 'evidence_refs', 'manual_result', 'policy',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v2');
+  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v3');
   }
   const actions = boundedArrayAt(record.actions, `${path}.actions`, 32)
     .map((item, index) => parseCycleRecoveryAction(
@@ -5008,7 +5169,11 @@ function parseCycleRecoveryOffer(
       disabledReasonCode: manualResultDisabledReasonCode,
     },
     primaryAction,
-    reasonCode: stringAt(record.reason_code, `${path}.reason_code`),
+    reason: {
+      code: stringAt(record.reason_code, `${path}.reason_code`),
+      message: failureMessageAt(record.message, `${path}.message`),
+      ...failureContextAt(record, path),
+    },
     evidenceRefs: stringArrayAt(record.evidence_refs, `${path}.evidence_refs`),
     policy: jsonRecordAt(record.policy, `${path}.policy`),
   };

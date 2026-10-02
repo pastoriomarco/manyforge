@@ -21,7 +21,7 @@ import { readStyleSource } from '../styles/readStyleSource';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v2',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v3',
     offerId: `sha256:${'e'.repeat(64)}`,
     offerRevision: 1,
     generatedAtNs: 1,
@@ -69,7 +69,12 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
       disabledReasonCode: 'manual_result_not_available',
     },
     primaryAction: 'replan_from_stopped_state',
-    reasonCode: 'ordinary_operator_stop',
+    reason: {
+      code: 'ordinary_operator_stop',
+      message: 'Stopped by the operator.',
+      details: null,
+      origin: null,
+    },
     evidenceRefs: [],
     policy: {},
   };
@@ -226,7 +231,7 @@ function controller(
         },
       },
       run: {
-        schemaVersion: 'manyforge.program_run_status.v2',
+        schemaVersion: 'manyforge.program_run_status.v3',
         ownerId: 'program-runner.cell-a',
         ownerEpoch: 'program-runner.epoch.1',
         runRevision: 4,
@@ -254,7 +259,7 @@ function controller(
         nodeStatusRevision: 2,
         nodeStatuses: { root: 'running' },
         activeOperationCount: 1,
-        reasonCode: null,
+        reason: null,
         message: '',
       },
       controls: null,
@@ -381,7 +386,12 @@ describe('Program runtime projection', () => {
 
     const settledMotionStop = controller('intervention_required');
     settledMotionStop.state.controls = ordinaryMotionStopControls();
-    settledMotionStop.state.run!.reasonCode = 'operation_stopped';
+    settledMotionStop.state.run!.reason = {
+      code: 'operation_stopped',
+      message: 'native operation was interrupted',
+      details: null,
+      origin: null,
+    };
     settledMotionStop.state.run!.message = 'native operation was interrupted';
     const settledMotionMarkup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={settledMotionStop} />,
@@ -412,6 +422,46 @@ describe('Program runtime projection', () => {
       <ProgramRuntimePanel enabled controller={executionStoppedWithStaleOffer} />,
     );
     expect(staleOfferMarkup).toContain('<strong>Stopped</strong>');
+  });
+
+  it('shows a run failure with its labelled details and failed node', () => {
+    const failed = controller('failed', 'terminal_awaiting_reset');
+    failed.state.run!.reason = {
+      code: 'node_input_unavailable',
+      message: "missing input duration_s from blackboard_key 'delay'",
+      details: {
+        input_problem: 'missing',
+        path: 'duration_s',
+        source_kind: 'blackboard_key',
+        source_reference: 'delay',
+      },
+      origin: { kind: 'program_node', nodeInstanceId: 'wait', ownerApi: null },
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={failed} />,
+    );
+    expect(markup).toContain(
+      'node input unavailable: missing input duration_s from blackboard_key &#x27;delay&#x27;',
+    );
+    expect(markup).toContain(
+      '<small> · Input: duration_s from blackboard key &#x27;delay&#x27; (missing)</small>',
+    );
+    expect(markup).toContain('<small> · Origin: node &#x27;wait&#x27;</small>');
+  });
+
+  it('shows a retained failed run that carries no details or origin', () => {
+    const failed = controller('failed', 'terminal_awaiting_reset');
+    failed.state.run!.reason = {
+      code: 'program_tree_failed',
+      message: 'Program failed.',
+      details: null,
+      origin: null,
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={failed} />,
+    );
+    expect(markup).toContain('<span>program tree failed: Program failed.</span>');
+    expect(markup).not.toContain('Origin:');
   });
 
   it('edits displayed groups in the Draft and applies them to the Motion panel after Apply', () => {
@@ -1059,6 +1109,41 @@ describe('Program runtime projection', () => {
     expect(guidance()).toEqual([expect.objectContaining({
       id: 'program.reset-required', severity: 'info', title: 'Program finished',
     })]);
+  });
+
+  it('names the held node failure and its details in the Program recovery notice', () => {
+    const program = controller('intervention_required');
+    const offer = ordinaryMotionStopOffer();
+    program.state.controls = {
+      ...ordinaryMotionStopControls(),
+      recoveryOffer: {
+        ...offer,
+        recoveryClass: 'node_failure_pause',
+        reason: {
+          code: 'owner_request_failed',
+          message: 'Move to pick was refused.',
+          details: { reference_type: 'frame_role', reference_id: 'tool0', target_role_id: 'arm' },
+          origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'kernel.operation' },
+        },
+      },
+    };
+    // Another branch's failure in the run status does not replace the held node's own.
+    program.state.run!.reason = {
+      code: 'program_tree_failed',
+      message: 'The Program paused on a failed node.',
+      details: null,
+      origin: { kind: 'program_runner', nodeInstanceId: null, ownerApi: null },
+    };
+    const robot = robotController();
+    robot.currentStatus = statusFixture();
+    const [recovery] = deriveTransportGuidance({
+      enabled: true, program, robot, motionActive: false, onReviewProgramRecovery: vi.fn(),
+    });
+    expect(recovery).toMatchObject({
+      id: 'recovery.program',
+      message: "Move to pick was refused. (Reference: frame_role 'tool0' of target role 'arm'; "
+        + "Origin: kernel.operation for node 'move')",
+    });
   });
 
   it('surfaces a cell-wide latch but never treats a cleared historical latch as blocking', () => {

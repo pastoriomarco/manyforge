@@ -304,7 +304,7 @@ async function mountHarness(
         identity: authoringWorkspaceIdentity(nextSnapshot),
         snapshot: nextSnapshot,
       };
-    }, [currentSnapshot, published]);
+    }, [currentSnapshot]);
     const authoring = useMemo(
       () => testAuthoringController(currentPublication, currentSnapshot),
       [currentPublication, currentSnapshot],

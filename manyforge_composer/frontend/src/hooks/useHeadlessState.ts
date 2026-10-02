@@ -3,6 +3,7 @@ import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
+  parseApiErrorDto,
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
   parseComponentOverviewProjection,
@@ -686,14 +687,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             // A definite client rejection has no submitted effect. A server
             // error can occur after submission and remains uncertain.
             acknowledged = response.status >= 400 && response.status < 500;
-            const detail = body !== null && typeof body === 'object'
-              && !Array.isArray(body) ? (body as Record<string, unknown>).detail : null;
-            const error = detail !== null && typeof detail === 'object'
-              && !Array.isArray(detail) ? detail as Record<string, unknown> : null;
+            const error = parseApiErrorDto(body);
             throw new Error(
-              typeof error?.message === 'string' ? error.message
-                : typeof error?.code === 'string' ? error.code
-                  : `Execution command rejected (HTTP ${response.status}).`,
+              error?.message || error?.code
+                || `Execution command rejected (HTTP ${response.status}).`,
             );
           }
           if (body === null || typeof body !== 'object' || Array.isArray(body)) {

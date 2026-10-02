@@ -1131,7 +1131,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         graph_revision=digest_a,
     )
     return {
-        "schema_version": "manyforge.program_run_status.v2",
+        "schema_version": "manyforge.program_run_status.v3",
         "owner_id": "program-runner.cell-a",
         "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
@@ -1166,6 +1166,8 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
+        "details": None,
+        "origin": None,
     }
 
 
@@ -2201,6 +2203,95 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
     assert current_environment != core.applied_program["node_environment_digest"]
 
 
+def test_program_run_status_carries_failure_details_and_origin_unchanged() -> None:
+    failed = {
+        **_program_run_snapshot(state="failed"),
+        "reason_code": "owner_refused",
+        "message": "Kernel refused move: target not ready",
+        "details": {
+            "reason": "target_not_ready",
+            "reference_type": "frame",
+            "reference_id": "r" * 256,
+            "retryable": False,
+            "latch_id": None,
+        },
+        "origin": {
+            "kind": "owner",
+            "node_instance_id": "move",
+            "owner_api": "kernel.operation",
+        },
+    }
+    expected = copy.deepcopy(failed)
+    assert HeadlessService._validate_program_run_snapshot(failed) == expected
+    for kind, node, owner_api in (
+        ("program_node", "wait", None),
+        ("owner", "move", None),
+        ("program_runner", None, None),
+        ("program_runner", "move", None),
+    ):
+        HeadlessService._validate_program_run_snapshot(
+            {
+                **failed,
+                "origin": {
+                    "kind": kind,
+                    "node_instance_id": node,
+                    "owner_api": owner_api,
+                },
+            }
+        )
+    HeadlessService._validate_program_run_snapshot({**failed, "details": None})
+
+    def origin(kind: Any, node: Any, owner_api: Any) -> dict[str, Any]:
+        return {"kind": kind, "node_instance_id": node, "owner_api": owner_api}
+
+    oversized = {
+        key: "x" * 250
+        for key in (
+            "input_problem",
+            "path",
+            "reason",
+            "reference_id",
+            "reference_type",
+            "required_action",
+            "source_kind",
+            "source_reference",
+            "target_role_id",
+        )
+    }
+    for field, value in (
+        ("schema_version", "manyforge.program_run_status.v2"),
+        ("details", {"unregistered": "x"}),
+        ("details", {"reason": "x" * 257}),
+        ("details", {"reason": {"nested": True}}),
+        ("details", {"reason": ["listed"]}),
+        ("details", {"reason": float("inf")}),
+        ("details", {"reason": 2**53}),
+        ("details", oversized),
+        ("details", {}),
+        ("details", "target_not_ready"),
+        ("origin", None),
+        ("origin", "owner"),
+        ("origin", origin("kernel", "move", None)),
+        ("origin", origin("program_node", None, None)),
+        ("origin", origin("program_node", "move", "kernel.operation")),
+        ("origin", origin("owner", None, "kernel.operation")),
+        ("origin", origin("program_runner", None, "kernel.operation")),
+        ("origin", origin("owner", "n" * 257, None)),
+        ("origin", origin("owner", "move", "")),
+        ("origin", {"kind": "program_runner", "node_instance_id": None}),
+    ):
+        with pytest.raises(HeadlessApiError) as error:
+            HeadlessService._validate_program_run_snapshot({**failed, field: value})
+        assert error.value.code == "program_runner_response_invalid"
+    without_origin = {key: value for key, value in failed.items() if key != "origin"}
+    with pytest.raises(HeadlessApiError):
+        HeadlessService._validate_program_run_snapshot(without_origin)
+    with pytest.raises(HeadlessApiError):
+        HeadlessService._validate_program_run_snapshot(
+            {**failed, "state": "succeeded", "details": None}
+        )
+
+
 def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
     core = FakeCore()
     core.applied_program = _applied_for_program_run()
@@ -3012,7 +3103,7 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
 
     core.record_program_diagnostic = record
     payload = {
-        "schema_version": "manyforge.program_diagnostic.v1",
+        "schema_version": "manyforge.program_diagnostic.v2",
         "program_run_id": "run.1",
         "owner_epoch": "runner.1",
         "program_revision": "sha256:" + "a" * 64,
@@ -3029,12 +3120,25 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
         "omitted_blackboard_count": 0,
         "omitted_override_count": 0,
         "delivery_loss_count": 2,
+        "details": {"input_problem": "type_mismatch", "path": "/ready"},
+        "origin": {
+            "kind": "program_node",
+            "node_instance_id": "check.ready",
+            "owner_api": None,
+        },
     }
     with client:
         valid = client.post("/api/program/diagnostics", json=payload)
         assert valid.status_code == 200, valid.text
         assert records == [payload]
         for invalid in (
+            {**payload, "schema_version": "manyforge.program_diagnostic.v1"},
+            {key: value for key, value in payload.items() if key != "origin"},
+            {**payload, "origin": None},
+            {**payload, "state": "succeeded"},
+            {**payload, "details": {"unregistered": "x"}},
+            {**payload, "details": {}},
+            {**payload, "origin": {**payload["origin"], "owner_api": "scene.frames"}},
             {**payload, "accepted": True},
             {**payload, "occurred_at_ns": str(2**63)},
             {**payload, "occurred_at_ns": "01"},

@@ -12,7 +12,9 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1878,7 +1880,7 @@ TEST(HeadlessApiCore,
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
   CanonicalValue record(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.program_diagnostic.v1")},
+      {"schema_version", CanonicalValue("manyforge.program_diagnostic.v2")},
       {"program_run_id", CanonicalValue("run.diagnostic")},
       {"owner_epoch", CanonicalValue("runner.1")},
       {"program_revision", CanonicalValue(Digest('1'))},
@@ -1899,6 +1901,8 @@ TEST(HeadlessApiCore,
       {"omitted_blackboard_count", CanonicalValue(2.0)},
       {"omitted_override_count", CanonicalValue(0.0)},
       {"delivery_loss_count", CanonicalValue(3.0)},
+      {"details", CanonicalValue(nullptr)},
+      {"origin", CanonicalValue(nullptr)},
   });
   const auto result = core.RecordProgramDiagnostic(record);
   EXPECT_TRUE(std::get<bool>(Member(result, "recorded").storage()));
@@ -1962,6 +1966,176 @@ TEST(HeadlessApiCore,
   invalid.emplace_back("accepted", CanonicalValue(true));
   EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(
                    CanonicalValue(std::move(invalid)))),
+               OperatorAlarmError);
+  auto previous_version = record.as_object();
+  for (auto &[name, value] : previous_version) {
+    if (name == "schema_version")
+      value = CanonicalValue("manyforge.program_diagnostic.v1");
+  }
+  EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+                   CanonicalValue(std::move(previous_version)))),
+               OperatorAlarmError);
+}
+
+TEST(HeadlessApiCore,
+     ProgramFailureDiagnosticCarriesBoundedDetailsAndOriginUnchanged) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const CanonicalValue details(CanonicalValue::Object{
+      {"reason", CanonicalValue("target_not_ready")},
+      {"reference_id", CanonicalValue(std::string(256U, 'r'))},
+      {"retryable", CanonicalValue(false)},
+      {"latch_id", CanonicalValue(nullptr)},
+      {"path", CanonicalValue(2.5)},
+  });
+  const CanonicalValue origin(CanonicalValue::Object{
+      {"kind", CanonicalValue("owner")},
+      {"node_instance_id", CanonicalValue("node.move")},
+      {"owner_api", CanonicalValue("kernel.operation")},
+  });
+  const auto with = [](CanonicalValue::Object fields, std::string_view field,
+                       CanonicalValue replacement) {
+    for (auto &[name, value] : fields) {
+      if (name == field)
+        value = replacement;
+    }
+    return CanonicalValue(std::move(fields));
+  };
+  const CanonicalValue::Object record{
+      {"schema_version", CanonicalValue("manyforge.program_diagnostic.v2")},
+      {"program_run_id", CanonicalValue("run.failure")},
+      {"owner_epoch", CanonicalValue("runner.1")},
+      {"program_revision", CanonicalValue(Digest('1'))},
+      {"program_binding_id", CanonicalValue(Digest('2'))},
+      {"retained_bundle_id", CanonicalValue(Digest('3'))},
+      {"graph_revision", CanonicalValue(Digest('4'))},
+      {"state", CanonicalValue("failed")},
+      {"reason_code", CanonicalValue("owner_refused")},
+      {"message", CanonicalValue("Kernel refused node.move: target not ready")},
+      {"occurred_at_ns", CanonicalValue("10")},
+      {"occurred_at_wall", CanonicalValue("2026-09-08T00:00:00Z")},
+      {"blackboard", CanonicalValue(CanonicalValue::Object{})},
+      {"runtime_overrides", CanonicalValue(CanonicalValue::Object{})},
+      {"omitted_blackboard_count", CanonicalValue(0.0)},
+      {"omitted_override_count", CanonicalValue(0.0)},
+      {"delivery_loss_count", CanonicalValue(0.0)},
+      {"details", details},
+      {"origin", origin},
+  };
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordProgramDiagnostic(CanonicalValue(record)), "recorded")
+          .storage()));
+  HistorianQuery query;
+  query.correlations.emplace("program_run_id", "run.failure");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 1U)
+      break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &payload =
+      Member(Member(Array(page, "events").front(), "event"), "payload");
+  EXPECT_EQ(Member(payload, "details"), details);
+  EXPECT_EQ(Member(payload, "origin"), origin);
+
+  for (const auto &[kind, node, owner_api] :
+       std::vector<std::tuple<std::string, CanonicalValue, CanonicalValue>>{
+           {"program_node", CanonicalValue("node.wait"),
+            CanonicalValue(nullptr)},
+           {"owner", CanonicalValue("node.move"), CanonicalValue(nullptr)},
+           {"program_runner", CanonicalValue(nullptr), CanonicalValue(nullptr)},
+           {"program_runner", CanonicalValue("node.move"),
+            CanonicalValue(nullptr)},
+       }) {
+    EXPECT_NO_THROW(static_cast<void>(
+        core.RecordProgramDiagnostic(with(record, "origin",
+                                          CanonicalValue(CanonicalValue::Object{
+                                              {"kind", CanonicalValue(kind)},
+                                              {"node_instance_id", node},
+                                              {"owner_api", owner_api},
+                                          })))));
+  }
+  EXPECT_NO_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+      with(record, "details", CanonicalValue(nullptr)))));
+
+  CanonicalValue::Object registered;
+  for (const auto key :
+       {"input_problem", "latch_id", "path", "reason", "reference_id",
+        "reference_type", "required_action", "retryable", "source_kind",
+        "source_reference", "target_role_id"}) {
+    registered.emplace_back(key, CanonicalValue(true));
+  }
+  EXPECT_NO_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+      with(record, "details", CanonicalValue(registered)))));
+  // Nine maximal strings exceed the 2,048-byte canonical details bound.
+  CanonicalValue::Object oversized;
+  for (const auto key : {"input_problem", "path", "reason", "reference_id",
+                         "reference_type", "required_action", "source_kind",
+                         "source_reference", "target_role_id"}) {
+    oversized.emplace_back(key, CanonicalValue(std::string(250U, 'x')));
+  }
+  const auto origin_of = [](CanonicalValue kind, CanonicalValue node,
+                            CanonicalValue owner_api) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", std::move(kind)},
+        {"node_instance_id", std::move(node)},
+        {"owner_api", std::move(owner_api)},
+    });
+  };
+  for (const auto &[field, replacement] :
+       std::vector<std::pair<std::string, CanonicalValue>>{
+           {"details", CanonicalValue(CanonicalValue::Object{
+                           {"unregistered", CanonicalValue("x")}})},
+           {"details",
+            CanonicalValue(CanonicalValue::Object{
+                {"reason", CanonicalValue(std::string(257U, 'x'))}})},
+           {"details",
+            CanonicalValue(CanonicalValue::Object{
+                {"reason", CanonicalValue(CanonicalValue::Object{})}})},
+           {"details",
+            CanonicalValue(CanonicalValue::Object{
+                {"reason", CanonicalValue(CanonicalValue::Array{})}})},
+           {"details", CanonicalValue(oversized)},
+           {"details", CanonicalValue(CanonicalValue::Object{})},
+           {"details", CanonicalValue("reason")},
+           {"origin", CanonicalValue(nullptr)},
+           {"origin", CanonicalValue("owner")},
+           {"origin",
+            origin_of(CanonicalValue("kernel"), CanonicalValue("node.move"),
+                      CanonicalValue(nullptr))},
+           {"origin",
+            origin_of(CanonicalValue("program_node"), CanonicalValue(nullptr),
+                      CanonicalValue(nullptr))},
+           {"origin", origin_of(CanonicalValue("program_node"),
+                                CanonicalValue("node.move"),
+                                CanonicalValue("kernel.operation"))},
+           {"origin",
+            origin_of(CanonicalValue("owner"), CanonicalValue(nullptr),
+                      CanonicalValue("kernel.operation"))},
+           {"origin",
+            origin_of(CanonicalValue("program_runner"), CanonicalValue(nullptr),
+                      CanonicalValue("kernel.operation"))},
+           {"origin", origin_of(CanonicalValue("owner"),
+                                CanonicalValue(std::string(257U, 'n')),
+                                CanonicalValue(nullptr))},
+           {"origin",
+            origin_of(CanonicalValue("owner"), CanonicalValue("node.move"),
+                      CanonicalValue(""))},
+           {"origin", CanonicalValue(CanonicalValue::Object{
+                          {"kind", CanonicalValue("program_runner")},
+                          {"node_instance_id", CanonicalValue(nullptr)},
+                      })},
+       }) {
+    EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(
+                     with(record, field, replacement))),
+                 OperatorAlarmError)
+        << field << " " << content_identity::canonical_json(replacement);
+  }
+  auto succeeded = with(record, "state", CanonicalValue("succeeded"));
+  EXPECT_THROW(static_cast<void>(core.RecordProgramDiagnostic(succeeded)),
                OperatorAlarmError);
 }
 

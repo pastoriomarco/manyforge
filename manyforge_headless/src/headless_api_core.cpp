@@ -421,6 +421,66 @@ std::string ProductionWallText() {
   return std::string(output.data(), static_cast<std::size_t>(count));
 }
 
+// Registered bounded failure-detail keys. manyforge_headless_api tests check
+// this set against the Python runtime's FAILURE_DETAIL_KEYS.
+const std::set<std::string> kFailureDetailKeys{
+    "input_problem",    "latch_id",      "path",
+    "reason",           "reference_id",  "reference_type",
+    "required_action",  "retryable",     "source_kind",
+    "source_reference", "target_role_id"};
+
+// Closed failure `details`/`origin` of a run record. Values pass through
+// unchanged; this only rejects shapes outside their bounds.
+void ValidateFailureDetailsAndOrigin(const CanonicalValue &details,
+                                     const CanonicalValue &origin,
+                                     const std::string &code) {
+  if (!details.is_null()) {
+    Require(details.is_object() && !details.as_object().empty() &&
+                details.as_object().size() <= 16U &&
+                content_identity::canonical_json(details).size() <= 2048U,
+            code, "Failure details are empty or exceed their bounds");
+    for (const auto &[key, value] : details.as_object()) {
+      Require(kFailureDetailKeys.contains(key), code,
+              "Failure detail key is not registered");
+      const auto *text = std::get_if<std::string>(&value.storage());
+      Require(!value.is_object() && !value.is_array() &&
+                  (text == nullptr || text->size() <= 256U),
+              code, "Failure detail value is not a bounded scalar");
+    }
+  }
+  if (origin.is_null()) {
+    Require(details.is_null(), code,
+            "Failure details require a failure origin");
+    return;
+  }
+  Require(origin.is_object() && origin.as_object().size() == 3U, code,
+          "Failure origin fields are invalid");
+  const auto *kind_member = origin.find_object_member("kind");
+  const auto *kind = kind_member == nullptr
+                         ? nullptr
+                         : std::get_if<std::string>(&kind_member->storage());
+  const auto identity =
+      [&](const std::string_view name) -> const std::string * {
+    const auto *member = origin.find_object_member(name);
+    Require(member != nullptr, code, "Failure origin fields are invalid");
+    if (member->is_null()) {
+      return nullptr;
+    }
+    const auto *text = std::get_if<std::string>(&member->storage());
+    Require(text != nullptr && !text->empty() && text->size() <= 256U, code,
+            "Failure origin identity is invalid");
+    return text;
+  };
+  const auto *node = identity("node_instance_id");
+  const auto *owner_api = identity("owner_api");
+  Require(kind != nullptr &&
+              ((*kind == "program_node" && node != nullptr &&
+                owner_api == nullptr) ||
+               (*kind == "owner" && node != nullptr) ||
+               (*kind == "program_runner" && owner_api == nullptr)),
+          code, "Failure origin kind is invalid");
+}
+
 } // namespace
 
 class HeadlessApiOwnerLock final {
@@ -1451,7 +1511,9 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
                                      "runtime_overrides",
                                      "omitted_blackboard_count",
                                      "omitted_override_count",
-                                     "delivery_loss_count"};
+                                     "delivery_loss_count",
+                                     "details",
+                                     "origin"};
   Require(record.is_object() && record.as_object().size() == fields.size(),
           code, "Program diagnostic fields are invalid");
   for (const auto &[name, value] : record.as_object()) {
@@ -1463,7 +1525,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
             "Program diagnostic text is invalid");
     return value;
   };
-  Require(text("schema_version") == "manyforge.program_diagnostic.v1", code,
+  Require(text("schema_version") == "manyforge.program_diagnostic.v2", code,
           "Program diagnostic version is unsupported");
   text("program_run_id");
   const auto epoch = text("owner_epoch");
@@ -1481,6 +1543,11 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
                       content_identity::is_utf8_nfc(*reason)),
           code, "Program diagnostic reason is invalid");
   text("message", 4096U);
+  const auto &origin = RequiredMember(record, "origin");
+  ValidateFailureDetailsAndOrigin(RequiredMember(record, "details"), origin,
+                                  code);
+  Require(state != "succeeded" || origin.is_null(), code,
+          "Program diagnostic success cannot carry a failure origin");
   const auto wall = text("occurred_at_wall", 64U);
   Require(HistorianRecordedUtcNs(wall).has_value(), code,
           "Program diagnostic UTC is invalid");

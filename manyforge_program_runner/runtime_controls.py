@@ -16,12 +16,13 @@ import unicodedata
 
 import rfc8785
 
+from manyforge_behavior.failure_details import failure_wire_fields
 from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
 
 
 RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v2"
 _LEGACY_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v1"
-RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v2"
+RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v3"
 _MAX_OVERRIDES: Final = 1_024
 _MAX_AUDIT: Final = 256
 _MAX_REVISION: Final = 9_007_199_254_740_991
@@ -696,6 +697,14 @@ class ProgramRuntimeControls:
             else None
         )
         projected_policy = _project_wire_value(policy)
+        # The held node's own failure, carried unchanged: several nodes can be
+        # held at once, so each offer names its own. Details and origin are
+        # null for an operator Stop; none of it ever chooses an action.
+        failure = {
+            "reason_code": intervention.reason_code,
+            "message": intervention.message,
+            **failure_wire_fields(intervention.details, intervention.origin),
+        }
         owner_actions = (
             owner.get("allowed_actions", []) if isinstance(owner, dict) else []
         )
@@ -872,12 +881,13 @@ class ProgramRuntimeControls:
             },
             "policy": projected_policy,
             "recovery_fences": deepcopy(self._recovery_fences),
+            **deepcopy(failure),
         }
         if selection_revision is not None:
             # The opaque offer also fences a newer selection Stop even when
             # it reuses the same physical Stop certificate.
             material["selection_revision"] = selection_revision
-        offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v2", material)
+        offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v3", material)
         with self._lock:
             if self._offer_key == offer_key and self._offer is not None:
                 return deepcopy(self._offer)
@@ -889,7 +899,7 @@ class ProgramRuntimeControls:
             self._offer_revision += 1
             result = {
                 "schema_version": RECOVERY_OFFER_SCHEMA,
-                "offer_id": _digest("manyforge.cycle_recovery_offer.v2", material),
+                "offer_id": _digest(RECOVERY_OFFER_SCHEMA, material),
                 "offer_revision": self._offer_revision,
                 "generated_at_ns": nonnegative_int64_value(time.monotonic_ns()),
                 "valid_until_ns": (
@@ -976,7 +986,7 @@ class ProgramRuntimeControls:
                 "primary_action": next(
                     (row["action_id"] for row in actions if row["enabled"]), None
                 ),
-                "reason_code": intervention.reason_code,
+                **failure,
                 "evidence_refs": (
                     owner.get("evidence_refs", []) if isinstance(owner, dict) else []
                 ),

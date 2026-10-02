@@ -1047,6 +1047,7 @@ ReadAuthoringAdmissionProjection(const DaemonDirectory &directory) {
                                 : std::string{}));
 }
 
+#if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
 /// Assemble and publish one real prepared activation for the exact candidate
 /// this test applies, and return its Apply summary. The fixture Program is
 /// re-verified against that candidate; if its roles do not resolve there the
@@ -1112,6 +1113,7 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
   }
   return content_identity::CanonicalValue(std::move(summary));
 }
+#endif
 
 std::string ApplyRequest(
     const DaemonDirectory &directory,
@@ -1183,8 +1185,16 @@ std::string ApplyRequest(
         candidate_bundle = bundle->retained_bundle_id().value();
         candidate_graph = bundle->value().cell_graph.graph_revision.value();
         if (prepared_activation_id_override.empty()) {
+#if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
           prepared_summary = PublishTestPreparedActivation(
               directory, *bundle, ReadManagerApplyFixtureMetadata());
+#else
+          // The Manager Apply fixture (and its prepared activation) exists
+          // only when the native execution host test fixture is configured.
+          throw std::logic_error(
+              "publishing a prepared activation needs the native execution "
+              "host test fixture");
+#endif
           prepared_activation_id =
               RequiredText(prepared_summary, "prepared_activation_id");
         } else {

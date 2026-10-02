@@ -7,6 +7,10 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.failure_details import (
+    NodeFailureOrigin,
+    exception_failure_details,
+)
 from manyforge_behavior.geometry import rpy_deg_to_xyzw
 from manyforge_behavior.nodes.geometry import (
     offset_pose,
@@ -29,8 +33,13 @@ from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     ProgramValueError,
     input_failure_reason,
-    node_input_failure_details,
 )
+
+# The node itself failed: its inputs, an expression, a value it read.
+_NODE_FAILURE = NodeFailureOrigin("program_node")
+# The frame transform owner refused or could not answer: the model-query
+# owner (`model_queries`) that serves the `model.kinematics` API.
+_FRAME_TRANSFORM_FAILURE = NodeFailureOrigin("owner", owner_api="model.kinematics")
 
 
 def _read_failure_reason(error: ProgramValueError) -> str:
@@ -70,22 +79,27 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
         self._blackboard_inputs: Mapping[str, Any] | None = None
         self._input_error: str | None = None
         # Read by the Program run for the failed tip; set only for failures
-        # that carry a stable reason (inputs, expression evaluation).
+        # that carry a stable reason (inputs, expression evaluation, an
+        # owner's frame transform).
         self.failure_reason_code: str | None = None
         self.failure_message = ""
-        # For an input failure: missing or invalid, the input path and its
-        # source (`input_failure_details`); None for any other failure.
+        # Bounded structured details (`bounded_failure_details`), for example
+        # an input's problem, path and source; None when there are none.
         self.failure_details: Mapping[str, Any] | None = None
+        # Where it failed: kind and owner API; the run names the instance.
+        self.failure_origin: NodeFailureOrigin | None = None
 
     def _fail(
         self,
         reason_code: str,
         message: str,
+        origin: NodeFailureOrigin,
         details: Mapping[str, Any] | None = None,
     ) -> py_trees.common.Status:
         self.failure_reason_code = reason_code
         self.failure_message = message
         self.failure_details = details
+        self.failure_origin = origin
         self.feedback_message = f"{reason_code}: {message}"
         return py_trees.common.Status.FAILURE
 
@@ -97,6 +111,7 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
         self.failure_reason_code = None
         self.failure_message = ""
         self.failure_details = None
+        self.failure_origin = None
         try:
             self._identity = self._attempt_source.begin(self._node_instance_id)
             snapshot = self._input_resolver.snapshot(
@@ -113,7 +128,10 @@ class _SnapshotAdapter(py_trees.behaviour.Behaviour):
             # outcomes its catalog entry declares (spec 440 §4.6).
             self._input_error = str(exc)
             self._fail(
-                input_failure_reason(exc), str(exc), node_input_failure_details(exc)
+                input_failure_reason(exc),
+                str(exc),
+                _NODE_FAILURE,
+                exception_failure_details(exc),
             )
 
     def _resolved_inputs(self) -> Mapping[str, Any] | None:
@@ -273,7 +291,12 @@ class LogicWaitForValue(_ProgramTimed, _KeyComparison):
         except KeyError:
             pass  # The key is still empty; keep waiting.
         except ProgramValueError as exc:
-            return self._fail(_read_failure_reason(exc), str(exc))
+            return self._fail(
+                _read_failure_reason(exc),
+                str(exc),
+                _NODE_FAILURE,
+                exception_failure_details(exc),
+            )
         else:
             matched = self._matches(inputs, actual)
             if matched is None:
@@ -346,7 +369,9 @@ class GeometryOffsetPose(_SnapshotAdapter):
             result = offset_pose(pose, inputs["offset"], axes_xyzw=axes)
             self._write(inputs["output_key"], result)
         except FrameTransformError as exc:
-            return self._fail(exc.reason_code, str(exc))
+            return self._fail(
+                exc.reason_code, str(exc), _FRAME_TRANSFORM_FAILURE, exc.details
+            )
         except (ProgramValueError, TypeError, ValueError) as exc:
             self.feedback_message = f"pose_offset_failed: {exc}"
             return py_trees.common.Status.FAILURE
@@ -371,7 +396,9 @@ class GeometryCheckPoseBounds(_SnapshotAdapter):
                 inclusive=inputs["inclusive"],
             )
         except FrameTransformError as exc:
-            return self._fail(exc.reason_code, str(exc))
+            return self._fail(
+                exc.reason_code, str(exc), _FRAME_TRANSFORM_FAILURE, exc.details
+            )
         except (TypeError, ValueError) as exc:
             self.feedback_message = f"pose_bounds_failed: {exc}"
             return py_trees.common.Status.FAILURE
@@ -421,7 +448,9 @@ class GeometryCheckPoseDistance(_SnapshotAdapter):
                 second_orientation,  # type: ignore[arg-type]
             )
         except FrameTransformError as exc:
-            return self._fail(exc.reason_code, str(exc))
+            return self._fail(
+                exc.reason_code, str(exc), _FRAME_TRANSFORM_FAILURE, exc.details
+            )
         except (KeyError, ProgramValueError, TypeError, ValueError) as exc:
             self.feedback_message = f"pose_comparison_failed: {exc}"
             return py_trees.common.Status.FAILURE

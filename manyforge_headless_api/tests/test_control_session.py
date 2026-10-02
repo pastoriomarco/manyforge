@@ -115,7 +115,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         }
     )
     run = {
-        "schema_version": "manyforge.program_run_status.v2",
+        "schema_version": "manyforge.program_run_status.v3",
         "owner_id": "runner",
         "owner_epoch": "runner.1",
         "run_revision": 1,
@@ -127,6 +127,8 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
+        "details": None,
+        "origin": None,
     }
     return {
         **_cycle(),
@@ -1519,6 +1521,11 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
                 ("state", []),
                 ("tree_status", {}),
                 ("node_statuses", {"root": []}),
+                ("details", {"unregistered": 1}),
+                (
+                    "origin",
+                    {"kind": "kernel", "node_instance_id": None, "owner_api": None},
+                ),
             )
         ],
     ],

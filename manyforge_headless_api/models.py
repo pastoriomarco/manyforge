@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 from typing import Annotated, Any, Literal
 
+import rfc8785
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -18,6 +20,14 @@ from pydantic import (
     model_serializer,
 )
 
+from manyforge_behavior.failure_details import (
+    FAILURE_DETAIL_KEYS,
+    FAILURE_ORIGIN_KINDS,
+    MAX_FAILURE_DETAIL_ENTRIES,
+    MAX_FAILURE_DETAIL_TEXT_BYTES,
+    MAX_FAILURE_DETAILS_BYTES,
+    MAX_FAILURE_ORIGIN_TEXT_BYTES,
+)
 from manyforge_behavior.json_scalars import (
     MAXIMUM_INT64,
     MAXIMUM_SAFE_INTEGER,
@@ -39,6 +49,67 @@ MAX_OPERATION_PARTICIPANTS = 4096
 MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES = 2 * 1024 * 1024
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _SHA256_RE = re.compile(SHA256_PATTERN)
+
+
+def validate_failure_details_and_origin(details: Any, origin: Any) -> None:
+    """Reject run-record failure fields outside their closed bounded shape.
+
+    The registered keys and bounds are the Program runtime's own constants.
+    Values pass through unchanged; nothing here derives or selects recovery.
+    """
+    if details is not None:
+        if (
+            not isinstance(details, dict)
+            or not 1 <= len(details) <= MAX_FAILURE_DETAIL_ENTRIES
+        ):
+            raise ValueError("failure details must be a non-empty bounded flat object")
+        for key, value in details.items():
+            if key not in FAILURE_DETAIL_KEYS:
+                raise ValueError("failure detail key is not registered")
+            if not (
+                value is None
+                or isinstance(value, (bool, int))
+                or (isinstance(value, float) and math.isfinite(value))
+                or (
+                    isinstance(value, str)
+                    and len(value.encode("utf-8")) <= MAX_FAILURE_DETAIL_TEXT_BYTES
+                )
+            ):
+                raise ValueError("failure detail value is not a bounded scalar")
+        try:
+            encoded = rfc8785.dumps(details)
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise ValueError("failure details are not canonical JSON") from exc
+        if len(encoded) > MAX_FAILURE_DETAILS_BYTES:
+            raise ValueError("failure details exceed their byte bound")
+    if origin is None:
+        if details is not None:
+            raise ValueError("failure details require a failure origin")
+        return
+    if not isinstance(origin, dict) or set(origin) != {
+        "kind",
+        "node_instance_id",
+        "owner_api",
+    }:
+        raise ValueError("failure origin fields are invalid")
+    kind = origin["kind"]
+    node = origin["node_instance_id"]
+    owner_api = origin["owner_api"]
+    for value in (node, owner_api):
+        if value is not None and not (
+            isinstance(value, str)
+            and value
+            and len(value.encode("utf-8")) <= MAX_FAILURE_ORIGIN_TEXT_BYTES
+        ):
+            raise ValueError("failure origin identity is invalid")
+    if not isinstance(kind, str) or kind not in FAILURE_ORIGIN_KINDS:
+        raise ValueError("failure origin kind is unsupported")
+    if not (
+        (kind == "program_node" and node is not None and owner_api is None)
+        or (kind == "owner" and node is not None)
+        or (kind == "program_runner" and owner_api is None)
+    ):
+        raise ValueError("failure origin kind is invalid")
 
 
 def _bounded_nfc(value: str, *, label: str, maximum_bytes: int) -> str:
@@ -976,7 +1047,7 @@ class ProgramModelAuditPolicy(StrictRequest):
 class ProgramDiagnosticRequest(StrictRequest):
     """Asynchronous attributed evidence; never a command or recovered state."""
 
-    schema_version: Literal["manyforge.program_diagnostic.v1"]
+    schema_version: Literal["manyforge.program_diagnostic.v2"]
     program_run_id: str
     owner_epoch: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -993,6 +1064,8 @@ class ProgramDiagnosticRequest(StrictRequest):
     omitted_blackboard_count: Annotated[int, Field(ge=0, le=100_000)]
     omitted_override_count: Annotated[int, Field(ge=0, le=100_000)]
     delivery_loss_count: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    details: dict[str, Any] | None
+    origin: dict[str, Any] | None
 
     @field_validator("program_run_id", "owner_epoch", "reason_code")
     @classmethod
@@ -1014,6 +1087,9 @@ class ProgramDiagnosticRequest(StrictRequest):
         from manyforge_behavior.canonical_artifact import canonical_json_bytes
         from manyforge_behavior.program_diagnostics import diagnostic_values
 
+        validate_failure_details_and_origin(self.details, self.origin)
+        if self.state == "succeeded" and self.origin is not None:
+            raise ValueError("Program diagnostic success cannot carry a failure origin")
         if len(canonical_json_bytes(self.model_dump(mode="python"))) > 64 * 1024:
             raise ValueError("Program diagnostic exceeds its byte bound")
         for values in (self.blackboard, self.runtime_overrides):

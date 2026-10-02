@@ -1793,6 +1793,9 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   const lastBootstrapFrame = useRef(source.getLatestExecutionObservation());
   const liveExecutionPresentation = useMemo(
     () => executionObservationPresentation.readMeasuredRobotPresentation(),
+    // The revision is the explicit invalidation key: the presentation reads
+    // the observation stream, which React cannot observe as a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [executionObservationPresentation, observationBootstrapRevision],
   );
   // Wake only until the first usable live frame (or after a model change that

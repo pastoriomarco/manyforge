@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import unicodedata
 from threading import RLock
 from typing import Any, Callable, Final, Iterator
 
+import rfc8785
+
 from .liveness import RetainedLiveness
 
 
@@ -23,7 +26,29 @@ LEGACY_SCHEMA_VERSION: Final = 3
 # Version 4 lacks only the completed persistent-value request table; an
 # existing version 4 journal is upgraded in place when it is opened.
 V4_SCHEMA_VERSION: Final = 4
-SCHEMA_VERSION: Final = 5
+# Version 5 retains Program-run status v2 records; an existing version 5
+# journal is carried to version 6 (status v3) when it is opened.
+V5_SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 6
+# The retained Program-run status shapes carried by the version 6 migration.
+_RUN_STATUS_V2: Final = "manyforge.program_run_status.v2"
+_RUN_STATUS_V3: Final = "manyforge.program_run_status.v3"
+_RUN_STATUS_V2_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "owner_id",
+        "owner_epoch",
+        "run_revision",
+        "state",
+        "capture",
+        "tree_status",
+        "node_status_revision",
+        "node_statuses",
+        "active_operation_count",
+        "reason_code",
+        "message",
+    }
+)
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 _LEGACY_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
@@ -244,10 +269,14 @@ _PERSISTENT_VALUE_REQUESTS_SQL: Final = """
       PRIMARY KEY(request_owner_epoch, request_id)
     )
 """
-_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
+_V5_TABLE_SQL: Final[dict[str, str]] = {
     **_V4_TABLE_SQL,
-    "program_cycle_metadata": _metadata_sql(SCHEMA_VERSION),
+    "program_cycle_metadata": _metadata_sql(V5_SCHEMA_VERSION),
     "program_persistent_value_requests": _PERSISTENT_VALUE_REQUESTS_SQL,
+}
+_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
+    **_V5_TABLE_SQL,
+    "program_cycle_metadata": _metadata_sql(SCHEMA_VERSION),
 }
 _SCHEMA_SQL: Final = (
     ";\n".join(statement.strip() for statement in _REQUIRED_TABLE_SQL.values()) + ";"
@@ -305,6 +334,29 @@ def _bounded_identity(value: object) -> bool:
         and unicodedata.normalize("NFC", value) == value
         and len(value.encode("utf-8")) <= 256
     )
+
+
+def _run_status_v3(snapshot: object) -> dict[str, Any]:
+    """One retained Program-run status v2 record as status v3."""
+
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != _RUN_STATUS_V2_FIELDS
+        or snapshot["schema_version"] != _RUN_STATUS_V2
+    ):
+        raise RuntimeError("Program-run history row is corrupt")
+    return {
+        **snapshot,
+        "schema_version": _RUN_STATUS_V3,
+        "details": None,
+        "origin": None,
+    }
+
+
+def _settlement_reference(settlement: Mapping[str, Any]) -> str:
+    """The terminal reference the runtime records for a Start settlement."""
+
+    return "sha256:" + hashlib.sha256(rfc8785.dumps(dict(settlement))).hexdigest()
 
 
 def _strict_object(
@@ -780,6 +832,10 @@ class ProgramCycleJournal:
                 schema_version = V4_SCHEMA_VERSION
                 expected_shapes = _V4_TABLE_SHAPES
                 expected_sql = _V4_TABLE_SQL
+            elif metadata_rows == [(1, V5_SCHEMA_VERSION)]:
+                schema_version = V5_SCHEMA_VERSION
+                expected_shapes = _REQUIRED_TABLE_SHAPES
+                expected_sql = _V5_TABLE_SQL
             elif metadata_rows == [(1, SCHEMA_VERSION)]:
                 schema_version = SCHEMA_VERSION
                 expected_shapes = _REQUIRED_TABLE_SHAPES
@@ -907,7 +963,7 @@ class ProgramCycleJournal:
                     _strict_object(request[5])
                     _strict_object(request[6])
 
-            if schema_version == SCHEMA_VERSION:
+            if schema_version in {V5_SCHEMA_VERSION, SCHEMA_VERSION}:
                 completed_count = 0
                 for completed in database.execute(
                     "SELECT request_owner_epoch,request_id,action,outcome,position "
@@ -1194,8 +1250,10 @@ class ProgramCycleJournal:
             else:
                 if existing_schema_version == LEGACY_SCHEMA_VERSION:
                     self._migrate_v3()
-                if existing_schema_version != SCHEMA_VERSION:
+                if existing_schema_version in {LEGACY_SCHEMA_VERSION, V4_SCHEMA_VERSION}:
                     self._migrate_v4()
+                if existing_schema_version != SCHEMA_VERSION:
+                    self._migrate_v5()
             with self._transaction():
                 if new_database:
                     self._database.execute(
@@ -1377,23 +1435,85 @@ class ProgramCycleJournal:
         self._database.execute("BEGIN IMMEDIATE")
         try:
             self._database.execute(_PERSISTENT_VALUE_REQUESTS_SQL)
-            self._database.execute(
-                _metadata_sql(SCHEMA_VERSION).replace(
-                    '"program_cycle_metadata"', "program_cycle_metadata_v5"
-                )
-            )
-            self._database.execute(
-                "INSERT INTO program_cycle_metadata_v5 VALUES(1,?)", (SCHEMA_VERSION,)
-            )
-            self._database.execute("DROP TABLE program_cycle_metadata")
-            self._database.execute(
-                "ALTER TABLE program_cycle_metadata_v5 "
-                "RENAME TO program_cycle_metadata"
-            )
+            self._replace_metadata(V5_SCHEMA_VERSION)
         except BaseException:
             self._database.execute("ROLLBACK")
             raise
         self._database.execute("COMMIT")
+
+    def _migrate_v5(self) -> None:
+        """Atomically carry v5's retained run records to Program-run status v3.
+
+        Status v3 adds the failure's bounded ``details`` and ``origin``. A
+        retained v2 record carries no structured failure, so both are null.
+        Every retained record is rewritten: the run history, and the
+        terminal run a Start settlement embeds together with the
+        ``terminal_reference`` digest that covers that settlement (the
+        runtime verifies the settlement against both). Anything that is not
+        exactly the v2 shape fails closed and nothing is changed.
+        """
+
+        self._database.execute("BEGIN IMMEDIATE")
+        try:
+            history = self._database.execute(
+                "SELECT program_run_id,snapshot_json FROM program_run_history"
+            ).fetchall()
+            for program_run_id, encoded in history:
+                self._database.execute(
+                    "UPDATE program_run_history SET snapshot_json=? "
+                    "WHERE program_run_id=?",
+                    (
+                        self._dump(
+                            _run_status_v3(_strict_object(encoded, required=True))
+                        ),
+                        program_run_id,
+                    ),
+                )
+            reference, encoded_settlement = self._database.execute(
+                "SELECT terminal_reference,start_settlement_json "
+                "FROM program_cycle WHERE singleton=1"
+            ).fetchone()
+            settlement = _strict_object(encoded_settlement)
+            if (
+                settlement is not None
+                and settlement.get("kind") == "terminal_effects_settled"
+            ):
+                if reference != _settlement_reference(settlement):
+                    raise RuntimeError("Program-cycle journal owner row is corrupt")
+                try:
+                    terminal_run = _run_status_v3(settlement.get("terminal_run"))
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        "Program-cycle journal owner row is corrupt"
+                    ) from error
+                migrated = {**settlement, "terminal_run": terminal_run}
+                self._database.execute(
+                    "UPDATE program_cycle SET start_settlement_json=?,"
+                    "terminal_reference=? WHERE singleton=1",
+                    (self._dump(migrated), _settlement_reference(migrated)),
+                )
+            self._replace_metadata(SCHEMA_VERSION)
+        except BaseException:
+            self._database.execute("ROLLBACK")
+            raise
+        self._database.execute("COMMIT")
+
+    def _replace_metadata(self, schema_version: int) -> None:
+        """Within a migration: replace the metadata row's fixed version."""
+
+        replacement = f"program_cycle_metadata_v{schema_version}"
+        self._database.execute(
+            _metadata_sql(schema_version).replace(
+                '"program_cycle_metadata"', replacement
+            )
+        )
+        self._database.execute(
+            f"INSERT INTO {replacement} VALUES(1,?)", (schema_version,)
+        )
+        self._database.execute("DROP TABLE program_cycle_metadata")
+        self._database.execute(
+            f"ALTER TABLE {replacement} RENAME TO program_cycle_metadata"
+        )
 
     @staticmethod
     def _safe_parent(metadata: os.stat_result) -> bool:
@@ -2710,5 +2830,6 @@ __all__ = [
     "ProgramCycleJournal",
     "RequestRecord",
     "SCHEMA_VERSION",
+    "V5_SCHEMA_VERSION",
     "STATES",
 ]
