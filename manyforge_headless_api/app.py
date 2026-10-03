@@ -77,6 +77,7 @@ from .models import (
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
+    ProgramNodeCorrectionPreviewRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramScenePreparationRequest,
@@ -87,9 +88,6 @@ from .models import (
     PersistentKeyValueSetRequest,
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -353,6 +351,7 @@ def _error_status(code: str) -> int:
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
+            "program_node_preview_busy",
             "deployment_candidate_cell_mismatch",
             "cclc_request_namespace_refreshed",
             "cclc_request_admission_deferred",
@@ -1166,68 +1165,30 @@ def create_app(
     ) -> dict[str, Any]:
         return service.program_runtime_controls(program_run_id)
 
+    @app.post("/api/program/runs/{program_run_id}/node-correction-previews")
+    def program_node_correction_preview(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramNodeCorrectionPreviewRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Advisory native preview of one held motion node; not a command."""
+        if body.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return service.program_node_correction_preview(
+            program_run_id,
+            body,
+            _trusted_attribution(request, trusted_principal_adapter),
+        )
+
     def require_control_path(program_run_id: str, request: Any) -> None:
         if request.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
-    async def stage_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideStageRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await rest_execution_command(
-            command_kind="program_runtime_override_stage",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
-    async def activate_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideActionRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await rest_execution_command(
-            command_kind="program_runtime_override_activate",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
-    async def clear_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideActionRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await rest_execution_command(
-            command_kind="program_runtime_override_clear",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
-    async def promote_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverridePromotionRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await rest_execution_command(
-            command_kind="program_runtime_override_promote",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
-        )
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
@@ -1423,8 +1384,12 @@ def create_app(
             if response.get("state") == "succeeded":
                 # Carry Manager's committed publication to the Program runner
                 # after this response: the Apply outcome is already final and
-                # nothing the runner does can change or delay it.
-                background.add_task(service.notify_committed_apply)
+                # nothing the runner does can change or delay it. Manager's
+                # published source follows its journal, so the runner is woken
+                # only once that source names this Apply (see apply_follower).
+                background.add_task(
+                    service.follow_committed_apply, apply_id, apply_generation
+                )
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
         code = error.get("code") if isinstance(error, dict) else None

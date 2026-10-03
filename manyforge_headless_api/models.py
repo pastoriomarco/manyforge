@@ -547,10 +547,19 @@ class ActivationPreparationRequest(StrictRequest):
     model_source_closure: dict[str, Any]
     program: dict[str, Any] | None
     program_role_assignment: dict[str, Any]
-    typed_parameter_overrides: dict[str, Any]
     expected_admission_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
+
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_removed_parameter_overrides(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "typed_parameter_overrides" in value:
+            raise ValueError(
+                "typed_parameter_overrides was removed: Program parameters "
+                "always take their Program defaults"
+            )
+        return value
 
     @field_validator("scenario_id")
     @classmethod
@@ -573,9 +582,8 @@ class ActivationPreparationRequest(StrictRequest):
             )
         if self.program is None and (
             self.program_role_assignment != {"component_roles": [], "target_roles": []}
-            or self.typed_parameter_overrides
         ):
-            raise ValueError("no Program requires empty role assignment and overrides")
+            raise ValueError("no Program requires an empty role assignment")
         return self
 
 
@@ -591,7 +599,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v3", "manyforge.prepared_activation_input.v4"]
+    schema_version: Literal["manyforge.prepared_activation_input.v5"]
     scenario_id: str
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment_artifact_id: str
@@ -601,12 +609,11 @@ class ManagerApplyPreparedActivation(StrictRequest):
     program_id: str | None
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)] | None
     # Exactly one typed outcome (H1a): {"kind": "bound", "program_binding_id"}
-    # or {"kind": "non_executable", "outcome"}, or v4 {"kind": "no_program"}.
+    # or {"kind": "non_executable", "outcome"}, or {"kind": "no_program"}.
     # The Manager verifies it against the immutable stored activation.
     program_outcome: dict[str, Any]
     node_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     assistant_mode: Literal["required", "optional", "forbidden"]
-    typed_parameter_overrides: dict[str, Any]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
     @field_validator("program_outcome")
@@ -653,13 +660,11 @@ class ManagerApplyPreparedActivation(StrictRequest):
     def require_program_identity(self) -> "ManagerApplyPreparedActivation":
         if self.program_outcome["kind"] == "no_program":
             if (
-                self.schema_version != "manyforge.prepared_activation_input.v4"
-                or self.program_id is not None
+                self.program_id is not None
                 or self.program_revision is not None
                 or self.assistant_mode != "optional"
-                or self.typed_parameter_overrides
             ):
-                raise ValueError("no_program requires v4 with no Program identity or overrides")
+                raise ValueError("no_program requires no Program identity")
         elif self.program_id is None or self.program_revision is None:
             raise ValueError("selected Program requires its identity and revision")
         return self
@@ -865,58 +870,6 @@ class ProgramFullStopResetRequest(ProgramFullStopResumeRequest):
     expected_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
-class RuntimeOverrideStageRequest(ProgramRunControlRequest):
-    node_instance_id: str
-    node_attempt_id: str
-    parameter_id: str
-    value: Any
-    source_observation_id: str | None = None
-    source_owner_generation: (
-        Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
-    ) = None
-
-    @field_validator(
-        "node_instance_id",
-        "node_attempt_id",
-        "parameter_id",
-        "source_observation_id",
-    )
-    @classmethod
-    def validate_override_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
-        )
-
-    @model_validator(mode="after")
-    def exact_source(self) -> "RuntimeOverrideStageRequest":
-        if (self.source_observation_id is None) != (
-            self.source_owner_generation is None
-        ):
-            raise ValueError(
-                "runtime override source identity and generation are paired"
-            )
-        return self
-
-
-class RuntimeOverrideActionRequest(ProgramRunControlRequest):
-    override_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    expected_override_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-
-
-class RuntimeOverridePromotionRequest(RuntimeOverrideActionRequest):
-    expected_draft_id: str
-    expected_draft_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-
-    @field_validator("expected_draft_id")
-    @classmethod
-    def validate_draft_identity(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="expected_draft_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
-
-
 class RuntimeBlackboardWriteRequest(ProgramRunControlRequest):
     key: str
     value: Any
@@ -1047,7 +1000,7 @@ class ProgramModelAuditPolicy(StrictRequest):
 class ProgramDiagnosticRequest(StrictRequest):
     """Asynchronous attributed evidence; never a command or recovered state."""
 
-    schema_version: Literal["manyforge.program_diagnostic.v2"]
+    schema_version: Literal["manyforge.program_diagnostic.v3"]
     program_run_id: str
     owner_epoch: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -1060,9 +1013,7 @@ class ProgramDiagnosticRequest(StrictRequest):
     occurred_at_ns: Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,18})$")]
     occurred_at_wall: Annotated[str, Field(max_length=64)]
     blackboard: Annotated[dict[str, Any], Field(max_length=32)]
-    runtime_overrides: Annotated[dict[str, Any], Field(max_length=32)]
     omitted_blackboard_count: Annotated[int, Field(ge=0, le=100_000)]
-    omitted_override_count: Annotated[int, Field(ge=0, le=100_000)]
     delivery_loss_count: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
     details: dict[str, Any] | None
     origin: dict[str, Any] | None
@@ -1092,11 +1043,10 @@ class ProgramDiagnosticRequest(StrictRequest):
             raise ValueError("Program diagnostic success cannot carry a failure origin")
         if len(canonical_json_bytes(self.model_dump(mode="python"))) > 64 * 1024:
             raise ValueError("Program diagnostic exceeds its byte bound")
-        for values in (self.blackboard, self.runtime_overrides):
-            if diagnostic_values(values.items(), total_count=len(values))[
-                "omitted_count"
-            ]:
-                raise ValueError("Program diagnostic values exceed capture bounds")
+        if diagnostic_values(
+            self.blackboard.items(), total_count=len(self.blackboard)
+        )["omitted_count"]:
+            raise ValueError("Program diagnostic values exceed capture bounds")
         return self
 
 
@@ -2707,6 +2657,59 @@ class ProgramManualHandoverRequest(ProgramRunStopRequest):
             raise ValueError(
                 "manual cleanup must name the operation's exact held Program"
             )
+        return self
+
+
+MAX_PROPOSED_NODE_INPUTS = 64
+
+
+class ProposedNodeInputRequest(StrictRequest):
+    """One proposed value at one parameter value path of the named node."""
+
+    path: Annotated[str, Field(min_length=1, max_length=512)]
+    value: Any
+
+
+class ProgramNodeCorrectionPreviewRequest(StrictRequest):
+    """Effect-free native preview of one held motion node with proposed inputs.
+
+    The Program runner resolves the node's inputs exactly as a fresh attempt
+    would and replaces the proposed paths. Binding, robot, capability and
+    lifecycle come from the captured run; this request cannot select them.
+    """
+
+    schema_version: Literal["manyforge.program_node_correction_preview_request.v1"]
+    request_id: str
+    program_run_id: str
+    expected_owner_epoch: str
+    program_id: str
+    program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    node_instance_id: str
+    node_attempt_id: str
+    proposed_inputs: Annotated[
+        list[ProposedNodeInputRequest], Field(max_length=MAX_PROPOSED_NODE_INPUTS)
+    ] = Field(default_factory=list)
+
+    @field_validator(
+        "request_id",
+        "program_run_id",
+        "expected_owner_epoch",
+        "program_id",
+        "node_instance_id",
+        "node_attempt_id",
+    )
+    @classmethod
+    def validate_preview_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @model_validator(mode="after")
+    def unique_paths(self) -> "ProgramNodeCorrectionPreviewRequest":
+        paths = [proposal.path for proposal in self.proposed_inputs]
+        if len(paths) != len(set(paths)):
+            raise ValueError("proposed input paths must be unique")
         return self
 
 

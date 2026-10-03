@@ -44,10 +44,9 @@ struct PreparedActivationAssemblyInput final {
   core::ContentDigest captured_input_digest;
   /// One of "required", "optional" or "forbidden".
   std::string assistant_mode;
-  CanonicalValue typed_parameter_overrides;
 };
 
-/// Assemble one complete v3 prepared activation from repository-verified
+/// Assemble one complete current-version prepared activation from repository-verified
 /// parts: bind the Program to `bundle` (bound or named non-executable), carry
 /// exactly the catalog artifacts that binding reads and the bundle's model-map
 /// artifact, then parse and verify the result like any stored value. Used by

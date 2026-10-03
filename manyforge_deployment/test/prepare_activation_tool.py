@@ -63,7 +63,6 @@ def _request(
         for name in (
             "assignment.yaml",
             "deployment.yaml",
-            "overrides.yaml",
             "program.yaml",
         )
     }
@@ -86,10 +85,9 @@ def _request(
         ),
         "program": program,
         "program_role_assignment": document["program_role_assignment"],
-        "typed_parameter_overrides": document["typed_parameter_overrides"],
     }
     request = {
-        "schema_version": "manyforge.activation_preparation_request.v2",
+        "schema_version": "manyforge.activation_preparation_request.v3",
         "runtime_cell_id": "activation_test_runtime",
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
@@ -146,11 +144,8 @@ def _scenario_request(
         "program_role_assignment": load_strict_json_yaml(
             scenario_path / "assignment.yaml"
         ),
-        "typed_parameter_overrides": load_strict_json_yaml(
-            scenario_path / "overrides.yaml"
-        ),
     }
-    if manifest.get("api_version") != "manyforge.scenario.project.v1":
+    if manifest.get("api_version") != "manyforge.scenario.project.v2":
         raise AssertionError("test input is not a Scenario project")
     program_id = document["program_draft"]["program_id"]
     return scenario_path, document, _request(
@@ -313,7 +308,7 @@ def _run(
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v4":
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v5":
         raise AssertionError("preparer did not return the direct v4 handoff")
     program_outcome = value.get("program_outcome")
     if (
@@ -596,7 +591,6 @@ def main() -> int:
             request["program_role_assignment"] = {
                 "component_roles": [], "target_roles": []
             }
-            request["typed_parameter_overrides"] = {}
             _rehash_request(request)
             _run(args, request, temporary / "keep", expected_program_outcome_kind="no_program")
             request["deployment"]["components"] = []
@@ -608,6 +602,21 @@ def main() -> int:
             _run(args, request, temporary / "empty", expected_program_outcome_kind="no_program")
             return 0
         if args.intent_rejections:
+            # Launch-time Program parameter overrides were removed; the former
+            # request form is refused by version, never reinterpreted.
+            removed_overrides = copy.deepcopy(request)
+            removed_overrides["schema_version"] = (
+                "manyforge.activation_preparation_request.v2"
+            )
+            removed_overrides["typed_parameter_overrides"] = {}
+            _rehash_request(removed_overrides)
+            _run(
+                args,
+                removed_overrides,
+                temporary / "removed-parameter-overrides",
+                expect_error="typed_parameter_overrides were removed",
+            )
+
             unsupported_version = copy.deepcopy(request)
             unsupported_version["deployment"]["api_version"] = (
                 "manyforge.deployment_intent.v999"

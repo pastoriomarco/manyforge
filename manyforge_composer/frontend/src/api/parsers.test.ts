@@ -60,7 +60,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
   const programSaved = program.saved as Record<string, unknown>;
   const deploymentDraft = deployment.draft as Record<string, unknown>;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 7,
     program: { ...programDraft, saved: programSaved },
@@ -80,7 +80,6 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
       source_diagnostics: [],
       source_document_digest: null,
       program_role_assignment: null,
-      typed_parameter_overrides: {},
       source_program_digest: null,
       source_deployment_digest: null,
     },
@@ -255,7 +254,6 @@ function programFixture(): Record<string, unknown> {
       parameter_id: 'duration',
       type: 'float64',
       default: 0.5,
-      runtime_mutability: 'before_run',
     }],
     blackboard: { namespaces: [], keys: [] },
     tree: {
@@ -301,7 +299,6 @@ function workspaceFixture(): Record<string, unknown> {
     },
     applicability: {
       applyReady: true,
-      affectedInstanceIds: [],
       unavailableReason: null,
     },
     saved: {
@@ -573,7 +570,7 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     intent_digest: `sha256:${'f'.repeat(64)}`,
     phase: 'fence_held',
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v3',
+      schema_version: 'manyforge.prepared_activation_input.v5',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
       scenario_id: 'fixture',
       source_document_digest: `sha256:${'b'.repeat(64)}`,
@@ -587,7 +584,6 @@ function managerApplyRecordFixture(): Record<string, unknown> {
       program_outcome: { kind: 'bound', program_binding_id: `sha256:${'b'.repeat(64)}` },
       node_environment_digest: `sha256:${'c'.repeat(64)}`,
       assistant_mode: 'forbidden',
-      typed_parameter_overrides: {},
     },
     request: {
       correlation_id: null,
@@ -783,7 +779,7 @@ describe('Program product projections', () => {
       run_revision: 3,
       state,
       capture: {
-        schema_version: 'manyforge.program_run_capture.v1',
+        schema_version: 'manyforge.program_run_capture.v2',
         program_run_id: 'program-run.1',
         applied_record_digest: digestC,
         scenario_id: 'cell-pick',
@@ -830,7 +826,7 @@ describe('Program product projections', () => {
 
   function recoveryOffer(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.cycle_recovery_offer.v3',
+      schema_version: 'manyforge.cycle_recovery_offer.v4',
       offer_id: digestA,
       offer_revision: 1,
       generated_at_ns: 10,
@@ -878,19 +874,20 @@ describe('Program product projections', () => {
       origin: { kind: 'program_node', node_instance_id: 'move', owner_api: null },
       evidence_refs: [],
       manual_result: { enabled: false, disabled_reason_code: 'manual_result_not_available' },
-      policy: {},
+      policy: { allow_intervention: true, max_retries: 0 },
+      retries_used: 300,
     };
   }
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v6',
+      schema_version: 'manyforge.program_runtime_control_projection.v7',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
       run_revision: 3,
       runtime_controls: {
-        schema_version: 'manyforge.program_runtime_controls.v2',
+        schema_version: 'manyforge.program_runtime_controls.v3',
         program_run_id: 'program-run.1',
         runtime_control_revision: 1,
         recovery_fences: {
@@ -899,11 +896,6 @@ describe('Program product projections', () => {
           scene_admission_epoch: 1,
           pose_source_apply_generation: 0,
         },
-        has_active_runtime_overrides: false,
-        has_staged_runtime_overrides: false,
-        has_stale_runtime_overrides: false,
-        overrides: [],
-        promotion_proposals: [],
         retry_counts: {},
         audit: [],
       },
@@ -921,20 +913,6 @@ describe('Program product projections', () => {
             target_role_id: 'arm',
           },
           runtime_scale_unavailable_reason: null }],
-      },
-      observation_override_candidate: {
-        schema_version: 'manyforge.runtime_override_observation_candidate.v1',
-        available: false,
-        reason_code: 'program_attempt_not_held',
-        reason: 'No Program node attempt is currently held.',
-        program_run_id: 'program-run.1',
-        node_instance_id: null,
-        node_attempt_id: null,
-        node_id: null,
-        parameter_id: null,
-        value: null,
-        source_observation_id: null,
-        source_owner_generation: null,
       },
     };
   }
@@ -962,7 +940,7 @@ describe('Program product projections', () => {
       retained_bundle_id: digestB,
       source_document_digest: digestA,
       scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v2',
+      schema_version: 'manyforge.applied_program_selection.v3',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
@@ -970,7 +948,6 @@ describe('Program product projections', () => {
         source_owner_epoch: 'headless.epoch.1',
         source_owner_id: 'headless.program-apply',
       },
-      typed_parameter_overrides: {},
     };
     const applied = parseAppliedProgramSelection(appliedInput);
 
@@ -1184,8 +1161,22 @@ describe('Program product projections', () => {
     }).recoveryOffer?.reason.message).toBe('é'.repeat(2048));
     expect(() => parseProgramRuntimeControlProjection({
       ...runtimeControlsProjection(),
-      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v2' },
-    })).toThrow(/cycle_recovery_offer.v3/);
+      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v3' },
+    })).toThrow(/cycle_recovery_offer.v4/);
+    // The captured two-field policy: zero is Unlimited and the used count
+    // may exceed the finite configured range.
+    expect(offer?.policy).toEqual({ allowIntervention: true, maxRetries: 0 });
+    expect(offer?.retriesUsed).toBe(300);
+    for (const policy of [
+      {},
+      { allow_intervention: true, max_retries: 256 },
+      { allow_intervention: true, max_retries: 1, intervention_delegate: 'forbidden' },
+    ]) {
+      expect(() => parseProgramRuntimeControlProjection({
+        ...runtimeControlsProjection(),
+        recovery_offer: { ...recoveryOffer(), policy },
+      })).toThrow();
+    }
     expect(() => parseProgramRuntimeControlProjection({
       ...runtimeControlsProjection(),
       recovery_offer: { ...recoveryOffer(), details: { secret: 'x' } },
@@ -1300,8 +1291,26 @@ describe('Program product projections', () => {
       event_revision: 9_744 + index, kind: 'event',
     }));
     expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
-    controls.schema_version = 'manyforge.program_runtime_controls.v1';
+    controls.schema_version = 'manyforge.program_runtime_controls.v2';
     expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+  });
+
+  it('accepts retry counts beyond 255 and refuses removed override state', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.retry_counts = { move: 300 };
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls.retryCounts)
+      .toEqual({ move: 300 });
+    controls.retry_counts = { move: 0 };
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    controls.retry_counts = {};
+    controls.overrides = [];
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/exactly/);
+    delete controls.overrides;
+    expect(() => parseProgramRuntimeControlProjection({
+      ...input,
+      observation_override_candidate: null,
+    })).toThrow(/exactly/);
   });
 
   it('parses one coherent cycle, run, and runtime-control observation', () => {
@@ -1397,7 +1406,7 @@ describe('Program product projections', () => {
       status: 'accepted',
       confirmation_token: null,
       prepared_activation: {
-        schema_version: 'manyforge.prepared_activation_input.v3',
+        schema_version: 'manyforge.prepared_activation_input.v5',
         prepared_activation_id: digestC,
         scenario_id: 'fixture',
         source_document_digest: digestA,
@@ -1411,7 +1420,6 @@ describe('Program product projections', () => {
         program_outcome: { kind: 'bound', program_binding_id: digestA },
         node_environment_digest: digestC,
         assistant_mode: 'forbidden',
-        typed_parameter_overrides: {},
       },
       candidate_preview: null,
       manager_apply: {
@@ -1626,7 +1634,7 @@ describe('Deployment workspace parser', () => {
     const digestB = `sha256:${'b'.repeat(64)}`;
     const digestC = `sha256:${'c'.repeat(64)}`;
     const preparedActivation = {
-      schema_version: 'manyforge.prepared_activation_input.v3',
+      schema_version: 'manyforge.prepared_activation_input.v5',
       prepared_activation_id: digestC,
       scenario_id: 'fixture',
       source_document_digest: digestA,
@@ -1640,7 +1648,6 @@ describe('Deployment workspace parser', () => {
       program_outcome: { kind: 'bound', program_binding_id: digestA },
       node_environment_digest: digestC,
       assistant_mode: 'forbidden',
-      typed_parameter_overrides: {},
     };
     const parsed = parseDeploymentCandidateOperationResponse({
       schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
@@ -1946,8 +1953,9 @@ describe('Program workspace parsers', () => {
     Object.assign(key, { type: 'int64', initial: 3, persistence: 'node' });
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('run or persistent');
     key.persistence = 'run';
-    parameter.runtime_mutability = 'between_operations';
-    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('immutable or before_run');
+    // The removed overridability field is refused, whatever its value.
+    parameter.runtime_mutability = 'before_run';
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('parameters[0]');
   });
 
   it('parses computed keys and refuses them with initial: or persistent', () => {
@@ -2022,52 +2030,46 @@ describe('Program workspace parsers', () => {
     }
   });
 
-  it('parses complete canonical node policies and rejects closed-shape drift', () => {
+  it('parses the two-field node policy and rejects removed or closed-shape drift', () => {
     const fixture = workspaceFixture();
     const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
     const tree = program.tree as Record<string, unknown>;
-    tree.modification_policy = {
-      runtime_override: 'human_approval',
-      persistent_edit: 'human_approval',
-      intervention_delegate: 'human_only',
-    };
-    tree.recovery_policy = {
-      allow_intervention: true,
-      allowed_recovery_actions: ['intervention'],
-      max_retries: 2,
-      allowed_skills: [],
-      persistence_ceiling: 'draft_patch',
-    };
+    tree.recovery_policy = { allow_intervention: true, max_retries: 0 };
     tree.operator_stop_policy = 'hold';
 
     const parsed = parseProgramWorkspaceResponse(fixture);
-    expect(parsed.draft.program?.tree.modification_policy).toEqual(
-      tree.modification_policy,
-    );
-    expect(parsed.draft.program?.tree.recovery_policy?.allowed_skills).toEqual([]);
+    // Zero is Unlimited with intervention on: an authored non-default.
+    expect(parsed.draft.program?.tree.recovery_policy).toEqual({
+      allow_intervention: true,
+      max_retries: 0,
+    });
     expect(parsed.draft.program?.tree.operator_stop_policy).toBe('hold');
 
     const cases = [
-      { modification_policy: null },
-      { recovery_policy: { allow_intervention: true } },
+      // Removed policy surfaces are refused, not ignored.
       {
         modification_policy: {
-          runtime_override: 'human_approval',
-          persistent_edit: 'human_approval',
-          intervention_delegate: 'human_only',
-          legacy: 'forbidden',
+          runtime_override: 'forbidden',
+          persistent_edit: 'forbidden',
+          intervention_delegate: 'forbidden',
         },
       },
-      { operator_stop_policy: 'pause' },
       {
         recovery_policy: {
-          allow_intervention: false,
+          allow_intervention: true,
           allowed_recovery_actions: ['intervention'],
-          max_retries: 0,
+          max_retries: 2,
           allowed_skills: [],
           persistence_ceiling: 'session_only',
         },
       },
+      { recovery_policy: { allow_intervention: true } },
+      { recovery_policy: { allow_intervention: true, max_retries: 256 } },
+      { recovery_policy: { allow_intervention: true, max_retries: -1 } },
+      // The canonical default is saved by omission.
+      { recovery_policy: { allow_intervention: false, max_retries: 0 } },
+      { operator_stop_policy: 'pause' },
+      { operator_stop_policy: 'inherit' },
     ];
     for (const change of cases) {
       const invalid = structuredClone(fixture);
@@ -2076,39 +2078,6 @@ describe('Program workspace parsers', () => {
       Object.assign(invalidTree, change);
       expect(() => parseProgramWorkspaceResponse(invalid)).toThrow();
     }
-  });
-
-  it('parses canonical imported skills without treating C1 applicability as syntax', () => {
-    const fixture = workspaceFixture();
-    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
-    const tree = program.tree as Record<string, unknown>;
-    tree.recovery_policy = {
-      allow_intervention: true,
-      allowed_recovery_actions: ['intervention'],
-      max_retries: 0,
-      allowed_skills: ['legacy.inspect'],
-      persistence_ceiling: 'session_only',
-    };
-    tree.children = [{
-      node_id: 'timer',
-      instance_id: 'update-b',
-      parameters: {},
-      children: [],
-    }];
-    fixture.applicability = {
-      applyReady: false,
-      affectedInstanceIds: ['wait'],
-      unavailableReason: {
-        code: 'composer_policy_skill_referent_unavailable',
-        message: 'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
-        restorationGates: [],
-      },
-    };
-    const parsed = parseProgramWorkspaceResponse(fixture);
-
-    expect(parsed.draft.program?.tree.recovery_policy?.allowed_skills)
-      .toEqual(['legacy.inspect']);
-    expect(parsed.applicability.affectedInstanceIds).toEqual(['wait']);
   });
 
   it('accepts an incomplete retained forest without inventing a Program candidate', () => {
@@ -2129,7 +2098,6 @@ describe('Program workspace parsers', () => {
     fixture.hasUnsavedChanges = true;
     fixture.applicability = {
       applyReady: false,
-      affectedInstanceIds: [],
       unavailableReason: {
         code: 'composer_authoring_draft_incomplete',
         message: 'Program requires exactly one root; found 0.',

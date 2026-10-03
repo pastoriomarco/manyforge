@@ -4,6 +4,9 @@ import copy
 from functools import lru_cache
 import hashlib
 import json
+import threading
+from threading import Event
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -143,7 +146,7 @@ def _program_binding(
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
+        api_version="manyforge.program_binding.v2",
     )
     return binding
 
@@ -184,7 +187,7 @@ def _applied_projection(
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": source_document_digest,
         "scenario_id": scenario_id,
-        "schema_version": "manyforge.applied_program_selection.v2",
+        "schema_version": "manyforge.applied_program_selection.v3",
         "source": {
             "record_digest": record_digest,
             "semantic_content_digest": "sha256:" + "7" * 64,
@@ -192,27 +195,7 @@ def _applied_projection(
             "source_owner_epoch": "program-owner.epoch.1",
             "source_owner_id": "program-owner.cell-a",
         },
-        "typed_parameter_overrides": {},
     }
-
-
-def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
-    value["program"].pop("tree")
-    value["program"]["program_revision"] = compute_content_identity(
-        value["program"],
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v2",
-    )
-    value["program_revision"] = value["program"]["program_revision"]
-    value["program_binding"]["program_revision"] = value["program_revision"]
-    value["program_binding"]["program_binding_id"] = compute_content_identity(
-        value["program_binding"],
-        own_field="program_binding_id",
-        identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
-    )
-    value["program_binding_id"] = value["program_binding"]["program_binding_id"]
 
 
 def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
@@ -222,7 +205,7 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
+        api_version="manyforge.program_binding.v2",
     )
     value["program_binding_id"] = binding["program_binding_id"]
 
@@ -386,7 +369,6 @@ def test_applied_program_status_rejects_invalid_deployment_identity(
         lambda value: value["program"].__setitem__(
             "program_revision", "sha256:" + "f" * 64
         ),
-        _remove_program_tree_with_valid_identity,
         lambda value: value.pop("program_binding"),
         lambda value: value["program_binding"].__setitem__(
             "program_revision", "sha256:" + "f" * 64
@@ -836,7 +818,7 @@ class FakeManager:
             "ok": True,
             "phase": "accepted",
             "prepared_activation": {
-                "schema_version": "manyforge.prepared_activation_input.v3",
+                "schema_version": "manyforge.prepared_activation_input.v5",
                 "scenario_id": "scenario.1",
                 "source_document_digest": "sha256:" + "1" * 64,
                 "captured_input_digest": "sha256:" + "d" * 64,
@@ -849,7 +831,6 @@ class FakeManager:
                 "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                 "node_environment_digest": "sha256:" + "5" * 64,
                 "assistant_mode": "optional",
-                "typed_parameter_overrides": {},
                 "prepared_activation_id": "sha256:" + "e" * 64,
             },
             "request_id": "request.1",
@@ -1137,7 +1118,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v1",
+            "schema_version": "manyforge.program_run_capture.v2",
             "program_run_id": "program-run.1",
             "applied_record_digest": "sha256:" + "5" * 64,
             "scenario_id": "cell-pick",
@@ -1201,10 +1182,6 @@ class FakeProgramRunner:
             "program_reset",
             "program_resume_full_stop",
             "program_discard_full_stop",
-            "program_runtime_override_stage",
-            "program_runtime_override_activate",
-            "program_runtime_override_clear",
-            "program_runtime_override_promote",
             "program_runtime_blackboard_write",
             "program_manual_result_stage",
             "program_manual_handover",
@@ -1613,7 +1590,7 @@ class FakeActivationPreparer:
     def prepare(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(copy.deepcopy(kwargs))
         return {
-            "schema_version": "manyforge.prepared_activation_input.v3",
+            "schema_version": "manyforge.prepared_activation_input.v5",
             "source_document_digest": kwargs["source_document_digest"],
             "scenario_id": kwargs["scenario_id"],
             "captured_input_digest": kwargs["captured_input_digest"],
@@ -1627,7 +1604,6 @@ class FakeActivationPreparer:
             "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "5" * 64},
             "node_environment_digest": "sha256:" + "7" * 64,
             "assistant_mode": "forbidden",
-            "typed_parameter_overrides": kwargs["typed_parameter_overrides"],
         }
 
 
@@ -1649,7 +1625,6 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
         },
         "program": {"api_version": "manyforge.program.v2"},
         "program_role_assignment": {"component_roles": [], "target_roles": []},
-        "typed_parameter_overrides": {},
         "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
@@ -1669,7 +1644,6 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
             },
             "program": {"api_version": "manyforge.program.v2"},
             "program_role_assignment": {"component_roles": [], "target_roles": []},
-            "typed_parameter_overrides": {},
         }
     ]
 
@@ -1677,6 +1651,35 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
     rejected = client.post("/api/activation-preparations", json=body)
     assert rejected.status_code == 409
     assert rejected.json()["detail"]["code"] == "stale_generation"
+
+
+def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
+    preparer = FakeActivationPreparer()
+    client = TestClient(
+        create_app(
+            service=_service(FakeCore(), FakeManager(), activation_preparer=preparer)
+        )
+    )
+    body = {
+        "scenario_id": "scenario_a",
+        "source_document_digest": "sha256:" + "6" * 64,
+        "captured_input_digest": "sha256:" + "8" * 64,
+        "deployment": {"api_version": "manyforge.deployment.v1"},
+        "model_source_closure": {
+            "schema_version": "manyforge.activation_model_source_closure.v1",
+            "components": [],
+        },
+        "program": {"api_version": "manyforge.program.v2"},
+        "program_role_assignment": {"component_roles": [], "target_roles": []},
+        "typed_parameter_overrides": {},
+        "expected_admission_generation": _ADMISSION_GENERATION,
+    }
+
+    response = client.post("/api/activation-preparations", json=body)
+
+    assert response.status_code == 422
+    assert "typed_parameter_overrides was removed" in response.text
+    assert preparer.calls == []
 
 
 class FakeCCLC:
@@ -2543,7 +2546,7 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
-                    "schema_version": "manyforge.prepared_activation_input.v3",
+                    "schema_version": "manyforge.prepared_activation_input.v5",
                     "scenario_id": "scenario.1",
                     "source_document_digest": "sha256:" + "1" * 64,
                     "captured_input_digest": "sha256:" + "d" * 64,
@@ -2556,7 +2559,6 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                     "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                     "node_environment_digest": "sha256:" + "5" * 64,
                     "assistant_mode": "optional",
-                    "typed_parameter_overrides": {},
                     "prepared_activation_id": "sha256:" + "e" * 64,
                 },
                 "expected_admission_generation": 7,
@@ -2621,15 +2623,40 @@ class _NotifiedRunner:
     def __init__(self, error: ProgramRunnerClientError | None = None) -> None:
         self.error = error
         self.reconciliations = 0
+        self.observed_activations: list[Any] = []
+        self.core: FakeCore | None = None
+        self.woken = threading.Condition()
 
     def reconcile_persistent_values(self) -> dict[str, Any]:
-        self.reconciliations += 1
+        with self.woken:
+            self.reconciliations += 1
+            if self.core is not None:
+                # What a real runner reads on wake: the committed activation.
+                self.observed_activations.append(
+                    getattr(self.core, "committed_activation", None)
+                )
+            self.woken.notify_all()
         if self.error is not None:
             raise self.error
         return {"outcome": "reconciled"}
 
+    def wait_for(self, count: int, timeout: float = 5.0) -> bool:
+        with self.woken:
+            return self.woken.wait_for(
+                lambda: self.reconciliations >= count, timeout
+            )
+
     def close(self) -> None:
         return None
+
+
+def _status_reading_service(
+    core: FakeCore, manager: FakeManager, runner: _NotifiedRunner
+) -> HeadlessService:
+    service = _service(core, manager, program_runner=runner)
+    assert service.apply_follower is not None
+    service.apply_follower._poll = 0.001  # noqa: SLF001
+    return service
 
 
 @pytest.mark.parametrize(
@@ -2641,16 +2668,65 @@ def test_only_an_observed_committed_apply_notifies_the_program_runner(
 ) -> None:
     runner = _NotifiedRunner()
     manager = _CommittingManager(state)
-    with TestClient(
-        create_app(service=_service(FakeCore(), manager, program_runner=runner))
-    ) as client:
+    core = FakeCore()
+    core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+    service = _status_reading_service(core, manager, runner)
+    with TestClient(create_app(service=service)) as client:
         response = client.get(
             "/api/manager/apply/status",
             params={"apply_id": "apply.1", "apply_generation": 1},
         )
-    assert response.status_code == 200
-    assert response.json()["state"] == state
+        assert response.status_code == 200
+        assert response.json()["state"] == state
+        if notified:
+            assert runner.wait_for(notified)
+        else:
+            # Only a committed Apply is followed at all.
+            assert not service.apply_follower._followed  # noqa: SLF001
     assert runner.reconciliations == notified
+
+
+def test_a_status_read_wakes_the_runner_only_once_manager_source_names_it() -> None:
+    """Manager answers status from its journal and publishes its source just
+    after: a runner woken in between would read a refusal (the live symptom
+    program_applied_selection_not_active / program_activation_history_incomplete).
+    The wake waits until the committed activation names the Apply."""
+
+    runner = _NotifiedRunner()
+    manager = _CommittingManager("succeeded")
+    core = FakeCore()
+    runner.core = core
+    projected = Event()
+    lagging_reads = 0
+
+    def lagging_activation() -> dict[str, Any]:
+        nonlocal lagging_reads
+        if not projected.is_set():
+            lagging_reads += 1
+            raise HeadlessApiError(
+                "program_applied_selection_not_active",
+                "Applied Program requires one converged active configuration",
+            )
+        return _committed_activation("apply.1")
+
+    core.committed_scenario_activation = lagging_activation  # type: ignore[method-assign]
+    service = _status_reading_service(core, manager, runner)
+    with TestClient(create_app(service=service)) as client:
+        response = client.get(
+            "/api/manager/apply/status",
+            params={"apply_id": "apply.1", "apply_generation": 1},
+        )
+        assert response.json()["state"] == "succeeded"
+        deadline = time.monotonic() + 5
+        while lagging_reads < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert lagging_reads >= 3
+        assert runner.reconciliations == 0  # never woken into the refusal
+        core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+        projected.set()
+        assert runner.wait_for(1)
+    assert runner.reconciliations == 1
+    assert runner.observed_activations == [_committed_activation("apply.1")]
 
 
 def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
@@ -2660,16 +2736,23 @@ def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
         )
     )
     manager = _CommittingManager("succeeded")
-    with TestClient(
-        create_app(service=_service(FakeCore(), manager, program_runner=runner))
-    ) as client:
-        observed = [
-            client.get(
-                "/api/manager/apply/status",
-                params={"apply_id": "apply.1", "apply_generation": 1},
+    core = FakeCore()
+    core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+    service = _status_reading_service(core, manager, runner)
+    observed = []
+    with TestClient(create_app(service=service)) as client:
+        for count in (1, 2):
+            observed.append(
+                client.get(
+                    "/api/manager/apply/status",
+                    params={"apply_id": "apply.1", "apply_generation": 1},
+                )
             )
-            for _ in range(2)
-        ]
+            assert runner.wait_for(count)
+            # The finished follow is released, so a later read follows again.
+            deadline = time.monotonic() + 5
+            while service.apply_follower._followed and time.monotonic() < deadline:  # noqa: SLF001
+                time.sleep(0.001)
     # The Apply stays succeeded, unchanged, however often it is observed; the
     # storage fault is the runner's to report.
     assert [response.status_code for response in observed] == [200, 200]
@@ -3103,7 +3186,7 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
 
     core.record_program_diagnostic = record
     payload = {
-        "schema_version": "manyforge.program_diagnostic.v2",
+        "schema_version": "manyforge.program_diagnostic.v3",
         "program_run_id": "run.1",
         "owner_epoch": "runner.1",
         "program_revision": "sha256:" + "a" * 64,
@@ -3116,9 +3199,7 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
         "occurred_at_ns": "9007199254740993",
         "occurred_at_wall": "2026-09-08T10:00:00Z",
         "blackboard": {"ready": False},
-        "runtime_overrides": {},
         "omitted_blackboard_count": 0,
-        "omitted_override_count": 0,
         "delivery_loss_count": 2,
         "details": {"input_problem": "type_mismatch", "path": "/ready"},
         "origin": {
@@ -3133,6 +3214,12 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
         assert records == [payload]
         for invalid in (
             {**payload, "schema_version": "manyforge.program_diagnostic.v1"},
+            {
+                **payload,
+                "schema_version": "manyforge.program_diagnostic.v2",
+                "runtime_overrides": {},
+                "omitted_override_count": 0,
+            },
             {key: value for key, value in payload.items() if key != "origin"},
             {**payload, "origin": None},
             {**payload, "state": "succeeded"},
@@ -3297,6 +3384,9 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/control-state",
     }.issubset(paths)
     assert "/api/execution/observation" not in paths
+    # The runtime-override workflow is removed; runtime keys stay writable.
+    assert not any("runtime-overrides" in path for path in paths)
+    assert "/api/program/runs/{program_run_id}/blackboard-values" in paths
     assert {
         "/api/execution/operations/{operation_id}/pause",
         "/api/execution/operations/{operation_id}/resume",

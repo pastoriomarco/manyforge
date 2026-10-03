@@ -9,6 +9,7 @@ import {
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import type { ResetApplyController } from '../hooks/useResetApply';
 import { OverlayPanel } from './OverlayPanel';
 import { programActionUnavailableReason, programApplyScenarioReason } from '../state/authoringWorkspace';
 
@@ -17,6 +18,8 @@ type ProgramAction = 'apply' | 'revert' | 'discard';
 interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
+  /** Apply while a Program run exists Resets it first (one confirmation). */
+  resetApply?: ResetApplyController | null;
   localInvalidEdit?: boolean;
   /** The workspace-independent Scenario New/Save/Save as/Load commands. */
   scenarioCommands?: ReactNode;
@@ -33,19 +36,21 @@ function actionTitle(action: ProgramAction): string {
 export function ProgramDocumentControls({
   controller,
   runtime,
+  resetApply = null,
   localInvalidEdit = false,
   scenarioCommands,
 }: ProgramDocumentControlsProps) {
   const {
     state,
-    mutationAvailable,
     mutationUnavailableReason,
+    documentUnavailableReason,
     apply: applyDraft,
     discard,
     revert,
     scenarioSourceDiagnostics = [],
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
+  const [applyRefusal, setApplyRefusal] = useState<string | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
@@ -54,26 +59,24 @@ export function ProgramDocumentControls({
     ?? 'Complete the authoring Draft before Save or Apply.';
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
+  // With a run, Apply ends it first: available when the Draft is editable
+  // (all Program motion stopped) and Reset is allowed.
+  const resetsRun = resetApply?.runExists === true;
+  const busyReason = busy ? 'Another Program operation is in progress.' : null;
+  const applyCommonReason = busyReason ?? (resetsRun && resetApply !== null
+    ? resetApply.unavailableReason('program') : documentUnavailableReason);
   const authoringBlockReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
-    : busy
-    ? 'Another Program operation is in progress.'
-    : mutationUnavailableReason;
+    : applyCommonReason;
   const currentScenario = runtime.state.currentScenario?.currentScenario ?? null;
   const currentScenarioUnavailable = programApplyScenarioReason(runtime.state.currentScenario);
-  const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
-  const commonReason = busy ? 'Another Program operation is in progress.'
-    : !mutationAvailable ? mutationUnavailableReason ?? 'Authoring is unavailable.' : null;
   const reasons = {
-    apply: programActionUnavailableReason(workspace, 'apply', commonReason)
+    apply: programActionUnavailableReason(workspace, 'apply', applyCommonReason)
       ?? (localInvalidEdit ? authoringBlockReason : null)
       ?? currentScenarioUnavailable,
-    revert: programActionUnavailableReason(workspace, 'revert', commonReason),
-    discard: programActionUnavailableReason(workspace, 'discard', commonReason),
+    revert: programActionUnavailableReason(workspace, 'revert', busyReason ?? documentUnavailableReason),
+    discard: programActionUnavailableReason(workspace, 'discard', busyReason ?? mutationUnavailableReason),
   };
-  const affectedPolicyInstanceSummary = affectedPolicyInstances.length <= 12
-    ? affectedPolicyInstances.join(', ')
-    : `${affectedPolicyInstances.slice(0, 12).join(', ')}, and ${affectedPolicyInstances.length - 12} more`;
 
   useEffect(() => {
     if (!workspace?.hasUnsavedChanges && !workspace?.hasUnappliedChanges) return undefined;
@@ -87,6 +90,7 @@ export function ProgramDocumentControls({
 
   const closeAction = useCallback(() => {
     setAction(null);
+    setApplyRefusal(null);
   }, []);
   const beginAction = (
     next: ProgramAction,
@@ -100,6 +104,14 @@ export function ProgramDocumentControls({
     if (action === null || reasons[action] !== null) return;
     operation();
     closeAction();
+  };
+  // The one acknowledgement: Reset the run, then the ordinary Apply.
+  const resetAndApply = () => {
+    if (resetApply === null || reasons.apply !== null) return;
+    void resetApply.confirm('program').then((refusal) => {
+      if (refusal === null) closeAction();
+      else setApplyRefusal(refusal);
+    });
   };
 
   const programName = authoring?.name ?? 'No Program';
@@ -132,8 +144,10 @@ export function ProgramDocumentControls({
                 ?? (!program
                   ? incompleteReason
                   : workspace?.applied.matchesDraft === true
-                  ? 'Draft already matches Applied.'
-                  : 'Apply this Draft to the current active Scenario without changing Deployment.')}
+                  ? 'Nothing to apply: the Program Draft matches Applied.'
+                  : resetsRun
+                    ? 'Reset the current run, then Apply this Draft. Deployment does not change.'
+                    : 'Apply this Draft to the current active Scenario without changing Deployment.')}
             onClick={(event) => beginAction('apply', event)}
           >
             Apply
@@ -183,17 +197,18 @@ export function ProgramDocumentControls({
             {!workspace?.applicability.applyReady && (
               <div className="document-apply-blocked" role="alert">
                 <strong>Draft is not Apply-ready.</strong>
-                {affectedPolicyInstanceSummary && <span>Affected nodes: {affectedPolicyInstanceSummary}.</span>}
                 <span>{workspace?.applicability.unavailableReason?.message}</span>
               </div>
             )}
+            {resetsRun && <ResetsRunWarning />}
+            {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <button
               type="button"
               className="primary-action"
               disabled={reasons.apply !== null}
-              onClick={() => complete(applyDraft)}
+              onClick={() => (resetsRun ? resetAndApply() : complete(applyDraft))}
             >
-              Apply Draft
+              {resetsRun ? 'Reset run and Apply Draft' : 'Apply Draft'}
             </button>
           </div>
         )}
@@ -217,5 +232,22 @@ export function ProgramDocumentControls({
         )}
       </OverlayPanel>
     </>
+  );
+}
+
+/**
+ * The single, visually clear warning of an Apply while a Program run exists.
+ * It is part of Apply's ordinary confirmation: no second dialog.
+ */
+export function ResetsRunWarning() {
+  return (
+    <div className="document-apply-blocked document-apply-resets-run" role="alert">
+      <strong>Applying Resets the current run.</strong>
+      <span>
+        The whole run ends, including any repeating part, and does not resume
+        where it stopped. When the cycle is Idle, exactly this Draft is
+        Applied. Nothing is saved, executed or run automatically.
+      </span>
+    </div>
   );
 }

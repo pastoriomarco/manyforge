@@ -32,9 +32,6 @@ from manyforge_headless_api.models import (
     ProgramScenePreparationRequest,
     ProgramSelectionStartRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
 )
 from manyforge_program_runner.runtime import (
     ProgramRunnerConfig,
@@ -329,7 +326,7 @@ class _Snapshot:
         revision: int,
     ) -> None:
         capture = {
-            "schema_version": "manyforge.program_run_capture.v1",
+            "schema_version": "manyforge.program_run_capture.v2",
             "program_run_id": program_run_id,
             "applied_record_digest": _DIGEST_B,
             "scenario_id": "scenario.1",
@@ -345,6 +342,7 @@ class _Snapshot:
         }
         self.capture = SimpleNamespace(
             program_run_id=program_run_id,
+            node_policy_by_instance_id={},
             to_dict=lambda: deepcopy(capture),
         )
         self._value = {
@@ -466,38 +464,8 @@ class _RuntimeControlOwner(_Owner):
         self.rows[program_run_id] = advanced
         return advanced
 
-    def validate_runtime_override(
-        self,
-        _program_run_id: str,
-        **values: Any,
-    ) -> Any:
-        return deepcopy(values["value"])
-
     def note_runtime_control_change(self, program_run_id: str) -> _Snapshot:
         return self._advance(program_run_id)
-
-    def activate_runtime_override(
-        self,
-        program_run_id: str,
-        **values: Any,
-    ) -> _Snapshot:
-        self.effects.append(("activate", deepcopy(values)))
-        return self._advance(program_run_id)
-
-    def clear_runtime_override(
-        self,
-        program_run_id: str,
-        **values: Any,
-    ) -> _Snapshot:
-        self.effects.append(("clear", deepcopy(values)))
-        return self._advance(program_run_id)
-
-    def validate_runtime_override_promotion(
-        self,
-        _program_run_id: str,
-        **_values: Any,
-    ) -> str:
-        return "motion.move_to_pose"
 
     def write_runtime_blackboard(
         self,
@@ -3213,15 +3181,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
 
     if near_revision_limit:
         controls = runtime._controls("program-cycle.1")
-        controls.stage_override(
-            node_instance_id="move.1",
-            node_attempt_id="attempt.1",
-            parameter_id="velocity_scale",
-            value=0.5,
-            source_observation_id=None,
-            source_owner_generation=None,
-            validator=lambda **values: values["value"],
-        )
+        controls.audit_value("prior_control")
         snapshot = controls.snapshot()
         maximum = 9_007_199_254_740_991
         snapshot["runtime_control_revision"] = maximum - 1
@@ -3483,72 +3443,11 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
     assert commands["operation_start"]["allowed"] is True
     assert commands["program_manual_handover"]["allowed"] is True
 
-    stage_request = RuntimeOverrideStageRequest.model_validate(
-        {
-            **request_base("controls.stage.1", 1),
-            "node_instance_id": "node.motion.1",
-            "node_attempt_id": "attempt.motion.1",
-            "parameter_id": "goal",
-            "value": {"position_m": [0.1, 0.2, 0.3]},
-            "source_observation_id": None,
-            "source_owner_generation": None,
-        }
-    )
-    staged = runtime.stage_runtime_override(program_run_id, stage_request)
-    with pytest.raises(ProgramRunnerError) as repeated_stage:
-        runtime.stage_runtime_override(program_run_id, stage_request)
-    assert repeated_stage.value.code == "program_runtime_control_stale"
-    assert repeated_stage.value.details == {
-        "expected_run_revision": 1,
-        "current_run_revision": 2,
-    }
-    override = staged["result"]
-    assert override["status"] == "staged"
-    assert owner.rows[program_run_id].run_revision == 2
-
-    activated = runtime.activate_runtime_override(
-        program_run_id,
-        RuntimeOverrideActionRequest.model_validate(
-            {
-                **request_base("controls.activate.1", 2),
-                "override_id": override["override_id"],
-                "expected_override_revision": 1,
-            }
-        ),
-    )
-    assert activated["result"]["status"] == "active"
-
-    promoted = runtime.promote_runtime_override(
-        program_run_id,
-        RuntimeOverridePromotionRequest.model_validate(
-            {
-                **request_base("controls.promote.1", 3),
-                "override_id": override["override_id"],
-                "expected_override_revision": 2,
-                "expected_draft_id": "draft.controls.1",
-                "expected_draft_revision": 1,
-            }
-        ),
-    )
-    assert promoted["result"]["status"] == "awaiting_reset"
-
-    cleared = runtime.clear_runtime_override(
-        program_run_id,
-        RuntimeOverrideActionRequest.model_validate(
-            {
-                **request_base("controls.clear.1", 4),
-                "override_id": override["override_id"],
-                "expected_override_revision": 2,
-            }
-        ),
-    )
-    assert cleared["result"]["status"] == "cleared"
-
     written = runtime.write_runtime_blackboard(
         program_run_id,
         RuntimeBlackboardWriteRequest.model_validate(
             {
-                **request_base("controls.write.1", 5),
+                **request_base("controls.write.1", 1),
                 "key": "operator.confirmed",
                 "value": True,
             }
@@ -3558,13 +3457,56 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
         "key": "operator.confirmed",
         "status": "written",
     }
-    expected_controls = written["runtime_controls"]["runtime_controls"]
-    assert expected_controls["runtime_control_revision"] == 6
-    assert [kind for kind, _values in owner.effects] == [
-        "activate",
-        "clear",
-        "write",
-    ]
+    with pytest.raises(ProgramRunnerError) as repeated_write:
+        runtime.write_runtime_blackboard(
+            program_run_id,
+            RuntimeBlackboardWriteRequest.model_validate(
+                {
+                    **request_base("controls.write.2", 1),
+                    "key": "operator.confirmed",
+                    "value": False,
+                }
+            ),
+        )
+    assert repeated_write.value.code == "program_runtime_control_stale"
+    assert repeated_write.value.details == {
+        "expected_run_revision": 1,
+        "current_run_revision": 2,
+    }
+    assert written["runtime_controls"]["runtime_controls"][
+        "runtime_control_revision"
+    ] == 2
+
+    # A failed attempt held for intervention keeps permitted keys writable
+    # through the same value-store path; the write never resumes the run and
+    # manual-result staging stays unavailable.
+    current = owner.rows[program_run_id]
+    owner.rows[program_run_id] = _Snapshot(
+        program_run_id,
+        owner_id=current.to_dict()["owner_id"],
+        owner_epoch=current.owner_epoch,
+        state="intervention_required",
+        revision=current.run_revision,
+    )
+    commands = {
+        row["command_kind"]: row for row in runtime.cycle_status()["allowed_commands"]
+    }
+    assert commands["program_runtime_blackboard_write"]["allowed"] is True
+    assert commands["program_manual_result_stage"]["allowed"] is False
+    paused = runtime.write_runtime_blackboard(
+        program_run_id,
+        RuntimeBlackboardWriteRequest.model_validate(
+            {
+                **request_base("controls.write.paused", current.run_revision),
+                "key": "operator.confirmed",
+                "value": False,
+            }
+        ),
+    )
+    assert paused["run"]["state"] == "intervention_required"
+    expected_controls = paused["runtime_controls"]["runtime_controls"]
+    assert expected_controls["runtime_control_revision"] == 3
+    assert [kind for kind, _values in owner.effects] == ["write", "write"]
 
     runtime.shutdown()
     restored = ProgramRuntime(
@@ -3594,143 +3536,6 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
         == expected_controls
     )
     restored.shutdown()
-
-
-@pytest.mark.parametrize(
-    "node_id",
-    ["motion.move_to_joint_target", "motion.move_to_pose"],
-)
-def test_runtime_override_uses_the_held_multi_robot_target(node_id: str) -> None:
-    program_run_id = "program-run.multi.1"
-    intervention = SimpleNamespace(
-        identity=SimpleNamespace(
-            node_instance_id="move.ur5e",
-            node_attempt_id="attempt.ur5e.1",
-        )
-    )
-    capture = SimpleNamespace(
-        graph_revision=_DIGEST_A,
-        retained_bundle_id=_DIGEST_B,
-        program_binding_id="sha256:" + "c" * 64,
-    )
-    parameters = {
-        "target_role": "ur5e_arm",
-        "base_frame_role": "base",
-        "tcp_frame_role": "tcp",
-        "target_mode": "absolute",
-        # The authored goal's frame is not the frame the TCP is measured in.
-        "goal": {"frame_ref": {"kind": "cell_frame"}},
-    }
-
-    class Owner:
-        def intervention(self, selected_run_id):
-            assert selected_run_id == program_run_id
-            return intervention
-
-        def read(self, selected_run_id):
-            assert selected_run_id == program_run_id
-            return SimpleNamespace(capture=capture)
-
-        def runtime_override_source_context(self, selected_run_id, **selection):
-            assert selected_run_id == program_run_id
-            assert selection == {"node_instance_id": "move.ur5e"}
-            return {
-                "node_id": node_id,
-                "parameters": parameters,
-                "target_binding": {
-                    "target_role_id": "ur5e_arm",
-                    "controllable_component_id": "ur5e_robot",
-                    "command_target_id": "arm",
-                },
-            }
-
-        def validate_runtime_override(self, selected_run_id, **candidate):
-            assert selected_run_id == program_run_id
-            return candidate["value"]
-
-    class Kernel:
-        queries: list[dict[str, Any]] = []
-
-        def observation(self):
-            return {
-                "ok": True,
-                "observation": {
-                    "owner_epoch": "kernel.1",
-                    "graph_revision": _DIGEST_A,
-                    "retained_bundle_id": _DIGEST_B,
-                    "targets": [
-                        {
-                            "controllable_component_id": "lite6_robot",
-                            "command_target_id": "arm",
-                            "source_joint_names": ["joint1"],
-                            "positions_si": [0.1],
-                            "source_epoch": "lite6.source.1",
-                            "source_sequence": 3,
-                        },
-                        {
-                            "controllable_component_id": "ur5e_robot",
-                            "command_target_id": "arm",
-                            "source_joint_names": ["shoulder_pan_joint"],
-                            "positions_si": [-0.4],
-                            "source_epoch": "ur5e.source.1",
-                            "source_sequence": 7,
-                        },
-                    ],
-                },
-            }
-
-        def query_target(self, query):
-            self.queries.append(deepcopy(query))
-            return {
-                "ok": True,
-                "target_observation": {
-                    **query,
-                    "source_epoch": "ur5e.source.1",
-                    "source_sequence": 7,
-                    "value": {
-                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
-                        "orientation": {
-                            "x": 0.0,
-                            "y": 0.0,
-                            "z": 0.0,
-                            "w": 1.0,
-                        },
-                    },
-                },
-            }
-
-    runtime = object.__new__(ProgramRuntime)
-    runtime._owner = Owner()  # type: ignore[attr-defined]
-    runtime._kernel = Kernel()  # type: ignore[attr-defined]
-
-    candidate = runtime._runtime_override_observation_candidate(program_run_id)
-
-    assert candidate["available"] is True
-    assert candidate["source_observation_id"] == "ur5e.source.1"
-    assert candidate["source_owner_generation"] == 7
-    if node_id == "motion.move_to_joint_target":
-        assert candidate["value"] == [
-            {"joint_name": "shoulder_pan_joint", "position_rad": -0.4}
-        ]
-        assert runtime._kernel.queries == []  # type: ignore[attr-defined]
-    else:
-        # Measured relative to the moving robot's base, and labelled so.
-        assert candidate["value"] == {
-            "frame_ref": {"kind": "target_frame", "target_role": "ur5e_arm", "frame_role": "base"},
-            "position_m": [0.1, 0.2, 0.3],
-            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
-        }
-        assert runtime._kernel.queries == [  # type: ignore[attr-defined]
-            {
-                "schema_version": "manyforge.target_observation_query.v1",
-                "owner_epoch": "kernel.1",
-                "program_binding_id": "sha256:" + "c" * 64,
-                "target_role_id": "ur5e_arm",
-                "kind": "frame_pose",
-                "frame_role_id": "tcp",
-                "relative_to_frame_role_id": "base",
-            }
-        ]
 
 
 def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
@@ -5517,6 +5322,8 @@ def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
         ("retry_motion_from_current_state", "incomplete"),
         ("retry_motion_from_current_state", "unknown"),
         ("retry_motion_from_current_state", "resolve_rejected"),
+        ("retry_runtime_step", "forbidden"),
+        ("retry_motion_from_current_state", "exhausted"),
     ],
 )
 def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
@@ -5538,6 +5345,17 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
     runtime._owner, runtime._host = owner, host
     runtime.start()
     runtime.start_run(_start_request())
+    # The run-start captured policy, not the caller, permits the Retry.
+    owner.rows["program-cycle.1"].capture.node_policy_by_instance_id = {
+        "move.1": SimpleNamespace(
+            recovery_policy={
+                "allow_intervention": case != "forbidden",
+                "max_retries": 1 if case == "exhausted" else 0,
+            }
+        )
+    }
+    if case == "exhausted":
+        runtime._controls("program-cycle.1").note_retry("move.1")
     intervention = SimpleNamespace(
         identity=SimpleNamespace(
             program_run_id="program-cycle.1",
@@ -5598,6 +5416,27 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
     )
     owner_action = None if action_id == "retry_runtime_step" else action_id
     try:
+        if case in {"forbidden", "exhausted"}:
+            # The command revalidates the same captured-policy predicate as
+            # the offer, before any effect, whatever the caller's label.
+            for index, label in enumerate(("operator_ui", "assistant")):
+                with pytest.raises(ProgramRunnerError) as refused:
+                    runtime.apply_recovery_action(
+                        request.model_copy(
+                            update={
+                                "request_id": f"retry.label.{index}",
+                                "source_label": label,
+                            }
+                        )
+                    )
+                assert refused.value.code == (
+                    "program_runtime_retry_forbidden_by_policy"
+                    if case == "forbidden"
+                    else "program_runtime_retry_limit_reached"
+                )
+            assert calls == []
+            assert not journal.read().reconciliation_required
+            return
         if case == "accepted":
             result = runtime.apply_recovery_action(request)
             # Owner prepares and releases all motion first; only then does

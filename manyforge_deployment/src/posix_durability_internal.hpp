@@ -141,6 +141,54 @@ class ProcessAffineLockFile final {
     bool missing_is_empty, const ErrorPolicy& errors,
     const ReadMessages& messages);
 
+/// Identity of one opened regular file version. Any replacement (new inode)
+/// or in-place rewrite (mtime/ctime/size) yields a different value.
+struct RegularFileIdentity final {
+  std::uint64_t device{};
+  std::uint64_t inode{};
+  std::uint64_t size{};
+  std::int64_t modified_seconds{};
+  std::int64_t modified_nanoseconds{};
+  std::int64_t changed_seconds{};
+  std::int64_t changed_nanoseconds{};
+
+  friend bool operator==(const RegularFileIdentity&,
+                         const RegularFileIdentity&) = default;
+};
+
+struct IdentifiedFileBytes final {
+  std::string bytes;
+  /// Identity of the descriptor the bytes were read from, observed both
+  /// before and after the exact read.
+  RegularFileIdentity identity;
+};
+
+/// Current CLOCK_REALTIME, the clock of file change timestamps.
+[[nodiscard]] std::int64_t realtime_now_ns();
+
+/// True when the file version last changed comfortably before
+/// `reference_realtime_ns`, by more than any filesystem timestamp granularity.
+/// Only then must any write made after that reference change the identity;
+/// a version changed within the same timestamp tick may not.
+[[nodiscard]] bool identity_settled_before(const RegularFileIdentity& identity,
+                                           std::int64_t reference_realtime_ns);
+
+/// The exact-read contract of read_exact_regular_file(), also returning the
+/// identity of the file version that was read.
+[[nodiscard]] std::optional<IdentifiedFileBytes>
+read_exact_regular_file_with_identity(const std::filesystem::path& path,
+                                      std::uint64_t maximum_bytes,
+                                      bool missing_is_empty,
+                                      const ErrorPolicy& errors,
+                                      const ReadMessages& messages);
+
+/// Opens without following links and returns the current regular-file
+/// identity under the same bound checks as the exact read, without reading.
+[[nodiscard]] std::optional<RegularFileIdentity> regular_file_identity(
+    const std::filesystem::path& path, std::uint64_t maximum_bytes,
+    bool missing_is_empty, const ErrorPolicy& errors,
+    const ReadMessages& messages);
+
 using ExistingValueVerifier =
     std::function<void(std::string_view existing_bytes)>;
 

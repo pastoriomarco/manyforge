@@ -129,9 +129,13 @@ void ManagerPackageGeneration::RequireCurrent(
   if (latched_error_.has_value()) {
     throw ManagerPackageGenerationRestartRequired(*latched_error_);
   }
-  const auto verified =
-      manyforge::core::VerifyRuntimeContractManifestSet(observed);
-  if (!verified.ok() || observed != manifest_set_) {
+  // The pinned set was digest-verified at construction and verification is a
+  // pure function of the value, so an exactly equal observation is already
+  // verified. Only a differing set is re-verified, to decide whether its
+  // digest may be reported.
+  if (observed != manifest_set_) {
+    const auto verified =
+        manyforge::core::VerifyRuntimeContractManifestSet(observed);
     LatchAndThrow("manifest_set_mismatch",
                   verified.ok()
                       ? std::optional{observed.manifest_set_digest}

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
@@ -4500,6 +4501,57 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
   ASSERT_EQ(peer->cell_runtime_root, primary.get());
 
+  // Re-sealing a joined peer excludes every route reader of that peer for
+  // its whole duration. Those readers serialize on the cell root's mutex, so
+  // the re-seal must hold the root's mutex, not the peer's own: a reader
+  // started while the backend route is being re-bound may not complete until
+  // the re-seal returns.
+  {
+    ManagedKernelAdmissionGate peer_reseal_gate;
+    const core::ConfigurationFenceId peer_reseal_fence_id(
+        "i6.joined.peer-reseal.apply");
+    const core::ConfigurationFenceScopeDTO peer_reseal_scope{};
+    peer_reseal_gate.RestoreFence(peer_reseal_fence_id, peer_reseal_scope);
+    // This fixture observes the peer engine through a subscription wrapper;
+    // re-seal resolves registrations against the retained engine itself.
+    const auto observed_registrations = peer->participant_registrations;
+    for (auto &registration : peer->participant_registrations) {
+      if (registration.engine == peer_subscription.get())
+        registration.engine = peer->participant_engine_for(true);
+    }
+    const auto retained_rebind = peer->rebind_motion_route;
+    ASSERT_TRUE(retained_rebind);
+    std::optional<std::future_status> reader_during_reseal;
+    std::future<bool> reader;
+    peer->rebind_motion_route =
+        [&](core::RuntimeParticipantBinding binding,
+            std::vector<core::RuntimeParticipantBinding> aliases) {
+          // A reader that only needs the route lock: the peer has no
+          // gripper, so it answers stale as soon as it holds the lock.
+          reader = std::async(std::launch::async, [&] {
+            return !peer->ReadGripperStatus(peer->motion_binding).ok();
+          });
+          reader_during_reseal =
+              reader.wait_for(std::chrono::milliseconds(200));
+          return retained_rebind(std::move(binding), std::move(aliases));
+        };
+    const auto resealed = reseal_retained_native_runtime_for_apply(
+        *peer,
+        RetainedNativeRuntimeResealInput{
+            peer->motion_binding, std::nullopt, {}, {},
+            peer->control_binding_representatives,
+            peer->participant_registrations, {}, nullptr,
+            peer->reference_resolver, peer_reseal_fence_id, peer_reseal_scope,
+            peer_reseal_gate});
+    peer->rebind_motion_route = retained_rebind;
+    peer->participant_registrations = observed_registrations;
+    ASSERT_TRUE(resealed.ok()) << resealed.error().message;
+    ASSERT_TRUE(reader_during_reseal.has_value());
+    EXPECT_EQ(*reader_during_reseal, std::future_status::timeout);
+    ASSERT_TRUE(reader.valid());
+    EXPECT_TRUE(reader.get());
+  }
+
   auto stable_stop_observer = primary->stop_surveillance_owner;
   ASSERT_NE(stable_stop_observer, nullptr);
   std::weak_ptr<RetainedStopSurveillanceOwner> stable_observer_lifetime =
@@ -5876,7 +5928,6 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
         parameters.emplace_back(CanonicalValue::Object{
             {"parameter_id", CanonicalValue("value" + std::to_string(10U + index))},
             {"type", CanonicalValue("string")},
-            {"runtime_mutability", CanonicalValue("immutable")},
             {"default", CanonicalValue(scalar(deployment::kMaxArtifactScalarBytes))}});
       }
       auto members = root.as_object();

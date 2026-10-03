@@ -293,5 +293,44 @@ TEST(StopFaultRecoveryTest, FactsRequireExactCapturedResourceCoverageAndCanonica
   EXPECT_EQ(stop_fault_recovery_facts_field_error(facts), "stop_fault_recovery_facts_invalid");
 }
 
+TEST(StopFaultRecoveryTest, LatchWithoutCapturedResourcesIsAssessableAndClearable) {
+  // Live incident 2026-10-02: a Stop that captured only a never-dispatched
+  // planning attempt latches no resource (it has no motion-rest obligation).
+  // Its exact recovery facts are therefore resource-free and must still be
+  // assessed and cleared, never rejected as incomplete.
+  auto status = Status();
+  status.fault_latch->trigger = StopFaultTriggerDTO::kPersistenceDegraded;
+  status.fault_latch->persistence_degraded = true;
+  status.fault_latch->captured_resources.clear();
+  auto facts = Facts(status);
+  facts.resource_facts.clear();
+  EXPECT_FALSE(stop_fault_recovery_facts_field_error(facts).has_value());
+
+  auto assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+  status.fault_latch = assessed.value();
+  auto evaluation = EvaluateStopFaultRecovery(Intent(*status.fault_latch), status, facts);
+  ASSERT_TRUE(evaluation.ok()) << evaluation.error().message;
+  EXPECT_TRUE(evaluation.value().result.accepted);
+  EXPECT_EQ(evaluation.value().result.latch.state, StopFaultLatchStateDTO::kCleared);
+
+  // Coverage stays exact: a resource fact the latch did not capture, or a
+  // still-missing durable record, keeps the latch closed.
+  auto widened = Facts(status);
+  auto rejected = AssessStopFaultRecovery(status, widened);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "stop_fault_recovery_facts_join_invalid");
+  status = Status();
+  status.fault_latch->captured_resources.clear();
+  status.acceptance_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kFailed, ErrorDTO{"journal_failed", "failed", {}}, 1U};
+  facts = Facts(status);
+  facts.resource_facts.clear();
+  assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
+}
+
 }  // namespace
 }  // namespace manyforge::core

@@ -515,6 +515,24 @@ RetainedObservedStateChannel::current_state(const std::int64_t now_ns) const {
   return publication_.current_state(publication_.query_context(), now_ns);
 }
 
+core::Result<RetainedBoundObservedState>
+RetainedObservedStateChannel::current_bound_state(
+    const std::int64_t now_ns) const {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  if (fresh_state_required_.load(std::memory_order_acquire)) {
+    return core::Result<RetainedBoundObservedState>::Err(channel_error(
+        "retained_state_fresh_sample_unavailable",
+        "native route state requires a fresh current-binding sample"));
+  }
+  auto state =
+      publication_.current_state(publication_.query_context(), now_ns);
+  if (!state.ok()) {
+    return core::Result<RetainedBoundObservedState>::Err(state.error());
+  }
+  return core::Result<RetainedBoundObservedState>::Ok(
+      RetainedBoundObservedState{current_binding_, std::move(state.value())});
+}
+
 core::Result<core::ObservedStateSnapshotDTO>
 RetainedObservedStateChannel::current_state_bounded(
     const std::int64_t now_ns, const std::int64_t deadline_ns,

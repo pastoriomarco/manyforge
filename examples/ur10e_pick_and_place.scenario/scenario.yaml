@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
     "deployment.yaml": "sha256:18f67a2316d3d1bf01f9d2b1ee32d6cafee48b4b9fbddddc40a9e8c37c89aaae",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:03ef9e36e634a2b0bf7d2a2e1ef7285f95ad233fc30d706602b1fbe463cebb98"
+    "program.yaml": "sha256:6fa1af32877291964d625137eaedba1146a9ec3a6e3fba744a61cbe256cdde44"
   },
   "name": "ur10e_robotiq_pick_place_preview",
   "saved_status": {
-    "checked_content_digest": "sha256:26e8249aa0369dd319839aa7346b630848df7e25aef544147807416d8c9a2732",
+    "checked_content_digest": "sha256:3daaa19611446a0c5add2030f275865a8714417f04f9f312318bd4207c137b63",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

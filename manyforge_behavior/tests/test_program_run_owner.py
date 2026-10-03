@@ -103,6 +103,7 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     record = owner.take_diagnostic(run_id)
     assert record["blackboard"] == {"recorded_value": True}
     assert record["program_binding_id"] == admission.program_binding_id
+    assert not {"runtime_overrides", "omitted_override_count"} & set(record)
     assert "blackboard" not in snapshot.to_dict()
     assert owner.take_diagnostic(run_id) is None
 
@@ -268,6 +269,16 @@ class _MalformedOperatorStopTaskPort(_OperatorStopTaskPort):
 
 class _StopFaultTaskPort(_OperatorStopTaskPort):
     recovery_class = "stop_fault_intervention"
+
+
+class _FirstTaskStoppedPort(_OperatorStopTaskPort):
+    """Only the first task is stopped; the resumed task keeps running."""
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        if task_id == "task-1":
+            return super().observe(task_id)
+        self.observations += 1
+        return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.ACTIVE)
 
 
 class _BlockingTaskPort(_TaskPort):
@@ -578,7 +589,6 @@ def _fixture(
                 owner_epoch="kernel.epoch.1",
             ),
         ),
-        program_parameter_values={},
     )
     owner = ProgramRunOwner(
         owner_id="program-runner.cell-a",
@@ -595,23 +605,13 @@ def _program_with_policies(
     admission: ProgramRunAdmission,
     *,
     second_row: bool = False,
-    allowed_skill: bool = False,
 ) -> Program:
     document = admission.program.to_dict()
     document["tree"]["operator_stop_policy"] = "hold"
     if second_row:
-        document["tree"]["children"][0]["modification_policy"] = {
-            "runtime_override": "human_approval",
-            "persistent_edit": "forbidden",
-            "intervention_delegate": "human_only",
-        }
-    if allowed_skill:
-        document["tree"]["recovery_policy"] = {
+        document["tree"]["children"][0]["recovery_policy"] = {
             "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 1,
-            "allowed_skills": ["recover-pick"],
-            "persistence_ceiling": "session_only",
+            "max_retries": 0,
         }
     document["program_revision"] = compute_content_identity(
         document,
@@ -684,25 +684,14 @@ def test_start_captures_exact_nondefault_policy_and_immutable_lookup() -> None:
 
     assert policy.to_dict() == {
         "instance_id": program.tree.instance_id,
-        "modification_policy": {
-            "runtime_override": "forbidden",
-            "persistent_edit": "forbidden",
-            "intervention_delegate": "forbidden",
-        },
-        "recovery_policy": {
-            "allow_intervention": False,
-            "allowed_recovery_actions": [],
-            "max_retries": 0,
-            "allowed_skills": [],
-            "persistence_ceiling": "session_only",
-        },
+        "recovery_policy": {"allow_intervention": False, "max_retries": 0},
         "operator_stop_policy": "hold",
     }
     assert started.capture.to_dict()["node_policies"] == [policy.to_dict()]
     with pytest.raises(TypeError):
         started.capture.node_policy_by_instance_id[program.tree.instance_id] = policy
     with pytest.raises(TypeError):
-        policy.modification_policy["runtime_override"] = "human_approval"
+        policy.recovery_policy["allow_intervention"] = True
     with pytest.raises(TypeError):
         policy.recovery_policy["max_retries"] = 1
 
@@ -738,18 +727,7 @@ def test_program_run_admission_rejects_nonexact_policy_vectors(
         binding["node_policies"] = [
             {
                 "instance_id": "unused",
-                "modification_policy": {
-                    "runtime_override": "forbidden",
-                    "persistent_edit": "forbidden",
-                    "intervention_delegate": "forbidden",
-                },
-                "recovery_policy": {
-                    "allow_intervention": False,
-                    "allowed_recovery_actions": [],
-                    "max_retries": 0,
-                    "allowed_skills": [],
-                    "persistence_ceiling": "session_only",
-                },
+                "recovery_policy": {"allow_intervention": False, "max_retries": 0},
                 "operator_stop_policy": "inherit",
             },
             *rows,
@@ -765,19 +743,28 @@ def test_program_run_admission_rejects_nonexact_policy_vectors(
         replace(admission, program=program, program_binding=binding)
 
 
-def test_program_run_admission_rejects_policy_skills_and_wrong_program_identity() -> (
+def test_program_run_admission_rejects_removed_policy_rows_and_wrong_identity() -> (
     None
 ):
     _owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED
     )
-    program = _program_with_policies(admission, allowed_skill=True)
+    program = _program_with_policies(admission, second_row=True)
+    rows = [policy.to_dict() for policy in program_node_policies(program)]
     binding = deepcopy(dict(admission.program_binding))
     binding["program_revision"] = program.program_revision
-    binding["node_policies"] = []
+    binding["node_policies"] = deepcopy(rows)
+    for row in binding["node_policies"]:
+        row["modification_policy"] = {
+            "runtime_override": "forbidden",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "forbidden",
+        }
 
-    with pytest.raises(ValueError, match="revision-qualified retained skill"):
+    with pytest.raises(ValueError, match="node_policies"):
         replace(admission, program=program, program_binding=binding)
+
+    binding["node_policies"] = deepcopy(rows)
 
     binding["program_revision"] = admission.program.program_revision
     with pytest.raises(ValueError, match="disagree"):
@@ -1289,6 +1276,77 @@ def _failure_paused_run():
     return owner, task, scope, interventions, run_id, failure
 
 
+class _ObservationBoundFailureTaskPort(_PolicyTaskPort):
+    """A failure whose owner Retry readiness carries an observation deadline."""
+
+    def __init__(self, events: list[str], *, deadline_ns: int) -> None:
+        super().__init__(events, OwnerTaskState.FAILED)
+        self.deadline_ns = deadline_ns
+        self.observations = 0
+
+    def _assessment(self) -> dict[str, Any]:
+        return {
+            "allowed_actions": ["retry_after_scene_repair", "reset_cycle"],
+            "observed_state_valid_until_ns": self.deadline_ns,
+            "recovery_class": "failed_validation",
+            "retry_admissible": True,
+            "status": "retry_ready",
+        }
+
+    def start(self, node_id, identity, inputs) -> OwnerTaskSnapshot:
+        started = super().start(node_id, identity, inputs)
+        return replace(
+            started,
+            metadata={**started.metadata, "recovery_assessment": self._assessment()},
+        )
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        self.observations += 1
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.FAILED,
+            metadata={"recovery_assessment": self._assessment()},
+            reason_code="no_feasible_candidate",
+        )
+
+
+@pytest.mark.parametrize("deadline_ns", [0, 1_000])
+def test_failure_pause_keeps_owner_observation_deadline_current(deadline_ns) -> None:
+    """A dormant failure pause re-reads its owner assessment only while that
+    assessment is bounded by an observation deadline, so a Retry offer follows
+    the owner's freshness instead of a deadline captured at failure time."""
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _ObservationBoundFailureTaskPort(
+            events, deadline_ns=deadline_ns
+        ),
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
+    failure = interventions.read(run_id)
+    assert failure.owner_assessment["observed_state_valid_until_ns"] == deadline_ns
+    if deadline_ns == 0:
+        # No owner deadline: the pause stays dormant without owner reads.
+        assert not owner.failure_assessment_refresh_required(run_id)
+        owner.advance_once(run_id)
+        assert task.observations == 0
+        owner.stop(run_id)
+        return
+
+    assert owner.failure_assessment_refresh_required(run_id)
+    task.deadline_ns = 2_000
+    held = owner.advance_once(run_id)
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert task.observations == 1
+    assert task.starts == 1  # the tree stayed dormant
+    refreshed = interventions.read(run_id)
+    assert refreshed.identity == failure.identity
+    assert refreshed.owner_assessment["observed_state_valid_until_ns"] == 2_000
+    owner.stop(run_id)
+
+
 def test_failure_retry_recovers_while_held_then_releases_and_restarts() -> None:
     owner, task, scope, interventions, run_id, failure = _failure_paused_run()
     assert scope.held  # the failure pause stopped all Program motion
@@ -1468,7 +1526,10 @@ def test_tick_host_retains_resume_after_a_stale_intervention_worker(
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE,
-        task_factory=_OperatorStopTaskPort,
+        # The resumed task must stay active: with every task reporting the
+        # Stop, the retried attempt can legitimately pause again before the
+        # final RUNNING read.
+        task_factory=_FirstTaskStoppedPort,
         interventions=interventions,
     )
     stale_worker_entered = Event()
@@ -1524,6 +1585,7 @@ def test_tick_host_retains_resume_after_a_stale_intervention_worker(
             assert time.monotonic() < deadline
             time.sleep(0.001)
         assert owner.read(program_run_id).state is ProgramRunState.RUNNING
+        assert interventions.read(program_run_id) is None
     finally:
         release_stale_worker.set()
         host.stop_run(program_run_id)
@@ -3541,14 +3603,14 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
     assert value["details"] is None and value["origin"] is None
     assert value["node_status_revision"] == 1
     assert value["node_statuses"]
-    assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v1")
+    assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v2")
 
 
 def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
     program = admission.program
     environment = admission.environment
     return {
-        "schema_version": "manyforge.program_run_input.v1",
+        "schema_version": "manyforge.program_run_input.v2",
         "applied_record_digest": admission.applied_record_digest,
         "scenario_id": admission.scenario_id,
         "source_document_digest": admission.source_document_digest,
@@ -3562,7 +3624,6 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         "node_environment_digest": environment.environment_digest,
         "assistant_mode": "forbidden",
         "assistant_projection": None,
-        "typed_parameter_overrides": {},
         "owner_identities": [
             {
                 "owner_role": "headless_projection",
@@ -3685,7 +3746,7 @@ def test_applied_program_publication_is_complete_run_input() -> None:
     }
     applied.update(
         {
-            "schema_version": "manyforge.applied_program_selection.v2",
+            "schema_version": "manyforge.applied_program_selection.v3",
             "baseline_program_binding_id": admission.program_binding_id,
             "preparation_digest": _DIGEST_C,
             "source": {"record_digest": _DIGEST_B},
@@ -3717,6 +3778,46 @@ def test_applied_program_publication_is_complete_run_input() -> None:
         raise AssertionError("incoherent Applied publication was admitted")
 
 
+def test_applied_publication_with_removed_parameter_overrides_is_refused() -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    live = _scenario_selection(admission)
+    applied = {
+        key: value
+        for key, value in live.items()
+        if key not in {"applied_record_digest", "schema_version"}
+    }
+    # The v2 publication carried launch-time typed_parameter_overrides. It is
+    # refused by version, never read as an override-free selection.
+    applied.update(
+        {
+            "schema_version": "manyforge.applied_program_selection.v2",
+            "baseline_program_binding_id": admission.program_binding_id,
+            "preparation_digest": _DIGEST_C,
+            "source": {"record_digest": _DIGEST_B},
+            "typed_parameter_overrides": {},
+        }
+    )
+    with pytest.raises(ProgramRunOwnerError, match="overrides were removed"):
+        build_applied_program_run_admission(
+            applied,
+            expected_scenario_id=admission.scenario_id,
+            expected_source_document_digest=admission.source_document_digest,
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
+    applied["schema_version"] = "manyforge.applied_program_selection.v3"
+    with pytest.raises(ProgramRunOwnerError, match="wrong fields"):
+        build_applied_program_run_admission(
+            applied,
+            expected_scenario_id=admission.scenario_id,
+            expected_source_document_digest=admission.source_document_digest,
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
+
+
 def _timer_with_sourced_duration_admission(
     admission: ProgramRunAdmission,
 ) -> ProgramRunAdmission:
@@ -3746,13 +3847,7 @@ def _timer_with_sourced_duration_admission(
                 "value_sources": {
                     "duration_s": {"kind": "blackboard_key", "reference": "delay"}
                 },
-                "recovery_policy": {
-                    "allow_intervention": True,
-                    "allowed_recovery_actions": ["intervention"],
-                    "max_retries": 1,
-                    "allowed_skills": [],
-                    "persistence_ceiling": "session_only",
-                },
+                "recovery_policy": {"allow_intervention": True, "max_retries": 1},
                 "children": [],
             }
         ],
@@ -3898,10 +3993,7 @@ def _pausing_move(admission: ProgramRunAdmission) -> ProgramRunAdmission:
     document = admission.program.to_dict()
     document["tree"]["children"][0]["recovery_policy"] = {
         "allow_intervention": True,
-        "allowed_recovery_actions": ["intervention"],
         "max_retries": 1,
-        "allowed_skills": [],
-        "persistence_ceiling": "session_only",
     }
     document["program_revision"] = compute_content_identity(
         document,
@@ -3940,12 +4032,12 @@ def test_input_failure_reaches_status_diagnostic_and_offer_exactly() -> None:
     assert status["reason_code"] == "node_input_unavailable"
     assert (status["details"], status["origin"]) == (details, origin)
     diagnostic = owner.take_diagnostic(run_id)
-    assert diagnostic["schema_version"] == "manyforge.program_diagnostic.v2"
+    assert diagnostic["schema_version"] == "manyforge.program_diagnostic.v3"
     assert diagnostic["reason_code"] == "node_input_unavailable"
     assert diagnostic["message"] == status["message"]
     assert (diagnostic["details"], diagnostic["origin"]) == (details, origin)
     offer = _recovery_offer(paused, interventions, run_id, "wait")
-    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v3"
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v4"
     assert offer["reason_code"] == "node_input_unavailable"
     assert offer["message"] == status["message"]
     assert offer["message"].startswith(

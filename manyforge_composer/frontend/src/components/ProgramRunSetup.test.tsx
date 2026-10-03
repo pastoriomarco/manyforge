@@ -20,7 +20,7 @@ const applied = {
   scenarioId: 'dual_cell',
   programRevision: 'sha256:0123456789abcdef',
   program: {
-    parameters: [{ parameter_id: 'max_tcp_linear_speed_mps', type: 'float64', default: 0.15, runtime_mutability: 'before_run' }],
+    parameters: [{ parameter_id: 'max_tcp_linear_speed_mps', type: 'float64', default: 0.15 }],
     tree: {
       node_id: 'parallel', instance_id: 'root', parameters: {},
       children: [motion('a', 'lite6_arm'), motion('b', 'ur5e_arm')],

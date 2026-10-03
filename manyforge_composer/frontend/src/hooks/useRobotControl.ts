@@ -24,6 +24,7 @@ import {
   motionTargetsForStatus,
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
+import type { StructuredError } from '../types/api';
 import type { HeadlessStateSource } from './useHeadlessState';
 import type {
   ManualCartesianDefaults,
@@ -70,7 +71,13 @@ export function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus
 /** Expected draft rejection is panel feedback, not an execution incident. */
 export function previewTargetRejection(error: unknown): string | null {
   if (!(error instanceof ApiError)) return null;
-  const detail = error.structuredError;
+  return motionPreviewRejectionMessage(error.structuredError);
+}
+
+/** The plain meaning of a native motion-preview rejection, if it is a known target result. */
+export function motionPreviewRejectionMessage(
+  detail: Pick<StructuredError, 'code' | 'details'> | null,
+): string | null {
   // The current proxy also uses HTTP 500 for these normal negative results.
   // Match the owner's exact result, never its broad code or HTTP status alone:
   // IK/planner transport failures use those same broad codes.

@@ -629,7 +629,6 @@
       "default": 0.35,
       "description": "Velocity scale for explicit Lite6 trocar moves.",
       "parameter_id": "velocity_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     }
   ],

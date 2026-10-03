@@ -39,7 +39,6 @@ def _parameter(parameter_id: str, value_type: str, default: Any) -> dict[str, An
         "parameter_id": parameter_id,
         "type": value_type,
         "default": default,
-        "runtime_mutability": "before_run",
     }
 
 

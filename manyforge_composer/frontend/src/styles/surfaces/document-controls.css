@@ -402,6 +402,13 @@
   font-size: var(--mf-font-size-068);
 }
 
+/* Apply while a Program run exists: the one warning that it Resets the run. */
+.document-apply-resets-run {
+  border-color: var(--mf-border-warning-34);
+  color: var(--mf-text-warning-77);
+  background: var(--mf-bg-warning-15);
+}
+
 @media (max-width: 90rem) {
   .document-actions button:not(.overlay-panel *) {
     padding-inline: 0.34rem;

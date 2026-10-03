@@ -51,7 +51,6 @@ from manyforge_behavior.skill_loader import SkillCatalog
 _MAX_TREE_DEPTH: Final = 256
 _MAX_TREE_NODES: Final = 100_000
 _MAX_CHILDREN_PER_NODE: Final = 10_000
-_MAX_RECOVERY_RETRIES: Final = 1_000_000
 _MAX_IDENTIFIER_CHARS: Final = 256
 _MAX_DESCRIPTION_CHARS: Final = 4096
 _MAX_VALUE_DEPTH: Final = 32
@@ -309,7 +308,6 @@ class TreeNode:
     name: str
     params: dict[str, Any] = field(default_factory=dict)
     children: list["TreeNode"] = field(default_factory=list)
-    modification_policy: dict[str, str] = field(default_factory=dict)
     recovery_policy: dict[str, Any] = field(default_factory=dict)
     operator_stop_policy: str = "inherit"
     execution_groups: str | tuple[str, ...] = "inherit"
@@ -331,10 +329,6 @@ class TreeNode:
         if any(type(child) is not TreeNode for child in self.children):
             raise ProgramValidationError("tree.children must contain TreeNode values")
         self.children = list(self.children)
-        self.modification_policy = _parse_modification_policy(
-            self.modification_policy,
-            path="tree",
-        )
         self.recovery_policy = _parse_recovery_policy(
             self.recovery_policy,
             path="tree",
@@ -373,37 +367,18 @@ def compute_program_tree_hash(tree: TreeNode) -> str:
     return hashlib.sha256(canonical_bytes).hexdigest()
 
 
-_MODIFICATION_POLICY_ALLOWED_VALUES: Final = {
-    "runtime_override": frozenset({"forbidden", "human_approval", "llm_allowed"}),
-    "persistent_edit": frozenset({"forbidden", "human_approval", "llm_allowed"}),
-    "intervention_delegate": frozenset(
-        {"forbidden", "human_only", "llm_allowed", "program_only"}
-    ),
-}
-_MODIFICATION_POLICY_FIELDS: Final = frozenset(_MODIFICATION_POLICY_ALLOWED_VALUES)
 OPERATOR_STOP_POLICY_VALUES: Final = frozenset({"inherit", "hold", "continue"})
-_RECOVERY_POLICY_ALLOWED_ACTIONS: Final = frozenset(
-    {"runtime_override", "intervention"}
-)
-_RECOVERY_POLICY_PERSISTENCE_CEILINGS: Final = frozenset(
-    {"session_only", "runtime_override", "draft_patch"}
-)
-_RECOVERY_POLICY_FIELDS: Final = frozenset(
-    {
-        "allow_intervention",
-        "allowed_recovery_actions",
-        "max_retries",
-        "allowed_skills",
-        "persistence_ceiling",
-    }
-)
+# The authored recovery policy is exactly two fields: an explicit opt-in to
+# failure intervention (default off) and the explicit failure-retry budget,
+# where zero means Unlimited (never "disabled").
+_RECOVERY_POLICY_FIELDS: Final = frozenset({"allow_intervention", "max_retries"})
+MAX_RECOVERY_POLICY_RETRIES: Final = 255
 _TREE_FIELDS: Final = frozenset(
     {
         "id",
         "name",
         "params",
         "children",
-        "modification_policy",
         "recovery_policy",
         "operator_stop_policy",
         "execution_groups",
@@ -450,25 +425,6 @@ def _execution_groups_document(groups: str | tuple[str, ...]) -> str | list[str]
     return groups if isinstance(groups, str) else list(groups)
 
 
-def _parse_modification_policy(raw_policy: Any, *, path: str) -> dict[str, str]:
-    if raw_policy is None:
-        return {}
-    policy = _validate_closed_mapping(
-        raw_policy,
-        allowed=_MODIFICATION_POLICY_FIELDS,
-        path=f"{path}.modification_policy",
-    )
-    parsed: dict[str, str] = {}
-    for key, value in policy.items():
-        allowed = _MODIFICATION_POLICY_ALLOWED_VALUES.get(key)
-        if type(value) is not str or allowed is None or value not in allowed:
-            raise ProgramValidationError(
-                f"{path}.modification_policy.{key} has an unsupported value"
-            )
-        parsed[key] = value
-    return parsed
-
-
 def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
     if raw_policy is None:
         return {}
@@ -485,121 +441,24 @@ def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
                 f"{path}.recovery_policy.allow_intervention must be boolean"
             )
         parsed["allow_intervention"] = value
-    if "allowed_recovery_actions" in policy:
-        actions = policy["allowed_recovery_actions"]
-        if (
-            type(actions) is not list
-            or len(actions) > 32
-            or any(
-                type(action) is not str
-                or action not in _RECOVERY_POLICY_ALLOWED_ACTIONS
-                for action in actions
-            )
-            or len(actions) != len(set(actions))
-        ):
-            raise ProgramValidationError(
-                f"{path}.recovery_policy.allowed_recovery_actions is invalid"
-            )
-        parsed["allowed_recovery_actions"] = list(actions)
     if "max_retries" in policy:
         retries = policy["max_retries"]
-        if type(retries) is not int or retries < 0 or retries > _MAX_RECOVERY_RETRIES:
+        if (
+            type(retries) is not int
+            or not 0 <= retries <= MAX_RECOVERY_POLICY_RETRIES
+        ):
             raise ProgramValidationError(
-                f"{path}.recovery_policy.max_retries must be bounded"
+                f"{path}.recovery_policy.max_retries must be an integer in "
+                f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)"
             )
         parsed["max_retries"] = retries
-    if "allowed_skills" in policy:
-        skills = policy["allowed_skills"]
-        if (
-            type(skills) is not list
-            or len(skills) > 256
-            or any(
-                type(skill) is not str
-                or not skill
-                or len(skill) > _MAX_IDENTIFIER_CHARS
-                for skill in skills
-            )
-            or len(skills) != len(set(skills))
-        ):
-            raise ProgramValidationError(
-                f"{path}.recovery_policy.allowed_skills is invalid"
-            )
-        parsed["allowed_skills"] = list(skills)
-    if "persistence_ceiling" in policy:
-        ceiling = policy["persistence_ceiling"]
-        if (
-            type(ceiling) is not str
-            or ceiling not in _RECOVERY_POLICY_PERSISTENCE_CEILINGS
-        ):
-            raise ProgramValidationError(
-                f"{path}.recovery_policy.persistence_ceiling is invalid"
-            )
-        parsed["persistence_ceiling"] = ceiling
     return parsed
 
 
-_CANONICAL_MODIFICATION_POLICY_FIELDS: Final = frozenset(
-    {
-        "runtime_override",
-        "persistent_edit",
-        "intervention_delegate",
-    }
-)
-_CANONICAL_RECOVERY_POLICY_FIELDS: Final = frozenset(
-    {
-        "allow_intervention",
-        "allowed_recovery_actions",
-        "max_retries",
-        "allowed_skills",
-        "persistence_ceiling",
-    }
-)
-_CANONICAL_RECOVERY_ACTIONS: Final = frozenset({"intervention", "runtime_override"})
-_CANONICAL_RECOVERY_PERSISTENCE_CEILINGS: Final = frozenset(
-    {"session_only", "runtime_override", "draft_patch"}
-)
-_CANONICAL_DEFAULT_MODIFICATION_POLICY: Final = {
-    "runtime_override": "forbidden",
-    "persistent_edit": "forbidden",
-    "intervention_delegate": "forbidden",
-}
 _CANONICAL_DEFAULT_RECOVERY_POLICY: Final = {
     "allow_intervention": False,
-    "allowed_recovery_actions": [],
     "max_retries": 0,
-    "allowed_skills": [],
-    "persistence_ceiling": "session_only",
 }
-
-
-def _parse_canonical_modification_policy(
-    raw_policy: Any,
-    *,
-    path: str,
-) -> dict[str, str]:
-    if type(raw_policy) is not dict:
-        raise ProgramValidationError(
-            f"{path}.modification_policy must be a complete object"
-        )
-    policy = _validate_closed_mapping(
-        raw_policy,
-        allowed=_CANONICAL_MODIFICATION_POLICY_FIELDS,
-        path=f"{path}.modification_policy",
-    )
-    if set(policy) != _CANONICAL_MODIFICATION_POLICY_FIELDS:
-        raise ProgramValidationError(
-            f"{path}.modification_policy must contain exactly "
-            f"{sorted(_CANONICAL_MODIFICATION_POLICY_FIELDS)}"
-        )
-    result: dict[str, str] = {}
-    for key, allowed in _MODIFICATION_POLICY_ALLOWED_VALUES.items():
-        value = policy[key]
-        if type(value) is not str or value not in allowed:
-            raise ProgramValidationError(
-                f"{path}.modification_policy.{key} has an unsupported value"
-            )
-        result[key] = value
-    return result
 
 
 def _parse_canonical_recovery_policy(
@@ -613,96 +472,36 @@ def _parse_canonical_recovery_policy(
         )
     policy = _validate_closed_mapping(
         raw_policy,
-        allowed=_CANONICAL_RECOVERY_POLICY_FIELDS,
+        allowed=_RECOVERY_POLICY_FIELDS,
         path=f"{path}.recovery_policy",
     )
-    if set(policy) != _CANONICAL_RECOVERY_POLICY_FIELDS:
+    if set(policy) != _RECOVERY_POLICY_FIELDS:
         raise ProgramValidationError(
             f"{path}.recovery_policy must contain exactly "
-            f"{sorted(_CANONICAL_RECOVERY_POLICY_FIELDS)}"
+            f"{sorted(_RECOVERY_POLICY_FIELDS)}"
         )
     allow_intervention = policy["allow_intervention"]
     if type(allow_intervention) is not bool:
         raise ProgramValidationError(
             f"{path}.recovery_policy.allow_intervention must be boolean"
         )
-
-    actions = policy["allowed_recovery_actions"]
-    if (
-        type(actions) is not list
-        or len(actions) > len(_CANONICAL_RECOVERY_ACTIONS)
-        or any(
-            type(action) is not str or action not in _CANONICAL_RECOVERY_ACTIONS
-            for action in actions
-        )
-        or len(actions) != len(set(actions))
-        or actions != sorted(actions)
-    ):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.allowed_recovery_actions is invalid"
-        )
-
     max_retries = policy["max_retries"]
-    if type(max_retries) is not int or not 0 <= max_retries <= 255:
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.max_retries must be an integer in 0..255"
-        )
-
-    skills = policy["allowed_skills"]
-    if type(skills) is not list or len(skills) > 256:
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.allowed_skills is invalid"
-        )
-    normalized_skills: list[str] = []
-    for index, skill in enumerate(skills):
-        skill_path = f"{path}.recovery_policy.allowed_skills[{index}]"
-        skill_id = _program_identifier(skill, path=skill_path)
-        try:
-            skill_bytes = skill_id.encode("ascii")
-        except UnicodeEncodeError:
-            raise ProgramValidationError(
-                f"{skill_path} must be an ASCII portable lower-case ID"
-            ) from None
-        if len(skill_bytes) > 128:
-            raise ProgramValidationError(
-                f"{skill_path} exceeds the 128-byte skill ID bound"
-            )
-        normalized_skills.append(skill_id)
-    if normalized_skills != sorted(normalized_skills) or len(normalized_skills) != len(
-        set(normalized_skills)
-    ):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.allowed_skills is not canonical-sorted"
-        )
-
-    persistence_ceiling = policy["persistence_ceiling"]
     if (
-        type(persistence_ceiling) is not str
-        or persistence_ceiling not in _CANONICAL_RECOVERY_PERSISTENCE_CEILINGS
+        type(max_retries) is not int
+        or not 0 <= max_retries <= MAX_RECOVERY_POLICY_RETRIES
     ):
         raise ProgramValidationError(
-            f"{path}.recovery_policy.persistence_ceiling is invalid"
+            f"{path}.recovery_policy.max_retries must be an integer in "
+            f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)"
         )
-    return {
-        "allow_intervention": allow_intervention,
-        "allowed_recovery_actions": list(actions),
-        "max_retries": max_retries,
-        "allowed_skills": normalized_skills,
-        "persistence_ceiling": persistence_ceiling,
-    }
+    return {"allow_intervention": allow_intervention, "max_retries": max_retries}
 
 
 def _normalize_canonical_node_policies(
     node: Mapping[str, Any],
     *,
     path: str,
-) -> tuple[dict[str, str] | None, dict[str, Any] | None, str | None]:
-    if "modification_policy" in node:
-        modification = _parse_canonical_modification_policy(
-            node["modification_policy"], path=path
-        )
-    else:
-        modification = dict(_CANONICAL_DEFAULT_MODIFICATION_POLICY)
+) -> tuple[dict[str, Any] | None, str | None]:
     if "recovery_policy" in node:
         recovery = _parse_canonical_recovery_policy(node["recovery_policy"], path=path)
     else:
@@ -718,54 +517,11 @@ def _normalize_canonical_node_policies(
             )
     else:
         operator_stop = "inherit"
-
-    actions = set(recovery["allowed_recovery_actions"])
-    if recovery["allow_intervention"] != ("intervention" in actions):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.allow_intervention must match "
-            "the intervention action"
-        )
-    if recovery["allowed_skills"] and "intervention" not in actions:
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.allowed_skills requires intervention"
-        )
-    if (
-        "runtime_override" in actions
-        and modification["runtime_override"] == "forbidden"
-    ):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.runtime_override requires a permitted "
-            "modification_policy.runtime_override"
-        )
-    if (
-        recovery["persistence_ceiling"] == "runtime_override"
-        and modification["runtime_override"] == "forbidden"
-    ):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.runtime_override persistence requires "
-            "a permitted modification_policy.runtime_override"
-        )
-    if (
-        recovery["persistence_ceiling"] == "draft_patch"
-        and modification["persistent_edit"] == "forbidden"
-    ):
-        raise ProgramValidationError(
-            f"{path}.recovery_policy.draft_patch persistence requires a "
-            "permitted modification_policy.persistent_edit"
-        )
-    if recovery != _CANONICAL_DEFAULT_RECOVERY_POLICY and not actions:
-        raise ProgramValidationError(
-            f"{path}.recovery_policy non-default values require an action"
-        )
-
-    normalized_modification = (
-        None if modification == _CANONICAL_DEFAULT_MODIFICATION_POLICY else modification
-    )
     normalized_recovery = (
         None if recovery == _CANONICAL_DEFAULT_RECOVERY_POLICY else recovery
     )
     normalized_stop = None if operator_stop == "inherit" else operator_stop
-    return normalized_modification, normalized_recovery, normalized_stop
+    return normalized_recovery, normalized_stop
 
 
 def _remove_explicit_default_policy_spelling(
@@ -775,31 +531,14 @@ def _remove_explicit_default_policy_spelling(
 ) -> dict[str, Any]:
     """Remove only the exact source spellings permitted by C1 migration."""
 
-    def is_default_modification(value: Any) -> bool:
-        return (
-            type(value) is dict
-            and set(value) == _CANONICAL_MODIFICATION_POLICY_FIELDS
-            and all(
-                type(value[field]) is str
-                and value[field] == _CANONICAL_DEFAULT_MODIFICATION_POLICY[field]
-                for field in _CANONICAL_MODIFICATION_POLICY_FIELDS
-            )
-        )
-
     def is_default_recovery(value: Any) -> bool:
         return (
             type(value) is dict
-            and set(value) == _CANONICAL_RECOVERY_POLICY_FIELDS
+            and set(value) == _RECOVERY_POLICY_FIELDS
             and type(value["allow_intervention"]) is bool
             and value["allow_intervention"] is False
-            and type(value["allowed_recovery_actions"]) is list
-            and value["allowed_recovery_actions"] == []
             and type(value["max_retries"]) is int
             and value["max_retries"] == 0
-            and type(value["allowed_skills"]) is list
-            and value["allowed_skills"] == []
-            and type(value["persistence_ceiling"]) is str
-            and value["persistence_ceiling"] == "session_only"
         )
 
     candidate = dict(root)
@@ -825,8 +564,6 @@ def _remove_explicit_default_policy_spelling(
                 del migrated["execution_groups"]
             else:
                 migrated["execution_groups"] = _execution_groups_document(groups)
-        if is_default_modification(migrated.get("modification_policy")):
-            del migrated["modification_policy"]
         if is_default_recovery(migrated.get("recovery_policy")):
             del migrated["recovery_policy"]
         if (
@@ -929,18 +666,6 @@ def _traverse_tree(
             copy_value=build_document,
             ancestors=ancestors,
         )
-        modification_policy = _parse_modification_policy(
-            node.modification_policy,
-            path=path,
-        )
-        if modification_policy:
-            modification_policy = _bounded_json_mapping(
-                modification_policy,
-                path=f"{path}.modification_policy",
-                budget=budget,
-                copy_value=build_document,
-                ancestors=ancestors,
-            )
         recovery_policy = _parse_recovery_policy(
             node.recovery_policy,
             path=path,
@@ -986,8 +711,6 @@ def _traverse_tree(
                 document["execution_groups"] = _execution_groups_document(
                     execution_groups
                 )
-            if modification_policy:
-                document["modification_policy"] = modification_policy
             if recovery_policy:
                 document["recovery_policy"] = recovery_policy
 
@@ -1087,18 +810,6 @@ def tree_node_from_dict(
                 copy_value=True,
                 ancestors=ancestors,
             )
-            modification_policy = _parse_modification_policy(
-                document.get("modification_policy"),
-                path=current_path,
-            )
-            if modification_policy:
-                modification_policy = _bounded_json_mapping(
-                    modification_policy,
-                    path=f"{current_path}.modification_policy",
-                    budget=budget,
-                    copy_value=True,
-                    ancestors=ancestors,
-                )
             recovery_policy = _parse_recovery_policy(
                 document.get("recovery_policy"),
                 path=current_path,
@@ -1154,7 +865,6 @@ def tree_node_from_dict(
                 name=name,
                 params=params,
                 children=children,
-                modification_policy=modification_policy,
                 recovery_policy=recovery_policy,
                 operator_stop_policy=operator_stop_policy,
                 execution_groups=execution_groups,
@@ -1310,18 +1020,6 @@ def apply_tree_param_overrides(
                 copy_value=True,
                 ancestors=ancestors,
             )
-            modification_policy = _parse_modification_policy(
-                current.modification_policy,
-                path=path,
-            )
-            if modification_policy:
-                modification_policy = _bounded_json_mapping(
-                    modification_policy,
-                    path=f"{path}.modification_policy",
-                    budget=output_budget,
-                    copy_value=True,
-                    ancestors=ancestors,
-                )
             recovery_policy = _parse_recovery_policy(
                 current.recovery_policy,
                 path=path,
@@ -1356,7 +1054,6 @@ def apply_tree_param_overrides(
                 name=name,
                 params=params,
                 children=children,
-                modification_policy=modification_policy,
                 recovery_policy=recovery_policy,
                 operator_stop_policy=operator_stop_policy,
                 execution_groups=current.execution_groups,
@@ -1377,7 +1074,6 @@ class ProgramTreeNode:
     value_sources: Mapping[str, Mapping[str, Any]]
     children: tuple["ProgramTreeNode", ...]
     metadata: Mapping[str, Any] | None = None
-    modification_policy: Mapping[str, str] | None = None
     recovery_policy: Mapping[str, Any] | None = None
     operator_stop_policy: str | None = None
     execution_groups: str | tuple[str, ...] = "inherit"
@@ -1396,8 +1092,6 @@ class ProgramTreeNode:
             }
         if self.metadata is not None:
             result["metadata"] = deepcopy(dict(self.metadata))
-        if self.modification_policy is not None:
-            result["modification_policy"] = deepcopy(dict(self.modification_policy))
         if self.recovery_policy is not None:
             result["recovery_policy"] = deepcopy(dict(self.recovery_policy))
         if self.operator_stop_policy is not None:
@@ -1575,7 +1269,6 @@ class ProgramNodePolicy:
     """One complete immutable non-default policy row for a Program node."""
 
     instance_id: str
-    modification_policy: Mapping[str, str]
     recovery_policy: Mapping[str, Any]
     operator_stop_policy: str
 
@@ -1588,57 +1281,25 @@ class ProgramNodePolicy:
             raise ProgramValidationError(
                 "node policy instance_id must be a bounded portable ID"
             )
-        modification = _parse_canonical_modification_policy(
-            dict(self.modification_policy),
-            path=f"node_policies.{self.instance_id}",
-        )
-        recovery_input = {
-            key: list(value) if isinstance(value, tuple) else value
-            for key, value in self.recovery_policy.items()
-        }
         recovery = _parse_canonical_recovery_policy(
-            recovery_input,
+            dict(self.recovery_policy),
             path=f"node_policies.{self.instance_id}",
         )
         normalized = _normalize_canonical_node_policies(
             {
-                "modification_policy": modification,
                 "recovery_policy": recovery,
                 "operator_stop_policy": self.operator_stop_policy,
             },
             path=f"node_policies.{self.instance_id}",
         )
-        if normalized == (None, None, None):
+        if normalized == (None, None):
             raise ProgramValidationError("default node-policy rows must be omitted")
-        if recovery["allowed_skills"]:
-            raise ProgramValidationError(
-                "Program Run rejects nonempty allowed_skills until an exact "
-                "revision-qualified retained skill referent exists"
-            )
-        object.__setattr__(
-            self,
-            "modification_policy",
-            MappingProxyType(modification),
-        )
-        object.__setattr__(
-            self,
-            "recovery_policy",
-            MappingProxyType(
-                {
-                    key: tuple(value) if isinstance(value, list) else value
-                    for key, value in recovery.items()
-                }
-            ),
-        )
+        object.__setattr__(self, "recovery_policy", MappingProxyType(recovery))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "instance_id": self.instance_id,
-            "modification_policy": dict(self.modification_policy),
-            "recovery_policy": {
-                key: list(value) if isinstance(value, tuple) else value
-                for key, value in self.recovery_policy.items()
-            },
+            "recovery_policy": dict(self.recovery_policy),
             "operator_stop_policy": self.operator_stop_policy,
         }
 
@@ -1651,33 +1312,15 @@ def program_node_policies(program: "Program") -> tuple[ProgramNodePolicy, ...]:
     rows: list[ProgramNodePolicy] = []
 
     def visit(node: ProgramTreeNode) -> None:
-        modification = {
-            **_CANONICAL_DEFAULT_MODIFICATION_POLICY,
-            **(
-                {}
-                if node.modification_policy is None
-                else dict(node.modification_policy)
-            ),
-        }
         recovery = {
             **_CANONICAL_DEFAULT_RECOVERY_POLICY,
             **({} if node.recovery_policy is None else dict(node.recovery_policy)),
         }
         stop = node.operator_stop_policy or "inherit"
-        if recovery["allowed_skills"]:
-            raise ProgramValidationError(
-                "Program Run rejects nonempty allowed_skills until an exact "
-                "revision-qualified retained skill referent exists"
-            )
-        if (
-            modification != _CANONICAL_DEFAULT_MODIFICATION_POLICY
-            or recovery != _CANONICAL_DEFAULT_RECOVERY_POLICY
-            or stop != "inherit"
-        ):
+        if recovery != _CANONICAL_DEFAULT_RECOVERY_POLICY or stop != "inherit":
             rows.append(
                 ProgramNodePolicy(
                     instance_id=node.instance_id,
-                    modification_policy=modification,
                     recovery_policy=recovery,
                     operator_stop_policy=stop,
                 )
@@ -1725,7 +1368,6 @@ class ProgramParameterDeclaration:
     type: str
     default: Any
     constraints: Mapping[str, Any]
-    runtime_mutability: str
     description: str = ""
 
 
@@ -1949,7 +1591,6 @@ _PROGRAM_PARAMETER_TYPES: Final = frozenset(
         "string_list",
     }
 )
-_RUNTIME_MUTABILITY_VALUES: Final = frozenset({"immutable", "before_run"})
 _BLACKBOARD_ACCESS_VALUES: Final = frozenset({"read", "write", "read_write"})
 _BLACKBOARD_PERSISTENCE_VALUES: Final = frozenset({"run", "persistent"})
 _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS: Final = frozenset(
@@ -2746,11 +2387,16 @@ def _validate_parameters(
     for index, raw in enumerate(rows):
         row_path = f"{path}[{index}]"
         row = _program_mapping(raw, path=row_path)
+        if "runtime_mutability" in row:
+            _program_error(
+                f"{row_path}.runtime_mutability",
+                "was removed: Program parameters have no override path and "
+                "always take their Program default; remove the field (values "
+                "that change during a run belong in blackboard keys)",
+            )
         _program_closed(
             row,
-            required=frozenset(
-                {"parameter_id", "type", "default", "runtime_mutability"}
-            ),
+            required=frozenset({"parameter_id", "type", "default"}),
             optional=frozenset({"constraints", "description"}),
             path=row_path,
         )
@@ -2760,18 +2406,6 @@ def _validate_parameters(
         declared_type = _program_identifier(row["type"], path=f"{row_path}.type")
         if declared_type not in _PROGRAM_PARAMETER_TYPES:
             _program_error(f"{row_path}.type", "is not a registered Program type")
-        runtime_mutability = _program_identifier(
-            row["runtime_mutability"], path=f"{row_path}.runtime_mutability"
-        )
-        if runtime_mutability == "between_operations":
-            _program_error(
-                f"{row_path}.runtime_mutability",
-                "between_operations was removed; parameters change only before "
-                "Run (use before_run), and values that change during a run "
-                "belong in blackboard keys",
-            )
-        if runtime_mutability not in _RUNTIME_MUTABILITY_VALUES:
-            _program_error(f"{row_path}.runtime_mutability", "has an unsupported value")
         default = deepcopy(row["default"])
         _validate_declared_type_value(
             declared_type,
@@ -2790,7 +2424,6 @@ def _validate_parameters(
             type=declared_type,
             default=default,
             constraints=_freeze_mapping(constraints),
-            runtime_mutability=runtime_mutability,
             description=_program_text(
                 row.get("description", ""),
                 path=f"{row_path}.description",
@@ -4009,7 +3642,6 @@ def _validate_program_tree(
             {
                 "metadata",
                 "value_sources",
-                "modification_policy",
                 "recovery_policy",
                 "operator_stop_policy",
             }
@@ -4213,11 +3845,9 @@ def _validate_program_tree(
         )
         for index, child in enumerate(raw_children)
     )
-    (
-        modification_policy,
-        recovery_policy,
-        operator_stop_policy,
-    ) = _normalize_canonical_node_policies(node, path=path)
+    recovery_policy, operator_stop_policy = _normalize_canonical_node_policies(
+        node, path=path
+    )
     execution_groups = parse_execution_groups(
         node.get("execution_groups", "inherit"), path=path
     )
@@ -4240,11 +3870,6 @@ def _validate_program_tree(
         ),
         children=children,
         metadata=metadata,
-        modification_policy=(
-            _freeze_mapping(modification_policy)
-            if modification_policy is not None
-            else None
-        ),
         recovery_policy=(
             _freeze_mapping(recovery_policy) if recovery_policy is not None else None
         ),

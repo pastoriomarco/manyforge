@@ -8,12 +8,14 @@ downstream preparation never reopens the mutable source paths.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 import gzip
 import hashlib
 import io
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import threading
 from typing import Any, Final, Mapping
 import xml.parsers.expat
 
@@ -27,6 +29,8 @@ MAX_XML_DEPTH: Final = 128
 MAX_XML_ELEMENTS: Final = 250_000
 MAX_XML_ATTRIBUTES: Final = 1_000_000
 _TRANSFER_CHUNK_BYTES: Final = 512 * 1024
+_ENCODED_MEMO_ENTRIES: Final = 1_024
+_ENCODED_MEMO_BYTES: Final = 256 * 1024 * 1024
 
 
 class ModelSourceCaptureError(ValueError):
@@ -60,6 +64,75 @@ def encode_model_source_artifact(
         "media_type": media_type,
         "transferred_byte_size": len(transferred),
     }
+
+
+_FileIdentity = tuple[int, int, int, int, int]
+
+
+def _file_identity(status: os.stat_result) -> _FileIdentity:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+class _EncodedSourceMemo:
+    """Bounded reuse of one source file's wire encoding.
+
+    Every capture still reads and hashes the file exactly as before, so a
+    missing, replaced or rewritten file is detected at the same point and with
+    the same error. Only the compression is reused, and only for the same
+    path, file identity (device, inode, size, mtime, ctime), content digest
+    and media type: the encoding is a pure function of the bytes just read,
+    so a reused value can never be stale. Least recently used entries are
+    evicted beyond the entry and transferred-byte bounds.
+    """
+
+    def __init__(self, *, entries: int, transferred_bytes: int) -> None:
+        self._entries = entries
+        self._transferred_bytes = transferred_bytes
+        self._lock = threading.Lock()
+        self._values: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._size = 0
+
+    def encode(
+        self,
+        value: bytes,
+        *,
+        path: str,
+        identity: _FileIdentity,
+        media_type: str,
+    ) -> dict[str, Any]:
+        key = (path, identity, _digest(value), media_type)
+        with self._lock:
+            known = self._values.get(key)
+            if known is not None:
+                self._values.move_to_end(key)
+                return {**known, "chunks": list(known["chunks"])}
+        encoded = encode_model_source_artifact(value, media_type=media_type)
+        size = encoded["transferred_byte_size"]
+        if size <= self._transferred_bytes:
+            with self._lock:
+                previous = self._values.pop(key, None)
+                if previous is not None:
+                    self._size -= previous["transferred_byte_size"]
+                self._values[key] = {**encoded, "chunks": tuple(encoded["chunks"])}
+                self._size += size
+                while (
+                    len(self._values) > self._entries
+                    or self._size > self._transferred_bytes
+                ):
+                    _key, evicted = self._values.popitem(last=False)
+                    self._size -= evicted["transferred_byte_size"]
+        return encoded
+
+
+_ENCODED_SOURCES = _EncodedSourceMemo(
+    entries=_ENCODED_MEMO_ENTRIES, transferred_bytes=_ENCODED_MEMO_BYTES
+)
 
 
 def decode_model_source_artifact(
@@ -128,7 +201,9 @@ def decode_model_source_artifact(
     return value
 
 
-def _read_plain_file(path: Path, *, maximum: int, label: str) -> bytes:
+def _read_plain_file(
+    path: Path, *, maximum: int, label: str
+) -> tuple[bytes, _FileIdentity]:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory_flags = flags | os.O_DIRECTORY
     descriptors: list[int] = []
@@ -167,7 +242,7 @@ def _read_plain_file(path: Path, *, maximum: int, label: str) -> bytes:
             or after.st_mtime_ns != before.st_mtime_ns
         ):
             raise ModelSourceCaptureError(f"{label} changed during capture")
-        return b"".join(chunks)
+        return b"".join(chunks), _file_identity(after)
     except OSError as error:
         raise ModelSourceCaptureError(f"could not read {label}: {error}") from error
     finally:
@@ -202,7 +277,9 @@ def _safe_resource_path(value: str) -> tuple[str, ...]:
     return path.parts
 
 
-def _read_package_resource(root: Path, relative: str) -> bytes:
+def _read_package_resource(
+    root: Path, relative: str
+) -> tuple[bytes, _FileIdentity]:
     parts = _safe_resource_path(relative)
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory_flags = flags | os.O_DIRECTORY
@@ -248,7 +325,7 @@ def _read_package_resource(root: Path, relative: str) -> bytes:
             raise ModelSourceCaptureError(
                 f"package resource changed during capture: {relative!r}"
             )
-        return b"".join(chunks)
+        return b"".join(chunks), _file_identity(after)
     except OSError as error:
         raise ModelSourceCaptureError(
             f"could not read package resource {relative!r}: {error}"
@@ -364,19 +441,21 @@ def capture_deployment_model_sources(
         ):
             raise ModelSourceCaptureError("Deployment component source is invalid")
         seen_components.add(component_id)
-        urdf = _read_plain_file(
-            _reference_path(source.get("urdf", {}), project_root=project_root),
-            maximum=MAX_XML_BYTES,
-            label=f"{component_id} URDF",
+        urdf_path = _reference_path(source.get("urdf", {}), project_root=project_root)
+        urdf, urdf_identity = _read_plain_file(
+            urdf_path, maximum=MAX_XML_BYTES, label=f"{component_id} URDF"
         )
         srdf_reference = source.get("srdf")
-        srdf = (
+        srdf_path = (
             None
             if srdf_reference is None
+            else _reference_path(srdf_reference, project_root=project_root)
+        )
+        srdf, srdf_identity = (
+            (None, None)
+            if srdf_path is None
             else _read_plain_file(
-                _reference_path(srdf_reference, project_root=project_root),
-                maximum=MAX_XML_BYTES,
-                label=f"{component_id} SRDF",
+                srdf_path, maximum=MAX_XML_BYTES, label=f"{component_id} SRDF"
             )
         )
         package_roots = source.get("package_roots")
@@ -402,7 +481,7 @@ def capture_deployment_model_sources(
                 raise ModelSourceCaptureError(
                     f"{component_id} has no root for {uri!r}"
                 )
-            value = _read_package_resource(root, relative)
+            value, identity = _read_package_resource(root, relative)
             total_bytes += len(value)
             total_resources += 1
             if total_resources > MAX_RESOURCES or total_bytes > MAX_CLOSURE_BYTES:
@@ -410,8 +489,11 @@ def capture_deployment_model_sources(
             resources.append(
                 {
                     "logical_uri": uri,
-                    **encode_model_source_artifact(
-                        value, media_type=_resource_media_type(uri)
+                    **_ENCODED_SOURCES.encode(
+                        value,
+                        path=os.path.join(os.path.abspath(root), *_safe_resource_path(relative)),
+                        identity=identity,
+                        media_type=_resource_media_type(uri),
                     ),
                 }
             )
@@ -419,13 +501,19 @@ def capture_deployment_model_sources(
         if total_bytes > MAX_CLOSURE_BYTES:
             raise ModelSourceCaptureError("model source closure exceeds its bound")
         entrypoints: dict[str, Any] = {
-            "urdf": encode_model_source_artifact(
-                urdf, media_type="application/xml"
+            "urdf": _ENCODED_SOURCES.encode(
+                urdf,
+                path=os.path.abspath(urdf_path),
+                identity=urdf_identity,
+                media_type="application/xml",
             )
         }
         if srdf is not None:
-            entrypoints["srdf"] = encode_model_source_artifact(
-                srdf, media_type="application/xml"
+            entrypoints["srdf"] = _ENCODED_SOURCES.encode(
+                srdf,
+                path=os.path.abspath(srdf_path),
+                identity=srdf_identity,
+                media_type="application/xml",
             )
         captured.append(
             {

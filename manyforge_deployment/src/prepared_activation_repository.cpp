@@ -276,7 +276,6 @@ PreparedActivationInput assemble_prepared_activation(
       {"scenario_id", CanonicalValue(input.scenario_id)},
       {"schema_version", CanonicalValue(std::string(kPreparedActivationInputSchemaVersion))},
       {"source_document_digest", CanonicalValue(input.source_document_digest.value())},
-      {"typed_parameter_overrides", input.typed_parameter_overrides},
   };
   const auto prepared_id =
       sha256_digest(canonical_json(CanonicalValue(identity)));
@@ -294,7 +293,7 @@ ProgramBindingOutcome
 recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
   const auto &closure = prepared.closure();
   // The structural verifier proved exact absence of artifacts, identities,
-  // assignments and overrides. There is no Program to compile or Scene to project.
+  // and assignments. There is no Program to compile or Scene to project.
   if (closure.program == nullptr) return {};
   const PreparedPayloadCatalogSource catalog(closure.catalog_artifacts);
   ProgramBindingOutcome recompiled;

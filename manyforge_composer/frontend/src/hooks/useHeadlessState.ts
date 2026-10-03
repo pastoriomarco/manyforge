@@ -182,9 +182,12 @@ export interface HeadlessStateAdmission {
 
 const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v2';
 const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v1';
+// Starts, resumes and recovery actions are admitted by Composer, which checks
+// the shared Draft (an unapplied Draft refuses Execute/Run/Resume/Retry).
 const HTTP_ADMITTED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'program_run', 'program_motion_start', 'program_motion_resume',
   'program_resume_full_stop', 'operation_start', 'operation_resume',
+  'execution_recovery',
 ]);
 const CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000;
 const CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000;
@@ -212,10 +215,6 @@ export type ExecutionControlCommandKind =
   | 'program_reset'
   | 'program_resume_full_stop'
   | 'program_discard_full_stop'
-  | 'program_runtime_override_stage'
-  | 'program_runtime_override_activate'
-  | 'program_runtime_override_clear'
-  | 'program_runtime_override_promote'
   | 'program_runtime_blackboard_write'
   | 'program_manual_result_stage'
   | 'program_manual_handover'
@@ -300,6 +299,19 @@ interface ClientIncidentState {
   occurrenceCount: number;
   maximumDelayNs: number | null;
   activationSent: boolean;
+}
+
+/**
+ * A command was submitted but its receipt was lost: the owner may or may not
+ * have received it. Every other rejection is definite (never sent, or a
+ * refusal receipt). Callers must reconcile through owner observation and
+ * never resend the command.
+ */
+export class CommandDeliveryUnconfirmedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'CommandDeliveryUnconfirmedError';
+  }
 }
 
 export interface ExecutionCommandReceipt {
@@ -744,7 +756,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             );
             this.refreshControlCondition();
             socket.close(4002, 'command delivery unconfirmed');
-            throw new Error(this.controlTransportError, { cause: error });
+            throw new CommandDeliveryUnconfirmedError(this.controlTransportError, { cause: error });
           }
           throw error;
         } finally {
@@ -806,7 +818,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           if (this.runtimeScaleControlPending === correlationId) {
             this.runtimeScaleControlPending = null;
           }
-          const error = new Error(
+          const error = new CommandDeliveryUnconfirmedError(
             'Command delivery is unconfirmed; commands are disabled.',
           );
           pending.reject(error);
@@ -1038,7 +1050,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.runtimeScaleControlPending = null;
     for (const pending of this.commandReceipts.values()) {
       if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
-      pending.reject(new Error(`Command delivery unconfirmed; ${reason}.`));
+      pending.reject(new CommandDeliveryUnconfirmedError(`Command delivery unconfirmed; ${reason}.`));
     }
     this.commandReceipts.clear();
   }

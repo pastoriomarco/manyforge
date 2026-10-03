@@ -155,14 +155,6 @@ def test_frozen_matrix_has_exact_five_non_aliasing_owner_rows(
     lite6 = [row for row in runner.SCENARIOS if row.profile == "lite6"]
     assert all("UniversalRobots" not in row.world_uri for row in lite6)
     assert all(row.component_id.startswith("isaac_lite6_") for row in lite6)
-    for row in runner.SCENARIOS:
-        assert row.runtime_resource_ids == tuple(
-            [
-                f"{row.component_id}.arm.coordinate.{index:06d}"
-                for index in range(6)
-            ]
-            + [f"{row.component_id}.gripper.coordinate.000000"]
-        )
     assert len({row.world_sha256 for row in runner.SCENARIOS}) == 3
 
 
@@ -226,7 +218,7 @@ def test_package_preflight_binds_projects_program_pose_and_site(
         (project / "scenario.yaml").write_text(
             json.dumps(
                 {
-                    "api_version": "manyforge.scenario.project.v1",
+                    "api_version": "manyforge.scenario.project.v2",
                     "scenario_id": row.scenario_id,
                 }
             ),
@@ -286,7 +278,7 @@ def test_package_preflight_binds_projects_program_pose_and_site(
     manifest.write_text(
         json.dumps(
             {
-                "api_version": "manyforge.scenario.project.v1",
+                "api_version": "manyforge.scenario.project.v2",
                 "scenario_id": "wrong-scenario",
             }
         ),

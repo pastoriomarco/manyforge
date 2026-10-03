@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-01 11:19:24 UTC
+  Last regenerated: 2026-10-02 12:41:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1390,6 +1390,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "ApplyDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -1664,6 +1677,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Arguments",
             "type": "object"
           },
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -1921,10 +1947,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "program_reset",
               "program_resume_full_stop",
               "program_discard_full_stop",
-              "program_runtime_override_stage",
-              "program_runtime_override_activate",
-              "program_runtime_override_clear",
-              "program_runtime_override_promote",
               "program_runtime_blackboard_write",
               "program_manual_result_stage",
               "program_manual_handover",
@@ -2451,96 +2473,94 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         ],
         "title": "ManualResultStageRequest",
         "type": "object"
-      }
-    },
-    "oneOf": [
-      {
-        "additionalProperties": false,
-        "description": "GET /api/cycle/status",
-        "properties": {
-          "action": {
-            "const": "state",
-            "type": "string"
-          }
-        },
-        "required": [
-          "action"
-        ],
-        "type": "object"
       },
-      {
+      "ProgramNodeCorrectionPreviewRequest": {
         "additionalProperties": false,
-        "description": "POST /api/cycle/recovery-actions",
+        "description": "Effect-free native preview of one held motion node with proposed inputs.\n\nThe Program runner resolves the node's inputs exactly as a fresh attempt\nwould and replaces the proposed paths. Binding, robot, capability and\nlifecycle come from the captured run; this request cannot select them.",
         "properties": {
-          "action": {
-            "const": "recover",
+          "expected_owner_epoch": {
+            "title": "Expected Owner Epoch",
             "type": "string"
           },
-          "body": {
-            "$ref": "#/$defs/CycleRecoveryActionRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/runs/{program_run_id}/manual-result",
-        "properties": {
-          "action": {
-            "const": "manual_result",
+          "node_attempt_id": {
+            "title": "Node Attempt Id",
             "type": "string"
           },
-          "body": {
-            "$ref": "#/$defs/ManualResultStageRequest"
+          "node_instance_id": {
+            "title": "Node Instance Id",
+            "type": "string"
           },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "program_run_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
+          "program_binding_id": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Program Binding Id",
+            "type": "string"
+          },
+          "program_id": {
+            "title": "Program Id",
+            "type": "string"
+          },
+          "program_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Program Revision",
+            "type": "string"
+          },
+          "program_run_id": {
+            "title": "Program Run Id",
+            "type": "string"
+          },
+          "proposed_inputs": {
+            "items": {
+              "$ref": "#/$defs/ProposedNodeInputRequest"
             },
-            "required": [
-              "program_run_id"
-            ],
-            "type": "object"
+            "maxItems": 64,
+            "title": "Proposed Inputs",
+            "type": "array"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": "manyforge.program_node_correction_preview_request.v1",
+            "title": "Schema Version",
+            "type": "string"
           }
         },
         "required": [
-          "action",
-          "path",
-          "body"
+          "schema_version",
+          "request_id",
+          "program_run_id",
+          "expected_owner_epoch",
+          "program_id",
+          "program_revision",
+          "program_binding_id",
+          "node_instance_id",
+          "node_attempt_id"
         ],
+        "title": "ProgramNodeCorrectionPreviewRequest",
         "type": "object"
-      }
-    ],
-    "type": "object"
-  },
-  "name": "manyforge_intervention"
-}
-```
-
-## manyforge_runtime_override
-
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
-
-```json
-{
-  "annotations": {
-    "destructiveHint": true,
-    "idempotentHint": false,
-    "openWorldHint": false,
-    "readOnlyHint": false
-  },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
-  "inputSchema": {
-    "$defs": {
+      },
+      "ProposedNodeInputRequest": {
+        "additionalProperties": false,
+        "description": "One proposed value at one parameter value path of the named node.",
+        "properties": {
+          "path": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "path",
+          "value"
+        ],
+        "title": "ProposedNodeInputRequest",
+        "type": "object"
+      },
       "RuntimeBlackboardWriteRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2623,389 +2643,80 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         ],
         "title": "RuntimeBlackboardWriteRequest",
         "type": "object"
-      },
-      "RuntimeOverrideActionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "client_sequence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_override_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Override Revision",
-            "type": "integer"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
-          },
-          "expected_run_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Run Revision",
-            "type": "integer"
-          },
-          "override_id": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Override Id",
-            "type": "string"
-          },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Session Id"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label",
-          "program_run_id",
-          "expected_owner_epoch",
-          "expected_run_revision",
-          "override_id",
-          "expected_override_revision"
-        ],
-        "title": "RuntimeOverrideActionRequest",
-        "type": "object"
-      },
-      "RuntimeOverrideMaterializationRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "programRunId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Programrunid",
-            "type": "string"
-          },
-          "proposalId": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Proposalid",
-            "type": "string"
-          },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision",
-          "programRunId",
-          "proposalId"
-        ],
-        "title": "RuntimeOverrideMaterializationRequest",
-        "type": "object"
-      },
-      "RuntimeOverridePromotionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "client_sequence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_draft_id": {
-            "title": "Expected Draft Id",
-            "type": "string"
-          },
-          "expected_draft_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Draft Revision",
-            "type": "integer"
-          },
-          "expected_override_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Override Revision",
-            "type": "integer"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
-          },
-          "expected_run_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Run Revision",
-            "type": "integer"
-          },
-          "override_id": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Override Id",
-            "type": "string"
-          },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Session Id"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label",
-          "program_run_id",
-          "expected_owner_epoch",
-          "expected_run_revision",
-          "override_id",
-          "expected_override_revision",
-          "expected_draft_id",
-          "expected_draft_revision"
-        ],
-        "title": "RuntimeOverridePromotionRequest",
-        "type": "object"
-      },
-      "RuntimeOverrideStageRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "client_sequence": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
-          },
-          "expected_run_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Run Revision",
-            "type": "integer"
-          },
-          "node_attempt_id": {
-            "title": "Node Attempt Id",
-            "type": "string"
-          },
-          "node_instance_id": {
-            "title": "Node Instance Id",
-            "type": "string"
-          },
-          "parameter_id": {
-            "title": "Parameter Id",
-            "type": "string"
-          },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Session Id"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          },
-          "source_observation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Observation Id"
-          },
-          "source_owner_generation": {
-            "anyOf": [
-              {
-                "maximum": 9007199254740991.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Owner Generation"
-          },
-          "value": {
-            "title": "Value"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label",
-          "program_run_id",
-          "expected_owner_epoch",
-          "expected_run_revision",
-          "node_instance_id",
-          "node_attempt_id",
-          "parameter_id",
-          "value"
-        ],
-        "title": "RuntimeOverrideStageRequest",
-        "type": "object"
       }
     },
     "oneOf": [
       {
         "additionalProperties": false,
+        "description": "GET /api/cycle/status",
+        "properties": {
+          "action": {
+            "const": "state",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/cycle/recovery-actions",
+        "properties": {
+          "action": {
+            "const": "recover",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/CycleRecoveryActionRequest"
+          }
+        },
+        "required": [
+          "action",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/program/runs/{program_run_id}/manual-result",
+        "properties": {
+          "action": {
+            "const": "manual_result",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/ManualResultStageRequest"
+          },
+          "path": {
+            "additionalProperties": false,
+            "properties": {
+              "program_run_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "program_run_id"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "path",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
         "description": "GET /api/program/runs/{program_run_id}/runtime-controls",
         "properties": {
           "action": {
-            "const": "read",
+            "const": "runtime_controls",
             "type": "string"
           },
           "path": {
@@ -3026,156 +2737,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "action",
           "path"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/runs/{program_run_id}/runtime-overrides",
-        "properties": {
-          "action": {
-            "const": "stage",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/RuntimeOverrideStageRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "program_run_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "program_run_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/runs/{program_run_id}/runtime-overrides/activate",
-        "properties": {
-          "action": {
-            "const": "activate",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/RuntimeOverrideActionRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "program_run_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "program_run_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/runs/{program_run_id}/runtime-overrides/clear",
-        "properties": {
-          "action": {
-            "const": "clear",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/RuntimeOverrideActionRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "program_run_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "program_run_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/runs/{program_run_id}/runtime-overrides/promote",
-        "properties": {
-          "action": {
-            "const": "promote",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/RuntimeOverridePromotionRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "program_run_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "program_run_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/draft/runtime-override-promotions",
-        "properties": {
-          "action": {
-            "const": "materialize",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/RuntimeOverrideMaterializationRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
         ],
         "type": "object"
       },
@@ -3211,11 +2772,44 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "body"
         ],
         "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/program/runs/{program_run_id}/node-correction-previews",
+        "properties": {
+          "action": {
+            "const": "node_preview",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/ProgramNodeCorrectionPreviewRequest"
+          },
+          "path": {
+            "additionalProperties": false,
+            "properties": {
+              "program_run_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "program_run_id"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "path",
+          "body"
+        ],
+        "type": "object"
       }
     ],
     "type": "object"
   },
-  "name": "manyforge_runtime_override"
+  "name": "manyforge_intervention"
 }
 ```
 

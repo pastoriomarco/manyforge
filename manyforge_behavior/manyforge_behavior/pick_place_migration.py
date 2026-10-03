@@ -26,7 +26,6 @@ _LEGACY_CATALOG_CONTENT_VERSION = "2.2.0"
 _MAX_TREE_NODES = 100_000
 _WRAPPER_FIELDS = (
     "metadata",
-    "modification_policy",
     "recovery_policy",
     "operator_stop_policy",
     "execution_groups",

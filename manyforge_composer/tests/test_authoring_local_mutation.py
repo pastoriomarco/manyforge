@@ -340,7 +340,6 @@ def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_pat
                 "program_draft": None,
                 "deployment_draft": None,
                 "program_role_assignment": None,
-                "typed_parameter_overrides": {},
             },
             document_path="scenario.test",
             source_document_digest="sha256:" + "a" * 64,
@@ -871,3 +870,190 @@ def test_external_submission_rejects_composite_workspace_race(tmp_path) -> None:
     assert submitted is False
     assert coordinator.local_claim_pending is False
     assert coordinator.mutation_ready is True
+
+
+def _held_cycle(
+    *, run_state: str = "intervention_required", all_group: str = "held",
+    active_operation_count: int | None = None, containment_pending: bool = False,
+) -> dict[str, Any]:
+    return {
+        "state": "running",
+        "program_run_id": "run.1",
+        "run": {
+            "state": run_state,
+            "capture": {"program_run_id": "run.1"},
+            "active_operation_count": active_operation_count,
+        },
+        "recovery_offer": {"actions": [{
+            "action_id": "retry_motion_from_current_state",
+            "enabled": not containment_pending,
+            "disabled_reason_code": (
+                "failure_pause_containment_unconfirmed" if containment_pending else None
+            ),
+        }]},
+        "runtime_controls": {"execution_selections": {"groups": [{
+            "group_id": "all", "state": all_group, "node_count": 3, "held_node_count": 3,
+        }]}},
+    }
+
+
+def _executed_cycle(*group_states: str) -> dict[str, Any]:
+    """Executed, no Run yet: the owner publishes every group ``ready``."""
+
+    return {
+        **_held_cycle(run_state="running"),
+        "recovery_offer": None,
+        "runtime_controls": {"execution_selections": {"groups": [
+            {"group_id": "all" if index == 0 else f"group.{index}", "state": state,
+             "node_count": 2, "held_node_count": 2 if state == "ready" else 0}
+            for index, state in enumerate(group_states)
+        ]}},
+    }
+
+
+class _HeldHeadless(_Headless):
+    """A Program run exists: Kernel authoring admission is closed."""
+
+    def __init__(self, cycle: dict[str, Any] | Exception, manual: list | None = None) -> None:
+        super().__init__(allowed=False)
+        self.cycle = cycle
+        self.manual = [] if manual is None else manual
+
+    def program_cycle_status(self) -> dict[str, Any]:
+        if isinstance(self.cycle, Exception):
+            raise self.cycle
+        return self.cycle
+
+    def execution_control_state(self) -> dict[str, Any]:
+        return {"ok": True, "control_state": {"manual_operations": self.manual}}
+
+
+def _draft_edit(coordinator, workspace, program, headless, envelope=None):
+    workspace.set_observer(lambda: headless.events.append("wake"))
+
+    def install() -> bool:
+        headless.events.append("install")
+        return program.install("rev-edit")
+
+    return coordinator.execute_draft_edit(
+        envelope or _envelope(),
+        operation_kind="mutate_draft",
+        workspace=workspace,
+        draft_id=program.draft_id,
+        expected_identity=workspace.identity(),
+        install=install,
+        session="program",
+    )
+
+
+def test_idle_draft_edit_commits_without_a_cell_claim(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+
+    commit = _draft_edit(coordinator, workspace, program, headless)
+
+    # Only the Draft changes: no Kernel claim is acquired or settled.
+    assert headless.events == ["install", "wake"]
+    assert headless.claims == [] and headless.settlements == []
+    assert commit.snapshot.workspace_revision == 2
+    assert commit.admission_generation == 7
+    assert coordinator.submission_outcome(_envelope())["outcome"] == {
+        "kind": "settled", "operation_kind": "mutate_draft", "apply": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "cycle",
+    [
+        _held_cycle(),  # failure pause, Stop of other motion confirmed
+        _held_cycle(run_state="running"),  # operator Stop holds everything
+        _held_cycle(run_state="running", all_group="mixed"),
+        _held_cycle(run_state="full_stopped", all_group="unavailable",
+                    active_operation_count=0),  # settled Halt
+        _executed_cycle("ready"),  # Executed, never Run
+        _executed_cycle("ready", "ready", "ready"),
+    ],
+)
+@pytest.mark.parametrize(
+    "manual",
+    [
+        [],
+        # Released terminal results and the owner's never-dispatched proof.
+        [{"resident": False, "operation": {"state": "completed"}}],
+        [{"resident": False, "operation": {"state": "stopped"}}],
+        [{"resident": False, "operation": {"state": "failed"}}],
+        [{"resident": True, "operation": {"state": "cancelled_pre_dispatch"}}],
+    ],
+)
+def test_held_run_with_all_motion_stopped_admits_a_draft_edit(
+    tmp_path, cycle, manual
+) -> None:
+    workspace, program, _deployment, _headless, _coordinator = _fixture(tmp_path)
+    headless = _HeldHeadless(cycle, manual)
+    coordinator = AuthoringAdmissionCoordinator(headless)
+
+    _draft_edit(coordinator, workspace, program, headless)
+
+    assert headless.events == ["install", "wake"]
+    assert headless.claims == []
+    assert workspace.revision == 2
+
+
+@pytest.mark.parametrize(
+    "cycle, manual",
+    [
+        (_held_cycle(all_group="stopping"), []),
+        (_held_cycle(all_group="running"), []),
+        (_held_cycle(all_group="ready"), []),  # failure pause, nothing held
+        # Executed, but a group has started (or a fact is not proven).
+        (_executed_cycle("ready", "running", "ready"), []),
+        (_executed_cycle("running"), []),
+        (_executed_cycle("ready", "mixed"), []),
+        (_executed_cycle("ready", "unavailable"), []),
+        (_executed_cycle(), []),
+        ({**_executed_cycle("ready"), "recovery_offer": {"actions": []}}, []),
+        ({**_executed_cycle("ready"), "runtime_controls": None}, []),
+        (_executed_cycle("ready"), [{"resident": True, "operation": {"state": "executing"}}]),
+        (_held_cycle(containment_pending=True), []),
+        (_held_cycle(run_state="full_stopping", active_operation_count=1), []),
+        (_held_cycle(run_state="full_stopped", active_operation_count=None), []),
+        ({**_held_cycle(), "state": "stopping"}, []),
+        (_held_cycle(), [{"resident": True, "operation": {"state": "executing"}}]),
+        # Not affirmatively settled: effect unproven, authority retained,
+        # or a state the owner did not (recognizably) publish.
+        (_held_cycle(), [{"resident": True, "operation": {"state": "intervention_required"}}]),
+        (_held_cycle(), [{"resident": True, "operation": {"state": "interrupted"}}]),
+        (_held_cycle(), [{"resident": False, "operation": {"state": "interrupted"}}]),
+        (_held_cycle(), [{"resident": False, "operation": {"state": "intervention_required"}}]),
+        (_held_cycle(), [{"resident": True, "operation": {"state": "completed"}}]),
+        (_held_cycle(), [{"resident": False, "operation": {"state": "mystery"}}]),
+        (_held_cycle(), [{"resident": False, "operation": {}}]),
+        (_held_cycle(), [{"operation": {"state": "completed"}}]),
+        (_held_cycle(), [{"resident": False}]),
+        ({**_held_cycle(), "recovery_offer": None}, []),  # failure pause unproven
+        (HeadlessClientError("headless_http_timeout", "timed out"), []),
+    ],
+)
+def test_moving_settling_or_unknown_run_refuses_a_draft_edit(
+    tmp_path, cycle, manual
+) -> None:
+    workspace, program, _deployment, _headless, _coordinator = _fixture(tmp_path)
+    headless = _HeldHeadless(cycle, manual)
+    coordinator = AuthoringAdmissionCoordinator(headless)
+
+    with pytest.raises(HTTPException) as refused:
+        _draft_edit(coordinator, workspace, program, headless)
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "authoring_not_ready"
+    assert headless.events == []
+    assert workspace.revision == 1
+
+
+def test_draft_edit_requires_the_displayed_admission_generation(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+
+    with pytest.raises(HTTPException) as refused:
+        _draft_edit(coordinator, workspace, program, headless, envelope=_envelope(6))
+
+    assert refused.value.detail["code"] == "stale_generation"
+    assert headless.events == []

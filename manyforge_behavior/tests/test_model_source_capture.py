@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from manyforge_behavior import model_source_capture
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
     capture_deployment_model_sources,
@@ -139,3 +140,105 @@ def test_capture_rejects_a_source_changed_during_its_bounded_read(
     monkeypatch.setattr(os, "read", read_then_change)
     with pytest.raises(ModelSourceCaptureError, match="changed during capture"):
         capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+
+
+def _counted_memo(monkeypatch: pytest.MonkeyPatch, **bounds: int) -> list[bytes]:
+    """A fresh memo whose compressions are recorded."""
+
+    encoded: list[bytes] = []
+    original = model_source_capture.encode_model_source_artifact
+
+    def counted(value: bytes, *, media_type: str) -> dict[str, object]:
+        encoded.append(value)
+        return original(value, media_type=media_type)
+
+    monkeypatch.setattr(model_source_capture, "encode_model_source_artifact", counted)
+    monkeypatch.setattr(
+        model_source_capture,
+        "_ENCODED_SOURCES",
+        model_source_capture._EncodedSourceMemo(
+            entries=bounds.get("entries", 16),
+            transferred_bytes=bounds.get("transferred_bytes", 1 << 20),
+        ),
+    )
+    return encoded
+
+
+def _mesh_model(tmp_path: Path, mesh: bytes) -> Path:
+    (tmp_path / "package" / "meshes").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "model.urdf").write_bytes(
+        b'<robot name="r"><link name="a"><visual><geometry>'
+        b'<mesh filename="package://example/meshes/a.stl"/>'
+        b"</geometry></visual></link></robot>"
+    )
+    (tmp_path / "model.srdf").write_bytes(b'<robot name="r"/>')
+    path = tmp_path / "package" / "meshes" / "a.stl"
+    path.write_bytes(mesh)
+    return path
+
+
+def _mesh_bytes(captured: dict[str, object]) -> bytes:
+    resource = captured["components"][0]["resources"][0]  # type: ignore[index]
+    return gzip.decompress(
+        b"".join(base64.b64decode(chunk) for chunk in resource["chunks"])
+    )
+
+
+def test_capture_compresses_each_unchanged_source_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoded = _counted_memo(monkeypatch)
+    _mesh_model(tmp_path, b"solid a\nendsolid a\n")
+
+    first = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    assert len(encoded) == 3  # URDF, SRDF and the mesh
+    second = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+
+    assert len(encoded) == 3
+    assert second == first
+    # A reused value is the caller's own: editing it cannot reach the memo.
+    second["components"][0]["resources"][0]["chunks"].clear()
+    third = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    assert third == first and len(encoded) == 3
+
+
+def test_capture_never_reuses_a_changed_or_missing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoded = _counted_memo(monkeypatch)
+    mesh = _mesh_model(tmp_path, b"solid a\nendsolid a\n")
+    before = mesh.stat()
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+
+    # Same size, timestamps restored: only the content identity differs.
+    mesh.write_bytes(b"solid b\nendsolid b\n")
+    os.utime(mesh, ns=(before.st_atime_ns, before.st_mtime_ns))
+    changed = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    assert _mesh_bytes(changed) == b"solid b\nendsolid b\n"
+    assert encoded[-1] == b"solid b\nendsolid b\n" and len(encoded) == 4
+
+    # A replaced file with the original bytes is a new file identity.
+    replacement = mesh.with_name("a.stl.new")
+    replacement.write_bytes(b"solid a\nendsolid a\n")
+    os.replace(replacement, mesh)
+    replaced = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    assert _mesh_bytes(replaced) == b"solid a\nendsolid a\n"
+    assert len(encoded) == 5
+
+    mesh.unlink()
+    with pytest.raises(ModelSourceCaptureError, match="could not read package resource"):
+        capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+
+
+def test_capture_memo_stays_within_its_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoded = _counted_memo(monkeypatch, entries=2)
+    _mesh_model(tmp_path, b"solid a\nendsolid a\n")
+
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+
+    # Three sources never fit two entries: the oldest is compressed again.
+    assert len(encoded) > 3
+    assert len(model_source_capture._ENCODED_SOURCES._values) == 2

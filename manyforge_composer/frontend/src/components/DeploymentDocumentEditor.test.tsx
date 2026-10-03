@@ -46,9 +46,12 @@ function controller(): DeploymentWorkspaceController {
     error: null,
     feedback: null,
     acceptedApply: null,
+    acceptedApplyCorrelationId: null,
+    activationScope: null,
     pendingApplyConfirmation: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
+    documentUnavailableReason: null,
     refresh: vi.fn(),
     clearFeedback: vi.fn(),
     dismissError: vi.fn(),
@@ -117,10 +120,10 @@ describe('DeploymentDocumentEditor', () => {
       <DeploymentDocumentControls controller={postApply} />,
     );
     expect(appliedMarkup).toMatch(
-      /<button[^>]*disabled=""[^>]*title="Draft already matches Manager Applied\."[^>]*>Discard<\/button>/,
+      /<button[^>]*disabled=""[^>]*title="Nothing to apply: the Deployment Draft matches Manager Applied\."[^>]*>Discard<\/button>/,
     );
     expect(appliedMarkup).toMatch(
-      /<button[^>]*disabled=""[^>]*title="Draft already matches Manager Applied\."[^>]*>Apply<\/button>/,
+      /<button[^>]*disabled=""[^>]*title="Nothing to apply: the Deployment Draft matches Manager Applied\."[^>]*>Apply<\/button>/,
     );
     expect(appliedMarkup).toMatch(/<button[^>]*>Revert<\/button>/);
 

@@ -86,16 +86,22 @@ std::string Redigest(std::string source) {
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.1.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.2.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "ae77823d45902f15070203e28fd579d3b74e64bc457072cdc2c55fdd83c3d4e6");
-  ASSERT_EQ(catalog.definitions().size(), 7U);
+            "c8c0bfebd53655ae7b0acbd30c6ad55df50c63745cd5f4868892e49339b808b6");
+  ASSERT_EQ(catalog.definitions().size(), 8U);
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
   EXPECT_TRUE(collision->requires_motion_attention);
   EXPECT_EQ(collision->max_evidence_refs, 32U);
+  const auto *scope = catalog.Find("manyforge.runtime.alarm_scope_unavailable");
+  ASSERT_NE(scope, nullptr);
+  EXPECT_EQ(scope->alarm_class, "runtime_health");
+  EXPECT_EQ(scope->adapter_id,
+            "manyforge.alarm_adapter.runtime_health_condition");
+  EXPECT_TRUE(scope->requires_motion_attention);
   EXPECT_EQ(catalog.Find("manyforge.unknown"), nullptr);
 }
 
@@ -105,7 +111,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            7U);
+            8U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

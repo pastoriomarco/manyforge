@@ -42,7 +42,7 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v1",
+            "schema_version": "manyforge.program_run_capture.v2",
             "program_run_id": "program-run.1",
             "applied_record_digest": _DIGEST_C,
             "scenario_id": "cell-pick",
@@ -170,6 +170,10 @@ class FakeRuntime:
         self.calls.append(("read", program_run_id))
         return _snapshot()
 
+    def preview_node_correction(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("node_preview", (program_run_id, request)))
+        return {"schema_version": "manyforge.program_node_correction_preview_intent.v1"}
+
     def stop_run(
         self,
         program_run_id: str,
@@ -248,22 +252,6 @@ class FakeRuntime:
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
         self.calls.append(("runtime_controls", program_run_id))
         return {"program_run_id": program_run_id}
-
-    def stage_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
-        self.calls.append(("stage_runtime_override", (program_run_id, request)))
-        return {"accepted": True}
-
-    def activate_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
-        self.calls.append(("activate_runtime_override", (program_run_id, request)))
-        return {"accepted": True}
-
-    def clear_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
-        self.calls.append(("clear_runtime_override", (program_run_id, request)))
-        return {"accepted": True}
-
-    def promote_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
-        self.calls.append(("promote_runtime_override", (program_run_id, request)))
-        return {"accepted": True}
 
     def write_runtime_blackboard(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("write_runtime_blackboard", (program_run_id, request)))
@@ -817,3 +805,42 @@ def test_persistent_value_routes_are_scenario_scoped_strict_requests() -> None:
         "reconcile_persistent_values",
     ]
     assert runtime.calls[1][1][1].value == 3
+
+
+def test_runtime_override_routes_are_removed_and_key_writes_remain() -> None:
+    paths = {
+        getattr(route, "path", None) for route in create_app(FakeRuntime()).routes
+    }
+    assert not any("runtime-overrides" in str(path) for path in paths)
+    assert "/api/program/runs/{program_run_id}/blackboard-values" in paths
+    assert "/api/program/runs/{program_run_id}/runtime-controls" in paths
+
+
+def test_node_correction_preview_is_a_plain_runner_query() -> None:
+    runtime = FakeRuntime()
+    body = {
+        "schema_version": "manyforge.program_node_correction_preview_request.v1",
+        "request_id": "node-preview.1",
+        "program_run_id": "program-run.1",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "program_id": "lite6_program",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "a" * 64,
+        "node_instance_id": "move",
+        "node_attempt_id": "attempt:1",
+        "proposed_inputs": [{"path": "goal", "value": []}],
+    }
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/program/runs/program-run.1/node-correction-previews", json=body
+        )
+        foreign = client.post(
+            "/api/program/runs/program-run.1/node-correction-previews",
+            json={**body, "target_role_id": "other"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert foreign.status_code == 422
+    assert [kind for kind, _value in runtime.calls] == ["node_preview"]
+    assert runtime.calls[0][1][1].model_dump(mode="json") == body

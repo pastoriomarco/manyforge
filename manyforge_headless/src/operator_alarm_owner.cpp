@@ -205,14 +205,12 @@ void ValidateAlarmCallerAttribution(const AlarmCallerAttribution &caller) {
 }
 
 AlarmLifecycleOwner::AlarmLifecycleOwner(
-    OperatorAlarmCatalog catalog, std::string cell_id,
-    std::set<std::string> valid_resource_ids, std::string owner_id,
+    OperatorAlarmCatalog catalog, std::string cell_id, std::string owner_id,
     std::string owner_epoch, MonotonicClock monotonic_clock,
     WallClock wall_clock, std::set<std::string> required_domains,
     const std::size_t terminal_retention, const std::size_t condition_capacity,
     const std::size_t live_alarm_capacity)
     : catalog_(std::move(catalog)), cell_id_(std::move(cell_id)),
-      valid_resource_ids_(std::move(valid_resource_ids)),
       owner_id_(std::move(owner_id)), owner_epoch_(std::move(owner_epoch)),
       monotonic_clock_(std::move(monotonic_clock)),
       wall_clock_(std::move(wall_clock)),
@@ -244,15 +242,26 @@ AlarmLifecycleOwner::AlarmLifecycleOwner(
           "operator_alarm_configuration_invalid",
           "live alarm capacity must be between 1 and 256 and cannot exceed "
           "condition capacity");
-  Require(valid_resource_ids_.size() <= kMaximumAlarmResourceRegistry,
-          "operator_alarm_configuration_invalid",
-          "resource registry exceeds the 4096-resource bound");
-  for (const auto &resource : valid_resource_ids_) {
-    ValidateText(resource, "valid_resource_id", kMaximumIdentityBytes);
-  }
   static_cast<void>(MonotonicNow());
   static_cast<void>(WallNow());
   metrics_.insert_or_assign("owner_restarts", 1U);
+}
+
+void AlarmLifecycleOwner::ReplaceResourceRegistry(
+    AlarmResourceRegistry registry) {
+  ValidateText(registry.retained_bundle_id, "retained_bundle_id",
+               kMaximumIdentityBytes);
+  ValidateText(registry.graph_revision, "graph_revision",
+               kMaximumIdentityBytes);
+  Require(registry.resource_ids.size() <= kMaximumAlarmResourceRegistry,
+          "operator_alarm_configuration_invalid",
+          "resource registry exceeds the 4096-resource bound");
+  for (const auto &resource : registry.resource_ids) {
+    ValidateText(resource, "resource_id", kMaximumIdentityBytes);
+  }
+  std::lock_guard lock(mutex_);
+  resource_registry_ = std::move(registry);
+  Increment(metrics_, "resource_registry_replacements");
 }
 
 std::int64_t AlarmLifecycleOwner::MonotonicNow() const {
@@ -430,6 +439,10 @@ void AlarmLifecycleOwner::StampFactsLocked(
 void AlarmLifecycleOwner::RecordRejectedUpdateLocked(
     const std::string_view code) {
   Increment(metrics_, "rejected_updates");
+  if (code == "operator_alarm_scope_invalid" ||
+      code == "operator_alarm_scope_inactive") {
+    Increment(metrics_, "scope_rejections");
+  }
   if (code == "operator_alarm_source_epoch_stale" ||
       code == "operator_alarm_source_sequence_stale") {
     Increment(metrics_, "stale_updates");
@@ -492,13 +505,33 @@ AlarmLifecycleOwner::SubmitImpl(AlarmConditionUpdate update,
             "operator_alarm_scope_invalid",
             "motion-attention scope requires canonical resources");
   }
-  for (const auto &resource : update.subject.resource_ids) {
-    Require(valid_resource_ids_.find(resource) != valid_resource_ids_.end(),
-            "operator_alarm_scope_invalid",
-            "alarm scope names an unknown active resource");
-  }
 
   std::lock_guard lock(mutex_);
+  const auto found = points_.find(condition_id);
+  // A resource-scoped activation must name the exact active configuration.
+  // A return to normal of an already retained condition is accepted after
+  // its resources leave the configuration, so a replaced configuration
+  // neither erases nor strands the alarm it once admitted.
+  std::vector<std::string> inactive_resources;
+  for (const auto &resource : update.subject.resource_ids) {
+    if (!resource_registry_.has_value() ||
+        !resource_registry_->resource_ids.contains(resource)) {
+      inactive_resources.push_back(resource);
+    }
+  }
+  if (!inactive_resources.empty() &&
+      (update.active || found == points_.end())) {
+    std::string message =
+        "alarm scope names resources outside the active configuration (";
+    message += resource_registry_.has_value()
+                   ? "retained bundle " + resource_registry_->retained_bundle_id
+                   : std::string("no active configuration observed");
+    message += "):";
+    for (const auto &resource : inactive_resources) {
+      message += " " + resource;
+    }
+    AlarmFail("operator_alarm_scope_inactive", message);
+  }
   const auto source = sources_.find(update.source_id);
   Require(source != sources_.end(), "operator_alarm_source_unregistered",
           "condition update source is unregistered");
@@ -508,7 +541,6 @@ AlarmLifecycleOwner::SubmitImpl(AlarmConditionUpdate update,
   Require(source->second.source_epoch == update.source_epoch,
           "operator_alarm_source_epoch_stale",
           "condition update belongs to a stale registered epoch");
-  const auto found = points_.find(condition_id);
   const auto point =
       found == points_.end()
           ? AlarmPointState{condition_id, 0U, std::nullopt, std::nullopt}
@@ -1010,7 +1042,8 @@ AlarmAttentionDecision AlarmLifecycleOwner::EvaluateMotionAttention(
     return {false, true, "operator_alarm_state_unavailable", generation_, {}};
   }
   for (const auto &resource : reserved_resource_ids) {
-    if (valid_resource_ids_.find(resource) == valid_resource_ids_.end()) {
+    if (!resource_registry_.has_value() ||
+        !resource_registry_->resource_ids.contains(resource)) {
       return {false,
               true,
               "operator_alarm_admission_scope_invalid",

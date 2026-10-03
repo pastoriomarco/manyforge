@@ -5,15 +5,22 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
+#include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/runtime_participant_stop_readiness.hpp>
+#include <manyforge_core/types/controller_lifecycle.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -2805,6 +2812,476 @@ TEST_F(ExecutionKernelTest, MotionPreviewUsesExplicitStartAndDoesNotDispatchOrMu
       test_projection_revision(), ProjectionLeaseId("mock_current_lease")};
   EXPECT_EQ(result.value().projection_binding, expected_projection_binding);
   EXPECT_EQ(cache.size(), 0U);
+}
+
+// --- Never-dispatched prepared failure fixtures ---
+// Sealed prepared-motion authority for the fixture request. Only identity
+// and the ordinary Stop plan are checked before planning; these failures stop
+// at planning, before any prepared product exists.
+
+[[nodiscard]] ResolvedStopBasePlanDTO prepared_failure_stop_base_plan() {
+  const auto path =
+      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+  std::ifstream stream(path, std::ios::binary);
+  std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+  if (bytes.ends_with('\n')) bytes.pop_back();
+  auto decoded = DecodeResolvedStopBasePlan(bytes);
+  if (!decoded.ok()) throw std::logic_error(decoded.error().message);
+  auto base = std::move(decoded.value());
+  base.retained_bundle_id = test_projection_revision().retained_bundle_id;
+  base.graph_revision = test_projection_revision().graph_revision;
+  auto& nominal = base.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("stop.command"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  nominal.containment_command.provider_contract_ref = contract;
+  nominal.command_qualification.controlled_substitution_contract->provider_contract_ref = contract;
+  JsonValueDTO::Array limits;
+  for (const auto& resource : {std::string("joint.1"), std::string("joint.2")}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{resource}},
+        {"max_deceleration", JsonValueDTO{JsonObjectDTO{
+                                 {"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
+                                 {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s")}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}}});
+  }
+  nominal.default_contract_parameters =
+      JsonObjectDTO{{"stop_mode", JsonValueDTO{std::string("soft_on_path")}},
+                    {"jerk_limits_enabled", JsonValueDTO{false}},
+                    {"deceleration_time_s", JsonValueDTO{1.0}},
+                    {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+                    {"per_resource_limits", JsonValueDTO{std::move(limits)}}};
+  auto current = MakeResolvedStopBasePlan(std::move(base));
+  if (!current.ok()) throw std::logic_error(current.error().message);
+  return std::move(current.value());
+}
+
+[[nodiscard]] RuntimeParticipantBinding prepared_failure_binding(
+    const ResolvedStopBasePlanDTO& base) {
+  const auto& target = base.escalation_stages.front().command_target;
+  std::vector<RuntimeCapabilityProviderPathDTO> supporting_providers{
+      RuntimeCapabilityProviderPathDTO{
+          CapabilityId("planning.motion.joint_goal"), CapabilityDefinitionRevision(kTestDigestC),
+          CapabilityProviderBindingId(kTestDigestD), CapabilityProviderBindingRevision(kTestDigestA),
+          ProviderInstanceId("planner.1"), ProviderManifestId(kTestDigestB),
+          ProviderManifestRevision(kTestDigestC), RuntimeUnitId("planner.runtime"),
+          RuntimeEpoch("planner.epoch")}};
+  std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs{
+      {RuntimeUnitId("planner.runtime"), RuntimeEpoch("planner.epoch")},
+      {base.source_runtime_unit_id, base.source_runtime_epoch},
+      {target.runtime_unit_id, target.runtime_unit_epoch}};
+  std::sort(
+      runtime_unit_epochs.begin(), runtime_unit_epochs.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.runtime_unit_id < rhs.runtime_unit_id; });
+  RuntimeParticipantBindingDTO value{
+      ProgramId("program.prepared"),
+      ProgramRevision(kTestDigestA),
+      ProgramBindingId(kTestDigestB),
+      base.retained_bundle_id,
+      base.graph_revision,
+      ComponentRoleId("robot"),
+      TargetRoleId("arm"),
+      ControllableComponentId("robot1"),
+      ComponentTypeId("robot.type"),
+      ComponentTypeRevision("robot.type.revision"),
+      CommandTargetId("arm"),
+      CapabilityId("execution.trajectory.execute"),
+      CapabilityDefinitionRevision(kTestDigestC),
+      std::nullopt,
+      {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
+                                  ModelRevision("model.revision")}},
+      {RuntimeModelGroupBindingDTO{ModelGroupRoleId("arm.group"),
+                                   ModelInstanceId("robot.model"),
+                                   "arm_group",
+                                   {"joint_1", "joint_2"}}},
+      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+                                  ModelRevision("model.revision"), "robot_base"},
+       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+                                  ModelRevision("model.revision"), "robot_tcp"}},
+      {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
+                                 std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
+       RuntimeResourceBindingDTO{ResourceRoleId("joint.2"), ResourceId("joint.2"),
+                                 std::string("joint_2"), "joint_2", CoordinateKind::kAngular}},
+      {},
+      RuntimeControlPathDTO{base.control_domain_id,
+                            base.control_domain_revision,
+                            base.control_binding_id,
+                            base.control_binding_revision,
+                            ControlInterfaceContractId("control.interface"),
+                            ControlInterfaceRevision("control.interface.revision"),
+                            base.controller_topology_id,
+                            base.topology_revision,
+                            base.control_route_id,
+                            base.activation_set_id,
+                            base.active_control_configuration_id,
+                            base.active_control_configuration_generation,
+                            target.provider_instance_id,
+                            target.provider_manifest_id,
+                            target.provider_manifest_revision,
+                            target.runtime_unit_id,
+                            target.provider_runtime_epoch,
+                            StateAuthorityId("state.measured"),
+                            StateAuthorityClass::kMeasured,
+                            base.stop_evidence_policy_id,
+                            base.stop_evidence_policy_revision,
+                            ContainmentGranularity::kResource,
+                            std::nullopt},
+      std::nullopt,
+      std::move(supporting_providers),
+      std::move(runtime_unit_epochs),
+      {}};
+  auto verified = verify_runtime_participant_binding(std::move(value));
+  if (!verified.ok()) throw std::logic_error(verified.error().message);
+  return std::move(verified.value());
+}
+
+[[nodiscard]] ControllerLifecycleExpectedDomain prepared_failure_expected_domain(
+    const ResolvedStopBasePlanDTO& base, const RuntimeParticipantBinding& binding) {
+  const auto& path = *binding.value().control_path;
+  const std::vector<ControllerInterfaceInstanceDTO> interfaces{{ResourceId("joint.1"), "position"},
+                                                               {ResourceId("joint.2"), "position"}};
+  const ControllerRoleId controller("hardware");
+  ControllerLifecycleExpectedDomainDTO value{
+      base.control_domain_id,
+      base.control_domain_revision,
+      base.controller_topology_id,
+      base.topology_revision,
+      ProductId("product.control.arm"),
+      ProductContractId("manyforge.control-domain-control.v2"),
+      ProductContractRevision(kTestDigestD),
+      ContentDigest(kTestDigestA),
+      ContentDigest(kTestDigestB),
+      base.source_runtime_unit_id,
+      base.source_runtime_epoch,
+      {base.controller_topology_id,
+       base.topology_revision,
+       {{controller,
+         {{path.control_interface_contract_id,
+           path.control_interface_revision,
+           {ControllerClaimDirection::kCommand, ControllerClaimDirection::kState}}},
+         {},
+         {}}},
+       {},
+       {{base.activation_set_id, {controller}, {}}},
+       {{base.control_route_id,
+         path.control_interface_contract_id,
+         path.control_interface_revision,
+         {controller},
+         {base.activation_set_id}}}},
+      {base.control_domain_id,
+       base.control_domain_revision,
+       base.controller_topology_id,
+       base.topology_revision,
+       base.activation_set_id,
+       {{path.control_binding_id, path.control_binding_revision, path.control_route_id}}},
+      {{path.control_binding_id, path.control_binding_revision, path.control_interface_contract_id,
+        path.control_interface_revision, interfaces, interfaces}},
+      {{controller,
+        ControllerImplementationId("implementation.hardware"),
+        ControllerImplementationRevision(kTestDigestC),
+        "controller_interface.ControllerInterface",
+        ContentDigest(kTestDigestD),
+        interfaces,
+        interfaces,
+        {},
+        {}}},
+      {{path.control_binding_id, path.control_binding_revision, path.control_route_id,
+        EndpointRoleId("endpoint.command"), "controller.command", true, false}}};
+  auto verified = verify_controller_lifecycle_expected_domain(std::move(value));
+  if (!verified.ok()) throw std::logic_error(verified.error().message);
+  return std::move(verified.value());
+}
+
+[[nodiscard]] ResolvedPreparedMotionExecutionRequestDTO prepared_failure_request(
+    ExecuteRequestDTO request) {
+  const auto base = prepared_failure_stop_base_plan();
+  auto binding = prepared_failure_binding(base);
+  const auto domain = prepared_failure_expected_domain(base, binding);
+  auto readiness = verify_runtime_participant_stop_readiness(
+      {binding.value().controllable_component_id, ComponentLifecycleGeneration(1U),
+       domain.value(), base},
+      binding, domain);
+  if (!readiness.ok()) throw std::logic_error(readiness.error().message);
+  const auto& sealed = binding.value();
+  auto& resolved = request.binding;
+  resolved.operation_id = OperationId("operation.prepared");
+  resolved.participant_id = OperationParticipantId("participant.prepared");
+  resolved.program_run_id = ProgramRunId("run.prepared");
+  resolved.program_id = sealed.program_id;
+  resolved.program_revision = sealed.program_revision;
+  resolved.program_binding_id = sealed.program_binding_id;
+  resolved.controllable_component_id = sealed.controllable_component_id;
+  resolved.command_target_id = sealed.command_target_id;
+  resolved.capability_id = sealed.capability_id;
+  const OperationRevision revision(1U);
+  const std::vector<HardStopResourceLimitDTO> limits{
+      {ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+      {ResourceId("joint.2"), AngularVelocityDTO{0.02}}};
+  auto stop = MakePreparedParticipantStopPlan(
+      readiness.value().value(),
+      PreparedParticipantStopPlanContextDTO{
+          resolved.operation_id, revision, resolved.participant_id, sealed.program_id,
+          sealed.program_revision, sealed.program_binding_id, resolved.program_run_id,
+          std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary, std::nullopt,
+          MotionInterruptNodeCategory::kGeneric},
+      sealed.resources, limits);
+  if (!stop.ok()) throw std::logic_error(stop.error().details.at("reason"));
+  return ResolvedPreparedMotionExecutionRequestDTO{
+      std::move(request),
+      revision,
+      std::move(binding),
+      std::move(readiness.value()),
+      std::nullopt,
+      0.0,
+      limits,
+      MotionInterruptNodeCategory::kGeneric,
+      std::make_shared<const PreparedParticipantStopPlanDTO>(std::move(stop.value())),
+      nullptr};
+}
+
+TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureIsRetryableWithoutBackendReset) {
+  // Live incident 2026-10-02: a Program motion whose IK had no solution
+  // failed while preparing, before any dispatch. It never commanded the
+  // robot, so the owner offers Retry instead of an unknown fault needing Reset.
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                            "RoboPlan could not resolve the pose goal",
+                            {{"reason", "native_ik_no_solution"}}};
+  planner.next_result = plan_err;
+  const auto prepared = kernel.PrepareMotion(prepared_failure_request(make_test_request("ik")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  const auto observed = kernel.ObservePreparedMotion(prepared.value());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed);
+  EXPECT_FALSE(observed.value().last_dispatched_participant);
+  scheduler.advance_to(clock.now());
+
+  const auto assessment = kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kFailedValidation);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_TRUE(assessment.retry_admissible);
+  EXPECT_EQ(assessment.allowed_actions,
+            (std::vector<RecoveryAction>{RecoveryAction::kRetryAfterSceneRepair,
+                                         RecoveryAction::kResetCycle}));
+  const auto reset_count_before = execution.reset_count;
+  const auto retried =
+      apply_recovery_action_after_projection(kernel, RecoveryAction::kRetryAfterSceneRepair);
+  ASSERT_TRUE(retried.accepted) << (retried.error ? retried.error->message : std::string{});
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(execution.reset_count, reset_count_before);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureRetryDeadlineFollowsMeasuredFreshness) {
+  // Retry readiness of a no-effect failure keeps the same observation
+  // freshness rule as the Stop-backed retry classes: newer measured samples
+  // extend the published validity deadline without churning the revision,
+  // and a stale source lets the deadline elapse (the Program offer then
+  // disables Retry as recovery_owner_observation_expired).
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                            "RoboPlan could not resolve the pose goal",
+                            {{"reason", "native_ik_no_solution"}}};
+  planner.next_result = plan_err;
+  const auto prepared =
+      kernel.PrepareMotion(prepared_failure_request(make_test_request("ik_fresh")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  constexpr std::int64_t kStepNs = 20'000'000;  // the default observation poll period
+  const auto publish_and_poll = [&] {
+    execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.0, 0.0});
+    scheduler.advance_to(clock.now());
+    clock.advance(kStepNs);
+    scheduler.advance_to(clock.now());
+  };
+  // Qualify the measured source (default dwell 200 ms, two samples).
+  for (int step = 0; step < 15; ++step) publish_and_poll();
+  execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.0, 0.0});
+  clock.advance(kStepNs);
+  scheduler.advance_to(clock.now());
+  const auto fresh = kernel.get_recovery_assessment();
+  ASSERT_EQ(fresh.recovery_class, RecoveryClass::kFailedValidation);
+  ASSERT_EQ(fresh.status, RecoveryAssessmentStatus::kRetryReady);
+  ASSERT_TRUE(fresh.observed_state_fresh);
+  ASSERT_GT(fresh.observed_state_valid_until_ns, clock.now());
+
+  // Fresh samples keep the published deadline ahead of the clock across
+  // several of their own freshness budgets, at one stable revision.
+  const auto budget_ns = fresh.observed_state_valid_until_ns - (clock.now() - kStepNs);
+  ASSERT_GT(budget_ns, 0);
+  const auto steps = static_cast<int>(3 * budget_ns / kStepNs) + 3;
+  for (int step = 0; step < steps; ++step) {
+    publish_and_poll();
+    const auto current = kernel.get_recovery_assessment();
+    EXPECT_EQ(current.assessment_revision, fresh.assessment_revision);
+    EXPECT_EQ(current.status, RecoveryAssessmentStatus::kRetryReady);
+    EXPECT_GT(current.observed_state_valid_until_ns, clock.now() - kStepNs);
+  }
+  execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.0, 0.0});
+  scheduler.advance_to(clock.now());
+  const auto extended = kernel.get_recovery_assessment();
+  EXPECT_GT(extended.observed_state_valid_until_ns, clock.now());
+  EXPECT_GT(extended.observed_state_valid_until_ns,
+            fresh.observed_state_valid_until_ns + 2 * budget_ns);
+  EXPECT_EQ(extended.assessment_revision, fresh.assessment_revision);
+
+  // The source goes stale: the Kernel-owned deadline elapses and the
+  // published assessment says so; nothing extends it.
+  clock.advance(extended.observed_state_valid_until_ns - clock.now());
+  scheduler.advance_to(clock.now());
+  clock.advance(kStepNs);
+  scheduler.advance_to(clock.now());
+  const auto stale = kernel.get_recovery_assessment();
+  EXPECT_FALSE(stale.observed_state_fresh);
+  EXPECT_GT(stale.assessment_revision, fresh.assessment_revision);
+  EXPECT_LE(stale.observed_state_valid_until_ns, clock.now());
+}
+
+TEST_F(ExecutionKernelTest, OrdinaryStopRetryDeadlineFollowsMeasuredFreshness) {
+  // An ordinary operator Stop publishes the same observation deadline as the
+  // other retry classes; the Kernel keeps it current from newer samples at one
+  // revision and republishes observed_state_fresh=false when it elapses.
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner,     context,         controlled_execution,
+                               local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_collision_world,
+                                               local_collision_engine);
+  ASSERT_TRUE(local_kernel.execute(make_test_request("ordinary_stop_fresh")).ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(local_kernel.stop().accepted);
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  constexpr std::int64_t kStepNs = 20'000'000;  // the default observation poll period
+  const auto publish_and_poll = [&] {
+    controlled_execution.publish_observed_state(local_clock.now(), {1.0, 1.0}, {0.0, 0.0});
+    local_scheduler.advance_to(local_clock.now());
+    local_clock.advance(kStepNs);
+    local_scheduler.advance_to(local_clock.now());
+  };
+  for (int step = 0; step < 15; ++step) publish_and_poll();
+  controlled_execution.publish_observed_state(local_clock.now(), {1.0, 1.0}, {0.0, 0.0});
+  local_clock.advance(kStepNs);
+  local_scheduler.advance_to(local_clock.now());
+  const auto fresh = local_kernel.get_recovery_assessment();
+  ASSERT_EQ(fresh.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
+  ASSERT_EQ(fresh.status, RecoveryAssessmentStatus::kRetryReady);
+  ASSERT_TRUE(fresh.observed_state_fresh);
+  ASSERT_GT(fresh.observed_state_valid_until_ns, local_clock.now());
+
+  const auto budget_ns = fresh.observed_state_valid_until_ns - (local_clock.now() - kStepNs);
+  ASSERT_GT(budget_ns, 0);
+  const auto steps = static_cast<int>(3 * budget_ns / kStepNs) + 3;
+  for (int step = 0; step < steps; ++step) {
+    publish_and_poll();
+    const auto current = local_kernel.get_recovery_assessment();
+    EXPECT_EQ(current.assessment_revision, fresh.assessment_revision);
+    EXPECT_GT(current.observed_state_valid_until_ns, local_clock.now() - kStepNs);
+  }
+
+  // No newer sample: the Kernel-owned deadline elapses and is published.
+  const auto extended = local_kernel.get_recovery_assessment();
+  local_clock.advance(extended.observed_state_valid_until_ns - local_clock.now());
+  local_scheduler.advance_to(local_clock.now());
+  local_clock.advance(kStepNs);
+  local_scheduler.advance_to(local_clock.now());
+  const auto stale = local_kernel.get_recovery_assessment();
+  EXPECT_EQ(stale.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
+  EXPECT_FALSE(stale.observed_state_fresh);
+  EXPECT_GT(stale.assessment_revision, fresh.assessment_revision);
+  EXPECT_LE(stale.observed_state_valid_until_ns, local_clock.now());
+}
+
+TEST_F(ExecutionKernelTest, UnpreparedNonValidationFailureStaysResetRequired) {
+  // Without exact never-dispatched preparation evidence a non-validation
+  // failure keeps the conservative classification.
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  planner.next_result = plan_err;
+  execute_sync(make_test_request("failed_unprepared_assessment"));
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  scheduler.advance_to(clock.now());
+
+  const auto assessment = kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kUnknownFault);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kResetRequired);
+  EXPECT_FALSE(
+      apply_recovery_action_after_projection(kernel, RecoveryAction::kRetryAfterSceneRepair)
+          .accepted);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewAfterUnpreparedFailureStillRequiresIdle) {
+  // Only an exact prepared session that failed before dispatch relaxes the
+  // idle requirement. An ordinary failed execution has no such evidence.
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  planner.next_result = plan_err;
+  execute_sync(make_test_request("failed_unprepared"));
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory.has_value());
+  RobotStateDTO explicit_start{{"j1", "j2"}, {0.0, 0.0}, {}};
+
+  auto result = kernel.preview_motion(make_test_request("preview_after_failure"),
+                                      std::move(*inventory), explicit_start, 0U);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "motion_preview_participant_not_idle");
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+}
+
+TEST_F(ExecutionKernelTest, StopAndResetCancelAnActivePreviewInsteadOfWaitingForPlanning) {
+  // A preview holds lifecycle_mutex_ for exclusive planner access. A waiting
+  // lifecycle command cancels it rather than waiting for planning to finish
+  // or for its planning timeout, which never fires on this manual scheduler.
+  for (const bool reset : {true, false}) {
+    SCOPED_TRACE(reset ? "Reset" : "Stop");
+    SlowMockPlanner slow_planner;
+    ThreadSafeFakeClock local_clock;
+    ThreadSafeManualScheduler local_scheduler;
+    TrajectoryCache local_cache{CacheConfig{10}};
+    ControlledExecution controlled_execution;
+    MockCollisionWorldPublisher local_publisher;
+    auto local_engine = std::make_shared<MockCollisionEngine>();
+    ExecutionKernel local_kernel{slow_planner, context,         controlled_execution,
+                                 local_clock,  local_scheduler, local_cache};
+    configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+    auto inventory = local_publisher.current_scene_snapshot_lease_inventory();
+    ASSERT_TRUE(inventory.has_value());
+    RobotStateDTO explicit_start{{"j1", "j2"}, {0.0, 0.0}, {}};
+    auto previewing = std::async(std::launch::async, [&] {
+      return local_kernel.preview_motion(make_test_request("held_preview"),
+                                         std::move(*inventory), explicit_start, 0U);
+    });
+    ASSERT_TRUE(slow_planner.wait_until_in_plan());
+
+    if (reset) {
+      EXPECT_TRUE(local_kernel.reset().accepted);
+    } else {
+      // An idle participant has no motion to stop; the call must still
+      // return without waiting for the preview's planning.
+      EXPECT_FALSE(local_kernel.stop().accepted);
+    }
+
+    const auto preview = previewing.get();
+    ASSERT_FALSE(preview.ok());
+    EXPECT_EQ(preview.error().details.at("reason"), "motion_preview_cancelled");
+    EXPECT_EQ(slow_planner.cancel_count, 1);
+    EXPECT_EQ(controlled_execution.execute_count, 0);
+  }
 }
 
 TEST_F(ExecutionKernelTest, Execute_RejectsNonPositiveExecutionTimeout) {

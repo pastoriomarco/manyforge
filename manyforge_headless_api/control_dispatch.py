@@ -38,9 +38,6 @@ from .models import (
     ProgramManualHandoverRequest,
     RuntimeScaleControlRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
@@ -441,35 +438,6 @@ class HeadlessExecutionControlDispatch:
                 )
                 result = self._service.program_run_reset_full_stop(
                     model.program_run_id, model
-                )
-            elif kind == "program_runtime_override_stage":
-                model = RuntimeOverrideStageRequest.model_validate(
-                    {**payload, **context}
-                )
-                result = self._service.program_runtime_control_action(
-                    model.program_run_id, "runtime-overrides", model
-                )
-            elif kind in {
-                "program_runtime_override_activate",
-                "program_runtime_override_clear",
-            }:
-                model = RuntimeOverrideActionRequest.model_validate(
-                    {**payload, **context}
-                )
-                suffix = (
-                    "runtime-overrides/activate"
-                    if kind == "program_runtime_override_activate"
-                    else "runtime-overrides/clear"
-                )
-                result = self._service.program_runtime_control_action(
-                    model.program_run_id, suffix, model
-                )
-            elif kind == "program_runtime_override_promote":
-                model = RuntimeOverridePromotionRequest.model_validate(
-                    {**payload, **context}
-                )
-                result = self._service.program_runtime_control_action(
-                    model.program_run_id, "runtime-overrides/promote", model
                 )
             elif kind == "program_runtime_blackboard_write":
                 model = RuntimeBlackboardWriteRequest.model_validate(

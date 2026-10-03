@@ -74,7 +74,7 @@ function snapshotFixture(
     ? null
     : `sha256:${String(programDraftRevision).padStart(64, '0')}`;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision,
     program: {
@@ -116,7 +116,6 @@ function snapshotFixture(
       sourceDiagnostics: [],
       sourceDocumentDigest: null,
       programRoleAssignment: null,
-      typedParameterOverrides: {},
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },
@@ -406,6 +405,72 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.unavailableReason).toBe(null);
     await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it('releases the guard when Load or Save refuses a project with a leftover overrides.yaml', async () => {
+    // The exact backend refusal body (routes_scenario_documents._raise), read
+    // through the real client so the classification sees what production sees.
+    const message = '/workspace/cell: Scenario parameter overrides (overrides.yaml) were removed; '
+      + 'Program parameters always take their Program defaults.';
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ detail: { code: 'scenario_artifact_version_unsupported', message } }),
+      { status: 409, statusText: 'Conflict', headers: { 'Content-Type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api: realApi } = await vi.importActual<typeof import('../api/client')>('../api/client');
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    const fence = {
+      draftId: 'draft.1', expectedDraftRevision: 3,
+      deploymentDraftId: 'deployment-draft.1', expectedDeploymentDraftRevision: 4,
+      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'load.1',
+      expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
+    } as Parameters<typeof realApi.scenarioDocuments.load>[0];
+    for (const request of [
+      () => realApi.scenarioDocuments.load(fence, '/workspace/cell', false),
+      () => realApi.scenarioDocuments.save(fence, {
+        path: '/workspace/cell', scenarioId: 'cell.1', name: 'Cell', description: '', confirmOverwrite: true,
+      }),
+    ]) {
+      await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+      const failure = await request().then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(ApiError);
+      expect(authoringRefusalMessage(failure)).toBe(
+        `Not applied: ${message.replace(/\.$/, '')}. Nothing was changed.`,
+      );
+      await act(async () => latest!.finishMutation(null, failure));
+      expect(latest!.submissionUnconfirmed).toBe(false);
+      expect(latest!.unavailableReason).toBe(null);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Authoring stays usable: the next change is admitted.
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it.each([
+    ['scenario_artifact_write_failed', 'Scenario project /workspace/cell may be partially written: No space left on device'],
+    ['scenario_artifact_target_invalid', 'Scenario project /workspace/cell may be partially written: Scenario project member program.yaml is not a regular file'],
+  ])('releases a pre-write %s refusal but keeps a partial Save unconfirmed', async (code, partial) => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    // Before Save creates or writes anything the backend keeps the named 400.
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError('refused', 400, { detail: { code, message: 'refused' } }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    // The same cause after the first write is the one distinct partial outcome.
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError(partial, 500, {
+        detail: { code: 'scenario_artifact_save_incomplete', message: partial },
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.unavailableReason).toContain('unconfirmed');
+    expect(latest!.beginMutation()).toBe(false);
   });
 
   it.each([

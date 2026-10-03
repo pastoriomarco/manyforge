@@ -76,7 +76,10 @@ def test_checked_in_native_binding_fixture_is_exact() -> None:
             0, "renamed_component_role_id"
         ),
         lambda value: value["records"]["node_policy"].remove("recovery_policy"),
-        lambda value: value["enums"]["recovery_action"].remove("intervention"),
+        lambda value: value["enums"]["operator_stop_policy"].remove("hold"),
+        lambda value: value["records"]["recovery_policy"].append(
+            "allowed_recovery_actions"
+        ),
         lambda value: value["records"]["target"].remove("command_target_id"),
         lambda value: value["records"]["component"].append("component_role_id"),
         lambda value: value["scalars"]["digest"].update(

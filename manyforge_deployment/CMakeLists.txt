@@ -1470,6 +1470,14 @@ if(BUILD_TESTING)
       "${srdf_path}"
       ${resource_inputs}
       ${ARGN})
+    # Build-time consumers re-read these sources beside the prepared receipt.
+    set(MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS
+      ${MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS}
+      "${urdf_path}"
+      "${srdf_path}"
+      ${resource_inputs}
+      ${ARGN}
+      PARENT_SCOPE)
     set(${output_variable} "${fixture_root}" PARENT_SCOPE)
   endfunction()
 
@@ -1577,13 +1585,20 @@ if(BUILD_TESTING)
     DEPENDS
       manyforge_maintained_deployment_occurrences
       ${MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS}
+      # Compiled into the tool; listed so the fixture names its whole closure.
+      "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
+      "${MANYFORGE_NODE_CATALOG_SOURCE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/resources/catalog/gripper.command_position.v1.yaml"
+      ${MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS}
       "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
       "${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
       "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
       "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
       "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
     VERBATIM)
-  add_custom_target(manyforge_ui6i_cell_bootstrap
+  # Part of the default test build, like the other process fixtures: the
+  # process tests consume this tree directly and must never see a stale one.
+  add_custom_target(manyforge_ui6i_cell_bootstrap ALL
     DEPENDS "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}")
 
   target_compile_definitions(test_cell_structure PRIVATE

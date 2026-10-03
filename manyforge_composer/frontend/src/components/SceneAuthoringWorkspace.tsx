@@ -67,6 +67,7 @@ import {
   executionRobotPresentation,
   runtimeScenePresentation,
   candidateObservationEpoch,
+  resolvedPreviewRobotPresentation,
 } from '../state/runtimeScenePresentation';
 import {
   quaternionFromRpyDegrees,
@@ -100,7 +101,11 @@ import type {
   SourceModelProjection,
   SourceModelOccurrence,
 } from '../types/api';
-import type { MotionPreviewReceipt, Pose3Value } from '../types/robotControl';
+import type {
+  ManualControlMotionDescriptor,
+  MotionPreviewReceipt,
+  Pose3Value,
+} from '../types/robotControl';
 import type { PoseTuple } from '../utils/poseTransforms';
 import { poseValueFromTuple } from '../utils/poseTransforms';
 
@@ -108,6 +113,13 @@ const StructuralViewer = lazy(async () => {
   const module = await import('./StructuralViewer');
   return { default: module.StructuralViewer };
 });
+
+interface CorrectionGhost {
+  receipt: MotionPreviewReceipt;
+  /** The physical target's model, resolved through the Applied Program binding. */
+  descriptor: ManualControlMotionDescriptor;
+  stale: boolean;
+}
 
 interface SceneAuthoringWorkspaceProps {
   editorTarget: HTMLElement | null;
@@ -119,6 +131,8 @@ interface SceneAuthoringWorkspaceProps {
   programController: ProgramWorkspaceController;
   programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
+  /** The advisory failed-node correction preview, shown as its own ghost. */
+  correctionGhost?: CorrectionGhost | null;
   runtimeEnabled: boolean;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   viewerActive: boolean;
@@ -1541,6 +1555,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   programController,
   programRuntime,
   robotControl,
+  correctionGhost,
   runtimeEnabled,
   objectControlSurface,
   inspectorTarget,
@@ -1601,6 +1616,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   programController: ProgramWorkspaceController;
   programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
+  correctionGhost: CorrectionGhost | null;
   runtimeEnabled: boolean;
   objectControlSurface?: ReactNode;
   inspectorTarget?: HTMLElement | null;
@@ -1874,6 +1890,16 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     source,
     sourceValue,
   ]);
+  // The correction preview has its own ghost: it is independent of the manual
+  // panel's draft and of manual-control availability, and it never gates.
+  const correctionRobot = useMemo(() => {
+    if (correctionGhost === null || readyManifest === null) return null;
+    const measured = executionObservationPresentation.readMeasuredRobotPresentation();
+    if (measured === null) return null;
+    return resolvedPreviewRobotPresentation(
+      correctionGhost.receipt, readyManifest, correctionGhost.descriptor, measured.linkTransforms,
+    );
+  }, [correctionGhost, executionObservationPresentation, readyManifest]);
   const dragReference = useRef<string | null>(null);
   const readCandidateReference = () => {
     const status = robotControl.selectedStatus;
@@ -1924,6 +1950,21 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       control.controllableComponentId, control.commandTargetId, control.baseFrameRoleId, pose, reference.base);
     robotControl.finishPoseDrag(local?.available ? local.pose : null);
   };
+  // The memoized viewer Canvas receives identity-stable drag callbacks that
+  // call the latest closures; fresh closures would re-render the R3F root
+  // (and force a WebGL frame) on every unrelated shell publication.
+  const candidateDragHandlers = useRef({ begin: beginCandidateDrag, finish: finishCandidateDrag });
+  useLayoutEffect(() => {
+    candidateDragHandlers.current = { begin: beginCandidateDrag, finish: finishCandidateDrag };
+  });
+  const beginCandidateDragStable = useCallback(
+    () => candidateDragHandlers.current.begin(),
+    [],
+  );
+  const finishCandidateDragStable = useCallback(
+    (pose: Pose3Value | null) => candidateDragHandlers.current.finish(pose),
+    [],
+  );
   const frameAxes = useMemo(() => {
     if (sourceValue === null || readyManifest === null) return [];
     const rolesBySourceLink = new Map<string, string[]>();
@@ -2202,8 +2243,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateTcpPose={ghost}
       candidateStale={ghostStale}
       candidateTcpEditable={candidatePoseEditable}
-      onEditCandidateTcpPose={finishCandidateDrag}
-      onBeginCandidateTcpDrag={beginCandidateDrag}
+      onEditCandidateTcpPose={finishCandidateDragStable}
+      onBeginCandidateTcpDrag={beginCandidateDragStable}
       candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
         robotControl.selectedStatus?.directControl?.programBindingId, robotControl.selectedStatus?.sceneRevision,
@@ -2213,6 +2254,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateRobot={candidates?.robot ?? null}
       candidateTool={candidates?.tool ?? null}
       candidateRejected={robotControl.state.previewIssue !== null}
+      correctionRobot={correctionRobot}
+      correctionStale={correctionGhost?.stale ?? false}
       runtimePresentation={runtimePresentation}
       executionObservationPresentation={executionObservationPresentation}
       sceneOwnerIdentity={sceneOwnerIdentity}
@@ -2300,6 +2343,7 @@ export function SceneAuthoringWorkspace({
   programController,
   programRuntime,
   robotControl,
+  correctionGhost = null,
   runtimeEnabled,
   sourceModel,
   viewerActive,
@@ -3158,6 +3202,7 @@ export function SceneAuthoringWorkspace({
       programController={programController}
       programRuntime={programRuntime}
       robotControl={robotControl}
+      correctionGhost={correctionGhost}
       runtimeEnabled={runtimeEnabled}
       objectControlSurface={ownerObjectControlSurface}
       inspectorTarget={viewerInspectorTarget}

@@ -1695,6 +1695,67 @@ TEST(ManagerApplyJournal,
   EXPECT_FALSE(records[0].terminal_outcome.has_value());
 }
 
+TEST(ManagerApplyJournal,
+     ReadsAreReverifiedOnlyAfterAnOwnOrForeignCommit) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+  const auto first = journal.ReadStatusInventory();
+  ASSERT_EQ(first.size(), 1U);
+  const auto verified = journal.record_verification_count();
+
+  // Unchanged database: the verified inventory is reused, not re-verified.
+  for (int read = 0; read < 2; ++read) {
+    const auto reused = journal.ReadStatusInventory();
+    ASSERT_EQ(reused.size(), 1U);
+    EXPECT_EQ(reused[0].intent, intent);
+    EXPECT_FALSE(reused[0].affected_scope.has_value());
+  }
+  EXPECT_EQ(journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
+            intent);
+  EXPECT_FALSE(
+      journal.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+  EXPECT_EQ(journal.record_verification_count(), verified);
+
+  // An own write is visible and re-verified on the very next read.
+  const auto scope =
+      journal.EnsureAffectedScope(intent.intent_digest, AffectedScope()).record;
+  const auto with_scope = journal.ReadStatusInventory();
+  EXPECT_GT(journal.record_verification_count(), verified);
+  ASSERT_EQ(with_scope.size(), 1U);
+  ASSERT_TRUE(with_scope[0].affected_scope.has_value());
+  EXPECT_EQ(with_scope[0].affected_scope->affected_scope_digest,
+            scope.affected_scope_digest);
+
+  // A foreign commit that corrupts a verified record is detected on the very
+  // next read, and no stale verified inventory survives the failure.
+  const auto rewrite_source = [&](const std::string &source) {
+    ExecSql(
+        path,
+        "DROP TRIGGER manager_apply_intents_no_update;"
+        "UPDATE manager_apply_intents SET source_label='" +
+            source +
+            "';"
+            "CREATE TRIGGER manager_apply_intents_no_update "
+            "BEFORE UPDATE ON manager_apply_intents BEGIN "
+            "SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
+  };
+  rewrite_source("tampered-source");
+  EXPECT_THROW(static_cast<void>(journal.ReadStatusInventory()),
+               ManagerApplyJournalIntegrityError);
+  EXPECT_THROW(static_cast<void>(journal.ReadStatusInventory()),
+               ManagerApplyJournalIntegrityError);
+  rewrite_source(Intent().request_context.source_label);
+  const auto restored = journal.ReadStatusInventory();
+  ASSERT_EQ(restored.size(), 1U);
+  EXPECT_EQ(restored[0].intent, intent);
+  ASSERT_TRUE(restored[0].affected_scope.has_value());
+  EXPECT_EQ(restored[0].affected_scope->affected_scope_digest,
+            scope.affected_scope_digest);
+}
+
 TEST(ManagerApplyJournal, CommittedChildWriteSurvivesProcessExit) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";

@@ -18,6 +18,7 @@
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <optional>
 #include <set>
@@ -47,6 +48,8 @@ constexpr std::string_view kAssistantModeIndexIdentityDomain =
     "manyforge-assistant-mode-index-semantic";
 constexpr std::string_view kHistorianOwnerHealthCode =
     "historian_delivery_unavailable";
+constexpr std::string_view kAlarmResourceRegistryHealthCode =
+    "operator_alarm_resource_registry_unavailable";
 
 [[noreturn]] void CoreFail(const std::string &code,
                            const std::string &message) {
@@ -642,8 +645,8 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
                           config_.freshness_policy, clocks_.wall_time_ns,
                           clocks_.monotonic_time_ns),
       alarm_owner_(OperatorAlarmCatalog::Load(config_.alarm_catalog_path),
-                   config_.cell_id, config_.resource_ids,
-                   config_.owner_id + ".alarm", config_.owner_epoch,
+                   config_.cell_id, config_.owner_id + ".alarm",
+                   config_.owner_epoch,
                    clocks_.monotonic_time_ns, clocks_.wall_time_text,
                    // Headless currently owns operation and runtime-health
                    // alarm adapters.  Scene-initialization faults use the
@@ -679,9 +682,26 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           0U,
           {},
           std::nullopt,
+      },
+      alarm_scope_adapter_{
+          config_.owner_id + ".alarm-scope-adapter",
+          "runtime_health",
+          "manyforge.alarm_adapter.runtime_health_condition",
+          {},
+          0U,
+          0U,
+          {},
+          std::nullopt,
       } {
   RegisterAdapterEpochLocked(runtime_health_adapter_,
                              config_.owner_epoch + ".runtime-health");
+  // The retained refusals are this owner's own state and start empty, so the
+  // alarm-scope source is complete from its first epoch.
+  RegisterAdapterEpochLocked(alarm_scope_adapter_,
+                             config_.owner_epoch + ".alarm-scope");
+  alarm_owner_.CompleteSourceSnapshot(alarm_scope_adapter_.source_id,
+                                      alarm_scope_adapter_.source_epoch,
+                                      AlarmConditionQuality::kGood);
 }
 
 HeadlessApiCore::~HeadlessApiCore() {
@@ -774,6 +794,13 @@ const CanonicalValue &HeadlessApiCore::ActiveAppliedRecordLocked(
           "program_applied_selection_not_active",
           "the active Apply has no successful terminal evidence");
   const auto &prepared = RequiredMember(*record, "prepared_activation");
+  // Development cutover: an active Apply recorded before the removal of
+  // launch-time parameter overrides is refused, never reinterpreted.
+  Require(RequiredString(prepared, "schema_version") ==
+              deployment::kPreparedActivationInputSchemaVersion,
+          "program_applied_selection_invalid",
+          "the active Apply used an unsupported prepared activation version; "
+          "replace the stopped workbench with fresh runtime state");
   Require(RequiredString(prepared, "retained_bundle_id") ==
                   RequiredString(active, "retained_bundle_id") &&
               RequiredString(prepared, "graph_revision") ==
@@ -796,9 +823,7 @@ AppliedProgramOutcome ReadAppliedProgramOutcome(const CanonicalValue &prepared) 
   const auto &outcome = RequiredMember(prepared, "program_outcome");
   const auto kind = RequiredString(outcome, "kind");
   if (kind == "no_program") {
-    Require(RequiredString(prepared, "schema_version") ==
-                "manyforge.prepared_activation_input.v4" &&
-                outcome.is_object() && outcome.as_object().size() == 1U &&
+    Require(outcome.is_object() && outcome.as_object().size() == 1U &&
                 RequiredMember(prepared, "program_id").is_null() &&
                 RequiredMember(prepared, "program_revision").is_null(),
             "program_applied_selection_invalid", "inconsistent no_program outcome");
@@ -980,8 +1005,6 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
            {"source_owner_id",
             RequiredMember(manager_section, "source_owner_id")},
        })},
-      {"typed_parameter_overrides",
-       RequiredMember(prepared, "typed_parameter_overrides")},
   });
 }
 
@@ -1508,9 +1531,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
                                      "occurred_at_ns",
                                      "occurred_at_wall",
                                      "blackboard",
-                                     "runtime_overrides",
                                      "omitted_blackboard_count",
-                                     "omitted_override_count",
                                      "delivery_loss_count",
                                      "details",
                                      "origin"};
@@ -1525,7 +1546,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
             "Program diagnostic text is invalid");
     return value;
   };
-  Require(text("schema_version") == "manyforge.program_diagnostic.v2", code,
+  Require(text("schema_version") == "manyforge.program_diagnostic.v3", code,
           "Program diagnostic version is unsupported");
   text("program_run_id");
   const auto epoch = text("owner_epoch");
@@ -1578,8 +1599,8 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
       Require(bytes >= 0, code, "Program diagnostic value exceeds byte bound");
     }
   };
-  for (const auto name : {"blackboard", "runtime_overrides"}) {
-    const auto &values = RequiredMember(record, name);
+  {
+    const auto &values = RequiredMember(record, "blackboard");
     Require(values.is_object() && values.as_object().size() <= 32U, code,
             "Program diagnostic values exceed their entry bound");
     std::int64_t budget = 16 * 1024;
@@ -1596,8 +1617,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
               "Program diagnostic section exceeds byte bound");
     }
   }
-  for (const auto name : {"omitted_blackboard_count", "omitted_override_count",
-                          "delivery_loss_count"}) {
+  for (const auto name : {"omitted_blackboard_count", "delivery_loss_count"}) {
     const auto value =
         content_identity::parse_nonnegative_int64(RequiredMember(record, name));
     Require(value <= (std::string_view(name) == "delivery_loss_count"
@@ -2249,8 +2269,11 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
             {"operation_id", CanonicalValue(operation)},
         }),
     };
-    const auto mutation = alarm_owner_.Submit(std::move(update));
-    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    if (const auto mutation = SubmitOperationConditionLocked(
+            std::move(update), OperationConditionKind::kExecutionFault,
+            operation)) {
+      static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+    }
     retired.push_back(operation);
   }
   for (const auto &operation : retired) {
@@ -2284,8 +2307,11 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
             {"operation_id", CanonicalValue(operation)},
         }),
     };
-    const auto mutation = alarm_owner_.Submit(std::move(update));
-    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    if (const auto mutation = SubmitOperationConditionLocked(
+            std::move(update), OperationConditionKind::kRuntimeCollision,
+            operation)) {
+      static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+    }
     retired.push_back(operation);
   }
   for (const auto &operation : retired) {
@@ -2323,11 +2349,20 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
             {"latch_id", CanonicalValue(latch)},
         }),
     };
-    const auto mutation = alarm_owner_.Submit(std::move(update));
-    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    if (const auto mutation = SubmitOperationConditionLocked(
+            std::move(update), OperationConditionKind::kStopFault, latch)) {
+      static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+    }
   }
   for (const auto &latch : retired) {
     active_stop_faults_.erase(latch);
+  }
+  if (current_stop_fault.has_value() && !current_fault_active) {
+    // An authoritative null snapshot also ends refused, never-admitted ones.
+    std::erase_if(refused_operation_conditions_, [](const auto &entry) {
+      return entry.second.kind == OperationConditionKind::kStopFault;
+    });
+    SynchronizeAlarmScopeConditionLocked();
   }
   alarm_owner_.CompleteSourceSnapshot(operation_adapter_.source_id,
                                       operation_adapter_.source_epoch,
@@ -2377,6 +2412,7 @@ void HeadlessApiCore::Shutdown() {
 
 HeadlessRuntimeSnapshot HeadlessApiCore::RefreshLocked() {
   auto runtime = runtime_aggregator_.Evaluate();
+  SynchronizeAlarmResourceRegistryLocked(runtime);
   RefreshRuntimeHealthAdapterLocked(runtime);
   RefreshSceneAdapterLocked(runtime);
   SynchronizeHistorianHealthLocked();
@@ -2941,6 +2977,8 @@ void HeadlessApiCore::RegisterOperationEpochLocked(
     return;
   }
   RegisterAdapterEpochLocked(operation_adapter_, std::move(source_owner_epoch));
+  refused_operation_conditions_.clear();
+  SynchronizeAlarmScopeConditionLocked();
   operation_native_sequence_ = 0U;
   operation_native_record_digest_.clear();
   observed_operation_faults_.clear();
@@ -3044,11 +3082,11 @@ void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
           {"request_id", CanonicalValue(request_id)},
       }),
   };
-  const auto mutation = alarm_owner_.Submit(std::move(update));
-  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
-  active_runtime_collisions_.insert_or_assign(
-      operation_id, AlarmSubject{"operation", operation_id, resources});
-  observed_runtime_collisions_.insert(operation_id);
+  if (const auto mutation = SubmitOperationConditionLocked(
+          std::move(update), OperationConditionKind::kRuntimeCollision,
+          operation_id)) {
+    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+  }
 }
 
 void HeadlessApiCore::ReconcileOperationFaultLocked(
@@ -3102,10 +3140,16 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
                                  : CanonicalValue(std::string(request_id))},
           }),
       };
-      const auto mutation = alarm_owner_.Submit(std::move(update));
-      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+      if (const auto mutation = SubmitOperationConditionLocked(
+              std::move(update), OperationConditionKind::kRuntimeCollision,
+              operation_id)) {
+        static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+      }
       active_runtime_collisions_.erase(collision);
       observed_runtime_collisions_.erase(operation_id);
+    } else {
+      ForgetRefusedOperationConditionLocked(
+          "manyforge.motion.runtime_collision", operation_id);
     }
   }
   const bool active = IsOperationFaultState(state_name) && !reset_accepted;
@@ -3130,11 +3174,11 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
             "headless_operation_event_invalid",
             "I6 operation fault scope must contain at most 16 exact resources");
     subject = AlarmSubject{"operation", operation_id, std::move(resources)};
-    active_operation_faults_.insert_or_assign(operation_id, subject);
-    observed_operation_faults_.insert(operation_id);
   } else {
     const auto found = active_operation_faults_.find(operation_id);
     if (found == active_operation_faults_.end()) {
+      ForgetRefusedOperationConditionLocked("manyforge.motion.execution_fault",
+                                            operation_id);
       return;
     }
     subject = found->second;
@@ -3157,7 +3201,7 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
   }
   AlarmConditionUpdate update{
       "manyforge.motion.execution_fault",
-      std::move(subject),
+      subject,
       active,
       operation_adapter_.source_id,
       operation_adapter_.source_epoch,
@@ -3183,8 +3227,12 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
                              : CanonicalValue(std::string(request_id))},
       }),
   };
-  const auto mutation = alarm_owner_.Submit(std::move(update));
-  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  // Only an admitted condition is tracked for its later return to normal.
+  if (const auto mutation = SubmitOperationConditionLocked(
+          std::move(update), OperationConditionKind::kExecutionFault,
+          operation_id)) {
+    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+  }
 }
 
 void HeadlessApiCore::ReconcileStopFaultLocked(
@@ -3212,10 +3260,11 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
   AlarmSubject subject;
   if (active) {
     subject = AlarmSubject{"cell", cell_id, {}};
-    active_stop_faults_.insert_or_assign(latch_id, subject);
   } else {
     const auto found = active_stop_faults_.find(latch_id);
     if (found == active_stop_faults_.end()) {
+      ForgetRefusedOperationConditionLocked("manyforge.motion.stop_fault",
+                                            latch_id);
       return;
     }
     subject = found->second;
@@ -3240,7 +3289,7 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
           "Stop fault projection must name its exact certificate");
   AlarmConditionUpdate update{
       "manyforge.motion.stop_fault",
-      std::move(subject),
+      subject,
       active,
       operation_adapter_.source_id,
       operation_adapter_.source_epoch,
@@ -3267,8 +3316,10 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
           {"stop_id", RequiredMember(fault_latch, "stop_id")},
       }),
   };
-  const auto mutation = alarm_owner_.Submit(std::move(update));
-  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  if (const auto mutation = SubmitOperationConditionLocked(
+          std::move(update), OperationConditionKind::kStopFault, latch_id)) {
+    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+  }
 }
 
 void HeadlessApiCore::ObserveCurrentStopFaultLocked(
@@ -3337,11 +3388,11 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
   if (found != active_stop_faults_.end()) {
     Require(found->second == subject, "headless_operation_event_invalid",
             "current Stop-fault condition changed subject identity");
-    if (current_stop_fault_fingerprint_ == payload_digest)
-      return;
+  }
+  if (current_stop_fault_fingerprint_ == payload_digest) {
+    return;
   }
 
-  active_stop_faults_.insert_or_assign(latch_id, subject);
   Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
           "headless_adapter_sequence_exhausted",
           "operation alarm adapter sequence is exhausted");
@@ -3379,9 +3430,272 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           {"stop_id", RequiredMember(fault_latch, "stop_id")},
       }),
   };
-  const auto mutation = alarm_owner_.Submit(std::move(update));
-  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  const auto mutation = SubmitOperationConditionLocked(
+      std::move(update), OperationConditionKind::kStopFault, latch_id);
+  // An unchanged observation is not resubmitted on every snapshot. A refused
+  // one is retained by the submit path and reconsidered once when the active
+  // configuration changes, so it is neither flooded nor stranded.
   current_stop_fault_fingerprint_ = payload_digest;
+  if (mutation.has_value()) {
+    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
+  }
+}
+
+void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
+    const HeadlessRuntimeSnapshot &runtime) {
+  // The alarm resource inventory follows the exact configuration Manager
+  // publishes as active. Before the first publication it stays empty; a stale
+  // publication keeps its last named configuration, because no newer
+  // configuration can be active without Manager publishing it.
+  const auto bundle_id =
+      OptionalStringMember(runtime.root, "active_retained_bundle_id");
+  const auto graph_revision =
+      OptionalStringMember(runtime.root, "active_graph_revision");
+  if (!bundle_id.has_value() || !graph_revision.has_value()) {
+    return;
+  }
+  auto identity = std::make_pair(*bundle_id, *graph_revision);
+  if (alarm_registry_identity_ == identity) {
+    return;
+  }
+  try {
+    const auto bundle = VerifiedActiveBundleLocked(
+        *bundle_id, *graph_revision,
+        std::string(kAlarmResourceRegistryHealthCode),
+        std::string(kAlarmResourceRegistryHealthCode));
+    std::set<std::string> resources;
+    for (const auto &binding : bundle->value().cell_graph.control_bindings) {
+      for (const auto &resource : binding.resource_bindings) {
+        resources.insert(resource.resource_id.value());
+      }
+    }
+    alarm_owner_.ReplaceResourceRegistry(
+        AlarmResourceRegistry{*bundle_id, *graph_revision, std::move(resources)});
+    alarm_registry_identity_ = std::move(identity);
+    alarm_owner_.ReconcileHealth(kAlarmResourceRegistryHealthCode);
+    ReconsiderRefusedOperationConditionsLocked();
+  } catch (const std::exception &error) {
+    // An active configuration whose inventory cannot be verified leaves no
+    // trustworthy attention scope: name it as owner health, which blocks new
+    // motion admission while the retained alarms stay visible.
+    std::string detail = error.what();
+    if (detail.empty() || detail.size() > 1024U ||
+        !content_identity::is_utf8_nfc(detail)) {
+      detail = "inventory verification failed";
+    }
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kAlarmResourceRegistryHealthCode),
+        "active configuration " + *bundle_id +
+            " has no verified alarm resource inventory: " + detail);
+  }
+}
+
+namespace {
+
+std::string RefusedConditionKey(const std::string_view definition_id,
+                                const std::string_view tracking_id) {
+  return std::string(definition_id) + '\n' + std::string(tracking_id);
+}
+
+} // namespace
+
+void HeadlessApiCore::TrackAdmittedOperationConditionLocked(
+    const OperationConditionKind kind, const std::string &tracking_id,
+    const AlarmSubject &subject) {
+  switch (kind) {
+  case OperationConditionKind::kExecutionFault:
+    active_operation_faults_.insert_or_assign(tracking_id, subject);
+    observed_operation_faults_.insert(tracking_id);
+    break;
+  case OperationConditionKind::kRuntimeCollision:
+    active_runtime_collisions_.insert_or_assign(tracking_id, subject);
+    observed_runtime_collisions_.insert(tracking_id);
+    break;
+  case OperationConditionKind::kStopFault:
+    active_stop_faults_.insert_or_assign(tracking_id, subject);
+    break;
+  }
+}
+
+void HeadlessApiCore::ForgetRefusedOperationConditionLocked(
+    const std::string_view definition_id, const std::string_view tracking_id) {
+  refused_operation_conditions_.erase(
+      RefusedConditionKey(definition_id, tracking_id));
+  SynchronizeAlarmScopeConditionLocked();
+}
+
+void HeadlessApiCore::ReconsiderRefusedOperationConditionsLocked() {
+  // Observation reconciliation for a changed active configuration: each
+  // still-current refused activation is offered once more. A renewed refusal
+  // is kept silently; it was already recorded when first observed.
+  auto refused = std::exchange(refused_operation_conditions_, {});
+  for (auto &[key, entry] : refused) {
+    if (entry.update.source_epoch != operation_adapter_.source_epoch ||
+        operation_adapter_.source_sequence >= kMaximumSafeInteger) {
+      continue;
+    }
+    entry.update.source_sequence = ++operation_adapter_.source_sequence;
+    try {
+      const auto mutation = alarm_owner_.Submit(entry.update);
+      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+      TrackAdmittedOperationConditionLocked(entry.kind, entry.tracking_id,
+                                            entry.update.subject);
+    } catch (const OperatorAlarmError &) {
+      refused_operation_conditions_.insert_or_assign(key, std::move(entry));
+    }
+  }
+  SynchronizeAlarmScopeConditionLocked();
+}
+
+void HeadlessApiCore::SynchronizeAlarmScopeConditionLocked() {
+  // One cell-scoped condition stands for every retained refusal, so it can
+  // never itself be refused for its scope. It names the refused faults within
+  // the details bound and returns to normal once none is retained (admitted
+  // after reconsideration, superseded, cleared, or ended with their source).
+  constexpr std::size_t kMaximumNamedRefusalBytes = 24U * 1024U;
+  CanonicalValue::Array named;
+  std::size_t named_bytes = 0U;
+  for (const auto &[key, entry] : refused_operation_conditions_) {
+    static_cast<void>(key);
+    CanonicalValue refusal(CanonicalValue::Object{
+        {"definition_id", CanonicalValue(entry.update.definition_id)},
+        {"subject",
+         CanonicalValue(CanonicalValue::Object{
+             {"resource_ids",
+              StringArrayValue(entry.update.subject.resource_ids)},
+             {"subject_id", CanonicalValue(entry.update.subject.subject_id)},
+             {"subject_kind",
+              CanonicalValue(entry.update.subject.subject_kind)},
+         })},
+        {"tracking_id", CanonicalValue(entry.tracking_id)},
+    });
+    const auto bytes = content_identity::canonical_json(refusal).size() + 1U;
+    if (named_bytes + bytes > kMaximumNamedRefusalBytes) {
+      break;
+    }
+    named_bytes += bytes;
+    named.push_back(std::move(refusal));
+  }
+  const bool active = !refused_operation_conditions_.empty();
+  const bool truncated = named.size() < refused_operation_conditions_.size();
+  // While refusals are retained, the configuration they were judged against
+  // is correlated; with none retained, a configuration change alone is not a
+  // new observation of this condition.
+  CanonicalValue::Object correlations;
+  if (active) {
+    CanonicalValue registry(nullptr);
+    if (alarm_registry_identity_.has_value()) {
+      registry = CanonicalValue(CanonicalValue::Object{
+          {"graph_revision", CanonicalValue(alarm_registry_identity_->second)},
+          {"retained_bundle_id",
+           CanonicalValue(alarm_registry_identity_->first)},
+      });
+    }
+    correlations.emplace_back("active_configuration", std::move(registry));
+  }
+  const CanonicalValue details(CanonicalValue::Object{
+      {"refused_condition_count",
+       Number(refused_operation_conditions_.size(), "refused_condition_count")},
+      {"refused_conditions", CanonicalValue(std::move(named))},
+      {"refused_conditions_truncated", CanonicalValue(truncated)},
+  });
+  try {
+    const auto mutation = SubmitAdapterUpdateLocked(
+        alarm_scope_adapter_, "manyforge.runtime.alarm_scope_unavailable",
+        AlarmSubject{"cell", config_.cell_id, {}}, active, details,
+        CanonicalValue(std::move(correlations)));
+    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+  } catch (const OperatorAlarmError &) {
+    // The owner already counts the rejected update and names an exhausted
+    // capacity as health. The unchanged cursor resubmits on the next change
+    // of the retained refusals; the operation feed is never failed by it.
+  }
+}
+
+std::optional<AlarmMutation> HeadlessApiCore::SubmitOperationConditionLocked(
+    AlarmConditionUpdate update, const OperationConditionKind kind,
+    std::string tracking_id) {
+  if (update.active && !update.subject.resource_ids.empty()) {
+    // Judge a new resource-scoped activation against the configuration
+    // Manager publishes now, not against the last one a reader happened to
+    // refresh: an Apply may have added or removed these resources. This is a
+    // read of the existing publication per fault fact, not a poll.
+    static_cast<void>(RefreshLocked());
+  }
+  const auto refused_key =
+      RefusedConditionKey(update.definition_id, tracking_id);
+  try {
+    auto mutation = alarm_owner_.Submit(update);
+    if (refused_operation_conditions_.erase(refused_key) != 0U) {
+      SynchronizeAlarmScopeConditionLocked();
+    }
+    if (update.active) {
+      TrackAdmittedOperationConditionLocked(kind, tracking_id, update.subject);
+    }
+    return mutation;
+  } catch (const OperatorAlarmError &error) {
+    if (error.code() != "operator_alarm_scope_inactive" &&
+        error.code() != "operator_alarm_scope_invalid") {
+      throw;
+    }
+    if (update.active) {
+      // Bounded like the live alarm set; beyond it a refusal stays recorded
+      // in history but is not reconsidered.
+      if (refused_operation_conditions_.contains(refused_key) ||
+          refused_operation_conditions_.size() < kMaximumLiveAlarmCapacity) {
+        refused_operation_conditions_.insert_or_assign(
+            refused_key,
+            RefusedOperationCondition{update, kind, std::move(tracking_id)});
+      }
+    } else {
+      refused_operation_conditions_.erase(refused_key);
+    }
+    CanonicalValue registry(nullptr);
+    if (alarm_registry_identity_.has_value()) {
+      registry = CanonicalValue(CanonicalValue::Object{
+          {"graph_revision", CanonicalValue(alarm_registry_identity_->second)},
+          {"retained_bundle_id",
+           CanonicalValue(alarm_registry_identity_->first)},
+      });
+    }
+    try {
+      auto event = MakeHistorianEvent(
+          "manyforge.alarm", "alarm_condition_rejected", "ERROR",
+          update.observed_at_ns, update.observed_at_wall,
+          CanonicalValue(CanonicalValue::Object{
+              {"active", CanonicalValue(update.active)},
+              {"active_configuration", std::move(registry)},
+              {"code", CanonicalValue(error.code())},
+              {"correlations", update.correlations},
+              {"definition_id", CanonicalValue(update.definition_id)},
+              {"message", CanonicalValue(std::string(error.what()))},
+              {"schema_version",
+               CanonicalValue("manyforge.alarm_condition_rejection.v1")},
+              {"source_epoch", CanonicalValue(update.source_epoch)},
+              {"source_id", CanonicalValue(update.source_id)},
+              {"source_sequence",
+               Number(update.source_sequence, "source_sequence")},
+              {"subject",
+               CanonicalValue(CanonicalValue::Object{
+                   {"resource_ids",
+                    StringArrayValue(update.subject.resource_ids)},
+                   {"subject_id", CanonicalValue(update.subject.subject_id)},
+                   {"subject_kind",
+                    CanonicalValue(update.subject.subject_kind)},
+               })},
+          }));
+      if (!historian_.TryEnqueue(std::move(event))) {
+        alarm_owner_.MarkHealthUnavailable(
+            std::string(kHistorianOwnerHealthCode),
+            "historian delivery queue rejected an alarm scope rejection");
+      }
+    } catch (const std::exception &history_error) {
+      historian_.ReportDeliveryFailure("historian_projection_failure",
+                                       history_error.what());
+    }
+    SynchronizeAlarmScopeConditionLocked();
+    return std::nullopt;
+  }
 }
 
 void HeadlessApiCore::RegisterAdapterEpochLocked(AdapterCursor &cursor,

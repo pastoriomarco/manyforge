@@ -16,6 +16,7 @@ import {
   programActionUnavailableReason,
   scenarioLocalFence,
   withSharedProgramAuthoring,
+  type PublishedAuthoringWorkspace,
 } from '../state/authoringWorkspace';
 import {
   INITIAL_PROGRAM_WORKSPACE_STATE,
@@ -27,7 +28,6 @@ import type {
   NewScenarioDocumentInput,
   JsonValue,
   LocalWorkspaceFenceRequest,
-  ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
   ProgramTreeNode,
@@ -47,7 +47,47 @@ function identity(prefix: string): string {
   return `${prefix}.${random}`;
 }
 
-interface ProgramWorkspaceRunResult {
+/** The exact Program Draft content a caller acts on (a confirmed Apply). */
+export interface ExpectedProgramDraft {
+  draftId: string;
+  draftRevision: number;
+  programRevision: string;
+}
+
+/**
+ * The installed Draft is not the content the caller confirmed: nothing was
+ * sent. Admission and workspace fences are refreshed from the current
+ * publication, but the Draft identity and content never are.
+ */
+export class ProgramDraftChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProgramDraftChangedError';
+  }
+}
+
+/** Why the published Draft is not `expected`, or null when it is. */
+export function programDraftMismatch(
+  published: PublishedAuthoringWorkspace | null,
+  expected: ExpectedProgramDraft,
+): string | null {
+  if (published === null) return 'The shared Draft publication is not available.';
+  const draft = published.snapshot.program.draft;
+  if (
+    published.identity.programDraftId !== expected.draftId
+    || draft.draftId !== expected.draftId
+  ) return 'The Program Draft was replaced.';
+  if (
+    published.identity.programDraftRevision !== expected.draftRevision
+    || draft.draftRevision !== expected.draftRevision
+    || draft.programRevision !== expected.programRevision
+  ) {
+    return `The Program Draft changed (revision ${draft.draftRevision}, expected ${expected.draftRevision}).`;
+  }
+  return null;
+}
+
+export interface ProgramWorkspaceRunResult {
   workspace: ProgramWorkspaceResponse;
   message: string | null;
   transitionStatus: ProgramWorkspaceTransitionStatus | null;
@@ -134,14 +174,31 @@ export function useProgramWorkspace(
   // Authoring identity, both Draft projections' fences and the admission gate
   // come from the one shared publication. This hook contributes the
   // Applied/applicability projection it reads from the Program workspace route,
-  // which owns runtime truth.
+  // which owns runtime truth. A Draft edit (and Discard) is also admitted
+  // while a held run has all its motion stopped; every other document action
+  // (Save, Open, New, Load, Revert, the ordinary Apply) requires Idle.
   const mutationUnavailableReason = state.workspace === null
     ? 'Program workspace is not loaded.'
-    : authoring.unavailableReason;
+    : authoring.editUnavailableReason;
   const mutationAvailable = mutationUnavailableReason === null;
+  const documentUnavailableReason = state.workspace === null
+    ? 'Program workspace is not loaded.'
+    : authoring.unavailableReason;
   const admissionObserved = snapshot !== null;
   const published = authoring.published;
   const project = authoring.project;
+  // The Draft content the next fence would act upon. A mutation reply can be
+  // ahead of the publication; a caller that names exact content waits for it.
+  const fenceDraftId = published?.identity.programDraftId ?? null;
+  const fenceDraftRevision = published?.identity.programDraftRevision ?? null;
+  const fenceProgramRevision = published?.snapshot.program.draft.programRevision ?? null;
+  const fenceDraft = useMemo((): {
+    draftId: string; draftRevision: number; programRevision: string | null;
+  } | null => (
+    fenceDraftId === null || fenceDraftRevision === null
+      ? null
+      : { draftId: fenceDraftId, draftRevision: fenceDraftRevision, programRevision: fenceProgramRevision }
+  ), [fenceDraftId, fenceDraftRevision, fenceProgramRevision]);
 
   const readWorkspace = useCallback((requestGeneration: number) => {
     if (
@@ -174,9 +231,12 @@ export function useProgramWorkspace(
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
   ): Promise<ProgramWorkspaceRunResult | null> => {
+    const edit = action === 'mutate' || action === 'discard';
     if ((action === 'apply' || action === 'revert' || action === 'discard')
-      && programActionUnavailableReason(state.workspace, action, mutationUnavailableReason) !== null) return null;
-    if (action !== 'refresh' && !authoring.beginMutation()) return null;
+      && programActionUnavailableReason(
+        state.workspace, action, edit ? mutationUnavailableReason : documentUnavailableReason,
+      ) !== null) return null;
+    if (action !== 'refresh' && !authoring.beginMutation(edit ? 'edit' : 'document')) return null;
     const current = generation.current + 1;
     generation.current = current;
     dispatch({ type: 'request_started', generation: current, action });
@@ -231,7 +291,7 @@ export function useProgramWorkspace(
       }
       return null;
     }
-  }, [authoring, state.workspace, mutationUnavailableReason, readWorkspace]);
+  }, [authoring, state.workspace, documentUnavailableReason, mutationUnavailableReason, readWorkspace]);
 
   const refresh = useCallback(() => {
     const result = run(
@@ -270,7 +330,12 @@ export function useProgramWorkspace(
   // publication when an accepted Load/Apply/Revert settles. Re-read once per
   // Applied runtime identity, as the runtime projection does, and never over
   // an in-flight operation, whose own result is still to be shown.
-  const appliedIdentity = programRuntimeWakeKey(snapshot);
+  // An explicit Applied re-read (a settled Apply, or the Applied view
+  // recovering from a transient readback refusal) joins the same key, so it is
+  // also deferred past an in-flight operation instead of being lost.
+  const [appliedReadRequest, setAppliedReadRequest] = useState(0);
+  const refreshApplied = useCallback(() => setAppliedReadRequest((value) => value + 1), []);
+  const appliedIdentity = `${programRuntimeWakeKey(snapshot)}:${appliedReadRequest}`;
   const operationPending = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   useEffect(() => {
@@ -311,20 +376,30 @@ export function useProgramWorkspace(
   const requireWorkspace = useCallback((): ProgramWorkspaceResponse | null =>
     state.workspace, [state.workspace]);
 
-  /** The one local Program fence, or ``null`` while authoring is gated. */
-  const localFence = useCallback((): LocalWorkspaceFenceRequest | null => {
+  /**
+   * The one local Program fence, or ``null`` while the action is gated (an
+   * `edit` is also admitted while a held run has all motion stopped). With
+   * `expected`, the fence's Draft identity must be exactly that content;
+   * otherwise nothing may be sent (`ProgramDraftChangedError`).
+   */
+  const localFence = useCallback((
+    kind: 'edit' | 'document',
+    expected?: ExpectedProgramDraft,
+  ): LocalWorkspaceFenceRequest | null => {
     if (
-      mutationUnavailableReason !== null
+      (kind === 'edit' ? mutationUnavailableReason : documentUnavailableReason) !== null
       || published === null
       || snapshot === null
     ) return null;
+    const mismatch = expected === undefined ? null : programDraftMismatch(published, expected);
+    if (mismatch !== null) throw new ProgramDraftChangedError(mismatch);
     return programLocalFence(
       published,
       snapshot,
       requestOwnerEpoch.current,
       identity('composer-authoring'),
     );
-  }, [mutationUnavailableReason, published, snapshot]);
+  }, [documentUnavailableReason, mutationUnavailableReason, published, snapshot]);
 
   /**
    * The one Scenario document fence.
@@ -334,7 +409,7 @@ export function useProgramWorkspace(
    */
   const scenarioFence = useCallback((): ScenarioDocumentFenceRequest | null => {
     if (
-      mutationUnavailableReason !== null
+      documentUnavailableReason !== null
       || published === null
       || snapshot === null
     ) return null;
@@ -344,13 +419,13 @@ export function useProgramWorkspace(
       requestOwnerEpoch.current,
       identity('composer-document'),
     );
-  }, [mutationUnavailableReason, published, snapshot]);
+  }, [documentUnavailableReason, published, snapshot]);
 
   const mutate = useCallback(async (
     mutation: string,
     args: Record<string, JsonValue>,
   ): Promise<DraftMutationResponse | null> => {
-    const requestFence = localFence();
+    const requestFence = localFence('edit');
     if (!requestFence) return null;
     let response: DraftMutationResponse | null = null;
     const result = await run(
@@ -364,7 +439,7 @@ export function useProgramWorkspace(
   }, [localFence, run]);
 
   const openDraft = useCallback((path: string, confirmDiscard: boolean) => {
-    const requestFence = localFence();
+    const requestFence = localFence('document');
     if (!requestFence) return;
     void run(
       'open_draft',
@@ -380,7 +455,7 @@ export function useProgramWorkspace(
   }, [localFence, run]);
 
   const save = useCallback(() => {
-    const requestFence = localFence();
+    const requestFence = localFence('document');
     if (!requestFence) return;
     void run(
       'save',
@@ -393,7 +468,7 @@ export function useProgramWorkspace(
   }, [localFence, run]);
 
   const saveAs = useCallback((path: string, confirmOverwrite: boolean) => {
-    const requestFence = localFence();
+    const requestFence = localFence('document');
     if (!requestFence) return;
     void run(
       'save_as',
@@ -408,18 +483,34 @@ export function useProgramWorkspace(
     );
   }, [localFence, run]);
 
-  const apply = useCallback(() => {
-    const requestFence = localFence();
-    if (!requestFence) return;
-    void run(
+  /**
+   * The ordinary Apply of the current Draft (Idle only; with a run, the
+   * Apply-after-Reset chain calls this once the run has ended). Resolves to
+   * the owner's result, including the exact accepted Manager Apply identity
+   * for the existing terminal tracker, or to null when not sent or refused.
+   * With `expectedDraft`, only exactly that Draft content is Applied;
+   * otherwise it rejects with `ProgramDraftChangedError` before anything is
+   * sent.
+   */
+  const apply = useCallback((
+    options: { correlationId?: string; expectedDraft?: ExpectedProgramDraft } = {},
+  ): Promise<ProgramWorkspaceRunResult | null> => {
+    let requestFence: LocalWorkspaceFenceRequest | null;
+    try {
+      requestFence = localFence('document', options.expectedDraft);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    if (!requestFence) return Promise.resolve(null);
+    return run(
       'apply',
-      () => api.programWorkspace.apply(requestFence)
+      () => api.programWorkspace.apply(requestFence, undefined, options.correlationId)
         .then((response) => programWorkspaceTransitionResult('apply', response)),
     );
   }, [localFence, run]);
 
   const discard = useCallback(() => {
-    const requestFence = localFence();
+    const requestFence = localFence('edit');
     if (!requestFence) return;
     void run(
       'discard',
@@ -432,7 +523,7 @@ export function useProgramWorkspace(
   }, [localFence, run]);
 
   const revert = useCallback(() => {
-    const requestFence = localFence();
+    const requestFence = localFence('document');
     if (!requestFence) return;
     void run(
       'revert',
@@ -526,14 +617,12 @@ export function useProgramWorkspace(
 
   const updateNodePolicies = useCallback((
     instanceId: string,
-    modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
     executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => {
     mutate('program_draft_update_node_policies', {
       instance_id: instanceId,
-      modification_policy: modificationPolicy as unknown as JsonValue,
       recovery_policy: recoveryPolicy as unknown as JsonValue,
       operator_stop_policy: operatorStopPolicy,
       execution_groups: executionGroups,
@@ -548,8 +637,11 @@ export function useProgramWorkspace(
     acceptedApply,
     mutationAvailable,
     mutationUnavailableReason,
+    documentUnavailableReason,
     admissionObserved,
+    fenceDraft,
     refresh,
+    refreshApplied,
     mutate,
     newScenarioDocument,
     openDraft,
@@ -578,8 +670,10 @@ export function useProgramWorkspace(
     apply,
     clearFeedback,
     discard,
+    documentUnavailableReason,
     loadScenarioDocument,
     exportScenarioDocument,
+    fenceDraft,
     mutate,
     mutationAvailable,
     mutationUnavailableReason,
@@ -587,6 +681,7 @@ export function useProgramWorkspace(
     openDraft,
     project,
     refresh,
+    refreshApplied,
     revert,
     save,
     saveAs,

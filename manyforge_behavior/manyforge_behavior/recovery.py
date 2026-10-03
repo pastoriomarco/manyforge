@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import py_trees
@@ -143,19 +143,36 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
             yield from super().tick()
 
 
-def recovery_policy_is_actionable(policy: ProgramNodePolicy) -> bool:
-    recovery = policy.recovery_policy
-    actions = recovery["allowed_recovery_actions"]
-    return bool(
-        (
-            recovery["allow_intervention"]
-            and "intervention" in actions
-        )
-        or (
-            recovery["max_retries"] > 0
-            and "runtime_override" in actions
-        )
+def recovery_retry_permitted(
+    recovery_policy: Mapping[str, Any], *, retries_used: int
+) -> bool:
+    """The one failure-intervention predicate for offers and commands.
+
+    ``recovery_policy`` is the captured node's two-field policy (an empty
+    mapping for a default node). Intervention is an explicit opt-in;
+    ``max_retries`` zero means Unlimited, a positive value bounds the explicit
+    failure retries of that node in the captured run. No caller identity,
+    source label or endpoint participates.
+    """
+
+    if type(retries_used) is not int or retries_used < 0:
+        raise ValueError("retries_used must be one nonnegative exact integer")
+    max_retries = recovery_policy.get("max_retries", 0)
+    if type(max_retries) is not int or max_retries < 0:
+        raise ValueError("captured recovery policy max_retries is invalid")
+    return recovery_policy.get("allow_intervention") is True and (
+        max_retries == 0 or retries_used < max_retries
     )
 
 
-__all__ = ["RecoveryAwareNode", "recovery_policy_is_actionable"]
+def recovery_policy_is_actionable(policy: ProgramNodePolicy) -> bool:
+    """Whether a failed attempt of this node is held for intervention."""
+
+    return recovery_retry_permitted(policy.recovery_policy, retries_used=0)
+
+
+__all__ = [
+    "RecoveryAwareNode",
+    "recovery_policy_is_actionable",
+    "recovery_retry_permitted",
+]

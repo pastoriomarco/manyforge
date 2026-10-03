@@ -49,17 +49,24 @@ protected:
             const std::size_t condition_capacity = 8192U,
             std::string owner_epoch = "alarm.owner.epoch.1",
             const std::size_t live_alarm_capacity = kDefaultLiveAlarmCapacity) {
-    return std::make_unique<AlarmLifecycleOwner>(
+    auto owner = std::make_unique<AlarmLifecycleOwner>(
         OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
-        std::string(kCellId),
-        std::set<std::string>{"resource.arm.a", "resource.arm.b"},
-        "alarm.owner", std::move(owner_epoch),
+        std::string(kCellId), "alarm.owner", std::move(owner_epoch),
         [this]() { return ++monotonic_ns_; },
         [this]() {
           return "2026-08-05T00:00:" + std::to_string(monotonic_ns_ % 60) + "Z";
         },
         std::move(required_domains), terminal_retention, condition_capacity,
         live_alarm_capacity);
+    owner->ReplaceResourceRegistry(
+        Registry("bundle.a", {"resource.arm.a", "resource.arm.b"}));
+    return owner;
+  }
+
+  static AlarmResourceRegistry Registry(std::string bundle,
+                                        std::set<std::string> resources) {
+    auto graph = "graph." + bundle;
+    return {std::move(bundle), std::move(graph), std::move(resources)};
   }
 
   static void RegisterScene(AlarmLifecycleOwner &owner,
@@ -421,6 +428,76 @@ TEST_F(AlarmOwnerTest,
   EXPECT_TRUE(replacement->Snapshot().reconciled);
 }
 
+TEST_F(AlarmOwnerTest,
+       ResourceScopeFollowsTheActiveConfigurationAndRetainsReplacedAlarms) {
+  auto owner = std::make_unique<AlarmLifecycleOwner>(
+      OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
+      std::string(kCellId), "alarm.owner", "alarm.owner.epoch.1",
+      [this]() { return ++monotonic_ns_; },
+      [this]() { return "2026-08-05T00:00:00Z"; },
+      std::set<std::string>{"motion"});
+  owner->RegisterSource("motion", "motion.source",
+                        "manyforge.alarm_adapter.kernel_condition",
+                        "motion.epoch.1", 1U);
+  owner->CompleteSourceSnapshot("motion.source", "motion.epoch.1",
+                                AlarmConditionQuality::kGood);
+
+  // Empty startup: no configuration is active, so no resource is either.
+  ExpectAlarmError(
+      [&]() {
+        static_cast<void>(owner->Submit(
+            MotionUpdate(1U, true, "operation.a", {"resource.arm.a"})));
+      },
+      "operator_alarm_scope_inactive");
+  EXPECT_TRUE(owner->Snapshot().reconciled);
+  EXPECT_EQ(owner->Snapshot().live_count, 0U);
+
+  owner->ReplaceResourceRegistry(Registry("bundle.a", {"resource.arm.a"}));
+  const auto retained =
+      owner->Submit(MotionUpdate(2U, true, "operation.a", {"resource.arm.a"}))
+          .records.front();
+
+  // The replacement configuration names other resources. The admitted
+  // alarm is kept; a new activation on a removed resource is refused and
+  // does not disturb the current feed or its retained member.
+  owner->ReplaceResourceRegistry(Registry("bundle.b", {"resource.arm.b"}));
+  EXPECT_EQ(owner->Snapshot().live_count, 1U);
+  ExpectAlarmError(
+      [&]() {
+        static_cast<void>(owner->Submit(
+            MotionUpdate(3U, true, "operation.stale", {"resource.arm.a"})));
+      },
+      "operator_alarm_scope_inactive");
+  const auto replacement =
+      owner->Submit(MotionUpdate(4U, true, "operation.b", {"resource.arm.b"}))
+          .records.front();
+  auto snapshot = owner->Snapshot();
+  EXPECT_TRUE(snapshot.reconciled);
+  EXPECT_EQ(snapshot.live_count, 2U);
+  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+  EXPECT_EQ(owner->EvaluateMotionAttention({"resource.arm.a"}).reason_code,
+            "operator_alarm_admission_scope_invalid");
+
+  // The retained alarm still follows its lifecycle: its own return to normal
+  // is accepted, and it can be acknowledged.
+  const auto returned = owner->Submit(
+      MotionUpdate(5U, false, "operation.a", {"resource.arm.a"}));
+  ASSERT_EQ(returned.records.size(), 1U);
+  EXPECT_EQ(returned.records.front().condition_id, retained.condition_id);
+  EXPECT_EQ(returned.records.front().lifecycle_state,
+            AlarmLifecycleState::kReturnedUnacknowledged);
+  static_cast<void>(owner->Acknowledge(
+      retained.condition_id, retained.activation_id,
+      returned.records.front().record_revision, Caller(), std::nullopt, true));
+  snapshot = owner->Snapshot();
+  ASSERT_EQ(snapshot.live_count, 1U);
+  EXPECT_EQ(snapshot.alarms.front().condition_id, replacement.condition_id);
+
+  const auto metrics = owner->Metrics();
+  EXPECT_EQ(metrics.totals.at("scope_rejections"), 2U);
+  EXPECT_EQ(metrics.totals.at("resource_registry_replacements"), 2U);
+}
+
 TEST_F(AlarmOwnerTest, CapacityAndTerminalRetentionNeverEvictLiveAttention) {
   auto owner = MakeOwner({"scene"}, 2U, 2U, "alarm.owner.epoch.1", 2U);
   RegisterScene(*owner);
@@ -492,15 +569,14 @@ TEST_F(AlarmOwnerTest, SubjectAndRegistryCardinalityAreBounded) {
        ++index) {
     oversized_registry.insert("resource." + std::to_string(index));
   }
-  EXPECT_THROW(
-      AlarmLifecycleOwner(
-          OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
-          std::string(kCellId), std::move(oversized_registry), "alarm.owner",
-          "alarm.owner.epoch.1", [this]() { return ++monotonic_ns_; },
-          [this]() { return "2026-08-05T00:00:00Z"; }),
-      OperatorAlarmError);
-
   auto owner = MakeOwner({"motion"});
+  ExpectAlarmError(
+      [&]() {
+        owner->ReplaceResourceRegistry(
+            Registry("bundle.oversized", std::move(oversized_registry)));
+      },
+      "operator_alarm_configuration_invalid");
+  EXPECT_EQ(owner->Metrics().totals.at("resource_registry_replacements"), 1U);
   owner->RegisterSource("motion", "motion.source",
                         "manyforge.alarm_adapter.kernel_condition",
                         "motion.epoch.1", 1U);

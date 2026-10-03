@@ -35,6 +35,7 @@ from .models import (
     ManualResultStageRequest,
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
+    ProgramNodeCorrectionPreviewRequest,
     ProgramScenePreparationRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionStartRequest,
@@ -44,9 +45,6 @@ from .models import (
     PersistentKeyValueSetRequest,
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
 )
 from .runtime import ProgramRunnerError
 
@@ -262,6 +260,10 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def read_run(self, program_run_id: str) -> dict[str, Any]: ...
 
+    def preview_node_correction(
+        self, program_run_id: str, request: ProgramNodeCorrectionPreviewRequest
+    ) -> dict[str, Any]: ...
+
     def stop_run(
         self,
         program_run_id: str,
@@ -311,22 +313,6 @@ class ProgramRunnerApplicationPort(Protocol):
     def cycle_status(self) -> dict[str, Any]: ...
 
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]: ...
-
-    def stage_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideStageRequest
-    ) -> dict[str, Any]: ...
-
-    def activate_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideActionRequest
-    ) -> dict[str, Any]: ...
-
-    def clear_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideActionRequest
-    ) -> dict[str, Any]: ...
-
-    def promote_runtime_override(
-        self, program_run_id: str, request: RuntimeOverridePromotionRequest
-    ) -> dict[str, Any]: ...
 
     def write_runtime_blackboard(
         self, program_run_id: str, request: RuntimeBlackboardWriteRequest
@@ -498,6 +484,14 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     ) -> dict[str, Any]:
         return runtime.read_run(program_run_id)
 
+    @app.post("/api/program/runs/{program_run_id}/node-correction-previews")
+    def preview_node_correction(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramNodeCorrectionPreviewRequest,
+    ) -> dict[str, Any]:
+        """Effect-free preview intent of one held motion node; not a control."""
+        return runtime.preview_node_correction(program_run_id, request)
+
     @app.post("/api/program/runs/{program_run_id}/stop")
     async def stop_run(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -615,42 +609,6 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
         return runtime.read_runtime_controls(program_run_id)
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides")
-    async def stage_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideStageRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.stage_runtime_override(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
-    async def activate_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideActionRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.activate_runtime_override(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
-    async def clear_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverrideActionRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.clear_runtime_override(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
-    async def promote_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: RuntimeOverridePromotionRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.promote_runtime_override(program_run_id, request)
-        )
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(

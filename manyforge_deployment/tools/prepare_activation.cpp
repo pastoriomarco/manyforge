@@ -280,17 +280,18 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
           read_file(options.input),
           deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
+  if (text(member(root, "schema_version", "request"), "schema_version") !=
+      "manyforge.activation_preparation_request.v3") {
+    throw std::invalid_argument(
+        "unsupported activation preparation request version (only v3; "
+        "launch-time typed_parameter_overrides were removed)");
+  }
   require_exact_fields(root,
                        {"schema_version", "runtime_cell_id", "source_document_digest",
                         "scenario_id", "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
-                        "program",
-                        "program_role_assignment", "typed_parameter_overrides"},
+                        "program", "program_role_assignment"},
                        "activation preparation request");
-  if (text(member(root, "schema_version", "request"), "schema_version") !=
-      "manyforge.activation_preparation_request.v2") {
-    throw std::invalid_argument("unsupported activation preparation request");
-  }
   const auto &source_digest =
       text(member(root, "source_document_digest", "request"),
            "source_document_digest");
@@ -326,12 +327,10 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto &program_value = member(root, "program", "request");
   const auto &assignment_value =
       member(root, "program_role_assignment", "request");
-  const auto &overrides = member(root, "typed_parameter_overrides", "request");
   static_cast<void>(object(deployment_value, "deployment"));
   static_cast<void>(object(model_source_closure, "model_source_closure"));
   static_cast<void>(object(prepared_model_closure, "prepared_model_closure"));
   if (!program_value.is_null()) static_cast<void>(object(program_value, "program"));
-  static_cast<void>(object(overrides, "typed_parameter_overrides"));
   const deployment::CanonicalValue captured(deployment::CanonicalValue::Object{
       {"deployment", deployment_value},
       {"model_source_closure", model_source_closure},
@@ -339,7 +338,6 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"program_role_assignment", assignment_value},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
-      {"typed_parameter_overrides", overrides},
   });
   if (deployment::sha256_digest(deployment::canonical_json(captured)) !=
       captured_digest) {
@@ -384,14 +382,14 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
         deployment::canonical_json(program_value), *materialized.bundle);
     deployment::verify_scenario_program_admission(
         program->normalized_program_root(), materialized.bundle->value(),
-        materialized.deployment_compatibility, mode, overrides);
+        materialized.deployment_compatibility, mode);
     outcome = deployment::compile_program_binding_outcome(
         *program, deployment::parse_program_role_assignment(assignment_value),
         *materialized.bundle, materialized.model_map, catalog_store);
   }
   const auto &binding = outcome.binding;
   // The complete assembled input is independently verified below, including
-  // strict absence of identities, assignments and overrides for no_program.
+  // strict absence of identities and assignments for no_program.
   deployment::CanonicalValue program_outcome(nullptr);
   deployment::CanonicalValue program_binding_payload(nullptr);
   if (program == nullptr) {
@@ -475,7 +473,6 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"schema_version",
        deployment::CanonicalValue(std::string(deployment::kPreparedActivationInputSchemaVersion))},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
-      {"typed_parameter_overrides", overrides},
   };
   const auto prepared_id = deployment::sha256_digest(
       deployment::canonical_json(deployment::CanonicalValue(identity)));

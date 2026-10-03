@@ -4,9 +4,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProgramTreeNode } from '../types/api';
 import { inheritedProgramExecutionGroups } from '../utils/programAuthoring';
 import {
-  ALLOWED_SKILLS_UNAVAILABLE_MESSAGE,
   effectiveProgramPolicy,
   ProgramPolicyEditor,
+  programRecoveryPolicy,
+  retryLimitLabel,
   validateProgramPolicy,
 } from './ProgramPolicyEditor';
 
@@ -80,70 +81,65 @@ describe('ProgramPolicyEditor', () => {
     expect(validateProgramPolicy({ ...form, execution_group_names: 'robot_a, all_grippers' }).execution_groups).toBeUndefined();
   });
 
-  it('renders omitted fields as effective canonical defaults', () => {
+  it('renders omitted fields as effective defaults with only the two recovery controls', () => {
     const form = effectiveProgramPolicy(node);
     const markup = renderToStaticMarkup(
       <ProgramPolicyEditor node={node} busy={false} onUpdate={vi.fn()} />,
     );
 
-    expect(form.modification_policy).toEqual({
-      runtime_override: 'forbidden',
-      persistent_edit: 'forbidden',
-      intervention_delegate: 'forbidden',
-    });
-    expect(form.recovery_policy).toEqual({
-      allow_intervention: false,
-      allowed_recovery_actions: [],
-      max_retries: 0,
-      allowed_skills: [],
-      persistence_ceiling: 'session_only',
-    });
+    expect(programRecoveryPolicy(form)).toEqual({ allow_intervention: false, max_retries: 0 });
+    expect(form.retry_limit_mode).toBe('unlimited');
     expect(form.operator_stop_policy).toBe('inherit');
-    expect(markup).toContain('Defaults are saved by omission.');
-    expect(markup).not.toContain('Save node policy to Draft');
+    expect(markup).toContain('defaults are saved by omission');
+    expect(markup).toContain('Allow intervention');
+    expect(markup).toContain('Retry limit');
+    expect(markup).toContain('<option value="unlimited" selected="">Unlimited</option>');
+    // Unlimited is never presented as a numeric zero.
+    expect(markup).not.toContain('value="0"');
+    expect(markup).not.toContain('id="policy-settle-max_retries"');
+    for (const removed of [
+      'Runtime override', 'Persistent edit', 'Intervention delegate',
+      'Allowed recovery actions', 'Persistence ceiling', 'Allowed skills', 'LLM',
+    ]) {
+      expect(markup).not.toContain(removed);
+    }
     expect(markup).toContain('Hold pauses this subtree');
     expect(markup).toContain('leaves default to Hold');
     expect(markup).toContain('the root to Continue');
-    expect(markup).toContain('Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.');
     expect(markup).not.toContain('>Apply<');
   });
 
-  it('blocks imported skills without inventing a retained referent', () => {
-    const imported: ProgramTreeNode = {
+  it('shows a finite authored limit as N and zero as Unlimited', () => {
+    const limited: ProgramTreeNode = {
       ...node,
-      recovery_policy: {
-        allow_intervention: true,
-        allowed_recovery_actions: ['intervention'],
-        max_retries: 0,
-        allowed_skills: ['legacy.skill'],
-        persistence_ceiling: 'session_only',
-      },
+      recovery_policy: { allow_intervention: true, max_retries: 3 },
     };
     const markup = renderToStaticMarkup(
-      <ProgramPolicyEditor node={imported} busy={false} onUpdate={vi.fn()} />,
+      <ProgramPolicyEditor node={limited} busy={false} onUpdate={vi.fn()} />,
     );
-
-    expect(markup).toContain(ALLOWED_SKILLS_UNAVAILABLE_MESSAGE);
-    expect(markup).toContain('Imported authored Allowed skills (legacy.skill)');
-    expect(markup).toContain('blocking applicability error');
-    expect(markup).not.toContain('id="policy-settle-allowed_skills"');
-    expect(markup).toContain('aria-invalid="true"');
-    expect(markup).not.toContain('Apply-ready');
+    expect(markup).toContain('<option value="limited" selected="">Limit to</option>');
+    expect(markup).toContain('value="3"');
+    expect(retryLimitLabel(0)).toBe('Unlimited');
+    expect(retryLimitLabel(1)).toBe('1 retry');
+    expect(retryLimitLabel(3)).toBe('3 retries');
   });
 
-  it('explains every canonical cross-field constraint before submit', () => {
-    const invalid = effectiveProgramPolicy(node);
-    invalid.recovery_policy.allow_intervention = true;
-    invalid.recovery_policy.allowed_recovery_actions = ['runtime_override'];
-    invalid.recovery_policy.persistence_ceiling = 'draft_patch';
-    invalid.recovery_policy.max_retries = 256;
-    const errors = validateProgramPolicy(invalid);
-
-    expect(errors['recovery_policy.allow_intervention']).toContain('match');
-    expect(errors['recovery_policy.allowed_recovery_actions']).toContain('requires');
-    expect(errors['modification_policy.runtime_override']).toContain('non-forbidden');
-    expect(errors['modification_policy.persistent_edit']).toContain('persistent edit');
-    expect(errors['recovery_policy.persistence_ceiling']).toContain('Draft-patch');
-    expect(errors['recovery_policy.max_retries']).toContain('0 to 255');
+  it('accepts a finite limit of 1..255 and explains anything else', () => {
+    const form = effectiveProgramPolicy(node);
+    expect(validateProgramPolicy(form)).toEqual({});
+    for (const retryLimit of [1, 255]) {
+      expect(validateProgramPolicy({
+        ...form, retry_limit_mode: 'limited', retry_limit: retryLimit,
+      })).toEqual({});
+    }
+    for (const retryLimit of [0, 256, 1.5, Number.NaN]) {
+      expect(validateProgramPolicy({
+        ...form, retry_limit_mode: 'limited', retry_limit: retryLimit,
+      })['recovery_policy.max_retries']).toContain('Choose Unlimited');
+    }
+    // The finite draft is ignored while Unlimited is chosen.
+    expect(programRecoveryPolicy({ ...form, retry_limit: 7 })).toEqual({
+      allow_intervention: false, max_retries: 0,
+    });
   });
 });

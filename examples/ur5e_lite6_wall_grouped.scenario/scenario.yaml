@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
     "deployment.yaml": "sha256:9684fda33f4e2716acd3e0a752176e337a7882740ee8015423e4cd33d9d57d0c",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:01b37e77097bb900d2e8924fd510c0228de234afbc25819c99c7c6c57fad523a"
+    "program.yaml": "sha256:9c3b177a755285d37716d77d8ec51331060fc0185836df9bc2a349ae74f7697a"
   },
   "name": "ur5e_lite6_wall_grouped",
   "saved_status": {
-    "checked_content_digest": "sha256:e5ee99bc8240f0f35b3d9ab7c5f8a9a90bef5dd49b1552a450ee4308eaa88414",
+    "checked_content_digest": "sha256:0b5e6b0fc4d019aecf99f4796a375bfefdf649c303b1d3ae7caab6773065569f",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

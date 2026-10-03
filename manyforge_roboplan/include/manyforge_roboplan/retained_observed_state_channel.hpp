@@ -75,6 +75,14 @@ struct RetainedObservedStateChannelConfig final {
   std::vector<core::ObservedRobotStateSourceConfig> source_precedence;
 };
 
+/// One route-consistent observation: the channel's current binding and the
+/// state sample selected through that same binding, taken under one route
+/// fence. A route rebind can never interleave between the two.
+struct RetainedBoundObservedState final {
+  core::RuntimeParticipantBinding binding;
+  core::ObservedStateSnapshotDTO state;
+};
+
 /// One exact native state-authority channel for a sealed runtime participant.
 ///
 /// Publication is committed before best-effort scene projection, so execution
@@ -256,6 +264,11 @@ public:
 
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t now_ns) const override;
+  /// Render/observation readers use this instead of pairing an owner binding
+  /// read with a later current_state(): Apply may rebind the route between
+  /// two separate reads.
+  [[nodiscard]] core::Result<RetainedBoundObservedState>
+  current_bound_state(std::int64_t now_ns) const;
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
   current_state_bounded(std::int64_t now_ns, std::int64_t deadline_ns,
                         std::stop_token cancellation) const override;

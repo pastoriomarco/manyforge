@@ -59,21 +59,15 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "state": ("GET", "/api/cycle/status"),
         "recover": ("POST", "/api/cycle/recovery-actions"),
         "manual_result": ("POST", "/api/program/runs/{program_run_id}/manual-result"),
-    },
-    "manyforge_runtime_override": {
-        "read": ("GET", "/api/program/runs/{program_run_id}/runtime-controls"),
-        "stage": ("POST", "/api/program/runs/{program_run_id}/runtime-overrides"),
-        "activate": (
-            "POST",
-            "/api/program/runs/{program_run_id}/runtime-overrides/activate",
+        "runtime_controls": (
+            "GET",
+            "/api/program/runs/{program_run_id}/runtime-controls",
         ),
-        "clear": ("POST", "/api/program/runs/{program_run_id}/runtime-overrides/clear"),
-        "promote": (
-            "POST",
-            "/api/program/runs/{program_run_id}/runtime-overrides/promote",
-        ),
-        "materialize": ("POST", "/api/program/draft/runtime-override-promotions"),
         "blackboard": ("POST", "/api/program/runs/{program_run_id}/blackboard-values"),
+        "node_preview": (
+            "POST",
+            "/api/program/runs/{program_run_id}/node-correction-previews",
+        ),
     },
     "manyforge_execution_status": {
         "state": ("GET", "/api/control/state"),

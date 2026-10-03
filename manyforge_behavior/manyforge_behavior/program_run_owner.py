@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -52,9 +52,9 @@ from manyforge_behavior.orchestration_values import ProgramValueError
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v3"
-PROGRAM_DIAGNOSTIC_API: Final = "manyforge.program_diagnostic.v2"
-PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v1"
-APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v2"
+PROGRAM_DIAGNOSTIC_API: Final = "manyforge.program_diagnostic.v3"
+PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v2"
+APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v3"
 _MAX_RETAINED_RUNS: Final = 4_096
 _MAX_NODE_STATUSES: Final = 100_000
 _NODE_STATUSES: Final = frozenset(
@@ -113,6 +113,20 @@ def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
     if len(value.encode("utf-8")) > maximum_bytes:
         raise ValueError(f"{field} exceeds {maximum_bytes} bytes")
     return value
+
+
+def _failure_assessment_has_deadline(intervention) -> bool:
+    """A failure pause whose owner assessment carries an observation deadline."""
+
+    if (
+        intervention is None
+        or intervention.policy_parameter == "operator_stop_policy"
+        or intervention.owner_task_id is None
+        or not isinstance(intervention.owner_assessment, Mapping)
+    ):
+        return False
+    deadline = intervention.owner_assessment.get("observed_state_valid_until_ns")
+    return type(deadline) is int and deadline > 0
 
 
 def _digest(value: object, *, field: str) -> str:
@@ -179,7 +193,6 @@ class ProgramRunAdmission:
     program_binding: Mapping[str, Any]
     readiness: NodeExecutionReadiness
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
-    program_parameter_values: Mapping[str, Any]
     assistant_projection: Mapping[str, Any] | None = None
     node_policies: tuple[ProgramNodePolicy, ...] = field(init=False)
 
@@ -249,17 +262,6 @@ class ProgramRunAdmission:
                 "admitted owner identities must be unique, role-sorted, and "
                 "exclude the local Program runner"
             )
-        if not isinstance(self.program_parameter_values, Mapping):
-            raise TypeError("program_parameter_values must be a mapping")
-        if any(
-            not isinstance(key, str) or not key for key in self.program_parameter_values
-        ):
-            raise ValueError("Program parameter IDs must be non-empty text")
-        object.__setattr__(
-            self,
-            "program_parameter_values",
-            MappingProxyType(deepcopy(dict(self.program_parameter_values))),
-        )
         if self.assistant_projection is not None and not isinstance(
             self.assistant_projection, Mapping
         ):
@@ -701,7 +703,6 @@ class ProgramRunOwner:
                     capture=capture,
                     readiness=admission.readiness,
                     ports=self._ports,
-                    program_parameter_values=admission.program_parameter_values,
                     program_clock=ProgramClock(self._program_clock_source),
                 )
                 run.refresh_operator_stop_scope()
@@ -791,6 +792,19 @@ class ProgramRunOwner:
             )
         return port.read(program_run_id)
 
+    def preview_node_inputs(
+        self,
+        program_run_id: str,
+        *,
+        node_instance_id: str,
+        proposed: Sequence[tuple[str, Any]],
+    ) -> tuple[str, Mapping[str, Any]]:
+        """Resolve one captured node's inputs with proposals; no owner effect."""
+
+        with self._lock:
+            run = self._entry(program_run_id).run
+        return run.preview_node_inputs(node_instance_id, proposed)
+
     def operator_stop_observation_required(self, program_run_id: str) -> bool:
         """Whether accepted Stop work still needs an observation tick.
 
@@ -807,6 +821,49 @@ class ProgramRunOwner:
                 return False
             run = entry.run
         return run.pending_selected_observation()
+
+    def failure_assessment_refresh_required(self, program_run_id: str) -> bool:
+        """Whether a failure pause holds an owner observation deadline.
+
+        Owner Retry readiness bounded by a measured observation stays current
+        only while the retained owner assessment is re-read; status
+        projections themselves perform no owner I/O. Without an owner
+        deadline the dormant pause needs no observation tick.
+        """
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                return False
+        port = self._ports.program_interventions
+        return _failure_assessment_has_deadline(
+            None if port is None else port.read(program_run_id)
+        )
+
+    def _refresh_failure_assessment(self, intervention) -> None:
+        """Re-read the failed task's current owner assessment.
+
+        A failed read keeps the retained assessment, whose deadline then
+        elapses and keeps Retry disabled (fail closed).
+        """
+
+        owner_port = getattr(self._ports, intervention.owner_port_name or "", None)
+        observe = getattr(owner_port, "observe", None)
+        port = self._ports.program_interventions
+        if not callable(observe) or port is None:
+            return
+        try:
+            task = observe(intervention.owner_task_id)
+        except Exception:
+            return
+        assessment = task.metadata.get("recovery_assessment")
+        if (
+            task.task_id != intervention.owner_task_id
+            or task.state not in {OwnerTaskState.FAILED, OwnerTaskState.INTERRUPTED}
+            or not isinstance(assessment, Mapping)
+        ):
+            return
+        port.refresh_owner_assessment(intervention.identity, assessment)
 
     def _refresh_stop_assessment(self, intervention):
         if intervention.owner_port_name is None or intervention.owner_task_id is None:
@@ -843,157 +900,6 @@ class ProgramRunOwner:
 
         with self._lock:
             entry = self._entry(program_run_id)
-            entry.revision += 1
-            return self._snapshot(entry)
-
-    def validate_runtime_override(
-        self,
-        program_run_id: str,
-        *,
-        node_instance_id: str,
-        node_attempt_id: str,
-        parameter_id: str,
-        value: Any,
-    ) -> Any:
-        with self._lock:
-            entry = self._entry(program_run_id)
-            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
-                raise ProgramRunOwnerError(
-                    "runtime overrides require the exact held Program attempt"
-                )
-            policy = entry.run.capture.node_policy_by_instance_id.get(node_instance_id)
-            if (
-                policy is None
-                or policy.modification_policy["runtime_override"] == "forbidden"
-                or "runtime_override"
-                not in policy.recovery_policy["allowed_recovery_actions"]
-            ):
-                raise ProgramRunOwnerError(
-                    "the captured node policy forbids runtime override"
-                )
-            intervention = self.intervention(
-                program_run_id, node_attempt_id=node_attempt_id
-            )
-            if (
-                intervention is None
-                or intervention.identity.node_instance_id != node_instance_id
-                or intervention.identity.node_attempt_id != node_attempt_id
-            ):
-                raise ProgramRunOwnerError(
-                    "runtime override identifies a stale node attempt"
-                )
-            store = entry.run.runtime_overrides
-        try:
-            return store.validate(node_instance_id, parameter_id, value)
-        except ProgramValueError as error:
-            raise ProgramRunOwnerError(str(error)) from error
-
-    def activate_runtime_override(
-        self,
-        program_run_id: str,
-        *,
-        node_instance_id: str,
-        node_attempt_id: str,
-        parameter_id: str,
-        value: Any,
-    ) -> ProgramRunSnapshot:
-        validated = self.validate_runtime_override(
-            program_run_id,
-            node_instance_id=node_instance_id,
-            node_attempt_id=node_attempt_id,
-            parameter_id=parameter_id,
-            value=value,
-        )
-        with self._lock:
-            entry = self._entry(program_run_id)
-            entry.run.runtime_overrides.activate(
-                node_instance_id, parameter_id, validated
-            )
-            entry.revision += 1
-            return self._snapshot(entry)
-
-    def validate_runtime_override_promotion(
-        self,
-        program_run_id: str,
-        *,
-        node_instance_id: str,
-    ) -> str:
-        with self._lock:
-            entry = self._entry(program_run_id)
-            policy = entry.run.capture.node_policy_by_instance_id.get(node_instance_id)
-            if (
-                policy is None
-                or policy.recovery_policy["persistence_ceiling"] != "draft_patch"
-                or policy.modification_policy["persistent_edit"] == "forbidden"
-            ):
-                raise ProgramRunOwnerError(
-                    "captured node policy forbids Draft promotion"
-                )
-            store = entry.run.runtime_overrides
-        try:
-            return store.node_id(node_instance_id)
-        except ProgramValueError as error:
-            raise ProgramRunOwnerError(str(error)) from error
-
-    def runtime_override_source_context(
-        self,
-        program_run_id: str,
-        *,
-        node_instance_id: str,
-    ) -> dict[str, Any]:
-        """Return immutable captured node facts for owner-derived staging."""
-
-        with self._lock:
-            entry = self._entry(program_run_id)
-            store = entry.run.runtime_overrides
-            program_binding = entry.program_binding
-        try:
-            context = store.node_context(node_instance_id)
-        except ProgramValueError as error:
-            raise ProgramRunOwnerError(str(error)) from error
-        parameters = context.get("parameters")
-        target_role = (
-            parameters.get("target_role")
-            if isinstance(parameters, Mapping)
-            else None
-        )
-        if not isinstance(target_role, str) or not target_role:
-            return context
-        target_binding = next(
-            (
-                row
-                for row in program_binding.get("target_role_bindings", ())
-                if isinstance(row, Mapping)
-                and row.get("target_role_id") == target_role
-            ),
-            None,
-        )
-        if target_binding is None:
-            raise ProgramRunOwnerError(
-                "captured Program Binding has no binding for the node target"
-            )
-        return {
-            **context,
-            "target_binding": {
-                key: deepcopy(target_binding[key])
-                for key in (
-                    "target_role_id",
-                    "controllable_component_id",
-                    "command_target_id",
-                )
-            },
-        }
-
-    def clear_runtime_override(
-        self,
-        program_run_id: str,
-        *,
-        node_instance_id: str,
-        parameter_id: str,
-    ) -> ProgramRunSnapshot:
-        with self._lock:
-            entry = self._entry(program_run_id)
-            entry.run.runtime_overrides.clear(node_instance_id, parameter_id)
             entry.revision += 1
             return self._snapshot(entry)
 
@@ -2521,6 +2427,7 @@ class ProgramRunOwner:
                 # terminal snapshot and revisions remain unchanged.
                 return self._observe_reset_containment(program_run_id)
             observe_only = False
+            failure_refresh = None
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.STOPPING:
@@ -2549,7 +2456,11 @@ class ProgramRunOwner:
                     self._schedule_program_time(entry, tree_ticks=not dormant)
                     if dormant:
                         if not self.operator_stop_observation_required(program_run_id):
-                            return self._snapshot(entry)
+                            dormant_snapshot = self._snapshot(entry)
+                            if _failure_assessment_has_deadline(intervention):
+                                failure_refresh = intervention
+                            else:
+                                return dormant_snapshot
                         # A separate intervention keeps ordinary tree work
                         # dormant, but cannot hide already-accepted Stop work.
                         observe_only = True
@@ -2564,6 +2475,10 @@ class ProgramRunOwner:
                     reconcile_full_stop = False
                     reconcile_finalize = False
                     run = entry.run
+            if failure_refresh is not None:
+                # Owner I/O outside the run lock; the tree stays dormant.
+                self._refresh_failure_assessment(failure_refresh)
+                return dormant_snapshot
             if reconcile_stop:
                 return self.reconcile_stop(program_run_id)
             if reconcile_full_stop:
@@ -2755,12 +2670,11 @@ def build_program_run_admission(
         "source_document_digest",
         "scenario_id",
         "schema_version",
-        "typed_parameter_overrides",
     }
-    if set(selection) != expected_fields:
-        raise ProgramRunOwnerError("Program-run input has wrong fields")
     if selection.get("schema_version") != PROGRAM_RUN_INPUT_API:
         raise ProgramRunOwnerError("Program-run input version is unsupported")
+    if set(selection) != expected_fields:
+        raise ProgramRunOwnerError("Program-run input has wrong fields")
     _text(selection.get("deployment_artifact_id"), field="deployment_artifact_id")
     _digest(selection.get("deployment_revision"), field="deployment_revision")
     if selection.get("assistant_mode") not in {
@@ -2799,13 +2713,10 @@ def build_program_run_admission(
 
     program_value = selection.get("program")
     binding_value = selection.get("program_binding")
-    overrides = selection.get("typed_parameter_overrides")
     if not isinstance(program_value, dict):
         raise ProgramRunOwnerError("scenario selection has no Program object")
     if not isinstance(binding_value, dict):
         raise ProgramRunOwnerError("scenario selection has no Program Binding object")
-    if not isinstance(overrides, dict):
-        raise ProgramRunOwnerError("scenario selection overrides are not an object")
     program = Program.from_dict(deepcopy(program_value), environment.catalog)
     program_binding_id = _digest(
         selection.get("program_binding_id"),
@@ -2926,7 +2837,6 @@ def build_program_run_admission(
         program_binding=binding_value,
         readiness=readiness,
         owner_identities=owner_identities,
-        program_parameter_values=overrides,
         assistant_projection=assistant_projection,
     )
 
@@ -2964,12 +2874,15 @@ def build_applied_program_run_admission(
         "scenario_id",
         "schema_version",
         "source",
-        "typed_parameter_overrides",
     }
+    if applied.get("schema_version") != APPLIED_PROGRAM_SELECTION_API:
+        raise ProgramRunOwnerError(
+            "Applied Program selection version is unsupported (only "
+            f"{APPLIED_PROGRAM_SELECTION_API}; launch-time Program parameter "
+            "overrides were removed)"
+        )
     if set(applied) != expected_applied_fields:
         raise ProgramRunOwnerError("Applied Program selection has wrong fields")
-    if applied.get("schema_version") != "manyforge.applied_program_selection.v2":
-        raise ProgramRunOwnerError("Applied Program selection version is unsupported")
     _digest(
         applied.get("baseline_program_binding_id"), field="baseline_program_binding_id"
     )
@@ -3002,7 +2915,6 @@ def build_applied_program_run_admission(
         "source_document_digest": applied["source_document_digest"],
         "scenario_id": applied["scenario_id"],
         "schema_version": PROGRAM_RUN_INPUT_API,
-        "typed_parameter_overrides": deepcopy(applied["typed_parameter_overrides"]),
     }
     return build_program_run_admission(
         normalized_selection,

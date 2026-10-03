@@ -337,19 +337,25 @@ TEST(EventHistorian, IndexedFiltersFindOlderErrorsAcrossClockDomainsBeforePagina
 
 TEST(EventHistorian, ProgramDiagnosticValuesRemainSearchableButNeverBecomeOwnerIdentities) {
   TemporaryDirectory directory;
-  // Originals recorded before the v2 cutover keep their version and derivation.
+  // Originals recorded before the v3 cutover keep their version and derivation.
   for (const auto version : kProgramDiagnosticSchemaVersions) {
     const auto path = directory.path() / (std::string(version) + ".sqlite3");
+    CanonicalValue::Object payload{
+        {"schema_version", CanonicalValue(std::string(version))},
+        {"program_run_id", CanonicalValue("run.actual")},
+        {"blackboard", CanonicalValue(CanonicalValue::Object{
+                           {"operation_id", CanonicalValue("operation.foreign")},
+                           {"program_run_id", CanonicalValue("run.foreign")}})},
+    };
+    if (version != "manyforge.program_diagnostic.v3") {
+      // Retained v1/v2 rows also carry the withdrawn runtime-override section.
+      payload.emplace_back("runtime_overrides",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"operation_id", CanonicalValue("operation.foreign")}}));
+    }
     const auto event = MakeHistorianEvent(
         "manyforge.program_runner", "program_failed", "ERROR", 100, "2026-09-08T00:00:00Z",
-        CanonicalValue(CanonicalValue::Object{
-            {"schema_version", CanonicalValue(std::string(version))},
-            {"program_run_id", CanonicalValue("run.actual")},
-            {"blackboard", CanonicalValue(CanonicalValue::Object{
-                               {"program_run_id", CanonicalValue("run.foreign")}})},
-            {"runtime_overrides", CanonicalValue(CanonicalValue::Object{
-                                      {"operation_id", CanonicalValue("operation.foreign")}})},
-        }));
+        CanonicalValue(std::move(payload)));
     for (const bool reopened : {false, true}) {
       SqliteEventHistoryStore store(path, 128U);
       if (!reopened) {

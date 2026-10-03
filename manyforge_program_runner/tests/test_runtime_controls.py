@@ -1,4 +1,4 @@
-"""C2 run-scoped recovery and override ledger contracts."""
+"""C2 run-scoped recovery ledger contracts."""
 
 from __future__ import annotations
 
@@ -91,13 +91,7 @@ def _intervention(
 
 
 def _policy() -> dict[str, object]:
-    return {
-        "allow_intervention": True,
-        "allowed_recovery_actions": ["intervention", "runtime_override"],
-        "allowed_skills": [],
-        "max_retries": 2,
-        "persistence_ceiling": "runtime_override",
-    }
+    return {"allow_intervention": True, "max_retries": 2}
 
 
 def test_revision_read_does_not_construct_a_full_snapshot(monkeypatch) -> None:
@@ -120,7 +114,7 @@ def test_recent_control_trace_rotates_without_a_lifetime_command_ceiling() -> No
     for value in range(10_000):
         controls.audit_value("runtime_blackboard_written", key="counter", value=value)
     snapshot = controls.snapshot()
-    assert snapshot["schema_version"] == "manyforge.program_runtime_controls.v2"
+    assert snapshot["schema_version"] == "manyforge.program_runtime_controls.v3"
     assert snapshot["runtime_control_revision"] == 10_001
     assert len(snapshot["audit"]) == 256
     assert snapshot["audit"][0]["event_revision"] == 9_745
@@ -129,22 +123,31 @@ def test_recent_control_trace_rotates_without_a_lifetime_command_ceiling() -> No
     assert restored.snapshot()["audit"][-1]["event_revision"] == 10_001
 
 
-def test_legacy_control_trace_is_validated_before_bounded_conversion() -> None:
-    legacy = ProgramRuntimeControls(_capture()).snapshot()
-    legacy["schema_version"] = "manyforge.program_runtime_controls.v1"
-    legacy["runtime_control_revision"] = 501
-    legacy["audit"] = [
-        {"event_revision": index, "kind": "legacy_event"} for index in range(1, 501)
-    ]
-    restored = ProgramRuntimeControls.restore(_capture(), legacy)
-    assert restored.revision == 501
-    assert len(restored.snapshot()["audit"]) == 256
-    # Reading neither reinterprets nor rewrites the original retained bytes.
-    assert len(legacy["audit"]) == 500
-    assert legacy["schema_version"].endswith(".v1")
-    legacy["audit"][0]["event_revision"] = 99
-    with pytest.raises(ValueError, match="audit is invalid"):
-        ProgramRuntimeControls.restore(_capture(), legacy)
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        "manyforge.program_runtime_controls.v2",
+        "manyforge.program_runtime_controls.v1",
+    ],
+)
+def test_superseded_control_snapshots_are_refused_not_converted(
+    schema_version: str,
+) -> None:
+    superseded = {
+        **ProgramRuntimeControls(_capture()).snapshot(),
+        "schema_version": schema_version,
+        "has_active_runtime_overrides": False,
+        "has_staged_runtime_overrides": False,
+        "has_stale_runtime_overrides": False,
+        "overrides": [],
+        "promotion_proposals": [],
+    }
+    with pytest.raises(ValueError, match="unsupported schema"):
+        ProgramRuntimeControls.restore(_capture(), superseded)
+    current = ProgramRuntimeControls(_capture()).snapshot()
+    current["overrides"] = []
+    with pytest.raises(ValueError, match="invalid shape"):
+        ProgramRuntimeControls.restore(_capture(), current)
 
 
 @pytest.mark.parametrize("damage", ["gap", "empty", "short", "bool_revision"])
@@ -165,104 +168,6 @@ def test_recent_control_trace_rejects_gaps_and_false_revision_types(damage) -> N
         ProgramRuntimeControls.restore(_capture(), snapshot)
 
 
-def _stage(controls, value, *, node="move.1", attempt="attempt.1"):
-    return controls.stage_override(
-        node_instance_id=node,
-        node_attempt_id=attempt,
-        parameter_id="velocity_scale",
-        value=value,
-        source_observation_id=None,
-        source_owner_generation=None,
-        validator=lambda **values: values["value"],
-    )
-
-
-def test_resolved_overrides_retire_but_pending_promotions_and_current_intent_do_not(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr("manyforge_program_runner.runtime_controls._MAX_OVERRIDES", 8)
-    controls = ProgramRuntimeControls(_capture())
-    protected = _stage(controls, 0.25, node="promoted")
-    proposal = controls.request_promotion(
-        protected["override_id"],
-        node_id="motion.move_to_joint_target",
-        expected_draft_id="draft.1",
-        expected_draft_revision=1,
-    )
-    controls.clear_override(protected["override_id"], clearer=lambda **_: None)
-    staged = _stage(controls, 0.5, node="staged")
-    active = _stage(controls, 0.75, node="active")
-    controls.activate_override(active["override_id"], activator=lambda **_: None)
-    for attempt in range(100):
-        row = _stage(controls, 0.1, attempt=f"attempt.{attempt}")
-        controls.clear_override(row["override_id"], clearer=lambda **_: None)
-        assert len(controls.snapshot()["overrides"]) <= 8
-    snapshot = controls.snapshot()
-    by_id = {row["override_id"]: row for row in snapshot["overrides"]}
-    assert by_id[protected["override_id"]]["status"] == "cleared"
-    assert by_id[staged["override_id"]]["status"] == "staged"
-    assert by_id[active["override_id"]]["status"] == "active"
-    assert snapshot["promotion_proposals"] == [proposal]
-    assert ProgramRuntimeControls.restore(_capture(), snapshot).snapshot() == snapshot
-
-
-def test_capacity_still_limits_simultaneous_unresolved_overrides(monkeypatch) -> None:
-    monkeypatch.setattr("manyforge_program_runner.runtime_controls._MAX_OVERRIDES", 2)
-    controls = ProgramRuntimeControls(_capture())
-    _stage(controls, 0.1, node="first")
-    _stage(controls, 0.2, node="second")
-    before = controls.snapshot()
-    with pytest.raises(ProgramRuntimeControlError) as error:
-        _stage(controls, 0.3, node="third")
-    assert error.value.code == "program_runtime_override_capacity_full"
-    assert controls.snapshot() == before
-
-
-def test_replacing_active_override_does_not_let_old_clear_erase_new_value() -> None:
-    controls = ProgramRuntimeControls(_capture())
-    effects = []
-    old = _stage(controls, 0.1)
-    controls.activate_override(
-        old["override_id"], activator=lambda **v: effects.append(v)
-    )
-    new = _stage(controls, 0.2)
-
-    def reject(**_):
-        raise RuntimeError("owner rejected replacement")
-
-    before = controls.snapshot()
-    with pytest.raises(RuntimeError, match="owner rejected"):
-        controls.activate_override(new["override_id"], activator=reject)
-    assert controls.snapshot() == before
-    controls.activate_override(
-        new["override_id"], activator=lambda **v: effects.append(v)
-    )
-    controls.clear_override(
-        old["override_id"], clearer=lambda **_: pytest.fail("cleared new value")
-    )
-    assert len(effects) == 2
-    active = [
-        row for row in controls.snapshot()["overrides"] if row["status"] == "active"
-    ]
-    assert [row["override_id"] for row in active] == [new["override_id"]]
-    again = _stage(controls, 0.1)
-    assert again["override_id"] == old["override_id"]
-    assert again["status"] == "staged"
-    assert again["override_revision"] > old["override_revision"]
-    controls.activate_override(
-        again["override_id"], activator=lambda **v: effects.append(v)
-    )
-    assert effects[-1]["value"] == 0.1
-    cleared = controls.clear_override(again["override_id"], clearer=lambda **_: None)
-    restaged = _stage(controls, 0.1)
-    assert restaged["status"] == "staged"
-    assert restaged["override_revision"] == cleared["override_revision"] + 1
-    assert (
-        ProgramRuntimeControls.restore(_capture(), controls.snapshot()).snapshot()
-        == controls.snapshot()
-    )
-
-
 def test_retry_state_is_bounded_by_program_nodes_and_reopens_above_old_limit() -> None:
     from manyforge_behavior.program import _MAX_TREE_NODES
     from manyforge_program_runner.runtime_controls import _MAX_RETRY_NODES
@@ -281,26 +186,104 @@ def test_retry_preflight_does_not_evict_an_exhausted_policy_allowance(
 ) -> None:
     monkeypatch.setattr("manyforge_program_runner.runtime_controls._MAX_RETRY_NODES", 2)
     controls = ProgramRuntimeControls(_capture())
+    unlimited = {"allow_intervention": True, "max_retries": 0}
     controls.note_retry("first")
     controls.note_retry("second")
     before = controls.snapshot()
     with pytest.raises(ProgramRuntimeControlError) as error:
-        controls.require_retry_capacity("third")
-    assert error.value.code == "program_runtime_retry_nodes_full"
+        controls.require_retry_capacity("third", unlimited)
+    assert error.value.code == "program_runtime_retry_count_exhausted"
     assert controls.snapshot() == before
-    for _ in range(254):
-        controls.note_retry("first")
+    with pytest.raises(ProgramRuntimeControlError):
+        controls.note_retry("third")
+    assert controls.snapshot() == before
+
+
+def test_positive_budget_is_exhausted_explicitly_for_offer_and_command() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention()
+    intervention.owner_task_id = None
+    intervention.owner_assessment = None
+    policy = {"allow_intervention": True, "max_retries": 2}
+    for used in range(2):
+        assert controls.retry_permitted("move.1", policy) is True
+        controls.require_retry_capacity("move.1", policy)
+        offer = controls.recovery_offer(
+            cycle_generation=6,
+            owner_epoch="runner.epoch.1",
+            intervention=intervention,
+            policy=policy,
+        )
+        assert offer["retries_used"] == used
+        assert offer["primary_action"] == "retry_runtime_step"
+        assert controls.note_retry("move.1") == used + 1
+    assert controls.retry_permitted("move.1", policy) is False
     with pytest.raises(ProgramRuntimeControlError) as error:
-        controls.require_retry_capacity("first")
+        controls.require_retry_capacity("move.1", policy)
     assert error.value.code == "program_runtime_retry_limit_reached"
-    assert controls.retry_count("first") == 255
+    exhausted = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy=policy,
+    )
+    assert exhausted["retries_used"] == 2
+    assert all(
+        action["action_id"] != "retry_runtime_step" for action in exhausted["actions"]
+    )
+    # Exhaustion survives retained-state reopen; another node has its own count.
+    reopened = ProgramRuntimeControls.restore(_capture(), controls.snapshot())
+    assert reopened.retry_permitted("move.1", policy) is False
+    assert reopened.retry_permitted("move.2", policy) is True
+
+
+def test_zero_budget_is_unlimited_beyond_255_across_reopen() -> None:
+    controls = ProgramRuntimeControls(_capture())
+    unlimited = {"allow_intervention": True, "max_retries": 0}
+    for _ in range(300):
+        controls.require_retry_capacity("move.1", unlimited)
+        controls.note_retry("move.1")
+    assert controls.retry_count("move.1") == 300
+    reopened = ProgramRuntimeControls.restore(_capture(), controls.snapshot())
+    assert reopened.retry_count("move.1") == 300
+    reopened.require_retry_capacity("move.1", unlimited)
+    assert reopened.note_retry("move.1") == 301
+    # Unlimited never enables a forbidden intervention.
+    forbidden = {"allow_intervention": False, "max_retries": 0}
+    assert reopened.retry_permitted("move.1", forbidden) is False
+    with pytest.raises(ProgramRuntimeControlError) as error:
+        reopened.require_retry_capacity("move.1", forbidden)
+    assert error.value.code == "program_runtime_retry_forbidden_by_policy"
+
+
+def test_retry_counter_exhaustion_is_explicit_never_wraparound(monkeypatch) -> None:
+    monkeypatch.setattr("manyforge_program_runner.runtime_controls._MAX_RETRY_COUNT", 3)
+    controls = ProgramRuntimeControls(_capture())
+    unlimited = {"allow_intervention": True, "max_retries": 0}
+    for _ in range(3):
+        controls.note_retry("move.1")
+    before = controls.snapshot()
+    assert controls.retry_permitted("move.1", unlimited) is False
+    with pytest.raises(ProgramRuntimeControlError) as error:
+        controls.require_retry_capacity("move.1", unlimited)
+    assert error.value.code == "program_runtime_retry_count_exhausted"
+    with pytest.raises(ProgramRuntimeControlError):
+        controls.note_retry("move.1")
+    assert controls.snapshot() == before
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 2**53, 1.0])
+def test_retained_retry_counts_are_exact_positive_integers(count) -> None:
+    snapshot = ProgramRuntimeControls(_capture()).snapshot()
+    snapshot["retry_counts"] = {"move.1": count}
+    with pytest.raises(ValueError, match="retry count is invalid"):
+        ProgramRuntimeControls.restore(_capture(), snapshot)
 
 
 def test_one_reset_owner_event_includes_attribution_and_deduplicates_phase_retry() -> (
     None
 ):
     controls = ProgramRuntimeControls(_capture())
-    _stage(controls, 0.5)
     request = {
         "request_id": "reset.1",
         "source_label": "operator",
@@ -313,7 +296,7 @@ def test_one_reset_owner_event_includes_attribution_and_deduplicates_phase_retry
     controls.mark_reset(**{**request, "request_id": "reset.retry.2"})
     assert controls.snapshot() == snapshot
     assert snapshot["audit"][-1] == {
-        "event_revision": 2,
+        "event_revision": 1,
         "kind": "program_runtime_controls_reset",
         "action_id": "reset_cycle",
         **request,
@@ -322,7 +305,7 @@ def test_one_reset_owner_event_includes_attribution_and_deduplicates_phase_retry
 
 def test_checked_revision_exhaustion_precedes_effect_and_preserves_reset() -> None:
     controls = ProgramRuntimeControls(_capture())
-    staged = _stage(controls, 0.5)
+    controls.note_retry("move.1")
     snapshot = controls.snapshot()
     maximum = 9_007_199_254_740_991
     snapshot["runtime_control_revision"] = maximum - 1
@@ -332,89 +315,11 @@ def test_checked_revision_exhaustion_precedes_effect_and_preserves_reset() -> No
     ]
     restored = ProgramRuntimeControls.restore(_capture(), snapshot)
     with pytest.raises(ProgramRuntimeControlError) as error:
-        restored.activate_override(
-            staged["override_id"], activator=lambda **_: pytest.fail("effect")
-        )
+        restored.note_retry("move.1")
     assert error.value.code == "program_runtime_control_revision_exhausted"
     assert restored.snapshot() == snapshot
-    restored.mark_reset()
+    restored.mark_reset(request_id="reset.1")
     assert restored.revision == maximum
-    assert restored.snapshot()["overrides"][0]["status"] == "stale"
-
-
-def test_override_lifecycle_is_exact_idempotent_and_restart_safe() -> None:
-    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    activations: list[dict[str, object]] = []
-    clears: list[dict[str, object]] = []
-
-    staged = controls.stage_override(
-        node_instance_id="move.1",
-        node_attempt_id="attempt.1",
-        parameter_id="velocity_scale",
-        value=0.5,
-        source_observation_id="observation.1",
-        source_owner_generation=4,
-        validator=lambda **values: values["value"],
-    )
-    assert (
-        controls.stage_override(
-            node_instance_id="move.1",
-            node_attempt_id="attempt.1",
-            parameter_id="velocity_scale",
-            value=0.5,
-            source_observation_id="observation.1",
-            source_owner_generation=4,
-            validator=lambda **values: values["value"],
-        )
-        == staged
-    )
-
-    active = controls.activate_override(
-        staged["override_id"], activator=lambda **values: activations.append(values)
-    )
-    assert active["status"] == "active"
-    assert len(activations) == 1
-    assert (
-        controls.activate_override(
-            staged["override_id"], activator=lambda **values: activations.append(values)
-        )
-        == active
-    )
-    assert len(activations) == 1
-
-    restored = ProgramRuntimeControls.restore(_capture(), controls.snapshot())
-    cleared = restored.clear_override(
-        staged["override_id"], clearer=lambda **values: clears.append(values)
-    )
-    assert cleared["status"] == "cleared"
-    assert clears == [{"node_instance_id": "move.1", "parameter_id": "velocity_scale"}]
-
-
-def test_promotion_becomes_materializable_only_after_reset_and_never_applies() -> None:
-    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    staged = controls.stage_override(
-        node_instance_id="move.1",
-        node_attempt_id="attempt.1",
-        parameter_id="velocity_scale",
-        value=0.25,
-        source_observation_id=None,
-        source_owner_generation=None,
-        validator=lambda **values: values["value"],
-    )
-    proposal = controls.request_promotion(
-        staged["override_id"],
-        node_id="motion.move_to_joint_target",
-        expected_draft_id="draft.1",
-        expected_draft_revision=5,
-    )
-    assert proposal["status"] == "awaiting_reset"
-    controls.mark_reset()
-    snapshot = controls.snapshot()
-    assert snapshot["overrides"][0]["status"] == "stale"
-    assert snapshot["promotion_proposals"][0]["status"] == "ready"
-    assert snapshot["promotion_proposals"][0]["proposal_id"] == (
-        proposal["proposal_id"]
-    )
 
 
 def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> None:
@@ -426,7 +331,9 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         policy=_policy(),
     )
     assert offer is not None
-    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v3"
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v4"
+    assert offer["policy"] == _policy()
+    assert offer["retries_used"] == 0
     # The held node's own failure is carried unchanged.
     assert offer["reason_code"] == "motion_intervention"
     assert offer["message"] == "motion owner refused the path (path_blocked)"
@@ -679,12 +586,7 @@ def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
             "status": "retry_ready",
         }
     )
-    policy = MappingProxyType(
-        {
-            **_policy(),
-            "allowed_recovery_actions": ("intervention",),
-        }
-    )
+    policy = MappingProxyType(_policy())
 
     offer = controls.recovery_offer(
         cycle_generation=6,
@@ -695,7 +597,7 @@ def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
 
     assert offer is not None
     assert offer["participants"] == [{"operation_participant_id": "participant.1"}]
-    assert offer["policy"]["allowed_recovery_actions"] == ["intervention"]
+    assert offer["policy"] == {"allow_intervention": True, "max_retries": 2}
     assert offer["primary_action"] == "retry_motion_from_current_state"
 
 
@@ -733,55 +635,6 @@ def test_owner_backed_retry_requires_confirmed_non_moving_state() -> None:
     assert any(
         action["action_id"] == "retry_runtime_step" and action["enabled"]
         for action in ownerless["actions"]
-    )
-
-
-def test_runtime_override_only_policy_requires_an_active_node_override() -> None:
-    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    intervention = _intervention()
-    intervention.owner_task_id = None
-    intervention.owner_assessment = None
-    policy = {
-        **_policy(),
-        "allow_intervention": False,
-        "allowed_recovery_actions": ["runtime_override"],
-    }
-    before = controls.recovery_offer(
-        cycle_generation=6,
-        owner_epoch="runner.epoch.1",
-        intervention=intervention,
-        policy=policy,
-    )
-    assert before is not None
-    assert all(
-        action["action_id"] != "retry_runtime_step" for action in before["actions"]
-    )
-
-    staged = controls.stage_override(
-        node_instance_id="move.1",
-        node_attempt_id="attempt.1",
-        parameter_id="velocity_scale",
-        value=0.5,
-        source_observation_id=None,
-        source_owner_generation=None,
-        validator=lambda **values: values["value"],
-    )
-    controls.activate_override(staged["override_id"], activator=lambda **_values: None)
-    intervention.identity = SimpleNamespace(
-        program_run_id="program-run.1",
-        node_instance_id="move.1",
-        node_attempt_id="attempt.2",
-    )
-    after = controls.recovery_offer(
-        cycle_generation=6,
-        owner_epoch="runner.epoch.1",
-        intervention=intervention,
-        policy=policy,
-    )
-    assert after is not None
-    assert any(
-        action["action_id"] == "retry_runtime_step" and action["enabled"]
-        for action in after["actions"]
     )
 
 
@@ -852,3 +705,117 @@ def test_expired_owner_observation_disables_every_recovery_effect() -> None:
         for action in offer["actions"]
         if action["action_id"] != "reset_cycle"
     } == {"recovery_owner_observation_expired"}
+
+
+def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> None:
+    """A held pre-dispatch failure (IK had no solution) never moved the robot.
+
+    The owner classifies it as a retryable no-effect failure; the offer then
+    enables Retry exactly by the captured policy predicate, with Unlimited
+    (``max_retries == 0``) allowing it and a forbidden intervention not.
+    """
+
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention()
+    intervention.owner_assessment = {
+        "acknowledged_non_moving": False,
+        "allowed_actions": ["retry_after_scene_repair", "reset_cycle"],
+        "assessment_revision": 15,
+        "control_command_epoch": 0,
+        "evidence_refs": [],
+        "execution_id": 22,
+        "latch_id": "",
+        "observed_state_valid_until_ns": 0,
+        "operation_revision": 1,
+        "participants": [{"operation_participant_id": "participant.1"}],
+        "recovery_class": "failed_validation",
+        "retry_admissible": True,
+        "status": "retry_ready",
+    }
+    intervention.reason_code = "ik_failed"
+
+    offer = controls.recovery_offer(
+        cycle_generation=5,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={"allow_intervention": True, "max_retries": 0},
+    )
+
+    assert offer is not None
+    assert offer["status"] == "retry_ready"
+    assert offer["recovery_class"] == "failed_validation"
+    assert offer["primary_action"] == "retry_after_scene_repair"
+    retry = next(
+        action
+        for action in offer["actions"]
+        if action["action_id"] == "retry_after_scene_repair"
+    )
+    assert retry["enabled"] is True
+    assert retry["disabled_reason_code"] is None
+
+    forbidden = controls.recovery_offer(
+        cycle_generation=5,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy={"allow_intervention": False, "max_retries": 0},
+    )
+    assert forbidden is not None
+    assert forbidden["primary_action"] is None
+    assert {
+        action["disabled_reason_code"]
+        for action in forbidden["actions"]
+        if action["action_id"] == "retry_after_scene_repair"
+    } == {"recovery_action_forbidden_by_captured_policy"}
+
+
+def test_owner_deadline_extension_keeps_retry_offer_and_expiry_disables_it() -> None:
+    """A fresh owner observation extends the deadline without replacing the
+    offer the operator is answering; a stale one disables Retry."""
+
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention()
+    now = time.monotonic_ns()
+    intervention.owner_assessment = {
+        "allowed_actions": ["retry_after_scene_repair", "reset_cycle"],
+        "assessment_revision": 4,
+        "control_command_epoch": 0,
+        "observed_state_valid_until_ns": now + 60_000_000_000,
+        "recovery_class": "failed_validation",
+        "retry_admissible": True,
+        "status": "retry_ready",
+    }
+    policy = {"allow_intervention": True, "max_retries": 0}
+
+    def offer():
+        return controls.recovery_offer(
+            cycle_generation=5,
+            owner_epoch="runner.epoch.1",
+            intervention=intervention,
+            policy=policy,
+        )
+
+    first = offer()
+    assert first["primary_action"] == "retry_after_scene_repair"
+    intervention.owner_assessment = {
+        **intervention.owner_assessment,
+        "observed_state_valid_until_ns": now + 120_000_000_000,
+    }
+    extended = offer()
+    assert extended["offer_id"] == first["offer_id"]
+    assert extended["offer_revision"] == first["offer_revision"]
+    assert extended["valid_until_ns"] == now + 120_000_000_000
+    assert extended["primary_action"] == "retry_after_scene_repair"
+
+    intervention.owner_assessment = {
+        **intervention.owner_assessment,
+        "observed_state_valid_until_ns": time.monotonic_ns() - 1,
+    }
+    stale = offer()
+    assert stale["offer_id"] != first["offer_id"]
+    assert stale["primary_action"] is None
+    retry = next(
+        action
+        for action in stale["actions"]
+        if action["action_id"] == "retry_after_scene_repair"
+    )
+    assert retry["disabled_reason_code"] == "recovery_owner_observation_expired"

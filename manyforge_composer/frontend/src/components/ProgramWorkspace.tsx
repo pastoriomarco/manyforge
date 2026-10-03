@@ -64,6 +64,9 @@ export function mergeProgramNotice(
 interface ProgramWorkspaceProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
+  /** The advisory preview of a held failed node's Draft edits: one status
+   * line in that node's Properties editor (the viewer shows its ghost). */
+  heldNodePreview?: { nodeInstanceId: string | null; statusText: string | null } | null;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   sourceModel: StructuralResourceState<SourceModelProjection>;
@@ -93,6 +96,7 @@ interface ProgramWorkspaceProps {
 export function ProgramWorkspace({
   controller,
   runtime,
+  heldNodePreview = null,
   catalog,
   environment,
   sourceModel,
@@ -397,7 +401,9 @@ export function ProgramWorkspace({
         id: 'program-runtime-active',
         key: 'program-runtime-active',
         kind: 'info',
-        message: 'Run active. Draft inspection remains available; authoring waits for Idle.',
+        message: mutationAvailable
+          ? 'Run held with all motion stopped. The Draft is editable; Apply Resets the run first, and Retry, Resume and Execute wait until the edits are Applied or Discarded.'
+          : 'Run active. Draft inspection remains available; editing waits until all Program motion is stopped or the cycle is Idle.',
         dismissible: false,
       });
     } else if (workspace !== null && !mutationAvailable) {
@@ -684,6 +690,13 @@ export function ProgramWorkspace({
               ) : toolView === 'nodes' && selectedNodeId === null ? (
                 <div className="program-inspector-empty" aria-label="No tree node selected" />
               ) : toolView === 'nodes' ? (
+                <>
+                {heldNodePreview?.statusText != null
+                  && heldNodePreview.nodeInstanceId === selectedNodeId && (
+                  <p className="held-node-preview hint" role="status" aria-label="Edited motion preview">
+                    {heldNodePreview.statusText}
+                  </p>
+                )}
                 <ProgramPropertyEditor
                   embedded
                   roots={authoring.forest}
@@ -739,6 +752,7 @@ export function ProgramWorkspace({
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
                 />
+                </>
               ) : (
                 <ProgramDeclarationsEditor
                   embedded

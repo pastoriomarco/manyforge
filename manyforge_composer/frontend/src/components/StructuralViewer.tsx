@@ -158,6 +158,9 @@ interface StructuralViewerProps {
   candidateRobot?: CandidateRobotPresentation | null;
   candidateTool?: CandidateRobotPresentation | null;
   candidateRejected?: boolean;
+  /** The advisory failed-node correction preview (D4), independent of the Robot panel. */
+  correctionRobot?: CandidateRobotPresentation | null;
+  correctionStale?: boolean;
   runtimePresentation?: RuntimeScenePresentation;
   executionObservationPresentation?: MeasuredRobotPresentationReader;
   sceneOwnerIdentity?: {
@@ -2473,6 +2476,8 @@ const ViewerCanvas = memo(function ViewerCanvas({
   candidateRobot,
   candidateTool,
   candidateRejected,
+  correctionRobot,
+  correctionStale,
   runtimePresentation,
   executionObservationPresentation,
   sceneOwnerIdentity,
@@ -2529,6 +2534,8 @@ const ViewerCanvas = memo(function ViewerCanvas({
   candidateRobot: CandidateRobotPresentation | null;
   candidateTool: CandidateRobotPresentation | null;
   candidateRejected: boolean;
+  correctionRobot: CandidateRobotPresentation | null;
+  correctionStale: boolean;
   runtimePresentation: RuntimeScenePresentation | undefined;
   executionObservationPresentation: MeasuredRobotPresentationReader | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
@@ -2917,6 +2924,14 @@ const ViewerCanvas = memo(function ViewerCanvas({
             onAssetError={onPreviewAssetError}
           />
         )}
+        {manifest !== null && correctionRobot !== null && (
+          <CandidateRobotGhost
+            manifest={manifest}
+            presentation={correctionRobot}
+            stale={correctionStale}
+            onAssetError={onPreviewAssetError}
+          />
+        )}
         {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
       </group>
       {viewerFrameIdentity !== undefined && (
@@ -2931,6 +2946,9 @@ const ViewerCanvas = memo(function ViewerCanvas({
     </div>
   );
 });
+
+// Stable default: a fresh `[]` per render would defeat the Canvas memo.
+const NO_FRAME_AXES: NonNullable<StructuralViewerProps['frameAxes']> = [];
 
 function StructuralViewerContent({
   viewerActive,
@@ -2964,6 +2982,8 @@ function StructuralViewerContent({
   candidateRobot = null,
   candidateTool = null,
   candidateRejected = false,
+  correctionRobot = null,
+  correctionStale = false,
   runtimePresentation,
   executionObservationPresentation,
   sceneOwnerIdentity,
@@ -2971,7 +2991,7 @@ function StructuralViewerContent({
   readViewerFrameIdentity,
   pointCloudCellId,
   viewer,
-  frameAxes = [],
+  frameAxes = NO_FRAME_AXES,
   objectAxesVisibleIds = [],
   objectAxesRows = [],
   onObjectAxesVisibleIdsChange,
@@ -3158,12 +3178,15 @@ function StructuralViewerContent({
     setFrameAxesSizeM(viewer?.frame_gizmo_size_m ?? 0.1);
     setObjectAxesSizeM(viewer?.object_axes_gizmo_size_m ?? 0.1);
   }, [viewer?.frame_gizmo_size_m, viewer?.object_axes_gizmo_size_m]);
+  // A memoized Canvas prop: a fresh array on every parent render would
+  // re-render the R3F root, whose configure() then forces a WebGL frame.
+  const presentedFrameAxes = useMemo(() => frameAxes
+    .filter((frame) => sessionFrameAxes.has(frame.linkName))
+    .sort((left, right) => left.sourceLinkName.localeCompare(right.sourceLinkName)),
+  [frameAxes, sessionFrameAxes]);
   // One outline per component: every robot link (not only those with axes
   // shown) resolves to its model instance.
   const outlineComponents = useOutlineComponents(frameAxes);
-  const presentedFrameAxes = frameAxes
-    .filter((frame) => sessionFrameAxes.has(frame.linkName))
-    .sort((left, right) => left.sourceLinkName.localeCompare(right.sourceLinkName));
   // Runtime measured state is the primary robot pose, not an optional ghost.
   // The current projection has no second passive comparison-pose contract.
   const comparisonGhostAvailable = false;
@@ -3547,6 +3570,8 @@ function StructuralViewerContent({
               candidateRobot={candidateRobot}
               candidateTool={candidateTool}
               candidateRejected={candidateRejected}
+              correctionRobot={correctionRobot}
+              correctionStale={correctionStale}
               runtimePresentation={presentedRuntime}
               executionObservationPresentation={executionObservationPresentation}
               sceneOwnerIdentity={sceneOwnerIdentity}

@@ -12,7 +12,6 @@ import type {
   JsonValue,
   ProgramAuthoringDiagnostic,
   ProgramAuthoringDocument,
-  ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
   ProgramParameterDeclaration,
@@ -85,7 +84,6 @@ interface ProgramPropertyEditorProps {
   onRenamed?: (previousId: string, renamedId: string) => void;
   onUpdateNodePolicies: (
     instanceId: string,
-    modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
     executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,

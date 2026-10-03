@@ -83,14 +83,9 @@ import type {
   ProgramDocument,
   ProgramAuthoringDocument,
   ProgramAuthoringDiagnostic,
-  ProgramInterventionDelegate,
-  ProgramModificationPolicyValue,
-  ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramParameterDeclaration,
   ProgramOperatorStopPolicy,
-  ProgramPersistenceCeiling,
-  ProgramRecoveryAction,
   ProgramSceneFrameRef,
   ProgramScenePose,
   ProgramSceneResource,
@@ -109,12 +104,9 @@ import type {
   ProgramRuntimeControlProjection,
   ProgramRuntimeControlsSnapshot,
   RuntimeControlAuditEvent,
-  RuntimeOverrideObservationCandidate,
-  RuntimeOverridePromotionProposal,
-  RuntimeOverrideRecord,
-  RuntimeOverrideStatus,
-  RuntimeOverrideMaterializationResponse,
   ProgramValueSource,
+  ProgramNodeCorrectionPreview,
+  ProgramNodeCorrectionPreviewRequest,
   ProgramViewerMetadata,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
@@ -898,146 +890,28 @@ function parseProgramValueSources(value: unknown, path: string): Record<string, 
   return sources;
 }
 
-const MODIFICATION_POLICY_VALUES = new Set<ProgramModificationPolicyValue>([
-  'forbidden',
-  'human_approval',
-  'llm_allowed',
-]);
-const INTERVENTION_DELEGATES = new Set<ProgramInterventionDelegate>([
-  'forbidden',
-  'human_only',
-  'llm_allowed',
-  'program_only',
-]);
-const RECOVERY_ACTIONS = new Set<ProgramRecoveryAction>([
-  'intervention',
-  'runtime_override',
-]);
-const PERSISTENCE_CEILINGS = new Set<ProgramPersistenceCeiling>([
-  'session_only',
-  'runtime_override',
-  'draft_patch',
-]);
 const OPERATOR_STOP_POLICIES = new Set<ProgramOperatorStopPolicy>([
   'inherit',
   'hold',
   'continue',
 ]);
 
-function policyIdAt(value: unknown, path: string): string {
-  const id = stringAt(value, path);
-  if (!/^[a-z][a-z0-9_.-]*$/.test(id)
-      || new TextEncoder().encode(id).length > 128) {
-    return fail(path, 'a bounded portable lower-case policy ID');
-  }
-  return id;
-}
-
-function parseProgramNodeModificationPolicy(
-  value: unknown,
-  path: string,
-): ProgramNodeModificationPolicy {
-  const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    ['runtime_override', 'persistent_edit', 'intervention_delegate'],
-    path,
-  );
-  const runtimeOverride = stringAt(
-    record.runtime_override,
-    `${path}.runtime_override`,
-  ) as ProgramModificationPolicyValue;
-  const persistentEdit = stringAt(
-    record.persistent_edit,
-    `${path}.persistent_edit`,
-  ) as ProgramModificationPolicyValue;
-  const interventionDelegate = stringAt(
-    record.intervention_delegate,
-    `${path}.intervention_delegate`,
-  ) as ProgramInterventionDelegate;
-  if (!MODIFICATION_POLICY_VALUES.has(runtimeOverride)
-      || !MODIFICATION_POLICY_VALUES.has(persistentEdit)
-      || !INTERVENTION_DELEGATES.has(interventionDelegate)) {
-    return fail(path, 'closed modification-policy enums');
-  }
-  return {
-    runtime_override: runtimeOverride,
-    persistent_edit: persistentEdit,
-    intervention_delegate: interventionDelegate,
-  };
-}
-
 function parseProgramNodeRecoveryPolicy(
   value: unknown,
   path: string,
 ): ProgramNodeRecoveryPolicy {
   const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    [
-      'allow_intervention',
-      'allowed_recovery_actions',
-      'max_retries',
-      'allowed_skills',
-      'persistence_ceiling',
-    ],
-    path,
-  );
-  const actions = canonicalStringArrayAt(
-    boundedArrayAt(
-      record.allowed_recovery_actions,
-      `${path}.allowed_recovery_actions`,
-      2,
-    ),
-    `${path}.allowed_recovery_actions`,
-  ) as ProgramRecoveryAction[];
-  if (actions.some((action) => !RECOVERY_ACTIONS.has(action))) {
-    return fail(`${path}.allowed_recovery_actions`, 'closed recovery actions');
-  }
+  exactKeysAt(record, ['allow_intervention', 'max_retries'], path);
   const maxRetries = integerAt(record.max_retries, `${path}.max_retries`);
-  if (maxRetries > 255) {
-    return fail(`${path}.max_retries`, 'an integer in 0..255');
-  }
-  const skills = boundedArrayAt(
-    record.allowed_skills,
-    `${path}.allowed_skills`,
-    256,
-  ).map((skill, index) => policyIdAt(
-    skill,
-    `${path}.allowed_skills[${index}]`,
-  ));
-  if (
-    skills.some((skill, index) => (
-      index > 0 && skill < skills[index - 1]
-    ))
-    || new Set(skills).size !== skills.length
-  ) {
-    return fail(`${path}.allowed_skills`, 'sorted unique policy IDs');
-  }
-  const allowIntervention = booleanAt(
-    record.allow_intervention,
-    `${path}.allow_intervention`,
-  );
-  const persistenceCeiling = stringAt(
-    record.persistence_ceiling,
-    `${path}.persistence_ceiling`,
-  ) as ProgramPersistenceCeiling;
-  if (!PERSISTENCE_CEILINGS.has(persistenceCeiling)) {
-    return fail(`${path}.persistence_ceiling`, 'a closed persistence ceiling');
-  }
-  const hasIntervention = actions.includes('intervention');
-  if (allowIntervention !== hasIntervention) {
-    return fail(path, 'matching intervention permission and action');
-  }
-  if (skills.length > 0 && !hasIntervention) {
-    return fail(path, 'allowed_skills only with intervention');
+  if (maxRetries < 0 || maxRetries > 255) {
+    return fail(`${path}.max_retries`, 'an integer in 0..255 (0 is Unlimited)');
   }
   return {
-    allow_intervention: allowIntervention,
-    allowed_recovery_actions: actions,
+    allow_intervention: booleanAt(
+      record.allow_intervention,
+      `${path}.allow_intervention`,
+    ),
     max_retries: maxRetries,
-    allowed_skills: skills,
-    persistence_ceiling: persistenceCeiling,
   };
 }
 
@@ -1054,7 +928,6 @@ function parseProgramTreeNode(
     [
       'value_sources',
       'metadata',
-      'modification_policy',
       'recovery_policy',
       'operator_stop_policy',
       'execution_groups',
@@ -1075,12 +948,6 @@ function parseProgramTreeNode(
   if (sources !== undefined) node.value_sources = sources;
   if (record.metadata !== undefined) {
     node.metadata = jsonRecordAt(record.metadata, `${path}.metadata`);
-  }
-  if (record.modification_policy !== undefined) {
-    node.modification_policy = parseProgramNodeModificationPolicy(
-      record.modification_policy,
-      `${path}.modification_policy`,
-    );
   }
   if (record.recovery_policy !== undefined) {
     node.recovery_policy = parseProgramNodeRecoveryPolicy(
@@ -1121,83 +988,15 @@ function parseProgramTreeNode(
       node.execution_groups = names;
     }
   }
-  const modification = node.modification_policy ?? {
-    runtime_override: 'forbidden' as const,
-    persistent_edit: 'forbidden' as const,
-    intervention_delegate: 'forbidden' as const,
-  };
-  const recovery = node.recovery_policy ?? {
-    allow_intervention: false,
-    allowed_recovery_actions: [],
-    max_retries: 0,
-    allowed_skills: [],
-    persistence_ceiling: 'session_only' as const,
-  };
-  const operatorStop = node.operator_stop_policy ?? 'inherit';
-  if (
-    node.modification_policy !== undefined
-    && modification.runtime_override === 'forbidden'
-    && modification.persistent_edit === 'forbidden'
-    && modification.intervention_delegate === 'forbidden'
-  ) {
-    return fail(`${path}.modification_policy`, 'omit the canonical default policy');
-  }
   if (
     node.recovery_policy !== undefined
-    && !recovery.allow_intervention
-    && recovery.allowed_recovery_actions.length === 0
-    && recovery.max_retries === 0
-    && recovery.allowed_skills.length === 0
-    && recovery.persistence_ceiling === 'session_only'
+    && !node.recovery_policy.allow_intervention
+    && node.recovery_policy.max_retries === 0
   ) {
     return fail(`${path}.recovery_policy`, 'omit the canonical default policy');
   }
-  if (
-    node.operator_stop_policy !== undefined
-    && operatorStop === 'inherit'
-  ) {
+  if (node.operator_stop_policy === 'inherit') {
     return fail(`${path}.operator_stop_policy`, 'omit the canonical default policy');
-  }
-  if (
-    recovery.allow_intervention
-    !== recovery.allowed_recovery_actions.includes('intervention')
-  ) {
-    return fail(path, 'matching intervention permission and action');
-  }
-  if (
-    recovery.allowed_skills.length > 0
-    && !recovery.allowed_recovery_actions.includes('intervention')
-  ) {
-    return fail(path, 'allowed_skills only with intervention');
-  }
-  if (
-    recovery.allowed_recovery_actions.includes('runtime_override')
-    && modification.runtime_override === 'forbidden'
-  ) {
-    return fail(path, 'runtime_override requires modification permission');
-  }
-  if (
-    recovery.persistence_ceiling === 'runtime_override'
-    && modification.runtime_override === 'forbidden'
-  ) {
-    return fail(path, 'runtime_override persistence requires modification permission');
-  }
-  if (
-    recovery.persistence_ceiling === 'draft_patch'
-    && modification.persistent_edit === 'forbidden'
-  ) {
-    return fail(path, 'draft_patch persistence requires persistent-edit permission');
-  }
-  if (
-    recovery.allowed_recovery_actions.length === 0
-    && (
-      recovery.allow_intervention
-      || recovery.max_retries !== 0
-      || recovery.allowed_skills.length !== 0
-      || recovery.persistence_ceiling !== 'session_only'
-    )
-  ) {
-    return fail(path, 'non-default recovery policy requires an action');
   }
   return node;
 }
@@ -1209,22 +1008,14 @@ function parseProgramParameter(
   const record = objectAt(value, path);
   allowedKeysAt(
     record,
-    ['parameter_id', 'type', 'default', 'runtime_mutability'],
+    ['parameter_id', 'type', 'default'],
     ['constraints', 'description'],
     path,
   );
-  const runtimeMutability = stringAt(
-    record.runtime_mutability,
-    `${path}.runtime_mutability`,
-  );
-  if (runtimeMutability !== 'immutable' && runtimeMutability !== 'before_run') {
-    return fail(`${path}.runtime_mutability`, 'immutable or before_run');
-  }
   const parameter: ProgramParameterDeclaration = {
     parameter_id: stringAt(record.parameter_id, `${path}.parameter_id`),
     type: stringAt(record.type, `${path}.type`),
     default: jsonValueAt(record.default, `${path}.default`),
-    runtime_mutability: runtimeMutability,
   };
   if (record.constraints !== undefined) {
     parameter.constraints = jsonRecordAt(record.constraints, `${path}.constraints`);
@@ -3083,22 +2874,7 @@ function parseProgramDraftApplicability(
   path: string,
 ): ProgramDraftApplicability {
   const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    ['applyReady', 'affectedInstanceIds', 'unavailableReason'],
-    path,
-  );
-  const affectedInstanceIds = boundedArrayAt(
-    record.affectedInstanceIds,
-    `${path}.affectedInstanceIds`,
-    100_000,
-  ).map((instanceId, index) => policyIdAt(
-    instanceId,
-    `${path}.affectedInstanceIds[${index}]`,
-  ));
-  if (new Set(affectedInstanceIds).size !== affectedInstanceIds.length) {
-    return fail(`${path}.affectedInstanceIds`, 'unique instance IDs');
-  }
+  exactKeysAt(record, ['applyReady', 'unavailableReason'], path);
   const unavailableReason = record.unavailableReason === null
     ? null
     : parseRuntimeAvailability(record.unavailableReason, `${path}.unavailableReason`);
@@ -3106,10 +2882,7 @@ function parseProgramDraftApplicability(
   if (applyReady === (unavailableReason !== null)) {
     return fail(path, 'an exact Apply-ready availability reason');
   }
-  if (applyReady && affectedInstanceIds.length > 0) {
-    return fail(path, 'no affected instances while Apply-ready');
-  }
-  return { applyReady, affectedInstanceIds, unavailableReason };
+  return { applyReady, unavailableReason };
 }
 
 function parseWorkspaceResponseIdentity(value: unknown): AuthoringWorkspaceIdentity {
@@ -3252,8 +3025,7 @@ function parseAuthoringWorkspaceProjectFacts(
   exactKeysAt(record, [
     'document_path', 'document_id', 'document_name', 'document_description',
     'source_diagnostics', 'source_document_digest', 'program_role_assignment',
-    'typed_parameter_overrides', 'source_program_digest',
-    'source_deployment_digest',
+    'source_program_digest', 'source_deployment_digest',
   ], path);
   const roleAssignment = record.program_role_assignment === null
     ? null
@@ -3292,10 +3064,6 @@ function parseAuthoringWorkspaceProjectFacts(
       `${path}.source_document_digest`,
     ),
     programRoleAssignment: roleAssignment,
-    typedParameterOverrides: jsonRecordAt(
-      record.typed_parameter_overrides,
-      `${path}.typed_parameter_overrides`,
-    ),
     sourceProgramDigest: nullableStringAt(
       record.source_program_digest,
       `${path}.source_program_digest`,
@@ -3328,10 +3096,10 @@ export function parseAuthoringWorkspaceSnapshot(
     path,
   );
   const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
-  if (schemaVersion !== 'manyforge.composer_authoring_workspace_snapshot.v1') {
+  if (schemaVersion !== 'manyforge.composer_authoring_workspace_snapshot.v2') {
     return fail(
       `${path}.schemaVersion`,
-      'manyforge.composer_authoring_workspace_snapshot.v1',
+      'manyforge.composer_authoring_workspace_snapshot.v2',
     );
   }
   const workspaceEpoch = stringAt(record.workspaceEpoch, `${path}.workspaceEpoch`);
@@ -3872,14 +3640,13 @@ function parsePreparedActivationInput(
     'source_document_digest', 'captured_input_digest', 'deployment_artifact_id',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
     'program_id', 'program_revision', 'program_outcome',
-    'node_environment_digest', 'assistant_mode', 'typed_parameter_overrides',
+    'node_environment_digest', 'assistant_mode',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.prepared_activation_input.v3'
-    && schemaVersion !== 'manyforge.prepared_activation_input.v4') {
+  if (schemaVersion !== 'manyforge.prepared_activation_input.v5') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v3 or v4',
+      'manyforge.prepared_activation_input.v5',
     );
   }
   const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);
@@ -3887,11 +3654,9 @@ function parsePreparedActivationInput(
   let programBindingId: string | null;
   if (outcomeKind === 'no_program') {
     exactKeysAt(outcome, ['kind'], `${path}.program_outcome`);
-    if (schemaVersion !== 'manyforge.prepared_activation_input.v4'
-      || record.program_id !== null || record.program_revision !== null
-      || record.assistant_mode !== 'optional'
-      || Object.keys(objectAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`)).length !== 0) {
-      return fail(path, 'no_program v4 with no Program identities or overrides');
+    if (record.program_id !== null || record.program_revision !== null
+      || record.assistant_mode !== 'optional') {
+      return fail(path, 'no_program with no Program identities');
     }
     programBindingId = null;
   } else if (outcomeKind === 'bound') {
@@ -3944,8 +3709,6 @@ function parsePreparedActivationInput(
       }
       return mode;
     })(),
-    typedParameterOverrides: jsonRecordAt(record.typed_parameter_overrides,
-      `${path}.typed_parameter_overrides`),
   };
 }
 
@@ -4212,13 +3975,12 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'scenario_id',
       'schema_version',
       'source',
-      'typed_parameter_overrides',
     ],
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.applied_program_selection.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v2');
+  if (schemaVersion !== 'manyforge.applied_program_selection.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v3');
   }
   const assistantMode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
   if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
@@ -4269,7 +4031,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     }
     throw error;
   }
-  jsonRecordAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
   const source = objectAt(record.source, `${path}.source`);
   exactKeysAt(
     source,
@@ -4561,8 +4322,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     ],
     `${path}.capture`,
   );
-  if (capture.schema_version !== 'manyforge.program_run_capture.v1') {
-    return fail(`${path}.capture.schema_version`, 'manyforge.program_run_capture.v1');
+  if (capture.schema_version !== 'manyforge.program_run_capture.v2') {
+    return fail(`${path}.capture.schema_version`, 'manyforge.program_run_capture.v2');
   }
   const ownerIdentities = boundedArrayAt(
     capture.owner_identities,
@@ -4708,10 +4469,6 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   };
 }
 
-const RUNTIME_OVERRIDE_STATUSES = new Set<RuntimeOverrideStatus>([
-  'staged', 'active', 'cleared', 'stale',
-]);
-
 const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
   'retry_motion_from_current_state',
   'acknowledge_and_continue',
@@ -4723,117 +4480,6 @@ const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
 
 function nullablePositiveIntegerAt(value: unknown, path: string): number | null {
   return value === null ? null : positiveIntegerAt(value, path);
-}
-
-function parseRuntimeOverrideRecord(
-  value: unknown,
-  path: string,
-): RuntimeOverrideRecord {
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'override_id', 'override_revision', 'status',
-    'program_run_id', 'program_revision', 'program_binding_id',
-    'retained_bundle_id', 'graph_revision', 'node_environment_digest',
-    'node_instance_id', 'node_attempt_id', 'parameter_id', 'value',
-    'source_observation_id', 'source_owner_generation',
-  ], path);
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.runtime_override.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.runtime_override.v1');
-  }
-  const status = stringAt(record.status, `${path}.status`) as RuntimeOverrideStatus;
-  if (!RUNTIME_OVERRIDE_STATUSES.has(status)) {
-    return fail(`${path}.status`, 'a supported runtime-override status');
-  }
-  const sourceObservationId = nullableStringAt(
-    record.source_observation_id,
-    `${path}.source_observation_id`,
-  );
-  const sourceOwnerGeneration = nullablePositiveIntegerAt(
-    record.source_owner_generation,
-    `${path}.source_owner_generation`,
-  );
-  if ((sourceObservationId === null) !== (sourceOwnerGeneration === null)) {
-    return fail(path, 'a paired source observation identity and generation');
-  }
-  return {
-    schemaVersion,
-    overrideId: digestAt(record.override_id, `${path}.override_id`),
-    overrideRevision: positiveIntegerAt(
-      record.override_revision,
-      `${path}.override_revision`,
-    ),
-    status,
-    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
-    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
-    programBindingId: digestAt(
-      record.program_binding_id,
-      `${path}.program_binding_id`,
-    ),
-    retainedBundleId: digestAt(
-      record.retained_bundle_id,
-      `${path}.retained_bundle_id`,
-    ),
-    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
-    nodeEnvironmentDigest: digestAt(
-      record.node_environment_digest,
-      `${path}.node_environment_digest`,
-    ),
-    nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
-    nodeAttemptId: stringAt(record.node_attempt_id, `${path}.node_attempt_id`),
-    parameterId: stringAt(record.parameter_id, `${path}.parameter_id`),
-    value: jsonValueAt(record.value, `${path}.value`),
-    sourceObservationId,
-    sourceOwnerGeneration,
-  };
-}
-
-function parseRuntimeOverridePromotionProposal(
-  value: unknown,
-  path: string,
-): RuntimeOverridePromotionProposal {
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'proposal_id', 'status', 'program_run_id',
-    'override_id', 'program_revision', 'program_binding_id',
-    'node_instance_id', 'node_id', 'parameter_id', 'value',
-    'expected_draft_id', 'expected_draft_revision',
-  ], path);
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.runtime_override_promotion.v1') {
-    return fail(
-      `${path}.schema_version`,
-      'manyforge.runtime_override_promotion.v1',
-    );
-  }
-  const status = stringAt(record.status, `${path}.status`);
-  if (!['awaiting_reset', 'ready'].includes(status)) {
-    return fail(`${path}.status`, 'awaiting_reset or ready');
-  }
-  return {
-    schemaVersion,
-    proposalId: digestAt(record.proposal_id, `${path}.proposal_id`),
-    status: status as RuntimeOverridePromotionProposal['status'],
-    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
-    overrideId: digestAt(record.override_id, `${path}.override_id`),
-    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
-    programBindingId: digestAt(
-      record.program_binding_id,
-      `${path}.program_binding_id`,
-    ),
-    nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
-    nodeId: stringAt(record.node_id, `${path}.node_id`),
-    parameterId: stringAt(record.parameter_id, `${path}.parameter_id`),
-    value: jsonValueAt(record.value, `${path}.value`),
-    expectedDraftId: stringAt(
-      record.expected_draft_id,
-      `${path}.expected_draft_id`,
-    ),
-    expectedDraftRevision: positiveIntegerAt(
-      record.expected_draft_revision,
-      `${path}.expected_draft_revision`,
-    ),
-  };
 }
 
 function parseRuntimeControlAuditEvent(
@@ -4864,13 +4510,11 @@ export function parseProgramRuntimeControlsSnapshot(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schema_version', 'program_run_id', 'runtime_control_revision',
-    'recovery_fences', 'has_active_runtime_overrides',
-    'has_staged_runtime_overrides', 'has_stale_runtime_overrides',
-    'overrides', 'promotion_proposals', 'retry_counts', 'audit',
+    'recovery_fences', 'retry_counts', 'audit',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_controls.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v2');
+  if (schemaVersion !== 'manyforge.program_runtime_controls.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v3');
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
   const fences = objectAt(record.recovery_fences, `${path}.recovery_fences`);
@@ -4878,19 +4522,6 @@ export function parseProgramRuntimeControlsSnapshot(
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
     'pose_source_apply_generation',
   ], `${path}.recovery_fences`);
-  const overrides = boundedArrayAt(record.overrides, `${path}.overrides`, 1024)
-    .map((item, index) => parseRuntimeOverrideRecord(
-      item,
-      `${path}.overrides[${index}]`,
-    ));
-  const promotionProposals = boundedArrayAt(
-    record.promotion_proposals,
-    `${path}.promotion_proposals`,
-    1024,
-  ).map((item, index) => parseRuntimeOverridePromotionProposal(
-    item,
-    `${path}.promotion_proposals[${index}]`,
-  ));
   const retryRecord = objectAt(record.retry_counts, `${path}.retry_counts`);
   const retryCounts = Object.fromEntries(Object.entries(retryRecord).map(
     ([nodeInstanceId, count]) => [
@@ -4898,9 +4529,11 @@ export function parseProgramRuntimeControlsSnapshot(
       integerAt(count, `${path}.retry_counts.${nodeInstanceId}`),
     ],
   ));
+  // Accumulated counts are independent of the finite authored limit: an
+  // Unlimited (0) node may exceed 255 explicit retries.
   if (Object.keys(retryCounts).length > 100_000
-      || Object.values(retryCounts).some((count) => count < 0 || count > 255)) {
-    return fail(`${path}.retry_counts`, 'at most 100000 Program nodes with retry counts from 0 through 255');
+      || Object.values(retryCounts).some((count) => count < 1)) {
+    return fail(`${path}.retry_counts`, 'at most 100000 Program nodes with positive exact retry counts');
   }
   const revision = positiveIntegerAt(
     record.runtime_control_revision,
@@ -4914,43 +4547,8 @@ export function parseProgramRuntimeControlsSnapshot(
   if (
     audit.length !== Math.min(revision - 1, 256)
     || audit.some((event, index) => event.eventRevision !== revision - audit.length + index)
-    || new Set(overrides.map((item) => item.overrideId)).size !== overrides.length
-    || new Set(promotionProposals.map((item) => item.proposalId)).size
-      !== promotionProposals.length
-    || overrides.some((item) => item.programRunId !== programRunId)
-    || promotionProposals.some((item) => item.programRunId !== programRunId)
-    || promotionProposals.some((proposal) => {
-      const override = overrides.find(
-        (row) => row.overrideId === proposal.overrideId,
-      );
-      return override === undefined
-        || proposal.programRevision !== override.programRevision
-        || proposal.programBindingId !== override.programBindingId
-        || proposal.nodeInstanceId !== override.nodeInstanceId
-        || proposal.parameterId !== override.parameterId
-        || JSON.stringify(proposal.value) !== JSON.stringify(override.value);
-    })
   ) {
     return fail(path, 'internally consistent run-scoped controls');
-  }
-  const hasActiveRuntimeOverrides = booleanAt(
-    record.has_active_runtime_overrides,
-    `${path}.has_active_runtime_overrides`,
-  );
-  const hasStagedRuntimeOverrides = booleanAt(
-    record.has_staged_runtime_overrides,
-    `${path}.has_staged_runtime_overrides`,
-  );
-  const hasStaleRuntimeOverrides = booleanAt(
-    record.has_stale_runtime_overrides,
-    `${path}.has_stale_runtime_overrides`,
-  );
-  if (
-    hasActiveRuntimeOverrides !== overrides.some((row) => row.status === 'active')
-    || hasStagedRuntimeOverrides !== overrides.some((row) => row.status === 'staged')
-    || hasStaleRuntimeOverrides !== overrides.some((row) => row.status === 'stale')
-  ) {
-    return fail(path, 'runtime-override flags matching their retained rows');
   }
   return {
     schemaVersion,
@@ -4974,11 +4572,6 @@ export function parseProgramRuntimeControlsSnapshot(
         `${path}.recovery_fences.pose_source_apply_generation`,
       ),
     },
-    hasActiveRuntimeOverrides,
-    hasStagedRuntimeOverrides,
-    hasStaleRuntimeOverrides,
-    overrides,
-    promotionProposals,
     retryCounts,
     audit,
   };
@@ -5040,11 +4633,20 @@ function parseCycleRecoveryOffer(
     'stop_certificate_id', 'stop_certificate_revision', 'status',
     'recovery_class', 'actions', 'primary_action', 'reason_code', 'message',
     'details', 'origin', 'evidence_refs', 'manual_result', 'policy',
+    'retries_used',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v3') {
-    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v3');
+  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v4') {
+    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v4');
   }
+  const policy = objectAt(record.policy, `${path}.policy`);
+  exactKeysAt(policy, ['allow_intervention', 'max_retries'], `${path}.policy`);
+  const maxRetries = integerAt(policy.max_retries, `${path}.policy.max_retries`);
+  if (maxRetries < 0 || maxRetries > 255) {
+    return fail(`${path}.policy.max_retries`, 'an integer in 0..255 (0 is Unlimited)');
+  }
+  const retriesUsed = integerAt(record.retries_used, `${path}.retries_used`);
+  if (retriesUsed < 0) return fail(`${path}.retries_used`, 'a nonnegative count');
   const actions = boundedArrayAt(record.actions, `${path}.actions`, 32)
     .map((item, index) => parseCycleRecoveryAction(
       item,
@@ -5175,62 +4777,15 @@ function parseCycleRecoveryOffer(
       ...failureContextAt(record, path),
     },
     evidenceRefs: stringArrayAt(record.evidence_refs, `${path}.evidence_refs`),
-    policy: jsonRecordAt(record.policy, `${path}.policy`),
+    policy: {
+      allowIntervention: booleanAt(
+        policy.allow_intervention,
+        `${path}.policy.allow_intervention`,
+      ),
+      maxRetries,
+    },
+    retriesUsed,
   };
-}
-
-function parseRuntimeOverrideObservationCandidate(
-  value: unknown,
-  path: string,
-): RuntimeOverrideObservationCandidate {
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'available', 'reason_code', 'reason', 'program_run_id',
-    'node_instance_id', 'node_attempt_id', 'node_id', 'parameter_id', 'value',
-    'source_observation_id', 'source_owner_generation',
-  ], path);
-  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.runtime_override_observation_candidate.v1') {
-    return fail(
-      `${path}.schema_version`,
-      'manyforge.runtime_override_observation_candidate.v1',
-    );
-  }
-  const available = booleanAt(record.available, `${path}.available`);
-  const result: RuntimeOverrideObservationCandidate = {
-    schemaVersion,
-    available,
-    reasonCode: nullableStringAt(record.reason_code, `${path}.reason_code`),
-    reason: nullableStringAt(record.reason, `${path}.reason`),
-    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
-    nodeInstanceId: nullableStringAt(record.node_instance_id, `${path}.node_instance_id`),
-    nodeAttemptId: nullableStringAt(record.node_attempt_id, `${path}.node_attempt_id`),
-    nodeId: nullableStringAt(record.node_id, `${path}.node_id`),
-    parameterId: nullableStringAt(record.parameter_id, `${path}.parameter_id`),
-    value: record.value === null ? null : jsonValueAt(record.value, `${path}.value`),
-    sourceObservationId: nullableStringAt(
-      record.source_observation_id,
-      `${path}.source_observation_id`,
-    ),
-    sourceOwnerGeneration: nullablePositiveIntegerAt(
-      record.source_owner_generation,
-      `${path}.source_owner_generation`,
-    ),
-  };
-  const exactAvailable = result.nodeInstanceId !== null
-    && result.nodeAttemptId !== null
-    && result.nodeId !== null
-    && result.parameterId !== null
-    && result.value !== null
-    && result.sourceObservationId !== null
-    && result.sourceOwnerGeneration !== null;
-  if (
-    (available && (!exactAvailable || result.reasonCode !== null || result.reason !== null))
-    || (!available && (result.reasonCode === null || result.reason === null))
-  ) {
-    return fail(path, 'a complete available candidate or an owner reason');
-  }
-  return result;
 }
 
 function parseExecutionSelectionControls(value: unknown, path: string): ProgramExecutionSelectionControls {
@@ -5313,13 +4868,13 @@ export function parseProgramRuntimeControlProjection(
   exactKeysAt(record, [
     'schema_version', 'owner_id', 'owner_epoch', 'program_run_id',
     'run_revision', 'runtime_controls', 'recovery_offer',
-    'observation_override_candidate', 'execution_selections',
+    'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v6') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v7') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v6',
+      'manyforge.program_runtime_control_projection.v7',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -5330,14 +4885,9 @@ export function parseProgramRuntimeControlProjection(
   const recoveryOffer = record.recovery_offer === null
     ? null
     : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
-  const observationOverrideCandidate = parseRuntimeOverrideObservationCandidate(
-    record.observation_override_candidate,
-    `${path}.observation_override_candidate`,
-  );
   if (
     runtimeControls.programRunId !== programRunId
     || (recoveryOffer !== null && recoveryOffer.programRunId !== programRunId)
-    || observationOverrideCandidate.programRunId !== programRunId
   ) {
     return fail(path, 'one exact Program-run identity');
   }
@@ -5350,7 +4900,6 @@ export function parseProgramRuntimeControlProjection(
     runtimeControls,
     recoveryOffer,
     executionSelections: parseExecutionSelectionControls(record.execution_selections, `${path}.execution_selections`),
-    observationOverrideCandidate,
   };
 }
 
@@ -5571,25 +5120,6 @@ export function parseExpressionCheckResult(value: unknown): ExpressionCheckResul
     return { name: text, type: nonEmptyStringAt(name.type, `${namePath}.type`) };
   });
   return { resultType, diagnostics, preview, names };
-}
-
-export function parseRuntimeOverrideMaterializationResponse(
-  value: unknown,
-): RuntimeOverrideMaterializationResponse {
-  const path = 'runtimeOverrideMaterialization';
-  const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    ['proposalId', 'mutation', 'details', 'workspace', 'authoringWorkspace'],
-    path,
-  );
-  return {
-    proposalId: digestAt(record.proposalId, `${path}.proposalId`),
-    mutation: stringAt(record.mutation, `${path}.mutation`),
-    details: jsonRecordAt(record.details, `${path}.details`),
-    workspace: parseProgramWorkspaceResponse(record.workspace),
-    authoringWorkspace: parseAuthoringWorkspaceSnapshot(record.authoringWorkspace),
-  };
 }
 
 function parseProgramApplyResult(
@@ -10398,6 +9928,128 @@ export function parseManualControlAvailability(value: unknown): ManualControlAva
     requestOwnerEpoch: stringAt(envelope.request_owner_epoch, `${path}.request_owner_epoch`),
     intentDigest: digestAt(envelope.intent_digest, `${path}.intent_digest`),
     available, unavailableReason, cleanupRequired, manualHandover,
+  };
+}
+
+/**
+ * The advisory node-correction preview, exactly for the request that asked.
+ * A late or foreign reply is refused rather than shown for a newer proposal.
+ */
+export function parseProgramNodeCorrectionPreview(
+  value: unknown,
+  request: ProgramNodeCorrectionPreviewRequest,
+): ProgramNodeCorrectionPreview {
+  const path = 'programNodeCorrectionPreview';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'request_id', 'program_run_id', 'program_id',
+    'program_revision', 'program_binding_id', 'node_instance_id',
+    'node_attempt_id', 'program_runner_owner_epoch', 'run_revision',
+    'retained_bundle_id', 'graph_revision', 'node_id', 'proposed_paths',
+    'parameters_digest', 'target', 'unavailable_reason', 'preview_check',
+    'preview',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_node_correction_preview.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_node_correction_preview.v1');
+  }
+  const proposedPaths = stringArrayAt(record.proposed_paths, `${path}.proposed_paths`);
+  if (
+    record.request_id !== request.request_id
+    || record.program_run_id !== request.program_run_id
+    || record.program_id !== request.program_id
+    || record.program_revision !== request.program_revision
+    || record.program_binding_id !== request.program_binding_id
+    || record.node_instance_id !== request.node_instance_id
+    || record.node_attempt_id !== request.node_attempt_id
+    || record.program_runner_owner_epoch !== request.expected_owner_epoch
+    || proposedPaths.length !== request.proposed_inputs.length
+    || proposedPaths.some((item, index) => item !== request.proposed_inputs[index].path)
+  ) {
+    return fail(path, 'the identities of the requested preview');
+  }
+  let target: ProgramNodeCorrectionPreview['target'] = null;
+  if (record.target !== null) {
+    const row = objectAt(record.target, `${path}.target`);
+    exactKeysAt(row, [
+      'target_role_id', 'component_role_id', 'controllable_component_id',
+      'command_target_id',
+    ], `${path}.target`);
+    target = {
+      targetRoleId: stringAt(row.target_role_id, `${path}.target.target_role_id`),
+      componentRoleId: stringAt(row.component_role_id, `${path}.target.component_role_id`),
+      controllableComponentId: stringAt(
+        row.controllable_component_id,
+        `${path}.target.controllable_component_id`,
+      ),
+      commandTargetId: stringAt(row.command_target_id, `${path}.target.command_target_id`),
+    };
+  }
+  let unavailableReason: ProgramNodeCorrectionPreview['unavailableReason'] = null;
+  if (record.unavailable_reason !== null) {
+    const reason = objectAt(record.unavailable_reason, `${path}.unavailable_reason`);
+    exactKeysAt(reason, ['code', 'message'], `${path}.unavailable_reason`);
+    unavailableReason = {
+      code: nonEmptyStringAt(reason.code, `${path}.unavailable_reason.code`),
+      message: stringAt(reason.message, `${path}.unavailable_reason.message`),
+    };
+  }
+  const previewCheck = nullableStringAt(record.preview_check, `${path}.preview_check`);
+  if (previewCheck !== null && previewCheck !== 'trajectory_planned_and_collision_validated') {
+    return fail(`${path}.preview_check`, 'a declared preview check');
+  }
+  let preview: ProgramNodeCorrectionPreview['preview'] = null;
+  if (record.preview !== null) {
+    const envelope = objectAt(record.preview, `${path}.preview`);
+    if (envelope.ok === true) {
+      const receipt = parseMotionPreviewResponse(envelope);
+      if (
+        receipt.requestId !== request.request_id
+        || receipt.programRunId !== request.program_run_id
+        || receipt.programBindingId !== request.program_binding_id
+        || target === null
+        || receipt.componentRoleId !== target.componentRoleId
+        || receipt.targetRoleId !== target.targetRoleId
+      ) {
+        return fail(`${path}.preview`, 'a receipt for the previewed node target');
+      }
+      preview = { ok: true, receipt };
+    } else {
+      const error = parseApiErrorDto({ detail: envelope.error });
+      if (envelope.ok !== false || error === null) {
+        return fail(`${path}.preview`, 'a native preview result or rejection');
+      }
+      preview = { ok: false, error };
+    }
+  }
+  if (
+    (unavailableReason === null) === (preview === null)
+    || (preview === null) !== (previewCheck === null)
+  ) {
+    return fail(path, 'a preview result or an unavailability reason');
+  }
+  return {
+    schemaVersion,
+    requestId: request.request_id,
+    programRunId: request.program_run_id,
+    programId: request.program_id,
+    programRevision: request.program_revision,
+    programBindingId: request.program_binding_id,
+    nodeInstanceId: request.node_instance_id,
+    nodeAttemptId: request.node_attempt_id,
+    programRunnerOwnerEpoch: request.expected_owner_epoch,
+    runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
+    retainedBundleId: digestAt(record.retained_bundle_id, `${path}.retained_bundle_id`),
+    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
+    nodeId: nullableStringAt(record.node_id, `${path}.node_id`),
+    proposedPaths,
+    parametersDigest: record.parameters_digest === null
+      ? null
+      : digestAt(record.parameters_digest, `${path}.parameters_digest`),
+    target,
+    unavailableReason,
+    previewCheck: previewCheck as ProgramNodeCorrectionPreview['previewCheck'],
+    preview,
   };
 }
 

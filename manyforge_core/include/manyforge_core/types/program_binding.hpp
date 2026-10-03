@@ -12,7 +12,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kProgramBindingApiVersion =
-    "manyforge.program_binding.v1";
+    "manyforge.program_binding.v2";
 inline constexpr std::size_t kMaxProgramRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramNestedRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramCapabilityBindings = 4096U;
@@ -162,7 +162,7 @@ struct ProgramBindingProvenanceDTO final {
                          const ProgramBindingProvenanceDTO&) = default;
 };
 
-/// Complete closed `manyforge.program_binding.v1` semantic value.
+/// Complete closed `manyforge.program_binding.v2` semantic value.
 ///
 /// This aggregate is an untrusted value representation. The deployment
 /// package's binding compiler and reload authority are the only producers of

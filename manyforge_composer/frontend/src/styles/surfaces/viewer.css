@@ -568,6 +568,20 @@ svg.viewer-camera-icon {
   flex: 0 1 auto;
 }
 
+/* The coverage notice wraps inside the panel; the transport is otherwise
+   single-line. It takes its own row between the title and the groups. */
+.transport-motion-panel:has(> .hint) {
+  grid-template-rows: 1.2rem auto minmax(0, 1fr);
+}
+
+.transport-motion-panel > .hint {
+  min-width: 0;
+  margin: 0;
+  padding-inline: 0.2rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .transport-panel-title {
   min-width: 0;
   margin: 0;

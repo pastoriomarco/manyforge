@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:f862d4ff526ce607ec2b4d6196eda87b370526fac52fe481c28edab0206cbdf4
+program_revision: sha256:95032da65ef8f09e3f8cc0a120e604c6f55f35b496f096bba75835b70020ce60
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
@@ -147,28 +147,24 @@ parameters:
   constraints:
     min_exclusive: 0.0
     max_inclusive: 1.0
-  runtime_mutability: before_run
   description: Acceleration scale shared by the two planned motions.
 - parameter_id: max_blend_deviation_rad
   type: float64
   default: 0.01
   constraints:
     min_inclusive: 0.0
-  runtime_mutability: before_run
   description: Default maximum Cartesian blend deviation.
 - parameter_id: max_tcp_linear_speed_mps
   type: float64
   default: 0.15
   constraints:
     min_exclusive: 0.0
-  runtime_mutability: before_run
   description: Maximum TCP linear speed shared by the two robots.
 - parameter_id: translation_tol_m
   type: float64
   default: 0.005
   constraints:
     min_exclusive: 0.0
-  runtime_mutability: before_run
   description: Default Cartesian translation tolerance.
 - parameter_id: velocity_scale
   type: float64
@@ -176,7 +172,6 @@ parameters:
   constraints:
     min_exclusive: 0.0
     max_inclusive: 1.0
-  runtime_mutability: before_run
   description: Velocity scale shared by the two planned motions.
 execution_groups:
   robot_group:

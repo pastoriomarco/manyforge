@@ -823,12 +823,31 @@ export function candidateRobotPresentation(
   descriptor: ManualControlMotionDescriptor,
   measured: Readonly<Record<string, RuntimeLinkTransform>>,
 ): CandidateRobotPresentation | null {
+  // A manual preview is planned through the manual-control binding whose
+  // roles the descriptor carries.
+  if (
+    receipt.componentRoleId !== descriptor.componentRoleId
+    || receipt.targetRoleId !== descriptor.targetRoleId
+  ) return null;
+  return resolvedPreviewRobotPresentation(receipt, manifest, descriptor, measured);
+}
+
+/**
+ * The robot ghost of a receipt whose binding identity the caller already
+ * resolved to this physical target's descriptor, for example a Program move
+ * resolved through the Applied Program binding, whose role ids need not be
+ * the manual-control binding's. The artifact and joint checks still apply.
+ */
+export function resolvedPreviewRobotPresentation(
+  receipt: MotionPreviewReceipt,
+  manifest: SceneUrdfManifest,
+  descriptor: ManualControlMotionDescriptor,
+  measured: Readonly<Record<string, RuntimeLinkTransform>>,
+): CandidateRobotPresentation | null {
   if (
     receipt.retainedBundleId !== manifest.retained_bundle_id
     || receipt.graphRevision !== manifest.graph_revision
     || receipt.sourceJointNames.length !== receipt.finalPositionsRad.length
-    || receipt.componentRoleId !== descriptor.componentRoleId
-    || receipt.targetRoleId !== descriptor.targetRoleId
     || receipt.sourceJointNames.length !== descriptor.joints.length
     || new Set(receipt.sourceJointNames).size !== receipt.sourceJointNames.length
     || receipt.finalPositionsRad.some((value) => !Number.isFinite(value))

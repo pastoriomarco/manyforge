@@ -31,11 +31,7 @@ def _legacy_pick_document() -> dict:
         "node_id": "motion.pick_object",
         "instance_id": subtree["instance_id"],
         "parameters": parameters,
-        "modification_policy": {
-            "runtime_override": "human_approval",
-            "persistent_edit": "human_approval",
-            "intervention_delegate": "human_only",
-        },
+        "recovery_policy": {"allow_intervention": True, "max_retries": 2},
         "operator_stop_policy": "hold",
         "children": [],
     }
@@ -60,7 +56,7 @@ def test_composite_pick_migrates_to_visible_ordinary_subtree() -> None:
 
     assert subtree["node_id"] == "sequence"
     assert subtree["instance_id"] == "pick_left_part"
-    assert subtree["modification_policy"]["runtime_override"] == "human_approval"
+    assert subtree["recovery_policy"] == {"allow_intervention": True, "max_retries": 2}
     assert subtree["operator_stop_policy"] == "hold"
     assert [child["node_id"] for child in subtree["children"]] == [
         "planning.plan_pick_sequence",

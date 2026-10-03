@@ -7,6 +7,7 @@ import { errorMessage } from '../state/structuralResource';
 import {
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
+  draftEditUnavailableReason,
   projectFacts,
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
@@ -86,8 +87,10 @@ export function useAuthoringWorkspace(
     // the exact record (never merely the latest one) identifies its Apply.
     const request = unknownRequest.current;
     if (submission.current !== 'unknown' || request === null) return;
+    // An Apply sent with a shared correlation (Apply after Reset) is
+    // recorded under that correlation instead of its own request id.
     const record = managerAdmission.records.find(
-      (candidate) => candidate.request.correlationId === request.requestId,
+      (candidate) => candidate.request.correlationId === (request.correlationId ?? request.requestId),
     );
     if (record === undefined) return;
     const identity = { applyId: record.applyId, applyGeneration: record.applyGeneration };
@@ -191,17 +194,25 @@ export function useAuthoringWorkspace(
   const ownerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
     : authoringUnavailableReason(published, snapshot) ?? managerAdmission.reason;
-  const unavailableReason = submissionState === null ? ownerReason
+  // A Draft edit is also admitted while a held run has all motion stopped.
+  const editOwnerReason = transportStatus !== 'connected'
+    ? 'Current backend status is unavailable.'
+    : draftEditUnavailableReason(published, snapshot) ?? managerAdmission.reason;
+  const submissionReason = submissionState === null ? null
     : submissionState === 'unknown' ? 'Submission outcome is unconfirmed; inspect backend status before further changes.'
       : 'Waiting for the submitted operation to be observed by the backend.';
-  const beginMutation = useCallback(() => {
-    if (submission.current !== null || ownerReason !== null) return false;
+  const unavailableReason = submissionReason ?? ownerReason;
+  const editUnavailableReason = submissionReason ?? editOwnerReason;
+  /** `edit`: a Draft-only edit (or Discard); `document`: every other action. */
+  const beginMutation = useCallback((kind: 'edit' | 'document' = 'document') => {
+    if (submission.current !== null
+      || (kind === 'edit' ? editOwnerReason : ownerReason) !== null) return false;
     submission.current = 'sending';
     unknownRequest.current = null;
     setRecheckMessage(null);
     setSubmissionState('sending');
     return true;
-  }, [ownerReason]);
+  }, [editOwnerReason, ownerReason]);
   const finishMutation = useCallback((accepted: ManagerApplyIdentity | null = null, failure?: unknown) => {
     // Only a definite client refusal proves that the effect was not accepted.
     // A transport/parse/server failure is not permission to replay a mutation.
@@ -270,6 +281,8 @@ export function useAuthoringWorkspace(
     current,
     /** Stable reason authoring is unavailable, or ``null`` when it is. */
     unavailableReason,
+    /** Why a Draft-only edit (or Discard) is unavailable, or ``null``. */
+    editUnavailableReason,
     /** The Scenario project facts of the installed publication. */
     project: facts,
     reading,
@@ -284,7 +297,7 @@ export function useAuthoringWorkspace(
     rechecking,
     recheckMessage,
     recheckSubmission,
-  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply, submissionState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
+  }), [current, error, facts, published, reading, refresh, unavailableReason, editUnavailableReason, beginMutation, finishMutation, observeApply, submissionState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

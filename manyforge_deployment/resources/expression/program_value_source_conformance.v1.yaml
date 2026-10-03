@@ -12,9 +12,9 @@
 schema: manyforge.program_value_source_conformance.v1
 
 parameters:
-  - {parameter_id: label, type: string, default: tray, runtime_mutability: before_run}
-  - {parameter_id: pitch, type: float64, default: 0.05, runtime_mutability: before_run}
-  - {parameter_id: start, type: int64, default: 1, runtime_mutability: before_run}
+  - {parameter_id: label, type: string, default: tray}
+  - {parameter_id: pitch, type: float64, default: 0.05}
+  - {parameter_id: start, type: int64, default: 1}
 
 blackboard_keys:
   - key: answer

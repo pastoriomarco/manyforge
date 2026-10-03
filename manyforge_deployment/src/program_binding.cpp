@@ -143,9 +143,7 @@ void require_text(std::string_view value, std::string_view path,
 
 [[nodiscard]] bool is_default_node_policy(
     const core::ProgramNodePolicyDTO& policy) {
-  return policy.modification_policy ==
-             core::ProgramNodeModificationPolicyDTO{} &&
-         policy.recovery_policy == core::ProgramNodeRecoveryPolicyDTO{} &&
+  return policy.recovery_policy == core::ProgramNodeRecoveryPolicyDTO{} &&
          policy.operator_stop_policy ==
              core::ProgramOperatorStopPolicy::kInherit;
 }
@@ -164,200 +162,20 @@ void validate_node_policy(const core::ProgramNodePolicyDTO& policy,
                    })) {
     fail(std::string(path) + ".instance_id: expected lower-case Program ID");
   }
-  const auto valid_modification = [](const auto value) {
-    return value == core::ProgramModificationPolicyValue::kForbidden ||
-           value == core::ProgramModificationPolicyValue::kHumanApproval ||
-           value == core::ProgramModificationPolicyValue::kLlmAllowed;
-  };
-  if (!valid_modification(policy.modification_policy.runtime_override) ||
-      !valid_modification(policy.modification_policy.persistent_edit)) {
-    fail(std::string(path) + ": invalid modification-policy enum");
-  }
-  const auto valid_delegate = [](const auto value) {
-    return value == core::ProgramInterventionDelegate::kForbidden ||
-           value == core::ProgramInterventionDelegate::kHumanOnly ||
-           value == core::ProgramInterventionDelegate::kLlmAllowed ||
-           value == core::ProgramInterventionDelegate::kProgramOnly;
-  };
-  if (!valid_delegate(policy.modification_policy.intervention_delegate)) {
-    fail(std::string(path) + ": invalid intervention-delegate enum");
-  }
-  if (policy.recovery_policy.allowed_recovery_actions.size() > 2U ||
-      !std::is_sorted(
-          policy.recovery_policy.allowed_recovery_actions.begin(),
-          policy.recovery_policy.allowed_recovery_actions.end()) ||
-      std::adjacent_find(
-          policy.recovery_policy.allowed_recovery_actions.begin(),
-          policy.recovery_policy.allowed_recovery_actions.end()) !=
-          policy.recovery_policy.allowed_recovery_actions.end()) {
-    fail(std::string(path) + ": recovery actions are not sorted and unique");
-  }
-  for (const auto action : policy.recovery_policy.allowed_recovery_actions) {
-    if (action != core::ProgramRecoveryAction::kIntervention &&
-        action != core::ProgramRecoveryAction::kRuntimeOverride) {
-      fail(std::string(path) + ": invalid recovery action");
-    }
-  }
-  if (policy.recovery_policy.allowed_skills.size() >
-          core::kMaxProgramAllowedSkills ||
-      !std::is_sorted(policy.recovery_policy.allowed_skills.begin(),
-                      policy.recovery_policy.allowed_skills.end()) ||
-      std::adjacent_find(policy.recovery_policy.allowed_skills.begin(),
-                         policy.recovery_policy.allowed_skills.end()) !=
-          policy.recovery_policy.allowed_skills.end()) {
-    fail(std::string(path) + ": recovery bounds are invalid");
-  }
-  for (const auto& skill : policy.recovery_policy.allowed_skills) {
-    if (skill.size() > core::kMaxProgramSkillIdBytes ||
-        skill.empty() ||
-        skill.front() < 'a' || skill.front() > 'z' ||
-        !std::all_of(skill.begin(), skill.end(), [](unsigned char byte) {
-          return (byte >= 'a' && byte <= 'z') ||
-                 (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
-                 byte == '-';
-        })) {
-      fail(std::string(path) + ": allowed skill is not a portable lower-case ID");
-    }
-  }
-  const auto valid_ceiling = [](const auto value) {
-    return value == core::ProgramRecoveryPersistenceCeiling::kSessionOnly ||
-           value == core::ProgramRecoveryPersistenceCeiling::kRuntimeOverride ||
-           value == core::ProgramRecoveryPersistenceCeiling::kDraftPatch;
-  };
-  if (!valid_ceiling(policy.recovery_policy.persistence_ceiling)) {
-    fail(std::string(path) + ": invalid recovery persistence ceiling");
+  if (policy.recovery_policy.max_retries > core::kMaxProgramRecoveryRetries) {
+    fail(std::string(path) + ": recovery retry budget is out of range");
   }
   if (policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kInherit &&
       policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kHold &&
       policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kContinue) {
     fail(std::string(path) + ": invalid operator Stop policy");
   }
-  const auto& actions = policy.recovery_policy.allowed_recovery_actions;
-  const bool intervention =
-      std::find(actions.begin(), actions.end(),
-                core::ProgramRecoveryAction::kIntervention) != actions.end();
-  if (policy.recovery_policy.allow_intervention != intervention) {
-    fail(std::string(path) +
-         ": allow_intervention does not match the intervention action");
-  }
-  if (!policy.recovery_policy.allowed_skills.empty() && !intervention) {
-    fail(std::string(path) + ": allowed_skills requires intervention");
-  }
-  const bool runtime_override =
-      std::find(actions.begin(), actions.end(),
-                core::ProgramRecoveryAction::kRuntimeOverride) !=
-      actions.end();
-  if (runtime_override &&
-      policy.modification_policy.runtime_override ==
-          core::ProgramModificationPolicyValue::kForbidden) {
-    fail(std::string(path) +
-         ": runtime_override action requires modification permission");
-  }
-  if (policy.recovery_policy.persistence_ceiling ==
-          core::ProgramRecoveryPersistenceCeiling::kRuntimeOverride &&
-      policy.modification_policy.runtime_override ==
-          core::ProgramModificationPolicyValue::kForbidden) {
-    fail(std::string(path) +
-         ": runtime_override persistence requires modification permission");
-  }
-  if (policy.recovery_policy.persistence_ceiling ==
-          core::ProgramRecoveryPersistenceCeiling::kDraftPatch &&
-      policy.modification_policy.persistent_edit ==
-          core::ProgramModificationPolicyValue::kForbidden) {
-    fail(std::string(path) +
-         ": draft_patch persistence requires persistent-edit permission");
-  }
-  if (!actions.empty() || policy.recovery_policy.allow_intervention ||
-      policy.recovery_policy.max_retries != 0U ||
-      !policy.recovery_policy.allowed_skills.empty() ||
-      policy.recovery_policy.persistence_ceiling !=
-          core::ProgramRecoveryPersistenceCeiling::kSessionOnly) {
-    if (actions.empty()) {
-      fail(std::string(path) +
-           ": non-default recovery policy requires an action");
-    }
-  }
-  if (!policy.recovery_policy.allowed_skills.empty()) {
-    fail(std::string(path) +
-         ": nonempty allowed_skills requires an exact revision-qualified "
-         "retained skill referent; ID-only assistant registry rows are "
-         "insufficient");
-  }
   if (is_default_node_policy(policy)) {
     fail(std::string(path) + ": default node-policy rows must be omitted");
   }
 }
 
-template <typename Enum>
-[[nodiscard]] Enum parse_policy_enum(const CanonicalValue& value,
-                                     std::string_view path);
-
-template <>
-[[nodiscard]] core::ProgramModificationPolicyValue parse_policy_enum(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
-  if (spelling == "forbidden") {
-    return core::ProgramModificationPolicyValue::kForbidden;
-  }
-  if (spelling == "human_approval") {
-    return core::ProgramModificationPolicyValue::kHumanApproval;
-  }
-  if (spelling == "llm_allowed") {
-    return core::ProgramModificationPolicyValue::kLlmAllowed;
-  }
-  fail(std::string(path) + ": invalid modification-policy enum");
-}
-
-template <>
-[[nodiscard]] core::ProgramInterventionDelegate parse_policy_enum(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
-  if (spelling == "forbidden") {
-    return core::ProgramInterventionDelegate::kForbidden;
-  }
-  if (spelling == "human_only") {
-    return core::ProgramInterventionDelegate::kHumanOnly;
-  }
-  if (spelling == "llm_allowed") {
-    return core::ProgramInterventionDelegate::kLlmAllowed;
-  }
-  if (spelling == "program_only") {
-    return core::ProgramInterventionDelegate::kProgramOnly;
-  }
-  fail(std::string(path) + ": invalid intervention-delegate enum");
-}
-
-template <>
-[[nodiscard]] core::ProgramRecoveryPersistenceCeiling parse_policy_enum(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
-  if (spelling == "session_only") {
-    return core::ProgramRecoveryPersistenceCeiling::kSessionOnly;
-  }
-  if (spelling == "runtime_override") {
-    return core::ProgramRecoveryPersistenceCeiling::kRuntimeOverride;
-  }
-  if (spelling == "draft_patch") {
-    return core::ProgramRecoveryPersistenceCeiling::kDraftPatch;
-  }
-  fail(std::string(path) + ": invalid recovery persistence ceiling");
-}
-
-template <>
-[[nodiscard]] core::ProgramRecoveryAction parse_policy_enum(
-    const CanonicalValue& value, std::string_view path) {
-  const auto& spelling = require_string(value, path);
-  if (spelling == "intervention") {
-    return core::ProgramRecoveryAction::kIntervention;
-  }
-  if (spelling == "runtime_override") {
-    return core::ProgramRecoveryAction::kRuntimeOverride;
-  }
-  fail(std::string(path) + ": invalid recovery action");
-}
-
-template <>
-[[nodiscard]] core::ProgramOperatorStopPolicy parse_policy_enum(
+[[nodiscard]] core::ProgramOperatorStopPolicy parse_operator_stop_policy(
     const CanonicalValue& value, std::string_view path) {
   const auto& spelling = require_string(value, path);
   if (spelling == "inherit") {
@@ -376,8 +194,9 @@ template <>
                                                 std::string_view path) {
   const auto* number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
-      *number > 255.0 || std::trunc(*number) != *number) {
-    fail(std::string(path) + ": expected integer in 0..255");
+      *number > static_cast<double>(core::kMaxProgramRecoveryRetries) ||
+      std::trunc(*number) != *number) {
+    fail(std::string(path) + ": expected integer in 0..255 (0 is Unlimited)");
   }
   return static_cast<std::uint8_t>(*number);
 }
@@ -386,118 +205,28 @@ template <>
     const CanonicalValue& value, std::string_view path) {
   const auto& root = require_object(value, path);
   require_exact_fields(
-      root,
-      {"instance_id", "modification_policy", "recovery_policy",
-       "operator_stop_policy"},
-      path);
-  const auto& modification = require_object(
-      require_member(root, "modification_policy", path),
-      child_path(path, "modification_policy"));
-  require_exact_fields(
-      modification,
-      {"runtime_override", "persistent_edit", "intervention_delegate"},
-      child_path(path, "modification_policy"));
+      root, {"instance_id", "recovery_policy", "operator_stop_policy"}, path);
+  const auto recovery_path = child_path(path, "recovery_policy");
   const auto& recovery = require_object(
-      require_member(root, "recovery_policy", path),
-      child_path(path, "recovery_policy"));
-  require_exact_fields(
-      recovery,
-      {"allow_intervention", "allowed_recovery_actions", "max_retries",
-       "allowed_skills", "persistence_ceiling"},
-      child_path(path, "recovery_policy"));
-  const auto allow = require_member(recovery, "allow_intervention",
-                                    child_path(path, "recovery_policy"));
+      require_member(root, "recovery_policy", path), recovery_path);
+  require_exact_fields(recovery, {"allow_intervention", "max_retries"},
+                       recovery_path);
+  const auto& allow =
+      require_member(recovery, "allow_intervention", recovery_path);
   if (!allow.is_bool()) {
-    fail(std::string(path) + ".recovery_policy.allow_intervention: expected boolean");
-  }
-  const auto actions_path =
-      child_path(child_path(path, "recovery_policy"),
-                 "allowed_recovery_actions");
-  const auto& actions = require_array(
-      require_member(recovery, "allowed_recovery_actions",
-                     child_path(path, "recovery_policy")),
-      actions_path);
-  if (actions.size() > 2U) {
-    fail(actions_path + ": exceeds closed action bound");
-  }
-  std::vector<core::ProgramRecoveryAction> parsed_actions;
-  for (std::size_t index = 0U; index < actions.size(); ++index) {
-    parsed_actions.push_back(parse_policy_enum<core::ProgramRecoveryAction>(
-        actions[index], index_path(actions_path, index)));
-  }
-  const auto action_less = [](const auto left, const auto right) {
-    return left < right;
-  };
-  if (!std::is_sorted(parsed_actions.begin(), parsed_actions.end(),
-                      action_less) ||
-      std::adjacent_find(parsed_actions.begin(), parsed_actions.end()) !=
-          parsed_actions.end()) {
-    fail(actions_path + ": must be duplicate-free and canonical-sorted");
-  }
-  const auto& skills_value = require_member(
-      recovery, "allowed_skills", child_path(path, "recovery_policy"));
-  const auto skills_path =
-      child_path(child_path(path, "recovery_policy"), "allowed_skills");
-  const auto& skills = require_array(skills_value, skills_path);
-  if (skills.size() > core::kMaxProgramAllowedSkills) {
-    fail(skills_path + ": exceeds the 256-skill bound");
-  }
-  std::vector<std::string> parsed_skills;
-  for (std::size_t index = 0U; index < skills.size(); ++index) {
-    const auto item_path = index_path(skills_path, index);
-    const auto& skill = require_string(skills[index], item_path);
-    if (skill.size() > core::kMaxProgramSkillIdBytes) {
-      fail(item_path + ": exceeds the 128-byte skill ID bound");
-    }
-    if (skill.empty() || skill.front() < 'a' || skill.front() > 'z' ||
-        !std::all_of(skill.begin(), skill.end(), [](unsigned char byte) {
-          return (byte >= 'a' && byte <= 'z') ||
-                 (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
-                 byte == '-';
-        })) {
-      fail(item_path + ": expected a portable lower-case skill ID");
-    }
-    parsed_skills.push_back(skill);
-  }
-  if (!std::is_sorted(parsed_skills.begin(), parsed_skills.end()) ||
-      std::adjacent_find(parsed_skills.begin(), parsed_skills.end()) !=
-          parsed_skills.end()) {
-    fail(skills_path + ": must be duplicate-free and canonical-sorted");
+    fail(std::string(path) +
+         ".recovery_policy.allow_intervention: expected boolean");
   }
   const auto result = core::ProgramNodePolicyDTO{
       core::ProgramNodeInstanceId(require_string(
           require_member(root, "instance_id", path),
           child_path(path, "instance_id"))),
-      core::ProgramNodeModificationPolicyDTO{
-          parse_policy_enum<core::ProgramModificationPolicyValue>(
-              require_member(modification, "runtime_override",
-                             child_path(path, "modification_policy")),
-              child_path(child_path(path, "modification_policy"),
-                         "runtime_override")),
-          parse_policy_enum<core::ProgramModificationPolicyValue>(
-              require_member(modification, "persistent_edit",
-                             child_path(path, "modification_policy")),
-              child_path(child_path(path, "modification_policy"),
-                         "persistent_edit")),
-          parse_policy_enum<core::ProgramInterventionDelegate>(
-              require_member(modification, "intervention_delegate",
-                             child_path(path, "modification_policy")),
-              child_path(child_path(path, "modification_policy"),
-                         "intervention_delegate"))},
       core::ProgramNodeRecoveryPolicyDTO{
           allow.as_bool(),
-          std::move(parsed_actions),
           parse_policy_retries(
-              require_member(recovery, "max_retries",
-                             child_path(path, "recovery_policy")),
-              child_path(child_path(path, "recovery_policy"), "max_retries")),
-          std::move(parsed_skills),
-          parse_policy_enum<core::ProgramRecoveryPersistenceCeiling>(
-              require_member(recovery, "persistence_ceiling",
-                             child_path(path, "recovery_policy")),
-              child_path(child_path(path, "recovery_policy"),
-                         "persistence_ceiling"))},
-      parse_policy_enum<core::ProgramOperatorStopPolicy>(
+              require_member(recovery, "max_retries", recovery_path),
+              child_path(recovery_path, "max_retries"))},
+      parse_operator_stop_policy(
           require_member(root, "operator_stop_policy", path),
           child_path(path, "operator_stop_policy"))};
   validate_node_policy(result, path);
@@ -558,7 +287,7 @@ void validate_source_record(const core::RetainedSourceRecordDTO& record,
 
 void normalize_and_validate(core::ProgramBindingDTO& value) {
   if (value.api_version != core::kProgramBindingApiVersion) {
-    fail("program_binding.api_version: expected manyforge.program_binding.v1");
+    fail("program_binding.api_version: expected manyforge.program_binding.v2");
   }
   require_digest(value.program_binding_id.value(),
                  "program_binding.program_binding_id");
@@ -926,30 +655,8 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
 
 [[nodiscard]] CanonicalValue node_policy_projection(
     const core::ProgramNodePolicyDTO& policy) {
-  CanonicalValue::Array actions;
-  actions.reserve(policy.recovery_policy.allowed_recovery_actions.size());
-  for (const auto action : policy.recovery_policy.allowed_recovery_actions) {
-    actions.emplace_back(std::string(core::to_string(action)));
-  }
-  CanonicalValue::Array skills;
-  skills.reserve(policy.recovery_policy.allowed_skills.size());
-  for (const auto& skill : policy.recovery_policy.allowed_skills) {
-    skills.emplace_back(skill);
-  }
   return CanonicalValue(CanonicalValue::Object{
       {"instance_id", CanonicalValue(policy.instance_id.value())},
-      {"modification_policy",
-       CanonicalValue(CanonicalValue::Object{
-           {"intervention_delegate",
-            CanonicalValue(std::string(core::to_string(
-                policy.modification_policy.intervention_delegate)))},
-           {"persistent_edit",
-            CanonicalValue(std::string(core::to_string(
-                policy.modification_policy.persistent_edit)))},
-           {"runtime_override",
-            CanonicalValue(std::string(core::to_string(
-                policy.modification_policy.runtime_override)))},
-       })},
       {"operator_stop_policy",
        CanonicalValue(std::string(
            core::to_string(policy.operator_stop_policy)))},
@@ -957,13 +664,8 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
        CanonicalValue(CanonicalValue::Object{
            {"allow_intervention",
             CanonicalValue(policy.recovery_policy.allow_intervention)},
-           {"allowed_recovery_actions", CanonicalValue(std::move(actions))},
-           {"allowed_skills", CanonicalValue(std::move(skills))},
            {"max_retries", CanonicalValue(static_cast<double>(
                                policy.recovery_policy.max_retries))},
-           {"persistence_ceiling",
-            CanonicalValue(std::string(core::to_string(
-                policy.recovery_policy.persistence_ceiling)))},
        })},
   });
 }

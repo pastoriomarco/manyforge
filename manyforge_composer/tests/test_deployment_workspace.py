@@ -831,6 +831,23 @@ class _Coordinator:
             )
         return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
 
+    def execute_draft_edit(
+        self, _envelope, *, workspace, session, draft_id, expected_identity,
+        install, validate=None, **_kwargs,
+    ):
+        if validate is not None:
+            validate()
+        commit = (
+            workspace.commit_deployment if session == "deployment"
+            else workspace.commit_program
+        )
+        return LocalAuthoringCommit(
+            snapshot=commit(
+                draft_id=draft_id, expected_identity=expected_identity, install=install
+            ),
+            admission_generation=2,
+        )
+
 
 class _Headless:
     pass
@@ -973,7 +990,6 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
             "deployment": applied,
             "model_source_closure": {},
             "program_role_assignment": {},
-            "typed_parameter_overrides": {},
             "source_document_digest": _DIGEST,
             "scenario_id": "cell_a",
         },
@@ -1373,7 +1389,6 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             "program_role_assignment": json.loads(
                 (project / "assignment.yaml").read_text(encoding="utf-8")
             ),
-            "typed_parameter_overrides": {},
         },
         document_path=str(project),
         source_document_digest="sha256:" + "6" * 64,
@@ -1428,7 +1443,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         prepare_only=False,
     ):
         prepared_activation = {
-            "schema_version": "manyforge.prepared_activation_input.v3",
+            "schema_version": "manyforge.prepared_activation_input.v5",
             "prepared_activation_id": "sha256:" + "9" * 64,
             "source_document_digest": intent["source_document_digest"],
             "captured_input_digest": intent["captured_input_digest"],
@@ -1441,7 +1456,6 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
             "node_environment_digest": "sha256:" + "d" * 64,
             "assistant_mode": "forbidden",
-            "typed_parameter_overrides": {},
         }
         if prepared is None:
             confirmation_required = (
@@ -1516,11 +1530,59 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert effects[-1][0]["deployment"] == edited["draft"]["document"]
     capture_calls_after_preparation = capture_calls
 
+    # The confirmation covers the complete activation input: the Program
+    # Draft, assignment and source the Deployment compiles with too. Any of
+    # them changed since is a named pre-effect refusal.
+    program_snapshot = state.draft_session.snapshot()
+    scope = {
+        "deploymentDraftId": edited["draft"]["id"],
+        "deploymentDraftRevision": edited["draft"]["revision"],
+        "deploymentRevision": edited["draft"]["deploymentRevision"],
+        "programDraftId": program_snapshot["draft_id"],
+        "programDraftRevision": program_snapshot["draft_revision"],
+        "programRevision": program_snapshot["program_revision"],
+        "sourceDocumentDigest": "sha256:" + "6" * 64,
+        "programRoleAssignment": state.scenario_program_role_assignment,
+    }
+    effects_before_scope = len(effects)
+    for index, changed in enumerate(
+        (
+            {"programDraftRevision": program_snapshot["draft_revision"] + 1},
+            {"programRevision": "sha256:" + "0" * 64},
+            {"sourceDocumentDigest": "sha256:" + "5" * 64},
+            {"programRoleAssignment": {"component_roles": [], "target_roles": []}},
+            {"deploymentDraftRevision": edited["draft"]["revision"] + 1},
+        )
+    ):
+        refused = client.post(
+            "/api/deployment/draft/apply",
+            json=_request(
+                edited,
+                kind=f"apply-scope-changed-{index}",
+                confirmationToken=confirmation_token,
+                preparationRequestOwnerEpoch=confirmation.json()["result"][
+                    "preparation"
+                ]["request_owner_epoch"],
+                preparationRequestId=confirmation.json()["result"]["preparation"][
+                    "request_id"
+                ],
+                expectedActivationScope={**scope, **changed},
+            ),
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"] == {
+            "code": "activation_input_changed_after_confirmation",
+            "message": "Draft changed after confirmation; review again",
+        }
+    assert len(effects) == effects_before_scope
+    assert capture_calls == capture_calls_after_preparation
+
     applied = client.post(
         "/api/deployment/draft/apply",
         json=_request(
             edited,
             kind="apply-confirmed",
+            expectedActivationScope=scope,
             confirmationToken=confirmation_token,
             preparationRequestOwnerEpoch=confirmation.json()["result"][
                 "preparation"
@@ -1545,6 +1607,43 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         confirmation.json()["result"]["prepared_activation"]
     )
 
+    # Nothing to apply: the Manager's Applied activation already is every
+    # input (Deployment, sources, assignment, Scenario) and the Applied
+    # Program is the Program Draft. Refused before admission or preparation.
+    applied_context = {
+        "deployment": deepcopy(edited["draft"]["document"]),
+        "model_source_closure": capture_sources(
+            state, edited["draft"]["document"]
+        ),
+        "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
+        "source_document_digest": "sha256:" + "6" * 64,
+        "scenario_id": "lite6_pick_and_place",
+    }
+    monkeypatch.setattr(
+        state, "published_scenario", lambda: {"published_scenario": {"ready": True}}
+    )
+    monkeypatch.setattr(
+        state, "applied_activation_for_publication", lambda _p: deepcopy(applied_context)
+    )
+    applied_program = {"program_revision": program["program_revision"]}
+    CandidateHeadless.program_applied = lambda _self: applied_program  # type: ignore[attr-defined]
+    effects_before_no_op = len(effects)
+    no_op = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(edited, kind="apply-no-op", local=False),
+    )
+    assert no_op.status_code == 409, no_op.text
+    assert no_op.json()["detail"]["code"] == "deployment_apply_nothing_to_apply"
+    assert no_op.json()["detail"]["message"].startswith("Nothing to apply")
+    assert len(effects) == effects_before_no_op
+    # A Program Draft that differs from Applied is something to apply.
+    applied_program["program_revision"] = "sha256:" + "0" * 64
+    changed = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(edited, kind="apply-program-differs", local=False),
+    )
+    assert changed.status_code == 202, changed.text
+
 
 def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -> None:
     state = ComposerState()
@@ -1557,7 +1656,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v3",
+        "schema_version": "manyforge.prepared_activation_input.v5",
         "scenario_id": "scenario-a",
         "prepared_activation_id": "sha256:" + "6" * 64,
         "source_document_digest": "sha256:" + "7" * 64,
@@ -1571,7 +1670,6 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
         "node_environment_digest": "sha256:" + "c" * 64,
         "assistant_mode": "forbidden",
-        "typed_parameter_overrides": {},
     }
     manager_requests: list[dict[str, Any]] = []
 
@@ -1596,7 +1694,6 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
             "deployment": {"api_version": "manyforge.deployment_intent.v2"},
             "model_source_closure": {},
             "program_role_assignment": {},
-            "typed_parameter_overrides": {},
             "source_document_digest": prepared_activation["source_document_digest"],
             "scenario_id": prepared_activation["scenario_id"],
         },
@@ -1943,7 +2040,6 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
         "program_draft": None,
         "deployment_draft": saved_deployment,
         "program_role_assignment": None,
-        "typed_parameter_overrides": {},
     }
     state.authoring_workspace.remember_project(
         document=saved_document,
@@ -2217,3 +2313,80 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
     else:
         assert response.status_code == 200
         assert response.json() == {"accepted": True}
+
+
+@pytest.mark.parametrize("route", ["control_command", "recovery_action"])
+def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> None:
+    state = ComposerState()
+    applied = {"program_revision": "sha256:" + "2" * 64}
+    state.draft_session.snapshot = lambda: {  # type: ignore[method-assign]
+        "program_loaded": True, "program_revision": _DIGEST,
+    }
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True, "published_scenario": applied,
+    }
+    submitted: list[str] = []
+
+    class Headless:
+        def submit_control_command(self, body):
+            submitted.append(body["payload"]["action_id"])
+            return {"accepted": True}
+
+        def cycle_recovery_action(self, body):
+            submitted.append(body["action_id"])
+            return {"accepted": True}
+
+    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    app = FastAPI()
+    app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
+    client = TestClient(app)
+
+    def recover(action_id: str):
+        payload = {
+            "request_id": f"recovery-{action_id}",
+            "request_owner_epoch": "browser-1",
+            "source_label": "test",
+            "correlation_id": None,
+            "expected_owner_epoch": "program-1",
+            "offer_id": _DIGEST,
+            "offer_revision": 1,
+            "action_id": action_id,
+            "reason": "operator-selected recovery action",
+        }
+        if route == "recovery_action":
+            return client.post("/api/cycle/recovery-actions", json=payload)
+        return client.post("/api/control/commands", json={
+            "command_envelope": {
+                "schema_version": "manyforge.execution_command.v1",
+                "command_kind": "execution_recovery",
+                "correlation_id": f"recovery-{action_id}",
+                "source_label": "test",
+                "control_session_id": None,
+                "client_sequence": None,
+                "freshness": {
+                    "context_id": "freshness-1",
+                    "receiver_incarnation": "headless-1",
+                    "semantic_owner_epoch": "program-1",
+                    "execution_control_revision": 1,
+                    "issued_server_sequence": "1",
+                    "valid_for_ns": 750_000_000,
+                },
+                "expected_semantic_owner_epoch": "program-1",
+                "expected_execution_control_revision": 1,
+            },
+            "payload": payload,
+        })
+
+    refused = recover("retry_motion_from_current_state")
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "execution_program_draft_unapplied"
+    assert refused.json()["detail"]["message"].startswith("Apply or Discard first")
+    assert recover("acknowledge_and_continue").status_code == 409
+    # Reset ends the run; it is how an Apply of the edited Draft begins.
+    assert recover("reset_cycle").status_code == 200
+    assert submitted == ["reset_cycle"]
+
+    # Applied (or Discarded): the Draft is exactly what is Applied again.
+    applied["program_revision"] = _DIGEST
+    assert recover("retry_motion_from_current_state").status_code == 200
+    assert submitted == ["reset_cycle", "retry_motion_from_current_state"]

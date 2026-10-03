@@ -107,11 +107,6 @@ export function ProgramRuntimePanel({
     cycleState,
     cycleFailure,
     refresh,
-    activateRuntimeOverride,
-    clearRuntimeOverride,
-    promoteRuntimeOverride,
-    materializePromotion,
-    promotionMaterializationReason,
     writeRuntimeBlackboard,
     persistentValues,
     commandAllowed,
@@ -155,7 +150,7 @@ export function ProgramRuntimePanel({
         ? 'Unknown'
         : MOTION_STATE_LABEL[allMotion.state] ?? 'Unknown';
   const hasAdvanced = enabled && (
-    controls !== null
+    (controls !== null && controls.audit.length > 0)
     || (state.run !== null && writableKeys.length > 0)
     || hasPersistentKeys
   );
@@ -347,7 +342,16 @@ export function ProgramRuntimePanel({
           </p>
           <p className="hint">
             Use Retry in the Motion panel to retry this node and resume the
-            Program&apos;s motion, or Reset to end the run.
+            Program&apos;s motion, or Reset to end the run. To correct its
+            inputs first, change a runtime value for this run under Advanced
+            below, or edit the Draft: Apply then Resets the run, and Retry,
+            Resume and Execute wait until the edits are Applied or Discarded.
+          </p>
+          <p className="hint">
+            Retry limit {recoveryOffer.policy.maxRetries === 0
+              ? 'Unlimited'
+              : `${recoveryOffer.policy.maxRetries}`} · {recoveryOffer.retriesUsed} used
+            {recoveryOffer.policy.allowIntervention ? '' : ' · intervention not allowed'}
           </p>
           {/* Kept visible but disabled: the backend path exists, but operator
               use is pending design (open point U10). */}
@@ -397,76 +401,7 @@ export function ProgramRuntimePanel({
       {/* Rarely needed tools, kept out of the way; they exist only during a
           run, so the section is shown only when it has content. */}
       {hasAdvanced && <details className="runtime-advanced">
-        <summary>Advanced: runtime overrides, blackboard, stored values and audit</summary>
-      {enabled && controls !== null && (
-        <section className="runtime-control-section" aria-labelledby="runtime-overrides-title">
-          <div className="runtime-control-heading">
-            <div>
-              <span>Current run only</span>
-              <h3 id="runtime-overrides-title">Runtime overrides</h3>
-            </div>
-            <code>revision {controls.runtimeControlRevision}</code>
-          </div>
-          {controls.overrides.length === 0 ? (
-            <p>No runtime overrides have been staged.</p>
-          ) : controls.overrides.map((override) => (
-            <details key={override.overrideId} className="runtime-control-record">
-              <summary>
-                {override.nodeInstanceId} · {override.parameterId} · {override.status}
-              </summary>
-              <pre>{JSON.stringify(override.value, null, 2)}</pre>
-              <div className="runtime-control-actions">
-                <button
-                  type="button"
-                  disabled={override.status !== 'staged' || state.controlPending !== null}
-                  onClick={() => activateRuntimeOverride(override)}
-                >
-                  Activate
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    !['staged', 'active'].includes(override.status)
-                    || state.controlPending !== null
-                  }
-                  onClick={() => clearRuntimeOverride(override)}
-                >
-                  Clear
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    !['staged', 'active'].includes(override.status)
-                    || state.controlPending !== null
-                  }
-                  onClick={() => promoteRuntimeOverride(override)}
-                >
-                  Request Draft promotion
-                </button>
-              </div>
-            </details>
-          ))}
-          {controls.promotionProposals.map((proposal) => {
-            const unavailable = promotionMaterializationReason(proposal);
-            return (
-              <div key={proposal.proposalId} className="runtime-control-record">
-                <span>
-                  Draft promotion · {proposal.nodeInstanceId} · {proposal.status}
-                </span>
-                <button
-                  type="button"
-                  disabled={unavailable !== null}
-                  title={unavailable ?? undefined}
-                  onClick={() => { void materializePromotion(proposal); }}
-                >
-                  Apply to Draft
-                </button>
-              </div>
-            );
-          })}
-        </section>
-      )}
-
+        <summary>Advanced: runtime blackboard, stored values and audit</summary>
       {enabled && state.run !== null && writableKeys.length > 0 && (
         <section className="runtime-control-section" aria-labelledby="runtime-blackboard-title">
           <div className="runtime-control-heading">
@@ -1036,7 +971,8 @@ export function ProgramTransportControls({
   const canResumeFullStop = enabled
     && !manualResident
     && programFullStopped
-    && state.pending === null;
+    && state.pending === null
+    && program.draftUnappliedReason === null;
   const canRunOrResume = canRun || canResumeFullStop;
   const canReset = enabled
     && state.pending === null
@@ -1067,7 +1003,8 @@ export function ProgramTransportControls({
     && retryAction !== null
     && retryAction.enabled
     && state.pending === null
-    && state.controlPending === null;
+    && state.controlPending === null
+    && program.draftUnappliedReason === null;
   const canProgramHalt = enabled
     && state.runnerAvailable
     && cycleState === 'running'
@@ -1301,7 +1238,8 @@ export function ProgramTransportControls({
                   disabled={retryAction !== null ? !canRetry : !canGroupRelease}
                   title={retryAction !== null && failureOffer !== null
                     ? retryAction.enabled
-                      ? `Retry ${failureOffer.nodeInstanceId} and let all the Program's motion continue.`
+                      ? program.draftUnappliedReason
+                        ?? `Retry ${failureOffer.nodeInstanceId} and let all the Program's motion continue.`
                       : retryAction.disabledReasonCode === 'failure_pause_containment_unconfirmed'
                         ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
                         : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`
@@ -1309,7 +1247,8 @@ export function ProgramTransportControls({
                       ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                       : group.state === 'running'
                         ? `${group.groupId} motion is running.`
-                        : group.resumeUnavailableReason?.replaceAll('_', ' ')
+                        : program.draftUnappliedReason
+                          ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
                           ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
                     if (retryAction !== null) {
@@ -1376,7 +1315,7 @@ export function ProgramTransportControls({
                 ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
                   ? 'Execute the exact Applied Program without starting robot motion.'
-                  : (cycleState === 'idle_after_reset' ? program.startBlockedReason : null)
+                  : program.draftUnappliedReason
                     ?? blockedReason
                     ?? 'Execute requires an Applied Program and an idle, reset runner.'}
             onClick={() => {

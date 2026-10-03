@@ -309,7 +309,6 @@ export function ProgramDeclarationsEditor({
   const [parameterType, setParameterType] = useState('float64');
   const [defaultText, setDefaultText] = useState('0');
   const [constraintsText, setConstraintsText] = useState('{}');
-  const [mutability, setMutability] = useState<ProgramParameterDeclaration['runtime_mutability']>('before_run');
   const [parameterDescription, setParameterDescription] = useState('');
   const [namespaceId, setNamespaceId] = useState('');
   const [namespaceDescription, setNamespaceDescription] = useState('');
@@ -383,7 +382,6 @@ export function ProgramDeclarationsEditor({
     || parameterType !== selectedParameter.type
     || defaultText !== JSON.stringify(selectedParameter.default, null, 2)
     || constraintsText !== JSON.stringify(selectedParameter.constraints ?? {}, null, 2)
-    || mutability !== selectedParameter.runtime_mutability
     || parameterDescription !== (selectedParameter.description ?? '')
   );
   const namespaceDirty = selectedNamespace !== null && (
@@ -511,7 +509,6 @@ export function ProgramDeclarationsEditor({
     setParameterType(parameter.type);
     setDefaultText(JSON.stringify(parameter.default, null, 2));
     setConstraintsText(JSON.stringify(parameter.constraints ?? {}, null, 2));
-    setMutability(parameter.runtime_mutability);
     setParameterDescription(parameter.description ?? '');
     clearError();
   }, [clearError]);
@@ -529,7 +526,6 @@ export function ProgramDeclarationsEditor({
         type: parameterType,
         default: defaultValue,
         constraints: constraints as Record<string, JsonValue>,
-        runtime_mutability: mutability,
         ...(parameterDescription.trim()
           ? { description: parameterDescription.trim() }
           : {}),
@@ -600,7 +596,6 @@ export function ProgramDeclarationsEditor({
         setParameterType(creationExpectedType ?? 'float64');
         setDefaultText(creationExpectedType === 'bool' ? 'false' : creationExpectedType === 'string' ? '""' : '0');
         setConstraintsText('{}');
-        setMutability('before_run');
         setParameterDescription('');
         clearError();
       }
@@ -822,7 +817,7 @@ export function ProgramDeclarationsEditor({
                 <li key={parameter.parameter_id}>
                   <button type="button" onClick={() => editParameter(parameter)}>
                     <strong>{parameter.parameter_id}</strong>
-                    <small>{parameter.type} · {parameter.runtime_mutability}</small>
+                    <small>{parameter.type}</small>
                   </button>
                   <span>
                     {usages.length} binding{usages.length === 1 ? '' : 's'}
@@ -851,7 +846,6 @@ export function ProgramDeclarationsEditor({
           }}>
             <label>Parameter ID<input id="program-parameter-id" value={parameterId} aria-invalid={errorTarget === 'program-parameter-id'} title={errorTarget === 'program-parameter-id' ? error ?? undefined : undefined} onChange={(event) => setParameterId(event.target.value)} /></label>
             <label>Type<select value={parameterType} onChange={(event) => changeParameterType(event.target.value)}>{PROGRAM_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
-            <label>Runtime mutability<select value={mutability} onChange={(event) => setMutability(event.target.value as typeof mutability)}><option value="immutable">immutable</option><option value="before_run">before run</option></select></label>
             <ProgramValueInput
               id="program-parameter-default"
               label="Default"

@@ -313,6 +313,16 @@ struct OperatorAlarmMetrics final {
   std::int64_t timestamp_ns;
 };
 
+/// The resource inventory of the exact active configuration that Headless
+/// observes through the Manager publication. Resource-scoped activations are
+/// admitted only against this inventory; it starts empty and is replaced as a
+/// whole when the active retained bundle changes.
+struct AlarmResourceRegistry final {
+  std::string retained_bundle_id;
+  std::string graph_revision;
+  std::set<std::string> resource_ids;
+};
+
 [[nodiscard]] std::string
 CanonicalAlarmConditionId(const OperatorAlarmCatalog &catalog,
                           const OperatorAlarmDefinition &definition,
@@ -337,8 +347,7 @@ public:
   using WallClock = std::function<std::string()>;
 
   AlarmLifecycleOwner(
-      OperatorAlarmCatalog catalog, std::string cell_id,
-      std::set<std::string> valid_resource_ids, std::string owner_id,
+      OperatorAlarmCatalog catalog, std::string cell_id, std::string owner_id,
       std::string owner_epoch, MonotonicClock monotonic_clock,
       WallClock wall_clock,
       std::set<std::string> required_domains = {"motion", "runtime_health",
@@ -355,6 +364,11 @@ public:
                               AlarmConditionQuality quality);
   void MarkSourceQualityUnknown(std::string_view source_id,
                                 std::string_view source_epoch);
+
+  /// Replace the active-configuration resource inventory. Existing condition
+  /// points are retained unchanged, including those naming resources that the
+  /// new configuration no longer contains.
+  void ReplaceResourceRegistry(AlarmResourceRegistry registry);
 
   [[nodiscard]] AlarmMutation Submit(AlarmConditionUpdate update);
   [[nodiscard]] AlarmMutation
@@ -422,7 +436,7 @@ private:
 
   OperatorAlarmCatalog catalog_;
   std::string cell_id_;
-  std::set<std::string> valid_resource_ids_;
+  std::optional<AlarmResourceRegistry> resource_registry_;
   std::string owner_id_;
   std::string owner_epoch_;
   MonotonicClock monotonic_clock_;

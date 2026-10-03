@@ -1296,7 +1296,7 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
     const auto &document = manifest.root();
     if (require_text(require_member(document, "api_version", "Scenario project"),
                      "Scenario project.api_version") !=
-        "manyforge.scenario.project.v1") {
+        "manyforge.scenario.project.v2") {
       throw std::invalid_argument(
           "maintained Scenario project has the wrong API version");
     }

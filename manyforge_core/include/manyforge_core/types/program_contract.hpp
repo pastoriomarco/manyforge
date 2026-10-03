@@ -22,8 +22,6 @@ inline constexpr std::size_t kMaxProgramExecutionGroups = 4096U;
 inline constexpr std::size_t kMaxProgramExecutionMemberships = kMaxProgramTreeNodes;
 inline constexpr std::size_t kMaxProgramTargetEffects = kMaxProgramTreeNodes;
 inline constexpr std::size_t kMaxProgramNodePolicies = kMaxProgramTreeNodes;
-inline constexpr std::size_t kMaxProgramAllowedSkills = 256U;
-inline constexpr std::size_t kMaxProgramSkillIdBytes = 128U;
 
 [[nodiscard]] constexpr bool valid_program_execution_group(std::string_view value) noexcept {
   if (value.empty() || value.size() > 128U || value == "inherit" || value.front() < 'a' ||
@@ -146,79 +144,6 @@ struct ProgramRunExecutionCaptureDTO final {
   std::shared_ptr<const ProgramBindingDTO> binding{};
 };
 
-enum class ProgramModificationPolicyValue : std::uint8_t {
-  kForbidden = 0,
-  kHumanApproval,
-  kLlmAllowed,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ProgramModificationPolicyValue value) noexcept {
-  switch (value) {
-    case ProgramModificationPolicyValue::kForbidden:
-      return "forbidden";
-    case ProgramModificationPolicyValue::kHumanApproval:
-      return "human_approval";
-    case ProgramModificationPolicyValue::kLlmAllowed:
-      return "llm_allowed";
-  }
-  return {};
-}
-
-enum class ProgramInterventionDelegate : std::uint8_t {
-  kForbidden = 0,
-  kHumanOnly,
-  kLlmAllowed,
-  kProgramOnly,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ProgramInterventionDelegate value) noexcept {
-  switch (value) {
-    case ProgramInterventionDelegate::kForbidden:
-      return "forbidden";
-    case ProgramInterventionDelegate::kHumanOnly:
-      return "human_only";
-    case ProgramInterventionDelegate::kLlmAllowed:
-      return "llm_allowed";
-    case ProgramInterventionDelegate::kProgramOnly:
-      return "program_only";
-  }
-  return {};
-}
-
-enum class ProgramRecoveryAction : std::uint8_t {
-  kIntervention = 0,
-  kRuntimeOverride,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ProgramRecoveryAction value) noexcept {
-  switch (value) {
-    case ProgramRecoveryAction::kIntervention:
-      return "intervention";
-    case ProgramRecoveryAction::kRuntimeOverride:
-      return "runtime_override";
-  }
-  return {};
-}
-
-enum class ProgramRecoveryPersistenceCeiling : std::uint8_t {
-  kSessionOnly = 0,
-  kRuntimeOverride,
-  kDraftPatch,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(
-    ProgramRecoveryPersistenceCeiling value) noexcept {
-  switch (value) {
-    case ProgramRecoveryPersistenceCeiling::kSessionOnly:
-      return "session_only";
-    case ProgramRecoveryPersistenceCeiling::kRuntimeOverride:
-      return "runtime_override";
-    case ProgramRecoveryPersistenceCeiling::kDraftPatch:
-      return "draft_patch";
-  }
-  return {};
-}
-
 enum class ProgramOperatorStopPolicy : std::uint8_t {
   kInherit = 0,
   kHold,
@@ -237,22 +162,14 @@ enum class ProgramOperatorStopPolicy : std::uint8_t {
   return {};
 }
 
-struct ProgramNodeModificationPolicyDTO final {
-  ProgramModificationPolicyValue runtime_override{ProgramModificationPolicyValue::kForbidden};
-  ProgramModificationPolicyValue persistent_edit{ProgramModificationPolicyValue::kForbidden};
-  ProgramInterventionDelegate intervention_delegate{ProgramInterventionDelegate::kForbidden};
-
-  friend bool operator==(const ProgramNodeModificationPolicyDTO&,
-                         const ProgramNodeModificationPolicyDTO&) = default;
-};
+/// Largest authored finite failure-retry budget; zero means Unlimited.
+inline constexpr std::uint8_t kMaxProgramRecoveryRetries = 255U;
 
 struct ProgramNodeRecoveryPolicyDTO final {
+  /// Explicit opt-in to failure intervention; never implied by the budget.
   bool allow_intervention{false};
-  std::vector<ProgramRecoveryAction> allowed_recovery_actions;
+  /// Explicit failure retries of this node per captured run; 0 is Unlimited.
   std::uint8_t max_retries{0U};
-  std::vector<std::string> allowed_skills;
-  ProgramRecoveryPersistenceCeiling persistence_ceiling{
-      ProgramRecoveryPersistenceCeiling::kSessionOnly};
 
   friend bool operator==(const ProgramNodeRecoveryPolicyDTO&,
                          const ProgramNodeRecoveryPolicyDTO&) = default;
@@ -265,7 +182,6 @@ struct ProgramNodeRecoveryPolicyDTO final {
 /// browser/editor metadata.
 struct ProgramNodePolicyDTO final {
   ProgramNodeInstanceId instance_id;
-  ProgramNodeModificationPolicyDTO modification_policy;
   ProgramNodeRecoveryPolicyDTO recovery_policy;
   ProgramOperatorStopPolicy operator_stop_policy{ProgramOperatorStopPolicy::kInherit};
 

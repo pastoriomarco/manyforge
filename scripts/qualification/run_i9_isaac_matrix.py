@@ -129,7 +129,6 @@ class ScenarioSpec:
     deployment_artifact_id: str
     cell_id: str
     component_id: str
-    runtime_resource_ids: tuple[str, ...]
     profile: str
     admission_filename: str
     program_filename: str
@@ -139,16 +138,6 @@ class ScenarioSpec:
     world_sha256: str
     required_topics: tuple[str, ...]
     required_checks: frozenset[str]
-
-
-def _runtime_resource_ids(component_id: str) -> tuple[str, ...]:
-    """Return the exact retained arm and gripper coordinate inventory."""
-
-    return tuple(
-        f"{component_id}.{domain}.coordinate.{index:06d}"
-        for domain, count in (("arm", 6), ("gripper", 1))
-        for index in range(count)
-    )
 
 
 _ISAAC_ASSET_ROOT = (
@@ -165,7 +154,6 @@ SCENARIOS: Final = (
         deployment_artifact_id="isaac_lite6_lite_gripper_pick_and_place",
         cell_id="isaac_lite6_pick_place_cell",
         component_id="isaac_lite6_robot",
-        runtime_resource_ids=_runtime_resource_ids("isaac_lite6_robot"),
         profile="lite6",
         admission_filename=(
             "canonical-empty-admission.isaac_lite6_pick_place_cell.json"
@@ -191,7 +179,6 @@ SCENARIOS: Final = (
         deployment_artifact_id="trocar_lite6_foundationpose_pick",
         cell_id="isaac_lite6_trocar_cell",
         component_id="isaac_lite6_trocar_robot",
-        runtime_resource_ids=_runtime_resource_ids("isaac_lite6_trocar_robot"),
         profile="lite6",
         admission_filename=(
             "canonical-empty-admission.isaac_lite6_trocar_cell.json"
@@ -233,7 +220,6 @@ SCENARIOS: Final = (
         deployment_artifact_id="isaac_manipulator_scene_light_ros2_control",
         cell_id="isaac_ur10e_light_cell",
         component_id="isaac_ur10e_light_robot",
-        runtime_resource_ids=_runtime_resource_ids("isaac_ur10e_light_robot"),
         profile="ur10e",
         admission_filename=(
             "canonical-empty-admission.isaac_ur10e_light_cell.json"
@@ -265,9 +251,6 @@ SCENARIOS: Final = (
         deployment_artifact_id="isaac_manipulator_scene_light_assistant",
         cell_id="isaac_ur10e_assistant_cell",
         component_id="isaac_ur10e_assistant_robot",
-        runtime_resource_ids=_runtime_resource_ids(
-            "isaac_ur10e_assistant_robot"
-        ),
         profile="ur10e",
         admission_filename=(
             "canonical-empty-admission.isaac_ur10e_assistant_cell.json"
@@ -303,9 +286,6 @@ SCENARIOS: Final = (
         ),
         cell_id="isaac_ur10e_collision_cell",
         component_id="isaac_ur10e_collision_robot",
-        runtime_resource_ids=_runtime_resource_ids(
-            "isaac_ur10e_collision_robot"
-        ),
         profile="ur10e",
         admission_filename=(
             "canonical-empty-admission.isaac_ur10e_collision_cell.json"
@@ -456,7 +436,7 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
             label=f"{spec.scenario_id} project manifest",
         )
         if (
-            manifest.get("api_version") != "manyforge.scenario.project.v1"
+            manifest.get("api_version") != "manyforge.scenario.project.v2"
             or manifest.get("scenario_id") != spec.scenario_id
         ):
             raise QualificationError(

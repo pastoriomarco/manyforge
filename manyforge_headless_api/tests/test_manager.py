@@ -26,7 +26,7 @@ def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) ->
 
 def _prepared_activation() -> dict[str, object]:
     return {
-        "schema_version": "manyforge.prepared_activation_input.v3",
+        "schema_version": "manyforge.prepared_activation_input.v5",
         "scenario_id": "scenario.1",
         "source_document_digest": "sha256:" + "1" * 64,
         "captured_input_digest": "sha256:" + "d" * 64,
@@ -39,7 +39,6 @@ def _prepared_activation() -> dict[str, object]:
         "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
         "node_environment_digest": "sha256:" + "5" * 64,
         "assistant_mode": "optional",
-        "typed_parameter_overrides": {},
         "prepared_activation_id": "sha256:" + "e" * 64,
     }
 

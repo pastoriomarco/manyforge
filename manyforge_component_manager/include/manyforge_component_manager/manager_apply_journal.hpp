@@ -407,8 +407,20 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadIntent(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
+  /// Every durable Apply status, each record digest-verified.
+  ///
+  /// All Read* operations reuse records they already decoded and verified
+  /// only while the database is provably unchanged: the same SQLite
+  /// `data_version` (no commit through any other connection) and the same
+  /// total change count of this connection (no own write). Any commit, or a
+  /// failed read, discards every reused record, so a changed or corrupted
+  /// record is re-read and re-verified by the very next read. VerifyIntegrity
+  /// always verifies the complete database.
   [[nodiscard]] std::vector<PersistedManagerApplyStatus>
   ReadStatusInventory() const;
+  /// Number of records decoded and digest-verified from SQLite (a diagnostic
+  /// for change-gated reuse; reuse does not advance it).
+  [[nodiscard]] std::uint64_t record_verification_count() const;
   /// One transactionally consistent immutable view of every durable record for
   /// exactly one Apply generation, or nullopt when that identity is unknown.
   [[nodiscard]] std::optional<PersistedManagerApplyStatus>

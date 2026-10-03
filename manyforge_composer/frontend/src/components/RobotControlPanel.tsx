@@ -408,10 +408,6 @@ export function RobotControlPanelView({
       onClick={() => { void reset(); }}
     >{controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}</button>
   );
-  const overrideCandidate = program?.state.controls
-    ?.observationOverrideCandidate ?? null;
-  const overridePending = program?.state.controlPending
-    === 'override:stage-observation';
   const presentedPose = robotControlHasLocalDraft(state) || observedMotion === null
     ? state.draftPose : observedMotion.currentTcpPose;
   const rpy = rpyDegreesFromQuaternion(presentedPose.orientation);
@@ -1212,33 +1208,6 @@ export function RobotControlPanelView({
                   </span>
                 </label>
                 </div>
-              )}
-
-              {(state.mode === 'joint'
-                || state.mode === 'pose_goal'
-                || state.mode === 'cartesian_path')
-                && overrideCandidate !== null
-                && overrideCandidate.nodeAttemptId !== null && (
-                // Assigning a pose to a Program move belongs to the move's
-                // goal in its properties ("Use current robot pose"). This
-                // block only offers the held move's recovery override.
-                <fieldset className="robot-control-stored-move">
-                  <legend>Held Program move</legend>
-                  <div className="robot-control-stored-actions">
-                    <button
-                      type="button"
-                      disabled={
-                        overrideCandidate.available !== true
-                        || program?.state.controlPending !== null
-                      }
-                      title={overrideCandidate.reason
-                        ?? 'Stage the exact source-owned observation for the held Program attempt.'}
-                      onClick={() => program?.stageObservationOverride()}
-                    >
-                      {overridePending ? 'Staging' : 'Stage as runtime override'}
-                    </button>
-                  </div>
-                </fieldset>
               )}
             </div>
 

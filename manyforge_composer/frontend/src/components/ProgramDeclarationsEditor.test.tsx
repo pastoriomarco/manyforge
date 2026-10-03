@@ -119,7 +119,7 @@ describe('Program declarations editor', () => {
         value_sources: { 'goal.position_m[2]': { kind: 'expression' as const, expression: 'key.count + 1' } },
       }],
       parameters: [{
-        parameter_id: 'tube_length', type: 'float64', default: 0.1, runtime_mutability: 'before_run' as const,
+        parameter_id: 'tube_length', type: 'float64', default: 0.1,
       }],
       namespaces: [],
       keys: [

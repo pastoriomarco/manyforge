@@ -572,6 +572,261 @@ class _ProgramScopeStop:
     unresolved: object | None = None
 
 
+class ProgramMotionPreviewUnavailableError(ProductionPortError):
+    """The node's exact motion has no representation on the native preview wire."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramMotionParticipant:
+    """One node's effect-free motion request, before any attempt or dispatch.
+
+    Program execution and the node-correction preview build this from the
+    same captured Program Binding and resolved node inputs; only the opaque
+    ``move_id`` differs between the two uses.
+    """
+
+    target: _TargetBinding
+    payload: Mapping[str, Any]
+
+
+def _goal_frame_reference(
+    poses: Sequence[object],
+    *,
+    field: str,
+    target_mode: str,
+    target_role_id: str,
+    base_frame_role_id: str,
+    targets: Mapping[str, _TargetBinding],
+) -> dict[str, Any] | None:
+    """The one frame an absolute pose/Cartesian goal is stated in.
+
+    None means the moving robot's base frame (the wire default). Any other
+    declared frame is forwarded as `goal_frame_reference` and resolved by
+    the native owner at motion admission.
+    """
+
+    frames: list[Mapping[str, Any] | None] = []
+    for index, pose in enumerate(poses):
+        label = field if len(poses) == 1 else f"{field}[{index}]"
+        frame = _mapping(pose, field=label).get("frame_ref")
+        frames.append(
+            None
+            if _is_base_frame(
+                frame,
+                field=f"{label}.frame_ref",
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+            )
+            else _mapping(frame, field=f"{label}.frame_ref")
+        )
+    if any(frame != frames[0] for frame in frames):
+        raise ProductionPortError(f"{field} waypoints must all use one frame")
+    if frames[0] is None:
+        return None
+    if target_mode != "absolute":
+        raise ProductionPortError(
+            f"{field}.frame_ref must be the moving robot's base frame for a "
+            "relative goal; its reference is target_reference"
+        )
+    return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets)
+
+
+def _motion_spec(
+    node_id: str,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    if node_id == "motion.move_to_joint_target":
+        goals = _sequence(parameters.get("goal"), field="goal")
+        joint_names: list[str] = []
+        positions: list[float] = []
+        for index, raw_goal in enumerate(goals):
+            goal = _mapping(raw_goal, field=f"goal[{index}]")
+            joint_names.append(_text(goal.get("joint_name"), field=f"goal[{index}].joint_name"))
+            positions.append(
+                _number(
+                    goal.get("position_rad"),
+                    field=f"goal[{index}].position_rad",
+                )
+            )
+        return {
+            "kind": "joint_goal",
+            "joint_names": joint_names,
+            "positions_rad": positions,
+        }
+    if node_id == "motion.move_to_pose":
+        return {
+            "kind": "pose_goal",
+            "goal": _pose3(parameters.get("goal"), field="goal"),
+        }
+    if node_id == "motion.follow_cartesian_path":
+        path = _sequence(parameters.get("path"), field="path")
+        return {
+            "kind": "cartesian_path",
+            "waypoints": [
+                _pose3(waypoint, field=f"path[{index}]")
+                for index, waypoint in enumerate(path)
+            ],
+            "max_translation_step_m": parameters["max_translation_step_m"],
+            "max_rotation_step_rad": parameters["max_rotation_step_rad"],
+            "speed_mode": "bounded",
+            # CartesianPathDTO still carries the planner's numerical
+            # bound, but it is not an authored second speed knob. The
+            # admitted SpeedProfile supplies the exact Deployment/request
+            # value and the planner takes the stricter value.
+            "max_angular_speed_rad_s": parameters["max_angular_speed_rad_s"],
+            "max_linear_acceleration_mps2": parameters["max_linear_acceleration_mps2"],
+            "max_angular_acceleration_rad_s2": parameters["max_angular_acceleration_rad_s2"],
+            "fallback_policy": parameters["fallback_policy"],
+            "max_blend_deviation_rad": parameters["max_blend_deviation_rad"],
+        }
+    raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
+
+
+def program_motion_participant(
+    node_id: str,
+    parameters: Mapping[str, Any],
+    *,
+    targets: Mapping[str, _TargetBinding],
+    contact_grasps: Mapping[str, _ContactGraspBinding],
+    move_id: str,
+) -> ProgramMotionParticipant:
+    """Translate resolved motion-node inputs into the native motion payload.
+
+    Pure: it reads only the captured Program Binding rows (``targets`` and
+    ``contact_grasps``) and the node's resolved ``parameters``. The binding,
+    robot and capability come from the capture, never from the inputs.
+    """
+
+    target_role_id = _text(parameters.get("target_role"), field="target_role")
+    try:
+        target = targets[target_role_id]
+    except KeyError as exc:
+        raise ProductionPortError(
+            f"Program Binding has no target role {target_role_id!r}"
+        ) from exc
+    if "execution.trajectory.execute" not in target.capabilities:
+        raise ProductionPortError(
+            f"target role {target_role_id!r} lacks 'execution.trajectory.execute'"
+        )
+    base_frame_role_id = _text(parameters.get("base_frame_role"), field="base_frame_role")
+    tcp_frame_role_id = _text(parameters.get("tcp_frame_role"), field="tcp_frame_role")
+    target_mode = parameters.get("target_mode", "absolute")
+    if target_mode not in {"absolute", "relative"}:
+        raise ProductionPortError("motion target_mode is unsupported")
+    target_reference = _reference(
+        parameters.get("target_reference"),
+        field="target_reference",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+        targets=targets,
+    )
+    offset_reference = _reference(
+        parameters.get("offset_reference"),
+        field="offset_reference",
+        target_role_id=target_role_id,
+        base_frame_role_id=base_frame_role_id,
+        targets=targets,
+    )
+    goal_poses: Sequence[object] = (
+        ()
+        if node_id == "motion.move_to_joint_target"
+        else (
+            (parameters.get("goal"),)
+            if node_id == "motion.move_to_pose"
+            else _sequence(parameters.get("path"), field="path")
+        )
+    )
+    goal_frame_reference = (
+        None
+        if not goal_poses
+        else _goal_frame_reference(
+            goal_poses,
+            field="goal" if node_id == "motion.move_to_pose" else "path",
+            target_mode=target_mode,
+            target_role_id=target_role_id,
+            base_frame_role_id=base_frame_role_id,
+            targets=targets,
+        )
+    )
+    runtime_object_ids = {
+        reference["runtime_object_id"]
+        for reference in (target_reference, offset_reference)
+        if reference is not None and reference["type"] == "runtime_object"
+    }
+    if runtime_object_ids:
+        raise ProductionPortError(
+            "runtime-object motion references require the N7-a5.3b " "scene-binding join"
+        )
+    contact_policy_id = parameters.get("contact_policy_id")
+    contact_scene_resource_id = parameters.get("contact_scene_resource_id")
+    runtime_object_bindings: list[dict[str, str]] = []
+    if (contact_policy_id is None) != (contact_scene_resource_id is None):
+        raise ProductionPortError(
+            "contact policy and contact scene resource must be supplied together"
+        )
+    if contact_policy_id is not None:
+        policy_id = _text(contact_policy_id, field="contact_policy_id")
+        scene_resource_id = _text(
+            contact_scene_resource_id, field="contact_scene_resource_id"
+        )
+        try:
+            contact = contact_grasps[policy_id]
+        except KeyError as exc:
+            raise ProductionPortError(
+                "Program Binding has no exact motion contact-grasp policy"
+            ) from exc
+        runtime_object_bindings.append(
+            {
+                "runtime_object_id": contact.runtime_object_id,
+                "scene_resource_id": scene_resource_id,
+            }
+        )
+    payload = {
+        "kind": "motion",
+        "move_id": _text(move_id, field="move_id"),
+        "base_frame_role_id": base_frame_role_id,
+        "tcp_frame_role_id": tcp_frame_role_id,
+        "tolerances": {
+            "joint_position_tol_rad": parameters["joint_position_tol_rad"],
+            "translation_tol_m": parameters["translation_tol_m"],
+            "rotation_tol_rad": parameters["rotation_tol_rad"],
+        },
+        "speed_profile": {
+            "velocity_scale": parameters["velocity_scale"],
+            "acceleration_scale": parameters["acceleration_scale"],
+            "max_tcp_linear_speed_mps": parameters.get("max_tcp_linear_speed_mps"),
+        },
+        "timeouts": {
+            "planning_timeout_s": parameters["planning_timeout_s"],
+            "execution_timeout_s": parameters["execution_timeout_s"],
+        },
+        "cache_mode": parameters["cache_mode"],
+        "planning_profile": parameters["planning_profile"],
+        "target_mode": target_mode,
+        "target_reference": target_reference,
+        "offset_reference": offset_reference,
+        "motion": _motion_spec(node_id, parameters),
+        "contact_policy_id": contact_policy_id,
+        # Resolved inputs are frozen; the wire needs plain per-joint objects.
+        "per_joint_dynamics_limits": {
+            joint_name: dict(_mapping(limit, field=f"per_joint_dynamics_limits.{joint_name}"))
+            for joint_name, limit in _mapping(
+                parameters.get("per_joint_dynamics_limits", {}),
+                field="per_joint_dynamics_limits",
+            ).items()
+        },
+        "motion_interrupt_scopes": [],
+        "runtime_object_bindings": runtime_object_bindings,
+    }
+    if goal_frame_reference is not None:
+        payload["goal_frame_reference"] = goal_frame_reference
+    return ProgramMotionParticipant(target, payload)
+
+
 class NativeKernelProgramPort:
     """Captured context plus separate native task and Program-scope clients."""
 
@@ -826,99 +1081,6 @@ class NativeKernelProgramPort:
     def _owner_status(self, context: _BoundContext) -> tuple[str, dict[str, Any]]:
         return self._owner_status_for_capture(context.capture)
 
-    @staticmethod
-    def _goal_frame_reference(
-        poses: Sequence[object],
-        *,
-        field: str,
-        target_mode: str,
-        target_role_id: str,
-        base_frame_role_id: str,
-        targets: Mapping[str, _TargetBinding],
-    ) -> dict[str, Any] | None:
-        """The one frame an absolute pose/Cartesian goal is stated in.
-
-        None means the moving robot's base frame (the wire default). Any other
-        declared frame is forwarded as `goal_frame_reference` and resolved by
-        the native owner at motion admission.
-        """
-
-        frames: list[Mapping[str, Any] | None] = []
-        for index, pose in enumerate(poses):
-            label = field if len(poses) == 1 else f"{field}[{index}]"
-            frame = _mapping(pose, field=label).get("frame_ref")
-            frames.append(
-                None
-                if _is_base_frame(
-                    frame,
-                    field=f"{label}.frame_ref",
-                    target_role_id=target_role_id,
-                    base_frame_role_id=base_frame_role_id,
-                )
-                else _mapping(frame, field=f"{label}.frame_ref")
-            )
-        if any(frame != frames[0] for frame in frames):
-            raise ProductionPortError(f"{field} waypoints must all use one frame")
-        if frames[0] is None:
-            return None
-        if target_mode != "absolute":
-            raise ProductionPortError(
-                f"{field}.frame_ref must be the moving robot's base frame for a "
-                "relative goal; its reference is target_reference"
-            )
-        return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets)
-
-    @staticmethod
-    def _motion_spec(
-        node_id: str,
-        parameters: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        if node_id == "motion.move_to_joint_target":
-            goals = _sequence(parameters.get("goal"), field="goal")
-            joint_names: list[str] = []
-            positions: list[float] = []
-            for index, raw_goal in enumerate(goals):
-                goal = _mapping(raw_goal, field=f"goal[{index}]")
-                joint_names.append(_text(goal.get("joint_name"), field=f"goal[{index}].joint_name"))
-                positions.append(
-                    _number(
-                        goal.get("position_rad"),
-                        field=f"goal[{index}].position_rad",
-                    )
-                )
-            return {
-                "kind": "joint_goal",
-                "joint_names": joint_names,
-                "positions_rad": positions,
-            }
-        if node_id == "motion.move_to_pose":
-            return {
-                "kind": "pose_goal",
-                "goal": _pose3(parameters.get("goal"), field="goal"),
-            }
-        if node_id == "motion.follow_cartesian_path":
-            path = _sequence(parameters.get("path"), field="path")
-            return {
-                "kind": "cartesian_path",
-                "waypoints": [
-                    _pose3(waypoint, field=f"path[{index}]")
-                    for index, waypoint in enumerate(path)
-                ],
-                "max_translation_step_m": parameters["max_translation_step_m"],
-                "max_rotation_step_rad": parameters["max_rotation_step_rad"],
-                "speed_mode": "bounded",
-                # CartesianPathDTO still carries the planner's numerical
-                # bound, but it is not an authored second speed knob. The
-                # admitted SpeedProfile supplies the exact Deployment/request
-                # value and the planner takes the stricter value.
-                "max_angular_speed_rad_s": parameters["max_angular_speed_rad_s"],
-                "max_linear_acceleration_mps2": parameters["max_linear_acceleration_mps2"],
-                "max_angular_acceleration_rad_s2": parameters["max_angular_acceleration_rad_s2"],
-                "fallback_policy": parameters["fallback_policy"],
-                "max_blend_deviation_rad": parameters["max_blend_deviation_rad"],
-            }
-        raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
-
     def _motion_payload(
         self,
         node_id: str,
@@ -926,114 +1088,100 @@ class NativeKernelProgramPort:
         identity: NodeAttemptIdentity,
     ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any]]:
         context = self._context(identity.program_run_id)
-        target_role_id = _text(parameters.get("target_role"), field="target_role")
-        target = self._target(context, target_role_id, "execution.trajectory.execute")
-        base_frame_role_id = _text(parameters.get("base_frame_role"), field="base_frame_role")
-        tcp_frame_role_id = _text(parameters.get("tcp_frame_role"), field="tcp_frame_role")
-        target_mode = parameters.get("target_mode", "absolute")
-        if target_mode not in {"absolute", "relative"}:
-            raise ProductionPortError("motion target_mode is unsupported")
-        target_reference = _reference(
-            parameters.get("target_reference"),
-            field="target_reference",
-            target_role_id=target_role_id,
-            base_frame_role_id=base_frame_role_id,
+        participant = program_motion_participant(
+            node_id,
+            parameters,
             targets=context.targets,
+            contact_grasps=context.contact_grasps,
+            move_id=_request_identity(
+                "move", identity.program_run_id, identity.node_attempt_id
+            ),
         )
-        offset_reference = _reference(
-            parameters.get("offset_reference"),
-            field="offset_reference",
-            target_role_id=target_role_id,
-            base_frame_role_id=base_frame_role_id,
+        return context, participant.target, dict(participant.payload)
+
+    def motion_preview_intent(
+        self,
+        identity: NodeAttemptIdentity,
+        node_id: str,
+        parameters: Mapping[str, Any],
+        *,
+        request_id: str,
+    ) -> tuple[ProgramMotionParticipant, dict[str, Any]]:
+        """Build the native preview intent of one node attempt's motion.
+
+        Effect-free: it reads the captured binding and the execution owner's
+        current identity, and starts, ticks, retries or reserves nothing. The
+        payload is the execution builder's own; a motion the native preview
+        cannot evaluate exactly raises ``ProgramMotionPreviewUnavailableError``
+        instead of being approximated.
+        """
+
+        if not isinstance(identity, NodeAttemptIdentity):
+            raise TypeError("motion preview requires one node-attempt identity")
+        if node_id not in _MOTION_NODE_IDS:
+            raise ProgramMotionPreviewUnavailableError(
+                "node_motion_preview_unsupported",
+                f"node {node_id!r} has no native motion preview",
+            )
+        try:
+            context = self._context(identity.program_run_id)
+        except ProductionPortError as error:
+            raise ProgramMotionPreviewUnavailableError(
+                "program_run_context_unavailable", str(error)
+            ) from error
+        preview_request_id = _text(request_id, field="request_id")
+        participant = program_motion_participant(
+            node_id,
+            parameters,
             targets=context.targets,
+            contact_grasps=context.contact_grasps,
+            move_id=_request_identity(
+                "preview-move",
+                identity.program_run_id,
+                identity.node_attempt_id,
+                preview_request_id,
+            ),
         )
-        goal_poses: Sequence[object] = (
-            ()
-            if node_id == "motion.move_to_joint_target"
-            else (
-                (parameters.get("goal"),)
-                if node_id == "motion.move_to_pose"
-                else _sequence(parameters.get("path"), field="path")
+        # The native preview plans only an already-resolved absolute target in
+        # the moving robot's base frame. Relative and other-frame goals are
+        # resolved against observed state at execution admission only.
+        if participant.payload["target_mode"] != "absolute":
+            raise ProgramMotionPreviewUnavailableError(
+                "relative_motion_preview_unsupported",
+                "the native motion preview cannot resolve a relative target; "
+                "execution resolves it only at motion admission",
             )
-        )
-        goal_frame_reference = (
-            None
-            if not goal_poses
-            else self._goal_frame_reference(
-                goal_poses,
-                field="goal" if node_id == "motion.move_to_pose" else "path",
-                target_mode=target_mode,
-                target_role_id=target_role_id,
-                base_frame_role_id=base_frame_role_id,
-                targets=context.targets,
+        if "goal_frame_reference" in participant.payload:
+            raise ProgramMotionPreviewUnavailableError(
+                "goal_frame_motion_preview_unsupported",
+                "the native motion preview cannot resolve a goal stated outside "
+                "the moving robot's base frame; execution resolves it only at "
+                "motion admission",
             )
-        )
-        runtime_object_ids = {
-            reference["runtime_object_id"]
-            for reference in (target_reference, offset_reference)
-            if reference is not None and reference["type"] == "runtime_object"
-        }
-        if runtime_object_ids:
-            raise ProductionPortError(
-                "runtime-object motion references require the N7-a5.3b " "scene-binding join"
-            )
-        contact_policy_id = parameters.get("contact_policy_id")
-        contact_scene_resource_id = parameters.get("contact_scene_resource_id")
-        runtime_object_bindings: list[dict[str, str]] = []
-        if (contact_policy_id is None) != (contact_scene_resource_id is None):
-            raise ProductionPortError(
-                "contact policy and contact scene resource must be supplied together"
-            )
-        if contact_policy_id is not None:
-            policy_id = _text(contact_policy_id, field="contact_policy_id")
-            scene_resource_id = _text(
-                contact_scene_resource_id, field="contact_scene_resource_id"
-            )
-            try:
-                contact = context.contact_grasps[policy_id]
-            except KeyError as exc:
-                raise ProductionPortError(
-                    "Program Binding has no exact motion contact-grasp policy"
-                ) from exc
-            runtime_object_bindings.append(
+        try:
+            owner_epoch, scene_revision = self._owner_status(context)
+        except Exception as error:
+            raise ProgramMotionPreviewUnavailableError(
+                "execution_owner_unavailable", _owner_failure_message(error)
+            ) from error
+        intent = self._operation_intent(
+            context,
+            request_id=preview_request_id,
+            owner_epoch=owner_epoch,
+            scene_revision=scene_revision,
+            participants=[
                 {
-                    "runtime_object_id": contact.runtime_object_id,
-                    "scene_resource_id": scene_resource_id,
+                    "component_role_id": participant.target.component_role_id,
+                    "target_role_id": participant.target.target_role_id,
+                    "required_capability_id": "execution.trajectory.execute",
+                    # Preview is not node work: no span or execution scope.
+                    "action_span": None,
+                    "payload": dict(participant.payload),
                 }
-            )
-        payload = {
-            "kind": "motion",
-            "move_id": _request_identity("move", identity.program_run_id, identity.node_attempt_id),
-            "base_frame_role_id": base_frame_role_id,
-            "tcp_frame_role_id": tcp_frame_role_id,
-            "tolerances": {
-                "joint_position_tol_rad": parameters["joint_position_tol_rad"],
-                "translation_tol_m": parameters["translation_tol_m"],
-                "rotation_tol_rad": parameters["rotation_tol_rad"],
-            },
-            "speed_profile": {
-                "velocity_scale": parameters["velocity_scale"],
-                "acceleration_scale": parameters["acceleration_scale"],
-                "max_tcp_linear_speed_mps": parameters.get("max_tcp_linear_speed_mps"),
-            },
-            "timeouts": {
-                "planning_timeout_s": parameters["planning_timeout_s"],
-                "execution_timeout_s": parameters["execution_timeout_s"],
-            },
-            "cache_mode": parameters["cache_mode"],
-            "planning_profile": parameters["planning_profile"],
-            "target_mode": target_mode,
-            "target_reference": target_reference,
-            "offset_reference": offset_reference,
-            "motion": self._motion_spec(node_id, parameters),
-            "contact_policy_id": contact_policy_id,
-            "per_joint_dynamics_limits": dict(parameters.get("per_joint_dynamics_limits", {})),
-            "motion_interrupt_scopes": [],
-            "runtime_object_bindings": runtime_object_bindings,
-        }
-        if goal_frame_reference is not None:
-            payload["goal_frame_reference"] = goal_frame_reference
-        return context, target, payload
+            ],
+            coordination_policy="independent",
+        )
+        return participant, intent
 
     def _gripper_payload(
         self,
@@ -4598,4 +4746,7 @@ __all__ = [
     "HeadlessSceneProgramPort",
     "NativeKernelProgramPort",
     "ProductionPortError",
+    "ProgramMotionParticipant",
+    "ProgramMotionPreviewUnavailableError",
+    "program_motion_participant",
 ]

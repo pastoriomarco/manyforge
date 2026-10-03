@@ -8059,16 +8059,95 @@ Result<std::vector<Pose3DTO>> ExecutionKernel::resolve_preview_reference_poses(
   return Result<std::vector<Pose3DTO>>::Ok(std::move(resolved));
 }
 
+std::shared_ptr<ExecutionKernel::PreparedMotionSession>
+ExecutionKernel::failed_preparation_never_dispatched_locked() {
+  // Caller holds lifecycle_mutex_. A Failed terminal whose exact prepared
+  // session never requested or reached dispatch commanded nothing: the
+  // dispatch barrier opens only for a Prepared product, and this execution
+  // committed its failure before one existed. Such a failure has no physical
+  // effect, so it is retryable like a pre-dispatch validation failure.
+  const auto status = sm_.status();
+  if (status.state != ExecutionState::kFailed || status.execution_id == 0U) return nullptr;
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) return nullptr;
+  std::lock_guard lock(session->mutex);
+  const bool never_dispatched =
+      session->execution_id == status.execution_id && !session->dispatch_requested &&
+      !session->last_dispatched_participant &&
+      (session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing ||
+       session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed);
+  return never_dispatched ? session : nullptr;
+}
+
+bool ExecutionKernel::failed_preparation_settled_locked() {
+  // Caller holds lifecycle_mutex_. Once the worker of a never-dispatched
+  // failed preparation has finished, an effect-free preview may plan from the
+  // same idle robot. This grants no execution, Reset or recovery authority.
+  const auto session = failed_preparation_never_dispatched_locked();
+  if (!session) return false;
+  {
+    std::lock_guard lock(session->mutex);
+    if (session->state != ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed) {
+      return false;
+    }
+  }
+  return worker_signals_.wait_for_completion(1);
+}
+
+struct ExecutionKernel::LifecyclePreemption final {
+  explicit LifecyclePreemption(ExecutionKernel& owner) : owner_(owner) {
+    owner_.lifecycle_preemption_waiters_.fetch_add(1U, std::memory_order_seq_cst);
+    std::lock_guard lock(owner_.preview_cancellation_mutex_);
+    if (owner_.active_preview_cancellation_.has_value()) {
+      owner_.active_preview_cancellation_->request_stop();
+    }
+  }
+  LifecyclePreemption(const LifecyclePreemption&) = delete;
+  LifecyclePreemption& operator=(const LifecyclePreemption&) = delete;
+  ~LifecyclePreemption() {
+    owner_.lifecycle_preemption_waiters_.fetch_sub(1U, std::memory_order_seq_cst);
+  }
+
+ private:
+  ExecutionKernel& owner_;
+};
+
 Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     ExecuteRequestDTO request, CollisionWorldLeaseInventory projection_inventory,
     RobotStateDTO start_state, const std::uint32_t planning_attempt_index,
-    const std::stop_token stop_token) {
+    const std::stop_token caller_stop_token) {
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  // Exclusive planner access stays with lifecycle_mutex_; a waiting Stop,
+  // Reset or recovery cancels this advisory preview instead of waiting for
+  // its planning to finish or time out. Register before reading the waiter
+  // count so either side observes the other.
+  std::stop_source preview_cancellation;
+  {
+    std::lock_guard lock(preview_cancellation_mutex_);
+    active_preview_cancellation_ = preview_cancellation;
+  }
+  struct ActivePreviewRegistration final {
+    ExecutionKernel& owner;
+    ~ActivePreviewRegistration() {
+      std::lock_guard lock(owner.preview_cancellation_mutex_);
+      owner.active_preview_cancellation_.reset();
+    }
+  } active_preview_registration{*this};
+  std::stop_callback caller_cancellation(
+      caller_stop_token, [&preview_cancellation]() { preview_cancellation.request_stop(); });
+  if (lifecycle_preemption_waiters_.load(std::memory_order_seq_cst) != 0U) {
+    preview_cancellation.request_stop();
+  }
+  const auto stop_token = preview_cancellation.get_token();
   const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
     return Result<MotionPreviewResultDTO>::Err(ErrorDTO{
         std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
   };
-  if (sm_.status().state != ExecutionState::kIdle) {
+  if (sm_.status().state != ExecutionState::kIdle && !failed_preparation_settled_locked()) {
     return reject(ErrorCode::kExecutionRejected, "Motion preview requires an idle participant",
                   "motion_preview_participant_not_idle");
   }
@@ -9581,6 +9660,7 @@ StopResultDTO ExecutionKernel::stop() {
     return StopResultDTO{true, std::nullopt};
   };
   join_finished_operator_stop_worker();
+  const LifecyclePreemption preemption(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
   if (!lifecycle_lock.owns_lock()) {
     if (execute_admission_interruptible_.load(std::memory_order_seq_cst)) {
@@ -9919,6 +9999,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
   if (auto stale = reject_if_stale()) {
     return *stale;
   }
+  const LifecyclePreemption preemption(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
   if (!lifecycle_lock.owns_lock()) {
     if (auto stale = reject_if_stale()) {
@@ -10302,6 +10383,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
 ResetResultDTO ExecutionKernel::reset_after_certified_containment(
     const std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
   EventDeferralScope event_scope(*this);
+  const LifecyclePreemption preemption(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (!control_command_epoch_matches(expected_epoch)) {
     return ResetResultDTO{false, stale_control_command_error()};
@@ -10610,8 +10692,9 @@ Result<void> ExecutionKernel::apply_retry_after_scene_repair_locked(const std::s
   }
 
   // The assessment transaction already classified the published failure as a
-  // retryable validation boundary. Consume that immutable publication rather
-  // than issuing a backend RPC under lifecycle_mutex_.
+  // retryable validation boundary or a never-dispatched prepared failure.
+  // Consume that immutable publication rather than issuing a backend RPC
+  // under lifecycle_mutex_.
   const auto failed_snapshot = snapshot_publisher_.latest();
   if (!failed_snapshot.error.has_value()) {
     return Result<void>::Err(ErrorDTO{kErrorInvalidRequest,
@@ -10619,7 +10702,8 @@ Result<void> ExecutionKernel::apply_retry_after_scene_repair_locked(const std::s
                                       "validation error",
                                       {{"reason", "failed_validation_error_missing"}}});
   }
-  if (!is_retryable_failed_validation_error(*failed_snapshot.error)) {
+  if (!is_retryable_failed_validation_error(*failed_snapshot.error) &&
+      !failed_preparation_never_dispatched_locked()) {
     return Result<void>::Err(ErrorDTO{kErrorInvalidRequest,
                                       "Cannot retry after scene repair: failure is not a retryable "
                                       "pre-dispatch validation boundary",
@@ -10823,7 +10907,8 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
   if (status.state == ExecutionState::kFailed) {
     const auto snapshot = snapshot_publisher_.latest();
     capture.failed_validation_retryable =
-        snapshot.error.has_value() && is_retryable_failed_validation_error(*snapshot.error);
+        (snapshot.error.has_value() && is_retryable_failed_validation_error(*snapshot.error)) ||
+        failed_preparation_never_dispatched_locked() != nullptr;
     if (snapshot.error.has_value()) {
       auto it = snapshot.error->details.find("reason");
       if (it != snapshot.error->details.end()) {
@@ -10873,8 +10958,17 @@ KernelRecoveryAssessmentDTO ExecutionKernel::publish_recovery_assessment_locked(
   if (!publication.changed) {
     // Equally admissible facts do not churn the published revision
     // (spec/210 §3.12 offer stability), but a newer equivalent observation
-    // extends its own freshness deadline. Keep the expiry schedule current
-    // without changing the operator-visible assessment revision.
+    // extends its own freshness deadline. Publish that deadline and keep the
+    // expiry schedule current without changing the operator-visible
+    // assessment revision; readers must not see an elapsed deadline while
+    // the observation is still fresh.
+    if (next.observed_state_valid_until_ns != previous.observed_state_valid_until_ns) {
+      std::lock_guard<std::mutex> lock(recovery_assessment_mutex_);
+      if (recovery_assessment_.assessment_revision == previous.assessment_revision) {
+        recovery_assessment_.observed_state_valid_until_ns = next.observed_state_valid_until_ns;
+        previous.observed_state_valid_until_ns = next.observed_state_valid_until_ns;
+      }
+    }
     schedule_recovery_freshness_deadline_locked(next);
     schedule_recovery_observation_poll_locked(next);
     return previous;
@@ -10945,11 +11039,27 @@ void ExecutionKernel::schedule_recovery_assessment_refresh(const char* trigger) 
   }
 }
 
+namespace {
+
+/// Retry classes whose published observation deadline the Kernel keeps
+/// current (polling newer samples) and enforces (republishing at expiry).
+/// A retry-admissible failed validation, including a never-dispatched
+/// preparation failure, and an ordinary operator Stop follow the same
+/// freshness rule as the other Stop-backed retry classes: a published
+/// deadline is never left to elapse silently.
+[[nodiscard]] bool recovery_observation_tracked(const KernelRecoveryAssessmentDTO& assessment) {
+  return assessment.recovery_class == RecoveryClass::kRuntimeCollision ||
+         assessment.recovery_class == RecoveryClass::kStopFaultIntervention ||
+         assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop ||
+         (assessment.recovery_class == RecoveryClass::kFailedValidation &&
+          assessment.retry_admissible);
+}
+
+}  // namespace
+
 void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
     const KernelRecoveryAssessmentDTO& assessment) {
-  const bool observation_dependent =
-      assessment.recovery_class == RecoveryClass::kRuntimeCollision ||
-      assessment.recovery_class == RecoveryClass::kStopFaultIntervention;
+  const bool observation_dependent = recovery_observation_tracked(assessment);
   const bool actionable = assessment.status == RecoveryAssessmentStatus::kRetryReady ||
                           assessment.status == RecoveryAssessmentStatus::kActionRequired;
   if (recovery_freshness_deadline_handle_ != 0) {
@@ -10985,9 +11095,7 @@ void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
 
 void ExecutionKernel::schedule_recovery_observation_poll_locked(
     const KernelRecoveryAssessmentDTO& assessment) {
-  const bool observation_dependent =
-      assessment.recovery_class == RecoveryClass::kRuntimeCollision ||
-      assessment.recovery_class == RecoveryClass::kStopFaultIntervention;
+  const bool observation_dependent = recovery_observation_tracked(assessment);
   if (!observation_dependent) {
     if (recovery_observation_poll_handle_ != 0) {
       scheduler_.cancel(recovery_observation_poll_handle_);
@@ -11017,6 +11125,7 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action(
 KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
     KernelRecoveryActionRequestDTO request) {
   EventDeferralScope event_scope(*this);
+  const LifecyclePreemption preemption(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
   RecoveryAuthorityCapture capture = capture_recovery_authority_locked();
   auto assessment = publish_recovery_assessment_locked(capture, "recovery_action_admission");

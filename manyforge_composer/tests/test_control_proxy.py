@@ -195,7 +195,9 @@ def test_proxy_forwards_both_directions_and_releases_demand(
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("command_kind", ["program_run", "program_resume_full_stop"])
+@pytest.mark.parametrize(
+    "command_kind", ["program_run", "program_resume_full_stop", "execution_recovery"]
+)
 def test_proxy_refuses_execution_start_that_bypasses_composer_admission(
     monkeypatch, command_kind: str,
 ) -> None:

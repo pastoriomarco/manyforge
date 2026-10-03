@@ -2655,9 +2655,48 @@ public:
       VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
       VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>>;
 
-  // Reuse verified predecessors only within one locked SQLite read. No
-  // result (including absence) survives the outer read or an exception.
-  // Subsequent operations still read and validate the database afresh.
+  /// Installs the change-gated verified-record cache for one public read
+  /// transaction. Must be called first inside that transaction: reading
+  /// `data_version` opens its read snapshot. Any commit through another
+  /// connection changes `data_version`; any write through this connection
+  /// changes its total change count. Either discards every cached result, so
+  /// a changed or corrupted record is re-read and re-verified by the very
+  /// next read. A failed read discards the cache as well.
+  class VerifiedReadScope final {
+  public:
+    explicit VerifiedReadScope(const Impl &impl) noexcept
+        : impl_(impl), exceptions_(std::uncaught_exceptions()) {}
+    ~VerifiedReadScope() {
+      impl_.verified_reads_ = nullptr;
+      if (std::uncaught_exceptions() != exceptions_) {
+        impl_.change_gated_reads_.reset();
+      }
+    }
+    VerifiedReadScope(const VerifiedReadScope &) = delete;
+    VerifiedReadScope &operator=(const VerifiedReadScope &) = delete;
+
+  private:
+    const Impl &impl_;
+    int exceptions_;
+  };
+
+  [[nodiscard]] VerifiedReadScope UseVerifiedReadsLocked() const {
+    const auto data_version = ScalarInteger(database_, "PRAGMA data_version");
+    const auto own_total_changes = sqlite3_total_changes64(database_);
+    if (!change_gated_reads_.has_value() ||
+        change_gated_reads_->data_version != data_version ||
+        change_gated_reads_->own_total_changes != own_total_changes) {
+      change_gated_reads_.emplace(
+          ChangeGatedReads{data_version, own_total_changes, {}});
+    }
+    verified_reads_ = &change_gated_reads_->reads;
+    return VerifiedReadScope(*this);
+  }
+
+  // Public reads reuse verified records while the database is provably
+  // unchanged (see UseVerifiedReadsLocked). Writes and integrity verification
+  // reuse verified predecessors only within their own locked operation; no
+  // result survives that operation.
   template <typename Record, typename Reader>
   std::optional<Record> ReadVerifiedRecord(const VerifiedReadKey &key,
                                            Reader &&read) const {
@@ -2675,6 +2714,7 @@ public:
       return found->second;
     }
     auto result = read();
+    ++record_verifications_;
     records.emplace(key, result);
     return result;
   }
@@ -4180,6 +4220,16 @@ public:
   mutable std::mutex mutex_;
   mutable VerifiedReads *verified_reads_{};
   bool closed_{};
+
+  /// Verified records of the last read transactions and the database change
+  /// identity they were read under. Guarded by `mutex_`.
+  struct ChangeGatedReads final {
+    std::int64_t data_version{};
+    sqlite3_int64 own_total_changes{};
+    VerifiedReads reads;
+  };
+  mutable std::optional<ChangeGatedReads> change_gated_reads_;
+  mutable std::uint64_t record_verifications_{};
 };
 
 SqliteManagerApplyJournal::SqliteManagerApplyJournal(
@@ -4332,6 +4382,7 @@ SqliteManagerApplyJournal::ReadIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->IntentLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -4342,6 +4393,7 @@ SqliteManagerApplyJournal::ReadStatusInventory() const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
 
   Statement rows(impl_->database_,
                  "SELECT apply_id,apply_generation FROM manager_apply_intents "
@@ -4371,6 +4423,11 @@ SqliteManagerApplyJournal::ReadStatusInventory() const {
   return result;
 }
 
+std::uint64_t SqliteManagerApplyJournal::record_verification_count() const {
+  std::lock_guard lock(impl_->mutex_);
+  return impl_->record_verifications_;
+}
+
 std::optional<PersistedManagerApplyStatus>
 SqliteManagerApplyJournal::ReadStatus(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
@@ -4380,6 +4437,7 @@ SqliteManagerApplyJournal::ReadStatus(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   auto status = impl_->StatusLocked(apply_id, generation);
   transaction.Commit();
   return status;
@@ -4394,6 +4452,7 @@ SqliteManagerApplyJournal::ReadRequest(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->RequestLocked(request_owner_epoch, request_id);
   transaction.Commit();
   return result;
@@ -4406,6 +4465,7 @@ SqliteManagerApplyJournal::ReadApplyGenerationHighWater(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->GenerationHighWaterLocked(apply_id);
   transaction.Commit();
   if (!result.has_value()) {
@@ -4487,6 +4547,7 @@ SqliteManagerApplyJournal::ReadAffectedScope(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->AffectedScopeLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -4606,6 +4667,7 @@ SqliteManagerApplyJournal::ReadFenceAttempt(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->FenceAttemptLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -4695,6 +4757,7 @@ SqliteManagerApplyJournal::ReadFenceAcceptance(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->FenceAcceptanceLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -4782,6 +4845,7 @@ SqliteManagerApplyJournal::ReadRuntimeConvergenceIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result =
       impl_->RuntimeConvergenceIntentLocked(apply_id, generation);
   transaction.Commit();
@@ -4884,6 +4948,7 @@ SqliteManagerApplyJournal::ReadLatestRuntimeStagedReady(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result =
       impl_->LatestRuntimeStagedReadyLocked(apply_id, generation);
   transaction.Commit();
@@ -4984,6 +5049,7 @@ SqliteManagerApplyJournal::ReadPrivateMaterialization(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->PrivateMaterializationLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -5088,6 +5154,7 @@ SqliteManagerApplyJournal::ReadPublicationReceipt(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->PublicationReceiptLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -5185,6 +5252,7 @@ SqliteManagerApplyJournal::ReadFenceReleaseIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->FenceReleaseIntentLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -5261,6 +5329,7 @@ SqliteManagerApplyJournal::ReadFenceReleased(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->FenceReleasedLocked(apply_id, generation);
   transaction.Commit();
   return result;
@@ -5392,6 +5461,7 @@ SqliteManagerApplyJournal::ReadTerminalOutcome(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
+  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->TerminalOutcomeLocked(apply_id, generation);
   transaction.Commit();
   return result;

@@ -851,6 +851,60 @@ TEST(RetainedObservedStateChannelTest,
 }
 
 TEST(RetainedObservedStateChannelTest,
+     BoundStatePairsBindingAndSampleUnderOneRouteFence) {
+  const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.native");
+  const auto rebound = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.successor");
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const std::array position{0.0}, velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(position, velocity, 100, 100).applied());
+
+  // A binding read followed by a separate state read straddles an Apply route
+  // publication: the pair crosses identities although both reads succeed.
+  const auto split_binding = channel.binding();
+  ASSERT_TRUE(channel.RebindRoute(rebound, 101).ok());
+  const auto split_state = channel.current_state(101);
+  ASSERT_TRUE(split_state.ok());
+  EXPECT_NE(split_binding.value().control_path->control_route_id,
+            split_state.value().control_route_id);
+
+  const auto bound = channel.current_bound_state(101);
+  ASSERT_TRUE(bound.ok()) << bound.error().message;
+  EXPECT_EQ(bound.value().binding.value(), rebound.value());
+  EXPECT_EQ(bound.value().state.control_route_id,
+            ControlRouteId("route.successor"));
+
+  // Readers concurrent with repeated route publication never observe a
+  // binding from one route paired with a sample from another.
+  std::atomic<bool> stop{false};
+  std::thread publisher([&] {
+    for (std::int64_t index = 0; index < 2000; ++index) {
+      const auto &next = index % 2 == 0 ? binding : rebound;
+      EXPECT_TRUE(channel.RebindRoute(next, 200 + index).ok());
+    }
+    stop.store(true, std::memory_order_release);
+  });
+  std::size_t reads = 0U;
+  while (!stop.load(std::memory_order_acquire) || reads == 0U) {
+    const auto current = channel.current_bound_state(5000);
+    const bool paired =
+        current.ok() &&
+        current.value().binding.value().control_path->control_route_id ==
+            current.value().state.control_route_id;
+    EXPECT_TRUE(paired) << (current.ok() ? "crossed route identity"
+                                         : current.error().message);
+    if (!paired) break;
+    ++reads;
+  }
+  publisher.join();
+  EXPECT_GT(reads, 0U);
+}
+
+TEST(RetainedObservedStateChannelTest,
      MoreThan4096RouteChangesRetainOnlyCurrentBinding) {
   const auto first = make_binding(CoordinateKind::kLinear, "gripper.target",
                                   true, "route.first");

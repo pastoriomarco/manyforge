@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
 import { ApiError, api } from './api/client';
@@ -32,6 +33,9 @@ import { activationFailureNotice } from './state/activationNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
+import { useHeldNodePreview } from './hooks/useHeldNodePreview';
+import { useResetApply } from './hooks/useResetApply';
+import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
 import {
   nodeEnvironmentRefreshKey,
@@ -45,7 +49,11 @@ import {
   useOperationalErrors,
 } from './state/operationalErrors';
 import { authoringUnavailableCause, requiredComponentFaultNotices } from './state/authoringWorkspace';
-import { sameManagerApply, type ManagerApplyIdentity } from './state/managerApply';
+import {
+  managerApplySettlementKey,
+  sameManagerApply,
+  type ManagerApplyIdentity,
+} from './state/managerApply';
 import {
   deploymentDocumentStates,
   deploymentUnapplied,
@@ -76,6 +84,8 @@ function isNotFound(error: unknown): boolean {
 
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
 const BRIEF_NOTICE_MS = 8_000;
+
+const NO_MOTION_TARGETS: readonly DirectControlMotionStatus[] = [];
 
 const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>> = {
   new_scenario_document: 'Creating and activating Scenario',
@@ -475,6 +485,32 @@ export default function App() {
     ? activation.status
     : null;
   const activationUnobservable = activation.unavailable;
+  // A settled Apply re-reads both Applied views (event-driven).
+  useAppliedSettlementRefresh({
+    settlement: managerApplySettlementKey(activation.status),
+    runtime: programRuntime,
+    program: programController,
+  });
+  // While a run is held on a failed node, preview its Draft edits (advisory).
+  const previewCatalogEntries = useMemo(
+    () => catalog.status === 'ready' ? catalog.data.entries : [],
+    [catalog],
+  );
+  const heldNodePreview = useHeldNodePreview({
+    runtime: programRuntime,
+    workspace: programController,
+    snapshot: headlessSnapshot,
+    catalogEntries: previewCatalogEntries,
+    motionTargets: robotControl.currentStatus?.directControlTargets ?? NO_MOTION_TARGETS,
+  });
+  // Apply while a Program run exists: Reset, observed Idle, then Apply.
+  const resetApply = useResetApply({
+    runtime: programRuntime,
+    program: programController,
+    deployment: deploymentController,
+    snapshot: headlessSnapshot,
+    activation: activationStatus,
+  });
   useEffect(() => {
     authoringWorkspace.observeApply(activation.status);
   }, [authoringWorkspace, activation.status]);
@@ -943,11 +979,13 @@ export default function App() {
         {activeWorkspace === 'deployment' ? (
           <DeploymentDocumentControls
             controller={deploymentController}
+            resetApply={resetApply}
             scenarioCommands={scenarioCommands}
           />
         ) : (
           <ProgramDocumentControls
             controller={programController}
+            resetApply={resetApply}
             scenarioCommands={scenarioCommands}
             runtime={programRuntime}
             localInvalidEdit={programInvalidEdit}
@@ -995,6 +1033,7 @@ export default function App() {
             <ProgramWorkspace
               controller={programController}
               runtime={programRuntime}
+              heldNodePreview={heldNodePreview}
               catalog={catalog}
               environment={nodeEnvironment}
               sourceModel={sourceModel}
@@ -1139,6 +1178,7 @@ export default function App() {
                 programController={programController}
                 programRuntime={programRuntime}
                 robotControl={robotControl}
+                correctionGhost={heldNodePreview.ghost}
                 runtimeEnabled={connectedProjection}
                 sourceModel={sourceModel}
                 viewerActive

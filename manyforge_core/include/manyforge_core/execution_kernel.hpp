@@ -575,6 +575,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
+  [[nodiscard]] std::shared_ptr<PreparedMotionSession> failed_preparation_never_dispatched_locked();
+  [[nodiscard]] bool failed_preparation_settled_locked();
   [[nodiscard]] std::optional<ErrorDTO>
   collision_resource_replacement_refusal_locked();
   [[nodiscard]] Result<void> retire_prepared_motion_membership();
@@ -1077,6 +1079,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // Serializes low-rate lifecycle authority transitions across execute, stop,
   // pause, resume, reset, and acknowledge.
   std::mutex lifecycle_mutex_;
+  /// A native preview holds lifecycle_mutex_ for exclusive planner access
+  /// while it plans. Lifecycle commands that must not wait for that planning
+  /// (Stop, Reset, recovery) announce themselves here and cancel the active
+  /// preview before blocking on lifecycle_mutex_.
+  struct LifecyclePreemption;
+  std::atomic<std::uint32_t> lifecycle_preemption_waiters_{0U};
+  std::mutex preview_cancellation_mutex_;
+  std::optional<std::stop_source> active_preview_cancellation_;
   std::atomic<std::uint64_t> control_command_epoch_{0};
   std::atomic<uint64_t> next_execution_id_{1};
   // Exact normal-completion event batch currently being published. Matching

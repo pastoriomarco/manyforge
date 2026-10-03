@@ -403,6 +403,54 @@ if(BUILD_TESTING)
   add_custom_target(manyforge_headless_test_assistant_package
     DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}")
 
+  add_executable(manyforge_generate_headless_alarm_registry_test_package
+    test/generate_alarm_registry_package.cpp)
+  target_compile_definitions(
+    manyforge_generate_headless_alarm_registry_test_package PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}")
+  target_include_directories(
+    manyforge_generate_headless_alarm_registry_test_package PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(
+    manyforge_generate_headless_alarm_registry_test_package PRIVATE
+    manyforge::deployment)
+
+  set(
+    MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/alarm-registry-test-fixture")
+  set(
+    MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT
+    "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT}/retained-package")
+  set(
+    MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE
+    "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT}/retained-bundle-ids.txt")
+  add_custom_command(
+    OUTPUT "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E remove_directory
+      "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E make_directory
+      "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT}"
+    COMMAND
+      "$<TARGET_FILE:manyforge_generate_headless_alarm_registry_test_package>"
+      --package-root
+      "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT}"
+      --cell-id
+      c1_build_authority_cell
+      --bundle-ids-output
+      "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}"
+    DEPENDS
+      manyforge_generate_headless_alarm_registry_test_package
+      "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+      "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+      ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+    VERBATIM)
+  add_custom_target(manyforge_headless_test_alarm_registry_package
+    DEPENDS "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}")
+
   if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
     if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
       message(FATAL_ERROR
@@ -629,9 +677,12 @@ if(BUILD_TESTING)
   add_executable(test_headless_api_core test/test_headless_api_core.cpp)
   add_dependencies(test_headless_api_core
     manyforge_headless_test_canonical_empty_package
-    manyforge_headless_test_assistant_package)
+    manyforge_headless_test_assistant_package
+    manyforge_headless_test_alarm_registry_package)
   target_compile_definitions(test_headless_api_core PRIVATE
     MANYFORGE_HEADLESS_TEST_ALARM_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/resources/operator-alarm-catalog.v1.yaml"
+    MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT}"
+    MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE="${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}"
     MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml"

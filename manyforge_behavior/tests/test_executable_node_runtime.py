@@ -43,7 +43,6 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     NodeInputError,
-    ProgramRuntimeOverrideStore,
     ProgramValueError,
     ProgramValueStore,
 )
@@ -919,18 +918,22 @@ def _run(
     )
 
 
-def test_removed_mutability_and_persistence_are_refused_by_name() -> None:
+@pytest.mark.parametrize("mutability", ["immutable", "before_run", "between_operations"])
+def test_removed_mutability_is_refused_by_name(mutability: str) -> None:
     document = _minimal_document()
     document["parameters"] = [
         {
             "parameter_id": "speed",
             "type": "float64",
             "default": 0.5,
-            "runtime_mutability": "between_operations",
+            "runtime_mutability": mutability,
         }
     ]
-    with pytest.raises(ProgramValidationError, match="between_operations was removed"):
+    with pytest.raises(ProgramValidationError, match="runtime_mutability: was removed"):
         Program.from_dict(_identified(document), _catalog())
+
+
+def test_removed_persistence_is_refused_by_name() -> None:
     document = _keyed_document(_key("flag", "bool", persistence="node"))
     with pytest.raises(ProgramValidationError, match="node was removed"):
         Program.from_dict(_identified(document), _catalog())
@@ -1257,78 +1260,6 @@ def test_persistent_keys_require_the_register() -> None:
     )
     with pytest.raises(ProgramValueError, match="persistent-key register"):
         _run(program)
-
-
-def test_runtime_override_changes_only_later_attempt_inputs() -> None:
-    catalog = _catalog()
-    program = Program(
-        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
-        catalog,
-    )
-    move = next(
-        node for node in _walk(program.tree) if node.node_id == "motion.move_to_joint_target"
-    )
-    store = ProgramValueStore.from_program(program)
-    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
-    resolver = NodeAttemptInputResolver(
-        program=program,
-        catalog=catalog,
-        value_store=store,
-        runtime_overrides=overrides,
-    )
-    before = resolver.snapshot(
-        node_id=move.node_id,
-        node_instance_id=move.instance_id,
-        parameters=move.parameters,
-        value_sources=move.value_sources,
-    )
-    overrides.activate(move.instance_id, "velocity_scale", 0.25)
-    after = resolver.snapshot(
-        node_id=move.node_id,
-        node_instance_id=move.instance_id,
-        parameters=move.parameters,
-        value_sources=move.value_sources,
-    )
-
-    assert before.parameters["velocity_scale"] != 0.25
-    assert after.parameters["velocity_scale"] == 0.25
-    assert before.parameters["velocity_scale"] != after.parameters["velocity_scale"]
-
-
-def test_runtime_override_cannot_replace_captured_binding_selectors() -> None:
-    catalog = _catalog()
-    program = Program(
-        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
-        catalog,
-    )
-    move = next(
-        node for node in _walk(program.tree) if node.node_id == "motion.move_to_joint_target"
-    )
-    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
-
-    with pytest.raises(ProgramValueError, match="captured binding meaning"):
-        overrides.validate(move.instance_id, "target_role", "other_arm")
-    with pytest.raises(ProgramValueError, match="captured binding meaning"):
-        overrides.validate(move.instance_id, "planning_profile", "first_feasible")
-
-
-def test_runtime_override_cannot_add_or_change_nested_semantic_selectors() -> None:
-    catalog = _catalog()
-    program = Program(
-        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
-        catalog,
-    )
-    move = next(node for node in _walk(program.tree) if node.instance_id == "move_to_pick_approach")
-    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
-    goal = deepcopy(dict(move.parameters["goal"]))
-    goal["frame_ref"] = {"kind": "cell_frame"}
-
-    with pytest.raises(ProgramValueError, match="captured semantic selection"):
-        overrides.validate(move.instance_id, "goal", goal)
-
-    changed_position = deepcopy(dict(move.parameters["goal"]))
-    changed_position["position_m"] = [0.0, 0.0, 0.2]
-    assert overrides.validate(move.instance_id, "goal", changed_position) == (changed_position)
 
 
 def test_nested_model_sources_are_captured_atomically_by_path() -> None:
@@ -1979,7 +1910,6 @@ def _parameter(parameter_id: str, value_type: str, default: Any) -> dict[str, An
         "parameter_id": parameter_id,
         "type": value_type,
         "default": default,
-        "runtime_mutability": "before_run",
     }
 
 
@@ -2121,7 +2051,7 @@ def test_key_typed_parameters_are_refused_by_name_at_validation(
 
 
 def test_key_typed_value_is_checked_again_at_node_attempt_time() -> None:
-    """A runtime override or a sourced pose must still match the key's type."""
+    """An attempt's input value or a sourced pose must still match the key's type."""
     program = _typed_program(
         [_key("count", "int64"), _key("copy", "stored_pose"), _key("place", "stored_pose")],
         _leaf("logic.set_value", "set_count", key="count", value=1),
@@ -2134,23 +2064,22 @@ def test_key_typed_value_is_checked_again_at_node_attempt_time() -> None:
     )
     catalog = _catalog()
     store = ProgramValueStore.from_program(program)
-    overrides = ProgramRuntimeOverrideStore(program=program, catalog=catalog)
     resolver = NodeAttemptInputResolver(
-        program=program, catalog=catalog, value_store=store, runtime_overrides=overrides
+        program=program, catalog=catalog, value_store=store
     )
     set_count, copy_place = program.tree.children
-    overrides.activate("set_count", "value", 2.5)  # closed union: a number
     with pytest.raises(ProgramValueError, match="signed 64-bit integer") as invalid:
         resolver.snapshot(
             node_id="logic.set_value",
             node_instance_id="set_count",
-            parameters=set_count.parameters,
+            # closed union: a number, but not the key's int64
+            parameters={**set_count.parameters, "value": 2.5},
             value_sources=set_count.value_sources,
         )
     assert dict(invalid.value.details) == {
         "input_problem": "invalid",
         "path": "value",
-        "source_kind": "runtime_override",
+        "source_kind": "parameter",
         "source_reference": None,
     }
     # Every write is checked with the Program's declared frames, so a key
@@ -3377,16 +3306,22 @@ def test_check_condition_succeeds_only_while_its_condition_is_true(condition, st
     assert _tick_to_end(_run(program)) is status
 
 
-def test_run_parameter_values_feed_expressions() -> None:
+def test_program_parameter_defaults_feed_expressions() -> None:
     program = _typed_program(
         [_computed("lift", "float64", "param.pitch * 2")],
         _idle(),
         parameters=[_parameter("pitch", "float64", 0.05)],
     )
-    store = ProgramValueStore.from_program(program, parameter_values={"pitch": 0.5})
-    assert store.read("lift") == 1.0
-    with pytest.raises(ProgramValueError, match="Program parameter 'pitch'"):
-        ProgramValueStore.from_program(program, parameter_values={"pitch": "x"})
+    store = ProgramValueStore.from_program(program)
+    assert store.read("lift") == 0.1
+    assert dict(store.program_parameters) == {
+        parameter_id: declaration.default
+        for parameter_id, declaration in program.parameters.items()
+    }
+    assert store.program_parameters["pitch"] == 0.05
+    # There is no override input: the Program default is the only source.
+    with pytest.raises(TypeError):
+        ProgramValueStore.from_program(program, parameter_values={"pitch": 0.5})
 
 
 def test_expression_failure_fails_the_node_naming_the_expression_and_cause() -> None:

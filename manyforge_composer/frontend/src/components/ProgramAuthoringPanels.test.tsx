@@ -80,7 +80,6 @@ const parameter: ProgramParameterDeclaration = {
   parameter_id: 'wait_time',
   type: 'float64',
   default: 0.5,
-  runtime_mutability: 'before_run',
 };
 
 const tree: ProgramTreeNode = {
@@ -878,7 +877,10 @@ describe('Program authoring panels', () => {
       mutationAvailable: true,
       acceptedApply: null,
       mutationUnavailableReason: null,
+      documentUnavailableReason: null,
       admissionObserved: true,
+      fenceDraft: null,
+      refreshApplied: vi.fn(),
       state: {
         status: 'ready',
         requestGeneration: 1,
@@ -903,7 +905,6 @@ describe('Program authoring panels', () => {
           },
           applicability: {
             applyReady: true,
-            affectedInstanceIds: [],
             unavailableReason: null,
           },
           saved: {
@@ -963,7 +964,7 @@ describe('Program authoring panels', () => {
       active: false,
       commandAllowed: vi.fn(() => false),
       commandDisabledReason: vi.fn(() => null),
-      startBlockedReason: null,
+      draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -977,12 +978,6 @@ describe('Program authoring panels', () => {
       resumeFullStop: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
-      stageObservationOverride: vi.fn(),
-      activateRuntimeOverride: vi.fn(),
-      clearRuntimeOverride: vi.fn(),
-      promoteRuntimeOverride: vi.fn(),
-      materializePromotion: vi.fn(),
-      promotionMaterializationReason: vi.fn(() => null),
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
@@ -1019,18 +1014,12 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('program-tree-node');
   });
 
-  it('keeps editing available and gates the final Apply for an imported skill', () => {
+  it('keeps editing available and gates the final Apply on the owner applicability reason', () => {
     const blockedTree: ProgramTreeNode = {
       ...tree,
       children: [{
         ...tree.children[0]!,
-        recovery_policy: {
-          allow_intervention: true,
-          allowed_recovery_actions: ['intervention'],
-          max_retries: 0,
-          allowed_skills: ['legacy.inspect'],
-          persistence_ceiling: 'session_only',
-        },
+        recovery_policy: { allow_intervention: true, max_retries: 0 },
       }],
     };
     const blockedWorkspace: ProgramWorkspaceResponse = {
@@ -1080,10 +1069,9 @@ describe('Program authoring panels', () => {
       },
       applicability: {
         applyReady: false,
-        affectedInstanceIds: ['settle'],
         unavailableReason: {
-          code: 'composer_policy_skill_referent_unavailable',
-          message: 'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.',
+          code: 'composer_authoring_draft_incomplete',
+          message: 'Program requires exactly one root; found 0.',
           restorationGates: [],
         },
       },
@@ -1106,7 +1094,10 @@ describe('Program authoring panels', () => {
       mutationAvailable: true,
       acceptedApply: null,
       mutationUnavailableReason: null,
+      documentUnavailableReason: null,
       admissionObserved: true,
+      fenceDraft: null,
+      refreshApplied: vi.fn(),
       state: {
         status: 'ready',
         requestGeneration: 1,
@@ -1154,7 +1145,7 @@ describe('Program authoring panels', () => {
       active: false,
       commandAllowed: vi.fn(() => false),
       commandDisabledReason: vi.fn(() => null),
-      startBlockedReason: null,
+      draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1168,12 +1159,6 @@ describe('Program authoring panels', () => {
       resumeFullStop: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
-      stageObservationOverride: vi.fn(),
-      activateRuntimeOverride: vi.fn(),
-      clearRuntimeOverride: vi.fn(),
-      promoteRuntimeOverride: vi.fn(),
-      materializePromotion: vi.fn(),
-      promotionMaterializationReason: vi.fn(() => null),
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
@@ -1216,7 +1201,7 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('aria-label="Load Scenario"');
     expect(markup).not.toContain('>Open</button>');
     expect(controlsSource).toContain('!workspace?.applicability.applyReady');
-    expect(controlsSource).toContain('Affected nodes:');
+    expect(controlsSource).not.toContain('Affected nodes:');
     expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');
     expect(controlsSource).toContain(
       "compact={action === 'apply' || action === 'discard' || action === 'revert'}",

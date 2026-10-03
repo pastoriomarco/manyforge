@@ -35,6 +35,7 @@ from .deployment_artifacts import (
 from .deployment_draft import DeploymentDraftError
 from .deployment_intent import DeploymentIntentError, rebase_deployment_intent_sources
 from .draft_session import DraftSessionError
+from .reset_apply_log import log_reset_apply_link
 from .state import ComposerState, _controllable_composition_change_kinds
 from .authoring_workspace import (
     AuthoringWorkspaceError,
@@ -47,6 +48,7 @@ from .scenario_artifacts import (
     save_scenario_member,
 )
 from .authoring_workspace_fence import (
+    commit_draft_edit,
     commit_local_authoring,
     require_captured_workspace_identity,
 )
@@ -204,7 +206,84 @@ class PreviewDeploymentCandidateRequest(_Fence):
     pass
 
 
+class ActivationScope(BaseModel):
+    """The complete activation input an operator confirmed.
+
+    Deployment activation compiles the Deployment Draft together with the
+    current Program Draft, the Scenario's Program role assignment and its
+    source document. A confirmation names all of them; any change before the
+    Apply is sent refuses it so the operator reviews the new input.
+    """
+
+    model_config = _DTO
+
+    deployment_draft_id: str = Field(
+        alias="deploymentDraftId", min_length=1, max_length=256
+    )
+    deployment_draft_revision: int = Field(
+        alias="deploymentDraftRevision", ge=0, le=9_007_199_254_740_991
+    )
+    deployment_revision: str | None = Field(
+        alias="deploymentRevision", max_length=256
+    )
+    program_draft_id: str = Field(alias="programDraftId", min_length=1, max_length=256)
+    program_draft_revision: int = Field(
+        alias="programDraftRevision", ge=0, le=9_007_199_254_740_991
+    )
+    program_revision: str | None = Field(alias="programRevision", max_length=256)
+    source_document_digest: str | None = Field(
+        alias="sourceDocumentDigest", max_length=256
+    )
+    program_role_assignment: dict[str, Any] | None = Field(
+        alias="programRoleAssignment"
+    )
+
+
+def _require_activation_scope(state: ComposerState, scope: ActivationScope) -> None:
+    """Refuse, before any effect, when the confirmed input changed."""
+
+    deployment = state.deployment_draft_session.retained_state()
+    document = deployment.get("document")
+    program = state.draft_session.snapshot()
+    if (
+        deployment.get("draft_id") != scope.deployment_draft_id
+        or deployment.get("draft_revision") != scope.deployment_draft_revision
+        or (document.get("deployment_revision") if isinstance(document, dict) else None)
+        != scope.deployment_revision
+        or program.get("draft_id") != scope.program_draft_id
+        or program.get("draft_revision") != scope.program_draft_revision
+        or program.get("program_revision") != scope.program_revision
+        or state.scenario_source_document_digest != scope.source_document_digest
+        or state.scenario_program_role_assignment != scope.program_role_assignment
+    ):
+        raise DeploymentDraftError(
+            "activation_input_changed_after_confirmation",
+            "Draft changed after confirmation; review again",
+            status_code=409,
+        )
+
+
+def _applied_program_revision(state: ComposerState) -> str | None:
+    """The Applied Program revision, or None when it cannot be read now."""
+
+    try:
+        applied = state.headless_client.program_applied()
+    except HeadlessClientError:
+        return None
+    revision = applied.get("program_revision") if isinstance(applied, dict) else None
+    return revision if isinstance(revision, str) and revision else None
+
+
 class ApplyDeploymentCandidateRequest(_Fence):
+    # The shared reference of an Apply that first Reset a held run; the
+    # Manager record keeps it instead of this request's own identity.
+    correlation_id: str | None = Field(
+        default=None, alias="correlationId", min_length=1, max_length=256
+    )
+    # The complete input the operator confirmed (see ActivationScope).
+    expected_activation_scope: ActivationScope | None = Field(
+        default=None, alias="expectedActivationScope"
+    )
     confirmation_token: str | None = Field(
         default=None,
         alias="confirmationToken",
@@ -524,7 +603,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             _require_draftable_composition(
                 before.get("document"), compiled.document
             )
-            commit = commit_local_authoring(
+            commit_draft_edit(
                 state,
                 body,
                 operation_kind="mutate_deployment_draft",
@@ -554,7 +633,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 )
             )
-            commit = commit_local_authoring(
+            commit_draft_edit(
                 state,
                 body,
                 operation_kind="mutate_deployment_controlled_stop",
@@ -585,7 +664,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 )
             )
-            commit = commit_local_authoring(
+            commit_draft_edit(
                 state,
                 body,
                 operation_kind="mutate_deployment_motion_target_limit",
@@ -760,7 +839,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 json.dumps(applied, ensure_ascii=False, allow_nan=False)
             )
 
-            def validate_applied_under_claim() -> None:
+            def validate_applied_unchanged() -> None:
                 _current, current_identity = read_applied()
                 if current_identity != applied_identity:
                     raise DeploymentDraftError(
@@ -769,12 +848,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
-            commit = commit_local_authoring(
+            commit_draft_edit(
                 state,
                 body,
                 operation_kind="discard_deployment_draft",
                 session="deployment",
-                validate_under_claim=validate_applied_under_claim,
+                validate=validate_applied_unchanged,
                 install=lambda: state.deployment_draft_session.commit_compiled(
                     compiled,
                     draft_id=body.draft_id,
@@ -811,7 +890,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
-        overrides = deepcopy(state.scenario_typed_parameter_overrides)
         if (
             not isinstance(program, dict)
             or not isinstance(assignment, dict)
@@ -835,7 +913,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "model_source_closure": source_closure,
                     "program": program,
                     "program_role_assignment": assignment,
-                    "typed_parameter_overrides": overrides,
                 }
             )
         )
@@ -862,7 +939,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "model_source_closure": source_closure,
             "program": deepcopy(program),
             "program_role_assignment": assignment,
-            "typed_parameter_overrides": overrides,
             "deployment": deepcopy(saved),
             "expected_manager_current": {
                 "retained_bundle_id": current_bundle,
@@ -1004,7 +1080,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
-        overrides = deepcopy(state.scenario_typed_parameter_overrides)
         if (
             not isinstance(program, dict)
             or not isinstance(assignment, dict)
@@ -1019,7 +1094,51 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=409,
                 )
             )
+        scope = (
+            body.expected_activation_scope
+            if isinstance(body, ApplyDeploymentCandidateRequest)
+            else None
+        )
+        if scope is not None:
+            try:
+                _require_activation_scope(state, scope)
+            except DeploymentDraftError as error:
+                _raise(error)
         source_closure = _capture_model_sources(state, deployment)
+        if apply:
+            # Nothing to apply: every input already is the Manager's Applied
+            # activation. Refused before admission, so no effect is possible.
+            # An Applied fact that cannot be read now never proves a no-op.
+            try:
+                publication = state.published_scenario().get("published_scenario")
+            except HeadlessClientError:
+                publication = None
+            applied_context = (
+                state.applied_activation_for_publication(publication)
+                if isinstance(publication, dict)
+                else None
+            )
+            program_revision = (
+                program.get("program_revision") if isinstance(program, dict) else None
+            )
+            if (
+                applied_context is not None
+                and applied_context.get("deployment") == deployment
+                and applied_context.get("model_source_closure") == source_closure
+                and applied_context.get("program_role_assignment") == assignment
+                and applied_context.get("source_document_digest") == source_document_digest
+                and applied_context.get("scenario_id") == scenario_id
+                and isinstance(program_revision, str)
+                and _applied_program_revision(state) == program_revision
+            ):
+                _raise(
+                    DeploymentDraftError(
+                        "deployment_apply_nothing_to_apply",
+                        "Nothing to apply: the Deployment and Program Drafts "
+                        "already match Applied",
+                        status_code=409,
+                    )
+                )
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1029,7 +1148,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "model_source_closure": source_closure,
                     "program": program,
                     "program_role_assignment": assignment,
-                    "typed_parameter_overrides": overrides,
                 }
             )
         )
@@ -1051,7 +1169,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "deployment": deepcopy(deployment),
             "program": deepcopy(program),
             "program_role_assignment": assignment,
-            "typed_parameter_overrides": overrides,
             "expected_manager_current": {
                 "retained_bundle_id": current_bundle,
                 "graph_revision": current_graph,
@@ -1061,7 +1178,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32],
-            "correlation_id": body.request_id,
+            "correlation_id": (
+                body.correlation_id
+                if isinstance(body, ApplyDeploymentCandidateRequest)
+                and body.correlation_id is not None
+                else body.request_id
+            ),
             "confirmation_token": (
                 body.confirmation_token
                 if isinstance(body, ApplyDeploymentCandidateRequest)
@@ -1090,6 +1212,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             state.deployment_draft_session.require_current(
                 body.draft_id, body.expected_draft_revision
             )
+            if scope is not None:
+                _require_activation_scope(state, scope)
             if state.deployment_draft_session.retained_state() != deployment_state:
                 raise DeploymentDraftError(
                     "deployment_draft_stale",
@@ -1101,7 +1225,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 state.draft_session.retained_state().get("program") != program
                 or state.scenario_program_role_assignment != assignment
                 or state.scenario_source_document_digest != source_document_digest
-                or state.scenario_typed_parameter_overrides != overrides
                 or (
                     _claim is not None
                     and _capture_model_sources(state, deployment) != source_closure
@@ -1214,6 +1337,36 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     def apply_authored_candidate(
         body: ApplyDeploymentCandidateRequest,
     ) -> dict[str, Any]:
-        return authored_candidate(body, apply=True)
+        if body.correlation_id is None:
+            return authored_candidate(body, apply=True)
+        try:
+            response = authored_candidate(body, apply=True)
+        except HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {}
+            log_reset_apply_link(
+                "deployment_apply",
+                correlation_id=body.correlation_id,
+                request_id=body.request_id,
+                outcome="error",
+                error_code=detail.get("code"),
+                draft_id=body.draft_id,
+                draft_revision=body.expected_draft_revision,
+            )
+            raise
+        result = response.get("result") if isinstance(response, dict) else None
+        manager = result.get("manager_apply") if isinstance(result, dict) else None
+        log_reset_apply_link(
+            "deployment_apply",
+            correlation_id=body.correlation_id,
+            request_id=body.request_id,
+            outcome=str(result.get("status")) if isinstance(result, dict) else "unknown",
+            apply_id=manager.get("apply_id") if isinstance(manager, dict) else None,
+            apply_generation=(
+                manager.get("apply_generation") if isinstance(manager, dict) else None
+            ),
+            draft_id=body.draft_id,
+            draft_revision=body.expected_draft_revision,
+        )
+        return response
 
     return router

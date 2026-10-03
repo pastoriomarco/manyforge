@@ -13,14 +13,13 @@ import type {
   ProgramRuntimeControlProjection,
   ProgramGroupRuntimeScaleState,
   ProgramCycleStatus,
-  RuntimeOverridePromotionProposal,
-  RuntimeOverrideRecord,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
   browserStableIdentity,
+  CommandDeliveryUnconfirmedError,
   type ExecutionControlCommandKind,
   type HeadlessStateSource,
 } from './useHeadlessState';
@@ -170,6 +169,12 @@ interface ProgramRuntimeState {
   error: string | null;
 }
 
+/** Commands that start or resume Program progression or motion. */
+const DRAFT_GATED_COMMANDS: ReadonlySet<string> = new Set([
+  'program_run', 'program_motion_start', 'program_motion_resume',
+  'program_resume_full_stop',
+]);
+
 const INITIAL_STATE: ProgramRuntimeState = {
   applied: null,
   nonExecutable: null,
@@ -202,7 +207,8 @@ function currentScenarioKey(value: CurrentScenarioResponse | null): string {
       ].join(':')}`;
 }
 
-function appliedKey(value: AppliedProgramSelection | null): string {
+/** The exact Applied Program selection a view shows ('none' when absent). */
+export function appliedKey(value: AppliedProgramSelection | null): string {
   return value === null
     ? 'none'
     : `${value.sourceOwnerEpoch}:${value.sourceGeneration}:${value.recordDigest}`;
@@ -222,7 +228,7 @@ function controlsKey(value: ProgramRuntimeControlProjection | null): string {
       + `${value.runtimeControls.runtimeControlRevision}:`
       + `${value.recoveryOffer?.offerId ?? 'no-offer'}:`
       + `${value.recoveryOffer?.offerRevision ?? 0}:`
-      + JSON.stringify([value.observationOverrideCandidate, value.executionSelections]);
+      + JSON.stringify(value.executionSelections);
 }
 
 export function controlPendingAfterProjection(
@@ -346,10 +352,34 @@ export function buildProgramStartRequest(
   };
 }
 
+/** The exact Reset this browser sent: the cycle it ends and its correlation. */
+export interface ProgramResetIdentity {
+  requestId: string;
+  correlationId: string;
+  programRunId: string;
+  programRunnerOwnerEpoch: string;
+  cycleGeneration: number;
+}
+
+/** The exact cycle a caller confirmed Reset for; any other is refused unsent. */
+export type ProgramResetExpectation = Pick<
+  ProgramResetIdentity, 'programRunId' | 'programRunnerOwnerEpoch' | 'cycleGeneration'
+>;
+
+/** What one Reset call established; never settlement on its own. */
+export type ProgramResetOutcome =
+  /** Received by the owner (its receipt was not a refusal). */
+  | { status: 'sent'; reset: ProgramResetIdentity }
+  /** Submitted, but its reply was lost: it may or may not have been received. */
+  | { status: 'unconfirmed'; reset: ProgramResetIdentity; message: string }
+  /** Definitely without effect: not sent, or refused by the owner. */
+  | { status: 'refused'; message: string };
+
 export function buildProgramResetRequest(
   snapshot: ComposerHeadlessState | null,
   requestOwnerEpoch: string,
   requestId: string,
+  correlationId: string = requestId,
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
   const allowed = cycle?.allowedCommands.some(
@@ -364,7 +394,7 @@ export function buildProgramResetRequest(
     request_id: requestId,
     request_owner_epoch: requestOwnerEpoch,
     source_label: 'operator_ui',
-    correlation_id: requestId,
+    correlation_id: correlationId,
     program_run_id: cycle.programRunId,
     expected_owner_epoch: cycle.programRunnerOwnerEpoch,
     expected_cycle_generation: cycle.cycleGeneration,
@@ -883,6 +913,20 @@ export function useProgramRuntime(
     });
   }, []);
 
+  // Execute, Run, Resume and Retry use only what is applied: while a Draft
+  // has unapplied changes they are refused (the Composer backend enforces the
+  // same rule where it admits them). Stop, Halt and Reset stay available.
+  const programPending = state.applied !== null && workspace !== null
+    && workspace.draft.programLoaded
+    && workspace.draft.programRevision !== state.applied.programRevision;
+  const pendingDocuments = [
+    ...(programPending ? ['Program (Scene edits included)'] : []),
+    ...(deploymentPending ? ['Deployment'] : []),
+  ];
+  const draftUnappliedReason = pendingDocuments.length === 0
+    ? null
+    : `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute, Run, Resume and Retry use only what is applied.`;
+
   const run = useCallback(async () => {
     const requestId = identity('program-run-start');
     const request = buildProgramStartRequest(
@@ -907,36 +951,71 @@ export function useProgramRuntime(
     state.applied, state.pending, state.runnerAvailable, workspace,
   ]);
 
-  const reset = useCallback(async () => {
+  /**
+   * Send one Reset for the cycle the caller names and report what is known.
+   *
+   * `expected` is the exact run, runner owner and cycle generation the caller
+   * confirmed: when the current observation differs, nothing is sent. A
+   * definite refusal (not sent, or refused by the owner) is distinct from a
+   * submitted Reset whose reply was lost: that one may have been received, so
+   * it keeps its request identity for reconciliation and must never be
+   * resent. Neither outcome is settlement: callers that continue after Reset
+   * observe its correlated cycle Idle.
+   */
+  const reset = useCallback(async (
+    options: { correlationId?: string; expected?: ProgramResetExpectation } = {},
+  ): Promise<ProgramResetOutcome> => {
     const requestId = identity('program-cycle-reset');
-    const request = buildProgramResetRequest(
-      snapshot, callerEpoch.current, requestId,
-    );
-    if (request === null || controlSource === null) {
-      if (mounted.current) setState((current) => ({
-        ...current,
-        error: request === null
-          ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
-          : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.',
-      }));
-      await refresh();
-      return;
+    const correlationId = options.correlationId ?? requestId;
+    const cycle = snapshot?.programCycle ?? null;
+    const { expected } = options;
+    if (expected !== undefined && (
+      cycle === null
+      || cycle.programRunId !== expected.programRunId
+      || cycle.programRunnerOwnerEpoch !== expected.programRunnerOwnerEpoch
+      || cycle.cycleGeneration !== expected.cycleGeneration
+    )) {
+      return {
+        status: 'refused',
+        message: `Program Reset was not sent: the observed cycle is no longer run ${expected.programRunId} at cycle generation ${expected.cycleGeneration}.`,
+      };
     }
+    const request = buildProgramResetRequest(
+      snapshot, callerEpoch.current, requestId, correlationId,
+    );
+    if (request === null || controlSource === null || cycle?.programRunId == null) {
+      const message = request === null
+        ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
+        : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.';
+      if (mounted.current) setState((current) => ({ ...current, error: message }));
+      await refresh();
+      return { status: 'refused', message };
+    }
+    const sent: ProgramResetIdentity = {
+      requestId,
+      correlationId,
+      programRunId: cycle.programRunId,
+      programRunnerOwnerEpoch: cycle.programRunnerOwnerEpoch,
+      cycleGeneration: cycle.cycleGeneration,
+    };
     beginProgramCommand('reset', requestId);
     try {
       await controlSource.sendExecutionCommand(
-        'program_reset', request, requestId,
+        'program_reset', request, correlationId,
       );
+      return { status: 'sent', reset: sent };
     } catch (reason) {
       await recordCommandFailure(
         reason, 'Program Reset was rejected.', requestId, 'program', 'reset',
       );
+      return reason instanceof CommandDeliveryUnconfirmedError
+        ? { status: 'unconfirmed', reset: sent, message: reason.message }
+        : { status: 'refused', message: errorMessage(reason, 'Program Reset was rejected.') };
     }
   }, [
     beginProgramCommand, controlSource,
     recordCommandFailure, refresh, snapshot,
   ]);
-
 
   const selectionCommand = useCallback(async (
     pending: 'start-motion' | 'motion-stop' | 'resume-motion', groupIds: string[],
@@ -945,7 +1024,8 @@ export function useProgramRuntime(
     const resume = pending === 'resume-motion';
     const controls = state.controls;
     if (
-      groupIds.length === 0
+      ((start || resume) && draftUnappliedReason !== null)
+      || groupIds.length === 0
       || !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
       || !state.runnerAvailable
@@ -1003,7 +1083,7 @@ export function useProgramRuntime(
       }));
     }
   }, [
-    beginProgramCommand, controlSource,
+    beginProgramCommand, controlSource, draftUnappliedReason,
     recordCommandFailure,
     state.pending, state.selectionPending, state.controlPending, state.controls,
     state.run, state.runnerAvailable,
@@ -1371,7 +1451,8 @@ export function useProgramRuntime(
 
   const resumeFullStop = useCallback(async () => {
     if (
-      !state.run
+      draftUnappliedReason !== null
+      || !state.run
       || state.run.state !== 'full_stopped'
       || !state.runnerAvailable
       || state.pending !== null
@@ -1401,7 +1482,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, controlSource,
+    beginProgramCommand, controlSource, draftUnappliedReason,
     recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
@@ -1463,6 +1544,8 @@ export function useProgramRuntime(
     if (
       offer === null || offer === undefined || action?.enabled !== true
       || state.controlPending !== null
+      // Retry and continue resume the run; only a Reset ends it.
+      || (!action.performsBackendReset && draftUnappliedReason !== null)
     ) return;
     const requestId = identity('program-recovery');
     const body = {
@@ -1483,72 +1566,7 @@ export function useProgramRuntime(
       body,
       'The recovery action was rejected.',
     );
-  }, [performRuntimeControl, state.controlPending, state.controls]);
-
-  const stageObservationOverride = useCallback(() => {
-    const candidate = state.controls?.observationOverrideCandidate;
-    const requestId = identity('program-runtime-override-stage');
-    const base = runtimeControlRequest(requestId);
-    if (
-      base === null
-      || candidate?.available !== true
-      || candidate.nodeInstanceId === null
-      || candidate.nodeAttemptId === null
-      || candidate.parameterId === null
-      || candidate.value === null
-      || candidate.sourceObservationId === null
-      || candidate.sourceOwnerGeneration === null
-    ) return;
-    void performRuntimeControl(
-      'override:stage-observation',
-      requestId,
-      'program_runtime_override_stage',
-      {
-        ...base,
-        node_instance_id: candidate.nodeInstanceId,
-        node_attempt_id: candidate.nodeAttemptId,
-        parameter_id: candidate.parameterId,
-        value: candidate.value,
-        source_observation_id: candidate.sourceObservationId,
-        source_owner_generation: candidate.sourceOwnerGeneration,
-      },
-      'The Robot snapshot could not be staged.',
-    );
-  }, [performRuntimeControl, runtimeControlRequest, state.controls]);
-
-  const runtimeOverrideAction = useCallback((
-    action: 'activate' | 'clear' | 'promote',
-    override: RuntimeOverrideRecord,
-  ) => {
-    const requestId = identity(`program-runtime-override-${action}`);
-    const base = runtimeControlRequest(requestId);
-    if (base === null || (action === 'promote' && workspace === null)) return;
-    const commandKind: ExecutionControlCommandKind = action === 'activate'
-      ? 'program_runtime_override_activate'
-      : action === 'clear'
-        ? 'program_runtime_override_clear'
-        : 'program_runtime_override_promote';
-    const body: Record<string, JsonValue> = {
-      ...base,
-      override_id: override.overrideId,
-      expected_override_revision: override.overrideRevision,
-    };
-    if (action === 'promote') {
-      body.expected_draft_id = workspace!.draft.draftId;
-      body.expected_draft_revision = workspace!.draft.draftRevision;
-    }
-    void performRuntimeControl(
-      `override:${action}:${override.overrideId}`,
-      requestId,
-      commandKind,
-      body,
-      action === 'activate'
-        ? 'The runtime override could not be activated.'
-        : action === 'clear'
-          ? 'The runtime override could not be cleared.'
-          : 'The runtime override promotion could not be requested.',
-    );
-  }, [performRuntimeControl, runtimeControlRequest, workspace]);
+  }, [draftUnappliedReason, performRuntimeControl, state.controlPending, state.controls]);
 
   /** Resolves to null when written, otherwise to why the write was refused. */
   const writeRuntimeBlackboard = useCallback((
@@ -1634,83 +1652,6 @@ export function useProgramRuntime(
     );
   }, [performRuntimeControl, runtimeControlRequest, state.controls]);
 
-  const materializePromotion = useCallback(async (
-    proposal: RuntimeOverridePromotionProposal,
-  ) => {
-    if (
-      proposal.status !== 'ready'
-      || workspace === null
-      || snapshot === null
-      || state.controlPending !== null
-      || proposal.expectedDraftId !== workspace.draft.draftId
-      || proposal.expectedDraftRevision !== workspace.draft.draftRevision
-      || snapshot.authoringWorkspace.programDraftId !== workspace.draft.draftId
-      || snapshot.authoringWorkspace.programDraftRevision
-        !== workspace.draft.draftRevision
-      || snapshot.programCycle.state !== 'idle_after_reset'
-      || !snapshot.authoringAdmission.authoringAllowed
-    ) return;
-    const requestId = identity('program-runtime-promotion-materialize');
-    setState((current) => ({
-      ...current,
-      controlPending: `promotion:materialize:${proposal.proposalId}`,
-      error: null,
-    }));
-    try {
-      await api.programWorkspace.materializeRuntimeOverride(
-        {
-          draftId: workspace.draft.draftId,
-          expectedDraftRevision: workspace.draft.draftRevision,
-          expectedWorkspaceEpoch: snapshot.authoringWorkspace.workspaceEpoch,
-          expectedWorkspaceRevision:
-            snapshot.authoringWorkspace.workspaceRevision,
-          expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
-          requestOwnerEpoch: callerEpoch.current,
-          requestId,
-        },
-        proposal.programRunId,
-        proposal.proposalId,
-      );
-      await refresh();
-      if (mounted.current) setState((current) => ({
-        ...current,
-        controlPending: null,
-      }));
-    } catch (reason) {
-      if (mounted.current) setState((current) => ({
-        ...current,
-        controlPending: null,
-        error: errorMessage(
-          reason,
-          'The runtime override could not be applied to the Draft.',
-        ),
-      }));
-    }
-  }, [refresh, snapshot, state.controlPending, workspace]);
-
-  const promotionMaterializationReason = useCallback((
-    proposal: RuntimeOverridePromotionProposal,
-  ): string | null => {
-    if (proposal.status !== 'ready') return 'Reset the Program cycle first.';
-    if (workspace === null || snapshot === null) {
-      return 'The current Draft and backend admission are unavailable.';
-    }
-    if (
-      proposal.expectedDraftId !== workspace.draft.draftId
-      || proposal.expectedDraftRevision !== workspace.draft.draftRevision
-    ) return 'The Draft changed after this promotion was requested.';
-    if (
-      snapshot.authoringWorkspace.programDraftId !== workspace.draft.draftId
-      || snapshot.authoringWorkspace.programDraftRevision
-        !== workspace.draft.draftRevision
-    ) return 'The displayed Draft is still synchronizing.';
-    if (
-      snapshot.programCycle.state !== 'idle_after_reset'
-      || !snapshot.authoringAdmission.authoringAllowed
-    ) return 'Applying the promotion to Draft requires authoritative Idle.';
-    return state.controlPending === null ? null : 'Another runtime control is pending.';
-  }, [snapshot, state.controlPending, workspace]);
-
   const active = useMemo(
     () => state.run !== null && CURRENT_STATES.has(state.run.state),
     [state.run],
@@ -1718,31 +1659,23 @@ export function useProgramRuntime(
   const cycleState = snapshot?.programCycle?.state ?? null;
   const cycleFailure = snapshot?.programCycle?.failure ?? null;
   const commandAllowed = useCallback((commandKind: string): boolean => (
-    (commandKind !== 'program_run' || buildProgramStartRequest(
+    !(DRAFT_GATED_COMMANDS.has(commandKind) && draftUnappliedReason !== null)
+    && (commandKind !== 'program_run' || buildProgramStartRequest(
       state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
       callerEpoch.current, 'availability-check', deploymentPending,
     ) !== null)
     && (snapshot?.programCycle.allowedCommands.some(
       (command) => command.commandKind === commandKind && command.allowed,
     ) ?? false)
-  ), [deploymentPending, snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
-  /** The backend's reason why a command is currently not allowed, if any. */
+  ), [deploymentPending, draftUnappliedReason, snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
+  /** Why a command is currently not allowed (unapplied Draft, then the
+   * backend's reason), if any. */
   const commandDisabledReason = useCallback((commandKind: string): string | null => (
-    snapshot?.programCycle.allowedCommands.find(
+    (DRAFT_GATED_COMMANDS.has(commandKind) ? draftUnappliedReason : null)
+    ?? snapshot?.programCycle.allowedCommands.find(
       (command) => command.commandKind === commandKind,
     )?.disabledReason ?? null
-  ), [snapshot]);
-  // Execute runs only what is applied: say which Draft still has changes.
-  const programPending = state.applied !== null && workspace !== null
-    && workspace.draft.programLoaded
-    && workspace.draft.programRevision !== state.applied.programRevision;
-  const pendingDocuments = [
-    ...(programPending ? ['Program (Scene edits included)'] : []),
-    ...(deploymentPending ? ['Deployment'] : []),
-  ];
-  const startBlockedReason = pendingDocuments.length === 0
-    ? null
-    : `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute runs only what is applied.`;
+  ), [draftUnappliedReason, snapshot]);
 
   return useMemo(() => ({
     state,
@@ -1750,7 +1683,7 @@ export function useProgramRuntime(
     cycleFailure,
     commandAllowed,
     commandDisabledReason,
-    startBlockedReason,
+    draftUnappliedReason,
     active,
     refresh,
     dismissError,
@@ -1765,18 +1698,6 @@ export function useProgramRuntime(
     resumeFullStop,
     reset,
     applyRecoveryAction,
-    stageObservationOverride,
-    activateRuntimeOverride: (override: RuntimeOverrideRecord) => (
-      runtimeOverrideAction('activate', override)
-    ),
-    clearRuntimeOverride: (override: RuntimeOverrideRecord) => (
-      runtimeOverrideAction('clear', override)
-    ),
-    promoteRuntimeOverride: (override: RuntimeOverrideRecord) => (
-      runtimeOverrideAction('promote', override)
-    ),
-    materializePromotion,
-    promotionMaterializationReason,
     writeRuntimeBlackboard,
     persistentValues,
     stageManualResult,
@@ -1788,7 +1709,7 @@ export function useProgramRuntime(
     cycleState,
     commandAllowed,
     commandDisabledReason,
-    startBlockedReason,
+    draftUnappliedReason,
     persistentValues,
     refresh,
     reset,
@@ -1802,11 +1723,7 @@ export function useProgramRuntime(
     fullStop,
     resumeFullStop,
     stageManualResult,
-    stageObservationOverride,
     state,
-    materializePromotion,
-    promotionMaterializationReason,
-    runtimeOverrideAction,
     writeRuntimeBlackboard,
   ]);
 }

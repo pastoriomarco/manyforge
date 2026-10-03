@@ -646,11 +646,14 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
 /// reconstruct the operation input.
 component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
     const CanonicalValue &value) {
-  RequireExactObjectSize(value, 15U, "Apply prepared activation");
+  // Development cutover: only the current prepared-activation version is
+  // accepted; v3/v4 carried the removed launch-time parameter overrides.
   const auto schema = RequiredString(value, "schema_version");
-  Require(schema == "manyforge.prepared_activation_input.v3" ||
-              schema == deployment::kPreparedActivationInputSchemaVersion,
-          "Apply prepared activation schema is unsupported");
+  Require(schema == deployment::kPreparedActivationInputSchemaVersion,
+          "Apply prepared activation schema is unsupported (only " +
+              std::string(deployment::kPreparedActivationInputSchemaVersion) +
+              "; launch-time Program parameter overrides were removed)");
+  RequireExactObjectSize(value, 14U, "Apply prepared activation");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
   const auto deployment_revision = RequiredString(value, "deployment_revision");
@@ -670,15 +673,11 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   const auto outcome_kind = RequiredString(program_outcome, "kind");
   const bool no_program = outcome_kind == "no_program";
   if (no_program) {
-    Require(schema == deployment::kPreparedActivationInputSchemaVersion,
-            "no_program requires prepared activation v4");
     RequireExactObjectSize(program_outcome, 1U, "Apply Program outcome");
     Require(RequiredMember(value, "program_id").is_null() &&
                 RequiredMember(value, "program_revision").is_null() &&
-                RequiredString(value, "assistant_mode") == "optional" &&
-                RequiredMember(value, "typed_parameter_overrides").is_object() &&
-                RequiredMember(value, "typed_parameter_overrides").as_object().empty(),
-            "no_program must have no Program identities or overrides");
+                RequiredString(value, "assistant_mode") == "optional",
+            "no_program must have no Program identities");
   } else if (outcome_kind == "bound") {
     RequireExactObjectSize(program_outcome, 2U, "Apply Program outcome");
     const auto binding_id = RequiredString(program_outcome, "program_binding_id");
@@ -718,9 +717,6 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   Require(assistant_mode == "required" || assistant_mode == "optional" ||
               assistant_mode == "forbidden",
           "Apply prepared activation assistant_mode is unsupported");
-  Require(RequiredMember(value, "typed_parameter_overrides").is_object(),
-          "Apply prepared activation typed_parameter_overrides must be an "
-          "object");
   static_cast<void>(RequiredString(value, "scenario_id"));
   if (!no_program) {
     static_cast<void>(RequiredString(value, "program_id"));
@@ -2942,7 +2938,15 @@ private:
   /// process.
   PublicationGenerations ObserveRuntimeAndPublish() {
     RequireCurrentPackageGeneration();
-    return PublishActiveRuntime(active_runtime_.Observe());
+    auto runtime = active_runtime_.Observe();
+    if (!ManagerRuntimeAccountsForCommittedApplies(
+            runtime, stores_.apply_journal().ReadStatusInventory())) {
+      // An Apply published after this observation read the durable pointer.
+      // Its pointer is written before its journal receipt, so observing again
+      // reads a publication that accounts for every receipt just seen.
+      runtime = active_runtime_.Observe();
+    }
+    return PublishActiveRuntime(std::move(runtime));
   }
 
   /// Effect-permitted convergence and publication. Restricted to bootstrap and
@@ -2956,9 +2960,14 @@ private:
 
   PublicationGenerations PublishActiveRuntime(
       component_manager::ManagerActiveRuntimeConvergenceResult runtime) {
-    last_runtime_ = runtime;
-    kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
-    if (kernel_apply_available_ && !scene_admission_reconciled_.exchange(
+    const bool kernel_apply_available = HasConvergedKernelApplyOwner(runtime);
+    {
+      // The Apply progression lane publishes transitions from these.
+      std::lock_guard source_lock(manager_source_mutex_);
+      last_runtime_ = runtime;
+      kernel_apply_available_ = kernel_apply_available;
+    }
+    if (kernel_apply_available && !scene_admission_reconciled_.exchange(
                                        true, std::memory_order_acq_rel)) {
       // Consume before I/O: a concurrent failed Commit may mark it dirty
       // again, and must not be overwritten by this successful reconciliation.
@@ -2973,7 +2982,10 @@ private:
     const auto active_bundle = verified_package_.get_verified(bundle_id);
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
-    last_active_bundle_ = active_bundle;
+    {
+      std::lock_guard source_lock(manager_source_mutex_);
+      last_active_bundle_ = active_bundle;
+    }
     const bool all_runtime_processes_present = std::all_of(
         runtime.observations.observations().begin(),
         runtime.observations.observations().end(), [](const auto &observation) {
@@ -3021,14 +3033,21 @@ private:
         pose_observation_replays_.clear();
       }
     }
-    const auto manager = manager_channel_.Publish(
-        "component_manager", manager_owner_id_, manager_owner_epoch_,
-        observed_at,
-        BuildManagerSourcePayload(
-            *active_bundle, runtime, stores_.apply_journal(),
-            kernel_apply_available_
-                ? ManagerApplyMutationAvailability::kAvailable
-                : ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+    const auto manager = [&] {
+      // One lock spans the journal read, the build and the write, so every
+      // Manager source value pairs one active publication with the Apply
+      // history read after it, and values are written in journal order.
+      std::lock_guard source_lock(manager_source_mutex_);
+      return manager_channel_.Publish(
+          "component_manager", manager_owner_id_, manager_owner_epoch_,
+          observed_at,
+          BuildManagerSourcePayload(
+              *active_bundle, runtime, stores_.apply_journal(),
+              stores_.apply_journal().ReadStatusInventory(),
+              kernel_apply_available
+                  ? ManagerApplyMutationAvailability::kAvailable
+                  : ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+    }();
 
     const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_generation = PublishSceneRuntime(observed_at);
@@ -3678,19 +3697,34 @@ private:
 
   void TryPublishApplyTransition() noexcept {
     try {
-      if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
-        return;
-      }
       const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
-      static_cast<void>(manager_channel_.Publish(
-          "component_manager", manager_owner_id_, manager_owner_epoch_,
-          observed_at,
-          BuildManagerSourcePayload(
-              *last_active_bundle_, *last_runtime_, stores_.apply_journal(),
-              kernel_apply_available_
-                  ? ManagerApplyMutationAvailability::kAvailable
-                  : ManagerApplyMutationAvailability::
-                        kKernelOwnerUnavailable)));
+      {
+        // Called from the command strand and the Apply progression lane.
+        std::lock_guard source_lock(manager_source_mutex_);
+        if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
+          return;
+        }
+        const auto apply_inventory =
+            stores_.apply_journal().ReadStatusInventory();
+        // The last observed runtime predates this Apply. Once the Apply has
+        // published, pairing them would show its committed record beside the
+        // predecessor publication. Keep the previous value (the Apply still
+        // in progress) until the command strand publishes the next observed
+        // runtime, which holds the new publication.
+        if (ManagerRuntimeAccountsForCommittedApplies(*last_runtime_,
+                                                      apply_inventory)) {
+          static_cast<void>(manager_channel_.Publish(
+              "component_manager", manager_owner_id_, manager_owner_epoch_,
+              observed_at,
+              BuildManagerSourcePayload(
+                  *last_active_bundle_, *last_runtime_,
+                  stores_.apply_journal(), apply_inventory,
+                  kernel_apply_available_
+                      ? ManagerApplyMutationAvailability::kAvailable
+                      : ManagerApplyMutationAvailability::
+                            kKernelOwnerUnavailable)));
+        }
+      }
       static_cast<void>(PublishLogicalScene(observed_at));
       static_cast<void>(PublishSceneRuntime(observed_at));
     } catch (const std::exception &error) {
@@ -3832,16 +3866,26 @@ private:
   }
 
   void PublishPackageRestartRequired() noexcept {
+    std::lock_guard source_lock(manager_source_mutex_);
     kernel_apply_available_ = false;
     if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
       return;
     }
     try {
+      const auto apply_inventory =
+          stores_.apply_journal().ReadStatusInventory();
+      if (!ManagerRuntimeAccountsForCommittedApplies(*last_runtime_,
+                                                     apply_inventory)) {
+        // The last observed runtime predates a committed Apply; its value
+        // would be inconsistent. Readers keep the previous value.
+        return;
+      }
       static_cast<void>(manager_channel_.Publish(
           "component_manager", manager_owner_id_, manager_owner_epoch_,
           static_cast<std::int64_t>(ElapsedNs()),
           BuildManagerSourcePayload(
               *last_active_bundle_, *last_runtime_, stores_.apply_journal(),
+              apply_inventory,
               ManagerApplyMutationAvailability::kFullStackRestartRequired)));
     } catch (const std::exception &publication_error) {
       std::cerr << "Manager daemon could not publish package-generation "
@@ -4903,6 +4947,9 @@ private:
   DaemonPlannedMaintenanceGate planned_maintenance_gate_;
   component_manager::ManagerPlannedMaintenanceCoordinator
       planned_maintenance_;
+  // Guards the three members below (written by the command strand, read by
+  // the Apply progression lane) and spans every Manager source build+write.
+  std::mutex manager_source_mutex_;
   bool kernel_apply_available_{};
   std::atomic<bool> scene_admission_reconciled_{false};
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>

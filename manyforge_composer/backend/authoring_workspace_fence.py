@@ -112,8 +112,48 @@ def commit_local_authoring(
     )
 
 
+def commit_draft_edit(
+    state: "ComposerState",
+    body: Any,
+    *,
+    operation_kind: str,
+    install: Callable[[], bool],
+    session: str = "program",
+    validate: Callable[[], None] | None = None,
+) -> LocalAuthoringCommit:
+    """Commit one Draft-only edit (no cell claim; see ``execute_draft_edit``).
+
+    The same composite and domain fences as :func:`commit_local_authoring`
+    apply; admission is Idle authoring or a held run whose motion is
+    confirmed stopped.
+    """
+
+    coordinator = state.authoring_admission
+    if coordinator is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "authoring_not_ready",
+                "message": "authoritative authoring admission is unavailable",
+            },
+        )
+    identity: "AuthoringWorkspaceIdentity" = state.authoring_workspace.identity()
+    body.require_workspace_fence(identity)
+    return coordinator.execute_draft_edit(
+        body.admission_envelope(),
+        operation_kind=operation_kind,
+        workspace=state.authoring_workspace,
+        draft_id=body.draft_id,
+        expected_identity=identity,
+        install=install,
+        session=session,
+        validate=validate,
+    )
+
+
 __all__ = [
     "MAXIMUM_WORKSPACE_FENCE_INTEGER",
+    "commit_draft_edit",
     "commit_local_authoring",
     "require_captured_workspace_identity",
 ]

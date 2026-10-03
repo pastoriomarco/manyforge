@@ -159,7 +159,6 @@ def _project_document() -> dict[str, Any]:
         "name": "Cell A",
         "description": "assembly",
         "program_role_assignment": {"roles": ["picker"]},
-        "typed_parameter_overrides": {"speed": 1},
         "program_draft": {"forest": []},
         "deployment_draft": {"components": []},
     }
@@ -211,7 +210,6 @@ def test_snapshot_shape_is_closed_and_carries_the_composite_identity() -> None:
         "source_diagnostics",
         "source_document_digest",
         "program_role_assignment",
-        "typed_parameter_overrides",
         "source_program_digest",
         "source_deployment_digest",
     }
@@ -408,7 +406,6 @@ def test_whole_workspace_replacement_rotates_both_identities_in_one_advance() ->
             "source_diagnostics": [],
             "source_document_digest": "sha256:bb",
             "program_role_assignment": {"roles": ["placer"]},
-            "typed_parameter_overrides": {},
             "source_program_digest": "sha256:cc",
             "source_deployment_digest": "sha256:dd",
         },

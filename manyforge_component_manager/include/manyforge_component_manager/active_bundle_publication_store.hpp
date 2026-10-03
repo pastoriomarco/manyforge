@@ -103,8 +103,14 @@ class SqliteActiveBundlePublicationStore final
       manyforge::core::ActiveBundlePublicationGeneration
           publication_generation) const override;
 
+  /// Complete SQLite, schema, receipt-chain and head verification. The last
+  /// complete result is reused only while the database is provably unchanged
+  /// (same SQLite `data_version` and same total change count of this
+  /// connection); any commit forces complete re-verification on the next call.
   [[nodiscard]] ActiveBundlePublicationStoreIntegrityReport
   VerifyIntegrity() const;
+  /// Number of complete verifications performed (reuse does not advance it).
+  [[nodiscard]] std::uint64_t complete_verification_count() const;
 
   void Close();
 

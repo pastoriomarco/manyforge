@@ -83,3 +83,16 @@ export function acceptManagerApplyStatus(
     ? candidate
     : current;
 }
+
+/**
+ * The identity of one settled Manager Apply (succeeded, failed or with an
+ * unknown effect), or null while none is settled. A settlement is the
+ * authoritative event after which the Applied projections are re-read.
+ */
+export function managerApplySettlementKey(
+  status: Pick<ManagerApplyStatus, 'applyId' | 'applyGeneration' | 'state'> | null,
+): string | null {
+  return status === null || status.state === 'pending'
+    ? null
+    : `${status.applyId}:${status.applyGeneration}:${status.state}`;
+}

@@ -25,7 +25,6 @@ from manyforge_headless_api.client import HeadlessClientError
 from .draft_session import (
     ComposerDraftSession,
     DraftSessionError,
-    draft_applicability,
 )
 from .deployment_draft import (
     DeploymentDraftError,
@@ -152,7 +151,6 @@ _PREPARED_ACTIVATION_FIELDS = (
     "program_outcome",
     "node_environment_digest",
     "assistant_mode",
-    "typed_parameter_overrides",
 )
 _DEPLOYMENT_GRAPH_COMPOSITION_RECORDS = (
     "component_attachments",
@@ -733,7 +731,6 @@ class ComposerState:
             "program_authoring": deepcopy(intent.get("program_authoring")),
             "model_source_closure": deepcopy(intent["model_source_closure"]),
             "program_role_assignment": deepcopy(intent["program_role_assignment"]),
-            "typed_parameter_overrides": deepcopy(intent["typed_parameter_overrides"]),
             "source_document_digest": intent["source_document_digest"],
             "scenario_id": intent["scenario_id"],
             "project_path": self.deployment_source_project_path,
@@ -823,10 +820,6 @@ class ComposerState:
     @property
     def scenario_program_role_assignment(self) -> dict[str, Any] | None:
         return self._authoring_project_fact("program_role_assignment")
-
-    @property
-    def scenario_typed_parameter_overrides(self) -> dict[str, Any]:
-        return self._authoring_project_fact("typed_parameter_overrides")
 
     @property
     def scenario_source_program_digest(self) -> str | None:
@@ -1232,8 +1225,15 @@ class ComposerState:
         claim: dict[str, Any] | None,
         *,
         apply: bool,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
-        """Prepare one captured input and its exact next Manager request."""
+        """Prepare one captured input and its exact next Manager request.
+
+        ``confirmed`` means the request itself is the operator's deliberate
+        confirmation of this exact candidate (Scenario Load), so a disruptive
+        or destructive impact is accepted from this one preparation instead of
+        a confirmation token round trip that would prepare it again.
+        """
 
         assert self.headless_client is not None
         phases: dict[str, float] = {}
@@ -1248,9 +1248,6 @@ class ComposerState:
                 "program": deepcopy(intent["program"]),
                 "program_role_assignment": deepcopy(
                     intent["program_role_assignment"]
-                ),
-                "typed_parameter_overrides": deepcopy(
-                    intent["typed_parameter_overrides"]
                 ),
                 "expected_admission_generation": intent[
                     "expected_admission_generation"
@@ -1324,7 +1321,9 @@ class ComposerState:
             prepared_activation=prepared_activation,
             preview=preview,
         )
-        supplied_confirmation = intent.get("confirmation_token")
+        supplied_confirmation = (
+            fresh_confirmation_token if confirmed else intent.get("confirmation_token")
+        )
         if (
             supplied_confirmation is not None
             and supplied_confirmation != fresh_confirmation_token
@@ -1340,7 +1339,7 @@ class ComposerState:
         ) is True
         confirmation_required = bool(
             apply
-            and intent.get("confirmation_token") is None
+            and supplied_confirmation is None
             and preview is not None
             and (
                 destructive_impact
@@ -1407,6 +1406,7 @@ class ComposerState:
         apply: bool,
         prepared: dict[str, Any] | None = None,
         prepare_only: bool = False,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         """Prepare or submit one candidate to Manager's transition owner."""
 
@@ -1421,7 +1421,7 @@ class ComposerState:
                 prepared = deepcopy(retained)
         if prepared is None:
             prepared = self._prepare_authored_deployment_candidate(
-                intent, claim, apply=apply
+                intent, claim, apply=apply, confirmed=confirmed
             )
 
         prepared_activation = prepared.get("prepared_activation")

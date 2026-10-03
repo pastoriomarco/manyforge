@@ -98,7 +98,6 @@
       "default": 0.5,
       "description": "Velocity scale for the pick move.",
       "parameter_id": "pick_velocity_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     }
   ],

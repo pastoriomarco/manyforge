@@ -8,22 +8,14 @@ from functools import lru_cache
 import hashlib
 import json
 import logging
+from threading import Lock
 import time
 from typing import Any, Callable, Sequence
 
 import rfc8785
 
-from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.canonical_artifact import (
-    StrictArtifactError,
-    verify_content_identity,
-)
-from manyforge_behavior.node_environment import (
-    BUILTIN_CATALOG_PATH,
-    build_node_environment,
-)
+from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
-from manyforge_behavior.program import Program, ProgramValidationError
 
 from .execution import ExecutionPort
 from .manager import ManagerPort
@@ -40,6 +32,7 @@ from .models import (
     AuthoringMutationSettlementRequest,
     AuthoringOwnerReconciliationRequest,
     ProgramModelAttemptRequest,
+    ProgramNodeCorrectionPreviewRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
@@ -53,9 +46,6 @@ from .models import (
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
     FullStopIntentRequest,
     GripperConfirmationRequest,
     OperationControlRequest,
@@ -86,8 +76,26 @@ from .program_binding_projection import (
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
+PROGRAM_NODE_PREVIEW_INTENT_VERSION = (
+    "manyforge.program_node_correction_preview_intent.v1"
+)
+PROGRAM_NODE_PREVIEW_VERSION = "manyforge.program_node_correction_preview.v1"
+# What the native motion preview evaluates: it plans a trajectory from the
+# current observed start state and collision-validates it against the named
+# scene revision. It is not IK-only, not a reservation, and execution always
+# plans and validates again.
+PROGRAM_NODE_PREVIEW_CHECK = "trajectory_planned_and_collision_validated"
+_PROGRAM_NODE_PREVIEW_IDENTITY_KEYS = (
+    "request_id",
+    "program_run_id",
+    "program_id",
+    "program_revision",
+    "program_binding_id",
+    "node_instance_id",
+    "node_attempt_id",
+)
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v3"
-PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
+PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v2"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _PROGRAM_RUN_STATES = frozenset(
@@ -168,13 +176,6 @@ def _sha256_identity(value: object) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _program_catalog() -> NodeCatalog:
-    """Load the build-owned authoring catalog once per headless process."""
-
-    return NodeCatalog(BUILTIN_CATALOG_PATH)
-
-
-@lru_cache(maxsize=1)
 def _build_skills():
     """One installed build input, never a mutable runtime skill registry."""
     environment = build_node_environment()
@@ -209,6 +210,10 @@ class HeadlessService:
         self.cell_admission = cell_admission
         self.cclc = cclc
         self.activation_preparer = activation_preparer
+        # Admission bound only: exact node attempts whose advisory native
+        # preview is in flight (see program_node_correction_preview).
+        self._node_previews_lock = Lock()
+        self._node_previews_in_flight: set[tuple[str, str]] = set()
         # Each Apply Headless forwards is followed to its committed outcome,
         # which wakes the Program runner (see apply_follower).
         self.apply_follower: CommittedApplyFollower | None = (
@@ -1156,11 +1161,6 @@ class HeadlessService:
                 "program_applied_selection_invalid",
                 "native core returned an unsupported Applied Program selection",
             ) from error
-        self._validate_applied_program_semantics(
-            projection,
-            error_code="program_applied_selection_invalid",
-            message="native core returned an unsupported Applied Program selection",
-        )
         return projection
 
     def program_applied_status(self) -> dict[str, Any]:
@@ -1263,6 +1263,19 @@ class HeadlessService:
                 error.code,
                 error,
             )
+
+    def follow_committed_apply(self, apply_id: str, apply_generation: int) -> None:
+        """Wake the Program runner for an Apply observed committed through a
+        status read, once Manager's published source names it.
+
+        Manager answers Apply status from its journal and publishes its source
+        just after, so a reader of the source can briefly still see the Apply
+        in progress. The follower waits that out (bounded) instead of waking
+        the runner into a refusal; a repeated identity is followed once.
+        """
+
+        if self.apply_follower is not None:
+            self.apply_follower.follow(apply_id, apply_generation)
 
     def program_model_attempt(
         self,
@@ -1847,6 +1860,136 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
+    def program_node_correction_preview(
+        self,
+        program_run_id: str,
+        request: ProgramNodeCorrectionPreviewRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        """Preview one held motion node with proposed inputs; no effect.
+
+        The Program runner builds the request with the node's own execution
+        builder; the native owner previews it through the same path as a
+        manual move. The result is advisory: it grants no dispatch, Retry,
+        Reset or Apply authority.
+
+        Native preview planning is synchronous and uncancellable. At most one
+        preview per exact (Program run, node attempt) is in flight; a
+        concurrent duplicate is refused before any owner read, never queued.
+        """
+
+        attempt = (program_run_id, request.node_attempt_id)
+        with self._node_previews_lock:
+            if attempt in self._node_previews_in_flight:
+                raise HeadlessApiError(
+                    "program_node_preview_busy",
+                    "A correction preview for this node attempt is already "
+                    "running; retry after it completes",
+                )
+            self._node_previews_in_flight.add(attempt)
+        try:
+            return self._preview_node_correction(program_run_id, request, attribution)
+        finally:
+            with self._node_previews_lock:
+                self._node_previews_in_flight.discard(attempt)
+
+    def _preview_node_correction(
+        self,
+        program_run_id: str,
+        request: ProgramNodeCorrectionPreviewRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        try:
+            built = self._program_runner().preview_node_correction(
+                program_run_id, request.model_dump(mode="json")
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        expected_keys = {
+            "schema_version",
+            *_PROGRAM_NODE_PREVIEW_IDENTITY_KEYS,
+            "program_runner_owner_epoch",
+            "run_revision",
+            "retained_bundle_id",
+            "graph_revision",
+            "node_id",
+            "proposed_paths",
+            "parameters_digest",
+            "target",
+            "unavailable_reason",
+            "operation",
+        }
+        operation = built.get("operation")
+        unavailable = built.get("unavailable_reason")
+        if (
+            set(built) != expected_keys
+            or built.get("schema_version") != PROGRAM_NODE_PREVIEW_INTENT_VERSION
+            or any(
+                built.get(key) != getattr(request, key)
+                for key in _PROGRAM_NODE_PREVIEW_IDENTITY_KEYS
+            )
+            or built.get("program_runner_owner_epoch") != request.expected_owner_epoch
+            or built.get("proposed_paths")
+            != [proposal.path for proposal in request.proposed_inputs]
+            or (operation is None) == (unavailable is None)
+            or (
+                unavailable is not None
+                and (
+                    not isinstance(unavailable, dict)
+                    or set(unavailable) != {"code", "message"}
+                    or not isinstance(unavailable.get("code"), str)
+                    or not unavailable["code"]
+                )
+            )
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid node-correction preview",
+            )
+        result = {
+            **{key: value for key, value in built.items() if key != "operation"},
+            "schema_version": PROGRAM_NODE_PREVIEW_VERSION,
+            "preview_check": None,
+            "preview": None,
+        }
+        if operation is None:
+            return result
+        target = built.get("target")
+        try:
+            intent = OperationIntentRequest.model_validate(operation)
+        except ValueError as error:
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid preview intent",
+            ) from error
+        participant = intent.participants[0] if len(intent.participants) == 1 else None
+        if (
+            participant is None
+            or not isinstance(target, dict)
+            or intent.request_context.request_id != request.request_id
+            or intent.program_run_id != program_run_id
+            or intent.program_id != request.program_id
+            or intent.program_revision != request.program_revision
+            or intent.program_binding_id != request.program_binding_id
+            or intent.expected_retained_bundle_id != built["retained_bundle_id"]
+            or intent.expected_graph_revision != built["graph_revision"]
+            or intent.manual_handover is not None
+            or participant.action_span is not None
+            or participant.payload.kind != "motion"
+            or participant.target_role_id != target.get("target_role_id")
+            or participant.component_role_id != target.get("component_role_id")
+            or participant.required_capability_id != "execution.trajectory.execute"
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner preview intent differs from the named node",
+            )
+        result["preview_check"] = PROGRAM_NODE_PREVIEW_CHECK
+        result["preview"] = self._execution().preview_motion(
+            intent, trusted_principal_id=attribution.principal_id
+        )
+        return result
+
     def program_runtime_control_action(
         self,
         program_run_id: str,
@@ -1936,34 +2079,6 @@ class HeadlessService:
         return self.cclc.route_request_result(
             request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
         )
-
-    @staticmethod
-    def _validate_applied_program_semantics(
-        applied: object,
-        *,
-        error_code: str,
-        message: str,
-    ) -> None:
-        if not isinstance(applied, dict):
-            raise HeadlessApiError(error_code, message)
-        program = applied["program"]
-        try:
-            identity = verify_content_identity(
-                program,
-                own_field="program_revision",
-                identity_domain="program-revision",
-                api_version="manyforge.program.v2",
-                label="applied_program.program",
-            )
-            validated = Program.from_dict(
-                program,
-                _program_catalog(),
-                path="<headless-applied-program>",
-            )
-        except (ProgramValidationError, StrictArtifactError, TypeError, ValueError):
-            raise HeadlessApiError(error_code, message)
-        if identity != applied["program_revision"] or validated.to_dict() != program:
-            raise HeadlessApiError(error_code, message)
 
     @staticmethod
     def _verified_viewer_asset(
@@ -2286,7 +2401,6 @@ class HeadlessService:
                 model_source_closure=request.model_source_closure,
                 program=request.program,
                 program_role_assignment=request.program_role_assignment,
-                typed_parameter_overrides=request.typed_parameter_overrides,
             )
         }
 

@@ -42,17 +42,40 @@ from .deployment_intent import (
 )
 
 
-SCENARIO_API_VERSION = "manyforge.scenario.authoring.v2"
+SCENARIO_API_VERSION = "manyforge.scenario.authoring.v3"
 SCENARIO_SUFFIXES = (".scenario.yaml", ".scenario.yml")
-SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v1"
+SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v2"
 SCENARIO_MANIFEST = "scenario.yaml"
 SCENARIO_PROJECT_MEMBERS = {
     "deployment_draft": "deployment.yaml",
     "program_draft": "program.yaml",
     "program_role_assignment": "assignment.yaml",
-    "typed_parameter_overrides": "overrides.yaml",
 }
+# Scenario parameter overrides were removed (single source of truth: Program
+# parameter defaults). The former member and versions are refused, never read.
+_REMOVED_OVERRIDES_MEMBER = "overrides.yaml"
+_REMOVED_OVERRIDES_MESSAGE = (
+    "Scenario parameter overrides (overrides.yaml) were removed; Program "
+    "parameters always take their Program defaults. Move any needed value into "
+    "the Program parameter default, delete overrides.yaml and recreate the "
+    "project with this ManyForge version (maintained examples are regenerated "
+    "by their tools)"
+)
+
+
+def _refuse_removed_overrides_member(directory_fd: int, *, source: str) -> None:
+    try:
+        os.stat(_REMOVED_OVERRIDES_MEMBER, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _fail(
+        "scenario_artifact_version_unsupported",
+        f"{source}: {_REMOVED_OVERRIDES_MESSAGE}",
+        status_code=409,
+    )
 SCENARIO_SAVE_MARKER = ".manyforge-save-pending.json"
+# Save failed after it created or started writing the project.
+SCENARIO_SAVE_INCOMPLETE = "scenario_artifact_save_incomplete"
 SCENARIO_SOURCE_SNAPSHOT_VERSION = "manyforge.scenario.source_snapshot.v1"
 _SCENARIO_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _STATUS_VALUES = frozenset({"ready", "incomplete", "unknown"})
@@ -98,7 +121,6 @@ def scenario_content_digest(
     program_draft: dict[str, Any] | None,
     deployment_draft: dict[str, Any] | None,
     program_role_assignment: dict[str, Any] | None,
-    typed_parameter_overrides: dict[str, Any],
 ) -> str:
     try:
         return raw_sha256_digest(
@@ -107,7 +129,6 @@ def scenario_content_digest(
                     "program_draft": program_draft,
                     "deployment_draft": deployment_draft,
                     "program_role_assignment": program_role_assignment,
-                    "typed_parameter_overrides": typed_parameter_overrides,
                 }
             )
         )
@@ -123,7 +144,6 @@ def build_scenario_document(
     program_draft: dict[str, Any] | None,
     deployment_draft: dict[str, Any] | None,
     program_role_assignment: dict[str, Any] | None,
-    typed_parameter_overrides: dict[str, Any],
     manyforge_version: str,
     last_known_status: str,
 ) -> dict[str, Any]:
@@ -131,7 +151,6 @@ def build_scenario_document(
         program_draft,
         deployment_draft,
         program_role_assignment,
-        typed_parameter_overrides,
     )
     document: dict[str, Any] = {
         "api_version": SCENARIO_API_VERSION,
@@ -141,7 +160,6 @@ def build_scenario_document(
         "program_draft": deepcopy(program_draft),
         "deployment_draft": deepcopy(deployment_draft),
         "program_role_assignment": deepcopy(program_role_assignment),
-        "typed_parameter_overrides": deepcopy(typed_parameter_overrides),
         "saved_status": {
             "manyforge_version": manyforge_version,
             "last_known_status": last_known_status,
@@ -236,11 +254,15 @@ def validate_scenario_document(
         "program_draft",
         "deployment_draft",
         "program_role_assignment",
-        "typed_parameter_overrides",
         "saved_status",
     }
     if type(value) is not dict:
         _fail("scenario_artifact_invalid", f"{source}: Scenario must be an object")
+    if "typed_parameter_overrides" in value:
+        _fail(
+            "scenario_artifact_version_unsupported",
+            f"{source}: {_REMOVED_OVERRIDES_MESSAGE}",
+        )
     if set(value) != expected:
         _fail(
             "scenario_artifact_invalid",
@@ -254,7 +276,6 @@ def validate_scenario_document(
     assignment = _validate_role_assignment(
         value["program_role_assignment"], source=source
     )
-    overrides = value["typed_parameter_overrides"]
     saved = _validate_saved_status(value["saved_status"], source=source)
     if value["api_version"] != SCENARIO_API_VERSION:
         _fail(
@@ -282,11 +303,6 @@ def validate_scenario_document(
             )
         except DeploymentIntentError as error:
             _fail("scenario_deployment_intent_invalid", str(error))
-    if type(overrides) is not dict:
-        _fail(
-            "scenario_artifact_invalid",
-            f"{source}: typed_parameter_overrides must be an object",
-        )
     try:
         canonical_json_bytes(value)
     except StrictArtifactError as error:
@@ -294,7 +310,6 @@ def validate_scenario_document(
     normalized = deepcopy(value)
     normalized["deployment_draft"] = deepcopy(deployment)
     normalized["program_role_assignment"] = assignment
-    normalized["typed_parameter_overrides"] = deepcopy(overrides)
     return normalized
 
 
@@ -366,6 +381,12 @@ def _validate_project_manifest(value: Any, *, source: str) -> dict[str, Any]:
     }
     if type(value) is not dict or set(value) != expected:
         _fail("scenario_artifact_invalid", f"{source}: invalid Scenario manifest")
+    if value["api_version"] == "manyforge.scenario.project.v1":
+        _fail(
+            "scenario_artifact_version_unsupported",
+            f"{source}: Scenario project version 'manyforge.scenario.project.v1' "
+            f"is unsupported: {_REMOVED_OVERRIDES_MESSAGE}",
+        )
     if value["api_version"] != SCENARIO_PROJECT_API_VERSION:
         _fail(
             "scenario_artifact_version_unsupported",
@@ -621,6 +642,7 @@ def _capture_project(
         manifest = _validate_project_manifest(
             manifest_value, source=str(project / SCENARIO_MANIFEST)
         )
+        _refuse_removed_overrides_member(directory_fd, source=str(project))
         member_values: dict[str, Any] = {}
         member_digests: dict[str, str] = {}
         total_bytes = len(manifest_raw)
@@ -637,9 +659,7 @@ def _capture_project(
                 )
             try:
                 member_values[field] = _load_project_member(
-                    raw,
-                    source=str(project / filename),
-                    nullable=field != "typed_parameter_overrides",
+                    raw, source=str(project / filename), nullable=True
                 )
             except StrictArtifactError as error:
                 _fail("scenario_artifact_invalid", str(error))
@@ -659,7 +679,6 @@ def _capture_project(
             document["program_draft"],
             document["deployment_draft"],
             document["program_role_assignment"],
-            document["typed_parameter_overrides"],
         )
         actual_presence = {
             "deployment_present": document["deployment_draft"] is not None,
@@ -857,6 +876,11 @@ def save_scenario_artifact(
     parent = target.parent
     parent_fd = -1
     project_fd = -1
+    # Set once the target can differ from before this call (a created project
+    # directory or a started member write). A failure from then on has one
+    # distinct code, so a pre-write refusal code never also means "partially
+    # written"; the left save marker is the durable interruption evidence.
+    effect_started = False
     try:
         parent_fd = os.open(
             parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -877,6 +901,7 @@ def save_scenario_artifact(
                     "Scenario project appeared and requires confirmation",
                     status_code=409,
                 )
+            effect_started = True
             os.fsync(parent_fd)
         else:
             if not stat.S_ISDIR(existing.st_mode):
@@ -899,6 +924,8 @@ def save_scenario_artifact(
         if actual_project != target or not is_path_within_roots(actual_project, roots):
             _fail("scenario_artifact_changed", "Scenario project changed", status_code=409)
         existing_names = set(os.listdir(project_fd))
+        if _REMOVED_OVERRIDES_MEMBER in existing_names:
+            _refuse_removed_overrides_member(project_fd, source=str(target))
         if existing_names and SCENARIO_MANIFEST not in existing_names and not existing_names <= {
             "sources",
             "assets",
@@ -918,6 +945,7 @@ def save_scenario_artifact(
             },
             label=SCENARIO_SAVE_MARKER,
         )
+        effect_started = True
         _replace_regular_at(project_fd, SCENARIO_SAVE_MARKER, marker)
         os.fsync(project_fd)
         for filename, raw in sorted(member_bytes.items()):
@@ -927,9 +955,15 @@ def save_scenario_artifact(
         os.unlink(SCENARIO_SAVE_MARKER, dir_fd=project_fd)
         os.fsync(project_fd)
         return str(target)
-    except ScenarioArtifactError:
-        raise
-    except OSError as error:
+    except (ScenarioArtifactError, OSError) as error:
+        if effect_started:
+            raise ScenarioArtifactError(
+                SCENARIO_SAVE_INCOMPLETE,
+                f"Scenario project {target} may be partially written: {error}",
+                status_code=500,
+            ) from error
+        if isinstance(error, ScenarioArtifactError):
+            raise
         _fail("scenario_artifact_write_failed", str(error))
     finally:
         if project_fd >= 0:
@@ -963,7 +997,7 @@ def save_scenario_member(
         "last_known_status": "unknown",
         "checked_content_digest": scenario_content_digest(
             document["program_draft"], document["deployment_draft"],
-            document["program_role_assignment"], document["typed_parameter_overrides"],
+            document["program_role_assignment"],
         ),
     }
     save_scenario_artifact(
@@ -1207,8 +1241,15 @@ def export_scenario_artifact(
         finally:
             os.close(parent_fd)
         return str(target)
-    except Exception:
+    except Exception as error:
         shutil.rmtree(temporary, ignore_errors=True)
+        if (
+            isinstance(error, ScenarioArtifactError)
+            and error.code == SCENARIO_SAVE_INCOMPLETE
+        ):
+            # Only the private staging copy was partially written, and it is
+            # removed; the destination was never published.
+            _fail("scenario_export_failed", str(error))
         raise
 
 

@@ -71,6 +71,10 @@ class ProgramRunnerPort(Protocol):
 
     def read_run(self, program_run_id: str) -> dict[str, Any]: ...
 
+    def preview_node_correction(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def stop_run(
         self,
         program_run_id: str,
@@ -312,6 +316,15 @@ class ProgramRunnerHttpClient:
     def read_run(self, program_run_id: str) -> dict[str, Any]:
         return self._request("GET", self._run_path(program_run_id))
 
+    def preview_node_correction(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self._run_path(program_run_id)}/node-correction-previews",
+            body=body,
+        )
+
     def stop_run(
         self,
         program_run_id: str,
@@ -412,10 +425,6 @@ class ProgramRunnerHttpClient:
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         allowed = {
-            "runtime-overrides",
-            "runtime-overrides/activate",
-            "runtime-overrides/clear",
-            "runtime-overrides/promote",
             "blackboard-values",
             "manual-result",
         }

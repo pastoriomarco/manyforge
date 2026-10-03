@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
     "deployment.yaml": "sha256:79de2a54b86bef7f2861d54b4303e176454fc6eb03ce181313eff322ad181b9f",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
     "program.yaml": "sha256:2124ee25ee59568fa6478c6a75bf13824f6972689da0a03158cb6e4dd95f40cb"
   },
   "name": "ur5_roboplan_local_semantic_shape_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:eb0f0bbf43babbc3f7e1de4b6ba520d2deb149e44a8b1e2bae00f5f05309fed0",
+    "checked_content_digest": "sha256:ee5cd7a01375900785018b8bbd229b8600e2c0db81a0b0afac946cf2bc148a60",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

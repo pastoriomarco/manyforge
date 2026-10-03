@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:ec168b407a70d946203d9267bfbb2311eca41c4f88e1f63e1ffd2b244fba903a
+program_revision: sha256:b635c557d3a9c6dccc85540a2cde9c41f54da689647c4081f5ca2dbd46fb0154
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -133,7 +133,6 @@ parameters:
     type: float64
     default: 0.2
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for all retained-world moves.
 tree:
   node_id: sequence

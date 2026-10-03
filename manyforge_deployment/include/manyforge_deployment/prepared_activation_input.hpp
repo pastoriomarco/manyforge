@@ -18,7 +18,7 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v4";
+    "manyforge.prepared_activation_input.v5";
 
 class PreparedActivationInputError final : public std::invalid_argument {
 public:
@@ -108,10 +108,6 @@ public:
   [[nodiscard]] std::string_view assistant_mode() const noexcept {
     return assistant_mode_;
   }
-  [[nodiscard]] const CanonicalValue &typed_parameter_overrides() const
-      noexcept {
-    return typed_parameter_overrides_;
-  }
   [[nodiscard]] const CanonicalValue &normalized_root() const noexcept {
     return normalized_root_;
   }
@@ -135,7 +131,7 @@ private:
       std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
       core::ProgramRoleAssignmentDTO program_role_assignment,
       core::ContentDigest node_environment_digest, std::string assistant_mode,
-      CanonicalValue typed_parameter_overrides, CanonicalValue normalized_root,
+      CanonicalValue normalized_root,
       VerifiedPreparedActivationClosure closure);
 
   core::ContentDigest prepared_activation_id_;
@@ -153,7 +149,6 @@ private:
   core::ProgramRoleAssignmentDTO program_role_assignment_;
   core::ContentDigest node_environment_digest_;
   std::string assistant_mode_;
-  CanonicalValue typed_parameter_overrides_;
   CanonicalValue normalized_root_;
   VerifiedPreparedActivationClosure closure_;
 

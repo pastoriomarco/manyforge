@@ -2090,7 +2090,15 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
                 "retained native owner re-seal requires the exact held Apply fence");
   }
 
-  std::lock_guard lock(runtime.route_publication_mutex_);
+  // Every reader and writer of a participant's routes (GripperSourceIsCurrent,
+  // RecordGraspObservation, ReadGripperStatus, route publication) serializes
+  // on its cell root's mutex, so the re-seal must hold that same mutex: a peer
+  // participant's own mutex would leave those readers running against the
+  // bindings and registrations replaced below.
+  auto *const cell_root = runtime.cell_runtime_root != nullptr
+                              ? runtime.cell_runtime_root
+                              : &runtime;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
   if (!input.admission_gate.exact_fence_is_held(input.apply_fence_id,
                                                 input.apply_scope)) {
     return fail("native_product_reseal_fence_changed",
@@ -2599,22 +2607,6 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
   }
   return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
       readback.value()->active_configuration);
-}
-
-core::RuntimeParticipantBinding
-RetainedNativeRuntime::ReadCurrentMotionBinding() const {
-  const auto *const cell_root =
-      cell_runtime_root != nullptr ? cell_runtime_root : this;
-  std::lock_guard lock(cell_root->route_publication_mutex_);
-  return motion_binding;
-}
-
-std::optional<core::RuntimeParticipantBinding>
-RetainedNativeRuntime::ReadCurrentGripperBinding() const {
-  const auto *const cell_root =
-      cell_runtime_root != nullptr ? cell_runtime_root : this;
-  std::lock_guard lock(cell_root->route_publication_mutex_);
-  return gripper_binding;
 }
 
 bool RetainedNativeRuntime::GripperSourceIsCurrent(

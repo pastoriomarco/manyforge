@@ -80,8 +80,7 @@ export function ScenarioDocumentCommands({
 }: ScenarioDocumentCommandsProps) {
   const {
     state,
-    mutationAvailable,
-    mutationUnavailableReason,
+    documentUnavailableReason,
     newScenarioDocument,
     saveScenarioDocument,
     loadScenarioDocument,
@@ -130,8 +129,9 @@ export function ScenarioDocumentCommands({
     ? 'Review or discard the invalid local field edit first.'
     : busy
       ? 'Another operation is in progress.'
-      : mutationUnavailableReason;
-  const blocked = busy || !mutationAvailable || localInvalidEdit || workspace === null;
+      : documentUnavailableReason;
+  // Scenario documents require Idle (unlike Draft edits during a held run).
+  const blocked = busy || documentUnavailableReason !== null || localInvalidEdit || workspace === null;
   const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true

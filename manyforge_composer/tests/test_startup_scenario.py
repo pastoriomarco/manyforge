@@ -67,7 +67,6 @@ def _selection(program: dict[str, Any]) -> dict[str, Any]:
         "program_binding_id": "sha256:" + "6" * 64,
         "program": deepcopy(program),
         "program_binding": {"program_binding_id": "sha256:" + "6" * 64},
-        "typed_parameter_overrides": {},
         "deployment": json.loads(_DEPLOYMENT_PATH.read_text(encoding="utf-8")),
     }
 
@@ -141,7 +140,6 @@ def _captured_activation(
         "deployment": deepcopy(selection["deployment"]),
         "model_source_closure": {},
         "program_role_assignment": {},
-        "typed_parameter_overrides": {},
         "source_document_digest": selection["source_document_digest"],
         "scenario_id": selection["scenario_id"],
     }

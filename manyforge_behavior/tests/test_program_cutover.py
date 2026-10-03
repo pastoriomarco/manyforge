@@ -23,6 +23,7 @@ from manyforge_behavior.program import (
     compute_program_tree_hash,
     find_tree_node_by_name,
     merge_param_patch,
+    program_node_policies,
     tree_node_from_dict,
 )
 
@@ -221,18 +222,7 @@ def test_program_node_policy_defaults_are_omission_compatible() -> None:
     baseline = Program.from_dict(source, catalog)
     explicit = deepcopy(source)
     node = explicit["tree"]["children"][0]
-    node["modification_policy"] = {
-        "runtime_override": "forbidden",
-        "persistent_edit": "forbidden",
-        "intervention_delegate": "forbidden",
-    }
-    node["recovery_policy"] = {
-        "allow_intervention": False,
-        "allowed_recovery_actions": [],
-        "max_retries": 0,
-        "allowed_skills": [],
-        "persistence_ceiling": "session_only",
-    }
+    node["recovery_policy"] = {"allow_intervention": False, "max_retries": 0}
     node["operator_stop_policy"] = "inherit"
 
     explicit["program_revision"] = baseline.program_revision
@@ -246,24 +236,7 @@ def test_program_node_policy_defaults_are_omission_compatible() -> None:
 @pytest.mark.parametrize(
     "field,value",
     [
-        (
-            "modification_policy",
-            {
-                "runtime_override": "forbidden",
-                "persistent_edit": "forbidden",
-                "intervention_delegate": "forbidden",
-            },
-        ),
-        (
-            "recovery_policy",
-            {
-                "allow_intervention": False,
-                "allowed_recovery_actions": [],
-                "max_retries": 0,
-                "allowed_skills": [],
-                "persistence_ceiling": "session_only",
-            },
-        ),
+        ("recovery_policy", {"allow_intervention": False, "max_retries": 0}),
         ("operator_stop_policy", "inherit"),
     ],
 )
@@ -287,24 +260,10 @@ def test_program_node_policy_independent_defaults_migrate_to_omission(
 @pytest.mark.parametrize(
     "policy",
     [
-        {"modification_policy": None},
-        {"modification_policy": {}},
-        {
-            "modification_policy": {
-                "runtime_override": "forbidden",
-                "persistent_edit": "forbidden",
-            }
-        },
         {"recovery_policy": None},
         {"recovery_policy": {}},
-        {
-            "recovery_policy": {
-                "allow_intervention": False,
-                "allowed_recovery_actions": [],
-                "max_retries": 0,
-                "allowed_skills": [],
-            }
-        },
+        {"recovery_policy": {"allow_intervention": True}},
+        {"recovery_policy": {"max_retries": 0}},
         {"operator_stop_policy": None},
     ],
 )
@@ -317,85 +276,75 @@ def test_program_node_policy_rejects_null_empty_and_partial_objects(
         Program.from_dict(_identified(document), _catalog())
 
 
-def test_program_node_policy_nondefaults_change_identity_and_round_trip() -> None:
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        {"allow_intervention": True, "max_retries": 2},
+        # Zero is Unlimited; intervention stays an explicit opt-in.
+        {"allow_intervention": True, "max_retries": 0},
+        {"allow_intervention": False, "max_retries": 3},
+    ],
+)
+def test_program_node_policy_nondefaults_change_identity_and_round_trip(
+    recovery: dict[str, Any],
+) -> None:
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     node = document["tree"]["children"][0]
-    node["modification_policy"] = {
-        "runtime_override": "human_approval",
-        "persistent_edit": "llm_allowed",
-        "intervention_delegate": "human_only",
-    }
-    node["recovery_policy"] = {
-        "allow_intervention": True,
-        "allowed_recovery_actions": ["intervention"],
-        "max_retries": 2,
-        "allowed_skills": [],
-        "persistence_ceiling": "draft_patch",
-    }
+    node["recovery_policy"] = recovery
     node["operator_stop_policy"] = "hold"
 
     identified = _identified(document)
     program = Program.from_dict(identified, _catalog())
 
-    assert program.to_dict()["tree"]["children"][0]["modification_policy"] == node[
-        "modification_policy"
-    ]
-    assert program.to_dict()["tree"]["children"][0]["recovery_policy"] == node[
-        "recovery_policy"
-    ]
-    assert program.to_dict()["tree"]["children"][0]["operator_stop_policy"] == "hold"
+    child = program.to_dict()["tree"]["children"][0]
+    assert child["recovery_policy"] == recovery
+    assert child["operator_stop_policy"] == "hold"
     assert program.program_revision == identified["program_revision"]
+    (row,) = program_node_policies(program)
+    assert row.to_dict() == {
+        "instance_id": node["instance_id"],
+        "recovery_policy": recovery,
+        "operator_stop_policy": "hold",
+    }
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
+        # The superseded five-field form, including an old zero budget with
+        # intervention: refused, never reinterpreted as Unlimited.
         ("recovery_policy", {
-            "allow_intervention": False,
+            "allow_intervention": True,
             "allowed_recovery_actions": ["intervention"],
             "max_retries": 0,
             "allowed_skills": [],
             "persistence_ceiling": "session_only",
         }),
         ("recovery_policy", {
-            "allow_intervention": True,
+            "allow_intervention": False,
+            "max_retries": 0,
             "allowed_recovery_actions": [],
-            "max_retries": 0,
-            "allowed_skills": [],
-            "persistence_ceiling": "session_only",
         }),
         ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": ["runtime_override"],
+            "allow_intervention": True,
             "max_retries": 0,
-            "allowed_skills": [],
             "persistence_ceiling": "session_only",
         }),
         ("recovery_policy", {
             "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
             "max_retries": 0,
-            "allowed_skills": ["z-skill", "a-skill"],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 0,
-            "allowed_skills": ["a" * 129],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": [],
-            "max_retries": 1,
             "allowed_skills": [],
-            "persistence_ceiling": "session_only",
         }),
+        ("modification_policy", {
+            "runtime_override": "forbidden",
+            "persistent_edit": "forbidden",
+            "intervention_delegate": "forbidden",
+        }),
+        ("modification_policy", {"intervention_delegate": "llm_allowed"}),
     ],
 )
-def test_program_node_policy_cross_fields_are_closed(
-    field: str, value: dict[str, Any]
+def test_program_node_policy_rejects_removed_policy_forms(
+    field: str, value: Any
 ) -> None:
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     document["tree"]["children"][0][field] = value
@@ -406,53 +355,11 @@ def test_program_node_policy_cross_fields_are_closed(
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("modification_policy", {
-            "runtime_override": "operator_allowed",
-            "persistent_edit": "forbidden",
-            "intervention_delegate": "human_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": ["runtime_override", "intervention"],
-            "max_retries": 0,
-            "allowed_skills": [],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": [],
-            "max_retries": True,
-            "allowed_skills": [],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": [],
-            "max_retries": 256,
-            "allowed_skills": [],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 0,
-            "allowed_skills": ["Z-skill"],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 0,
-            "allowed_skills": ["z-skill", "a-skill"],
-            "persistence_ceiling": "session_only",
-        }),
-        ("recovery_policy", {
-            "allow_intervention": False,
-            "allowed_recovery_actions": [],
-            "max_retries": 0,
-            "allowed_skills": [],
-            "persistence_ceiling": "persistent",
-        }),
+        ("recovery_policy", {"allow_intervention": "yes", "max_retries": 0}),
+        ("recovery_policy", {"allow_intervention": False, "max_retries": True}),
+        ("recovery_policy", {"allow_intervention": True, "max_retries": 256}),
+        ("recovery_policy", {"allow_intervention": True, "max_retries": -1}),
+        ("recovery_policy", {"allow_intervention": True, "max_retries": 1.5}),
         ("operator_stop_policy", "pause"),
     ],
 )
@@ -536,7 +443,6 @@ def test_program_rejects_dynamic_target_selection() -> None:
             "type": "string",
             "default": "arm",
             "constraints": {},
-            "runtime_mutability": "before_run",
         }
     )
     move = document["tree"]["children"][0]
@@ -582,14 +488,12 @@ def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
             "type": "string_list",
             "default": ["red workpiece", "red workpiece", "Bin A"],
             "constraints": {"min_length": 1},
-            "runtime_mutability": "immutable",
         },
         {
             "parameter_id": "operator_note",
             "type": "string",
             "default": "Select the red workpiece from Bin A.",
             "constraints": {"min_length": 1},
-            "runtime_mutability": "before_run",
         },
         *document["parameters"],
     ]
@@ -677,7 +581,6 @@ def test_translated_historical_program_negative_corpus(
                 "type": "string",
                 "default": "ready",
                 "constraints": {"min_inclusive": 0.0},
-                "runtime_mutability": "immutable",
             },
         )
     else:  # pragma: no cover - keeps the mutation table closed.

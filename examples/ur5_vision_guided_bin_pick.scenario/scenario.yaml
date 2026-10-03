@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
     "deployment.yaml": "sha256:20c578c59e63d647ea05f6e1e33c4bf45099749933e2c481a416474ce7341a60",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
     "program.yaml": "sha256:98b53e667ead9dc7c8e998b06868f2027274c207f87aa8dde23a10810438d68a"
   },
   "name": "ur5_roboplan_local_vision_guided_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:94a057b031015760693c58f17fc7e266e9a49a1932ab620b3a0b37b8644de1d2",
+    "checked_content_digest": "sha256:ed00b83dddf9bc06b35aa9d6267e0893739adfff295ce98e0046a52fd5d0fea0",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

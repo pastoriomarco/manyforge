@@ -15,6 +15,7 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 import rfc8785
 
 from .authoring_identity import canonical_digest
+from .held_run_authoring import held_run_draft_editable
 
 if TYPE_CHECKING:
     from .authoring_workspace import (
@@ -343,6 +344,77 @@ class AuthoringAdmissionCoordinator:
             )
             self._record_outcome(envelope, operation_kind)
             return result
+
+    def execute_draft_edit(
+        self,
+        envelope: AuthoringMutationEnvelope,
+        *,
+        operation_kind: str,
+        workspace: "AuthoringWorkspace",
+        draft_id: str,
+        expected_identity: "AuthoringWorkspaceIdentity",
+        install: Callable[[], bool],
+        session: str,
+        validate: Callable[[], None] | None = None,
+    ) -> LocalAuthoringCommit:
+        """Commit one edit that changes only the Draft; it takes no cell claim.
+
+        A Draft edit has no external effect, so it needs no Kernel authoring
+        claim. It is admitted when authoring is Idle or when a held Program run
+        has all its motion confirmed stopped (``held_run_authoring``), at the
+        client's displayed admission generation. The commit is serialized
+        with execution starts and external submissions by the same lock, so
+        Execute, Run, Resume and Retry observe either the old or the new Draft.
+        """
+
+        if session not in {"program", "deployment"}:
+            raise ValueError("a Draft edit commits one Draft session")
+        if not callable(install):
+            raise TypeError("Draft edit install must be callable")
+        with self._local_mutation_lock:
+            if workspace.failed_closed is not None:
+                raise self._unavailable(
+                    "composer_workspace_failed_closed",
+                    f"the authoring workspace is contained: {workspace.failed_closed}",
+                )
+            self._settle_pending_local_claim()
+            self._require_mutation_ready()
+            admission = self._client.authoring_admission()
+            if admission.get("admission_generation") != envelope.expected_admission_generation:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "stale_generation", "message": "admission changed"},
+                )
+            if admission.get("authoring_allowed") is not True and not (
+                held_run_draft_editable(self._client)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "authoring_not_ready",
+                        "message": (
+                            "editing the Draft requires Idle or a Program run "
+                            "whose motion is confirmed stopped"
+                        ),
+                    },
+                )
+            if validate is not None:
+                validate()
+            commit = (
+                workspace.commit_deployment
+                if session == "deployment"
+                else workspace.commit_program
+            )
+            snapshot = commit(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+            self._record_outcome(envelope, operation_kind)
+            return LocalAuthoringCommit(
+                snapshot=snapshot,
+                admission_generation=envelope.expected_admission_generation,
+            )
 
     def submit_execution_start(self, callback: Callable[[], Any]) -> Any:
         """Serialize an execution start with Composer's local Draft commits.

@@ -37,7 +37,7 @@ from check_maintained_deployment_sources import (
 ZERO_DIGEST: Final = "sha256:" + "0" * 64
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
-SCENARIO_PROJECT_API: Final = "manyforge.scenario.project.v1"
+SCENARIO_PROJECT_API: Final = "manyforge.scenario.project.v2"
 DEPLOYMENT_INTENT_API: Final = "manyforge.deployment_intent.v2"
 SCENARIO_SOURCE_SNAPSHOT_API: Final = "manyforge.scenario.source_snapshot.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
@@ -3127,12 +3127,10 @@ def _scenario_project_outputs(
 ) -> list[tuple[Path, bytes, str]]:
     program_draft = _program_draft(program)
     role_assignment = _role_assignment(assignment)
-    overrides: dict[str, Any] = {}
     content = {
         "program_draft": program_draft,
         "deployment_draft": deployment_intent,
         "program_role_assignment": role_assignment,
-        "typed_parameter_overrides": overrides,
     }
     saved_status = {
         "manyforge_version": manyforge_version,
@@ -3143,7 +3141,6 @@ def _scenario_project_outputs(
         "deployment.yaml": pretty_bytes(deployment_intent),
         "program.yaml": pretty_bytes(program_draft),
         "assignment.yaml": pretty_bytes(role_assignment),
-        "overrides.yaml": pretty_bytes(overrides),
     }
     source_entries: list[dict[str, str]] = []
     source_closure = capture_deployment_model_sources(

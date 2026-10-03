@@ -167,22 +167,10 @@ make_program_root(const RetainedBundle &bundle,
   };
   if (include_node_policy) {
     tree.emplace_back(
-        "modification_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"runtime_override", CanonicalValue("human_approval")},
-            {"persistent_edit", CanonicalValue("forbidden")},
-            {"intervention_delegate", CanonicalValue("human_only")},
-        }));
-    tree.emplace_back(
         "recovery_policy",
         CanonicalValue(CanonicalValue::Object{
-            {"allow_intervention", CanonicalValue(false)},
-            {"allowed_recovery_actions",
-             CanonicalValue(
-                 CanonicalValue::Array{CanonicalValue("runtime_override")})},
+            {"allow_intervention", CanonicalValue(true)},
             {"max_retries", CanonicalValue(1.0)},
-            {"allowed_skills", CanonicalValue(CanonicalValue::Array{})},
-            {"persistence_ceiling", CanonicalValue("session_only")},
         }));
     tree.emplace_back("operator_stop_policy", CanonicalValue("hold"));
   }
@@ -845,7 +833,7 @@ prepare(const std::filesystem::path &root, const BindingCompilerContext &context
       {manyforge::core::ContentDigest("sha256:" + std::string(64U, '1')),
        "scenario.readback",
        manyforge::core::ContentDigest("sha256:" + std::string(64U, '2')),
-       "optional", CanonicalValue(CanonicalValue::Object{})},
+       "optional"},
       *context.bundle, context.model_map, *contract,
       assignment_value(command_target), catalog_store, raw_store);
 }
@@ -960,6 +948,34 @@ TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingA
   EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
       reidentify(with_member(value, "schema_version", CanonicalValue("manyforge.prepared_activation_input.v3"))))),
       manyforge::deployment::PreparedActivationInputError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     ReadbackRefusesTheRemovedParameterOverrideForm) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto bound = prepare(root.path(), context, kLite6ArmTargetId);
+  // v4 carried launch-time typed_parameter_overrides. Even rehashed it is
+  // refused by version with guidance, never read as an override-free value.
+  auto removed = bound.normalized_root().as_object();
+  removed.emplace_back("typed_parameter_overrides",
+                       CanonicalValue(CanonicalValue::Object{}));
+  try {
+    static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+        reidentify(with_member(CanonicalValue(std::move(removed)), "schema_version",
+                               CanonicalValue("manyforge.prepared_activation_input.v4")))));
+    FAIL() << "the removed v4 prepared activation form was accepted";
+  } catch (const manyforge::deployment::PreparedActivationInputError &error) {
+    EXPECT_NE(std::string(error.what()).find("parameter overrides were removed"),
+              std::string::npos);
+  }
+  // The current version cannot smuggle the removed field either.
+  auto smuggled = bound.normalized_root().as_object();
+  smuggled.emplace_back("typed_parameter_overrides",
+                        CanonicalValue(CanonicalValue::Object{}));
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+                   reidentify(CanonicalValue(std::move(smuggled))))),
+               manyforge::deployment::PreparedActivationInputError);
 }
 
 TEST(ProgramBindingCompilerTest,

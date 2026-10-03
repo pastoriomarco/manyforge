@@ -100,7 +100,7 @@ def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
         raise WorkbenchError(str(error)) from error
     scenario_id = value.get("scenario_id")
     if (
-        value.get("api_version") != "manyforge.scenario.project.v1"
+        value.get("api_version") != "manyforge.scenario.project.v2"
         or not isinstance(scenario_id, str)
         or re.fullmatch(r"[a-z][a-z0-9._-]{0,127}", scenario_id) is None
     ):

@@ -33,7 +33,6 @@ import {
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
-  parseRuntimeOverrideMaterializationResponse,
   parseRuntimeScaleControlStatus,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
@@ -44,6 +43,7 @@ import {
   parseProgramDraftMeshAssetMetadata,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
+  parseProgramNodeCorrectionPreview,
 } from './parsers';
 import {
   parseComposerSettingsSnapshot,
@@ -90,7 +90,6 @@ import type {
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
-  RuntimeOverrideMaterializationResponse,
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
@@ -103,6 +102,9 @@ import type {
   SceneUrdfManifest,
   SourceModelProjection,
   StructuredError,
+  ResetApplyContext,
+  ProgramNodeCorrectionPreview,
+  ProgramNodeCorrectionPreviewRequest,
 } from '../types/api';
 import type {
   AlarmMembership,
@@ -122,6 +124,7 @@ import type {
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
+import type { DeploymentActivationScope } from '../state/activationScope';
 import type {
   AssistantModeIndex,
   AssistantProviderStatus,
@@ -376,8 +379,72 @@ export function authoringRefusalMessage(error: unknown): string | null {
       ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim() : '';
     return `Not applied: the candidate could not be prepared${cause ? ` (${cause})` : ''}. Correct it and try again.`;
   }
+  if (code !== null && (SCENARIO_PRE_EFFECT_REFUSAL_CODES.has(code) || APPLY_PRE_EFFECT_REFUSAL_CODES.has(code))) {
+    return `Not applied: ${error.message.replace(/[.\s]*$/, '')}. Nothing was changed.`;
+  }
   return null;
 }
+
+/**
+ * Apply refusals (409) raised before preparation, admission or any Manager
+ * submission: a no-op Apply (every input already is Applied) and a
+ * confirmed activation scope that changed before the Apply was sent.
+ */
+const APPLY_PRE_EFFECT_REFUSAL_CODES = new Set([
+  'program_apply_nothing_to_apply',
+  'deployment_apply_nothing_to_apply',
+  'activation_input_changed_after_confirmation',
+]);
+
+/**
+ * Scenario-document refusals (409) that every raising site on the Scenario
+ * Save/Load/New/Export and Scenario-member Save routes reaches before any
+ * workspace commit, Manager submission or project file write. The code itself
+ * proves that nothing happened, so the browser's submission guard is released.
+ *
+ * - `scenario_artifact_version_unsupported`: a removed form (leftover
+ *   `overrides.yaml`, a v1 manifest, typed overrides) found while capturing or
+ *   before Save writes anything.
+ * - `scenario_project_save_interrupted`, `scenario_project_incomplete`: project
+ *   capture (Load, or the read before a member Save writes).
+ * - `scenario_source_invalid`, `scenario_model_source_unavailable`: model-source
+ *   capture during project capture or Save/New preparation, before writing.
+ * - `scenario_artifact_overwrite_confirmation_required`,
+ *   `scenario_destination_exists`: the target exists; nothing is created.
+ * - `scenario_discard_confirmation_required`, `scenario_activation_incomplete`,
+ *   `scenario_activation_preview_changed`, `scenario_applied_source_unavailable`,
+ *   `scenario_applied_source_changed`, `scenario_new_impact_changed`: Load/New
+ *   checks before the claim, or under it before the workspace commit (the
+ *   claim is then settled as proven no-effect).
+ * - `scenario_export_source_unavailable`: Export without a saved project.
+ * - `scenario_artifact_changed`: the project or its directory moved before
+ *   Save created or wrote anything.
+ *
+ * Save reports every failure after it created or started writing the project
+ * as `scenario_artifact_save_incomplete` (500), never with a pre-write code, so
+ * that outcome and the post-write outcomes (`scenario_created_not_activated`,
+ * `scenario_load_activation_not_confirmed`, `scenario_saved_baseline_not_adopted`)
+ * stay unconfirmed. Pre-write `scenario_artifact_target_invalid` and
+ * `scenario_artifact_write_failed` are 400 refusals. A re-capture after Save
+ * writes is not a workspace commit: the coordinator settles it as no-effect.
+ */
+const SCENARIO_PRE_EFFECT_REFUSAL_CODES = new Set([
+  'scenario_artifact_version_unsupported',
+  'scenario_project_save_interrupted',
+  'scenario_project_incomplete',
+  'scenario_source_invalid',
+  'scenario_model_source_unavailable',
+  'scenario_artifact_overwrite_confirmation_required',
+  'scenario_destination_exists',
+  'scenario_discard_confirmation_required',
+  'scenario_activation_incomplete',
+  'scenario_activation_preview_changed',
+  'scenario_applied_source_unavailable',
+  'scenario_applied_source_changed',
+  'scenario_new_impact_changed',
+  'scenario_export_source_unavailable',
+  'scenario_artifact_changed',
+]);
 
 const STALE_WORKSPACE_CODES = new Set([
   // The composite workspace or a Draft identity moved under this request.
@@ -409,6 +476,8 @@ export type AuthoringRequestIdentity = {
   requestId: string;
   expectedAdmissionGeneration: number;
   path?: string;
+  /** The shared reference an Apply after Reset was sent with. */
+  correlationId?: string;
 };
 
 const failedAuthoringRequests = new WeakMap<object, AuthoringRequestIdentity>();
@@ -463,6 +532,7 @@ async function requestJson<T>(
           requestOwnerEpoch: body.requestOwnerEpoch, requestId: body.requestId,
           expectedAdmissionGeneration: body.expectedAdmissionGeneration!,
           path,
+          ...(typeof body.correlationId === 'string' ? { correlationId: body.correlationId } : {}),
         });
       }
     }
@@ -682,6 +752,21 @@ export const api = {
     ),
   },
   authoringWorkspace: {
+    /** Log one confirmed Apply-after-Reset before its Reset; grants no authority. */
+    recordResetApplyContext: (
+      context: ResetApplyContext,
+      signal?: AbortSignal,
+    ): Promise<void> => requestJson(
+      '/api/authoring/reset-apply-contexts',
+      (value) => {
+        const record = value as { correlationId?: unknown; recorded?: unknown } | null;
+        if (record?.correlationId !== context.correlationId || record.recorded !== true) {
+          throw new Error('the Apply context was not recorded for this correlation');
+        }
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(context) },
+    ),
     submissionOutcome: (request: AuthoringRequestIdentity) => requestJson(
       `/api/authoring/submission-outcome?${new URLSearchParams({
         request_owner_epoch: request.requestOwnerEpoch,
@@ -775,13 +860,18 @@ export const api = {
     apply: (
       fence: DraftFenceRequest,
       signal?: AbortSignal,
+      /** An Apply after Reset keeps its shared reference in the Manager record. */
+      correlationId?: string,
     ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
       '/api/program/apply',
       parseProgramWorkspaceTransitionResponse,
       signal,
       {
         method: 'POST',
-        body: JSON.stringify(fence),
+        body: JSON.stringify({
+          ...fence,
+          ...(correlationId === undefined ? {} : { correlationId }),
+        }),
       },
     ),
     discard: (
@@ -816,24 +906,6 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify(fence),
-      },
-    ),
-    materializeRuntimeOverride: (
-      fence: LocalWorkspaceFenceRequest,
-      programRunId: string,
-      proposalId: string,
-      signal?: AbortSignal,
-    ): Promise<RuntimeOverrideMaterializationResponse> => requestJson(
-      '/api/program/draft/runtime-override-promotions',
-      parseRuntimeOverrideMaterializationResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          programRunId,
-          proposalId,
-        }),
       },
     ),
   },
@@ -1022,6 +1094,11 @@ export const api = {
         preparation: DeploymentCandidatePreparation;
       } | null = null,
       signal?: AbortSignal,
+      /** An Apply after Reset keeps its shared reference in the Manager record. */
+      correlationId?: string,
+      /** The complete activation input the operator confirmed; rechecked
+       * by the backend before any effect. */
+      expectedActivationScope?: DeploymentActivationScope | null,
     ): Promise<DeploymentCandidateOperationResponse> => requestJson(
       '/api/deployment/draft/apply',
       parseDeploymentCandidateOperationResponse,
@@ -1030,6 +1107,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({
           ...fence,
+          ...(correlationId === undefined ? {} : { correlationId }),
+          ...(expectedActivationScope == null ? {} : { expectedActivationScope }),
           confirmationToken: confirmation?.token ?? null,
           preparationRequestOwnerEpoch:
             confirmation?.preparation.requestOwnerEpoch ?? null,
@@ -1046,6 +1125,16 @@ export const api = {
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
     appliedStatus: (signal?: AbortSignal): Promise<AppliedProgramStatus> =>
       requestJson('/api/program/applied/status', parseAppliedProgramStatus, signal),
+    /** Advisory, effect-free preview of one held motion node (D4). */
+    nodeCorrectionPreview: (
+      request: ProgramNodeCorrectionPreviewRequest,
+      signal?: AbortSignal,
+    ): Promise<ProgramNodeCorrectionPreview> => requestJson(
+      `/api/program/runs/${encodeURIComponent(request.program_run_id)}/node-correction-previews`,
+      (value) => parseProgramNodeCorrectionPreview(value, request),
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
+    ),
     persistentValues: (
       scenarioId: string,
       signal?: AbortSignal,

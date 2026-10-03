@@ -763,10 +763,41 @@ ToString(const ManagerApplyMutationAvailability availability) noexcept {
   return {};
 }
 
+bool ManagerRuntimeAccountsForCommittedApplies(
+    const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
+    const std::vector<component_manager::PersistedManagerApplyStatus>
+        &apply_inventory) noexcept {
+  const auto &active = runtime.plan.active_publication;
+  return std::all_of(
+      apply_inventory.begin(), apply_inventory.end(),
+      [&active](const auto &status) {
+        if (!status.publication_receipt.has_value()) {
+          return true;
+        }
+        const auto &receipt =
+            status.publication_receipt->publication.publication_receipt;
+        return receipt.publication_generation.value() <
+                   active.publication_generation.value() ||
+               receipt == active;
+      });
+}
+
 CanonicalValue BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
     const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
     const component_manager::SqliteManagerApplyJournal &apply_journal,
+    const ManagerApplyMutationAvailability apply_availability) {
+  return BuildManagerSourcePayload(active_bundle, runtime, apply_journal,
+                                   apply_journal.ReadStatusInventory(),
+                                   apply_availability);
+}
+
+CanonicalValue BuildManagerSourcePayload(
+    const manyforge::deployment::RetainedBundle &active_bundle,
+    const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
+    const component_manager::SqliteManagerApplyJournal &apply_journal,
+    const std::vector<component_manager::PersistedManagerApplyStatus>
+        &apply_inventory,
     const ManagerApplyMutationAvailability apply_availability) {
   Require(manyforge::deployment::verify_retained_bundle_identity(active_bundle),
           "active retained bundle failed identity verification");
@@ -796,8 +827,12 @@ CanonicalValue BuildManagerSourcePayload(
   for (const auto &row : runtime.observations.observations()) {
     observed.emplace_back(RuntimeObservation(row));
   }
+  // The active publication and the Apply history are published together, so
+  // they must be one generation: a runtime result observed before a
+  // committed Apply published cannot be paired with that Apply's record.
+  Require(ManagerRuntimeAccountsForCommittedApplies(runtime, apply_inventory),
+          "active runtime predates a committed Apply publication");
   CanonicalValue::Array applies;
-  const auto apply_inventory = apply_journal.ReadStatusInventory();
   applies.reserve(apply_inventory.size());
   for (const auto &apply : apply_inventory) {
     Require(apply.intent.intent.cell_id == apply_journal.cell_id(),

@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import time
 
@@ -65,6 +64,46 @@ def read_stop_terminal(native, owner_epoch, stop_id):
     raise AssertionError(
         "Stop terminal evidence exceeds the short-workflow history bound"
     )
+
+
+def activation_preparation_inputs(scenario_project, program, *, allowed_root):
+    """Capture one Scenario project as Composer's Load does, for this Program.
+
+    Returns the keyword inputs of the production ``ActivationPreparer.prepare``,
+    which builds the complete ``manyforge.activation_preparation_request.v3``
+    (runtime cell, prepared model closure) and runs the native preparer. The
+    exact project bytes, Scenario identity, Deployment intent, role assignment
+    and captured model sources come from the same production capture helpers;
+    only the Program is this probe's own query Program.
+    """
+    from manyforge_behavior.model_source_capture import (
+        capture_deployment_model_sources,
+    )
+    from manyforge_composer.backend.scenario_artifacts import (
+        capture_scenario_artifact,
+    )
+
+    document, source, source_document_digest = capture_scenario_artifact(
+        str(scenario_project), allowed_roots=[str(allowed_root)]
+    )
+    deployment = document["deployment_draft"]
+    model_source_closure = capture_deployment_model_sources(
+        deployment, project_root=Path(source)
+    )
+    captured = {
+        "scenario_id": document["scenario_id"],
+        "source_document_digest": source_document_digest,
+        "deployment": deployment,
+        "model_source_closure": model_source_closure,
+        "program": program,
+        "program_role_assignment": document["program_role_assignment"],
+    }
+    # The identity Composer captures for Load and the native preparer
+    # recomputes; it covers exactly these six inputs.
+    return {
+        **captured,
+        "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
+    }
 
 
 def check_completed_program_operations(native, composer, journal_path, run_id):
@@ -738,7 +777,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--package-root", type=Path, required=True)
     parser.add_argument("--build-root", type=Path, required=True)
-    parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument(
         "--pending-scene-shutdown",
         action="store_true",
@@ -956,18 +994,7 @@ def main() -> None:
     if args.runtime_groups and not args.recover_parallel:
         parser.error("--runtime-groups requires --selections --recover-parallel")
     workspace = Path("/workspace")
-    compiler = (
-        args.build_root
-        / "roboplan/manyforge_component_manager/manyforge_deployment/manyforge_maintained_deployment_occurrences"
-    )
-    prepared = tuple(
-        (name, args.prepared_root / directory)
-        for name, directory in (
-            ("lite6_lite_gripper", "lite6_lite_gripper_structural"),
-            ("ur10e_robotiq_2f_140", "ur10e_robotiq_2f_140_structural"),
-            ("ur5_roboplan", "ur5_roboplan_structural"),
-        )
-    )
+    activation_preparer = args.build_root / "deployment/manyforge_prepare_activation"
     scenario = {"scenario_id": "lite6_pick_and_place"}
     state = Path(tempfile.mkdtemp(prefix="h5q-"))
     package = state / "package"
@@ -1288,69 +1315,32 @@ def main() -> None:
     scenario_document_path = (
         workspace / "examples" / f"{scenario['scenario_id']}.scenario"
     )
-    member_digests = {
-        name: raw_sha256_digest((scenario_document_path / name).read_bytes())
-        for name in (
-            "assignment.yaml",
-            "deployment.yaml",
-            "overrides.yaml",
-            "program.yaml",
-        )
-    }
-    source_document_digest = raw_sha256_digest(
-        canonical_json_bytes(
-            {
-                "manifest": raw_sha256_digest(
-                    (scenario_document_path / "scenario.yaml").read_bytes()
-                ),
-                "members": member_digests,
-            }
-        )
-    )
-    deployment = load_strict_json_yaml(deployment_path)
-    program = load_strict_json_yaml(program_path)
-    capture = {
-        "source_document_digest": source_document_digest,
-        "deployment": deployment,
-        "program": program,
-        "program_role_assignment": load_strict_json_yaml(
-            scenario_document_path / "assignment.yaml"
-        ),
-        "typed_parameter_overrides": load_strict_json_yaml(
-            scenario_document_path / "overrides.yaml"
-        ),
-    }
-    preparation_request = {
-        "schema_version": "manyforge.activation_preparation_request.v1",
-        **capture,
-        "captured_input_digest": raw_sha256_digest(canonical_json_bytes(capture)),
-    }
-    preparation_path = state / "activation-preparation.json"
-    preparation_path.write_bytes(canonical_json_bytes(preparation_request))
-    subprocess.run(
-        [
-            str(compiler),
-            "--input",
-            str(preparation_path),
-            "--capability-root",
-            str(workspace),
-            "--candidate-root",
-            str(package),
-            *(
-                arg
-                for name, path in prepared
-                for arg in ("--prepared", f"{name}={path}")
-            ),
-        ],
-        check=True,
-    )
-
     spec = importlib.util.spec_from_file_location(
         "query_workbench", workspace / "scripts/dev-workbench.py"
     )
     assert spec is not None and spec.loader is not None
     workbench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(workbench)
+    # Prepare exactly as production Load does: Composer's capture of the
+    # Scenario project, then Headless's ActivationPreparer, which builds the
+    # complete v3 request and runs the native preparer for the workbench cell.
+    from manyforge_headless_api.activation_preparer import ActivationPreparer
+
+    activation_root = state / "activation-preparation"
+    activation_root.mkdir()
+    ActivationPreparer(
+        executable=activation_preparer,
+        capability_root=workspace,
+        activation_root=activation_root,
+        runtime_cell_id=workbench.WORKBENCH_CELL_ID,
+        timeout_seconds=600.0,
+    ).prepare(
+        **activation_preparation_inputs(
+            scenario_document_path,
+            load_strict_json_yaml(program_path),
+            allowed_root=workspace,
+        )
+    )
     workbench.STATE_ROOT = state / "owners"
     workbench.PACKAGE_ROOT = package
     workbench.HEADLESS_BUILD = args.build_root / "headless"
@@ -1365,7 +1355,7 @@ def main() -> None:
     # These only locate already qualified build/package inputs. Normal owner
     # construction, exact tuple checks, lifecycle convergence and teardown run.
     workbench._import_package = lambda: None
-    workbench._ensure_activation_preparer = lambda: (compiler, prepared)
+    workbench._ensure_activation_preparer = lambda: activation_preparer
     if args.ordinary_jerk or stop_profile_edit:
         # Verify the private, compiler-produced Deployment with the same
         # revision check as the ordinary workspace source. Do not bypass it.

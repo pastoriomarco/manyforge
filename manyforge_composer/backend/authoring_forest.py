@@ -78,7 +78,6 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
                 "type": "float64",
                 "default": 1.0,
                 "constraints": {"min_exclusive": 0.0, "max_inclusive": 1.0},
-                "runtime_mutability": "before_run",
                 "description": "Default acceleration scale for motion nodes.",
             },
             {
@@ -86,7 +85,6 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.01,
                 "constraints": {"min_inclusive": 0.0},
-                "runtime_mutability": "before_run",
                 "description": "Default maximum Cartesian blend deviation.",
             },
             {
@@ -94,7 +92,6 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.005,
                 "constraints": {"min_exclusive": 0.0},
-                "runtime_mutability": "before_run",
                 "description": "Default Cartesian translation tolerance for motion nodes.",
             },
             {
@@ -102,7 +99,6 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
                 "type": "float64",
                 "default": 1.0,
                 "constraints": {"min_exclusive": 0.0, "max_inclusive": 1.0},
-                "runtime_mutability": "before_run",
                 "description": "Default velocity scale for motion nodes.",
             },
         ],

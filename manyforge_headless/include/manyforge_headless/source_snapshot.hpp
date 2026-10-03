@@ -84,6 +84,12 @@ public:
 /// and directory fsync. Readers open the selected inode with O_NOFOLLOW and
 /// validate the complete closed record. The channel owns no source semantics;
 /// it advances generation by comparing verified semantic digests only.
+///
+/// Each read still opens, stats and reads the complete selected file. Only
+/// when those bytes are identical to the last record this channel completely
+/// verified (decoded, or encoded itself) is that verified value reused instead
+/// of decoding and re-deriving both digests again; any other byte sequence is
+/// fully decoded and verified.
 class AtomicSourceSnapshotChannel final {
 public:
   AtomicSourceSnapshotChannel(std::filesystem::path directory,
@@ -101,10 +107,22 @@ public:
           std::string source_owner_epoch, std::int64_t observed_at_ns,
           manyforge::content_identity::CanonicalValue payload);
 
+  /// Number of complete record decodes performed by this channel's reads (a
+  /// diagnostic for byte-identical reuse; reuse does not advance it).
+  [[nodiscard]] std::uint64_t decode_count() const;
+
+  /// Exact canonical bytes and value of the last completely verified record.
+  struct VerifiedRecord final {
+    std::string bytes;
+    SourceSnapshot snapshot;
+  };
+
 private:
   std::filesystem::path directory_;
   std::string file_name_;
   mutable std::mutex mutex_;
+  mutable std::optional<VerifiedRecord> last_verified_;
+  mutable std::uint64_t decode_count_{};
 };
 
 } // namespace manyforge::headless

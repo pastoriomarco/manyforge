@@ -30,9 +30,12 @@ _SEND_TIMEOUT_SECONDS = 0.25
 _STATE_MESSAGE = re.compile(r'"message_kind"\s*:\s*"(?:snapshot|delta)"')
 _SNAPSHOT_MESSAGE = re.compile(r'"message_kind"\s*:\s*"snapshot"')
 _SERVER_SEQUENCE = re.compile(r'("server_sequence"\s*:\s*")([1-9][0-9]*)(")')
+# Starts, resumes and recovery actions go through Composer's HTTP admission,
+# which checks the shared Draft under the authoring serialization lock.
 _HTTP_ADMITTED_COMMANDS = frozenset({
     "program_run", "program_motion_start", "program_motion_resume",
     "program_resume_full_stop", "operation_start", "operation_resume",
+    "execution_recovery",
 })
 _LOGGER = logging.getLogger(__name__)
 
@@ -248,7 +251,7 @@ async def serve_headless_state(
                         ):
                             await websocket.close(
                                 code=1008,
-                                reason="execution start requires Composer admission",
+                                reason="this command requires Composer admission",
                             )
                             raise WebSocketDisconnect()
                     await upstream.send(message)

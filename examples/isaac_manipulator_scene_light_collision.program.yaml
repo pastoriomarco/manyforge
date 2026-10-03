@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:2371f4dee1cddd90098d7db63cedc21b8ccf7694c97a64f964b4ee6c9e80d0cc
+program_revision: sha256:9a1354521a13a4cecb71f489531fb0568a8dd4361386eca6d67c066ca605fec1
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: >-
@@ -129,7 +129,6 @@ parameters:
     type: float64
     default: 0.2
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for the collision-bearing move.
 tree:
   node_id: sequence

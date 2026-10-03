@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_demo
-program_revision: sha256:4477bda3a8aa160c27c21ac6cc387819d7b2b434e89457bf6516629c6a0b1b7b
+program_revision: sha256:0237bc153663a6fe2f512d7c4832710487c2a3ace38858c6e3a60f5410a1dd98
 program_profile: composable-cell-v1
 name: pick_and_place_demo
 description: >-
@@ -78,7 +78,6 @@ parameters:
     type: float64
     default: 0.5
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for all moves.
 blackboard:
   namespaces: []

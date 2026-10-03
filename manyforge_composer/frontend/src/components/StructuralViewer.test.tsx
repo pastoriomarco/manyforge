@@ -578,7 +578,9 @@ describe('viewer failure isolation', () => {
     expect(viewer.includes('onBeginCandidateTcpDrag')).toBe(true);
     expect(workspace).toContain("robotControl.state.mode === 'pose_goal'");
     expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
-    expect(workspace.includes('onEditCandidateTcpPose={finishCandidateDrag}')).toBe(true);
+    // Identity-stable Canvas callbacks delegate to the latest drag closures.
+    expect(workspace.includes('onEditCandidateTcpPose={finishCandidateDragStable}')).toBe(true);
+    expect(workspace).toContain('candidateDragHandlers.current = { begin: beginCandidateDrag, finish: finishCandidateDrag }');
     expect(workspace).toContain('candidateTcpPoseFromCell(');
     expect(workspace).toContain('robotControlCandidatePresentationAllowed(');
     expect(workspace).toContain('candidatePresentationAllowed={candidatePresentationAllowed}');

@@ -481,15 +481,6 @@ struct RetainedNativeRuntime final
   ReadCurrentPublishedRouteConfiguration(
       const core::ControlDomainId &control_domain_id) const;
 
-  /// Take a route-publication-consistent copy of the physical target bindings.
-  /// CCLC may re-seal their active configuration identity without replacing
-  /// the runtime owner; status and observation readers must use these current
-  /// bindings rather than the Composition's build-time candidate copies.
-  [[nodiscard]] core::RuntimeParticipantBinding
-  ReadCurrentMotionBinding() const;
-  [[nodiscard]] std::optional<core::RuntimeParticipantBinding>
-  ReadCurrentGripperBinding() const;
-
   /// Final source check and evidence write share route-publication ordering.
   /// The host supplies the verified confirmation representative and its
   /// explicit policy; this is not an unqualified public mutation endpoint.
@@ -517,7 +508,8 @@ private:
       const core::ConfigurationFenceId &fence_id,
       const core::ConfigurationFenceScopeDTO &scope);
 
-  // Caller holds route_publication_mutex_. No owner read or write escapes it.
+  // Caller holds the cell root's route_publication_mutex_ (this runtime's
+  // own when it is the root). No owner read or write escapes it.
   [[nodiscard]] bool
   GripperSourceIsCurrent(const core::RuntimeParticipantBinding &source) const;
   mutable std::mutex route_publication_mutex_;

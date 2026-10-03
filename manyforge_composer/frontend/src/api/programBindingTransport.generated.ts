@@ -21,9 +21,8 @@ const FIELDS = {
   resource: ['resource_role_id', 'resource_ids', 'compiled_resource_names'],
   collision: ['collision_body_role_id', 'model_instance_id', 'model_revision', 'compiled_collision_body_names'],
   capability: ['capability_id', 'capability_definition_revision', 'control_binding', 'capability_provider_binding', 'command_schema'],
-  node_policy: ['instance_id', 'modification_policy', 'recovery_policy', 'operator_stop_policy'],
-  modification_policy: ['runtime_override', 'persistent_edit', 'intervention_delegate'],
-  recovery_policy: ['allow_intervention', 'allowed_recovery_actions', 'max_retries', 'allowed_skills', 'persistence_ceiling'],
+  node_policy: ['instance_id', 'recovery_policy', 'operator_stop_policy'],
+  recovery_policy: ['allow_intervention', 'max_retries'],
   control: ['control_binding_id', 'control_binding_revision'],
   provider: ['capability_provider_binding_id', 'capability_provider_binding_revision'],
   command_schema: ['command_schema_id', 'command_schema_revision'],
@@ -32,23 +31,16 @@ const FIELDS = {
   provenance: ['binding_compiler_contract_digest', 'role_assignment_digest', 'source_records', 'resolved_output_records'],
   provenance_record: ['record_kind', 'record_id', 'revision'],
 } as const;
-const MODIFICATION_VALUES = new Set(['forbidden', 'human_approval', 'llm_allowed']);
-const INTERVENTION_DELEGATES = new Set(['forbidden', 'human_only', 'llm_allowed', 'program_only']);
-const RECOVERY_ACTIONS = new Set(['intervention', 'runtime_override']);
-const PERSISTENCE_CEILINGS = new Set(['session_only', 'runtime_override', 'draft_patch']);
 const STOP_POLICIES = new Set(['inherit', 'hold', 'continue']);
 const COLLISION_BODY_ID = 'component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}';
 const MAX_ROWS = 4096;
 const ROLE_MAX_ROWS = 4096;
 const NODE_POLICY_MAX_ROWS = 100000;
-const RECOVERY_ACTION_MAX = 2;
-const SKILL_MAX = 256;
-const SKILL_ID_MAX_BYTES = 128;
 const RETRY_MAX = 255;
 const PROVENANCE_MAX_ROWS = 16384;
 const TEXT_MAX_BYTES = 4096;
 const IDENTITY_MAX_BYTES = 128;
-const BINDING_API_VERSION = 'manyforge.program_binding.v1';
+const BINDING_API_VERSION = 'manyforge.program_binding.v2';
 type Row = Record<string, unknown>;
 
 export class ProgramBindingTransportError extends Error {}
@@ -116,85 +108,25 @@ const strings = (value: unknown, path: string, asText = false): string[] => {
 const policyId = (value: unknown, path: string): string => {
   const result = identity(value, path);
   if (!/^[a-z][a-z0-9_.-]*$/.test(result)) bad(path, 'portable lower-case ID');
-  if (new TextEncoder().encode(result).length > SKILL_ID_MAX_BYTES) {
-    bad(path, 'bounded skill ID');
-  }
   return result;
 };
 const nodePolicy = (value: unknown, path: string): Row => {
   const row = record(value, FIELDS.node_policy, path);
   policyId(row.instance_id, `${path}.instance_id`);
-  const modification = record(row.modification_policy, FIELDS.modification_policy,
-    `${path}.modification_policy`);
-  if (!MODIFICATION_VALUES.has(modification.runtime_override as string)
-      || !MODIFICATION_VALUES.has(modification.persistent_edit as string)
-      || !INTERVENTION_DELEGATES.has(modification.intervention_delegate as string)) {
-    bad(path, 'closed modification-policy enums');
-  }
   const recovery = record(row.recovery_policy, FIELDS.recovery_policy,
     `${path}.recovery_policy`);
   if (typeof recovery.allow_intervention !== 'boolean') {
     bad(`${path}.recovery_policy.allow_intervention`, 'boolean');
   }
-  const actions = array(recovery.allowed_recovery_actions,
-    `${path}.recovery_policy.allowed_recovery_actions`, 0, RECOVERY_ACTION_MAX)
-    .map((item, i) => {
-      const action = text(
-        item,
-        `${path}.recovery_policy.allowed_recovery_actions[${i}]`,
-        IDENTITY_MAX_BYTES,
-      );
-      if (!RECOVERY_ACTIONS.has(action)) {
-        bad(`${path}.recovery_policy.allowed_recovery_actions[${i}]`, 'closed enum');
-      }
-      return action;
-    });
-  sorted(actions.map((item) => ({value: item})), (item) => item.value,
-    `${path}.recovery_policy.allowed_recovery_actions`);
   const retries = recovery.max_retries;
   if (typeof retries !== 'number' || !Number.isInteger(retries)
       || retries < 0 || retries > RETRY_MAX) {
     bad(`${path}.recovery_policy.max_retries`, 'bounded integer');
   }
-  const skills = array(recovery.allowed_skills,
-    `${path}.recovery_policy.allowed_skills`, 0, SKILL_MAX).map((item, i) => {
-      const skill = policyId(item, `${path}.recovery_policy.allowed_skills[${i}]`);
-      return skill;
-    });
-  sorted(skills.map((item) => ({value: item})), (item) => item.value,
-    `${path}.recovery_policy.allowed_skills`);
-  if (!PERSISTENCE_CEILINGS.has(recovery.persistence_ceiling as string)
-      || !STOP_POLICIES.has(row.operator_stop_policy as string)) {
-    bad(path, 'closed recovery/Stop enums');
+  if (!STOP_POLICIES.has(row.operator_stop_policy as string)) {
+    bad(`${path}.operator_stop_policy`, 'closed enum');
   }
-  const intervention = actions.includes('intervention');
-  if (recovery.allow_intervention !== intervention) bad(path, 'intervention cross-field rule');
-  if (skills.length > 0 && !intervention) bad(path, 'allowed_skills requires intervention');
-  if (actions.includes('runtime_override') && modification.runtime_override === 'forbidden') {
-    bad(path, 'runtime_override requires modification permission');
-  }
-  if (recovery.persistence_ceiling === 'runtime_override'
-      && modification.runtime_override === 'forbidden') {
-    bad(path, 'runtime_override persistence requires modification permission');
-  }
-  if (recovery.persistence_ceiling === 'draft_patch'
-      && modification.persistent_edit === 'forbidden') {
-    bad(path, 'draft_patch persistence requires persistent-edit permission');
-  }
-  if (actions.length === 0 && (
-      recovery.allow_intervention || retries !== 0 || skills.length !== 0
-      || recovery.persistence_ceiling !== 'session_only')) {
-    bad(path, 'non-default recovery policy requires an action');
-  }
-  if (skills.length > 0) {
-    bad(`${path}.recovery_policy.allowed_skills`,
-      'requires an exact revision-qualified retained skill referent');
-  }
-  if (modification.runtime_override === 'forbidden'
-      && modification.persistent_edit === 'forbidden'
-      && modification.intervention_delegate === 'forbidden'
-      && actions.length === 0 && retries === 0 && skills.length === 0
-      && recovery.persistence_ceiling === 'session_only'
+  if (recovery.allow_intervention === false && retries === 0
       && row.operator_stop_policy === 'inherit') {
     bad(path, 'default node-policy rows must be omitted');
   }

@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from manyforge_composer.backend import routes_scenario_documents
+from manyforge_composer.backend import routes_scenario_documents, scenario_artifacts
 from manyforge_composer.backend.routes_scenario_documents import (
     _document_content_digest,
     create_scenario_document_router,
@@ -33,6 +33,7 @@ from manyforge_composer.backend.scenario_artifacts import (
     load_scenario_artifact,
     prepare_scenario_artifact,
     save_scenario_artifact,
+    validate_scenario_document,
 )
 from manyforge_composer.backend.state import ComposerState
 
@@ -71,7 +72,7 @@ def _deployment_intent() -> dict:
     }
 
 
-def _document(*, version: str = "1.0.0", overrides: dict | None = None) -> dict:
+def _document(*, version: str = "1.0.0") -> dict:
     return build_scenario_document(
         scenario_id="cell_fixture",
         name="Cell fixture",
@@ -79,7 +80,6 @@ def _document(*, version: str = "1.0.0", overrides: dict | None = None) -> dict:
         program_draft=deepcopy(_PROGRAM_FIXTURE),
         deployment_draft=_deployment_intent(),
         program_role_assignment={"component_roles": [], "target_roles": []},
-        typed_parameter_overrides={} if overrides is None else overrides,
         manyforge_version=version,
         last_known_status="ready",
     )
@@ -174,7 +174,7 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
     assert state.current_drafts_match_remembered_scenario()
     assert state.authoring_workspace.snapshot().deployment["differsFromSaved"] is False
     assert sorted(path.name for path in target.iterdir()) == [
-        "assignment.yaml", "deployment.yaml", "overrides.yaml", "program.yaml", "scenario.yaml"
+        "assignment.yaml", "deployment.yaml", "program.yaml", "scenario.yaml"
     ]
 
     # Save As changes the project location, not the referenced model. A later
@@ -335,7 +335,6 @@ def test_save_load_and_discovery_preserve_one_editable_project(
     assert sorted(path.name for path in Path(saved_path).iterdir()) == [
         "assignment.yaml",
         "deployment.yaml",
-        "overrides.yaml",
         "program.yaml",
         "scenario.yaml",
     ]
@@ -374,8 +373,11 @@ def test_listing_reports_history_not_current_content_validation(tmp_path: Path) 
             overwrite=False,
         )
     )
-    (target / "overrides.yaml").write_text(
-        json.dumps({"speed": 0.5}), encoding="utf-8"
+    (target / "assignment.yaml").write_text(
+        json.dumps({"component_roles": [], "target_roles": [
+            {"command_target_id": "arm", "target_role_id": "picker"}
+        ]}),
+        encoding="utf-8",
     )
 
     _, changed = discover_scenario_artifacts(
@@ -387,7 +389,7 @@ def test_listing_reports_history_not_current_content_validation(tmp_path: Path) 
     assert "Previously recorded" in changed[0]["status_detail"]
 
     save_scenario_artifact(
-        _document(overrides={"speed": 0.5}),
+        _document(),
         str(target),
         allowed_roots=[str(tmp_path)],
         overwrite=True,
@@ -519,7 +521,8 @@ def test_interrupted_overwrite_is_detected_without_rollback(
             overwrite=True,
         )
 
-    assert interrupted.value.code == "scenario_artifact_write_failed"
+    assert interrupted.value.code == "scenario_artifact_save_incomplete"
+    assert interrupted.value.status_code == 500
     assert (target / "scenario.yaml").read_bytes() == previous_manifest
     assert (target / ".manyforge-save-pending.json").is_file()
     assert list(target.glob(".*.tmp-*")) == []
@@ -652,7 +655,6 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             }
         },
     }
-    confirmation_token = "sha256:" + "c" * 64
     observed_generations: list[tuple[int, int | None]] = []
     before = state.authoring_workspace.snapshot()
     def prepare_or_apply(
@@ -662,6 +664,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
         apply,
         prepared=None,
         prepare_only=False,
+        confirmed=False,
     ):
         if preparation_fails:
             raise HeadlessClientError(
@@ -679,7 +682,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             (intent["expected_admission_generation"], acquired_generation)
         )
         candidate = {
-            "schema_version": "manyforge.prepared_activation_input.v3",
+            "schema_version": "manyforge.prepared_activation_input.v5",
             "prepared_activation_id": "prepared-load-test",
             "scenario_id": intent["scenario_id"],
             "source_document_digest": intent["source_document_digest"],
@@ -693,21 +696,17 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             "program_outcome": {"kind": "bound", "program_binding_id": "binding-load-test"},
             "node_environment_digest": "sha256:" + "a" * 64,
             "assistant_mode": "forbidden",
-            "typed_parameter_overrides": {},
         }
         if prepare_only:
-            if intent["confirmation_token"] is not None:
-                assert intent["confirmation_token"] == confirmation_token
+            # Load is the operator's confirmation: one preparation, no token.
+            assert confirmed is True
+            assert intent["confirmation_token"] is None
             return {
                 "prepared_activation": candidate,
                 "candidate_preview": dict(preview),
                 "manager_apply": None,
-                "confirmation_required": intent["confirmation_token"] is None,
-                "confirmation_token": (
-                    confirmation_token
-                    if intent["confirmation_token"] is None
-                    else None
-                ),
+                "confirmation_required": False,
+                "confirmation_token": None,
                 "preparation": None,
                 "phases_ms": {},
             }
@@ -753,7 +752,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
         "apply_id": None,
     }
     assert admission.events == ["validate", "commit", "submit", "wake"]
-    assert observed_generations == [(1, None), (1, None), (1, 2)]
+    assert observed_generations == [(1, None), (1, 2)]
     assert state.scenario_document_id == "cell_fixture"
     loaded = state.authoring_workspace.snapshot().as_dict()
     # The reply carries the full committed snapshot the browser parser
@@ -761,7 +760,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     # identity.
     assert response.json()["authoringWorkspace"] == loaded
     assert loaded["schemaVersion"] == (
-        "manyforge.composer_authoring_workspace_snapshot.v1"
+        "manyforge.composer_authoring_workspace_snapshot.v2"
     )
     assert loaded["program"]["saved"]["matchesDraft"] is True
     assert loaded["program"]["saved"]["path"] == str(target / "program.yaml")
@@ -796,7 +795,9 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
     before = state.authoring_workspace.snapshot()
     calls: list[str] = []
 
-    def prepare_or_apply(intent, claim, *, apply, prepared=None, prepare_only=False):
+    def prepare_or_apply(
+        intent, claim, *, apply, prepared=None, prepare_only=False, confirmed=False
+    ):
         assert intent["program"] is None
         assert intent["program_authoring"]["forest"] == []
         assert not intent["program_authoring"].get("scene")
@@ -806,8 +807,9 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
             assert intent["deployment"]["name"] == "Fixture deployment"
             assert len(intent["deployment"]["components"]) == 1
         assert intent["program_role_assignment"] == {"component_roles": [], "target_roles": []}
-        assert intent["typed_parameter_overrides"] == {}
+        assert "typed_parameter_overrides" not in intent
         if prepare_only:
+            assert confirmed is True
             assert not target.exists()
             calls.append("prepare")
             if failure == "prepare":
@@ -912,7 +914,6 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
         program_draft=None,
         deployment_draft=None,
         program_role_assignment=None,
-        typed_parameter_overrides={},
         manyforge_version="1.0.0",
         last_known_status="incomplete",
     )
@@ -923,7 +924,6 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
         program_draft=None,
         deployment_draft=None,
         program_role_assignment=None,
-        typed_parameter_overrides={},
         manyforge_version="1.0.0",
         last_known_status="incomplete",
     )
@@ -947,6 +947,195 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
     assert digest.startswith("sha256:")
 
 
+def test_removed_parameter_override_forms_are_refused_not_read(tmp_path: Path) -> None:
+    # The in-memory document form.
+    with pytest.raises(ScenarioArtifactError) as document_form:
+        validate_scenario_document(
+            {**_document(), "typed_parameter_overrides": {}}, source="<test>"
+        )
+    assert document_form.value.code == "scenario_artifact_version_unsupported"
+    assert "overrides.yaml) were removed" in str(document_form.value)
+
+    # A current project with a leftover overrides.yaml member.
+    target = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "leftover"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    (target / "overrides.yaml").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ScenarioArtifactError) as leftover:
+        load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert leftover.value.code == "scenario_artifact_version_unsupported"
+    # Save never silently drops or rewrites the removed member.
+    with pytest.raises(ScenarioArtifactError) as overwrite:
+        save_scenario_artifact(
+            _document(), str(target), allowed_roots=[str(tmp_path)], overwrite=True,
+        )
+    assert overwrite.value.code == "scenario_artifact_version_unsupported"
+    assert (target / "overrides.yaml").read_text(encoding="utf-8") == "{}\n"
+
+    # A former v1 project (overrides.yaml in its member table).
+    (target / "overrides.yaml").unlink()
+    manifest = json.loads((target / "scenario.yaml").read_text(encoding="utf-8"))
+    manifest["api_version"] = "manyforge.scenario.project.v1"
+    (target / "scenario.yaml").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ScenarioArtifactError) as former:
+        load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert former.value.code == "scenario_artifact_version_unsupported"
+    assert "manyforge.scenario.project.v1" in str(former.value)
+    _, entries = discover_scenario_artifacts(
+        str(tmp_path), allowed_roots=[str(tmp_path)], manyforge_version="1.0.0",
+    )
+    assert entries[0]["display_status"] == "unsupported"
+    assert "overrides.yaml) were removed" in entries[0]["status_detail"]
+
+
+def test_routes_refuse_leftover_overrides_before_any_effect(tmp_path: Path) -> None:
+    """Load and Save refuse a leftover overrides.yaml with no file or workspace effect.
+
+    The browser releases its submission guard for this code (frontend
+    ``SCENARIO_PRE_EFFECT_REFUSAL_CODES``), which is only correct because both
+    routes refuse before touching the project or the authoring workspace.
+    """
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    target = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "leftover"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    (target / "overrides.yaml").write_text("speed: 0.5\n", encoding="utf-8")
+    before_files = {
+        path.name: path.read_bytes() for path in sorted(target.iterdir())
+    }
+    before_workspace = state.authoring_workspace.snapshot().as_dict()
+
+    responses = [
+        client.post("/api/scenario-documents/load", json={
+            **_fence(state), "path": str(target), "confirmDiscard": True,
+        }),
+        client.post("/api/scenario-documents/save", json={
+            **_fence(state), "path": str(target), "scenarioId": "cell_fixture",
+            "name": "Cell fixture", "description": "", "confirmOverwrite": True,
+        }),
+    ]
+
+    for response in responses:
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == (
+            "scenario_artifact_version_unsupported"
+        )
+        assert "overrides.yaml) were removed" in response.json()["detail"]["message"]
+    assert {
+        path.name: path.read_bytes() for path in sorted(target.iterdir())
+    } == before_files
+    assert state.authoring_workspace.snapshot().as_dict() == before_workspace
+
+
+def _project_bytes(project: Path) -> dict[str, bytes]:
+    return {
+        path.name: path.read_bytes()
+        for path in sorted(project.iterdir())
+        if path.is_file()
+    }
+
+
+def test_save_failure_codes_never_mean_both_refused_and_partially_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-write code is a refusal; after the first write there is one code.
+
+    The browser releases its guard for a pre-write 400 and keeps a partial Save
+    unconfirmed, so no code may be raised on both sides of the first write.
+    """
+
+    roots = [str(tmp_path)]
+    project = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "cell"), allowed_roots=roots, overwrite=False,
+    ))
+    before = _project_bytes(project)
+
+    # Pre-write: the target is not a directory / the project cannot be listed.
+    (tmp_path / "plain").write_text("not a project\n", encoding="utf-8")
+    with pytest.raises(ScenarioArtifactError) as not_directory:
+        save_scenario_artifact(
+            _document(), str(tmp_path / "plain"), allowed_roots=roots, overwrite=True,
+        )
+    assert not_directory.value.code == "scenario_artifact_target_invalid"
+    assert not_directory.value.status_code == 400
+    assert (tmp_path / "plain").read_text(encoding="utf-8") == "not a project\n"
+
+    def unlistable(_fd):
+        raise OSError("listing refused")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scenario_artifacts.os, "listdir", unlistable)
+        with pytest.raises(ScenarioArtifactError) as unreadable:
+            save_scenario_artifact(
+                _document(), str(project), allowed_roots=roots, overwrite=True,
+            )
+    assert unreadable.value.code == "scenario_artifact_write_failed"
+    assert unreadable.value.status_code == 400
+    assert _project_bytes(project) == before
+
+    # Post-write: the same causes after the save marker was written.
+    replace = scenario_artifacts._replace_regular_at
+
+    def fail_after_marker(directory_fd, name, raw):
+        if name != scenario_artifacts.SCENARIO_SAVE_MARKER:
+            raise OSError("No space left on device")
+        replace(directory_fd, name, raw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scenario_artifacts, "_replace_regular_at", fail_after_marker)
+        with pytest.raises(ScenarioArtifactError) as write_failed:
+            save_scenario_artifact(
+                _document(), str(project), allowed_roots=roots, overwrite=True,
+            )
+    assert write_failed.value.code == "scenario_artifact_save_incomplete"
+    assert write_failed.value.status_code == 500
+    assert "No space left on device" in str(write_failed.value)
+    assert (project / scenario_artifacts.SCENARIO_SAVE_MARKER).is_file()
+
+    other = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "other"), allowed_roots=roots, overwrite=False,
+    ))
+    (other / "program.yaml").unlink()
+    (other / "program.yaml").mkdir()
+    with pytest.raises(ScenarioArtifactError) as member_invalid:
+        save_scenario_artifact(
+            _document(), str(other), allowed_roots=roots, overwrite=True,
+        )
+    assert member_invalid.value.code == "scenario_artifact_save_incomplete"
+    assert "is not a regular file" in str(member_invalid.value)
+    assert (other / scenario_artifacts.SCENARIO_SAVE_MARKER).is_file()
+    with pytest.raises(ScenarioArtifactError) as reopened:
+        load_scenario_artifact(str(other), allowed_roots=roots)
+    assert reopened.value.code == "scenario_project_save_interrupted"
+
+
+def test_save_route_reports_a_partial_write_as_its_distinct_outcome(
+    tmp_path: Path,
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    project = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "cell"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    (project / "program.yaml").unlink()
+    (project / "program.yaml").mkdir()
+
+    response = client.post("/api/scenario-documents/save", json={
+        **_fence(state), "path": str(project), "scenarioId": "cell_fixture",
+        "name": "Cell fixture", "description": "", "confirmOverwrite": True,
+    })
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "scenario_artifact_save_incomplete"
+
+
 def test_single_file_scenario_is_not_a_project(tmp_path: Path) -> None:
     source = tmp_path / "legacy.scenario.yaml"
     source.write_text(json.dumps(_document()), encoding="utf-8")
@@ -965,12 +1154,15 @@ def test_valid_hand_edit_is_loaded_without_rechecking_during_discovery(tmp_path:
             overwrite=False,
         )
     )
-    (target / "overrides.yaml").write_text('{"speed": 0.25}\n', encoding="utf-8")
+    edited = {"component_roles": [], "target_roles": [
+        {"command_target_id": "arm", "target_role_id": "picker"}
+    ]}
+    (target / "assignment.yaml").write_text(json.dumps(edited) + "\n", encoding="utf-8")
 
     loaded, _ = load_scenario_artifact(
         str(target), allowed_roots=[str(tmp_path)]
     )
-    assert loaded["typed_parameter_overrides"] == {"speed": 0.25}
+    assert loaded["program_role_assignment"] == edited
     _, entries = discover_scenario_artifacts(
         str(tmp_path),
         allowed_roots=[str(tmp_path)],
@@ -1114,3 +1306,91 @@ def test_dynamic_index_lists_only_project_documents(tmp_path: Path) -> None:
     assert [(row["source_kind"], row["scenario_id"]) for row in body["entries"]] == [
         ("saved", "cell_fixture"),
     ]
+
+
+@pytest.mark.parametrize("destructive", [False, True])
+def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
+    tmp_path: Path, destructive: bool
+) -> None:
+    """Load is the operator's confirmation: one preparation, no token round trip."""
+
+    current = {"retained_bundle_id": "bundle-current", "graph_revision": "graph-current"}
+    prepared_activation = {
+        "schema_version": "manyforge.prepared_activation_input.v5",
+        "prepared_activation_id": "prepared-1",
+        "scenario_id": "cell",
+        "source_document_digest": "sha256:" + "1" * 64,
+        "captured_input_digest": "sha256:" + "2" * 64,
+        "deployment_artifact_id": "deployment",
+        "deployment_revision": "deployment-revision",
+        "retained_bundle_id": "bundle-next",
+        "graph_revision": "graph-next",
+        "program_id": "program",
+        "program_revision": "program-revision",
+        "program_outcome": {"kind": "bound", "program_binding_id": "binding"},
+        "node_environment_digest": "sha256:" + "3" * 64,
+        "assistant_mode": "forbidden",
+    }
+
+    class Headless:
+        prepare_calls = 0
+
+        def prepare_activation(self, _request):
+            Headless.prepare_calls += 1
+            return {"prepared_activation": deepcopy(prepared_activation)}
+
+        def manager_status(self):
+            return {
+                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
+                           "source_owner_epoch": "manager.epoch"},
+                "status": {"manager_ready": True, "active": dict(current)},
+            }
+
+        def manager_deployment_candidate_preview(self, _request):
+            return {
+                "ok": True,
+                "diff": {"controllable_components": {"added": ["robot"]}},
+                "impact": {"destructive": destructive},
+                "candidate_receipt": {
+                    "candidate_retained_bundle_id": "bundle-next",
+                    "candidate_graph_revision": "graph-next",
+                    "expected_current": dict(current),
+                    "impact_digest": "sha256:" + "4" * 64,
+                },
+            }
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.headless_client = Headless()  # type: ignore[assignment]
+    intent = {
+        "scenario_id": "cell",
+        "source_document_digest": prepared_activation["source_document_digest"],
+        "captured_input_digest": prepared_activation["captured_input_digest"],
+        "deployment": {},
+        "model_source_closure": {},
+        "program": None,
+        "program_role_assignment": {},
+        "expected_manager_current": dict(current),
+        "expected_admission_generation": 1,
+        "manager_request_id": "request",
+        "correlation_id": "correlation",
+        "confirmation_token": None,
+        "draft_id": "draft",
+        "draft_revision": 1,
+    }
+
+    unconfirmed = state.execute_authored_deployment_candidate(
+        intent, None, apply=True, prepare_only=True
+    )
+    assert unconfirmed["confirmation_required"] is True
+    assert unconfirmed["manager_apply"] is None
+
+    Headless.prepare_calls = 0
+    confirmed = state.execute_authored_deployment_candidate(
+        intent, None, apply=True, prepare_only=True, confirmed=True
+    )
+    assert Headless.prepare_calls == 1
+    assert confirmed["confirmation_required"] is False
+    assert confirmed["confirmation_token"] is None
+    assert confirmed["manager_apply"]["accepted_impact_digest"] == (
+        "sha256:" + "4" * 64 if destructive else None
+    )

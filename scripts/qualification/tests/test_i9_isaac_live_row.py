@@ -1374,11 +1374,7 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
     assert value(manager, "--execution-run-root") == value(
         headless, "--execution-run-root"
     )
-    assert tuple(
-        headless[index + 1]
-        for index, argument in enumerate(headless)
-        if argument == "--resource-id"
-    ) == scenario.runtime_resource_ids
+    assert "--resource-id" not in headless
     assert commands["composer"].count("--authoring-state-root") == 0
 
 

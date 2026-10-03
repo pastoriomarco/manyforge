@@ -311,7 +311,7 @@ std::optional<std::string_view> stop_fault_recovery_facts_field_error(
       !identity(facts.latch_id) || !facts.latch_generation.nonzero() ||
       !projection_status_valid(facts.acceptance_projection) ||
       !projection_status_valid(facts.terminal_projection) ||
-      !projection_status_valid(facts.surveillance_projection) || facts.resource_facts.empty() ||
+      !projection_status_valid(facts.surveillance_projection) ||
       facts.resource_facts.size() > kMaximumStopFaultRecoveryEvidenceRefs ||
       !canonical(facts.resource_facts,
                  [](const auto& left, const auto& right) {

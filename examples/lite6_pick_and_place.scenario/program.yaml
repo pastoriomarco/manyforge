@@ -539,7 +539,6 @@
       "default": 1.0,
       "description": "Acceleration scale for all Lite6 pick-and-place moves.",
       "parameter_id": "acceleration_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -549,7 +548,6 @@
       "default": 0.01,
       "description": "Default maximum Cartesian blend deviation.",
       "parameter_id": "max_blend_deviation_rad",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -559,7 +557,6 @@
       "default": 0.15,
       "description": "Maximum TCP linear speed for all Lite6 pick-and-place moves.",
       "parameter_id": "max_tcp_linear_speed_mps",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -569,7 +566,6 @@
       "default": 0.005,
       "description": "Default Cartesian translation tolerance for motion nodes.",
       "parameter_id": "translation_tol_m",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -580,7 +576,6 @@
       "default": 0.4,
       "description": "Velocity scale for all Lite6 pick-and-place moves.",
       "parameter_id": "velocity_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     }
   ],

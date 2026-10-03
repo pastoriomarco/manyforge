@@ -7,7 +7,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import logging
-import math
 from pathlib import Path
 from threading import Event, RLock
 from typing import Any, Final, NoReturn
@@ -42,6 +41,7 @@ from manyforge_behavior.orchestration_values import (
     ProgramValueError,
     ProgramValueStore,
     ProgramValueUncertainError,
+    input_failure_reason,
 )
 from manyforge_behavior.program import (
     BlackboardKeyDeclaration,
@@ -51,6 +51,8 @@ from manyforge_behavior.program import (
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
     NativeKernelProgramPort,
+    ProductionPortError,
+    ProgramMotionPreviewUnavailableError,
 )
 from manyforge_behavior.program_run_owner import (
     PROGRAM_RESET_STOP_REASON,
@@ -62,6 +64,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunState,
     build_applied_program_run_admission,
 )
+from manyforge_behavior.program_runtime import NodeInputProposalError
 from manyforge_behavior.program_scheduling import (
     ProgramInterventionRegistry,
     ProgramRunTickHost,
@@ -83,7 +86,7 @@ from manyforge_headless_api.cell_admission import (
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
-from .cycle_journal import ProgramCycleJournal
+from .cycle_journal import ProgramCycleJournal, ProgramCycleJournalVersionError
 from .execution_transport import ProgramRunnerExecutionTransport
 from .liveness import (
     ProgramRunnerLivenessError,
@@ -97,6 +100,7 @@ from .models import (
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramNodeAvailabilityRequest,
+    ProgramNodeCorrectionPreviewRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
     ProgramSelectionStartRequest,
@@ -105,9 +109,6 @@ from .models import (
     PersistentKeyValueSetRequest,
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
 )
 from .persistent_keys import (
     OPERATOR_WRITABLE_ACCESS,
@@ -133,6 +134,9 @@ PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v1"
 PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v1"
 PERSISTENT_KEY_RECONCILIATION_VERSION: Final = (
     "manyforge.persistent_key_reconciliation.v1"
+)
+PROGRAM_NODE_PREVIEW_INTENT_VERSION: Final = (
+    "manyforge.program_node_correction_preview_intent.v1"
 )
 _MAX_INFLIGHT_COMMANDS: Final = 4_096
 
@@ -344,16 +348,21 @@ class ProgramRuntime:
                 timeout_seconds=min(config.headless_timeout_seconds, 30.0),
             )
         )
-        self._journal = cycle_journal or (
-            None
-            if config.cycle_journal_path is None
-            else ProgramCycleJournal(
-                config.cycle_journal_path,
-                owner_epoch=self.owner_epoch,
-                maximum_inflight_commands=config.maximum_inflight_commands,
-                maximum_retained_runs=config.maximum_retained_runs,
+        try:
+            self._journal = cycle_journal or (
+                None
+                if config.cycle_journal_path is None
+                else ProgramCycleJournal(
+                    config.cycle_journal_path,
+                    owner_epoch=self.owner_epoch,
+                    maximum_inflight_commands=config.maximum_inflight_commands,
+                    maximum_retained_runs=config.maximum_retained_runs,
+                )
             )
-        )
+        except ProgramCycleJournalVersionError as error:
+            raise ProgramRunnerError(
+                "program_cycle_journal_version_unsupported", str(error)
+            ) from error
         self._liveness: ProgramRunnerLivenessReceiver | None = None
         if config.manager_liveness_socket is not None:
             if self._journal is None:
@@ -1424,10 +1433,6 @@ class ProgramRuntime:
             # enables these only after proving the tree is Full-stopped.
             "program_resume_full_stop": False,
             "program_discard_full_stop": False,
-            "program_runtime_override_stage": cycle.state == "running",
-            "program_runtime_override_activate": cycle.state == "running",
-            "program_runtime_override_clear": cycle.state == "running",
-            "program_runtime_override_promote": cycle.state == "running",
             "program_runtime_blackboard_write": cycle.state == "running",
             "program_manual_result_stage": cycle.state == "running",
             # Only the Kernel-selected held tasks may be retired; the owner
@@ -1649,17 +1654,15 @@ class ProgramRuntime:
                 and cycle_running
                 and run_state == "full_stopped"
             ),
-            **{
-                kind: run_allows(kind, "running")
-                for kind in (
-                    "program_runtime_override_stage",
-                    "program_runtime_override_activate",
-                    "program_runtime_override_clear",
-                    "program_runtime_override_promote",
-                    "program_runtime_blackboard_write",
-                    "program_manual_result_stage",
-                )
-            },
+            # A permitted runtime key stays writable while a failed attempt
+            # is held for intervention; the value store keeps every access,
+            # type and lifecycle check, and a write never resumes motion.
+            "program_runtime_blackboard_write": run_allows(
+                "program_runtime_blackboard_write", *stoppable
+            ),
+            "program_manual_result_stage": run_allows(
+                "program_manual_result_stage", "running"
+            ),
         }
         for command in result["allowed_commands"]:
             kind = command["command_kind"]
@@ -1766,6 +1769,7 @@ class ProgramRuntime:
         policy = live.capture.node_policy_by_instance_id.get(
             intervention.identity.node_instance_id
         )
+        recovery_policy = {} if policy is None else dict(policy.recovery_policy)
         selection_revision = None
         if intervention.policy_parameter == "operator_stop_policy":
             if selection_scope is None:
@@ -1776,7 +1780,7 @@ class ProgramRuntime:
             cycle_generation=cycle_generation,
             owner_epoch=self.owner_epoch,
             intervention=intervention,
-            policy={} if policy is None else policy.recovery_policy,
+            policy=recovery_policy,
             selection_revision=selection_revision,
             containment_pending=(
                 intervention.policy_parameter != "operator_stop_policy"
@@ -1784,306 +1788,17 @@ class ProgramRuntime:
             ),
         )
 
-    @staticmethod
-    def _runtime_override_candidate_unavailable(
-        program_run_id: str,
-        *,
-        reason_code: str,
-        reason: str,
-        node_instance_id: str | None = None,
-        node_attempt_id: str | None = None,
-        node_id: str | None = None,
+    def _captured_recovery_policy(
+        self, program_run_id: str, node_instance_id: str
     ) -> dict[str, Any]:
-        return {
-            "schema_version": ("manyforge.runtime_override_observation_candidate.v1"),
-            "available": False,
-            "reason_code": reason_code,
-            "reason": reason,
-            "program_run_id": program_run_id,
-            "node_instance_id": node_instance_id,
-            "node_attempt_id": node_attempt_id,
-            "node_id": node_id,
-            "parameter_id": None,
-            "value": None,
-            "source_observation_id": None,
-            "source_owner_generation": None,
-        }
+        """The run-start captured recovery policy of one node; empty is default."""
 
-    def _runtime_override_observation_candidate(
-        self, program_run_id: str
-    ) -> dict[str, Any]:
-        """Project one exact owner-derived Robot snapshot staging candidate."""
-
-        try:
-            intervention = self._owner.intervention(program_run_id)
-        except ProgramRunOwnerError as error:
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="program_attempt_context_unavailable",
-                reason=str(error),
-            )
-        if intervention is None:
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="program_attempt_not_held",
-                reason="Stage requires the exact held Program node attempt.",
-            )
-        node_instance_id = intervention.identity.node_instance_id
-        node_attempt_id = intervention.identity.node_attempt_id
         try:
             live = self._owner.read(program_run_id)
-            context = self._owner.runtime_override_source_context(
-                program_run_id,
-                node_instance_id=node_instance_id,
-            )
         except ProgramRunOwnerError as error:
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="program_attempt_context_unavailable",
-                reason=str(error),
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-            )
-        node_id = context["node_id"]
-        parameters = context["parameters"]
-        if (
-            not isinstance(parameters, Mapping)
-            or parameters.get("target_mode", "absolute") != "absolute"
-            or node_id not in {"motion.move_to_joint_target", "motion.move_to_pose"}
-        ):
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="robot_snapshot_override_not_supported",
-                reason=(
-                    "The held node does not accept an absolute Robot snapshot "
-                    "as its goal."
-                ),
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        target_binding = context.get("target_binding")
-        if not isinstance(target_binding, Mapping):
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="program_attempt_context_unavailable",
-                reason="The held node has no captured execution target binding.",
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        try:
-            observation_projection = self._kernel.observation()
-        except Exception as error:
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="robot_observation_unavailable",
-                reason=str(error) or "The current Robot observation is unavailable.",
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        observation = observation_projection.get("observation")
-        capture = live.capture
-        if (
-            observation_projection.get("ok") is not True
-            or not isinstance(observation, Mapping)
-            or observation.get("graph_revision") != capture.graph_revision
-            or observation.get("retained_bundle_id") != capture.retained_bundle_id
-            or not isinstance(observation.get("owner_epoch"), str)
-            or not observation["owner_epoch"]
-        ):
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="robot_observation_identity_mismatch",
-                reason=(
-                    "The execution owner has no complete Robot observation "
-                    "for this exact Program target."
-                ),
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        if node_id == "motion.move_to_joint_target":
-            rows = observation.get("targets")
-            observed_targets = (
-                [
-                    row
-                    for row in rows
-                    if isinstance(row, Mapping)
-                    and row.get("controllable_component_id")
-                    == target_binding.get("controllable_component_id")
-                    and row.get("command_target_id")
-                    == target_binding.get("command_target_id")
-                ]
-                if isinstance(rows, list)
-                else []
-            )
-            observed = observed_targets[0] if len(observed_targets) == 1 else None
-            if not isinstance(observed, Mapping):
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_identity_mismatch",
-                    reason=(
-                        "The execution owner has no unique Robot observation "
-                        "for this exact Program target."
-                    ),
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            names = observed.get("source_joint_names")
-            positions = observed.get("positions_si")
-            if (
-                not isinstance(names, list)
-                or not isinstance(positions, list)
-                or not names
-                or len(names) != len(positions)
-                or any(not isinstance(name, str) or not name for name in names)
-                or any(
-                    isinstance(position, bool)
-                    or not isinstance(position, (int, float))
-                    or not math.isfinite(position)
-                    for position in positions
-                )
-            ):
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_value_invalid",
-                    reason="The current joint observation is incomplete.",
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            value: Any = [
-                {"joint_name": name, "position_rad": position}
-                for name, position in zip(names, positions, strict=True)
-            ]
-        else:
-            try:
-                target_projection = self._kernel.query_target(
-                    {
-                        "schema_version": "manyforge.target_observation_query.v1",
-                        "owner_epoch": observation["owner_epoch"],
-                        "program_binding_id": capture.program_binding_id,
-                        "target_role_id": parameters["target_role"],
-                        "kind": "frame_pose",
-                        "frame_role_id": parameters["tcp_frame_role"],
-                        "relative_to_frame_role_id": parameters["base_frame_role"],
-                    }
-                )
-            except Exception as error:
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_unavailable",
-                    reason=str(error) or "The current Robot observation is unavailable.",
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            observed = target_projection.get("target_observation")
-            pose = observed.get("value") if isinstance(observed, Mapping) else None
-            position = pose.get("position_m") if isinstance(pose, Mapping) else None
-            orientation = pose.get("orientation") if isinstance(pose, Mapping) else None
-            if not isinstance(position, Mapping) or not isinstance(
-                orientation, Mapping
-            ):
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_value_invalid",
-                    reason="The current TCP observation is incomplete.",
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            try:
-                position_value = [position[field] for field in ("x_m", "y_m", "z_m")]
-                orientation_value = [
-                    orientation[field] for field in ("x", "y", "z", "w")
-                ]
-            except KeyError:
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_value_invalid",
-                    reason="The current TCP observation is incomplete.",
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            if any(
-                isinstance(component, bool)
-                or not isinstance(component, (int, float))
-                or not math.isfinite(component)
-                for component in (*position_value, *orientation_value)
-            ):
-                return self._runtime_override_candidate_unavailable(
-                    program_run_id,
-                    reason_code="robot_observation_value_invalid",
-                    reason="The current TCP observation is incomplete.",
-                    node_instance_id=node_instance_id,
-                    node_attempt_id=node_attempt_id,
-                    node_id=node_id,
-                )
-            # The TCP is measured relative to the moving robot's base frame,
-            # so the candidate is labelled with that frame, never with the
-            # authored goal's frame (which may be the cell or another frame).
-            value = {
-                "frame_ref": {
-                    "kind": "target_frame",
-                    "target_role": parameters["target_role"],
-                    "frame_role": parameters["base_frame_role"],
-                },
-                "position_m": position_value,
-                "orientation": {"xyzw": orientation_value},
-            }
-        if (
-            not isinstance(observed.get("source_epoch"), str)
-            or not observed["source_epoch"]
-            or type(observed.get("source_sequence")) is not int
-            or observed["source_sequence"] < 1
-        ):
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="robot_observation_identity_mismatch",
-                reason=(
-                    "The execution owner has no complete Robot observation "
-                    "for this exact Program target."
-                ),
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        try:
-            validated = self._owner.validate_runtime_override(
-                program_run_id,
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                parameter_id="goal",
-                value=value,
-            )
-        except ProgramRunOwnerError as error:
-            return self._runtime_override_candidate_unavailable(
-                program_run_id,
-                reason_code="robot_snapshot_override_rejected",
-                reason=str(error),
-                node_instance_id=node_instance_id,
-                node_attempt_id=node_attempt_id,
-                node_id=node_id,
-            )
-        return {
-            "schema_version": ("manyforge.runtime_override_observation_candidate.v1"),
-            "available": True,
-            "reason_code": None,
-            "reason": None,
-            "program_run_id": program_run_id,
-            "node_instance_id": node_instance_id,
-            "node_attempt_id": node_attempt_id,
-            "node_id": node_id,
-            "parameter_id": "goal",
-            "value": validated,
-            "source_observation_id": observed["source_epoch"],
-            "source_owner_generation": observed["source_sequence"],
-        }
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
+        policy = live.capture.node_policy_by_instance_id.get(node_instance_id)
+        return {} if policy is None else dict(policy.recovery_policy)
 
     @staticmethod
     def _run_recovery_fences(
@@ -3363,6 +3078,128 @@ class ProgramRuntime:
                 str(error),
             ) from error
 
+    def preview_node_correction(
+        self,
+        program_run_id: str,
+        request: ProgramNodeCorrectionPreviewRequest,
+    ) -> dict[str, Any]:
+        """Build the native preview intent of one held motion node; no effect.
+
+        The node's inputs are resolved as a fresh attempt would resolve them,
+        with the proposed paths replaced, and translated by the execution
+        builder. Nothing is ticked, submitted, retried or written; the caller
+        sends the returned intent to the native preview.
+        """
+
+        if self._closed:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is closed"
+            )
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        try:
+            live = self._owner.read(program_run_id)
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
+        capture = live.capture
+        if (
+            live.owner_epoch != request.expected_owner_epoch
+            or capture.program_id != request.program_id
+            or capture.program_revision != request.program_revision
+            or capture.program_binding_id != request.program_binding_id
+        ):
+            raise ProgramRunnerError(
+                "program_node_preview_identity_stale",
+                "the preview names another Program run owner or captured Program",
+            )
+        intervention = self._owner.intervention(
+            program_run_id, node_attempt_id=request.node_attempt_id
+        )
+        if (
+            intervention is None
+            or intervention.identity.node_instance_id != request.node_instance_id
+        ):
+            raise ProgramRunnerError(
+                "program_node_preview_attempt_stale",
+                "the preview names no exact held attempt of this node",
+            )
+        result: dict[str, Any] = {
+            "schema_version": PROGRAM_NODE_PREVIEW_INTENT_VERSION,
+            "request_id": request.request_id,
+            "program_run_id": program_run_id,
+            "program_runner_owner_epoch": live.owner_epoch,
+            "run_revision": live.run_revision,
+            "program_id": capture.program_id,
+            "program_revision": capture.program_revision,
+            "program_binding_id": capture.program_binding_id,
+            "retained_bundle_id": capture.retained_bundle_id,
+            "graph_revision": capture.graph_revision,
+            "node_instance_id": request.node_instance_id,
+            "node_attempt_id": request.node_attempt_id,
+            "node_id": None,
+            "proposed_paths": [proposal.path for proposal in request.proposed_inputs],
+            "parameters_digest": None,
+            "target": None,
+            "unavailable_reason": None,
+            "operation": None,
+        }
+
+        def unavailable(code: str, message: str) -> dict[str, Any]:
+            result["unavailable_reason"] = {
+                "code": code,
+                "message": message[:1024] or code,
+            }
+            return result
+
+        try:
+            node_id, parameters = self._owner.preview_node_inputs(
+                program_run_id,
+                node_instance_id=request.node_instance_id,
+                proposed=[
+                    (proposal.path, proposal.value)
+                    for proposal in request.proposed_inputs
+                ],
+            )
+        except NodeInputProposalError as error:
+            raise ProgramRunnerError(
+                "program_node_preview_input_invalid", str(error)
+            ) from error
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
+        except ProgramValueError as error:
+            # A sourced input other than the proposal cannot be resolved now.
+            return unavailable(input_failure_reason(error), str(error))
+        result["node_id"] = node_id
+        result["parameters_digest"] = (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(dict(parameters))).hexdigest()
+        )
+        try:
+            participant, operation = self._native.motion_preview_intent(
+                intervention.identity,
+                node_id,
+                parameters,
+                request_id=request.request_id,
+            )
+        except ProgramMotionPreviewUnavailableError as error:
+            return unavailable(error.reason_code, str(error))
+        except ProductionPortError as error:
+            # Execution would refuse these exact inputs identically.
+            raise ProgramRunnerError(
+                "program_node_preview_input_invalid", str(error)
+            ) from error
+        target = participant.target
+        result["target"] = {
+            "target_role_id": target.target_role_id,
+            "component_role_id": target.component_role_id,
+            "controllable_component_id": target.controllable_component_id,
+            "command_target_id": target.command_target_id,
+        }
+        result["operation"] = operation
+        return result
+
     def _runtime_controls_projection(
         self,
         program_run_id: str,
@@ -3373,7 +3210,7 @@ class ProgramRuntime:
         execution_selections: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v6",
+            "schema_version": "manyforge.program_runtime_control_projection.v7",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
@@ -3381,9 +3218,6 @@ class ProgramRuntime:
             "runtime_controls": controls.snapshot(),
             "recovery_offer": recovery_offer,
             "execution_selections": execution_selections,
-            "observation_override_candidate": (
-                self._runtime_override_observation_candidate(program_run_id)
-            ),
         }
 
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
@@ -3567,195 +3401,6 @@ class ProgramRuntime:
         if error is not None:
             failure["cause_code"] = getattr(error, "code", type(error).__name__)
         return failure
-
-    def stage_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideStageRequest
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        controls = self._controls(program_run_id)
-
-        def effect():
-            if request.source_observation_id is not None:
-                candidate = self._runtime_override_observation_candidate(program_run_id)
-                if (
-                    candidate.get("available") is not True
-                    or candidate.get("node_instance_id") != request.node_instance_id
-                    or candidate.get("node_attempt_id") != request.node_attempt_id
-                    or candidate.get("parameter_id") != request.parameter_id
-                    or candidate.get("value") != request.value
-                    or candidate.get("source_observation_id")
-                    != request.source_observation_id
-                    or candidate.get("source_owner_generation")
-                    != request.source_owner_generation
-                ):
-                    raise ProgramRunnerError(
-                        "program_runtime_observation_stale",
-                        (
-                            candidate.get("reason")
-                            if isinstance(candidate.get("reason"), str)
-                            else (
-                                "Robot observation changed before runtime override "
-                                "staging"
-                            )
-                        ),
-                    )
-            before = controls.revision
-            record = controls.stage_override(
-                node_instance_id=request.node_instance_id,
-                node_attempt_id=request.node_attempt_id,
-                parameter_id=request.parameter_id,
-                value=request.value,
-                source_observation_id=request.source_observation_id,
-                source_owner_generation=request.source_owner_generation,
-                validator=lambda **values: self._owner.validate_runtime_override(
-                    program_run_id, **values
-                ),
-            )
-            if controls.revision != before:
-                try:
-                    self._owner.note_runtime_control_change(program_run_id)
-                except Exception as error:
-                    raise RuntimeError(
-                        "runtime override was staged but its run projection "
-                        "could not be advanced"
-                    ) from error
-            return record
-
-        return self._control_effect(
-            request, kind="runtime_override_stage", effect=effect
-        )
-
-    def activate_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideActionRequest
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        controls = self._controls(program_run_id)
-
-        def effect():
-            current = next(
-                (
-                    row
-                    for row in controls.snapshot()["overrides"]
-                    if row["override_id"] == request.override_id
-                ),
-                None,
-            )
-            if (
-                current is None
-                or current["override_revision"] != request.expected_override_revision
-            ):
-                raise ProgramRuntimeControlError(
-                    "program_runtime_override_stale",
-                    "runtime override revision changed",
-                )
-            return controls.activate_override(
-                request.override_id,
-                activator=lambda **values: self._owner.activate_runtime_override(
-                    program_run_id, **values
-                ),
-            )
-
-        return self._control_effect(
-            request, kind="runtime_override_activate", effect=effect
-        )
-
-    def clear_runtime_override(
-        self, program_run_id: str, request: RuntimeOverrideActionRequest
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        controls = self._controls(program_run_id)
-
-        def effect():
-            current = next(
-                (
-                    row
-                    for row in controls.snapshot()["overrides"]
-                    if row["override_id"] == request.override_id
-                ),
-                None,
-            )
-            if (
-                current is None
-                or current["override_revision"] != request.expected_override_revision
-            ):
-                raise ProgramRuntimeControlError(
-                    "program_runtime_override_stale",
-                    "runtime override revision changed",
-                )
-            return controls.clear_override(
-                request.override_id,
-                clearer=lambda **values: self._owner.clear_runtime_override(
-                    program_run_id, **values
-                ),
-            )
-
-        return self._control_effect(
-            request, kind="runtime_override_clear", effect=effect
-        )
-
-    def promote_runtime_override(
-        self, program_run_id: str, request: RuntimeOverridePromotionRequest
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        controls = self._controls(program_run_id)
-
-        def effect():
-            current = next(
-                (
-                    row
-                    for row in controls.snapshot()["overrides"]
-                    if row["override_id"] == request.override_id
-                ),
-                None,
-            )
-            if (
-                current is None
-                or current["override_revision"] != request.expected_override_revision
-            ):
-                raise ProgramRuntimeControlError(
-                    "program_runtime_override_stale",
-                    "runtime override revision changed",
-                )
-            node_id = self._owner.validate_runtime_override_promotion(
-                program_run_id,
-                node_instance_id=current["node_instance_id"],
-            )
-            before = controls.revision
-            proposal = controls.request_promotion(
-                request.override_id,
-                node_id=node_id,
-                expected_draft_id=request.expected_draft_id,
-                expected_draft_revision=request.expected_draft_revision,
-            )
-            if controls.revision != before:
-                try:
-                    self._owner.note_runtime_control_change(program_run_id)
-                except Exception as error:
-                    raise RuntimeError(
-                        "runtime promotion was staged but its run projection "
-                        "could not be advanced"
-                    ) from error
-            return proposal
-
-        return self._control_effect(
-            request, kind="runtime_override_promote", effect=effect
-        )
 
     def write_runtime_blackboard(
         self, program_run_id: str, request: RuntimeBlackboardWriteRequest
@@ -4497,8 +4142,13 @@ class ProgramRuntime:
                     request.action_id not in {"reset_cycle", "acknowledge_and_continue"}
                     and intervention.policy_parameter != "operator_stop_policy"
                 ):
+                    # The same captured-policy predicate that built the offer,
+                    # revalidated at the exact command; no caller input.
                     controls.require_retry_capacity(
-                        intervention.identity.node_instance_id
+                        intervention.identity.node_instance_id,
+                        self._captured_recovery_policy(
+                            program_run_id, intervention.identity.node_instance_id
+                        ),
                     )
                 if request.action_id == "reset_cycle":
                     # The offer only authorizes the action. The ordinary Reset

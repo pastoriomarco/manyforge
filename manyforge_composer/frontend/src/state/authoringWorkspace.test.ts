@@ -32,7 +32,7 @@ function workspaceSnapshot(
   deploymentDraftRevision: number,
 ): AuthoringWorkspaceSnapshot {
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision,
     program: {
@@ -72,7 +72,6 @@ function workspaceSnapshot(
       ] satisfies ScenarioSourceDiagnostic[],
       sourceDocumentDigest: `sha256:${'c'.repeat(64)}`,
       programRoleAssignment: { arm: 'role.arm' },
-      typedParameterOverrides: {},
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },
@@ -225,6 +224,26 @@ describe('authoringWorkspace', () => {
     expect(requiredComponentFaultNotices(state)).toHaveLength(1);
   });
 
+  it('does not report an available alarm owner with active alarms as unavailable', () => {
+    const state = headlessState(5);
+    const alarms = {
+      id: 'operator_alarms', label: 'Current functional alarms', required: true, status: 'fault',
+      detail: '1 active owner-issued condition(s)', reasonCode: 'active_functional_alarm',
+    };
+    state.componentOverview = { components: [alarms] } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([]);
+
+    state.componentOverview = {
+      components: [{
+        ...alarms, status: 'offline', detail: 'alarm owner unreachable',
+        reasonCode: 'alarm_owner_unavailable',
+      }],
+    } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
+      id: 'component.health.operator_alarms', title: 'Current functional alarms unavailable',
+    })]);
+  });
+
   it('builds the one local fence and its Scenario extension from the publication', () => {
     const snapshot = workspaceSnapshot(5, 3, 4);
     const installed = published(snapshot);
@@ -291,7 +310,7 @@ describe('authoringWorkspace', () => {
         deploymentDraftId: 'deployment-draft.1', deploymentDraftRevision: 1,
       },
       draft: { draftId: 'draft.1', draftRevision: 2, programLoaded: false },
-      applicability: { applyReady: true, affectedInstanceIds: [], unavailableReason: null },
+      applicability: { applyReady: true, unavailableReason: null },
       saved: { available: false, matchesDraft: false, path: null, programRevision: null },
       applied: {
         available: true,

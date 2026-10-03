@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/types/kinematic_state_view.hpp>
@@ -89,10 +90,20 @@ class RetainedBundle final {
   core::RetainedBundleDTO value_;
   CanonicalValue normalized_root_;
   std::string canonical_bytes_;
+  // Outcome of verify_retained_bundle_identity(): 0 not yet computed, 1
+  // verified, 2 rejected. Every field above is fixed at construction and the
+  // value can be neither copied, moved nor mutated, so the outcome is a pure
+  // function of this object and is computed at most once per lifetime.
+  mutable std::atomic<std::uint8_t> identity_verification_{0U};
 
   friend class detail::RetainedBundleConstructionAuthority;
+  friend bool verify_retained_bundle_identity(const RetainedBundle& bundle);
 };
 
+/// Independently re-derives the bundle's semantic projection and content
+/// identity from its canonical root. The outcome is memoized on the immutable
+/// value: repeated checks of one in-memory bundle cost one atomic load. A new
+/// retained identity is a new value and is verified on its own first check.
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle& bundle);
 

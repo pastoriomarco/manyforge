@@ -133,7 +133,11 @@ def test_same_revision_source_order_survives_late_feedback_and_later_terminal_ac
 # A retained v1 original keeps its recorded version and attribution rule.
 @pytest.mark.parametrize(
     "schema_version",
-    ["manyforge.program_diagnostic.v1", "manyforge.program_diagnostic.v2"],
+    [
+        "manyforge.program_diagnostic.v1",
+        "manyforge.program_diagnostic.v2",
+        "manyforge.program_diagnostic.v3",
+    ],
 )
 def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
     schema_version,
@@ -143,11 +147,18 @@ def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
         "schema_version": schema_version,
         "program_run_id": "run.1",
         "blackboard": {"ready": False, "program_run_id": "foreign.run"},
-        "runtime_overrides": {'["move","scale"]': 0.4},
         "omitted_blackboard_count": 8,
-        "omitted_override_count": 1,
         "delivery_loss_count": 3,
     }
+    if schema_version != "manyforge.program_diagnostic.v3":
+        # Retained v1/v2 originals still carry withdrawn runtime-override values;
+        # they are read as recorded but never become identities or samples.
+        event["event"]["payload"].update(
+            {
+                "runtime_overrides": {"program_run_id": "override.run"},
+                "omitted_override_count": 1,
+            }
+        )
     bundle = forensic_bundle(
         {"events": [event], "truncated": False, "next_before_sequence": None},
         program_run_id="run.1",
@@ -157,12 +168,8 @@ def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
     assert sample["values"] == {"ready": False, "program_run_id": "foreign.run"}
     assert sample["causal_references"]["program_run_id"] == ["run.1"]
     assert bundle["normalized_trace"]["records"][0]["program_run_id"] == "run.1"
-    assert sample["runtime_overrides"] == {'["move","scale"]': 0.4}
-    assert (
-        sample["omitted_value_count"],
-        sample["omitted_override_count"],
-        sample["delivery_loss_count"],
-    ) == (8, 1, 3)
+    assert "runtime_overrides" not in sample
+    assert (sample["omitted_value_count"], sample["delivery_loss_count"]) == (8, 3)
 
 
 @pytest.mark.parametrize("late_order", [None, str(2**53 + 1)])

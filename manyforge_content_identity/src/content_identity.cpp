@@ -74,21 +74,27 @@ bool is_sha256_digest(std::string_view value) noexcept {
 std::string framed_sha256(std::string_view identity_domain,
                           std::string_view api_version,
                           const CanonicalValue& normalized_payload) {
+  return framed_sha256_of_canonical_json(identity_domain, api_version,
+                                         canonical_json(normalized_payload));
+}
+
+std::string framed_sha256_of_canonical_json(std::string_view identity_domain,
+                                            std::string_view api_version,
+                                            std::string_view canonical_payload) {
   require_ascii_token(identity_domain, "identity domain");
   require_ascii_token(api_version, "api_version");
 
-  const std::string payload = canonical_json(normalized_payload);
   std::string preimage;
   preimage.reserve(kContentIdentityPrefix.size() + 1U +
                    identity_domain.size() + 1U + api_version.size() + 1U +
-                   payload.size());
+                   canonical_payload.size());
   preimage.append(kContentIdentityPrefix);
   preimage.push_back('\0');
   preimage.append(identity_domain);
   preimage.push_back('\0');
   preimage.append(api_version);
   preimage.push_back('\0');
-  preimage.append(payload);
+  preimage.append(canonical_payload);
   return sha256_digest(preimage);
 }
 

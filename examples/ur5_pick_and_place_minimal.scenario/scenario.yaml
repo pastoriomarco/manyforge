@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:012f8211e8645888115c79898fd50a4ab4d83605f8cc7608cd206e690cd90f12",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:1eb8410af8b29e1296a0411132c178c139ba7ee90b0369401114d80e7e2e5541"
+    "program.yaml": "sha256:3da0300ccffc5d23bf159f3839078d976aa981c5dacec607f5b4b98ff198417e"
   },
   "name": "ur5_roboplan_local_pick_place",
   "saved_status": {
-    "checked_content_digest": "sha256:3c6c3c153978da4cc8f8937b343e9ba369486ee2607b341e5428074356907424",
+    "checked_content_digest": "sha256:85c7ee8335a2226735c0974451c40bf83c3b0635bd0f21709098d0dc704218c5",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

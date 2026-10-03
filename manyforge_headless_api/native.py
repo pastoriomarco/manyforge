@@ -65,7 +65,6 @@ class HeadlessApiConfig:
     manager_run_root: Path
     execution_run_root: Path
     cell_id: str
-    resource_ids: tuple[str, ...] = ()
     owner_id: str = "headless-api"
     # Deterministic override for in-process qualification only. Production
     # launchers leave this unset so every owner restart mints a new epoch.
@@ -138,17 +137,6 @@ class HeadlessApiConfig:
             or len(self.owner_epoch.encode("utf-8")) > 256
         ):
             raise ValueError("owner_epoch must be bounded non-empty NFC text")
-        if tuple(sorted(set(self.resource_ids))) != self.resource_ids:
-            raise ValueError("resource_ids must be strictly sorted and unique")
-        if len(self.resource_ids) > 4_096:
-            raise ValueError("resource_ids exceeds the 4096-resource bound")
-        for resource_id in self.resource_ids:
-            if (
-                not resource_id
-                or unicodedata.normalize("NFC", resource_id) != resource_id
-                or len(resource_id.encode("utf-8")) > 1_024
-            ):
-                raise ValueError("resource_ids must contain bounded non-empty NFC text")
         if self.freshness_milliseconds < 1:
             raise ValueError("freshness_milliseconds must be positive")
         if not 0 < self.manager_timeout_seconds <= MAX_MANAGER_COMMAND_TIMEOUT_SECONDS:
@@ -363,7 +351,6 @@ class NativeHeadlessCore:
                 str(config.alarm_catalog_path),
                 str(config.historian_database_path),
                 config.cell_id,
-                list(config.resource_ids),
                 config.owner_id,
                 config.owner_epoch,
                 config.freshness_milliseconds,

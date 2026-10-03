@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.scenario.project.v1",
+  "api_version": "manyforge.scenario.project.v2",
   "content": {
     "assignment_present": true,
     "deployment_present": true,
@@ -9,12 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:dc572e492edec9edcd61a9e8404f16c75c4ad77cb9cab55aff7d8f20eeb7a253",
     "deployment.yaml": "sha256:6fed4fbdf3de1756b55c3b3142d0b2919961330e3c02f0ceefdd7b0b37b038ee",
-    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
-    "program.yaml": "sha256:5aa8ad971b5b46ed921e60db4ab8b12f02c11050831f6daee10b6d66973fdc85"
+    "program.yaml": "sha256:41b4f38d80654567bd6269b35fc6f726c1d218684e0f20ca9e2155e4e71e9e4a"
   },
   "name": "isaac_lite6_lite_gripper_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:41ceadcf65b917fd8fbbe85d70df1ef8427aa1d906c8cb1a80b63b061c80ccc4",
+    "checked_content_digest": "sha256:d646dc412a1b5f7312cf10f19b12734a09ca0d6f1ae3370466cbb6f6b86146d4",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

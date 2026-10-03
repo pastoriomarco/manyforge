@@ -44,9 +44,10 @@ inline constexpr std::string_view kHistorianCapturePageSchemaVersion =
 /// fields are correlation attribution; blackboard/override values are data.
 /// Ingress accepts only the current version; originals recorded before a
 /// schema cutover keep their recorded version and this derivation.
-inline constexpr std::array<std::string_view, 2>
+inline constexpr std::array<std::string_view, 3>
     kProgramDiagnosticSchemaVersions{"manyforge.program_diagnostic.v1",
-                                     "manyforge.program_diagnostic.v2"};
+                                     "manyforge.program_diagnostic.v2",
+                                     "manyforge.program_diagnostic.v3"};
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
 /// Minimum interval between the starts of two writer commits. Events that
 /// arrive meanwhile wait in memory and share the next transaction.

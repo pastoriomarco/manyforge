@@ -42,7 +42,7 @@ def _client_binding() -> dict[str, object]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
+        api_version="manyforge.program_binding.v2",
     )
     return binding
 
@@ -74,7 +74,7 @@ def _client_applied() -> dict[str, object]:
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": "sha256:" + "1" * 64,
         "scenario_id": "cell-pick",
-        "schema_version": "manyforge.applied_program_selection.v2",
+        "schema_version": "manyforge.applied_program_selection.v3",
         "source": {
             "record_digest": "sha256:" + "2" * 64,
             "semantic_content_digest": "sha256:" + "3" * 64,
@@ -82,7 +82,6 @@ def _client_applied() -> dict[str, object]:
             "source_owner_epoch": "owner.epoch.1",
             "source_owner_id": "owner.cell-a",
         },
-        "typed_parameter_overrides": {},
     }
 
 

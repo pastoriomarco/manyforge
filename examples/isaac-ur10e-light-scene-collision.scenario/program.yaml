@@ -283,7 +283,6 @@
       "default": 0.2,
       "description": "Velocity scale for the collision-bearing move.",
       "parameter_id": "velocity_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     }
   ],

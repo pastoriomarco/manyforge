@@ -234,7 +234,7 @@ PreparedActivationInput::PreparedActivationInput(
     std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
     core::ProgramRoleAssignmentDTO program_role_assignment,
     core::ContentDigest node_environment_digest, std::string assistant_mode,
-    CanonicalValue typed_parameter_overrides, CanonicalValue normalized_root,
+    CanonicalValue normalized_root,
     VerifiedPreparedActivationClosure closure)
     : prepared_activation_id_(std::move(prepared_activation_id)),
       source_document_digest_(std::move(source_document_digest)),
@@ -250,11 +250,25 @@ PreparedActivationInput::PreparedActivationInput(
       program_role_assignment_(std::move(program_role_assignment)),
       node_environment_digest_(std::move(node_environment_digest)),
       assistant_mode_(std::move(assistant_mode)),
-      typed_parameter_overrides_(std::move(typed_parameter_overrides)),
       normalized_root_(std::move(normalized_root)), closure_(std::move(closure)) {}
 
 PreparedActivationInput
 parse_prepared_activation_input(const CanonicalValue &value) {
+  // Development cutover: only the current version opens. v3/v4 carried the
+  // removed launch-time typed_parameter_overrides and are refused, never
+  // reinterpreted; Program parameters always take their Program defaults.
+  if (const auto *schema = value.find_object_member("schema_version");
+      schema != nullptr &&
+      std::get_if<std::string>(&schema->storage()) != nullptr &&
+      std::get<std::string>(schema->storage()) !=
+          kPreparedActivationInputSchemaVersion) {
+    fail("prepared activation input schema_version " +
+         std::get<std::string>(schema->storage()) +
+         " is unsupported; only " +
+         std::string(kPreparedActivationInputSchemaVersion) +
+         " opens (launch-time Program parameter overrides were removed); "
+         "prepare the Scenario again from a fresh stopped workbench");
+  }
   require_exact_fields(
       value,
       {"activation_payload", "assistant_mode", "captured_input_digest",
@@ -262,13 +276,10 @@ parse_prepared_activation_input(const CanonicalValue &value) {
        "node_environment_digest", "prepared_activation_id",
        "program_id", "program_outcome", "program_revision",
        "retained_bundle_id", "scenario_id", "schema_version",
-       "source_document_digest",
-       "typed_parameter_overrides"},
+       "source_document_digest"},
       "prepared activation input");
   const auto &schema = text(member(value, "schema_version"), "schema_version");
-  // v3 is retained readback for already-recorded bound/non-executable Applies.
-  if (schema != kPreparedActivationInputSchemaVersion &&
-      schema != "manyforge.prepared_activation_input.v3") {
+  if (schema != kPreparedActivationInputSchemaVersion) {
     fail("prepared activation input has an unsupported schema_version");
   }
   const auto &prepared_id =
@@ -294,7 +305,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   std::optional<std::string> program_binding_id;
   std::optional<ProgramNonExecutableOutcomeDTO> program_outcome;
   const bool no_program = outcome_kind == "no_program";
-  if (no_program && schema == kPreparedActivationInputSchemaVersion) {
+  if (no_program) {
     require_exact_fields(outcome_value, {"kind"}, "program_outcome");
     if (!member(value, "program_id").is_null() ||
         !member(value, "program_revision").is_null()) {
@@ -342,8 +353,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       assistant_mode != "forbidden") {
     fail("prepared activation input assistant_mode is unsupported");
   }
-  const auto &overrides = member(value, "typed_parameter_overrides");
-  static_cast<void>(object(overrides, "typed_parameter_overrides"));
 
   CanonicalValue::Object identity;
   for (const auto &[name, field] : object(value, "prepared activation input")) {
@@ -403,9 +412,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   }
   std::shared_ptr<const ProgramBindingContract> program;
   if (no_program) {
-    if (!member(payload, "program").is_null() || !overrides.as_object().empty() ||
-        assistant_mode != "optional") {
-      fail("no_program must have no Program or overrides and optional assistant mode");
+    if (!member(payload, "program").is_null() || assistant_mode != "optional") {
+      fail("no_program must have no Program and optional assistant mode");
     }
   } else {
     program = verify_program_binding_contract(
@@ -481,8 +489,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
           ? std::optional(core::ProgramBindingId(*program_binding_id))
           : std::nullopt,
       std::move(program_outcome), std::move(role_assignment),
-      core::ContentDigest(node_environment_digest), assistant_mode, overrides,
-      value, std::move(closure));
+      core::ContentDigest(node_environment_digest), assistant_mode, value,
+      std::move(closure));
 }
 
 } // namespace manyforge::deployment

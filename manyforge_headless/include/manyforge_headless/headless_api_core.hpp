@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace manyforge::headless {
@@ -30,7 +31,7 @@ inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
 inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
-    "manyforge.applied_program_selection.v2";
+    "manyforge.applied_program_selection.v3";
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
 inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
@@ -146,7 +147,6 @@ struct HeadlessApiCoreConfig final {
   std::filesystem::path alarm_catalog_path;
   std::filesystem::path historian_database_path;
   std::string cell_id;
-  std::set<std::string> resource_ids;
   std::string owner_id;
   std::string owner_epoch;
   RuntimeSnapshotFreshnessPolicy freshness_policy;
@@ -330,6 +330,42 @@ private:
   void ObserveCurrentStopFaultLocked(
       const manyforge::content_identity::CanonicalValue &fault_latch,
       std::uint64_t native_sequence);
+  /// Which adapter-local record an admitted operation condition updates.
+  enum class OperationConditionKind {
+    kExecutionFault,
+    kRuntimeCollision,
+    kStopFault,
+  };
+  /// A still-current activation the alarm owner refused for its scope. It is
+  /// reconsidered once whenever the active configuration changes.
+  struct RefusedOperationCondition final {
+    AlarmConditionUpdate update;
+    OperationConditionKind kind;
+    std::string tracking_id;
+  };
+
+  void SynchronizeAlarmResourceRegistryLocked(
+      const HeadlessRuntimeSnapshot &runtime);
+  /// Submit one operation-derived condition. A scope the alarm owner refuses
+  /// (stale or invalid resources) is recorded as a named, historian-visible
+  /// rejection and returns no mutation; it never fails the operation feed.
+  /// A refused activation is retained for reconsideration after the next
+  /// active-configuration change; any later update of it supersedes that.
+  [[nodiscard]] std::optional<AlarmMutation>
+  SubmitOperationConditionLocked(AlarmConditionUpdate update,
+                                 OperationConditionKind kind,
+                                 std::string tracking_id);
+  void TrackAdmittedOperationConditionLocked(OperationConditionKind kind,
+                                             const std::string &tracking_id,
+                                             const AlarmSubject &subject);
+  void ForgetRefusedOperationConditionLocked(std::string_view definition_id,
+                                             std::string_view tracking_id);
+  void ReconsiderRefusedOperationConditionsLocked();
+  /// Hold the cell-scoped alarm-scope condition active exactly while at least
+  /// one refused operation condition is retained, naming each of them. Called
+  /// after every change of the retained refusals; unchanged state is not
+  /// resubmitted.
+  void SynchronizeAlarmScopeConditionLocked();
   void RegisterAdapterEpochLocked(AdapterCursor &cursor,
                                   std::string source_epoch);
   [[nodiscard]] AlarmMutation SubmitAdapterUpdateLocked(
@@ -371,10 +407,15 @@ private:
   AsyncEventHistorian historian_;
   RuntimeSnapshotAggregator runtime_aggregator_;
   AlarmLifecycleOwner alarm_owner_;
+  /// (retained bundle, graph revision) whose resources the alarm owner
+  /// currently admits; empty until Manager publishes an active configuration.
+  std::optional<std::pair<std::string, std::string>> alarm_registry_identity_;
+  std::map<std::string, RefusedOperationCondition> refused_operation_conditions_;
   AdapterCursor runtime_health_adapter_;
   bool runtime_health_baseline_observed_{};
   AdapterCursor scene_adapter_;
   AdapterCursor operation_adapter_;
+  AdapterCursor alarm_scope_adapter_;
   std::uint64_t operation_native_sequence_{};
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;

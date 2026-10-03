@@ -93,7 +93,7 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
     with pytest.raises(ValidationError):
         ProgramDiagnosticRequest.model_validate(
             {
-                "schema_version": "manyforge.program_diagnostic.v2",
+                "schema_version": "manyforge.program_diagnostic.v3",
                 "program_run_id": "run.1",
                 "owner_epoch": "runner.1",
                 "program_revision": "sha256:" + "a" * 64,
@@ -106,9 +106,7 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
                 "occurred_at_ns": "9007199254740993",
                 "occurred_at_wall": "2026-09-08T10:00:00Z",
                 "blackboard": {"value": value},
-                "runtime_overrides": {},
                 "omitted_blackboard_count": 0,
-                "omitted_override_count": 0,
                 "delivery_loss_count": 0,
                 "details": None,
                 "origin": None,
@@ -156,7 +154,7 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
-            "schema_version": "manyforge.prepared_activation_input.v3",
+            "schema_version": "manyforge.prepared_activation_input.v5",
             "scenario_id": "scenario.1",
             "source_document_digest": "sha256:" + "1" * 64,
             "captured_input_digest": "sha256:" + "d" * 64,
@@ -169,7 +167,6 @@ def _prepared_activation() -> dict[str, object]:
             "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
             "node_environment_digest": "sha256:" + "5" * 64,
             "assistant_mode": "optional",
-            "typed_parameter_overrides": {},
             "prepared_activation_id": "sha256:" + "e" * 64,
         }
     )
@@ -186,14 +183,14 @@ def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
 def test_no_program_activation_requires_exact_absence() -> None:
     value = {
         **_prepared_activation(),
-        "schema_version": "manyforge.prepared_activation_input.v4",
+        "schema_version": "manyforge.prepared_activation_input.v5",
         "program_id": None,
         "program_revision": None,
         "program_outcome": {"kind": "no_program"},
     }
     assert ManagerApplyPreparedActivation.model_validate(value).program_id is None
     for field, inconsistent in (
-        ("schema_version", "manyforge.prepared_activation_input.v3"),
+        ("schema_version", "manyforge.prepared_activation_input.v4"),
         ("program_id", "old.program"),
         ("program_revision", "sha256:" + "4" * 64),
         ("program_outcome", {"kind": "no_program", "program_binding_id": "sha256:" + "9" * 64}),

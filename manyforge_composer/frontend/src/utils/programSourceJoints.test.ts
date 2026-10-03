@@ -57,7 +57,7 @@ const program: ProgramDocument = {
 };
 
 const applied: AppliedProgramSelection = {
-  schemaVersion: 'manyforge.applied_program_selection.v2',
+  schemaVersion: 'manyforge.applied_program_selection.v3',
   scenarioId: 'lite6',
   sourceDocumentDigest: 'sha256:catalog',
   programId: 'pick',
@@ -78,7 +78,7 @@ const applied: AppliedProgramSelection = {
   }],
   program,
   programBinding: {
-    api_version: 'manyforge.program_binding.v1',
+    api_version: 'manyforge.program_binding.v2',
     program_binding_id: 'sha256:binding',
     program_id: 'pick',
     program_revision: 'sha256:program',

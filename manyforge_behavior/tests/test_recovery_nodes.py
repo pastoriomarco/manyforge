@@ -12,7 +12,57 @@ from manyforge_behavior.nodes.recovery import (
 from manyforge_behavior.program import ProgramNodePolicy
 from manyforge_behavior.program_runtime import ProgramRunAttemptSource
 from manyforge_behavior.program_scheduling import ProgramInterventionRegistry
-from manyforge_behavior.recovery import RecoveryAwareNode
+from manyforge_behavior.recovery import (
+    RecoveryAwareNode,
+    recovery_policy_is_actionable,
+    recovery_retry_permitted,
+)
+
+
+@pytest.mark.parametrize(
+    "policy,used,expected",
+    [
+        ({}, 0, False),
+        ({"allow_intervention": False, "max_retries": 0}, 0, False),
+        # A positive budget never enables a forbidden intervention.
+        ({"allow_intervention": False, "max_retries": 5}, 0, False),
+        ({"allow_intervention": True, "max_retries": 2}, 0, True),
+        ({"allow_intervention": True, "max_retries": 2}, 1, True),
+        ({"allow_intervention": True, "max_retries": 2}, 2, False),
+        # Zero is Unlimited, including far beyond the former 255 bound.
+        ({"allow_intervention": True, "max_retries": 0}, 0, True),
+        ({"allow_intervention": True, "max_retries": 0}, 256, True),
+        ({"allow_intervention": True, "max_retries": 0}, 2**53 - 1, True),
+    ],
+)
+def test_recovery_retry_predicate_is_one_source_independent_budget(
+    policy, used, expected
+) -> None:
+    assert recovery_retry_permitted(policy, retries_used=used) is expected
+
+
+def test_recovery_predicate_rejects_inexact_inputs() -> None:
+    with pytest.raises(ValueError):
+        recovery_retry_permitted({"allow_intervention": True}, retries_used=-1)
+    with pytest.raises(ValueError):
+        recovery_retry_permitted(
+            {"allow_intervention": True, "max_retries": True}, retries_used=0
+        )
+
+
+@pytest.mark.parametrize(
+    "recovery,held",
+    [
+        ({"allow_intervention": True, "max_retries": 0}, True),
+        ({"allow_intervention": True, "max_retries": 1}, True),
+        ({"allow_intervention": False, "max_retries": 3}, False),
+    ],
+)
+def test_only_an_allowed_intervention_holds_a_failed_attempt(recovery, held) -> None:
+    policy = ProgramNodePolicy(
+        instance_id="move", recovery_policy=recovery, operator_stop_policy="inherit"
+    )
+    assert recovery_policy_is_actionable(policy) is held
 
 
 @pytest.mark.parametrize("action", ["retry", "manual_success"])
@@ -40,13 +90,7 @@ def test_parallel_recovery_never_reinvokes_an_unresolved_sibling(action):
         recovery_port=registry,
         policy=ProgramNodePolicy(
             instance_id=child.name, operator_stop_policy="hold",
-            modification_policy={"runtime_override": "forbidden",
-                                 "persistent_edit": "forbidden",
-                                 "intervention_delegate": "human_only"},
-            recovery_policy={"allow_intervention": True,
-                             "allowed_recovery_actions": ["intervention"],
-                             "max_retries": 0, "allowed_skills": [],
-                             "persistence_ceiling": "session_only"},
+            recovery_policy={"allow_intervention": True, "max_retries": 0},
         ),
     ) for child in children]
     root = py_trees.composites.Parallel(

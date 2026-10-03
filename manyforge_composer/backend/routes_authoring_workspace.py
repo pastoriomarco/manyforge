@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from .authoring_workspace import AuthoringWorkspaceError
 from .authoring_admission import AuthoringMutationEnvelope
+from .reset_apply_log import ResetApplyContextRequest, record_reset_apply_context
 from .state import ComposerState
 
 
@@ -40,6 +41,16 @@ def create_authoring_workspace_router(state: ComposerState) -> APIRouter:
         return state.authoring_admission.submission_outcome(AuthoringMutationEnvelope(
             expected_admission_generation, request_owner_epoch, request_id,
         ))
+
+    @router.post("/api/authoring/reset-apply-contexts")
+    def record_reset_apply(body: ResetApplyContextRequest) -> dict[str, Any]:
+        """Log one confirmed Apply-after-Reset before its Reset is sent.
+
+        Validation only bounds the logged metadata; the record grants no
+        Reset or Apply authority and is not a persisted workflow.
+        """
+
+        return record_reset_apply_context(body)
 
     @router.get("/api/authoring/workspace")
     def read_authoring_workspace() -> dict[str, Any]:

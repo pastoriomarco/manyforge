@@ -311,7 +311,6 @@
       "default": 0.5,
       "description": "Acceleration scale shared by the two planned motions.",
       "parameter_id": "acceleration_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -321,7 +320,6 @@
       "default": 0.01,
       "description": "Default maximum Cartesian blend deviation.",
       "parameter_id": "max_blend_deviation_rad",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -331,7 +329,6 @@
       "default": 0.15,
       "description": "Maximum TCP linear speed shared by the two robots.",
       "parameter_id": "max_tcp_linear_speed_mps",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -341,7 +338,6 @@
       "default": 0.005,
       "description": "Default Cartesian translation tolerance.",
       "parameter_id": "translation_tol_m",
-      "runtime_mutability": "before_run",
       "type": "float64"
     },
     {
@@ -352,7 +348,6 @@
       "default": 0.35,
       "description": "Velocity scale shared by the two planned motions.",
       "parameter_id": "velocity_scale",
-      "runtime_mutability": "before_run",
       "type": "float64"
     }
   ],

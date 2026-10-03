@@ -2217,7 +2217,10 @@ RetainedBundleConstructionAuthority::construct(
 
 } // namespace detail
 
-bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
+namespace {
+
+[[nodiscard]] bool
+derive_retained_bundle_identity(const RetainedBundle &bundle) {
   try {
     const core::RetainedBundleDTO parsed =
         verify_current_retained_bundle_projection(bundle.normalized_root());
@@ -2245,6 +2248,23 @@ bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
   } catch (const std::exception &) {
     return false;
   }
+}
+
+} // namespace
+
+bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
+  constexpr std::uint8_t kVerified = 1U;
+  constexpr std::uint8_t kRejected = 2U;
+  const auto known =
+      bundle.identity_verification_.load(std::memory_order_acquire);
+  if (known != 0U) {
+    return known == kVerified;
+  }
+  // Concurrent first checks may both derive; they reach the same outcome.
+  const bool verified = derive_retained_bundle_identity(bundle);
+  bundle.identity_verification_.store(verified ? kVerified : kRejected,
+                                      std::memory_order_release);
+  return verified;
 }
 
 std::shared_ptr<const RetainedBundle>

@@ -43,7 +43,9 @@ from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
     NativeKernelProgramPort,
     ProductionPortError,
+    ProgramMotionPreviewUnavailableError,
     _owner_failure_message,
+    program_motion_participant,
 )
 
 
@@ -3755,3 +3757,156 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
     )
     assert unresolved.succeeded is False
     assert "carried-object pose projection is unavailable" in unresolved.message
+
+
+def _joint_inputs() -> OwnerNodeInputs:
+    parameters = dict(_motion_inputs().parameters)
+    for name in ("target_reference", "offset_reference", "contact_policy_id"):
+        parameters.pop(name)
+    parameters.update(
+        target_mode="absolute",
+        goal=[
+            {"joint_name": "joint_1", "position_rad": 0.25},
+            {"joint_name": "joint_2", "position_rad": -0.5},
+        ],
+        per_joint_dynamics_limits={"joint_1": {"max_velocity_rad_s": 0.75}},
+    )
+    return OwnerNodeInputs(parameters=parameters)
+
+
+def _contact_pose_inputs() -> OwnerNodeInputs:
+    parameters = dict(_absolute_inputs("motion.move_to_pose", [_BASE]).parameters)
+    parameters.update(
+        contact_policy_id="pick.contact",
+        contact_scene_resource_id="part.7",
+        max_tcp_linear_speed_mps=0.2,
+        planning_profile="quality_bounded",
+        cache_mode="disable",
+    )
+    return OwnerNodeInputs(parameters=parameters)
+
+
+_PREVIEW_VARIANTS = {
+    "joint_goal": ("motion.move_to_joint_target", _joint_inputs, None),
+    "pose_base_frame_with_contact": (
+        "motion.move_to_pose",
+        _contact_pose_inputs,
+        None,
+    ),
+    "cartesian_base_frame": (
+        "motion.follow_cartesian_path",
+        lambda: _absolute_inputs("motion.follow_cartesian_path", [None, _BASE]),
+        None,
+    ),
+    "pose_relative": (
+        "motion.move_to_pose",
+        _motion_inputs,
+        "relative_motion_preview_unsupported",
+    ),
+    "pose_cell_goal_frame": (
+        "motion.move_to_pose",
+        lambda: _absolute_inputs("motion.move_to_pose", [{"kind": "cell_frame"}]),
+        "goal_frame_motion_preview_unsupported",
+    ),
+    "cartesian_other_robot_goal_frame": (
+        "motion.follow_cartesian_path",
+        lambda: _absolute_inputs(
+            "motion.follow_cartesian_path",
+            [{"kind": "target_frame", "target_role": "gripper", "frame_role": "tcp"}] * 2,
+        ),
+        "goal_frame_motion_preview_unsupported",
+    ),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(_PREVIEW_VARIANTS))
+def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None:
+    node_id, inputs_factory, unavailable = _PREVIEW_VARIANTS[variant]
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = inputs_factory()
+    identity = _identity("move-preview")
+
+    port.operations.start(node_id, identity, inputs)
+    executed = transport.submissions[0]
+    executed_payload = executed["participants"][0]["payload"]
+    bound = port._context(identity.program_run_id)  # noqa: SLF001
+    shared = program_motion_participant(
+        node_id,
+        inputs.parameters,
+        targets=bound.targets,
+        contact_grasps=bound.contact_grasps,
+        move_id=executed_payload["move_id"],
+    )
+    # One builder: relative targets, goal frames, contact inputs and limits
+    # are the execution payload itself, not a second translation.
+    assert dict(shared.payload) == executed_payload
+    submissions_before = deepcopy(transport.submissions)
+    controls_before = deepcopy(transport.controls)
+
+    if unavailable is not None:
+        with pytest.raises(ProgramMotionPreviewUnavailableError) as refused:
+            port.motion_preview_intent(identity, node_id, inputs.parameters, request_id="p.1")
+        assert refused.value.reason_code == unavailable
+    else:
+        participant, intent = port.motion_preview_intent(
+            identity, node_id, inputs.parameters, request_id="preview.1"
+        )
+        previewed = intent["participants"][0]
+        assert previewed["payload"]["move_id"] != executed_payload["move_id"]
+        assert {**previewed["payload"], "move_id": None} == {
+            **executed_payload,
+            "move_id": None,
+        }
+        assert participant.target.target_role_id == "arm"
+        assert previewed == {
+            "component_role_id": executed["participants"][0]["component_role_id"],
+            "target_role_id": executed["participants"][0]["target_role_id"],
+            "required_capability_id": "execution.trajectory.execute",
+            "action_span": None,
+            "payload": previewed["payload"],
+        }
+        assert intent["request_context"]["request_id"] == "preview.1"
+        assert {
+            key: value
+            for key, value in intent.items()
+            if key not in {"request_context", "participants"}
+        } == {
+            key: value
+            for key, value in executed.items()
+            if key not in {"request_context", "participants"}
+        }
+    # Preview submitted, controlled and retained nothing.
+    assert transport.submissions == submissions_before
+    assert transport.controls == controls_before
+
+
+def test_node_preview_refuses_unbound_runs_and_non_motion_nodes() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    identity = _identity("move-preview")
+
+    with pytest.raises(ProgramMotionPreviewUnavailableError) as unbound:
+        port.motion_preview_intent(
+            identity, "motion.move_to_pose", _contact_pose_inputs().parameters, request_id="p"
+        )
+    assert unbound.value.reason_code == "program_run_context_unavailable"
+    port.bind(_context())
+    with pytest.raises(ProgramMotionPreviewUnavailableError) as gripper:
+        port.motion_preview_intent(
+            identity, "gripper.command_position", {"target_role": "gripper"}, request_id="p"
+        )
+    assert gripper.value.reason_code == "node_motion_preview_unsupported"
+    # A captured frame naming no Program Binding robot is refused, not guessed.
+    with pytest.raises(ProductionPortError, match="absent from the Program Binding"):
+        port.motion_preview_intent(
+            identity,
+            "motion.move_to_pose",
+            _absolute_inputs(
+                "motion.move_to_pose",
+                [{"kind": "target_frame", "target_role": "ghost", "frame_role": "tcp"}],
+            ).parameters,
+            request_id="p",
+        )
+    assert transport.submissions == []

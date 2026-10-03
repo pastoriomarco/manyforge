@@ -251,18 +251,7 @@ def _node_policy_arguments(
 ) -> dict:
     return {
         "instance_id": instance_id,
-        "modification_policy": {
-            "runtime_override": "human_approval",
-            "persistent_edit": "human_approval",
-            "intervention_delegate": "human_only",
-        },
-        "recovery_policy": {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 2,
-            "allowed_skills": [],
-            "persistence_ceiling": "draft_patch",
-        },
+        "recovery_policy": {"allow_intervention": True, "max_retries": 2},
         "operator_stop_policy": "hold",
     }
 
@@ -1147,18 +1136,8 @@ def test_node_policy_mutation_round_trips_nondefaults_and_reidentifies() -> None
     assert result.snapshot["draft_revision"] == 2
     assert result.snapshot["program_revision"] != original.program_revision
     assert node["instance_id"] == "move_to_pick"
-    assert node["modification_policy"] == {
-        "runtime_override": "human_approval",
-        "persistent_edit": "human_approval",
-        "intervention_delegate": "human_only",
-    }
-    assert node["recovery_policy"] == {
-        "allow_intervention": True,
-        "allowed_recovery_actions": ["intervention"],
-        "max_retries": 2,
-        "allowed_skills": [],
-        "persistence_ceiling": "draft_patch",
-    }
+    assert "modification_policy" not in node
+    assert node["recovery_policy"] == {"allow_intervention": True, "max_retries": 2}
     assert node["operator_stop_policy"] == "hold"
     assert Program.from_dict(
         result.snapshot["program"],
@@ -1205,22 +1184,21 @@ def test_node_execution_groups_use_existing_draft_policy_validation() -> None:
         ) == groups
 
 
-def test_node_policy_rejects_unavailable_skills_atomically() -> None:
-    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+def test_node_policy_zero_retries_is_unlimited_and_not_implicit_intervention() -> None:
+    session = ComposerDraftSession(_program())
     arguments = _node_policy_arguments(session)
-    arguments["recovery_policy"]["allowed_skills"] = ["inspect"]
-    before = deepcopy(session.workspace_snapshot())
+    arguments["recovery_policy"] = {"allow_intervention": True, "max_retries": 0}
+    node = _mutate(session, "program_draft_update_node_policies", arguments).snapshot[
+        "program"
+    ]["tree"]["children"][0]
+    # Zero is Unlimited, an authored non-default because intervention is on.
+    assert node["recovery_policy"] == {"allow_intervention": True, "max_retries": 0}
 
-    with pytest.raises(DraftSessionError) as failed:
-        _mutate(session, "program_draft_update_node_policies", arguments)
-
-    assert failed.value.status_code == 409
-    assert failed.value.code == "composer_policy_skill_referent_unavailable"
-    assert str(failed.value) == (
-        "Allowed recovery skills are unavailable: each skill requires an "
-        "exact revision-qualified retained referent. Leave Allowed skills empty."
-    )
-    assert session.workspace_snapshot() == before
+    arguments["recovery_policy"] = {"allow_intervention": False, "max_retries": 255}
+    node = _mutate(session, "program_draft_update_node_policies", arguments).snapshot[
+        "program"
+    ]["tree"]["children"][0]
+    assert node["recovery_policy"] == {"allow_intervention": False, "max_retries": 255}
 
 
 def test_node_policy_instance_id_uses_the_128_byte_portable_bound() -> None:
@@ -1256,18 +1234,7 @@ def test_node_policy_explicit_defaults_normalize_to_omission_identity() -> None:
     original = _program()
     session = ComposerDraftSession(original)
     arguments = _node_policy_arguments(session)
-    arguments["modification_policy"] = {
-        "runtime_override": "forbidden",
-        "persistent_edit": "forbidden",
-        "intervention_delegate": "forbidden",
-    }
-    arguments["recovery_policy"] = {
-        "allow_intervention": False,
-        "allowed_recovery_actions": [],
-        "max_retries": 0,
-        "allowed_skills": [],
-        "persistence_ceiling": "session_only",
-    }
+    arguments["recovery_policy"] = {"allow_intervention": False, "max_retries": 0}
     arguments["operator_stop_policy"] = "inherit"
 
     result = _mutate(session, "program_draft_update_node_policies", arguments)
@@ -1286,18 +1253,7 @@ def test_node_policy_noop_is_allowed_at_revision_exhaustion() -> None:
     session = ComposerDraftSession(_program())
     session._revision = 9_007_199_254_740_991
     arguments = _node_policy_arguments(session)
-    arguments["modification_policy"] = {
-        "runtime_override": "forbidden",
-        "persistent_edit": "forbidden",
-        "intervention_delegate": "forbidden",
-    }
-    arguments["recovery_policy"] = {
-        "allow_intervention": False,
-        "allowed_recovery_actions": [],
-        "max_retries": 0,
-        "allowed_skills": [],
-        "persistence_ceiling": "session_only",
-    }
+    arguments["recovery_policy"] = {"allow_intervention": False, "max_retries": 0}
     arguments["operator_stop_policy"] = "inherit"
     before = deepcopy(session.snapshot())
 
@@ -1366,10 +1322,12 @@ def test_node_policy_mutation_uses_the_draft_fence_and_instance_identity_atomica
 @pytest.mark.parametrize(
     "change",
     [
-        lambda args: args.update({"modification_policy": None}),
         lambda args: args["recovery_policy"].pop("max_retries"),
         lambda args: args["recovery_policy"].update({"unexpected": 1}),
-        lambda args: args["modification_policy"].update({"runtime_override": "pause"}),
+        lambda args: args["recovery_policy"].update({"max_retries": -1}),
+        lambda args: args["recovery_policy"].update({"max_retries": 256}),
+        lambda args: args["recovery_policy"].update({"max_retries": True}),
+        lambda args: args["recovery_policy"].update({"allow_intervention": 1}),
         lambda args: args.update({"operator_stop_policy": "pause"}),
     ],
 )
@@ -1384,7 +1342,30 @@ def test_node_policy_mutation_rejects_closed_schema_values(change) -> None:
     assert session.workspace_snapshot() == before
 
 
-def test_node_policy_cross_field_failure_preserves_saved_applied_and_revisions() -> None:
+@pytest.mark.parametrize(
+    "removed",
+    [
+        lambda args: args.update(
+            {
+                "modification_policy": {
+                    "runtime_override": "forbidden",
+                    "persistent_edit": "forbidden",
+                    "intervention_delegate": "forbidden",
+                }
+            }
+        ),
+        lambda args: args["recovery_policy"].update(
+            {"allowed_recovery_actions": ["intervention"]}
+        ),
+        lambda args: args["recovery_policy"].update({"allowed_skills": []}),
+        lambda args: args["recovery_policy"].update(
+            {"persistence_ceiling": "session_only"}
+        ),
+    ],
+)
+def test_node_policy_refuses_removed_policy_fields_preserving_saved_and_applied(
+    removed,
+) -> None:
     session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
     before = deepcopy(
         session.workspace_snapshot(
@@ -1392,17 +1373,12 @@ def test_node_policy_cross_field_failure_preserves_saved_applied_and_revisions()
         )
     )
     arguments = _node_policy_arguments(session)
-    arguments["modification_policy"]["runtime_override"] = "forbidden"
-    arguments["recovery_policy"]["allowed_recovery_actions"] = ["runtime_override"]
-    arguments["recovery_policy"]["allow_intervention"] = False
-    arguments["recovery_policy"]["max_retries"] = 0
-    arguments["recovery_policy"]["allowed_skills"] = []
-    arguments["recovery_policy"]["persistence_ceiling"] = "session_only"
+    removed(arguments)
 
     with pytest.raises(DraftSessionError) as failed:
         _mutate(session, "program_draft_update_node_policies", arguments)
 
-    assert failed.value.code == "composer_draft_validation_failed"
+    assert failed.value.code == "draft_arguments_invalid"
     assert session.workspace_snapshot(
         applied_program_revision=before["draft"]["programRevision"],
     ) == before
@@ -2260,7 +2236,6 @@ def test_duplicate_declaration_identity_is_rejected_without_last_write_wins() ->
         "type": "float64",
         "default": 0.5,
         "constraints": {},
-        "runtime_mutability": "before_run",
     }
 
     with pytest.raises(DraftSessionError) as duplicate:
@@ -2308,7 +2283,6 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
                     "type": "int64",
                     "default": 2,
                     "constraints": {"min_inclusive": 1},
-                    "runtime_mutability": "before_run",
                 }
             ]
         },

@@ -402,7 +402,6 @@
 }
 
 .robot-control-move-to,
-.robot-control-stored-move,
 .robot-control-pose-note {
   grid-column: 1 / -1;
 }
@@ -511,34 +510,6 @@
   width: 100%;
   min-width: 0;
   padding: 0.35rem 0.5rem;
-}
-
-.robot-control-stored-move {
-  display: grid;
-  gap: 0.4rem;
-  margin-top: 0.55rem;
-  padding: 0.55rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-lg);
-}
-
-.robot-control-stored-move > legend {
-  padding: 0 0.25rem;
-  color: var(--mf-text-neutral-78);
-  font-size: var(--inspector-label-font-size);
-}
-
-.robot-control-stored-move > label {
-  display: grid;
-  gap: 0.25rem;
-  color: var(--mf-text-neutral-64b);
-  font-size: var(--inspector-label-font-size);
-}
-
-.robot-control-stored-actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.35rem;
 }
 
 .robot-control-preview-actions {

@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     from .draft_session import ComposerDraftSession
 
 
-SNAPSHOT_API_VERSION = "manyforge.composer_authoring_workspace_snapshot.v1"
+SNAPSHOT_API_VERSION = "manyforge.composer_authoring_workspace_snapshot.v2"
 
 # One JavaScript-safe integer ceiling (2**53 - 1), shared with the Program
 # Draft revision. Exhaustion fails closed; it never wraps and never restarts
@@ -74,7 +74,6 @@ _PROJECT_FACT_FIELDS = (
     "source_diagnostics",
     "source_document_digest",
     "program_role_assignment",
-    "typed_parameter_overrides",
     "source_program_digest",
     "source_deployment_digest",
 )
@@ -149,8 +148,8 @@ def scenario_project_facts(
     """
 
     if document is None:
-        # Forgetting the loaded document clears its identity, digests,
-        # assignment and overrides. The selected project path is a project
+        # Forgetting the loaded document clears its identity, digests and
+        # assignment. The selected project path is a project
         # selection rather than document content, so it is retained unless the
         # caller supplies a replacement path.
         return {
@@ -161,7 +160,6 @@ def scenario_project_facts(
             "source_diagnostics": [],
             "source_document_digest": None,
             "program_role_assignment": None,
-            "typed_parameter_overrides": {},
             "source_program_digest": None,
             "source_deployment_digest": None,
         }
@@ -173,9 +171,6 @@ def scenario_project_facts(
         "source_diagnostics": deepcopy(source_diagnostics or []),
         "source_document_digest": source_document_digest,
         "program_role_assignment": deepcopy(document.get("program_role_assignment")),
-        "typed_parameter_overrides": deepcopy(
-            document.get("typed_parameter_overrides", {})
-        ),
         "source_program_digest": canonical_digest(
             {"value": document.get("program_draft")}
         ),
@@ -336,7 +331,6 @@ class AuthoringWorkspace:
         self._source_diagnostics: list[dict[str, str]] = []
         self._source_document_digest: str | None = None
         self._program_role_assignment: dict[str, Any] | None = None
-        self._typed_parameter_overrides: dict[str, Any] = {}
         self._source_program_digest: str | None = None
         self._source_deployment_digest: str | None = None
 
@@ -809,7 +803,6 @@ class AuthoringWorkspace:
             "source_diagnostics": deepcopy(self._source_diagnostics),
             "source_document_digest": self._source_document_digest,
             "program_role_assignment": deepcopy(self._program_role_assignment),
-            "typed_parameter_overrides": deepcopy(self._typed_parameter_overrides),
             "source_program_digest": self._source_program_digest,
             "source_deployment_digest": self._source_deployment_digest,
         }
@@ -849,9 +842,6 @@ class AuthoringWorkspace:
         self._source_diagnostics = deepcopy(facts["source_diagnostics"])
         self._source_document_digest = facts["source_document_digest"]
         self._program_role_assignment = deepcopy(facts["program_role_assignment"])
-        self._typed_parameter_overrides = deepcopy(
-            facts["typed_parameter_overrides"]
-        )
         self._source_program_digest = facts["source_program_digest"]
         self._source_deployment_digest = facts["source_deployment_digest"]
 

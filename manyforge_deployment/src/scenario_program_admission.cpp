@@ -4,8 +4,6 @@
 #include <manyforge_core/types/program_contract.hpp>
 
 #include <algorithm>
-#include <cmath>
-#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -120,117 +118,6 @@ namespace {
   return result;
 }
 
-[[nodiscard]] double Number(const CanonicalValue &value,
-                            const std::string &path) {
-  const auto *number = std::get_if<double>(&value.storage());
-  if (number == nullptr || !std::isfinite(*number))
-    Fail(path + " must be a finite number");
-  return *number;
-}
-
-[[nodiscard]] std::size_t Utf8Length(std::string_view value) noexcept {
-  return static_cast<std::size_t>(
-      std::count_if(value.begin(), value.end(), [](const unsigned char item) {
-        return (item & 0xc0U) != 0x80U;
-      }));
-}
-
-void ValidateOverride(const CanonicalValue &value,
-                      const CanonicalValue &declaration,
-                      const std::set<std::string, std::less<>> &resources,
-                      const std::string &path) {
-  const auto &type = Text(Member(declaration, "type", path), path + ".type");
-  if (type == "bool") {
-    if (std::get_if<bool>(&value.storage()) == nullptr)
-      Fail(path + " does not match bool");
-  } else if (type == "float64") {
-    static_cast<void>(Number(value, path));
-  } else if (type == "int64") {
-    const auto number = Number(value, path);
-    if (std::trunc(number) != number || std::abs(number) > 9007199254740991.0)
-      Fail(path + " does not match int64");
-  } else if (type == "scene_resource" || type == "string") {
-    const auto &text = Text(value, path);
-    if (text.empty() || (type == "scene_resource" && !resources.contains(text)))
-      Fail(path + " does not match " + type);
-  } else if (type == "string_list") {
-    for (const auto &item : Array(value, path))
-      static_cast<void>(Text(item, path));
-  } else if (type == "cartesian_path") {
-    const auto &items = Array(value, path);
-    if (items.size() < 2U)
-      Fail(path + " does not match cartesian_path");
-    for (const auto &item : items)
-      static_cast<void>(Object(item, path));
-  } else if (type == "coordinate_position" || type == "model_response" ||
-             type == "pick_planning_result" ||
-             type == "scene_selection_context" ||
-             type == "scene_selection_result" || type == "stored_pose") {
-    static_cast<void>(Object(value, path));
-  } else {
-    Fail(path + " has an unsupported Program parameter type");
-  }
-
-  const auto *constraints = declaration.find_object_member("constraints");
-  if (constraints == nullptr)
-    return;
-  if (type == "float64" || type == "int64") {
-    const auto number = Number(value, path);
-    for (const auto &[name, bound_value] : Object(*constraints, path + ".constraints")) {
-      const auto bound = Number(bound_value, path + ".constraints." + name);
-      const bool valid = (name == "min_inclusive" && number >= bound) ||
-                         (name == "min_exclusive" && number > bound) ||
-                         (name == "max_inclusive" && number <= bound) ||
-                         (name == "max_exclusive" && number < bound);
-      if (!valid)
-        Fail(path + " violates " + name);
-    }
-  } else if (type == "string" || type == "string_list") {
-    const auto length = type == "string" ? Utf8Length(Text(value, path))
-                                           : Array(value, path).size();
-    for (const auto &[name, bound_value] : Object(*constraints, path + ".constraints")) {
-      const auto bound = Number(bound_value, path + ".constraints." + name);
-      const bool valid =
-          (name == "min_length" && static_cast<double>(length) >= bound) ||
-          (name == "max_length" && static_cast<double>(length) <= bound);
-      if (!valid)
-        Fail(path + " violates " + name);
-    }
-  }
-}
-
-void ValidateOverrides(const CanonicalValue &program,
-                       const CanonicalValue &overrides) {
-  std::set<std::string, std::less<>> resources;
-  if (const auto *scene = program.find_object_member("scene"); scene != nullptr)
-    for (const auto &resource : Array(*scene, "Program.scene"))
-      resources.emplace(IdentifierValue(
-          Member(resource, "scene_resource_id", "Program.scene[]"),
-          "Program.scene[].scene_resource_id"));
-
-  std::map<std::string, const CanonicalValue *, std::less<>> declarations;
-  if (const auto *parameters = program.find_object_member("parameters");
-      parameters != nullptr)
-    for (const auto &declaration : Array(*parameters, "Program.parameters")) {
-      const auto id = IdentifierValue(
-          Member(declaration, "parameter_id", "Program.parameters[]"),
-          "Program.parameters[].parameter_id");
-      if (!declarations.emplace(id, &declaration).second)
-        Fail("Program parameters contain a duplicate identifier");
-    }
-
-  for (const auto &[id, value] : Object(overrides, "typed_parameter_overrides")) {
-    const auto found = declarations.find(id);
-    if (found == declarations.end())
-      Fail("typed_parameter_overrides selects an undeclared Program parameter");
-    if (Text(Member(*found->second, "runtime_mutability", "Program parameter"),
-             "Program parameter.runtime_mutability") == "immutable")
-      Fail("typed_parameter_overrides selects an immutable Program parameter");
-    ValidateOverride(value, *found->second, resources,
-                     "typed_parameter_overrides." + id);
-  }
-}
-
 } // namespace
 
 ScenarioDeploymentCompatibilityDTO scenario_deployment_compatibility(
@@ -250,8 +137,7 @@ ScenarioDeploymentCompatibilityDTO scenario_deployment_compatibility(
 void verify_scenario_program_admission(
     const CanonicalValue &program, const core::RetainedBundleDTO &bundle,
     const ScenarioDeploymentCompatibilityDTO &deployment_compatibility,
-    const ScenarioAssistantMode assistant_mode,
-    const CanonicalValue &typed_parameter_overrides) {
+    const ScenarioAssistantMode assistant_mode) {
   CanonicalValue::Array provides;
   for (const auto &item : deployment_compatibility.provides)
     provides.emplace_back(item);
@@ -303,7 +189,6 @@ void verify_scenario_program_admission(
   if (assistant_mode == ScenarioAssistantMode::kOptional &&
       program_assistant != "optional")
     Fail("optional scenario assistant mode requires an optional Program");
-  ValidateOverrides(program, typed_parameter_overrides);
 }
 
 } // namespace manyforge::deployment

@@ -19,6 +19,29 @@ import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
+import {
+  ACTIVATION_SCOPE_CHANGED,
+  deploymentActivationScope,
+  sameActivationScope,
+  type DeploymentActivationScope,
+} from '../state/activationScope';
+
+/** The exact Deployment Draft content a caller acts on (a confirmed Apply). */
+export interface ExpectedDeploymentDraft {
+  draftId: string;
+  draftRevision: number;
+}
+
+/**
+ * The installed Deployment Draft is not the content the caller confirmed:
+ * nothing was sent.
+ */
+export class DeploymentDraftChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeploymentDraftChangedError';
+  }
+}
 
 function requestId(): string {
   return `composer-deployment.${globalThis.crypto?.randomUUID?.()
@@ -41,9 +64,17 @@ export function useDeploymentWorkspace(
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
+  /** The shared Reset/Apply correlation the accepted Apply carries, if any. */
+  const [acceptedApplyCorrelationId, setAcceptedApplyCorrelationId] = useState<string | null>(null);
   const [pendingApplyConfirmation, setPendingApplyConfirmation] = useState<
     DeploymentCandidateOperationResponse | null
   >(null);
+  // What the disruptive-impact confirmation must carry to its Apply: the
+  // shared correlation and the exact activation scope the first Apply sent.
+  const pendingConfirmationContext = useRef<{
+    correlationId: string | undefined;
+    scope: DeploymentActivationScope | null;
+  } | null>(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
   const refreshSequence = useRef(0);
@@ -89,19 +120,28 @@ export function useDeploymentWorkspace(
     return () => { mounted.current = false; };
   }, [enabled, refresh]);
 
-  const mutationUnavailableReason = !enabled
+  // A Draft edit (and Discard) only changes the Draft: it is also admitted
+  // while a held run has all motion stopped, and it consumes no admission
+  // generation. Every other action (Open, Save, Revert, the ordinary Apply)
+  // requires Idle and waits for the generation its claim consumed.
+  const unavailableBefore = !enabled
     ? 'Deployment authoring requires the configured headless product.'
     : snapshot === null
       ? 'Backend status is disconnected or has not arrived.'
-      : completedAdmission?.receiverEpoch === snapshot.receiverEpoch
-          && snapshot.authoringAdmission.admissionGeneration <= completedAdmission.generation
-          ? 'Waiting for updated backend authoring permissions.'
-          : authoring.unavailableReason
-            ?? (workspace === null
-              ? 'Deployment workspace is not loaded.'
-              : null);
+      : null;
+  const mutationUnavailableReason = unavailableBefore
+    ?? authoring.editUnavailableReason
+    ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
   const mutationAvailable = mutationUnavailableReason === null;
+  const documentUnavailableReason = unavailableBefore
+    ?? (completedAdmission?.receiverEpoch === snapshot!.receiverEpoch
+      && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
+      ? 'Waiting for updated backend authoring permissions.'
+      : authoring.unavailableReason
+        ?? (workspace === null ? 'Deployment workspace is not loaded.' : null));
   const published = authoring.published;
+  /** The complete activation input of the installed publication. */
+  const activationScope = useMemo(() => deploymentActivationScope(published), [published]);
 
   useEffect(() => {
     if (workspace === null || published === null) return;
@@ -123,30 +163,42 @@ export function useDeploymentWorkspace(
     setWorkspace(merged);
   }, [published, workspace]);
 
-  const fence = useCallback((): LocalWorkspaceFenceRequest | null => {
+  const fence = useCallback((
+    kind: 'edit' | 'document',
+    expected?: ExpectedDeploymentDraft,
+  ): LocalWorkspaceFenceRequest | null => {
     if (
-      !mutationAvailable
+      (kind === 'edit' ? mutationUnavailableReason : documentUnavailableReason) !== null
       || snapshot === null
       || published === null
       || workspace === null
     ) return null;
+    if (expected !== undefined && (
+      published.identity.deploymentDraftId !== expected.draftId
+      || published.identity.deploymentDraftRevision !== expected.draftRevision
+    )) {
+      throw new DeploymentDraftChangedError(
+        `The Deployment Draft changed (revision ${published.identity.deploymentDraftRevision}, expected ${expected.draftRevision}).`,
+      );
+    }
     return programLocalFence(
       published,
       snapshot,
       ownerEpoch.current,
       requestId(),
     );
-  }, [mutationAvailable, published, snapshot, workspace]);
+  }, [documentUnavailableReason, mutationUnavailableReason, published, snapshot, workspace]);
 
   const run = useCallback(async (
     operation: (requestFence: LocalWorkspaceFenceRequest) => Promise<DeploymentWorkspaceResponse>,
     message: string,
+    kind: 'edit' | 'document',
     action?: 'discard',
   ) => {
     if (action && deploymentActionUnavailableReason(workspace, action, mutationUnavailableReason) !== null) return null;
-    const requestFence = fence();
+    const requestFence = fence(kind);
     if (requestFence === null || snapshot === null || inFlight.current) return null;
-    if (!authoring.beginMutation()) return null;
+    if (!authoring.beginMutation(kind)) return null;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -156,11 +208,14 @@ export function useDeploymentWorkspace(
       authoring.finishMutation();
       if (mounted.current) {
         // The HTTP post-image can arrive before the shared status stream.
-        // Never submit the next edit with the just-consumed admission fence.
-        setCompletedAdmission({
-          receiverEpoch: snapshot.receiverEpoch,
-          generation: requestFence.expectedAdmissionGeneration,
-        });
+        // Never submit the next claimed action with the just-consumed
+        // admission fence (a Draft edit takes no claim and consumes none).
+        if (kind === 'document') {
+          setCompletedAdmission({
+            receiverEpoch: snapshot.receiverEpoch,
+            generation: requestFence.expectedAdmissionGeneration,
+          });
+        }
         // A read that started before this mutation may still be in flight and
         // must not replace the newer owner-issued post-image when it arrives.
         refreshSequence.current += 1;
@@ -192,13 +247,22 @@ export function useDeploymentWorkspace(
   const runApply = useCallback(async (
     operation: (
       requestFence: LocalWorkspaceFenceRequest,
+      scope: DeploymentActivationScope | null,
     ) => Promise<DeploymentCandidateOperationResponse>,
     message: string,
     action: 'apply' | 'revert' = 'apply',
+    expected?: ExpectedDeploymentDraft,
+    /** The activation scope the operator confirmed; it must be unchanged. */
+    expectedScope?: DeploymentActivationScope | null,
+    correlationId?: string,
   ) => {
-    if (deploymentActionUnavailableReason(workspace, action, mutationUnavailableReason) !== null) return null;
-    const requestFence = fence();
+    if (deploymentActionUnavailableReason(workspace, action, documentUnavailableReason) !== null) return null;
+    const requestFence = fence('document', expected);
     if (requestFence === null || snapshot === null || inFlight.current) return null;
+    if (expectedScope != null && !sameActivationScope(expectedScope, activationScope)) {
+      throw new DeploymentDraftChangedError(ACTIVATION_SCOPE_CHANGED);
+    }
+    const scope = expectedScope ?? activationScope;
     if (!authoring.beginMutation()) return null;
     inFlight.current = true;
     setBusy(true);
@@ -206,7 +270,7 @@ export function useDeploymentWorkspace(
     setError(null);
     setFeedback(null);
     try {
-      const response = await operation(requestFence);
+      const response = await operation(requestFence, scope);
       const accepted = response.result.status === 'accepted' ? response.result.managerApply : null;
       authoring.finishMutation(accepted === null ? null : {
         applyId: accepted.applyId, applyGeneration: accepted.applyGeneration,
@@ -219,9 +283,11 @@ export function useDeploymentWorkspace(
         refreshSequence.current += 1;
         setWorkspace(response.workspace);
         if (response.result.status === 'confirmation_required') {
+          pendingConfirmationContext.current = { correlationId, scope };
           setPendingApplyConfirmation(response);
           setFeedback(null);
         } else {
+          pendingConfirmationContext.current = null;
           setPendingApplyConfirmation(null);
           const managerApply = response.result.managerApply;
           if (response.result.status === 'accepted' && managerApply !== null) {
@@ -229,6 +295,7 @@ export function useDeploymentWorkspace(
               applyId: managerApply.applyId,
               applyGeneration: managerApply.applyGeneration,
             });
+            setAcceptedApplyCorrelationId(correlationId ?? null);
           }
           setFeedback(
             response.result.status === 'accepted'
@@ -248,6 +315,7 @@ export function useDeploymentWorkspace(
       // A terminal request failure must return the UI to the ordinary Apply
       // action instead of leaving a disabled confirmation overlay behind.
       if (mounted.current) setPendingApplyConfirmation(null);
+      pendingConfirmationContext.current = null;
       const refusal = authoringRefusalMessage(reason);
       if (refusal !== null) {
         if (mounted.current) setFeedback(refusal);
@@ -265,7 +333,7 @@ export function useDeploymentWorkspace(
       if (mounted.current) setBusy(false);
       if (mounted.current) setApplying(false);
     }
-  }, [authoring, fence, refresh, snapshot, workspace, mutationUnavailableReason]);
+  }, [activationScope, authoring, documentUnavailableReason, fence, refresh, snapshot, workspace]);
 
   const actions = useMemo(() => ({
     open: (path: string, confirmDiscard: boolean) => run(
@@ -273,6 +341,7 @@ export function useDeploymentWorkspace(
         requestFence, path, confirmDiscard,
       ),
       'Deployment opened as Draft; Manager Applied was unchanged.',
+      'document',
     ),
     mutate: (
       path: Array<string | number>,
@@ -283,12 +352,14 @@ export function useDeploymentWorkspace(
         requestFence, path, operation, value,
       ),
       'Deployment Draft updated; Manager Applied was unchanged.',
+      'edit',
     ),
     updateControlledStop: (update: DeploymentControlledStopUpdate) => run(
       (requestFence) => api.deploymentWorkspace.updateControlledStop(
         requestFence, update,
       ),
       'Controlled Stop Draft updated atomically; Manager Applied was unchanged.',
+      'edit',
     ),
     updateMotionTargetLimit: (
       controllableComponentId: string,
@@ -302,20 +373,24 @@ export function useDeploymentWorkspace(
         maximumTcpLinearSpeedMps,
       ),
       'Target maximum TCP speed updated in Draft; Manager Applied was unchanged.',
+      'edit',
     ),
     save: () => run(
       (requestFence) => api.deploymentWorkspace.save(requestFence),
       'Deployment Draft saved; Manager Applied was unchanged.',
+      'document',
     ),
     saveAs: (path: string, confirmOverwrite: boolean) => run(
       (requestFence) => api.deploymentWorkspace.saveAs(
         requestFence, path, confirmOverwrite,
       ),
       'Deployment Draft saved to the selected path; Manager Applied was unchanged.',
+      'document',
     ),
     discard: () => run(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
+      'edit',
       'discard',
     ),
     revert: () => runApply(
@@ -323,16 +398,36 @@ export function useDeploymentWorkspace(
       'Saved Deployment was already current in Manager.',
       'revert',
     ),
-    applyDraft: () => {
-      if (!mutationAvailable || inFlight.current) return Promise.resolve(null);
+    /**
+     * The ordinary Apply (Idle only; with a run, the Apply-after-Reset chain
+     * calls this once the run has ended). With `expectedDraft`, only exactly
+     * that Draft is Applied; otherwise it rejects with
+     * `DeploymentDraftChangedError` before anything is sent.
+     */
+    applyDraft: (
+      options: {
+        correlationId?: string;
+        expectedDraft?: ExpectedDeploymentDraft;
+        /** The complete activation input the operator confirmed. */
+        expectedScope?: DeploymentActivationScope | null;
+      } = {},
+    ) => {
+      if (documentUnavailableReason !== null || inFlight.current) return Promise.resolve(null);
+      pendingConfirmationContext.current = null;
       setPendingApplyConfirmation(null);
       return runApply(
-        (requestFence) => api.deploymentWorkspace.applyDraft(requestFence),
+        (requestFence, scope) => api.deploymentWorkspace.applyDraft(
+          requestFence, null, undefined, options.correlationId, scope,
+        ),
         'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
+        'apply',
+        options.expectedDraft,
+        options.expectedScope,
+        options.correlationId,
       );
     },
     confirmApply: () => {
-      if (!mutationAvailable || inFlight.current) return Promise.resolve(null);
+      if (documentUnavailableReason !== null || inFlight.current) return Promise.resolve(null);
       const token = pendingApplyConfirmation?.result.confirmationToken ?? null;
       const preparation = pendingApplyConfirmation?.result.preparation ?? null;
       if (token === null || preparation === null) return Promise.resolve(null);
@@ -340,16 +435,27 @@ export function useDeploymentWorkspace(
       // exact token and preparation identity have been captured, close the
       // overlay before dispatching the potentially long-running Apply. The
       // ordinary workspace busy/error state owns progress from this point.
+      // The confirmed impact belongs to the exact input the first Apply sent
+      // and to its shared Reset/Apply correlation: carry both to the Apply.
+      const context = pendingConfirmationContext.current;
+      pendingConfirmationContext.current = null;
       setPendingApplyConfirmation(null);
       return runApply(
-        (requestFence) => api.deploymentWorkspace.applyDraft(
-          requestFence, { token, preparation },
+        (requestFence, scope) => api.deploymentWorkspace.applyDraft(
+          requestFence, { token, preparation }, undefined, context?.correlationId, scope,
         ),
         'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
+        'apply',
+        undefined,
+        context?.scope ?? null,
+        context?.correlationId,
       );
     },
-    cancelApplyConfirmation: () => setPendingApplyConfirmation(null),
-  }), [mutationAvailable, pendingApplyConfirmation, run, runApply]);
+    cancelApplyConfirmation: () => {
+      pendingConfirmationContext.current = null;
+      setPendingApplyConfirmation(null);
+    },
+  }), [documentUnavailableReason, pendingApplyConfirmation, run, runApply]);
 
   return {
     workspace,
@@ -359,9 +465,12 @@ export function useDeploymentWorkspace(
     error,
     feedback,
     acceptedApply,
+    acceptedApplyCorrelationId,
+    activationScope,
     pendingApplyConfirmation,
     mutationAvailable,
     mutationUnavailableReason,
+    documentUnavailableReason,
     refresh,
     clearFeedback: () => setFeedback(null),
     dismissError: () => setError(null),

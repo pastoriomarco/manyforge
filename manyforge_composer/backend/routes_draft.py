@@ -28,7 +28,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from .draft_session import (
     DraftSessionError,
     OPERATOR_DRAFT_MUTATIONS,
-    draft_applicability,
 )
 from .authoring_forest import AuthoringForestError, derive_candidate, from_program
 from .expression_check import ExpressionCheckRefusal, check_draft_expression
@@ -38,6 +37,7 @@ from .node_environment_client import (
     read_active_node_environment,
 )
 from .source_model_client import ActiveSourceModelProjectionError
+from .reset_apply_log import log_reset_apply_link
 from .program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
@@ -60,6 +60,7 @@ from .scenario_artifacts import (
     save_scenario_member,
 )
 from .authoring_workspace_fence import (
+    commit_draft_edit,
     commit_local_authoring,
     require_captured_workspace_identity,
 )
@@ -155,18 +156,17 @@ class _LocalDraftFence(_DraftFence):
     pass
 
 
+# A fixed-input correction links its Draft edit and Apply to the context it
+# recorded before Reset. The correlation is a reference, never a payload or an
+# authority; ordinary edits and Applies omit it.
+_CorrelationField = Field(
+    default=None, alias="correlationId", min_length=1, max_length=256
+)
+
+
 class DraftMutationRequest(_LocalDraftFence):
     mutation: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any]
-
-
-class RuntimeOverrideMaterializationRequest(_LocalDraftFence):
-    program_run_id: str = Field(
-        alias="programRunId", min_length=1, max_length=256
-    )
-    proposal_id: str = Field(
-        alias="proposalId", pattern=r"^sha256:[0-9a-f]{64}$"
-    )
 
 
 class OpenDraftRequest(_LocalDraftFence):
@@ -201,7 +201,7 @@ class SaveDraftAsRequest(_LocalDraftFence):
 
 
 class ApplyDraftRequest(_DraftFence):
-    pass
+    correlation_id: str | None = _CorrelationField
 
 
 class DiscardDraftRequest(_LocalDraftFence):
@@ -245,6 +245,11 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
     raise error
+
+
+def _error_code(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) and code else type(error).__name__
 
 
 def _active_catalog(state: ComposerState):
@@ -1160,27 +1165,16 @@ def _source_resolved_mutation(
     return None
 
 
-def _require_apply_ready(program: Program) -> None:
-    applicability = draft_applicability(program.to_dict())
-    if not applicability["applyReady"]:
-        reason = applicability["unavailableReason"]
-        raise DraftSessionError(
-            reason["code"],
-            reason["message"],
-            status_code=409,
-            detail={
-                "affectedInstanceIds": applicability["affectedInstanceIds"],
-            },
-        )
-
-
 def create_draft_router(state: ComposerState) -> APIRouter:
     """Expose revision-fenced authoring and thin authoritative Apply/Load."""
 
     router = APIRouter()
 
     def prepare_program_activation(
-        body: _DraftFence, program_document: dict[str, Any] | None
+        body: _DraftFence,
+        program_document: dict[str, Any] | None,
+        *,
+        correlation_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Prepare one complete immutable activation for a Program change."""
 
@@ -1223,10 +1217,8 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 "An active Deployment model source changed since Apply",
                 status_code=409,
             )
-        overrides = deepcopy(context["typed_parameter_overrides"])
         if program_document is None:
             assignment = {"component_roles": [], "target_roles": []}
-            overrides = {}
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1236,7 +1228,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "model_source_closure": source_closure,
                     "program": program_document,
                     "program_role_assignment": assignment,
-                    "typed_parameter_overrides": overrides,
                 }
             )
         )
@@ -1251,7 +1242,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             "model_source_closure": source_closure,
             "program": deepcopy(program_document),
             "program_role_assignment": assignment,
-            "typed_parameter_overrides": overrides,
             "expected_manager_current": {
                 "retained_bundle_id": bundle,
                 "graph_revision": graph,
@@ -1261,7 +1251,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32],
-            "correlation_id": body.request_id,
+            # Preserve a correction's shared reference; otherwise the request
+            # is its own correlation.
+            "correlation_id": correlation_id or body.request_id,
             "confirmation_token": None,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
@@ -1363,7 +1355,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
-            commit = commit_local_authoring(
+            commit = commit_draft_edit(
                 state,
                 body,
                 operation_kind="mutate_draft",
@@ -1374,90 +1366,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise_workspace_error(error)
         return {
-            "mutation": prepared.tool_id,
-            "details": thaw_json(prepared.details),
-            "workspace": _workspace(state),
-            "authoringWorkspace": commit.snapshot.as_dict(),
-        }
-
-    @router.post("/api/program/draft/runtime-override-promotions")
-    def materialize_runtime_override(
-        body: RuntimeOverrideMaterializationRequest,
-    ) -> dict[str, Any]:
-        try:
-            if state.headless_client is None:
-                raise DraftSessionError(
-                    "program_runtime_promotion_unavailable",
-                    "runtime promotion requires the current Program Runner",
-                    status_code=503,
-                )
-            try:
-                projection = state.headless_client.program_runtime_controls(
-                    body.program_run_id
-                )
-            except HeadlessClientError as error:
-                raise headless_client_http_exception(error) from error
-            controls = projection.get("runtime_controls")
-            proposals = (
-                controls.get("promotion_proposals")
-                if isinstance(controls, dict)
-                else None
-            )
-            proposal = next(
-                (
-                    row
-                    for row in proposals
-                    if isinstance(row, dict)
-                    and row.get("proposal_id") == body.proposal_id
-                ),
-                None,
-            ) if isinstance(proposals, list) else None
-            if (
-                projection.get("program_run_id") != body.program_run_id
-                or not isinstance(proposal, dict)
-                or proposal.get("status") != "ready"
-                or proposal.get("program_run_id") != body.program_run_id
-                or proposal.get("expected_draft_id") != body.draft_id
-                or proposal.get("expected_draft_revision")
-                != body.expected_draft_revision
-                or not isinstance(proposal.get("node_instance_id"), str)
-                or not isinstance(proposal.get("node_id"), str)
-                or not isinstance(proposal.get("parameter_id"), str)
-                or "value" not in proposal
-            ):
-                raise DraftSessionError(
-                    "program_runtime_promotion_stale",
-                    "runtime promotion no longer names this exact idle Draft",
-                    status_code=409,
-                )
-            arguments = {
-                "instance_id": proposal["node_instance_id"],
-                "expected_node_id": proposal["node_id"],
-                "parameters": {
-                    proposal["parameter_id"]: deepcopy(proposal["value"])
-                },
-                "merge": True,
-            }
-            # Prepare the promoted parameter edit outside every owner lock.
-            prepared = state.draft_session.prepare_mutation(
-                tool_id="tree_draft_update_node_params",
-                arguments=arguments,
-                expected_revision=body.expected_draft_revision,
-                catalog=state.node_catalog,
-                draft_id=body.draft_id,
-            )
-            commit = commit_local_authoring(
-                state,
-                body,
-                operation_kind="materialize_runtime_override",
-                install=lambda: state.draft_session.install_prepared_mutation(
-                    prepared
-                ),
-            )
-        except Exception as error:
-            _raise_workspace_error(error)
-        return {
-            "proposalId": proposal["proposal_id"],
             "mutation": prepared.tool_id,
             "details": thaw_json(prepared.details),
             "workspace": _workspace(state),
@@ -1668,8 +1576,22 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             program = Program.from_dict(
                 document, _active_catalog(state), path="<composer-program-apply>"
             )
-            _require_apply_ready(program)
-            intent, prepared = prepare_program_activation(body, program.to_dict())
+            # Nothing to apply: refused before preparation or admission, so no
+            # effect is possible. An Applied Program that cannot be read now
+            # never proves a no-op.
+            applied_context, _unavailable = _applied_context(state)
+            if (
+                applied_context is not None
+                and applied_context.program_revision == program.program_revision
+            ):
+                raise DraftSessionError(
+                    "program_apply_nothing_to_apply",
+                    "Nothing to apply: the Program Draft already matches Applied",
+                    status_code=409,
+                )
+            intent, prepared = prepare_program_activation(
+                body, program.to_dict(), correlation_id=body.correlation_id
+            )
             coordinator = state.authoring_admission
             if coordinator is None:
                 raise DraftSessionError(
@@ -1704,6 +1626,18 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     intent, claim, apply=True, prepared=prepared
                 ),
             )
+            if body.correlation_id is not None:
+                log_reset_apply_link(
+                    "program_apply",
+                    correlation_id=body.correlation_id,
+                    request_id=body.request_id,
+                    outcome=str(result.get("status")),
+                    apply_id=result.get("apply_id"),
+                    apply_generation=result.get("apply_generation"),
+                    manager_request_id=intent["manager_request_id"],
+                    draft_id=body.draft_id,
+                    draft_revision=body.expected_draft_revision,
+                )
             return JSONResponse(
                 status_code=202 if result["status"] == "accepted" else 200,
                 content={
@@ -1713,6 +1647,16 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 },
             )
         except Exception as error:
+            if body.correlation_id is not None:
+                log_reset_apply_link(
+                    "program_apply",
+                    correlation_id=body.correlation_id,
+                    request_id=body.request_id,
+                    outcome="error",
+                    error_code=_error_code(error),
+                    draft_id=body.draft_id,
+                    draft_revision=body.expected_draft_revision,
+                )
             _raise_workspace_error(error)
 
     @router.post("/api/program/discard")
@@ -1774,7 +1718,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 applied_program, _active_catalog(state)
             )
 
-            def validate_applied_under_claim() -> None:
+            def validate_applied_unchanged() -> None:
                 _program, current_identity = read_applied()
                 if current_identity != applied_identity:
                     raise DraftSessionError(
@@ -1783,11 +1727,11 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
-            commit = commit_local_authoring(
+            commit_draft_edit(
                 state,
                 body,
                 operation_kind="discard_draft",
-                validate_under_claim=validate_applied_under_claim,
+                validate=validate_applied_unchanged,
                 install=lambda: state.draft_session.install_prepared_replacement(
                     prepared,
                     expected_draft_id=body.draft_id,

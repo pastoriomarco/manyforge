@@ -1456,16 +1456,41 @@ class SqliteActiveBundlePublicationStore::Impl final {
     std::lock_guard lock(mutex_);
     RequireOpen();
     Transaction transaction(database_, "BEGIN");
+    // Reading data_version opens this transaction's read snapshot. A commit
+    // through any other connection changes it; a write through this
+    // connection changes its total change count. Only a provably unchanged
+    // database reuses the last complete verification.
+    const auto data_version = ScalarInteger(database_, "PRAGMA data_version");
+    const auto own_total_changes = sqlite3_total_changes64(database_);
+    if (verified_.has_value() && verified_->data_version == data_version &&
+        verified_->own_total_changes == own_total_changes) {
+      auto report = verified_->report;
+      transaction.Commit();
+      return report;
+    }
+    verified_.reset();
     auto report = VerifyIntegrityLocked();
     transaction.Commit();
+    ++complete_verifications_;
+    verified_.emplace(VerifiedIntegrity{data_version, own_total_changes, report});
     return report;
   }
+
+  struct VerifiedIntegrity final {
+    std::int64_t data_version{};
+    sqlite3_int64 own_total_changes{};
+    ActiveBundlePublicationStoreIntegrityReport report;
+  };
 
   std::filesystem::path database_path_;
   core::CellId cell_id_;
   sqlite3* database_{};
   mutable std::mutex mutex_;
   bool closed_{};
+  /// Last complete integrity verification and the change identity it held
+  /// under. Guarded by `mutex_`; discarded before every re-verification.
+  mutable std::optional<VerifiedIntegrity> verified_;
+  mutable std::uint64_t complete_verifications_{};
 };
 
 SqliteActiveBundlePublicationStore::SqliteActiveBundlePublicationStore(
@@ -1509,6 +1534,12 @@ SqliteActiveBundlePublicationStore::ReadActiveBundlePublication(
 ActiveBundlePublicationStoreIntegrityReport
 SqliteActiveBundlePublicationStore::VerifyIntegrity() const {
   return impl_->VerifyIntegrity();
+}
+
+std::uint64_t
+SqliteActiveBundlePublicationStore::complete_verification_count() const {
+  std::lock_guard lock(impl_->mutex_);
+  return impl_->complete_verifications_;
 }
 
 void SqliteActiveBundlePublicationStore::Close() {

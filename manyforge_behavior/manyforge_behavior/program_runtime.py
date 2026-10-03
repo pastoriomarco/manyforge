@@ -16,6 +16,7 @@ from time import monotonic_ns
 import py_trees
 import rfc8785
 
+from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.executable_node_resolver import (
     NodeAdapterBuildContext,
     build_executable_node_resolver,
@@ -32,7 +33,6 @@ from manyforge_behavior.node_environment import NodeEnvironment
 from manyforge_behavior.orchestration_ports import NodeAdapterPorts, NodeAttemptIdentity
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
-    ProgramRuntimeOverrideStore,
     ProgramValueStore,
 )
 from manyforge_behavior.program import (
@@ -50,8 +50,14 @@ from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopState,
 )
 from manyforge_behavior.program_clock import ProgramClock
+from manyforge_behavior.value_path import (
+    ValuePathError,
+    parse_value_path,
+    path_covers,
+    replace_at_path,
+)
 
-PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
+PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v2"
 
 _MOTION_TARGET_NODE_IDS: Final = frozenset(
     {
@@ -64,6 +70,16 @@ _MOTION_TARGET_NODE_IDS: Final = frozenset(
 
 class ProgramRuntimeError(RuntimeError):
     """A Program run cannot be built or advanced truthfully."""
+
+
+class NodeInputProposalError(ValueError):
+    """A proposed node input is foreign, selects captured meaning, or is invalid."""
+
+
+# Parameters that name a captured Program Binding row by value. Required
+# capability parameters and declared blackboard-key parameters are read from
+# the catalog entry itself.
+_BINDING_SELECTION_PARAMETERS: Final = frozenset({"contact_policy_id"})
 
 
 def _require_text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
@@ -285,7 +301,6 @@ class ExecutableProgramRun:
         capture: ProgramRunCapture,
         readiness: NodeExecutionReadiness,
         ports: NodeAdapterPorts,
-        program_parameter_values: Mapping[str, Any] | None = None,
         program_clock: ProgramClock | None = None,
     ) -> None:
         if not isinstance(program, Program):
@@ -352,20 +367,14 @@ class ExecutableProgramRun:
 
         self._value_store = ProgramValueStore.from_program(
             program,
-            parameter_values=program_parameter_values,
             scenario_id=capture.scenario_id,
             register=ports.persistent_keys,
             program_run_id=capture.program_run_id,
-        )
-        self._runtime_overrides = ProgramRuntimeOverrideStore(
-            program=program,
-            catalog=environment.catalog,
         )
         self._input_resolver = NodeAttemptInputResolver(
             program=program,
             catalog=environment.catalog,
             value_store=self._value_store,
-            runtime_overrides=self._runtime_overrides,
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
         self._ports = ports
@@ -494,9 +503,132 @@ class ExecutableProgramRun:
     def value_store(self) -> ProgramValueStore:
         return self._value_store
 
-    @property
-    def runtime_overrides(self) -> ProgramRuntimeOverrideStore:
-        return self._runtime_overrides
+    def preview_node_inputs(
+        self,
+        node_instance_id: str,
+        proposed: Sequence[tuple[str, Any]],
+    ) -> tuple[str, Mapping[str, Any]]:
+        """Resolve one node's inputs as a fresh attempt would, with proposals.
+
+        Effect-free: one atomic read through the run's own input resolver. It
+        mints no attempt, ticks nothing and writes no key. A proposal replaces
+        the value at its parameter value path and shadows any value source at
+        or beneath that path. Proposals cannot select a target, component,
+        capability, contact-grasp binding or blackboard key: those keep the
+        captured meaning. Raises ``NodeInputProposalError`` for a foreign or
+        invalid proposal; a sourced input that cannot be resolved now raises
+        the resolver's own ``ProgramValueError``.
+        """
+
+        pending = [self._program.tree]
+        node: ProgramTreeNode | None = None
+        while pending:
+            candidate = pending.pop()
+            if candidate.instance_id == node_instance_id:
+                node = candidate
+                break
+            pending.extend(candidate.children)
+        if node is None:
+            raise NodeInputProposalError(
+                f"node instance {node_instance_id!r} is not in the captured Program"
+            )
+        catalog = self._environment.catalog
+        entry = catalog.get(node.node_id)
+        declarations = {parameter.id: parameter for parameter in entry.parameters}
+        fixed = set(_BINDING_SELECTION_PARAMETERS)
+        fixed.update(
+            parameter
+            for requirement in entry.required_capabilities
+            for parameter in (
+                requirement.target_parameter,
+                requirement.component_parameter,
+                requirement.when_parameter,
+            )
+            if parameter is not None
+        )
+        fixed.update(
+            binding.key_parameter
+            for binding in (*entry.blackboard_reads, *entry.blackboard_writes)
+        )
+        prefix = f"node[{node.node_id}].parameters."
+
+        def validate(parameter_id: str, value: Any) -> None:
+            issues = validate_value(
+                declarations[parameter_id].schema,
+                value,
+                registry=catalog.schema_registry,
+                path=f"{prefix}{parameter_id}",
+            )
+            if issues:
+                raise NodeInputProposalError(f"{issues[0].path}: {issues[0].message}")
+
+        proposals: list[tuple[str, tuple[Any, ...], Any]] = []
+        for path, value in proposed:
+            try:
+                segments = parse_value_path(path)
+            except ValuePathError as error:
+                raise NodeInputProposalError(
+                    f"proposed input path {path!r} is invalid: {error}"
+                ) from error
+            root = segments[0]
+            if root not in declarations:
+                raise NodeInputProposalError(
+                    f"node {node.node_id!r} has no parameter {root!r}"
+                )
+            if root in fixed:
+                raise NodeInputProposalError(
+                    f"node parameter {root!r} selects captured binding meaning"
+                )
+            if any(
+                path_covers(segments, other) or path_covers(other, segments)
+                for _path, other, _value in proposals
+            ):
+                raise NodeInputProposalError(
+                    f"proposed input path {path!r} overlaps another proposal"
+                )
+            if len(segments) == 1:
+                validate(root, value)
+            proposals.append((path, segments, deepcopy(value)))
+        value_sources = {
+            source_path: source
+            for source_path, source in node.value_sources.items()
+            if not any(
+                path_covers(segments, parse_value_path(source_path))
+                for _path, segments, _value in proposals
+            )
+        }
+        parameters = deepcopy(dict(node.parameters))
+        for _path, segments, value in proposals:
+            if len(segments) == 1:
+                parameters[segments[0]] = deepcopy(value)
+        snapshot = self._input_resolver.snapshot(
+            node_id=node.node_id,
+            node_instance_id=node.instance_id,
+            parameters=parameters,
+            value_sources=value_sources,
+        )
+        resolved = deepcopy(dict(snapshot.parameters))
+        for path, segments, value in proposals:
+            root = segments[0]
+            try:
+                resolved[root] = replace_at_path(resolved.get(root), segments, value)
+            except KeyError as error:
+                raise NodeInputProposalError(
+                    f"proposed input {path!r} names no value of node {node.node_id!r}"
+                ) from error
+        for root in {segments[0] for _path, segments, _value in proposals}:
+            validate(root, resolved[root])
+            key_parameter = catalog.schema_registry.resolve(
+                declarations[root].schema
+            ).value_type_from_key
+            if key_parameter is not None:
+                try:
+                    self._program.validate_key_value(
+                        resolved[key_parameter], resolved[root], path=f"{prefix}{root}"
+                    )
+                except (KeyError, ValueError) as error:
+                    raise NodeInputProposalError(str(error)) from error
+        return node.node_id, MappingProxyType(resolved)
 
     @property
     def status(self) -> py_trees.common.Status:
@@ -536,14 +668,11 @@ class ExecutableProgramRun:
         """Capture local values at the owner transition; no remote reads or I/O."""
         with self._lock:
             blackboard = self._value_store.diagnostic_snapshot()
-            overrides = self._runtime_overrides.diagnostic_snapshot()
             return {
                 "occurred_at_ns": str(monotonic_ns()),
                 "occurred_at_wall": datetime.now(timezone.utc).isoformat(),
                 "blackboard": blackboard["values"],
-                "runtime_overrides": overrides["values"],
                 "omitted_blackboard_count": blackboard["omitted_count"],
-                "omitted_override_count": overrides["omitted_count"],
             }
 
     def reconcile_full_stop_tasks(
@@ -872,6 +1001,7 @@ class ExecutableProgramRun:
 
 __all__ = [
     "ExecutableProgramRun",
+    "NodeInputProposalError",
     "PROGRAM_RUN_CAPTURE_API",
     "ProgramRunAttemptSource",
     "ProgramRunCapture",

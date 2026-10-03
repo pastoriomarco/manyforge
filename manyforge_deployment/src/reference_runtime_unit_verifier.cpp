@@ -213,11 +213,16 @@ std::string reference_runtime_profile_document() {
 }
 
 std::string reference_runtime_profile_revision() {
-  const CanonicalValue root =
-      parse_strict_json_model_yaml(reference_runtime_profile_document()).root();
-  return require_digest(require_object(root, "reference_runtime_profile"),
-                        "runtime_profile_revision",
-                        "reference_runtime_profile");
+  // A pure function of build constants: derive it once per process.
+  static const std::string revision = [] {
+    const CanonicalValue root =
+        parse_strict_json_model_yaml(reference_runtime_profile_document())
+            .root();
+    return require_digest(require_object(root, "reference_runtime_profile"),
+                          "runtime_profile_revision",
+                          "reference_runtime_profile");
+  }();
+  return revision;
 }
 
 const std::string& reference_runtime_launchable_script() {

@@ -53,7 +53,6 @@ void verify_scenario_program_admission(
     const CanonicalValue &normalized_program_root,
     const core::RetainedBundleDTO &retained_bundle,
     const ScenarioDeploymentCompatibilityDTO &deployment_compatibility,
-    ScenarioAssistantMode assistant_mode,
-    const CanonicalValue &typed_parameter_overrides);
+    ScenarioAssistantMode assistant_mode);
 
 } // namespace manyforge::deployment

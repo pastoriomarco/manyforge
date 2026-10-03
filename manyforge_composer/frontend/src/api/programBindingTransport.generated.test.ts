@@ -43,18 +43,7 @@ const fixture = (): Row => {
 function nodePolicy(instance_id = 'root'): Row {
   return {
     instance_id,
-    modification_policy: {
-      runtime_override: 'human_approval',
-      persistent_edit: 'forbidden',
-      intervention_delegate: 'human_only',
-    },
-    recovery_policy: {
-      allow_intervention: false,
-      allowed_recovery_actions: ['runtime_override'],
-      max_retries: 1,
-      allowed_skills: [],
-      persistence_ceiling: 'session_only',
-    },
+    recovery_policy: { allow_intervention: false, max_retries: 1 },
     operator_stop_policy: 'hold',
   };
 }
@@ -78,7 +67,6 @@ function mutate(name: string, value: Row): void {
     component, target, contact, resource, collision, capability, body, provenance,
   } = context(value);
   const policy = rows(value.node_policies)[0];
-  const modification = row(policy.modification_policy);
   const recovery = row(policy.recovery_policy);
   const duplicate = (owner: Row, field: string): void => {
     const values = rows(owner[field]);
@@ -137,16 +125,21 @@ function mutate(name: string, value: Row): void {
     case 'node-policies-missing': delete value.node_policies; break;
     case 'node-policies-wrong-type': value.node_policies = {}; break;
     case 'node-policy-null': value.node_policies = [null]; break;
-    case 'modification-unknown': modification.unknown = true; break;
-    case 'modification-null': policy.modification_policy = null; break;
-    case 'modification-empty': policy.modification_policy = {}; break;
-    case 'modification-partial': delete modification.persistent_edit; break;
-    case 'modification-enum': modification.runtime_override = 'operator_allowed'; break;
+    // Removed policy surfaces are refused, not ignored.
+    case 'removed-modification-policy':
+      policy.modification_policy = {
+        runtime_override: 'forbidden',
+        persistent_edit: 'forbidden',
+        intervention_delegate: 'forbidden',
+      };
+      break;
+    case 'removed-recovery-actions': recovery.allowed_recovery_actions = []; break;
+    case 'removed-skills': recovery.allowed_skills = []; break;
+    case 'removed-persistence-ceiling': recovery.persistence_ceiling = 'session_only'; break;
     case 'recovery-unknown': recovery.unknown = true; break;
     case 'recovery-null': policy.recovery_policy = null; break;
     case 'recovery-empty': policy.recovery_policy = {}; break;
     case 'recovery-partial': delete recovery.max_retries; break;
-    case 'recovery-enum': recovery.persistence_ceiling = 'persistent'; break;
     case 'stop-enum': policy.operator_stop_policy = 'pause'; break;
     case 'stop-null': policy.operator_stop_policy = null; break;
     case 'stop-wrong-type': policy.operator_stop_policy = 1; break;
@@ -154,31 +147,6 @@ function mutate(name: string, value: Row): void {
     case 'retry-bool': recovery.max_retries = true; break;
     case 'retry-low': recovery.max_retries = -1; break;
     case 'retry-high': recovery.max_retries = 256; break;
-    case 'actions-wrong-type': recovery.allowed_recovery_actions = {}; break;
-    case 'actions-bound':
-      recovery.allowed_recovery_actions = ['intervention', 'runtime_override', 'runtime_override'];
-      break;
-    case 'actions-enum': recovery.allowed_recovery_actions = ['unknown']; break;
-    case 'actions-duplicate': recovery.allowed_recovery_actions = ['runtime_override', 'runtime_override']; break;
-    case 'actions-unsorted':
-      modification.runtime_override = 'llm_allowed';
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['runtime_override', 'intervention'];
-      break;
-    case 'skills-wrong-type': recovery.allowed_skills = {}; break;
-    case 'skills-bound': recovery.allowed_skills = Array.from({ length: 257 }, (_, i) => `skill-${i}`); break;
-    case 'skill-upper': recovery.allowed_skills = ['Upper']; break;
-    case 'skill-bytes': recovery.allowed_skills = ['a'.repeat(129)]; break;
-    case 'skills-duplicate':
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['intervention'];
-      recovery.allowed_skills = ['a-skill', 'a-skill'];
-      break;
-    case 'skills-unsorted':
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['intervention'];
-      recovery.allowed_skills = ['z-skill', 'a-skill'];
-      break;
     case 'instance-upper': policy.instance_id = 'Root'; break;
     case 'instance-bytes': policy.instance_id = 'a'.repeat(129); break;
     case 'table-duplicate': value.node_policies = [policy, structuredClone(policy)]; break;
@@ -187,43 +155,9 @@ function mutate(name: string, value: Row): void {
     case 'default-row':
       value.node_policies = [{
         instance_id: 'root',
-        modification_policy: {
-          runtime_override: 'forbidden',
-          persistent_edit: 'forbidden',
-          intervention_delegate: 'forbidden',
-        },
-        recovery_policy: {
-          allow_intervention: false,
-          allowed_recovery_actions: [],
-          max_retries: 0,
-          allowed_skills: [],
-          persistence_ceiling: 'session_only',
-        },
+        recovery_policy: { allow_intervention: false, max_retries: 0 },
         operator_stop_policy: 'inherit',
       }];
-      break;
-    case 'skills-fail-closed':
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['intervention'];
-      recovery.allowed_skills = ['a-skill'];
-      break;
-    case 'allow-action-cross-field': recovery.allow_intervention = true; break;
-    case 'skills-intervention-cross-field': recovery.allowed_skills = ['a-skill']; break;
-    case 'runtime-override-cross-field': modification.runtime_override = 'forbidden'; break;
-    case 'runtime-persistence-cross-field':
-      modification.runtime_override = 'forbidden';
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['intervention'];
-      recovery.persistence_ceiling = 'runtime_override';
-      break;
-    case 'draft-persistence-cross-field':
-      recovery.allow_intervention = true;
-      recovery.allowed_recovery_actions = ['intervention'];
-      recovery.persistence_ceiling = 'draft_patch';
-      break;
-    case 'recovery-requires-action':
-      recovery.allowed_recovery_actions = [];
-      recovery.max_retries = 1;
       break;
     default: throw new Error(`unknown corpus case ${name}`);
   }
@@ -241,20 +175,15 @@ const cases = [
   'body-minimum', 'body-order', 'generated-body-id', 'body-target',
   'body-collision', 'body-model', 'provenance-kind', 'provenance-order',
   'node-policies-missing', 'node-policies-wrong-type', 'node-policy-null',
-  'modification-unknown', 'modification-null', 'modification-empty',
-  'modification-partial',
-  'modification-enum', 'recovery-unknown', 'recovery-null', 'recovery-empty',
-  'recovery-partial', 'recovery-enum', 'stop-enum', 'allow-intervention-type',
+  'removed-modification-policy', 'removed-recovery-actions', 'removed-skills',
+  'removed-persistence-ceiling',
+  'recovery-unknown', 'recovery-null', 'recovery-empty',
+  'recovery-partial', 'stop-enum', 'allow-intervention-type',
   'retry-bool',
   'stop-null', 'stop-wrong-type',
-  'retry-low', 'retry-high', 'actions-wrong-type', 'actions-bound',
-  'actions-enum', 'actions-duplicate', 'actions-unsorted', 'skills-wrong-type',
-  'skills-bound', 'skill-upper', 'skill-bytes', 'skills-duplicate',
-  'skills-unsorted', 'instance-upper', 'instance-bytes', 'table-duplicate',
-  'table-unsorted', 'table-bound', 'default-row', 'skills-fail-closed',
-  'allow-action-cross-field', 'skills-intervention-cross-field',
-  'runtime-override-cross-field', 'runtime-persistence-cross-field',
-  'draft-persistence-cross-field', 'recovery-requires-action',
+  'retry-low', 'retry-high',
+  'instance-upper', 'instance-bytes', 'table-duplicate',
+  'table-unsorted', 'table-bound', 'default-row',
 ];
 
 describe('generated Program Binding transport parser', () => {

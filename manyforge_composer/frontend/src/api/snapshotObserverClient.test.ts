@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { parseSnapshotObserverRequest } from './snapshotObserverClient';
+import {
+  parseSnapshotObserverRequest,
+  subscribeSnapshotObserver,
+} from './snapshotObserverClient';
 
 function request(): Record<string, unknown> {
   return {
@@ -35,5 +38,47 @@ describe('snapshot observer wire', () => {
       mutate(invalid);
       expect(() => parseSnapshotObserverRequest(invalid)).toThrow();
     }
+  });
+});
+
+describe('snapshot observer reconnect', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('backs off while another workbench holds the single observer binding', () => {
+    vi.useFakeTimers();
+    const sockets: Array<{ onclose: ((event: { code: number }) => void) | null }> = [];
+    class FakeSocket {
+      onmessage = null;
+      onclose: ((event: { code: number }) => void) | null = null;
+      constructor() { sockets.push(this); }
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeSocket);
+    vi.stubGlobal('window', { location: { href: 'http://composer.test/' } });
+    const unsubscribe = subscribeSnapshotObserver(() => undefined);
+    const closeLatest = (code: number) => sockets.at(-1)!.onclose?.({ code });
+
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const before = sockets.length;
+      closeLatest(1013);
+      let waited = 0;
+      while (sockets.length === before) {
+        vi.advanceTimersByTime(1_000);
+        waited += 1_000;
+      }
+      delays.push(waited);
+    }
+    expect(delays).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+
+    // Any other close is an ordinary transport loss: reconnect promptly.
+    const before = sockets.length;
+    closeLatest(1006);
+    vi.advanceTimersByTime(1_000);
+    expect(sockets.length).toBe(before + 1);
+    unsubscribe();
   });
 });

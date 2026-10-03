@@ -1124,7 +1124,7 @@ TEST(RetainedNativeCellRuntimeTest,
 }
 
 TEST(RetainedNativeCellRuntimeTest,
-     GripperOnlyOwnerKeepsUnqualifiedStopRecoveryClosedWithoutMotionRuntime) {
+     GripperOnlyOwnerAssessesEmptyCaptureStopRecoveryWithoutMotionRuntime) {
   const auto binding = GripperOnlyBinding();
   CellTestExecutionEngine engine;
   auto resolver = UnusedResolver();
@@ -1145,10 +1145,14 @@ TEST(RetainedNativeCellRuntimeTest,
     const auto status = EmptyCapturedStopStatus(
         core::CellId("cell.native-cell.gripper"),
         binding.value().retained_bundle_id, binding.value().graph_revision);
+    // A latch that captured no resource has no physical rest obligation:
+    // its exact facts are resource-free yet still name the owner's exact
+    // control configuration, and are never rejected as incomplete.
     const auto facts = cell.BuildStopRecoveryFacts(status, 1);
-    ASSERT_FALSE(facts.ok());
-    EXPECT_EQ(facts.error().message,
-              "native Stop recovery facts are incomplete or inconsistent");
+    ASSERT_TRUE(facts.ok()) << facts.error().message;
+    EXPECT_TRUE(facts.value().resource_facts.empty());
+    ASSERT_FALSE(facts.value().configuration_facts.empty());
+    EXPECT_TRUE(core::AssessStopFaultRecovery(status, facts.value()).ok());
     ASSERT_EQ(cell.participant_registrations().size(), 1U);
     EXPECT_EQ(cell.participant_registrations().front().binding.value().capability_id,
               core::CapabilityId("tool.gripper.command"));

@@ -368,6 +368,10 @@
   gap: 0.55rem;
 }
 
+.program-policy-actions-row button {
+  padding: 0.5rem 0.7rem;
+}
+
 .program-policy-help,
 .program-policy-blocked {
   margin: 0;
@@ -387,8 +391,7 @@
   border: 0;
 }
 
-.program-policy-fieldset legend,
-.program-policy-actions legend {
+.program-policy-fieldset legend {
   padding: 0 0 0.25rem;
   color: var(--mf-text-neutral-68);
   font-size: var(--mf-font-size-065);
@@ -436,21 +439,6 @@
   accent-color: var(--mf-text-accent-61);
 }
 
-.program-policy-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 1rem;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.program-policy-actions legend,
-.program-policy-actions .program-form-error {
-  flex-basis: 100%;
-}
-
 .program-policy-help {
   grid-column: 1 / -1;
 }
@@ -464,8 +452,11 @@
   margin-top: -0.1rem;
 }
 
-.program-policy-actions-row button {
-  padding: 0.5rem 0.7rem;
+/* One advisory preview line for a held failed node's Draft edits. */
+.held-node-preview {
+  margin: 0 0 0.5rem;
+  font-size: var(--mf-font-size-068);
+  overflow-wrap: anywhere;
 }
 
 .program-policy-blocked {

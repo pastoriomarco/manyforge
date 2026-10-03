@@ -26,7 +26,7 @@ const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
 function appliedProgram(): AppliedProgramSelection {
   return {
-    schemaVersion: 'manyforge.applied_program_selection.v2',
+    schemaVersion: 'manyforge.applied_program_selection.v3',
     scenarioId: 'two-robots',
     sourceDocumentDigest: digest('a'),
     programId: 'two-robots',
@@ -74,7 +74,7 @@ function appliedProgram(): AppliedProgramSelection {
       },
     },
     programBinding: {
-      api_version: 'manyforge.program_binding.v1',
+      api_version: 'manyforge.program_binding.v2',
       program_binding_id: digest('c'),
       program_id: 'two-robots',
       program_revision: digest('b'),

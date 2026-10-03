@@ -476,7 +476,6 @@ function workspaceFixture(): Record<string, unknown> {
     },
     applicability: {
       applyReady: true,
-      affectedInstanceIds: [],
       unavailableReason: null,
     },
     saved: {
@@ -505,7 +504,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
   const draft = workspace.draft as Record<string, unknown>;
   const saved = workspace.saved as Record<string, unknown>;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 3,
     program: { ...draft, saved },
@@ -525,7 +524,6 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
       source_diagnostics: [],
       source_document_digest: null,
       program_role_assignment: null,
-      typed_parameter_overrides: {},
       source_program_digest: null,
       source_deployment_digest: null,
     },
@@ -540,7 +538,7 @@ function appliedResultFixture(): Record<string, unknown> {
     status: 'applied',
     confirmation_token: null,
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v3',
+      schema_version: 'manyforge.prepared_activation_input.v5',
       prepared_activation_id: digestC,
       scenario_id: 'fixture',
       source_document_digest: digestA,
@@ -554,7 +552,6 @@ function appliedResultFixture(): Record<string, unknown> {
       program_outcome: { kind: 'bound', program_binding_id: digestC },
       node_environment_digest: digestA,
       assistant_mode: 'forbidden',
-      typed_parameter_overrides: {},
     },
     candidate_preview: null,
     manager_apply: null,

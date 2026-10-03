@@ -184,9 +184,12 @@ authorized command. Browser closure does not Stop the runtime, and an unconfirme
 viewer pose must not be treated as current measured state.
 
 The ordinary authoring artifact is a Scenario project directory with fixed
-members: `scenario.yaml`, `deployment.yaml`, `program.yaml`, `assignment.yaml`
-and `overrides.yaml`, plus optional `sources/` and `assets/`. Open the project
-directory to load those parts together. Save updates authored intent and source
+members: `scenario.yaml`, `deployment.yaml`, `program.yaml` and
+`assignment.yaml`, plus optional `sources/` and `assets/`. Open the project
+directory to load those parts together. Program parameters always take their
+Program defaults: a former project with `overrides.yaml` (or a
+`manyforge.scenario.project.v1` manifest) is refused, not read; move any
+needed value into the Program default and recreate the project. Save updates authored intent and source
 references; Save As creates another project without copying referenced external
 sources. Missing/invalid sources block preparation, while changed compatible
 sources are reported for review rather than silently pinned to an old vendor

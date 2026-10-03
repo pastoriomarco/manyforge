@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   DraftMutationResponse,
-  ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
   ProgramWorkspaceResponse,
@@ -14,6 +13,7 @@ const apiMock = vi.hoisted(() => ({
   programWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
+    apply: vi.fn(),
   },
   scenarioDocuments: {
     save: vi.fn(),
@@ -37,12 +37,13 @@ vi.mock('../api/client', async (importOriginal) => ({
 import {
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
+  draftEditUnavailableReason,
   projectFacts,
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
 } from '../state/authoringWorkspace';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
-import { useProgramWorkspace } from './useProgramWorkspace';
+import { ProgramDraftChangedError, useProgramWorkspace } from './useProgramWorkspace';
 import { ApiError } from '../api/client';
 
 /**
@@ -60,6 +61,7 @@ function testAuthoringController(
     published,
     current: publicationIsCurrent(published, snapshot),
     unavailableReason: authoringUnavailableReason(published, snapshot),
+    editUnavailableReason: draftEditUnavailableReason(published, snapshot),
     project: projectFacts(published),
     reading: false,
     error: null,
@@ -79,7 +81,7 @@ function testPublication(
   workspace: ProgramWorkspaceResponse,
 ): PublishedAuthoringWorkspace {
   const snapshot = {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1' as const,
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2' as const,
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 1,
     program: { draft: workspace.draft, saved: workspace.saved },
@@ -99,7 +101,6 @@ function testPublication(
       sourceDiagnostics: [],
       sourceDocumentDigest: null,
       programRoleAssignment: null,
-      typedParameterOverrides: {},
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },
@@ -172,7 +173,6 @@ function workspace(
     },
     applicability: {
       applyReady: true,
-      affectedInstanceIds: [],
       unavailableReason: null,
     },
     saved: {
@@ -196,17 +196,9 @@ function workspace(
   };
 }
 
-const modificationPolicy: ProgramNodeModificationPolicy = {
-  runtime_override: 'human_approval',
-  persistent_edit: 'human_approval',
-  intervention_delegate: 'human_only',
-};
 const recoveryPolicy: ProgramNodeRecoveryPolicy = {
   allow_intervention: true,
-  allowed_recovery_actions: ['intervention'],
   max_retries: 2,
-  allowed_skills: [],
-  persistence_ceiling: 'draft_patch',
 };
 const operatorStopPolicy: ProgramOperatorStopPolicy = 'hold';
 
@@ -544,7 +536,6 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     await act(async () => {
       latest?.updateNodePolicies(
         'root',
-        modificationPolicy,
         recoveryPolicy,
         operatorStopPolicy,
         ['all_grippers', 'robot_a'],
@@ -560,7 +551,6 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         'program_draft_update_node_policies',
         {
           instance_id: 'root',
-          modification_policy: modificationPolicy,
           recovery_policy: recoveryPolicy,
           operator_stop_policy: operatorStopPolicy,
           execution_groups: ['all_grippers', 'robot_a'],
@@ -575,6 +565,43 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     }));
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.pendingAction).toBeNull();
+  });
+
+  it('fences an Apply after Reset to its exact Draft content, refreshing only admission', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    const rerender = await mountHarness(
+      initial,
+      authoringSnapshot(workspace(2)),
+      testPublication(workspace(2)),
+    );
+    await act(async () => initial.resolve(workspace(2)));
+    const expectedDraft = {
+      draftId: 'draft-1', draftRevision: 2, programRevision: workspace(2).draft.programRevision!,
+    };
+    // Reset legitimately advanced the admission generation: the fence follows it.
+    const afterReset = authoringSnapshot(workspace(2));
+    afterReset.authoringAdmission = { ...afterReset.authoringAdmission, admissionGeneration: 12 };
+    await rerender(afterReset);
+    apiMock.programWorkspace.apply.mockResolvedValueOnce({
+      status: 'accepted',
+      workspace: workspace(2),
+      headless: { apply_id: 'apply-1', apply_generation: 2 },
+    });
+    await act(async () => {
+      await latest?.apply({ correlationId: 'reset-apply.1', expectedDraft });
+    });
+    expect(apiMock.programWorkspace.apply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 2, expectedAdmissionGeneration: 12 }),
+      undefined,
+      'reset-apply.1',
+    );
+    // Another browser's edit is now installed: the confirmed content is gone,
+    // so no Apply is sent, with a named refusal.
+    apiMock.programWorkspace.get.mockResolvedValue(workspace(3));
+    await rerender(authoringSnapshot(workspace(3)));
+    await expect(latest!.apply({ correlationId: 'reset-apply.1', expectedDraft }))
+      .rejects.toBeInstanceOf(ProgramDraftChangedError);
+    expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
   });
 
   it('New uses the shared fence and follows the exact accepted Apply without a second command', async () => {

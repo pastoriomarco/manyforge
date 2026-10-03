@@ -43,7 +43,6 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         manager_run_root=manager_run_root,
         execution_run_root=execution_run_root,
         cell_id="c1_build_authority_cell",
-        resource_ids=("resource.arm.a",),
         owner_id="headless-api.test",
         owner_epoch=owner_epoch,
         freshness_milliseconds=100,

@@ -29,7 +29,6 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
     },
     applicability: {
       applyReady: true,
-      affectedInstanceIds: [],
       unavailableReason: null,
     },
     saved: {
@@ -237,12 +236,16 @@ describe('Program workspace lifecycle controls', () => {
     expect(appSource).not.toContain("authoringCause === 'execution_active'");
     expect(appSource).not.toContain('Authoring waits for Idle');
     expect(workspaceSource).toContain(
-      'Run active. Draft inspection remains available; authoring waits for Idle.',
+      'Run active. Draft inspection remains available; editing waits until all Program motion is stopped or the cycle is Idle.',
     );
+    expect(workspaceSource).toContain('Run held with all motion stopped. The Draft is editable');
     expect(workspaceSource).toContain('Authoring unavailable. ${mutationUnavailableReason}');
     expect(workspaceSource).toContain('dismissible: false');
     expect(workspaceSource).toContain('? mutationUnavailableReason');
-    expect(controlsSource).toContain('!mutationAvailable ? mutationUnavailableReason');
+    // Edits and Discard follow the Draft-edit gate; Apply with a run Resets
+    // it first; every other document action requires Idle.
+    expect(controlsSource).toContain("busyReason ?? mutationUnavailableReason");
+    expect(controlsSource).toContain("resetApply.unavailableReason('program') : documentUnavailableReason");
     expect(workspaceSource).not.toContain('affect only later runs');
   });
 });

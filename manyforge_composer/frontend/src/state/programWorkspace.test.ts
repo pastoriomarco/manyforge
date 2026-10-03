@@ -44,7 +44,6 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
     },
     applicability: {
       applyReady: true,
-      affectedInstanceIds: [],
       unavailableReason: null,
     },
     saved: {

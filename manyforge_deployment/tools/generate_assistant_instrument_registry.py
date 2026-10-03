@@ -136,7 +136,6 @@ STRUCTURED_PROGRAM_TYPES = {
     "scene_selection_context",
     "scene_selection_result",
 }
-RUNTIME_MUTABILITY = ("immutable", "before_run")
 BLACKBOARD_ACCESS = ("read", "write", "read_write")
 BLACKBOARD_PERSISTENCE = ("run", "persistent")
 VALUE_SOURCE_FORBIDDEN_PARAMETER_IDS = {
@@ -783,18 +782,9 @@ def _program_parameter_schema(catalog: NodeCatalog) -> dict[str, Any]:
                     "type": {"const": parameter_type},
                     "default": default_schema,
                     "constraints": constraints,
-                    "runtime_mutability": {
-                        "type": "string",
-                        "enum": list(RUNTIME_MUTABILITY),
-                    },
                     "description": copy.deepcopy(BOUNDED_TEXT),
                 },
-                required=(
-                    "parameter_id",
-                    "type",
-                    "default",
-                    "runtime_mutability",
-                ),
+                required=("parameter_id", "type", "default"),
             )
         )
     return {"oneOf": variants}

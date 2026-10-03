@@ -118,7 +118,8 @@ struct RecoveryAuthorityCapture {
   std::optional<KernelStopCertificateDTO> operator_stop_certificate;
   std::optional<AddressedMotionStopRecoveryEvidenceDTO> addressed_motion_stop_evidence;
   bool stop_fault_intervention_classified = false;
-  /// Classified retryable pre-dispatch validation failure, if any.
+  /// Classified retryable pre-dispatch validation failure, or a Failed
+  /// prepared execution proven never dispatched (no physical effect).
   bool failed_validation_retryable = false;
   std::string failed_validation_reason;
   /// Observation evidence; absent until RT-8C wires the dedicated

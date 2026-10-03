@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:4a83ca284cea69ff41ce802720ac145e2fa432356bce3cdab6698baa6454be99
+program_revision: sha256:36738396196d9f19541641b94345e442d58ce00ddc2cdfff675b0c55e6ed7eda
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: >-
@@ -124,7 +124,6 @@ parameters:
     type: float64
     default: 0.35
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for explicit Lite6 trocar moves.
 blackboard:
   namespaces:

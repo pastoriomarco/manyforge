@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import copy
+from functools import lru_cache
+import hashlib
 import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
 import pytest
+import rfc8785
 
+from manyforge_behavior.canonical_artifact import compute_content_identity
+from manyforge_behavior.node_environment import build_node_environment
+from manyforge_behavior.program import Program
 from manyforge_headless_api.activation_preparer import ActivationPreparer
 from manyforge_headless_api.native import (
     HeadlessApiConfig,
@@ -16,6 +23,7 @@ from manyforge_headless_api.native import (
 
 
 _DIGEST = "sha256:" + "1" * 64
+_ROOT = Path(__file__).resolve().parents[2]
 _CLOSURE = {
     "schema_version": "manyforge.activation_model_source_closure.v1",
     "components": [],
@@ -86,9 +94,19 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
     )
 
 
-def _result() -> dict[str, object]:
+@lru_cache(maxsize=1)
+def _admitted_program() -> dict[str, object]:
+    return Program(
+        _ROOT / "examples" / "pick_and_place_minimal.program.yaml",
+        build_node_environment().catalog,
+    ).to_dict()
+
+
+def _result(program: object = ...) -> dict[str, object]:
+    if program is ...:
+        program = copy.deepcopy(_admitted_program())
     identity: dict[str, object] = {
-        "schema_version": "manyforge.prepared_activation_input.v4",
+        "schema_version": "manyforge.prepared_activation_input.v5",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,
@@ -96,17 +114,22 @@ def _result() -> dict[str, object]:
         "deployment_revision": _DIGEST,
         "retained_bundle_id": _DIGEST,
         "graph_revision": _DIGEST,
-        "program_id": "program_a",
-        "program_revision": _DIGEST,
-        "program_outcome": {"kind": "bound", "program_binding_id": _DIGEST},
+        "program_id": program["program_id"] if program is not None else None,
+        "program_revision": (
+            program["program_revision"] if program is not None else None
+        ),
+        "program_outcome": (
+            {"kind": "bound", "program_binding_id": _DIGEST}
+            if program is not None
+            else {"kind": "no_program"}
+        ),
         "node_environment_digest": _DIGEST,
         "assistant_mode": "forbidden",
-        "typed_parameter_overrides": {},
-        "activation_payload": {"raw_artifacts": [{"bytes": "YQ=="}]},
+        "activation_payload": {
+            "program": program,
+            "raw_artifacts": [{"bytes": "YQ=="}],
+        },
     }
-    import hashlib
-    import rfc8785
-
     return {
         **identity,
         "prepared_activation_id": "sha256:"
@@ -137,14 +160,13 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         model_source_closure=_CLOSURE,
         program={"z": 2, "a": "program"},
         program_role_assignment={"component_roles": [], "target_roles": []},
-        typed_parameter_overrides={},
     )
 
     expected = _result()
     expected.pop("activation_payload")
     assert result == expected
     assert observed["input"] == {
-        "schema_version": "manyforge.activation_preparation_request.v2",
+        "schema_version": "manyforge.activation_preparation_request.v3",
         "runtime_cell_id": "cell_a",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
@@ -154,7 +176,6 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         "prepared_model_closure": _PREPARED_CLOSURE,
         "program": {"a": "program", "z": 2},
         "program_role_assignment": {"component_roles": [], "target_roles": []},
-        "typed_parameter_overrides": {},
     }
     assert "shell" not in observed["kwargs"]
     assert observed["kwargs"]["stdin"] is subprocess.DEVNULL
@@ -188,7 +209,6 @@ def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
             model_source_closure=_CLOSURE,
             program={},
             program_role_assignment={},
-            typed_parameter_overrides={},
         )
     assert raised.value.code == "activation_preparation_failed"
     assert raised.value.details == {"preparer_detail": diagnostic[:4096]}
@@ -213,7 +233,6 @@ def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
                 model_source_closure=_CLOSURE,
                 program={"api_version": "manyforge.program.v2"},
                 program_role_assignment={"component_roles": [], "target_roles": []},
-                typed_parameter_overrides={},
             )
     finally:
         preparer._lock.release()
@@ -246,7 +265,6 @@ def test_preparer_rejects_an_oversized_encoded_request_before_spawning(
             model_source_closure=_CLOSURE,
             program={"api_version": "manyforge.program.v2"},
             program_role_assignment={"component_roles": [], "target_roles": []},
-            typed_parameter_overrides={},
         )
 
     assert raised.value.code == "activation_preparation_request_oversized"
@@ -271,7 +289,6 @@ def test_preparer_rejects_timeout_and_invalid_output(
             model_source_closure=_CLOSURE,
             program={"api_version": "manyforge.program.v2"},
             program_role_assignment={"component_roles": [], "target_roles": []},
-            typed_parameter_overrides={},
         )
     assert raised.value.code == "activation_preparation_timeout"
 
@@ -289,6 +306,122 @@ def test_preparer_rejects_timeout_and_invalid_output(
             model_source_closure=_CLOSURE,
             program={"api_version": "manyforge.program.v2"},
             program_role_assignment={"component_roles": [], "target_roles": []},
-            typed_parameter_overrides={},
         )
+    assert raised.value.code == "activation_preparer_response_invalid"
+
+
+def _prepare_with_result(
+    preparer: ActivationPreparer,
+    monkeypatch: pytest.MonkeyPatch,
+    result: dict[str, object],
+) -> dict[str, object]:
+    def run(_command, **kwargs):
+        kwargs["stdout"].write(json.dumps(result).encode("utf-8"))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return preparer.prepare(
+        source_document_digest=_DIGEST,
+        scenario_id="scenario_a",
+        captured_input_digest=_DIGEST,
+        deployment={"api_version": "manyforge.deployment.v1"},
+        model_source_closure=_CLOSURE,
+        program=None,
+        program_role_assignment={"component_roles": [], "target_roles": []},
+    )
+
+
+def test_preparer_admits_no_program_without_program_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _prepare_with_result(preparer, monkeypatch, _result(None))
+    assert result["program_id"] is None
+    assert preparer.prepared_value(result["prepared_activation_id"]) == result
+
+
+def _without_tree_with_valid_identity(program: dict[str, object]) -> None:
+    program.pop("tree")
+    program["program_revision"] = compute_content_identity(
+        program,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+
+
+def _with_unknown_node_parameter(program: dict[str, object]) -> None:
+    program["tree"]["parameters"]["not_a_catalog_parameter"] = 1
+    program["program_revision"] = compute_content_identity(
+        program,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+
+
+@pytest.mark.parametrize(
+    ("malform", "code"),
+    [
+        (_without_tree_with_valid_identity, "activation_preparation_failed"),
+        (_with_unknown_node_parameter, "activation_preparation_failed"),
+        (
+            lambda program: program.__setitem__("name", "stale identity"),
+            "activation_preparation_failed",
+        ),
+        (
+            lambda program: program.__setitem__("program_id", "other_program"),
+            "activation_preparer_response_invalid",
+        ),
+    ],
+)
+def test_preparer_refuses_a_program_the_program_validator_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malform, code: str
+) -> None:
+    preparer = _preparer(tmp_path)
+    program = copy.deepcopy(_admitted_program())
+    malform(program)
+    result = _result(program)
+    if code == "activation_preparer_response_invalid":
+        # The receipt names the admitted Program; the payload diverges from it.
+        identity = {
+            key: value for key, value in result.items()
+            if key != "prepared_activation_id"
+        }
+        identity["program_id"] = _admitted_program()["program_id"]
+        result = {
+            **identity,
+            "prepared_activation_id": "sha256:"
+            + hashlib.sha256(rfc8785.dumps(identity)).hexdigest(),
+        }
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_result(preparer, monkeypatch, result)
+
+    assert raised.value.code == code
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_refuses_a_program_payload_for_no_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result(None)
+    identity = {
+        key: value for key, value in result.items()
+        if key != "prepared_activation_id"
+    }
+    identity["activation_payload"] = {
+        **identity["activation_payload"],
+        "program": copy.deepcopy(_admitted_program()),
+    }
+    result = {
+        **identity,
+        "prepared_activation_id": "sha256:"
+        + hashlib.sha256(rfc8785.dumps(identity)).hexdigest(),
+    }
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_result(preparer, monkeypatch, result)
+
     assert raised.value.code == "activation_preparer_response_invalid"

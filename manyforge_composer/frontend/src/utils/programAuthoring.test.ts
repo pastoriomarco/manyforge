@@ -65,7 +65,6 @@ const declaration: ProgramParameterDeclaration = {
   parameter_id: 'vscale',
   type: 'float64',
   default: 0.3,
-  runtime_mutability: 'before_run',
 };
 
 function tree(overrides: Partial<ProgramTreeNode> = {}): ProgramTreeNode {

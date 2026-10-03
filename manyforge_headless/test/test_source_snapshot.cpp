@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 
 #include "manyforge_headless/source_snapshot.hpp"
+
+#include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -71,6 +74,52 @@ TEST(SourceSnapshotCodec, RoundTripsCanonicalClosedRecordAndRejectsTamper) {
   auto noncanonical = bytes;
   noncanonical.push_back('\n');
   EXPECT_THROW(SourceSnapshotCodec::Decode(noncanonical),
+               SourceSnapshotIntegrityError);
+}
+
+TEST(SourceSnapshotCodec, VerifiesBothDigestsOverTheExactReceivedSpelling) {
+  // A payload that itself carries record-shaped members must not confuse the
+  // span-based digest verification.
+  const auto snapshot = SourceSnapshotCodec::Create(
+      "component_manager", "manager.cell-a", "epoch-a", 7U, 1000,
+      CanonicalValue(CanonicalValue::Object{
+          {"record_digest", CanonicalValue("sha256:not-the-record")},
+          {"source_owner_kind", CanonicalValue("nested")},
+      }));
+  const auto bytes = SourceSnapshotCodec::Encode(snapshot);
+  EXPECT_EQ(SourceSnapshotCodec::Decode(bytes), snapshot);
+
+  for (const auto &digest :
+       {snapshot.semantic_content_digest, snapshot.record_digest}) {
+    auto tampered = bytes;
+    const auto position = tampered.find(digest);
+    ASSERT_NE(position, std::string::npos);
+    tampered[position + 7U] = tampered[position + 7U] == '0' ? '1' : '0';
+    EXPECT_THROW(SourceSnapshotCodec::Decode(tampered),
+                 SourceSnapshotIntegrityError);
+  }
+
+  // Self-consistent digests over a canonical but non-producer spelling of
+  // observed_at_ns (decimal text below the safe-integer limit) are refused:
+  // no producer can emit that record.
+  auto foreign = CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kSourceSnapshotApiVersion))},
+      {"observed_at_ns", CanonicalValue("1000")},
+      {"payload", snapshot.payload},
+      {"semantic_content_digest",
+       CanonicalValue(snapshot.semantic_content_digest)},
+      {"source_generation", CanonicalValue(7.0)},
+      {"source_owner_epoch", CanonicalValue("epoch-a")},
+      {"source_owner_id", CanonicalValue("manager.cell-a")},
+      {"source_owner_kind", CanonicalValue("component_manager")},
+  };
+  const auto foreign_record_digest = content_identity::framed_sha256(
+      kSourceSnapshotRecordIdentityDomain, kSourceSnapshotApiVersion,
+      CanonicalValue(foreign));
+  foreign.emplace_back("record_digest", CanonicalValue(foreign_record_digest));
+  EXPECT_THROW(SourceSnapshotCodec::Decode(content_identity::canonical_json(
+                   CanonicalValue(std::move(foreign)))),
                SourceSnapshotIntegrityError);
 }
 
@@ -149,6 +198,70 @@ TEST(AtomicSourceSnapshotChannel,
   EXPECT_THROW(reopened.Publish("logical_scene", "scene.cell-a", "epoch-b",
                                 5000, Payload("bravo")),
                SourceSnapshotIntegrityError);
+}
+
+TEST(AtomicSourceSnapshotChannel,
+     DecodesOnlyChangedBytesAndDetectsCorruptionOnTheNextRead) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel writer(directory.path(), "manager.json");
+  AtomicSourceSnapshotChannel reader(directory.path(), "manager.json");
+
+  // The publisher never decodes the record it wrote itself.
+  const auto first = writer.Publish("component_manager", "manager.cell-a",
+                                    "epoch-a", 1000, Payload("alpha"));
+  const auto pulse = writer.Publish("component_manager", "manager.cell-a",
+                                    "epoch-a", 2000, Payload("alpha"));
+  EXPECT_EQ(pulse.source_generation, first.source_generation);
+  EXPECT_EQ(writer.decode_count(), 0U);
+
+  // A reader decodes one record once; identical bytes are not decoded again.
+  EXPECT_EQ(*reader.Read(), pulse);
+  EXPECT_EQ(*reader.Read(), pulse);
+  EXPECT_EQ(reader.decode_count(), 1U);
+  const auto changed = writer.Publish("component_manager", "manager.cell-a",
+                                      "epoch-a", 3000, Payload("bravo"));
+  EXPECT_EQ(*reader.Read(), changed);
+  EXPECT_EQ(reader.decode_count(), 2U);
+
+  // Same-size in-place corruption is detected by both sides on the next read.
+  const auto path = directory.path() / "manager.json";
+  std::string bytes;
+  {
+    std::ifstream stream(path, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(stream), {});
+  }
+  const auto position = bytes.find("bravo");
+  ASSERT_NE(position, std::string::npos);
+  auto tampered = bytes;
+  tampered.replace(position, 5U, "brava");
+  {
+    std::ofstream stream(path, std::ios::binary | std::ios::in |
+                                   std::ios::out);
+    stream.write(tampered.data(),
+                 static_cast<std::streamsize>(tampered.size()));
+  }
+  EXPECT_THROW(static_cast<void>(reader.Read()),
+               SourceSnapshotIntegrityError);
+  EXPECT_THROW(static_cast<void>(writer.Publish("component_manager",
+                                                "manager.cell-a", "epoch-a",
+                                                4000, Payload("bravo"))),
+               SourceSnapshotIntegrityError);
+  {
+    std::ofstream stream(path, std::ios::binary | std::ios::in |
+                                   std::ios::out);
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  EXPECT_EQ(*reader.Read(), changed);
+
+  // A foreign publication is fully decoded before the generation decision.
+  AtomicSourceSnapshotChannel foreign(directory.path(), "manager.json");
+  const auto replaced = foreign.Publish("component_manager", "manager.cell-a",
+                                        "epoch-b", 5000, Payload("charlie"));
+  const auto writer_decodes = writer.decode_count();
+  const auto resumed = writer.Publish("component_manager", "manager.cell-a",
+                                      "epoch-b", 6000, Payload("charlie"));
+  EXPECT_EQ(writer.decode_count(), writer_decodes + 1U);
+  EXPECT_EQ(resumed.source_generation, replaced.source_generation);
 }
 
 TEST(AtomicSourceSnapshotChannel,

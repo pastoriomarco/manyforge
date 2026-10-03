@@ -1,7 +1,6 @@
 #include "manyforge_headless/source_snapshot.hpp"
 
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_deployment/artifact_codec.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -12,6 +11,7 @@
 #include <cerrno>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -225,7 +225,10 @@ FileDescriptor OpenDirectory(const std::filesystem::path &directory) {
 }
 
 std::optional<SourceSnapshotFileObservation>
-ReadObservedAt(const int directory_fd, const std::string &file_name) {
+ReadObservedAt(const int directory_fd, const std::string &file_name,
+               std::optional<AtomicSourceSnapshotChannel::VerifiedRecord>
+                   &last_verified,
+               std::uint64_t &decode_count) {
   const int descriptor =
       ::openat(directory_fd, file_name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
@@ -279,10 +282,20 @@ ReadObservedAt(const int directory_fd, const std::string &file_name) {
     throw SourceSnapshotIntegrityError(
         "source snapshot publication mtime is invalid");
   }
-  return SourceSnapshotFileObservation{
-      SourceSnapshotCodec::Decode(bytes),
-      status.st_mtim.tv_sec * kNanosecondsPerSecond + status.st_mtim.tv_nsec,
-  };
+  const auto modified_at_ns =
+      status.st_mtim.tv_sec * kNanosecondsPerSecond + status.st_mtim.tv_nsec;
+  // Byte-identical to the last completely verified record: its decoded value
+  // and both digests are a pure function of these exact bytes.
+  if (last_verified.has_value() && last_verified->bytes == bytes) {
+    return SourceSnapshotFileObservation{last_verified->snapshot,
+                                         modified_at_ns};
+  }
+  last_verified.reset();
+  auto snapshot = SourceSnapshotCodec::Decode(bytes);
+  ++decode_count;
+  last_verified.emplace(
+      AtomicSourceSnapshotChannel::VerifiedRecord{std::move(bytes), snapshot});
+  return SourceSnapshotFileObservation{std::move(snapshot), modified_at_ns};
 }
 
 void WriteAll(const int descriptor, const std::string_view bytes) {
@@ -344,6 +357,54 @@ void PublishAt(const int directory_fd, const std::string &file_name,
   }
 }
 
+SourceSnapshot CreateRecord(std::string source_owner_kind,
+                            std::string source_owner_id,
+                            std::string source_owner_epoch,
+                            const std::uint64_t source_generation,
+                            const std::int64_t observed_at_ns,
+                            CanonicalValue payload,
+                            std::optional<std::string> semantic_digest) {
+  ValidateOwnerToken(source_owner_kind, "source_owner_kind");
+  ValidateOwnerToken(source_owner_id, "source_owner_id");
+  ValidateOwnerToken(source_owner_epoch, "source_owner_epoch");
+  static_cast<void>(Number(source_generation, "source_generation"));
+  static_cast<void>(Number(observed_at_ns, "observed_at_ns"));
+
+  SourceSnapshot result{
+      std::move(source_owner_kind),
+      std::move(source_owner_id),
+      std::move(source_owner_epoch),
+      source_generation,
+      observed_at_ns,
+      std::move(payload),
+      {},
+      {},
+  };
+  // A caller-supplied semantic digest was derived by the caller from these
+  // exact owner identities and payload; it is not derived a second time.
+  result.semantic_content_digest =
+      semantic_digest.has_value()
+          ? std::move(*semantic_digest)
+          : SemanticDigest(result.source_owner_kind, result.source_owner_id,
+                           result.source_owner_epoch, result.payload);
+  result.record_digest = RecordDigest(result);
+  if (!result.valid()) {
+    throw std::invalid_argument("constructed source snapshot is invalid");
+  }
+  return result;
+}
+
+/// Encodes a record whose digests were derived by CreateRecord in this call
+/// chain. Public Encode re-derives both digests for caller-supplied values.
+std::string EncodeCreated(const SourceSnapshot &snapshot) {
+  auto bytes = content_identity::canonical_json(CompleteRecordValue(snapshot));
+  if (bytes.empty() || bytes.size() > kMaximumSourceSnapshotBytes) {
+    throw SourceSnapshotIntegrityError(
+        "encoded source snapshot exceeds its byte bound");
+  }
+  return bytes;
+}
+
 } // namespace
 
 bool SourceSnapshot::valid() const noexcept {
@@ -367,30 +428,9 @@ SourceSnapshot SourceSnapshotCodec::Create(
     std::string source_owner_kind, std::string source_owner_id,
     std::string source_owner_epoch, const std::uint64_t source_generation,
     const std::int64_t observed_at_ns, CanonicalValue payload) {
-  ValidateOwnerToken(source_owner_kind, "source_owner_kind");
-  ValidateOwnerToken(source_owner_id, "source_owner_id");
-  ValidateOwnerToken(source_owner_epoch, "source_owner_epoch");
-  static_cast<void>(Number(source_generation, "source_generation"));
-  static_cast<void>(Number(observed_at_ns, "observed_at_ns"));
-
-  SourceSnapshot result{
-      std::move(source_owner_kind),
-      std::move(source_owner_id),
-      std::move(source_owner_epoch),
-      source_generation,
-      observed_at_ns,
-      std::move(payload),
-      {},
-      {},
-  };
-  result.semantic_content_digest =
-      SemanticDigest(result.source_owner_kind, result.source_owner_id,
-                     result.source_owner_epoch, result.payload);
-  result.record_digest = RecordDigest(result);
-  if (!result.valid()) {
-    throw std::invalid_argument("constructed source snapshot is invalid");
-  }
-  return result;
+  return CreateRecord(std::move(source_owner_kind), std::move(source_owner_id),
+                      std::move(source_owner_epoch), source_generation,
+                      observed_at_ns, std::move(payload), std::nullopt);
 }
 
 std::string SourceSnapshotCodec::Encode(const SourceSnapshot &snapshot) {
@@ -419,15 +459,22 @@ SourceSnapshotCodec::Decode(const std::string_view canonical_bytes) {
         "source snapshot bytes violate the fixed bound");
   }
 
+  // A record is exactly its canonical bytes, so the canonical parser (which
+  // rejects every spelling that does not reserialize byte for byte) is the
+  // whole syntax check. Readers decode every changed liveness pulse; the
+  // general YAML/JSON artifact decoder cost about twice as much here.
   CanonicalValue root;
   try {
-    root = deployment::parse_strict_json_model_yaml(canonical_bytes).root();
+    root = content_identity::parse_canonical_json(
+        canonical_bytes, content_identity::CanonicalJsonParseLimits{
+                             kMaximumSourceSnapshotBytes,
+                             content_identity::kMaximumCanonicalJsonDepth,
+                             content_identity::kMaximumCanonicalJsonNodes});
   } catch (const std::exception &error) {
-    throw SourceSnapshotIntegrityError("source snapshot is not strict JSON: " +
-                                       std::string(error.what()));
+    throw SourceSnapshotIntegrityError(
+        "source snapshot is not canonical JSON: " + std::string(error.what()));
   }
-  if (!root.is_object() || root.as_object().size() != 9U ||
-      content_identity::canonical_json(root) != canonical_bytes) {
+  if (!root.is_object() || root.as_object().size() != 9U) {
     throw SourceSnapshotIntegrityError(
         "source snapshot must be one exact canonical closed v1 object");
   }
@@ -444,14 +491,82 @@ SourceSnapshotCodec::Decode(const std::string_view canonical_bytes) {
     throw SourceSnapshotIntegrityError(
         "source snapshot observed_at_ns is not exact nonnegative int64");
   }
-  auto result = Create(RequiredString(root, "source_owner_kind"),
-                       RequiredString(root, "source_owner_id"),
-                       RequiredString(root, "source_owner_epoch"), generation,
-                       observed,
-                       RequiredMember(root, "payload"));
+  if (RequiredMember(root, "observed_at_ns") !=
+      Number(observed, "observed_at_ns")) {
+    throw SourceSnapshotIntegrityError(
+        "source snapshot observed_at_ns is not its producer spelling");
+  }
+  SourceSnapshot result{
+      RequiredString(root, "source_owner_kind"),
+      RequiredString(root, "source_owner_id"),
+      RequiredString(root, "source_owner_epoch"),
+      generation,
+      observed,
+      RequiredMember(root, "payload"),
+      RequiredString(root, "semantic_content_digest"),
+      RequiredString(root, "record_digest"),
+  };
+  try {
+    ValidateOwnerToken(result.source_owner_kind, "source_owner_kind");
+    ValidateOwnerToken(result.source_owner_id, "source_owner_id");
+    ValidateOwnerToken(result.source_owner_epoch, "source_owner_epoch");
+  } catch (const std::invalid_argument &error) {
+    throw SourceSnapshotIntegrityError(error.what());
+  }
+  if (!result.valid()) {
+    throw SourceSnapshotIntegrityError("source snapshot fields are invalid");
+  }
+
+  // The bytes are exactly canonical_json(root), and a canonical object is its
+  // sorted members' serializations joined by commas. Both digest preimages
+  // are therefore spans of these verified bytes plus re-serialized scalars;
+  // the payload is hashed as received instead of being copied and
+  // re-serialized twice per read.
+  const auto member = [&root](const std::string_view name) {
+    return content_identity::canonical_json(CanonicalValue(std::string(name))) +
+           ":" + content_identity::canonical_json(RequiredMember(root, name));
+  };
+  // Appending (not `"literal" + std::string`) also avoids GCC 12's false
+  // -Wrestrict positive in Release builds.
+  const auto join = [](std::initializer_list<std::string_view> parts) {
+    std::string joined;
+    for (const auto part : parts) {
+      joined.append(part);
+    }
+    return joined;
+  };
+  const auto prefix = join({"{", member("api_version"), ",",
+                            member("observed_at_ns"), ",\"payload\":"});
+  const auto owners =
+      join({",", member("source_owner_epoch"), ",", member("source_owner_id"),
+            ",", member("source_owner_kind"), "}"});
+  const auto after_record_digest =
+      join({",", member("semantic_content_digest"), ",",
+            member("source_generation"), owners});
+  const auto suffix = join({",", member("record_digest"), after_record_digest});
+  if (canonical_bytes.size() <= prefix.size() + suffix.size() ||
+      !canonical_bytes.starts_with(prefix) ||
+      !canonical_bytes.ends_with(suffix)) {
+    throw SourceSnapshotIntegrityError(
+        "source snapshot members are not in canonical record order");
+  }
+  const auto payload_bytes = canonical_bytes.substr(
+      prefix.size(), canonical_bytes.size() - prefix.size() - suffix.size());
+  std::string semantic_preimage;
+  semantic_preimage.reserve(payload_bytes.size() + owners.size() + 16U);
+  semantic_preimage.append("{\"payload\":").append(payload_bytes).append(owners);
+  std::string record_preimage;
+  record_preimage.reserve(prefix.size() + payload_bytes.size() +
+                          after_record_digest.size());
+  record_preimage.append(prefix).append(payload_bytes).append(after_record_digest);
   if (result.semantic_content_digest !=
-          RequiredString(root, "semantic_content_digest") ||
-      result.record_digest != RequiredString(root, "record_digest")) {
+          content_identity::framed_sha256_of_canonical_json(
+              kSourceSnapshotSemanticIdentityDomain, kSourceSnapshotApiVersion,
+              semantic_preimage) ||
+      result.record_digest !=
+          content_identity::framed_sha256_of_canonical_json(
+              kSourceSnapshotRecordIdentityDomain, kSourceSnapshotApiVersion,
+              record_preimage)) {
     throw SourceSnapshotIntegrityError(
         "source snapshot digest verification failed");
   }
@@ -489,7 +604,13 @@ std::optional<SourceSnapshotFileObservation>
 AtomicSourceSnapshotChannel::ReadObserved() const {
   std::lock_guard lock(mutex_);
   auto directory = OpenDirectory(directory_);
-  return ReadObservedAt(directory.get(), file_name_);
+  return ReadObservedAt(directory.get(), file_name_, last_verified_,
+                        decode_count_);
+}
+
+std::uint64_t AtomicSourceSnapshotChannel::decode_count() const {
+  std::lock_guard lock(mutex_);
+  return decode_count_;
 }
 
 SourceSnapshot AtomicSourceSnapshotChannel::Publish(
@@ -503,8 +624,13 @@ SourceSnapshot AtomicSourceSnapshotChannel::Publish(
 
   std::lock_guard lock(mutex_);
   auto directory = OpenDirectory(directory_);
-  const auto current = ReadObservedAt(directory.get(), file_name_);
-  const auto semantic_digest = SemanticDigest(
+  // The current file is read on every publication. Bytes identical to this
+  // channel's own last publication reuse that verified value; any other
+  // bytes (a foreign writer, corruption, or another channel) are decoded and
+  // verified completely before the generation decision.
+  const auto current = ReadObservedAt(directory.get(), file_name_,
+                                      last_verified_, decode_count_);
+  auto semantic_digest = SemanticDigest(
       source_owner_kind, source_owner_id, source_owner_epoch, payload);
   std::uint64_t generation = 1U;
   if (current.has_value()) {
@@ -525,11 +651,15 @@ SourceSnapshot AtomicSourceSnapshotChannel::Publish(
     }
   }
 
-  auto next = SourceSnapshotCodec::Create(
-      std::move(source_owner_kind), std::move(source_owner_id),
-      std::move(source_owner_epoch), generation, observed_at_ns,
-      std::move(payload));
-  PublishAt(directory.get(), file_name_, SourceSnapshotCodec::Encode(next));
+  auto next = CreateRecord(std::move(source_owner_kind),
+                           std::move(source_owner_id),
+                           std::move(source_owner_epoch), generation,
+                           observed_at_ns, std::move(payload),
+                           std::move(semantic_digest));
+  auto bytes = EncodeCreated(next);
+  last_verified_.reset();
+  PublishAt(directory.get(), file_name_, bytes);
+  last_verified_.emplace(VerifiedRecord{std::move(bytes), next});
   return next;
 }
 

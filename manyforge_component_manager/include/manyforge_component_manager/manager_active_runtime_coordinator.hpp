@@ -68,6 +68,9 @@ private:
   const SqliteActiveBundlePublicationStore &publication_store_;
   const SqliteManagerApplyJournal &apply_journal_;
   std::optional<ManagerBootstrapRuntimePlanDTO> bootstrap_plan_;
+  /// Last named-Apply plan accepted by ReadCurrentPlan.
+  mutable std::mutex verified_plan_mutex_;
+  mutable std::optional<ManagerActiveRuntimePlanDTO> verified_plan_;
 };
 
 class ManagerActiveRuntimeCoordinatorError : public std::runtime_error {

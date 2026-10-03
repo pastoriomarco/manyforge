@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -352,12 +353,6 @@ void ValidateWallTimeText(const std::string& value) {
 }
 
 [[nodiscard]] ErrorDTO JournalError(const JournalFailure& error) {
-  if (error.code() == "operation_journal_stop_projection_unavailable") {
-    return ErrorDTO{
-        error.code(),
-        error.what(),
-        {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}};
-  }
   return ErrorDTO{error.code(), error.what(), {{"reason", "operation_journal_failure"}}};
 }
 
@@ -461,6 +456,17 @@ class Statement final {
  private:
   sqlite3* database_{};
   sqlite3_stmt* statement_{};
+};
+
+class ReadSnapshot final {
+ public:
+  explicit ReadSnapshot(sqlite3* database) : database_(database) { Exec(database_, "BEGIN"); }
+  ~ReadSnapshot() { sqlite3_exec(database_, "COMMIT", nullptr, nullptr, nullptr); }
+  ReadSnapshot(const ReadSnapshot&) = delete;
+  ReadSnapshot& operator=(const ReadSnapshot&) = delete;
+
+ private:
+  sqlite3* database_{};
 };
 
 class Transaction final {
@@ -2737,7 +2743,12 @@ class SqliteOperationJournal::Impl final {
     try {
       Configure();
       InitializeOrValidate();
+      OpenReader();
     } catch (...) {
+      if (reader_ != nullptr) {
+        sqlite3_close(reader_);
+        reader_ = nullptr;
+      }
       sqlite3_close(database_);
       database_ = nullptr;
       throw;
@@ -2752,9 +2763,22 @@ class SqliteOperationJournal::Impl final {
   }
 
   void Close() {
-    std::lock_guard lock(mutex_);
+    const auto lock = LockOrdinaryWriter();
     if (closed_) {
       return;
+    }
+    {
+      // The reader holds no writer authority; retire it before the final
+      // truncating checkpoint so no read snapshot pins the WAL.
+      std::lock_guard reader_lock(reader_mutex_);
+      if (reader_ != nullptr) {
+        const auto closed_reader = sqlite3_close(reader_);
+        if (closed_reader != SQLITE_OK) {
+          Fail("operation_journal_storage_failure",
+               "close operation journal reader: " + SqliteDetail(reader_, closed_reader));
+        }
+        reader_ = nullptr;
+      }
     }
     sqlite3_wal_checkpoint_v2(database_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     const auto result = sqlite3_close(database_);
@@ -2836,9 +2860,117 @@ class SqliteOperationJournal::Impl final {
                                           bool operational_only = false);
 
  private:
+  // Journal writer authority is a strict handoff under one mutex and
+  // condition variable. An ordinary writer acquires only while the writer is
+  // free and no Stop projection is registered as waiting; a Stop projection
+  // registers under that same mutex and acquires as soon as the writer is
+  // free. Once a Stop projection is waiting, no ordinary writer that does not
+  // already hold the writer can precede it: it waits for exactly the one write
+  // in progress.
+  //
+  // The Stop's wait has no wall-clock bound of its own. The write it waits for
+  // is a single transaction whose lock waits are bounded by the SQLite busy
+  // timeout and whose remaining cost is its own statements and FULL fsync, on
+  // the same storage the Stop's own commit must then use. A wall-clock bound
+  // on the handoff therefore cannot bound the projection on stalled storage
+  // (the Stop's own fsync would stall identically); it could only turn
+  // healthy-but-slow I/O into spurious failed attempts and, after the Kernel's
+  // bounded retry, a spurious persistence-degraded latch. A genuine storage
+  // failure surfaces as the in-progress write's own error, which releases the
+  // writer, and then as the Stop transaction's own failure: the Kernel makes
+  // one projection attempt and fails closed through its persistence latch. The wait runs only on the Stop projection worker after containment
+  // was linearized, never on the Stop acceptance or StopControl lanes, and
+  // event readers use their own WAL connection and never take the writer.
+  class WriterLease final {
+   public:
+    explicit WriterLease(Impl& owner) noexcept : owner_(owner) {}
+    ~WriterLease() { owner_.ReleaseWriter(); }
+    WriterLease(const WriterLease&) = delete;
+    WriterLease& operator=(const WriterLease&) = delete;
+    WriterLease(WriterLease&&) = delete;
+    WriterLease& operator=(WriterLease&&) = delete;
+
+   private:
+    Impl& owner_;
+  };
+
+  [[nodiscard]] WriterLease LockOrdinaryWriter() {
+    std::unique_lock gate(writer_gate_mutex_);
+    const auto may_acquire = [this] {
+      return !writer_held_ && stop_projection_writers_waiting_ == 0U;
+    };
+    if (!may_acquire()) {
+      gate.unlock();
+      if (critical_section_observer_) {
+        critical_section_observer_("ordinary_writer_wait");
+      }
+      gate.lock();
+      writer_gate_changed_.wait(gate, may_acquire);
+    }
+    writer_held_ = true;
+    return WriterLease(*this);
+  }
+
+  [[nodiscard]] WriterLease LockStopProjectionWriter() {
+    std::unique_lock gate(writer_gate_mutex_);
+    if (writer_held_) {
+      ++stop_projection_writers_waiting_;
+      gate.unlock();
+      try {
+        if (critical_section_observer_) {
+          critical_section_observer_("stop_projection_writer_wait");
+        }
+      } catch (...) {
+        gate.lock();
+        --stop_projection_writers_waiting_;
+        gate.unlock();
+        writer_gate_changed_.notify_all();
+        throw;
+      }
+      gate.lock();
+      writer_gate_changed_.wait(gate, [this] { return !writer_held_; });
+      --stop_projection_writers_waiting_;
+    }
+    writer_held_ = true;
+    return WriterLease(*this);
+  }
+
+  void ReleaseWriter() noexcept {
+    {
+      std::lock_guard gate(writer_gate_mutex_);
+      writer_held_ = false;
+    }
+    writer_gate_changed_.notify_all();
+  }
+
   void RequireOpen() const {
     Require(!closed_ && database_ != nullptr, "operation_journal_closed",
             "operation journal database is closed");
+  }
+
+  // Event reads use their own read-only WAL connection and lock. They observe
+  // a committed snapshot and never take the writer's process lock, so a
+  // reader can neither delay nor starve a Stop projection, which waits only
+  // for the one write in progress. SQLite WAL readers never block the writer.
+  void OpenReader() {
+    const auto result = sqlite3_open_v2(
+        database_path_.string().c_str(), &reader_,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
+    if (result != SQLITE_OK) {
+      Fail("operation_journal_storage_failure",
+           "open operation journal reader: " + SqliteDetail(reader_, result));
+    }
+    Check(reader_, sqlite3_busy_timeout(reader_, kBusyTimeoutMilliseconds),
+          "configure operation journal reader busy timeout");
+    Exec(reader_, "PRAGMA query_only=ON");
+    Exec(reader_, "PRAGMA trusted_schema=OFF");
+    int defensive_enabled = 0;
+    Check(reader_, sqlite3_db_config(reader_, SQLITE_DBCONFIG_DEFENSIVE, 1, &defensive_enabled),
+          "enable defensive operation journal reader");
+    Require(defensive_enabled == 1,
+            "operation_journal_storage_unsupported",
+            "operation journal reader could not be configured");
+    sqlite3_limit(reader_, SQLITE_LIMIT_LENGTH, static_cast<int>(kMaximumRecordJsonBytes));
   }
 
   void Configure() {
@@ -2909,7 +3041,7 @@ class SqliteOperationJournal::Impl final {
   }
 
   void InitializeOrValidate() {
-    std::lock_guard lock(mutex_);
+    const auto lock = LockOrdinaryWriter();
     Transaction transaction(database_);
     const auto objects = SchemaObjectNames(database_);
     if (objects.empty()) {
@@ -3030,9 +3162,14 @@ class SqliteOperationJournal::Impl final {
   std::size_t history_capacity_;
   std::function<std::string()> wall_time_text_;
   std::function<void(std::string_view)> critical_section_observer_;
-  std::mutex mutex_;
+  std::mutex writer_gate_mutex_;
+  std::condition_variable writer_gate_changed_;
+  bool writer_held_{};
+  std::size_t stop_projection_writers_waiting_{};
   sqlite3* database_{};
   bool closed_{};
+  std::mutex reader_mutex_;
+  sqlite3* reader_{};
 };
 
 std::uint64_t SqliteOperationJournal::Impl::Append(
@@ -3059,11 +3196,14 @@ std::uint64_t SqliteOperationJournal::Impl::Append(
           "operation journal record exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
 
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
   Transaction transaction(database_);
+  if (critical_section_observer_) {
+    critical_section_observer_("ordinary_write");
+  }
   Statement active(database_,
                    "SELECT request_capacity FROM owner_epochs "
                    "WHERE owner_epoch=? AND active=1");
@@ -3183,9 +3323,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
           "Stop acceptance projection exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
 
-  std::unique_lock lock(mutex_, std::try_to_lock);
-  Require(lock.owns_lock(), "operation_journal_stop_projection_unavailable",
-          "Stop acceptance projection cannot wait for the operation journal");
+  const auto lock = LockStopProjectionWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
@@ -3195,6 +3333,30 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
   Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
           "operation_journal_owner_epoch_stale",
           "Stop acceptance projection names a non-active owner epoch");
+
+  // A request that joined a resident physical Stop is an additional request
+  // receipt for that Stop, not a new capture. The creating acceptance owns the
+  // Stop's recovery projection and the operation captures it carries; later
+  // state and terminal records advance them. A joined receipt carries the same
+  // operation captures (equal journal capture order) inside different record
+  // bytes, so it must neither re-anchor operation snapshots nor claim the
+  // Stop's single recovery projection row. Its projection may run before or
+  // after the creator's: only the physical transaction identity is joined.
+  const bool joined_receipt =
+      acceptance.acceptance_path == EmergencyStopAcceptancePathDTO::kJoinedResident;
+  const auto require_joined_transaction = [&] {
+    Statement creator(database_,
+                      "SELECT acceptance_payload FROM stop_projections "
+                      "WHERE stop_id=? AND stop_generation=?");
+    creator.Bind(1, accepted.stop_id.value());
+    creator.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
+    if (!creator.Step()) return;
+    auto decoded = DecodeStopJournalAcceptanceProjection(creator.Text(0));
+    Require(decoded.ok() && !creator.Step() &&
+                decoded.value().accepted.captured_scope_digest == accepted.captured_scope_digest,
+            "operation_journal_stop_projection_conflict",
+            "joined Stop acceptance does not name its resident physical Stop");
+  };
 
   // Projection retry is idempotent by exact canonical payload. Different
   // accepted records may legitimately share a request ID after conservative
@@ -3212,6 +3374,11 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
     Require(existing.Text(1) == payload_json && !existing.Step(),
             "operation_journal_stop_projection_conflict",
             "Stop acceptance identity names different canonical projection bytes");
+    if (joined_receipt) {
+      require_joined_transaction();
+      transaction.Commit();
+      return sequence;
+    }
     const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
         StopJournalAcceptanceProjectionDTO{accepted, affected_state});
     Require(acceptance_projection.ok(), "operation_journal_record_invalid",
@@ -3255,6 +3422,11 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
           "Stop acceptance journal insert returned an unexpected row");
   const auto sequence =
       PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  if (joined_receipt) {
+    require_joined_transaction();
+    transaction.Commit();
+    return sequence;
+  }
   for (const auto& state : affected_state.operations) {
     StoreOperationSnapshotMonotonic(database_, owner_epoch, state, sequence, payload_digest);
   }
@@ -3288,9 +3460,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
   Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "Stop surveillance projection exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
-  std::unique_lock lock(mutex_, std::try_to_lock);
-  Require(lock.owns_lock(), "operation_journal_stop_projection_unavailable",
-          "Stop surveillance projection cannot wait for the operation journal");
+  const auto lock = LockStopProjectionWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
@@ -3392,9 +3562,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
           "Stop terminal projection exceeds the fixed payload bound");
   const auto payload_digest = content_identity::sha256_digest(payload_json);
 
-  std::unique_lock lock(mutex_, std::try_to_lock);
-  Require(lock.owns_lock(), "operation_journal_stop_projection_unavailable",
-          "Stop terminal projection cannot wait for the operation journal");
+  const auto lock = LockStopProjectionWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
@@ -3484,15 +3652,20 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
           "operation_journal_event_query_invalid",
           "operation journal event query exceeds its identity or page bound");
 
-  std::lock_guard lock(mutex_);
-  RequireOpen();
-  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  std::lock_guard lock(reader_mutex_);
+  Require(reader_ != nullptr, "operation_journal_closed", "operation journal database is closed");
+  // One committed snapshot covers the owner check and the page.
+  ReadSnapshot snapshot(reader_);
+  Statement active(reader_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
   active.Bind(1, owner_epoch.value());
   Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
           "operation_journal_owner_epoch_stale",
           "operation event query names a non-active owner epoch");
+  if (critical_section_observer_) {
+    critical_section_observer_("read_events");
+  }
 
-  Statement query(database_,
+  Statement query(reader_,
                   operational_only
                       ? "SELECT sequence,record_kind,request_id,operation_id,"
                         "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
@@ -3569,7 +3742,7 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
           "operation_journal_owner_epoch_invalid",
           "operation journal resource inventory is invalid");
 
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   Transaction transaction(database_);
   Statement reused(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=?");
@@ -4090,7 +4263,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
           cleared_latch.clear_projection.state == StopDurableProjectionStateDTO::kRecorded &&
           stop_status_field_error(resulting_stop_status) == std::nullopt,
       "operation_journal_record_invalid", "Stop fault-clear projection is invalid");
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
@@ -4209,7 +4382,7 @@ std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEp
                                                             const std::int64_t closed_at_ns) {
   Require(!owner_epoch.empty() && closed_at_ns >= 0, "operation_journal_owner_epoch_invalid",
           "owner close identity is invalid");
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
@@ -4360,7 +4533,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
               claim.intent.expected_admission_generation == claim.acquired_admission_generation &&
               claim.accepted_at_ns >= 0,
           "operation_journal_record_invalid", "cell-admission acquire record is invalid");
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   if (critical_section_observer_) {
     critical_section_observer_("cell_admission_acquire");
   }
@@ -4602,7 +4775,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
               claim.acquired_admission_generation == release.acquired_admission_generation &&
               resulting_generation.nonzero() && resulting_generation.value() <= kMaximumSafeInteger,
           "operation_journal_record_invalid", "cell-admission release record is invalid");
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   Transaction transaction(database_);
   Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
@@ -4769,7 +4942,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
         authorization.reconciliation_evidence_digest.value() + "\n";
   }
   const auto authorization_digest = content_identity::sha256_digest(authorizations);
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   Transaction transaction(database_);
   Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
@@ -5046,7 +5219,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionGenerationAdvance
   Require(prior_generation.nonzero() && prior_generation.value() < kMaximumSafeInteger &&
               resulting_generation.value() == prior_generation.value() + 1U,
           "operation_journal_record_invalid", "cell-admission generation transition is invalid");
-  std::lock_guard lock(mutex_);
+  const auto lock = LockOrdinaryWriter();
   RequireOpen();
   Transaction transaction(database_);
   Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import lru_cache
 import json
 import hashlib
 import logging
@@ -15,12 +16,15 @@ from typing import Any, Mapping
 
 import rfc8785
 
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.model_source_capture import SOURCE_CLOSURE_SCHEMA
 from manyforge_behavior.model_source_preparation import (
     PREPARED_MODEL_CLOSURE_SCHEMA,
     StructuralModelPreparationError,
     prepare_captured_model_source,
 )
+from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
+from manyforge_behavior.program import Program, ProgramValidationError
 
 from .native import (
     HeadlessApiError,
@@ -45,7 +49,6 @@ _RECEIPT_FIELDS = {
     "scenario_id",
     "schema_version",
     "source_document_digest",
-    "typed_parameter_overrides",
 }
 _EXPECTED_RESULT_FIELDS = _RECEIPT_FIELDS | {"activation_payload"}
 
@@ -134,6 +137,59 @@ def _model_preparation_profiles(
             )
         profiles[profile_id] = family
     return profiles
+
+
+@lru_cache(maxsize=1)
+def _program_catalog() -> NodeCatalog:
+    """Load the build-owned authoring catalog once per headless process."""
+
+    return NodeCatalog(BUILTIN_CATALOG_PATH)
+
+
+def _require_admitted_program(value: Mapping[str, Any]) -> None:
+    """Admit the prepared Program once against the authoring Program contract.
+
+    Native preparation proves the Program's content identity, envelope, roles,
+    tree, key-typed parameters, value sources, expressions and execution
+    groups against the retained catalog, but not the remaining node-catalog
+    parameter, Scene, blackboard and contact-policy semantics the Program
+    validator owns. The admitted Program is content-addressed, so this one
+    check covers every later read of the Applied Program.
+    """
+
+    program = value["activation_payload"].get("program")
+    if value.get("program_id") is None:
+        if program is not None:
+            raise HeadlessApiError(
+                "activation_preparer_response_invalid",
+                "Activation preparer returned a Program for no Program",
+            )
+        return
+    if (
+        not isinstance(program, dict)
+        or program.get("program_id") != value.get("program_id")
+        or program.get("program_revision") != value.get("program_revision")
+    ):
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Activation preparer returned a divergent Program",
+        )
+    try:
+        admitted = Program.from_dict(
+            program, _program_catalog(), path="<activation-prepared-program>"
+        ).to_dict()
+    except (ProgramValidationError, TypeError, ValueError) as error:
+        raise HeadlessApiError(
+            "activation_preparation_failed",
+            "Activation preparation refused an invalid Program",
+            details={"preparer_detail": str(error)[:4096]},
+        ) from error
+    if admitted != program:
+        raise HeadlessApiError(
+            "activation_preparation_failed",
+            "Activation preparation refused a Program that is not in its "
+            "validated canonical form",
+        )
 
 
 def _prepare_model_closure(
@@ -271,7 +327,6 @@ class ActivationPreparer:
         model_source_closure: Mapping[str, Any],
         program: Mapping[str, Any] | None,
         program_role_assignment: Mapping[str, Any],
-        typed_parameter_overrides: Mapping[str, Any],
     ) -> dict[str, Any]:
         if not self._lock.acquire(blocking=False):
             raise HeadlessApiError(
@@ -286,7 +341,7 @@ class ActivationPreparer:
                 profiles=self._profiles,
             )
             request = {
-                "schema_version": "manyforge.activation_preparation_request.v2",
+                "schema_version": "manyforge.activation_preparation_request.v3",
                 "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
                 "scenario_id": scenario_id,
@@ -296,7 +351,6 @@ class ActivationPreparer:
                 "prepared_model_closure": prepared_model_closure,
                 "program": dict(program) if program is not None else None,
                 "program_role_assignment": dict(program_role_assignment),
-                "typed_parameter_overrides": dict(typed_parameter_overrides),
             }
             encoded = rfc8785.dumps(request)
             if len(encoded) > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES:
@@ -378,11 +432,9 @@ class ActivationPreparer:
                 not isinstance(value, dict)
                 or set(value) != _EXPECTED_RESULT_FIELDS
                 or value.get("schema_version")
-                != "manyforge.prepared_activation_input.v4"
+                != "manyforge.prepared_activation_input.v5"
                 or value.get("source_document_digest") != source_document_digest
                 or value.get("captured_input_digest") != captured_input_digest
-                or value.get("typed_parameter_overrides")
-                != dict(typed_parameter_overrides)
             ):
                 raise HeadlessApiError(
                     "activation_preparer_response_invalid",
@@ -403,6 +455,7 @@ class ActivationPreparer:
                     "activation_preparer_response_invalid",
                     "Activation preparer returned an invalid direct payload",
                 )
+            _require_admitted_program(value)
             receipt = {field: value[field] for field in _RECEIPT_FIELDS}
             self._prepared = {prepared_activation_id: receipt}
             return deepcopy(receipt)

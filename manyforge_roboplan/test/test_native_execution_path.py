@@ -678,10 +678,9 @@ def _run_native_benchmark_move(
     # Native manual-control settlement is backend-owned. Keep retirement
     # outside the historical timing sample without a redundant client Ack.
     _wait_retired(client, operation_id)
-    deadline = time.monotonic() + 5.0
-    while not admission.get()["authoring_allowed"]:
-        assert time.monotonic() < deadline
-        time.sleep(0.005)
+    # Non-residency is published only after the manual admission claim is
+    # released, so admission is already reopened here.
+    assert admission.get()["authoring_allowed"] is True
     return elapsed_seconds
 
 
@@ -2174,10 +2173,7 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
         # already-settled manual operation. Do not invent a second Reset.
         _wait_retired(client, accepted["operation_id"])
         admission = CellAdmissionClient(execution_run_root)
-        deadline = time.monotonic() + 5.0
-        while not admission.get()["authoring_allowed"]:
-            assert time.monotonic() < deadline
-            time.sleep(0.005)
+        assert admission.get()["authoring_allowed"] is True
 
         next_operation = _direct_control_joint_operation(
             identity,
@@ -3229,6 +3225,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         operation_id = accepted["accepted"]["operation_id"]
         terminal = _wait_terminal(runner, operation_id)
         assert terminal["operation"]["state"] == "completed", terminal
+        # Compare one settled projection; residency is transient until the
+        # Kernel retires the operation and releases its admission claim.
+        _wait_retired(native, operation_id)
 
         composer_projection = composer.operation(operation_id)
         current_projection = headless.operation(operation_id)

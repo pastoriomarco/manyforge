@@ -1,7 +1,7 @@
 import { act, useState } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 
-import type { ProgramTreeNode } from '../types/api';
+import type { ProgramNodeRecoveryPolicy, ProgramTreeNode } from '../types/api';
 import { executionGroupScopes, type ExecutionGroupScope } from '../state/programExecutionGroups';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { MotionControlSettings } from './ProgramRuntimePanel';
@@ -54,15 +54,17 @@ type GroupWrite = ProgramTreeNode['execution_groups'];
 async function mountPolicy(initial: ProgramTreeNode, inheritedGroups: string[], applyWrites = true) {
   const { host, find } = mountedHost();
   const writes: GroupWrite[] = [];
+  const recoveryWrites: ProgramNodeRecoveryPolicy[] = [];
   const createGroup = vi.fn();
   function Host() {
     const [node, setNode] = useState<ProgramTreeNode>(initial);
     return <ProgramPolicyEditor node={node} inheritedGroups={inheritedGroups}
       availableGroups={['left', 'right']} onCreateGroup={createGroup} busy={false}
-      onUpdate={(_, modification_policy, recovery_policy, operator_stop_policy, execution_groups) => {
+      onUpdate={(_, recovery_policy, operator_stop_policy, execution_groups) => {
         writes.push(execution_groups);
+        recoveryWrites.push(recovery_policy);
         if (applyWrites) {
-          setNode({ ...node, modification_policy, recovery_policy, operator_stop_policy, execution_groups });
+          setNode({ ...node, recovery_policy, operator_stop_policy, execution_groups });
         }
       }} />;
   }
@@ -77,7 +79,7 @@ async function mountPolicy(initial: ProgramTreeNode, inheritedGroups: string[], 
   const inherit = () => find((p) => p.id === `policy-${initial.instance_id}-execution_groups`);
   const change = (props: Props, checked: boolean) => act(() => props.onChange?.({ target: { checked } }));
   const blur = () => act(() => find((p) => p.className === 'program-policy-form').onBlur?.());
-  return { writes, createGroup, group, inherit, change, blur, find, unmount: () => act(() => root.unmount()) };
+  return { writes, recoveryWrites, createGroup, group, inherit, change, blur, find, unmount: () => act(() => root.unmount()) };
 }
 
 const move: ProgramTreeNode = { node_id: 'motion.move_to_pose', instance_id: 'move', parameters: {}, children: [] };
@@ -196,4 +198,34 @@ it('saves only the requested group while All is revealed automatically', async (
     expect(changes).toEqual([['all'], []]);
     expect(checkbox('all').checked).toBe(true);
   } finally { await unmount(); }
+});
+
+it('authors Allow intervention and a Retry limit of Unlimited or N, never a bare 0', async () => {
+  const mounted = await mountPolicy(move, []);
+  const { recoveryWrites, find, blur } = mounted;
+  try {
+    const intervention = () => find((p) => p.id === 'policy-move-allow_intervention');
+    const mode = () => find((p) => p.id === 'policy-move-retry_limit_mode');
+    // The omitted default is shown as Unlimited, not as a numeric 0.
+    expect(mode().value).toBe('unlimited');
+    expect(() => find((p) => p.id === 'policy-move-max_retries')).toThrow();
+    // Unlimited does not imply intervention: it stays an explicit opt-in.
+    expect(intervention().checked).toBe(false);
+    await act(() => intervention().onChange?.({ target: { checked: true } }));
+    expect(recoveryWrites).toEqual([{ allow_intervention: true, max_retries: 0 }]);
+    await act(() => mode().onChange?.({ target: { value: 'limited' } }));
+    expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: true, max_retries: 1 });
+    const limit = () => find((p) => p.id === 'policy-move-max_retries');
+    expect(limit().min).toBe(1);
+    await act(() => limit().onChange?.({ target: { value: '0' } }));
+    await blur();
+    // Zero is not a finite limit: it is refused locally rather than saved.
+    expect(limit()['aria-invalid']).toBe(true);
+    expect(recoveryWrites).toHaveLength(2);
+    await act(() => limit().onChange?.({ target: { value: '3' } }));
+    await blur();
+    expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: true, max_retries: 3 });
+    await act(() => mode().onChange?.({ target: { value: 'unlimited' } }));
+    expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: true, max_retries: 0 });
+  } finally { await mounted.unmount(); }
 });

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-30 22:53:31 UTC
+  Last regenerated: 2026-10-02 19:28:14 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -22,6 +22,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant-draft-callback | Invoke Draft Tool |
 | `GET` | `/api/assistant/modes` | headless-runtime-client | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
+| `POST` | `/api/authoring/reset-apply-contexts` | composer-authoring-workspace | Record Reset Apply |
 | `GET` | `/api/authoring/submission-outcome` | composer-authoring-workspace | Read Submission Outcome |
 | `GET` | `/api/authoring/workspace` | composer-authoring-workspace | Read Authoring Workspace |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
@@ -107,7 +108,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `POST` | `/api/program/draft/expression-check` | composer-draft | Check Expression |
 | `POST` | `/api/program/draft/mutations` | composer-draft | Mutate Draft |
-| `POST` | `/api/program/draft/runtime-override-promotions` | composer-draft | Materialize Runtime Override |
 | `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
 | `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
 | `POST` | `/api/program/new-draft` | composer-draft | New Draft |
@@ -121,14 +121,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
 | `POST` | `/api/program/runs/{program_run_id}/motion-start` | headless-runtime-client | Program Run Motion Start |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
+| `POST` | `/api/program/runs/{program_run_id}/node-correction-previews` | headless-runtime-client | Program Node Correction Preview |
 | `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-motion` | headless-runtime-client | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` | headless-runtime-client | Stage Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` | headless-runtime-client | Activate Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/clear` | headless-runtime-client | Clear Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/promote` | headless-runtime-client | Promote Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |

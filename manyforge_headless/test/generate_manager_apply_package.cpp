@@ -465,7 +465,6 @@ void WriteMetadata(
             std::string(scenario_id),
             core::ContentDigest("sha256:" + std::string(64U, 'e')),
             "optional",
-            deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
         },
         bundle, *model_map, *program.program, program.role_assignment,
         catalogs, raw_artifacts);

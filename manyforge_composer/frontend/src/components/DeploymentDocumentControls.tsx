@@ -1,11 +1,13 @@
 import { useState, type ReactNode } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ResetApplyController } from '../hooks/useResetApply';
 import type { ManagerDeploymentImpact } from '../types/api';
 import { deploymentMatchesApplied, deploymentUnapplied, deploymentActionUnavailableReason } from '../state/documentStates';
 import { OverlayPanel } from './OverlayPanel';
+import { ResetsRunWarning } from './ProgramDocumentControls';
 
-type Action = 'discard' | 'revert';
+type Action = 'discard' | 'revert' | 'apply';
 
 const DISPOSITION_LABEL = {
   add: 'Added',
@@ -86,13 +88,17 @@ export function DeploymentApplyImpactSummary({
 
 export function DeploymentDocumentControls({
   controller,
+  resetApply = null,
   scenarioCommands,
 }: {
   controller: DeploymentWorkspaceController;
+  /** Apply while a Program run exists Resets it first (one confirmation). */
+  resetApply?: ResetApplyController | null;
   /** The workspace-independent Scenario New/Save/Save as/Load commands. */
   scenarioCommands?: ReactNode;
 }) {
   const [action, setAction] = useState<Action | null>(null);
+  const [applyRefusal, setApplyRefusal] = useState<string | null>(null);
   const workspace = controller.workspace;
   // Manager Applied is the publication identity.  Runtime convergence is a
   // separate readiness concern and must not make the document controls
@@ -105,13 +111,22 @@ export function DeploymentDocumentControls({
   const pendingConfirmation = controller.pendingApplyConfirmation;
   // Why authoring is blocked comes first, so every disabled control explains
   // itself the same way the Program controls do.
-  const blockReason = controller.busy
-    ? 'Another Deployment operation is in progress.'
-    : controller.mutationUnavailableReason;
-  const close = () => setAction(null);
+  const busyReason = controller.busy ? 'Another Deployment operation is in progress.' : null;
+  const blockReason = busyReason ?? controller.mutationUnavailableReason;
+  // With a run, Apply ends it first: available when the Draft is editable
+  // (all Program motion stopped) and Reset is allowed.
+  const resetsRun = resetApply?.runExists === true;
+  const applyReason = busyReason ?? (resetsRun && resetApply !== null
+    ? resetApply.unavailableReason('deployment') : controller.documentUnavailableReason);
+  const close = () => {
+    setAction(null);
+    setApplyRefusal(null);
+  };
   const reasons = {
-    apply: deploymentActionUnavailableReason(workspace, 'apply', blockReason),
-    revert: deploymentActionUnavailableReason(workspace, 'revert', blockReason),
+    apply: deploymentActionUnavailableReason(workspace, 'apply', applyReason),
+    revert: deploymentActionUnavailableReason(
+      workspace, 'revert', busyReason ?? controller.documentUnavailableReason,
+    ),
     discard: deploymentActionUnavailableReason(workspace, 'discard', blockReason),
   };
   const complete = async (request: () => Promise<unknown>) => {
@@ -142,7 +157,7 @@ export function DeploymentDocumentControls({
             disabled={reasons.discard !== null}
             title={blockReason ?? (hasUnappliedChanges
               ? 'Discard Draft changes and return to Manager Applied.'
-              : 'Draft already matches Manager Applied.')}
+              : 'Nothing to apply: the Deployment Draft matches Manager Applied.')}
             onClick={() => setAction('discard')}
           >Discard</button>
           <button
@@ -155,12 +170,17 @@ export function DeploymentDocumentControls({
             type="button"
             className="primary-action"
             disabled={reasons.apply !== null}
-            title={blockReason ?? (!workspace?.draft.document
+            title={applyReason ?? (!workspace?.draft.document
               ? 'No Deployment Draft is loaded.'
               : draftMatchesManager
-                ? 'Draft already matches Manager Applied.'
-                : 'Validate and apply this Deployment Draft to runtime.')}
-            onClick={() => { void controller.applyDraft(); }}
+                ? 'Nothing to apply: the Deployment Draft matches Manager Applied.'
+                : resetsRun
+                  ? 'Reset the current run, then validate and apply this Deployment Draft.'
+                  : 'Validate and apply this Deployment Draft to runtime.')}
+            onClick={() => {
+              if (resetsRun) setAction('apply');
+              else void controller.applyDraft();
+            }}
           >{controller.applying ? 'Applying Deployment' : 'Apply'}</button>
         </div>
       </div>
@@ -168,7 +188,8 @@ export function DeploymentDocumentControls({
       {action !== null && (
         <OverlayPanel
           open
-          title={action === 'revert' ? 'Revert to saved Deployment?' : 'Discard Deployment changes?'}
+          title={action === 'revert' ? 'Revert to saved Deployment?'
+            : action === 'apply' ? 'Apply Deployment Draft?' : 'Discard Deployment changes?'}
           titleId="deployment-document-dialog-title"
           onClose={close}
           compact
@@ -178,6 +199,24 @@ export function DeploymentDocumentControls({
             <div className="dialog-copy compact-confirmation">
               <p>Discard the unsaved Deployment Draft changes?</p>
               <button type="button" className="primary-action" disabled={reasons.discard !== null} onClick={() => { void complete(controller.discard); }}>Discard changes</button>
+            </div>
+          )}
+          {action === 'apply' && resetApply !== null && (
+            <div className="dialog-copy compact-confirmation">
+              <p>Apply this Deployment Draft to runtime? Manager confirms any disruptive impact before it changes components.</p>
+              <ResetsRunWarning />
+              {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
+              <button
+                type="button"
+                className="primary-action"
+                disabled={reasons.apply !== null}
+                onClick={() => {
+                  void resetApply.confirm('deployment').then((refusal) => {
+                    if (refusal === null) close();
+                    else setApplyRefusal(refusal);
+                  });
+                }}
+              >Reset run and Apply Deployment</button>
             </div>
           )}
           {action === 'revert' && (
@@ -216,7 +255,7 @@ export function DeploymentDocumentControls({
               type="button"
               className="primary-action"
               disabled={reasons.apply !== null}
-              title={blockReason ?? 'Apply the validated Deployment to runtime.'}
+              title={applyReason ?? 'Apply the validated Deployment to runtime.'}
               onClick={() => { void controller.confirmApply(); }}
             >{controller.applying ? 'Applying Deployment' : 'Confirm apply'}</button>
           </div>

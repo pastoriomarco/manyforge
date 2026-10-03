@@ -56,7 +56,7 @@ async def qualify(core, config):
     )
     source._loop = loop
     record_value = {
-        "schema_version": "manyforge.program_diagnostic.v2",
+        "schema_version": "manyforge.program_diagnostic.v3",
         "owner_epoch": "cost.runner",
         **{
             key: "sha256:" + value * 64
@@ -72,9 +72,7 @@ async def qualify(core, config):
         "message": "History cost probe",
         "occurred_at_wall": "2026-09-08T10:00:00Z",
         "blackboard": {f"item{index}": "x" * 2048 for index in range(7)},
-        "runtime_overrides": {},
         "omitted_blackboard_count": 0,
-        "omitted_override_count": 0,
         "delivery_loss_count": 0,
         "details": None,
         "origin": {

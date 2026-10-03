@@ -55,7 +55,6 @@ _STATIC_FIELDS = frozenset(
 _WRAPPER_FIELDS = frozenset(
     {
         "metadata",
-        "modification_policy",
         "recovery_policy",
         "operator_stop_policy",
         "execution_groups",

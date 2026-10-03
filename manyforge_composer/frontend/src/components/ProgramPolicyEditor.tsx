@@ -1,71 +1,36 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
-  ProgramModificationPolicyValue,
-  ProgramInterventionDelegate,
-  ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
-  ProgramPersistenceCeiling,
-  ProgramRecoveryAction,
   ProgramTreeNode,
 } from '../types/api';
 
-export const ALLOWED_SKILLS_UNAVAILABLE_MESSAGE =
-  'Allowed recovery skills are unavailable: each skill requires an exact revision-qualified retained referent. Leave Allowed skills empty.';
-
-const DEFAULT_MODIFICATION_POLICY: ProgramNodeModificationPolicy = {
-  runtime_override: 'forbidden',
-  persistent_edit: 'forbidden',
-  intervention_delegate: 'forbidden',
-};
-const DEFAULT_RECOVERY_POLICY: ProgramNodeRecoveryPolicy = {
-  allow_intervention: false,
-  allowed_recovery_actions: [],
-  max_retries: 0,
-  allowed_skills: [],
-  persistence_ceiling: 'session_only',
-};
 const DEFAULT_OPERATOR_STOP_POLICY: ProgramOperatorStopPolicy = 'inherit';
-const RECOVERY_ACTIONS: ProgramRecoveryAction[] = [
-  'intervention',
-  'runtime_override',
-];
+/** Largest finite retry limit; 0 on the wire means Unlimited. */
+export const MAX_RETRY_LIMIT = 255;
 
 export interface ProgramPolicyForm {
-  modification_policy: ProgramNodeModificationPolicy;
-  recovery_policy: ProgramNodeRecoveryPolicy;
+  allow_intervention: boolean;
+  /** Unlimited is authored as `max_retries: 0`, never shown as a bare 0. */
+  retry_limit_mode: 'unlimited' | 'limited';
+  /** The finite limit while limited; NaN while the field is empty. */
+  retry_limit: number;
   operator_stop_policy: ProgramOperatorStopPolicy;
   execution_group_mode: 'inherit' | 'all' | 'named';
   execution_group_names: string;
 }
 
 export type ProgramPolicyField =
-  | 'modification_policy.runtime_override'
-  | 'modification_policy.persistent_edit'
-  | 'modification_policy.intervention_delegate'
-  | 'recovery_policy.allow_intervention'
-  | 'recovery_policy.allowed_recovery_actions'
   | 'recovery_policy.max_retries'
-  | 'recovery_policy.allowed_skills'
-  | 'recovery_policy.persistence_ceiling'
-  | 'operator_stop_policy'
   | 'execution_groups';
 
 export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm {
+  const maxRetries = node.recovery_policy?.max_retries ?? 0;
   return {
-    modification_policy: {
-      ...DEFAULT_MODIFICATION_POLICY,
-      ...node.modification_policy,
-    },
-    recovery_policy: {
-      ...DEFAULT_RECOVERY_POLICY,
-      ...node.recovery_policy,
-      allowed_recovery_actions: [
-        ...(node.recovery_policy?.allowed_recovery_actions ?? []),
-      ],
-      allowed_skills: [...(node.recovery_policy?.allowed_skills ?? [])],
-    },
+    allow_intervention: node.recovery_policy?.allow_intervention ?? false,
+    retry_limit_mode: maxRetries === 0 ? 'unlimited' : 'limited',
+    retry_limit: maxRetries === 0 ? 1 : maxRetries,
     operator_stop_policy: node.operator_stop_policy ?? DEFAULT_OPERATOR_STOP_POLICY,
     execution_group_mode: Array.isArray(node.execution_groups)
       ? 'named' : node.execution_groups ?? 'inherit',
@@ -74,12 +39,19 @@ export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm
   };
 }
 
-function setError(
-  errors: Partial<Record<ProgramPolicyField, string>>,
-  field: ProgramPolicyField,
-  message: string,
-) {
-  errors[field] = errors[field] ? `${errors[field]} ${message}` : message;
+/** The authored two-field policy the form describes. */
+export function programRecoveryPolicy(form: ProgramPolicyForm): ProgramNodeRecoveryPolicy {
+  return {
+    allow_intervention: form.allow_intervention,
+    max_retries: form.retry_limit_mode === 'unlimited' ? 0 : form.retry_limit,
+  };
+}
+
+/** "Unlimited" or "N retries": the authored zero is never shown as 0. */
+export function retryLimitLabel(maxRetries: number): string {
+  return maxRetries === 0
+    ? 'Unlimited'
+    : `${maxRetries} ${maxRetries === 1 ? 'retry' : 'retries'}`;
 }
 
 export function validateProgramPolicy(
@@ -91,79 +63,16 @@ export function validateProgramPolicy(
     if (groups.length > 4096 || new Set(groups).size !== groups.length
         || groups.some((name) => name.length > 128 || !/^[a-z][a-z0-9_.-]*$/.test(name)
           || name === 'all' || name === 'inherit')) {
-      setError(errors, 'execution_groups',
-        'Use unique lower-case group names separated by commas (letters, digits, _, . or -; start with a letter; at most 128 characters). All and inherit are reserved.');
-    }
-  }
-  const { modification_policy: modification, recovery_policy: recovery } = form;
-  const hasIntervention = recovery.allowed_recovery_actions.includes('intervention');
-  const hasRuntimeOverride = recovery.allowed_recovery_actions.includes('runtime_override');
-
-  if (recovery.allow_intervention !== hasIntervention) {
-    const message = 'Intervention permission must match the Intervention recovery action.';
-    setError(errors, 'recovery_policy.allow_intervention', message);
-    setError(errors, 'recovery_policy.allowed_recovery_actions', message);
-  }
-  if (recovery.allowed_skills.length > 0 && !hasIntervention) {
-    setError(
-      errors,
-      'recovery_policy.allowed_skills',
-      'Allowed skills require the Intervention recovery action.',
-    );
-  }
-  if (
-    (hasRuntimeOverride || recovery.persistence_ceiling === 'runtime_override')
-    && modification.runtime_override === 'forbidden'
-  ) {
-    const message = 'Runtime recovery action or persistence requires non-forbidden runtime override permission.';
-    setError(errors, 'modification_policy.runtime_override', message);
-    if (hasRuntimeOverride) {
-      setError(errors, 'recovery_policy.allowed_recovery_actions', message);
-    }
-    if (recovery.persistence_ceiling === 'runtime_override') {
-      setError(errors, 'recovery_policy.persistence_ceiling', message);
+      errors.execution_groups = 'Use unique lower-case group names separated by commas (letters, digits, _, . or -; start with a letter; at most 128 characters). All and inherit are reserved.';
     }
   }
   if (
-    recovery.persistence_ceiling === 'draft_patch'
-    && modification.persistent_edit === 'forbidden'
+    form.retry_limit_mode === 'limited'
+    && (!Number.isInteger(form.retry_limit)
+      || form.retry_limit < 1
+      || form.retry_limit > MAX_RETRY_LIMIT)
   ) {
-    const message = 'Draft-patch persistence requires non-forbidden persistent edit permission.';
-    setError(errors, 'modification_policy.persistent_edit', message);
-    setError(errors, 'recovery_policy.persistence_ceiling', message);
-  }
-  const nondefaultRecovery = recovery.allow_intervention
-    || recovery.allowed_recovery_actions.length > 0
-    || recovery.max_retries !== 0
-    || recovery.allowed_skills.length > 0
-    || recovery.persistence_ceiling !== 'session_only';
-  if (nondefaultRecovery && recovery.allowed_recovery_actions.length === 0) {
-    const message = 'A non-default recovery policy requires at least one recovery action.';
-    setError(errors, 'recovery_policy.allowed_recovery_actions', message);
-    if (recovery.allow_intervention) {
-      setError(errors, 'recovery_policy.allow_intervention', message);
-    }
-    if (recovery.max_retries !== 0) {
-      setError(errors, 'recovery_policy.max_retries', message);
-    }
-    if (recovery.persistence_ceiling !== 'session_only') {
-      setError(errors, 'recovery_policy.persistence_ceiling', message);
-    }
-    if (recovery.allowed_skills.length > 0) {
-      setError(errors, 'recovery_policy.allowed_skills', message);
-    }
-  }
-  if (!Number.isInteger(recovery.max_retries) || recovery.max_retries < 0 || recovery.max_retries > 255) {
-    setError(errors, 'recovery_policy.max_retries', 'Max retries must be an integer from 0 to 255.');
-  }
-  if (recovery.allowed_skills.length > 0) {
-    const message = hasIntervention
-      ? ALLOWED_SKILLS_UNAVAILABLE_MESSAGE
-      : `Allowed skills require the Intervention recovery action. ${ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}`;
-    setError(errors, 'recovery_policy.allowed_skills', message);
-    // Imported skills have no editable C1 control. Mark their nearest visible
-    // recovery control so the invalid retained value cannot be visually hidden.
-    setError(errors, 'recovery_policy.allowed_recovery_actions', message);
+    errors['recovery_policy.max_retries'] = `A retry limit is a whole number from 1 to ${MAX_RETRY_LIMIT}. Choose Unlimited for no limit.`;
   }
   return errors;
 }
@@ -204,12 +113,22 @@ interface ProgramPolicyEditorProps {
   busy: boolean;
   onUpdate: (
     instanceId: string,
-    modificationPolicy: ProgramNodeModificationPolicy,
     recoveryPolicy: ProgramNodeRecoveryPolicy,
     operatorStopPolicy: ProgramOperatorStopPolicy,
     executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => void;
   onInvalidChange?: (message: string | null) => void;
+}
+
+/** The exact authored values one commit would send. */
+function authoredPolicy(form: ProgramPolicyForm) {
+  return {
+    recovery: programRecoveryPolicy(form),
+    operatorStop: form.operator_stop_policy,
+    groups: form.execution_group_mode === 'named'
+      ? splitGroupNames(form.execution_group_names).sort()
+      : form.execution_group_mode,
+  };
 }
 
 export function ProgramPolicyEditor({
@@ -238,30 +157,20 @@ export function ProgramPolicyEditor({
     invalidChange.current?.(firstError);
   }, [firstError]);
   useEffect(() => () => invalidChange.current?.(null), []);
-  // The form last handed to onUpdate for this node: a later blur (or a repeated
-  // change) must not submit it again while the Draft round trip is pending.
+  // The policy last handed to onUpdate for this node: a later blur (or a
+  // repeated change) must not submit it again while the Draft round trip is
+  // pending.
   const submitted = useRef<string | null>(null);
   useEffect(() => {
     submitted.current = null;
   }, [node]);
   const commit = (next: ProgramPolicyForm = form) => {
-    const key = JSON.stringify(next);
-    if (busy || key === JSON.stringify(original) || key === submitted.current
-        || Object.keys(validateProgramPolicy(next)).length > 0) return;
+    if (busy || Object.keys(validateProgramPolicy(next)).length > 0) return;
+    const authored = authoredPolicy(next);
+    const key = JSON.stringify(authored);
+    if (key === JSON.stringify(authoredPolicy(original)) || key === submitted.current) return;
     submitted.current = key;
-    onUpdate(
-      node.instance_id,
-      { ...next.modification_policy },
-      {
-        ...next.recovery_policy,
-        allowed_recovery_actions: [...next.recovery_policy.allowed_recovery_actions],
-        allowed_skills: [...next.recovery_policy.allowed_skills],
-      },
-      next.operator_stop_policy,
-      next.execution_group_mode === 'named'
-        ? splitGroupNames(next.execution_group_names).sort()
-        : next.execution_group_mode,
-    );
+    onUpdate(node.instance_id, authored.recovery, authored.operatorStop, authored.groups);
   };
   // Membership checkboxes are discrete choices: they commit on change.
   const changeGroups = (groups: string[] | 'inherit') => {
@@ -280,33 +189,10 @@ export function ProgramPolicyEditor({
   // Memberships whose group is not declared stay visible so they can be removed.
   const missingGroups = resolvedGroups.filter((groupId) => !availableGroups.includes(groupId));
   const branch = node.children.length > 0;
-  const updateModification = (
-    field: keyof ProgramNodeModificationPolicy,
-    value: ProgramModificationPolicyValue | ProgramInterventionDelegate,
-  ) => {
-    setForm((current) => ({
-      ...current,
-      modification_policy: {
-        ...current.modification_policy,
-        [field]: value,
-      },
-    }));
-  };
-  const updateRecovery = <K extends keyof ProgramNodeRecoveryPolicy>(
-    field: K,
-    value: ProgramNodeRecoveryPolicy[K],
-  ) => {
-    setForm((current) => ({
-      ...current,
-      recovery_policy: {
-        ...current.recovery_policy,
-        [field]: value,
-      },
-    }));
-  };
   const errorId = (field: ProgramPolicyField) => fieldId(id, `${field}-error`);
   const describedBy = (field: ProgramPolicyField) =>
     errors[field] ? errorId(field) : undefined;
+  const retryError = errors['recovery_policy.max_retries'];
 
   return (
     <section className="program-policy-editor dcard" aria-labelledby={fieldId(id, 'title')}>
@@ -320,199 +206,86 @@ export function ProgramPolicyEditor({
         }}
       >
         <p className="program-policy-note hint">
-          Effective canonical defaults are shown when fields are omitted. Defaults
-          are saved by omission. These values are authored for future Run behavior;
-          they are not currently applied to the runtime. Saving policy changes only
-          this Draft. Save persists independently; global Apply makes the validated
-          Draft the live runtime Program. A Run already started keeps its captured policy.
+          Effective defaults are shown when fields are omitted; defaults are saved
+          by omission. Changes edit only this Draft. Save persists independently;
+          Apply makes the Draft the live Program. A Run captures this policy when
+          it starts, so a running Run keeps its captured policy.
         </p>
 
       <fieldset className="program-policy-fieldset">
-        <legend>Modification controls</legend>
-        <label className="program-policy-field" htmlFor={fieldId(id, 'runtime_override')}>
-          Runtime override
-          <select
-            id={fieldId(id, 'runtime_override')}
-            value={form.modification_policy.runtime_override}
-            disabled={busy}
-            aria-invalid={errors['modification_policy.runtime_override'] !== undefined}
-            aria-describedby={describedBy('modification_policy.runtime_override')}
-            title={errors['modification_policy.runtime_override']}
-            onChange={(event) => updateModification(
-              'runtime_override',
-              event.target.value as ProgramModificationPolicyValue,
-            )}
-          >
-            {selectOptions([
-              ['forbidden', 'Forbidden'],
-              ['human_approval', 'Human approval'],
-              ['llm_allowed', 'LLM allowed'],
-            ])}
-          </select>
-          <FieldError
-            id={errorId('modification_policy.runtime_override')}
-            message={errors['modification_policy.runtime_override']}
-          />
-        </label>
-        <label className="program-policy-field" htmlFor={fieldId(id, 'persistent_edit')}>
-          Persistent edit
-          <select
-            id={fieldId(id, 'persistent_edit')}
-            value={form.modification_policy.persistent_edit}
-            disabled={busy}
-            aria-invalid={errors['modification_policy.persistent_edit'] !== undefined}
-            aria-describedby={describedBy('modification_policy.persistent_edit')}
-            title={errors['modification_policy.persistent_edit']}
-            onChange={(event) => updateModification(
-              'persistent_edit',
-              event.target.value as ProgramModificationPolicyValue,
-            )}
-          >
-            {selectOptions([
-              ['forbidden', 'Forbidden'],
-              ['human_approval', 'Human approval'],
-              ['llm_allowed', 'LLM allowed'],
-            ])}
-          </select>
-          <FieldError
-            id={errorId('modification_policy.persistent_edit')}
-            message={errors['modification_policy.persistent_edit']}
-          />
-        </label>
-        <label className="program-policy-field" htmlFor={fieldId(id, 'intervention_delegate')}>
-          Intervention delegate
-          <select
-            id={fieldId(id, 'intervention_delegate')}
-            value={form.modification_policy.intervention_delegate}
-            disabled={busy}
-            onChange={(event) => updateModification(
-              'intervention_delegate',
-              event.target.value as ProgramInterventionDelegate,
-            )}
-          >
-            {selectOptions([
-              ['forbidden', 'Forbidden'],
-              ['human_only', 'Human only'],
-              ['llm_allowed', 'LLM allowed'],
-              ['program_only', 'Program only'],
-            ])}
-          </select>
-        </label>
-      </fieldset>
-
-      <fieldset className="program-policy-fieldset">
-        <legend>Recovery</legend>
+        <legend>Failure recovery</legend>
         <label className="program-policy-checkbox" htmlFor={fieldId(id, 'allow_intervention')}>
           <input
             id={fieldId(id, 'allow_intervention')}
             type="checkbox"
-            checked={form.recovery_policy.allow_intervention}
+            checked={form.allow_intervention}
             disabled={busy}
-            aria-invalid={errors['recovery_policy.allow_intervention'] !== undefined}
-            aria-describedby={describedBy('recovery_policy.allow_intervention')}
-            title={errors['recovery_policy.allow_intervention']}
-            onChange={(event) => updateRecovery('allow_intervention', event.target.checked)}
+            onChange={(event) => {
+              const next = { ...form, allow_intervention: event.target.checked };
+              setForm(next);
+              commit(next);
+            }}
           />
           Allow intervention
         </label>
-        <FieldError
-          id={errorId('recovery_policy.allow_intervention')}
-          message={errors['recovery_policy.allow_intervention']}
-        />
-
-        <fieldset className="program-policy-actions">
-          <legend>Allowed recovery actions</legend>
-          {RECOVERY_ACTIONS.map((action) => {
-            const actionId = fieldId(id, `action-${action}`);
-            return (
-              <label className="program-policy-checkbox" htmlFor={actionId} key={action}>
-                <input
-                  id={actionId}
-                  type="checkbox"
-                  checked={form.recovery_policy.allowed_recovery_actions.includes(action)}
-                  disabled={busy}
-                  aria-invalid={errors['recovery_policy.allowed_recovery_actions'] !== undefined}
-                  aria-describedby={describedBy('recovery_policy.allowed_recovery_actions')}
-                  title={errors['recovery_policy.allowed_recovery_actions']}
-                  onChange={(event) => {
-                    const actions = new Set(form.recovery_policy.allowed_recovery_actions);
-                    if (event.target.checked) actions.add(action);
-                    else actions.delete(action);
-                    updateRecovery(
-                      'allowed_recovery_actions',
-                      RECOVERY_ACTIONS.filter((candidate) => actions.has(candidate)),
-                    );
-                  }}
-                />
-                {action === 'runtime_override' ? 'Runtime override' : 'Intervention'}
-              </label>
-            );
-          })}
-          <FieldError
-            id={errorId('recovery_policy.allowed_recovery_actions')}
-            message={errors['recovery_policy.allowed_recovery_actions']}
-          />
-        </fieldset>
-
-        <label className="program-policy-field" htmlFor={fieldId(id, 'max_retries')}>
-          Max retries
-          <input
-            id={fieldId(id, 'max_retries')}
-            type="number"
-            min={0}
-            max={255}
-            step={1}
-            value={Number.isNaN(form.recovery_policy.max_retries) ? '' : form.recovery_policy.max_retries}
-            disabled={busy}
-            aria-invalid={errors['recovery_policy.max_retries'] !== undefined}
-            aria-describedby={describedBy('recovery_policy.max_retries')}
-            title={errors['recovery_policy.max_retries']}
-            onChange={(event) => updateRecovery(
-              'max_retries',
-              event.target.value.trim() === '' ? Number.NaN : Number(event.target.value),
-            )}
-          />
-          <FieldError
-            id={errorId('recovery_policy.max_retries')}
-            message={errors['recovery_policy.max_retries']}
-          />
-        </label>
-        <label className="program-policy-field" htmlFor={fieldId(id, 'persistence_ceiling')}>
-          Persistence ceiling
+        <p className="program-policy-help">
+          When this node fails, the run pauses and anyone (operator, assistant or
+          API) may correct it and Retry. Otherwise the failure ends the run. The
+          same rule applies to every caller.
+        </p>
+        <label className="program-policy-field" htmlFor={fieldId(id, 'retry_limit_mode')}>
+          Retry limit
           <select
-            id={fieldId(id, 'persistence_ceiling')}
-            value={form.recovery_policy.persistence_ceiling}
+            id={fieldId(id, 'retry_limit_mode')}
+            value={form.retry_limit_mode}
             disabled={busy}
-            aria-invalid={errors['recovery_policy.persistence_ceiling'] !== undefined}
-            aria-describedby={describedBy('recovery_policy.persistence_ceiling')}
-            title={errors['recovery_policy.persistence_ceiling']}
-            onChange={(event) => updateRecovery(
-              'persistence_ceiling',
-              event.target.value as ProgramPersistenceCeiling,
-            )}
+            onChange={(event) => {
+              const next: ProgramPolicyForm = {
+                ...form,
+                retry_limit_mode: event.target.value as ProgramPolicyForm['retry_limit_mode'],
+              };
+              setForm(next);
+              commit(next);
+            }}
           >
             {selectOptions([
-              ['session_only', 'Session only'],
-              ['runtime_override', 'Runtime override'],
-              ['draft_patch', 'Draft patch'],
+              ['unlimited', 'Unlimited'],
+              ['limited', 'Limit to'],
             ])}
           </select>
-          <FieldError
-            id={errorId('recovery_policy.persistence_ceiling')}
-            message={errors['recovery_policy.persistence_ceiling']}
-          />
         </label>
-
-        <p id={fieldId(id, 'skills-help')} className="program-policy-help">
-          {ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}
-        </p>
-        {form.recovery_policy.allowed_skills.length > 0 && (
-          <p className="program-form-error inline-message severity-error" role="alert">
-            Imported authored Allowed skills ({form.recovery_policy.allowed_skills.join(', ')})
-            are a blocking applicability error in this editor. Refresh or retry after
-            the retained referent contract is available.
-          </p>
+        {form.retry_limit_mode === 'limited' && (
+          <label className="program-policy-field" htmlFor={fieldId(id, 'max_retries')}>
+            Retries per run
+            <input
+              id={fieldId(id, 'max_retries')}
+              type="number"
+              min={1}
+              max={MAX_RETRY_LIMIT}
+              step={1}
+              value={Number.isNaN(form.retry_limit) ? '' : form.retry_limit}
+              disabled={busy}
+              aria-invalid={retryError !== undefined}
+              aria-describedby={describedBy('recovery_policy.max_retries')}
+              title={retryError}
+              onChange={(event) => setForm((current) => ({
+                ...current,
+                retry_limit: event.target.value.trim() === ''
+                  ? Number.NaN
+                  : Number(event.target.value),
+              }))}
+            />
+            <FieldError
+              id={errorId('recovery_policy.max_retries')}
+              message={retryError}
+            />
+          </label>
         )}
+        <p className="program-policy-help">
+          Counts explicit Retries of this node within one run. Unlimited never
+          retries automatically, and the limit applies only while intervention
+          is allowed. Resuming an operator Stop and Reset are not retries.
+        </p>
       </fieldset>
 
       <fieldset className="program-policy-fieldset">

@@ -53,8 +53,8 @@ function speedRequests(applied: AppliedProgramSelection): SpeedRequest[] {
 
 function requestSummary(requests: SpeedRequest[]): string {
   if (requests.length === 0) return 'none (Deployment maximum)';
-  // A Program parameter shows its default: the run may have started with
-  // another value, and the value actually admitted is not known here.
+  // A Program parameter's value is always its Program default: there is no
+  // Scenario or launch-time override.
   const labels = [...new Set(requests.map((request) => (
     request.parameterId !== null
       ? `${request.value ?? '?'} m/s (default of ${request.parameterId})`

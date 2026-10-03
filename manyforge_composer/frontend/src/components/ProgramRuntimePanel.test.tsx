@@ -21,7 +21,7 @@ import { readStyleSource } from '../styles/readStyleSource';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v3',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v4',
     offerId: `sha256:${'e'.repeat(64)}`,
     offerRevision: 1,
     generatedAtNs: 1,
@@ -76,7 +76,8 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
       origin: null,
     },
     evidenceRefs: [],
-    policy: {},
+    policy: { allowIntervention: false, maxRetries: 0 },
+    retriesUsed: 0,
   };
 }
 
@@ -163,11 +164,11 @@ function controller(
   return {
     commandAllowed: vi.fn(() => true),
     commandDisabledReason: vi.fn(() => null),
-    startBlockedReason: null,
+    draftUnappliedReason: null,
     state: {
       currentScenario: null,
       applied: {
-        schemaVersion: 'manyforge.applied_program_selection.v2',
+        schemaVersion: 'manyforge.applied_program_selection.v3',
         scenarioId: 'cell-pick',
         sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
         programId: 'next-pick',
@@ -206,7 +207,7 @@ function controller(
           },
         },
         programBinding: {
-          api_version: 'manyforge.program_binding.v1',
+          api_version: 'manyforge.program_binding.v2',
           program_binding_id: `sha256:${'c'.repeat(64)}`,
           program_id: 'next-pick',
           program_revision: `sha256:${'b'.repeat(64)}`,
@@ -289,12 +290,6 @@ function controller(
     resumeFullStop: vi.fn(),
     reset: vi.fn(),
     applyRecoveryAction: vi.fn(),
-    stageObservationOverride: vi.fn(),
-    activateRuntimeOverride: vi.fn(),
-    clearRuntimeOverride: vi.fn(),
-    promoteRuntimeOverride: vi.fn(),
-    materializePromotion: vi.fn(),
-    promotionMaterializationReason: vi.fn(() => null),
     writeRuntimeBlackboard: vi.fn(),
     persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
     stageManualResult: vi.fn(),
@@ -322,7 +317,8 @@ describe('Program runtime projection', () => {
     expect(markup).not.toContain('Execute Applied Program');
     expect(markup).not.toContain('Reset Program cycle');
     // Advanced tools exist only with run controls; no empty section otherwise.
-    expect(markup).not.toContain('Advanced: runtime overrides');
+    expect(markup).not.toContain('Advanced: runtime blackboard');
+    expect(markup).not.toContain('Runtime overrides');
   });
 
   it('offers typed runtime writes and shows the backend reason when they are refused', () => {
@@ -342,7 +338,7 @@ describe('Program runtime projection', () => {
       <ProgramRuntimePanel enabled controller={halted} />,
     );
 
-    expect(markup).toContain('Advanced: runtime overrides, blackboard, stored values and audit');
+    expect(markup).toContain('Advanced: runtime blackboard, stored values and audit');
     // Only writable keys with a typed editor; no raw JSON entry remains.
     expect(markup).toContain('<option value="flag">flag · bool</option>');
     expect(markup).toContain('<option value="layer">layer · int64</option>');
@@ -374,6 +370,31 @@ describe('Program runtime projection', () => {
       <ProgramRuntimePanel enabled controller={unknownMotion} />,
     );
     expect(unknownMarkup).toContain('<span>Motion</span><strong>Unknown</strong>');
+  });
+
+  it('shows the captured retry budget, with zero as Unlimited, and where to correct', () => {
+    const held = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = {
+      ...controls.recoveryOffer!,
+      recoveryClass: 'node_failure_pause',
+      nodeInstanceId: 'move',
+      policy: { allowIntervention: true, maxRetries: 0 },
+      retriesUsed: 300,
+    };
+    held.state.controls = controls;
+    const unlimited = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={held} />);
+    expect(unlimited).toContain('Retry limit Unlimited · 300 used');
+    expect(unlimited).toContain('change a runtime value for this run under Advanced');
+    expect(unlimited).toContain('Apply then Resets the run');
+    expect(unlimited).not.toContain('Retry limit 0');
+    controls.recoveryOffer = {
+      ...controls.recoveryOffer!,
+      policy: { allowIntervention: true, maxRetries: 3 },
+      retriesUsed: 1,
+    };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={held} />))
+      .toContain('Retry limit 3 · 1 used');
   });
 
   it('distinguishes ordinary Motion Stop from whole-Program Stop', () => {

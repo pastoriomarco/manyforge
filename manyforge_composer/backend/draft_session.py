@@ -26,6 +26,7 @@ from manyforge_behavior.geometry import (
     rpy_deg_to_xyzw,
 )
 from manyforge_behavior.program import (
+    MAX_RECOVERY_POLICY_RETRIES,
     Program,
     ProgramValidationError,
     merge_param_patch,
@@ -117,88 +118,9 @@ def _is_portable_id(value: Any) -> bool:
     )
 
 
-_SKILL_REFERENT_UNAVAILABLE_MESSAGE = (
-    "Allowed recovery skills are unavailable: each skill requires an exact "
-    "revision-qualified retained referent. Leave Allowed skills empty."
-)
-_MODIFICATION_POLICY_FIELDS = frozenset(
-    {"runtime_override", "persistent_edit", "intervention_delegate"}
-)
-_RECOVERY_POLICY_FIELDS = frozenset(
-    {
-        "allow_intervention",
-        "allowed_recovery_actions",
-        "max_retries",
-        "allowed_skills",
-        "persistence_ceiling",
-    }
-)
-_MODIFICATION_POLICY_VALUES = {
-    "runtime_override": frozenset({"forbidden", "human_approval", "llm_allowed"}),
-    "persistent_edit": frozenset({"forbidden", "human_approval", "llm_allowed"}),
-    "intervention_delegate": frozenset(
-        {"forbidden", "human_only", "llm_allowed", "program_only"}
-    ),
-}
-_RECOVERY_ACTIONS = frozenset({"intervention", "runtime_override"})
-_PERSISTENCE_CEILINGS = frozenset(
-    {"session_only", "runtime_override", "draft_patch"}
-)
+_RECOVERY_POLICY_FIELDS = frozenset({"allow_intervention", "max_retries"})
 _OPERATOR_STOP_POLICIES = frozenset({"inherit", "hold", "continue"})
-_DEFAULT_MODIFICATION_POLICY = {
-    "runtime_override": "forbidden",
-    "persistent_edit": "forbidden",
-    "intervention_delegate": "forbidden",
-}
-_DEFAULT_RECOVERY_POLICY = {
-    "allow_intervention": False,
-    "allowed_recovery_actions": [],
-    "max_retries": 0,
-    "allowed_skills": [],
-    "persistence_ceiling": "session_only",
-}
-
-
-def draft_applicability(document: dict[str, Any]) -> dict[str, Any]:
-    """Return the one Draft-wide C1 applicability projection.
-
-    Canonical Program parsing deliberately accepts retained skill IDs.  C1
-    cannot resolve those IDs, so this separate projection is the boundary
-    consumed by Apply and the workspace editor.
-    """
-
-    affected_instance_ids: list[str] = []
-    pending: list[Any] = []
-    tree = document.get("tree")
-    if type(tree) is dict:
-        pending.append(tree)
-    while pending:
-        node = pending.pop()
-        recovery = node.get("recovery_policy")
-        skills = recovery.get("allowed_skills") if type(recovery) is dict else None
-        if type(skills) is list and skills:
-            instance_id = node.get("instance_id")
-            if type(instance_id) is str:
-                affected_instance_ids.append(instance_id)
-        children = node.get("children")
-        if type(children) is list:
-            pending.extend(
-                child for child in reversed(children) if type(child) is dict
-            )
-    unavailable_reason = (
-        {
-            "code": "composer_policy_skill_referent_unavailable",
-            "message": _SKILL_REFERENT_UNAVAILABLE_MESSAGE,
-            "restorationGates": [],
-        }
-        if affected_instance_ids
-        else None
-    )
-    return {
-        "applyReady": not affected_instance_ids,
-        "affectedInstanceIds": affected_instance_ids,
-        "unavailableReason": unavailable_reason,
-    }
+_DEFAULT_RECOVERY_POLICY = {"allow_intervention": False, "max_retries": 0}
 
 
 class DraftSessionError(RuntimeError):
@@ -468,10 +390,9 @@ def _lookup_exact_instance(
 
 def _node_policy_arguments(
     arguments: dict[str, Any],
-) -> tuple[str, dict[str, str], dict[str, Any], str]:
+) -> tuple[str, dict[str, Any], str]:
     expected_fields = {
         "instance_id",
-        "modification_policy",
         "recovery_policy",
         "operator_stop_policy",
     }
@@ -495,118 +416,23 @@ def _node_policy_arguments(
             status_code=409,
         )
 
-    modification = arguments["modification_policy"]
-    if (
-        type(modification) is not dict
-        or set(modification) != _MODIFICATION_POLICY_FIELDS
-    ):
-        _error(
-            "draft_arguments_invalid",
-            "modification_policy must contain exactly its canonical fields",
-        )
-    for field, allowed in _MODIFICATION_POLICY_VALUES.items():
-        value = modification[field]
-        if type(value) is not str or value not in allowed:
-            _error(
-                "draft_arguments_invalid",
-                f"modification_policy.{field} has an unsupported value",
-            )
-
     recovery = arguments["recovery_policy"]
     if type(recovery) is not dict or set(recovery) != _RECOVERY_POLICY_FIELDS:
         _error(
             "draft_arguments_invalid",
-            "recovery_policy must contain exactly its canonical fields",
+            "recovery_policy must contain exactly allow_intervention and max_retries",
         )
     if type(recovery["allow_intervention"]) is not bool:
         _error(
             "draft_arguments_invalid",
             "recovery_policy.allow_intervention must be boolean",
         )
-    actions = recovery["allowed_recovery_actions"]
-    if (
-        type(actions) is not list
-        or len(actions) > len(_RECOVERY_ACTIONS)
-        or any(
-            type(action) is not str or action not in _RECOVERY_ACTIONS
-            for action in actions
-        )
-        or len(actions) != len(set(actions))
-        or actions != sorted(actions)
-    ):
-        _error(
-            "draft_arguments_invalid",
-            "recovery_policy.allowed_recovery_actions is invalid",
-        )
     retries = recovery["max_retries"]
-    if type(retries) is not int or not 0 <= retries <= 255:
+    if type(retries) is not int or not 0 <= retries <= MAX_RECOVERY_POLICY_RETRIES:
         _error(
             "draft_arguments_invalid",
-            "recovery_policy.max_retries must be an integer in 0..255",
-        )
-    skills = recovery["allowed_skills"]
-    if type(skills) is list and skills:
-        _error(
-            "composer_policy_skill_referent_unavailable",
-            _SKILL_REFERENT_UNAVAILABLE_MESSAGE,
-            status_code=409,
-        )
-    if type(skills) is not list or len(skills) > 256:
-        _error(
-            "draft_arguments_invalid",
-            "recovery_policy.allowed_skills is invalid",
-        )
-    for skill in skills:
-        if (
-            type(skill) is not str
-            or re.fullmatch(r"^[a-z][a-z0-9_.-]*$", skill) is None
-            or len(skill.encode("ascii", errors="ignore")) != len(skill)
-            or len(skill.encode("ascii", errors="ignore")) > 128
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "recovery_policy.allowed_skills is invalid",
-            )
-    if skills != sorted(skills) or len(skills) != len(set(skills)):
-        _error(
-            "draft_arguments_invalid",
-            "recovery_policy.allowed_skills is not canonical-sorted",
-        )
-    persistence = recovery["persistence_ceiling"]
-    if (
-        type(persistence) is not str
-        or persistence not in _PERSISTENCE_CEILINGS
-    ):
-        _error(
-            "draft_arguments_invalid",
-            "recovery_policy.persistence_ceiling is invalid",
-        )
-
-    action_set = set(actions)
-    if recovery["allow_intervention"] != ("intervention" in action_set):
-        _error(
-            "composer_draft_validation_failed",
-            "recovery_policy.allow_intervention must match the intervention action",
-        )
-    if "runtime_override" in action_set and modification["runtime_override"] == "forbidden":
-        _error(
-            "composer_draft_validation_failed",
-            "runtime_override recovery requires permitted runtime override modification",
-        )
-    if persistence == "runtime_override" and modification["runtime_override"] == "forbidden":
-        _error(
-            "composer_draft_validation_failed",
-            "runtime_override persistence requires permitted runtime override modification",
-        )
-    if persistence == "draft_patch" and modification["persistent_edit"] == "forbidden":
-        _error(
-            "composer_draft_validation_failed",
-            "draft_patch persistence requires permitted persistent edit modification",
-        )
-    if recovery != _DEFAULT_RECOVERY_POLICY and not action_set:
-        _error(
-            "composer_draft_validation_failed",
-            "non-default recovery policy requires at least one recovery action",
+            "recovery_policy.max_retries must be an integer in "
+            f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)",
         )
 
     operator_stop = arguments["operator_stop_policy"]
@@ -618,12 +444,7 @@ def _node_policy_arguments(
             "draft_arguments_invalid",
             "operator_stop_policy must be inherit, hold, or continue",
         )
-    return (
-        instance_id,
-        deepcopy(modification),
-        deepcopy(recovery),
-        operator_stop,
-    )
+    return instance_id, deepcopy(recovery), operator_stop
 
 
 def _insert_index(arguments: dict[str, Any], child_count: int) -> int:
@@ -1144,11 +965,10 @@ class ComposerDraftSession:
         matches_saved = self._matches_saved_locked()
         program_document = program.to_dict() if program is not None else None
         applicability = (
-            draft_applicability(program_document)
+            {"applyReady": True, "unavailableReason": None}
             if program_document is not None
             else {
                 "applyReady": False,
-                "affectedInstanceIds": [],
                 "unavailableReason": {
                     "code": "composer_authoring_draft_incomplete",
                     "message": (
@@ -3027,12 +2847,7 @@ class ComposerDraftSession:
         arguments: dict[str, Any],
         _catalog: NodeCatalog,
     ) -> dict[str, Any]:
-        (
-            instance_id,
-            modification,
-            recovery,
-            operator_stop,
-        ) = _node_policy_arguments(arguments)
+        instance_id, recovery, operator_stop = _node_policy_arguments(arguments)
         groups = None
         if "execution_groups" in arguments:
             try:
@@ -3040,10 +2855,6 @@ class ComposerDraftSession:
             except ProgramValidationError as error:
                 _error("draft_arguments_invalid", str(error))
         node = _lookup_exact_instance(document["forest"], instance_id)
-        if modification == _DEFAULT_MODIFICATION_POLICY:
-            node.pop("modification_policy", None)
-        else:
-            node["modification_policy"] = modification
         if recovery == _DEFAULT_RECOVERY_POLICY:
             node.pop("recovery_policy", None)
         else:

@@ -30,7 +30,6 @@ from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
 from manyforge_composer.backend.routes_draft import (
     _assistant_proposal_operations,
     _observed_scene_arguments,
-    _require_apply_ready,
 )
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -109,6 +108,25 @@ class _AuthoringPassThrough:
                 install=install,
             )
         return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
+
+    def execute_draft_edit(
+        self, _envelope, *, workspace, session, draft_id, expected_identity,
+        install, validate=None, **_kwargs,
+    ):
+        """A Draft-only edit through the real composite owner; no Kernel."""
+
+        if validate is not None:
+            validate()
+        commit = (
+            workspace.commit_deployment if session == "deployment"
+            else workspace.commit_program
+        )
+        return LocalAuthoringCommit(
+            snapshot=commit(
+                draft_id=draft_id, expected_identity=expected_identity, install=install
+            ),
+            admission_generation=2,
+        )
 
 
 _FENCED_STATE: ComposerState | None = None
@@ -998,18 +1016,7 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
     ).json()
     arguments = {
         "instance_id": "move_to_pick",
-        "modification_policy": {
-            "runtime_override": "human_approval",
-            "persistent_edit": "human_approval",
-            "intervention_delegate": "human_only",
-        },
-        "recovery_policy": {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 1,
-            "allowed_skills": [],
-            "persistence_ceiling": "draft_patch",
-        },
+        "recovery_policy": {"allow_intervention": True, "max_retries": 1},
         "operator_stop_policy": "hold",
     }
 
@@ -1094,7 +1101,7 @@ def test_program_settings_mutation_is_validated_and_draft_only(
     assert source.read_bytes() == original_bytes
 
 
-@pytest.mark.parametrize("invalid", ["skills", "instance_id"])
+@pytest.mark.parametrize("invalid", ["removed_policy_field", "instance_id"])
 def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
     tmp_path: Path,
     invalid: str,
@@ -1128,20 +1135,11 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
     )
     arguments = {
         "instance_id": "move_to_pick",
-        "modification_policy": {
-            "runtime_override": "human_approval",
-            "persistent_edit": "human_approval",
-            "intervention_delegate": "human_only",
-        },
-        "recovery_policy": {
-            "allow_intervention": True,
-            "allowed_recovery_actions": ["intervention"],
-            "max_retries": 1,
-            "allowed_skills": ["inspect"] if invalid == "skills" else [],
-            "persistence_ceiling": "draft_patch",
-        },
+        "recovery_policy": {"allow_intervention": True, "max_retries": 1},
         "operator_stop_policy": "hold",
     }
+    if invalid == "removed_policy_field":
+        arguments["recovery_policy"]["allowed_skills"] = []
     if invalid == "instance_id":
         arguments["instance_id"] = "a" + ("b" * 128)
 
@@ -1154,142 +1152,11 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
         },
     )
 
-    assert response.status_code == 409
-    if invalid == "skills":
-        assert response.json()["detail"] == {
-            "code": "composer_policy_skill_referent_unavailable",
-            "message": (
-                "Allowed recovery skills are unavailable: each skill requires "
-                "an exact revision-qualified retained referent. Leave Allowed "
-                "skills empty."
-            ),
-        }
-    else:
-        assert response.json()["detail"]["code"] == "draft_arguments_invalid"
+    assert response.status_code == (400 if invalid == "removed_policy_field" else 409)
+    assert response.json()["detail"]["code"] == "draft_arguments_invalid"
     assert headless.calls == []
     assert state.draft_session.workspace_snapshot() == before
     assert source.read_bytes() == original_bytes
-
-
-def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_free(
-    tmp_path: Path,
-) -> None:
-    catalog = build_node_environment().catalog
-    document = Program(_SOURCE_PROGRAM, catalog).to_dict()
-    document["tree"]["children"][0]["modification_policy"] = {
-        "runtime_override": "human_approval",
-        "persistent_edit": "human_approval",
-        "intervention_delegate": "human_only",
-    }
-    document["tree"]["children"][0]["recovery_policy"] = {
-        "allow_intervention": True,
-        "allowed_recovery_actions": ["intervention"],
-        "max_retries": 0,
-        "allowed_skills": ["legacy.inspect"],
-        "persistence_ceiling": "session_only",
-    }
-    document["program_revision"] = compute_content_identity(
-        document,
-        own_field="program_revision",
-        identity_domain="program-revision",
-        api_version="manyforge.program.v2",
-    )
-    program = Program.from_dict(document, catalog)
-
-    class FailOnHeadlessCall:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        def __getattr__(self, name: str) -> object:
-            self.calls.append(name)
-            raise AssertionError(f"unexpected headless call: {name}")
-
-    headless = FailOnHeadlessCall()
-    state = _enable_authoring(ComposerState(
-        program=program,
-    ))
-    client = TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(tmp_path)],
-                cors_origins=["http://localhost:3000"],
-            ),
-        )
-    )
-    before = state.draft_session.snapshot()
-    workspace = state.draft_session.workspace_snapshot()
-    assert workspace["applicability"] == {
-        "applyReady": False,
-        "affectedInstanceIds": ["move_to_pick"],
-        "unavailableReason": {
-            "code": "composer_policy_skill_referent_unavailable",
-            "message": (
-                "Allowed recovery skills are unavailable: each skill requires "
-                "an exact revision-qualified retained referent. Leave Allowed "
-                "skills empty."
-            ),
-            "restorationGates": [],
-        },
-    }
-    response = client.post(
-        "/api/program/draft/mutations",
-        json={
-            **_fence(workspace),
-            "mutation": "program_draft_update_node_policies",
-            "arguments": {
-                "instance_id": "remove_table",
-                "modification_policy": {
-                    "runtime_override": "forbidden",
-                    "persistent_edit": "forbidden",
-                    "intervention_delegate": "forbidden",
-                },
-                "recovery_policy": {
-                    "allow_intervention": False,
-                    "allowed_recovery_actions": [],
-                    "max_retries": 0,
-                    "allowed_skills": [],
-                    "persistence_ceiling": "session_only",
-                },
-                "operator_stop_policy": "hold",
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert set(body) == {
-        "mutation",
-        "details",
-        "workspace",
-        "authoringWorkspace",
-    }
-    assert body["workspace"]["draft"]["program"]["tree"]["children"][0][
-        "recovery_policy"
-    ]["allowed_skills"] == ["legacy.inspect"]
-    assert body["workspace"]["draft"]["draftRevision"] == before["draft_revision"] + 1
-
-    blocked_apply = client.post(
-        "/api/program/apply",
-        json=_fence(body["workspace"]),
-    )
-    assert blocked_apply.status_code == 409
-    assert blocked_apply.json()["detail"] == {
-        "code": "composer_policy_skill_referent_unavailable",
-        "message": (
-            "Allowed recovery skills are unavailable: each skill requires "
-            "an exact revision-qualified retained referent. Leave Allowed "
-            "skills empty."
-        ),
-        "context": {"affectedInstanceIds": ["move_to_pick"]},
-    }
-    assert headless.calls == []
-
-    with pytest.raises(DraftSessionError) as direct_apply:
-        _require_apply_ready(program)
-    assert direct_apply.value.status_code == 409
-    assert direct_apply.value.code == "composer_policy_skill_referent_unavailable"
-    assert headless.calls == []
 
 
 def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(
@@ -1647,7 +1514,6 @@ def _expression_program(tmp_path: Path) -> Path:
             "parameter_id": parameter_id,
             "type": value_type,
             "default": default,
-            "runtime_mutability": "before_run",
         }
 
     def key(name: str, value_type: str, **extra) -> dict:
@@ -1904,3 +1770,156 @@ def test_workspace_reports_the_names_each_draft_formula_reads(tmp_path: Path) ->
     assert draft["formulaReferences"] == expected
     snapshot = client.get("/api/authoring/workspace").json()
     assert snapshot["program"]["formulaReferences"] == expected
+
+
+def _reset_apply_context(**changes) -> dict:
+    return {
+        "schemaVersion": "manyforge.composer_reset_apply_context.v1",
+        "correlationId": "reset-apply.1",
+        "document": "program",
+        "programRunId": "program-run.7",
+        "programRunnerOwnerEpoch": "program-runner.epoch.1",
+        "cycleGeneration": 7,
+        "draftId": "draft-1",
+        "draftRevision": 3,
+        "draftContentRevision": "sha256:" + "a" * 64,
+        "appliedRevision": "sha256:" + "b" * 64,
+        **changes,
+    }
+
+
+def test_reset_apply_context_is_bounded_logged_once_and_grants_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _client(tmp_path)
+    before = client.get("/api/program/workspace").json()
+    with caplog.at_level("INFO", logger="manyforge_composer.reset_apply"):
+        recorded = client.post(
+            "/api/authoring/reset-apply-contexts", json=_reset_apply_context()
+        )
+    assert recorded.status_code == 200, recorded.text
+    assert recorded.json() == {"correlationId": "reset-apply.1", "recorded": True}
+    [record] = [row for row in caplog.records if row.msg == "reset_apply_context"]
+    assert record.reset_apply_correlation_id == "reset-apply.1"
+    assert (record.document, record.program_run_id, record.cycle_generation) == (
+        "program", "program-run.7", 7,
+    )
+    assert record.draft_revision == 3
+    # Metadata only: no Draft, workspace or runtime change.
+    assert client.get("/api/program/workspace").json() == before
+
+    for invalid in (
+        _reset_apply_context(document="scene"),
+        _reset_apply_context(cycleGeneration=-1),
+        _reset_apply_context(draftId=""),
+        {**_reset_apply_context(), "authority": "reset"},
+    ):
+        assert client.post(
+            "/api/authoring/reset-apply-contexts", json=invalid
+        ).status_code == 422
+
+
+@pytest.mark.parametrize("correlation", [None, "reset-apply.1"])
+def test_program_apply_preserves_a_shared_reset_apply_correlation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, correlation: str | None
+) -> None:
+    program = Program(_copy_program(tmp_path), build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    submitted: list[dict] = []
+
+    class Admission(_AuthoringPassThrough):
+        def execute_external_submission(
+            self, _envelope, *, validate_under_claim, submit, **_kwargs
+        ):
+            validate_under_claim({})
+            return submit({})
+
+    state.authoring_admission = Admission()  # type: ignore[assignment]
+    closure = {"closure": "fixture"}
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {}})
+    monkeypatch.setattr(state, "applied_activation_for_publication", lambda _p: {
+        "deployment": {"components": []},
+        "program_role_assignment": {"component_roles": [], "target_roles": []},
+        "source_document_digest": "sha256:" + "b" * 64,
+        "scenario_id": "cell",
+        "project_path": str(tmp_path),
+        "model_source_closure": closure,
+    })
+    monkeypatch.setattr(
+        routes_draft, "capture_deployment_model_sources", lambda *_a, **_k: closure
+    )
+    monkeypatch.setattr(routes_draft, "_active_catalog", lambda s: s.node_catalog)
+    monkeypatch.setattr(routes_draft, "_workspace", lambda _s: {})
+    monkeypatch.setattr(state, "_manager_current", lambda _s: ("bundle", "graph", "epoch"))
+
+    def execute(intent, claim, *, apply, prepared=None, prepare_only=False):
+        if prepare_only:
+            return {"confirmation_required": False, "prepared_activation": {}}
+        submitted.append(intent)
+        return {"status": "accepted", "apply_id": "apply-1", "apply_generation": 4}
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", execute)
+    client = TestClient(create_app(state, security=SecurityConfig(
+        allowed_fs_roots=[str(tmp_path)], cors_origins=["http://localhost:3000"],
+    )))
+    # Only the Manager read the activation needs; the app routes no headless.
+    # The Applied Program is unreadable here, which never proves a no-op.
+    def program_applied():
+        raise HeadlessClientError("headless_http_timeout", "timed out")
+
+    state.headless_client = SimpleNamespace(  # type: ignore[assignment]
+        manager_status=lambda: {}, program_applied=program_applied,
+    )
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    if correlation is not None:
+        body["correlationId"] = correlation
+    response = client.post("/api/program/apply", json=body)
+
+    assert response.status_code == 202, response.text
+    assert "typed_parameter_overrides" not in submitted[0]
+    # The Manager record carries the shared reference with its own request ID.
+    assert submitted[0]["correlation_id"] == (correlation or body["requestId"])
+    assert submitted[0]["manager_request_id"].startswith("program-activation-")
+
+
+
+
+def test_program_apply_refuses_a_no_op_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    program = Program(_copy_program(tmp_path), build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+
+    class Admission(_AuthoringPassThrough):
+        def execute_external_submission(self, *_args, **_kwargs):
+            pytest.fail("a no-op Apply must not reach admission")
+
+    state.authoring_admission = Admission()  # type: ignore[assignment]
+
+    def prepare(*_args, **_kwargs):
+        pytest.fail("a no-op Apply must not prepare an activation")
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare)
+    monkeypatch.setattr(routes_draft, "_active_catalog", lambda s: s.node_catalog)
+    # The Applied Program already is exactly the Draft.
+    monkeypatch.setattr(routes_draft, "_applied_context", lambda _s: (
+        SimpleNamespace(program_revision=program.program_revision), None,
+    ))
+    client = TestClient(create_app(state, security=SecurityConfig(
+        allowed_fs_roots=[str(tmp_path)], cors_origins=["http://localhost:3000"],
+    )))
+    state.headless_client = SimpleNamespace(  # type: ignore[assignment]
+        manager_status=lambda: {}
+    )
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    response = client.post("/api/program/apply", json=body)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "program_apply_nothing_to_apply"
+    assert response.json()["detail"]["message"].startswith("Nothing to apply")

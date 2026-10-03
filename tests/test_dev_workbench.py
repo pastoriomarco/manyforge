@@ -349,7 +349,7 @@ def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path)
     project = tmp_path / "cell.scenario"
     project.mkdir()
     (project / "scenario.yaml").write_text(
-        '{"api_version":"manyforge.scenario.project.v1",'
+        '{"api_version":"manyforge.scenario.project.v2",'
         '"scenario_id":"cell"}',
         encoding="utf-8",
     )

@@ -465,7 +465,6 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.5,
                 "constraints": {"min_exclusive": 0.0, "max_inclusive": 1.0},
-                "runtime_mutability": "before_run",
                 "description": "Acceleration scale shared by the two planned motions.",
             },
             {
@@ -473,7 +472,6 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.01,
                 "constraints": {"min_inclusive": 0.0},
-                "runtime_mutability": "before_run",
                 "description": "Default maximum Cartesian blend deviation.",
             },
             {
@@ -481,7 +479,6 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.15,
                 "constraints": {"min_exclusive": 0.0},
-                "runtime_mutability": "before_run",
                 "description": "Maximum TCP linear speed shared by the two robots.",
             },
             {
@@ -489,7 +486,6 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.005,
                 "constraints": {"min_exclusive": 0.0},
-                "runtime_mutability": "before_run",
                 "description": "Default Cartesian translation tolerance.",
             },
             {
@@ -497,7 +493,6 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "type": "float64",
                 "default": 0.35,
                 "constraints": {"min_exclusive": 0.0, "max_inclusive": 1.0},
-                "runtime_mutability": "before_run",
                 "description": "Velocity scale shared by the two planned motions.",
             },
         ],

@@ -253,16 +253,7 @@ struct BindingContext final {
   auto value = make_binding_value(context);
   value.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
       manyforge::core::ProgramNodeInstanceId("root"),
-      manyforge::core::ProgramNodeModificationPolicyDTO{
-          manyforge::core::ProgramModificationPolicyValue::kHumanApproval,
-          manyforge::core::ProgramModificationPolicyValue::kForbidden,
-          manyforge::core::ProgramInterventionDelegate::kHumanOnly},
-      manyforge::core::ProgramNodeRecoveryPolicyDTO{
-          false,
-          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
-          1U,
-          {},
-          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{true, 1U},
       manyforge::core::ProgramOperatorStopPolicy::kHold});
   return value;
 }
@@ -439,16 +430,7 @@ TEST(ProgramBindingTest, NodePoliciesAreRequiredSparseAndIdentitySensitive) {
   ProgramBindingDTO value = make_binding_value(context);
   value.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
       manyforge::core::ProgramNodeInstanceId("root"),
-      manyforge::core::ProgramNodeModificationPolicyDTO{
-          manyforge::core::ProgramModificationPolicyValue::kHumanApproval,
-          manyforge::core::ProgramModificationPolicyValue::kForbidden,
-          manyforge::core::ProgramInterventionDelegate::kHumanOnly},
-      manyforge::core::ProgramNodeRecoveryPolicyDTO{
-          false,
-          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
-          1U,
-          {},
-          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{true, 1U},
       manyforge::core::ProgramOperatorStopPolicy::kHold});
   const auto sealed = ProgramBindingConstructionAuthority::seal(value);
 
@@ -474,50 +456,26 @@ TEST(ProgramBindingTest, NodePolicyWireAndCrossFieldNegativesFailClosed) {
   default_row.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
       manyforge::core::ProgramNodeInstanceId("root"),
       {},
-      {},
       manyforge::core::ProgramOperatorStopPolicy::kInherit});
   EXPECT_THROW(
       static_cast<void>(
           ProgramBindingConstructionAuthority::seal(std::move(default_row))),
       ProgramBindingError);
 
-  ProgramBindingDTO cross_field = make_binding_value(context);
-  cross_field.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
+  // Zero is Unlimited: an intervention-allowing row with a zero budget is a
+  // real non-default policy, never a default to omit.
+  ProgramBindingDTO unlimited = make_binding_value(context);
+  unlimited.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
       manyforge::core::ProgramNodeInstanceId("root"),
-      {},
-      manyforge::core::ProgramNodeRecoveryPolicyDTO{
-          false,
-          {manyforge::core::ProgramRecoveryAction::kRuntimeOverride},
-          0U,
-          {},
-          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
+      manyforge::core::ProgramNodeRecoveryPolicyDTO{true, 0U},
       manyforge::core::ProgramOperatorStopPolicy::kInherit});
-  EXPECT_THROW(
-      static_cast<void>(
-          ProgramBindingConstructionAuthority::seal(std::move(cross_field))),
-      ProgramBindingError);
-
-  ProgramBindingDTO skills = make_binding_value(context);
-  skills.node_policies.push_back(manyforge::core::ProgramNodePolicyDTO{
-      manyforge::core::ProgramNodeInstanceId("root"),
-      {},
-      manyforge::core::ProgramNodeRecoveryPolicyDTO{
-          true,
-          {manyforge::core::ProgramRecoveryAction::kIntervention},
-          0U,
-          {"unqualified-skill"},
-          manyforge::core::ProgramRecoveryPersistenceCeiling::kSessionOnly},
-      manyforge::core::ProgramOperatorStopPolicy::kInherit});
-  try {
-    static_cast<void>(
-        ProgramBindingConstructionAuthority::seal(std::move(skills)));
-    FAIL() << "nonempty allowed_skills unexpectedly sealed";
-  } catch (const ProgramBindingError& error) {
-    EXPECT_NE(
-        std::string(error.what()).find(
-            "exact revision-qualified retained skill referent"),
-        std::string::npos);
-  }
+  const auto sealed_unlimited =
+      ProgramBindingConstructionAuthority::seal(std::move(unlimited));
+  ASSERT_NE(sealed_unlimited, nullptr);
+  EXPECT_NE(sealed_unlimited->canonical_bytes().find(
+                "\"recovery_policy\":{\"allow_intervention\":true,"
+                "\"max_retries\":0}"),
+            std::string::npos);
 
   const auto sealed =
       ProgramBindingConstructionAuthority::seal(make_binding_value(context));
@@ -547,97 +505,29 @@ TEST(ProgramBindingTest, RawNodePolicyReloadRejectsEveryBoundedNegativeFamily) {
   };
 
   expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"persistence_ceiling\":\"session_only\"}}",
-                   "\"persistence_ceiling\":\"session_only\"},\"zzz\":true}")));
+      valid, replace_once(row, "\"max_retries\":1}}",
+                          "\"max_retries\":1},\"zzz\":true}")));
   expect_rejected(replace_policy_table(
-      valid, replace_once(row, ",\"operator_stop_policy\":\"hold\"", "")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(
-          row,
-          "\"modification_policy\":{\"intervention_delegate\":\"human_only\",\"persistent_edit\":\"forbidden\",\"runtime_override\":\"human_approval\"}",
-          "\"modification_policy\":null")));
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, ",\"persistent_edit\":\"forbidden\"", "")));
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"runtime_override\":\"human_approval\"",
-                          "\"runtime_override\":\"operator_allowed\"")));
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"intervention_delegate\":\"human_only\"",
-                          "\"intervention_delegate\":\"operator\"")));
-
+      valid, replace_once(row, "\"operator_stop_policy\":\"hold\",", "")));
   expect_rejected(replace_policy_table(
       valid,
-      replace_once(
-          row,
-          "\"recovery_policy\":{\"allow_intervention\":false,\"allowed_recovery_actions\":[\"runtime_override\"],\"allowed_skills\":[],\"max_retries\":1,\"persistence_ceiling\":\"session_only\"}",
-          "\"recovery_policy\":null")));
+      replace_once(row,
+                   "\"recovery_policy\":{\"allow_intervention\":true,"
+                   "\"max_retries\":1}",
+                   "\"recovery_policy\":null")));
   expect_rejected(replace_policy_table(
       valid, replace_once(row, ",\"max_retries\":1", "")));
   expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"allow_intervention\":false",
-                          "\"allow_intervention\":0")));
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-                          "\"allowed_recovery_actions\":{}")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(
-          row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-          "\"allowed_recovery_actions\":[\"intervention\",\"runtime_override\",\"runtime_override\"]")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-                   "\"allowed_recovery_actions\":[\"unknown\"]")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-                   "\"allowed_recovery_actions\":[\"runtime_override\",\"runtime_override\"]")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-                   "\"allowed_recovery_actions\":[\"runtime_override\",\"intervention\"]")));
+      valid, replace_once(row, "\"allow_intervention\":true",
+                          "\"allow_intervention\":1")));
   expect_rejected(replace_policy_table(
       valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":true")));
   expect_rejected(replace_policy_table(
       valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":256")));
   expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":[\"Upper\"]")));
+      valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":-1")));
   expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":{}")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":[\"a-skill\",\"a-skill\"]")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":[\"z-skill\",\"a-skill\"]")));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":[\"a-skill\"]")));
-  std::string oversized_skills = "[";
-  for (std::size_t index = 0U; index < 257U; ++index) {
-    if (index != 0U) {
-      oversized_skills += ",";
-    }
-    oversized_skills += "\"skill-" + std::to_string(index) + "\"";
-  }
-  oversized_skills += "]";
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"allowed_skills\":[]",
-                          "\"allowed_skills\":" + oversized_skills)));
-  expect_rejected(replace_policy_table(
-      valid,
-      replace_once(row, "\"allowed_skills\":[]",
-                   "\"allowed_skills\":[\"" + std::string(129, 'a') + "\"]")));
-
+      valid, replace_once(row, "\"max_retries\":1", "\"max_retries\":1.5")));
   expect_rejected(replace_policy_table(
       valid, replace_once(row, "\"instance_id\":\"root\"",
                           "\"instance_id\":\"Root\"")));
@@ -649,47 +539,24 @@ TEST(ProgramBindingTest, RawNodePolicyReloadRejectsEveryBoundedNegativeFamily) {
       valid,
       replace_once(row, "\"operator_stop_policy\":\"hold\"",
                    "\"operator_stop_policy\":false")));
-  expect_rejected(replace_policy_table(
-      valid, replace_once(row, "\"runtime_override\":\"human_approval\"",
-                          "\"runtime_override\":\"forbidden\"")));
 
-  const std::string intervention_row = replace_once(
-      replace_once(
-          replace_once(row, "\"allow_intervention\":false",
-                       "\"allow_intervention\":true"),
-          "\"allowed_recovery_actions\":[\"runtime_override\"]",
-          "\"allowed_recovery_actions\":[\"intervention\"]"),
-      "\"allowed_skills\":[]", "\"allowed_skills\":[\"a-skill\"]");
-  expect_rejected(replace_policy_table(valid, intervention_row));
+  // The removed policy forms are refused, never reinterpreted.
   expect_rejected(replace_policy_table(
       valid,
-      replace_once(
-          replace_once(
-              replace_once(
-                  replace_once(row, "\"runtime_override\":\"human_approval\"",
-                               "\"runtime_override\":\"forbidden\""),
-                  "\"allow_intervention\":false",
-                  "\"allow_intervention\":true"),
-              "\"allowed_recovery_actions\":[\"runtime_override\"]",
-              "\"allowed_recovery_actions\":[\"intervention\"]"),
-          "\"persistence_ceiling\":\"session_only\"",
-          "\"persistence_ceiling\":\"runtime_override\"")));
+      replace_once(row, "\"instance_id\":\"root\",",
+                   "\"instance_id\":\"root\",\"modification_policy\":{"
+                   "\"intervention_delegate\":\"forbidden\","
+                   "\"persistent_edit\":\"forbidden\","
+                   "\"runtime_override\":\"forbidden\"},")));
   expect_rejected(replace_policy_table(
-      valid,
-      replace_once(
-          replace_once(
-              replace_once(row, "\"allow_intervention\":false",
-                           "\"allow_intervention\":true"),
-              "\"allowed_recovery_actions\":[\"runtime_override\"]",
-              "\"allowed_recovery_actions\":[\"intervention\"]"),
-          "\"persistence_ceiling\":\"session_only\"",
-          "\"persistence_ceiling\":\"draft_patch\"")));
+      valid, replace_once(row, "\"allow_intervention\":true,",
+                          "\"allow_intervention\":true,"
+                          "\"allowed_recovery_actions\":[\"intervention\"],"
+                          "\"allowed_skills\":[],")));
   expect_rejected(replace_policy_table(
-      valid,
-      replace_once(
-          replace_once(row, "\"allowed_recovery_actions\":[\"runtime_override\"]",
-                       "\"allowed_recovery_actions\":[]"),
-          "\"max_retries\":1", "\"max_retries\":2")));
+      valid, replace_once(row, "\"max_retries\":1}",
+                          "\"max_retries\":1,"
+                          "\"persistence_ceiling\":\"session_only\"}")));
 
   const std::string duplicate_table = row + "," + row;
   expect_rejected(replace_policy_table(valid, duplicate_table));

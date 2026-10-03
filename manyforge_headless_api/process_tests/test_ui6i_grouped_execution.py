@@ -625,54 +625,102 @@ def test_repeated_project_activation_replaces_one_coherent_publication() -> None
         assert observed[0] != observed[1]
 
 
-def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:
+def _write_mixed_variants(
+    stack: ProcessStack, kinds: tuple[str, ...]
+) -> dict[str, Path]:
+    """Writes GROUPED variants: `single` keeps only lite6, `replace` changes
+    only ur5e's controller input so lite6 is retained by the component delta."""
     # Keep Composer out of native-only test collection. These helpers are
-    # required only by this owner-connected scenario test.
+    # required only by owner-connected scenario tests.
     from manyforge_composer.backend.scenario_artifacts import (
         build_scenario_document,
         load_scenario_artifact,
         save_scenario_artifact,
     )
 
+    examples = _required_path("MANYFORGE_EXAMPLE_SCENARIO_ROOT")
+    source = examples / f"{GROUPED_SCENARIO}.scenario"
+    document, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    variants = stack.root / "mixed-scenarios"
+    variants.mkdir()
+    paths: dict[str, Path] = {}
+    for kind in kinds:
+        candidate = deepcopy(document)
+        candidate["scenario_id"] = f"mixed_{kind}"
+        candidate["name"] = f"Mixed Apply {kind}"
+        components = candidate["deployment_draft"]["components"]
+        if kind == "single":
+            candidate["deployment_draft"]["components"] = [
+                row for row in components if row["component_id"] == "lite6_robot"
+            ]
+        else:
+            assert kind == "replace", kind
+            ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
+            # Change only B's controller input; A must survive unchanged.
+            ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
+        target = variants / f"mixed_{kind}.scenario"
+        candidate = build_scenario_document(
+            scenario_id=candidate["scenario_id"],
+            name=candidate["name"],
+            description=candidate["description"],
+            program_draft=candidate["program_draft"],
+            deployment_draft=candidate["deployment_draft"],
+            program_role_assignment=candidate["program_role_assignment"],
+            manyforge_version=candidate["saved_status"]["manyforge_version"],
+            last_known_status="unknown",
+        )
+        save_scenario_artifact(
+            candidate, str(target),
+            allowed_roots=[str(examples), str(stack.root)],
+            overwrite=False, source_project_path=str(source),
+        )
+        paths[kind] = target
+    return paths
+
+
+def test_retained_robot_plans_after_apply_retires_its_first_composition() -> None:
+    # The retained lite6 runtime keeps the RoboPlan worker built by the first
+    # composition. A changed candidate reselects the worker projection, which
+    # restarts the worker from that first planning-model stage after the first
+    # composition was retired. Both robots must still plan and execute.
     with _dual_robot_stack() as stack:
         _load_scenario(stack, GROUPED_SCENARIO)
-        examples = _required_path("MANYFORGE_EXAMPLE_SCENARIO_ROOT")
-        source = examples / f"{GROUPED_SCENARIO}.scenario"
-        document, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
-        variants = stack.root / "mixed-scenarios"
-        variants.mkdir()
-        paths: dict[str, Path] = {}
-        for kind in ("single", "replace"):
-            candidate = deepcopy(document)
-            candidate["scenario_id"] = f"mixed_{kind}"
-            candidate["name"] = f"Mixed Apply {kind}"
-            components = candidate["deployment_draft"]["components"]
-            if kind == "single":
-                candidate["deployment_draft"]["components"] = [
-                    row for row in components if row["component_id"] == "lite6_robot"
-                ]
-            else:
-                ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
-                # Change only B's controller input; A must survive unchanged.
-                ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
-            target = variants / f"mixed_{kind}.scenario"
-            candidate = build_scenario_document(
-                scenario_id=candidate["scenario_id"],
-                name=candidate["name"],
-                description=candidate["description"],
-                program_draft=candidate["program_draft"],
-                deployment_draft=candidate["deployment_draft"],
-                program_role_assignment=candidate["program_role_assignment"],
-                typed_parameter_overrides=candidate["typed_parameter_overrides"],
-                manyforge_version=candidate["saved_status"]["manyforge_version"],
-                last_known_status="unknown",
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            survivor = headless.cclc_component("lite6_robot")
+        paths = _write_mixed_variants(stack, ("replace",))
+        applied, source_document_digest = _load_scenario(
+            stack, "mixed_replace", scenario_path=paths["replace"]
+        )
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            retained = headless.cclc_component("lite6_robot")
+        assert retained["provider_occurrences"] == survivor["provider_occurrences"]
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=applied["scenario_id"],
+                source_document_digest=source_document_digest,
+                applied=applied,
             )
-            save_scenario_artifact(
-                candidate, str(target),
-                allowed_roots=[str(examples), str(stack.root)],
-                overwrite=False, source_project_path=str(source),
+            program_run_id = started["capture"]["program_run_id"]
+            _start_motion(client, started, request_id="ui6i.retained.motion-start")
+            accepted = _operation_acceptances(stack, program_run_id)
+            assert {
+                event["payload"]["intent"]["participants"][0]["target_role_id"]
+                for event in accepted
+            } == {"lite6_arm", "ur5e_arm"}
+            terminal = _wait_run_state(
+                client,
+                program_run_id,
+                {"succeeded", "failed", "intervention_required", "stopped"},
             )
-            paths[kind] = target
+            assert terminal["state"] == "succeeded", terminal
+            _reset_cycle(client, program_run_id)
+
+
+def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        paths = _write_mixed_variants(stack, ("single", "replace"))
 
         def target_keys(status: dict[str, Any]) -> set[tuple[str, str, str]]:
             return {

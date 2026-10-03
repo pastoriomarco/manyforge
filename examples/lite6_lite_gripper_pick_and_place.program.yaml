@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:6c6ae1c4beded8dc3611af2a7257b9bcbe6bd7e8a6089821e7c84c699db72f8e
+program_revision: sha256:b7246dc9006ec37694c7a4e14d70133a998e25d0a777e82672f7b8690ade6e86
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-
@@ -100,31 +100,26 @@ parameters:
     type: float64
     default: 1.0
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Acceleration scale for all Lite6 pick-and-place moves.
   - parameter_id: max_blend_deviation_rad
     type: float64
     default: 0.01
     constraints: {min_inclusive: 0.0}
-    runtime_mutability: before_run
     description: Default maximum Cartesian blend deviation.
   - parameter_id: max_tcp_linear_speed_mps
     type: float64
     default: 0.15
     constraints: {min_exclusive: 0.0}
-    runtime_mutability: before_run
     description: Maximum TCP linear speed for all Lite6 pick-and-place moves.
   - parameter_id: translation_tol_m
     type: float64
     default: 0.005
     constraints: {min_exclusive: 0.0}
-    runtime_mutability: before_run
     description: Default Cartesian translation tolerance for motion nodes.
   - parameter_id: velocity_scale
     type: float64
     default: 0.4
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for all Lite6 pick-and-place moves.
 tree:
   node_id: sequence

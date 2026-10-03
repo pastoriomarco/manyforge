@@ -394,15 +394,18 @@ std::string ros2_control_execution_runtime_profile_document() {
 }
 
 std::string ros2_control_execution_runtime_profile_revision() {
-  const auto root =
-      parse_strict_json_model_yaml(
-          ros2_control_execution_runtime_profile_document())
-          .root();
-  return require_string(
-      require_member(require_object(root, "ros2_control_runtime_profile"),
-                     "runtime_profile_revision",
-                     "ros2_control_runtime_profile"),
-      "ros2_control_runtime_profile.runtime_profile_revision");
+  // A pure function of build constants: derive it once per process.
+  static const std::string revision = [] {
+    const auto root = parse_strict_json_model_yaml(
+                          ros2_control_execution_runtime_profile_document())
+                          .root();
+    return require_string(
+        require_member(require_object(root, "ros2_control_runtime_profile"),
+                       "runtime_profile_revision",
+                       "ros2_control_runtime_profile"),
+        "ros2_control_runtime_profile.runtime_profile_revision");
+  }();
+  return revision;
 }
 
 bool ros2_control_execution_runtime_configuration_is_qualified(

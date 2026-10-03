@@ -220,6 +220,27 @@ RequiredMember(const content_identity::CanonicalValue &value,
   return *member;
 }
 
+/// Whether one Manager source value pairs its active publication with an
+/// Apply history of the same generation: publication 1 is the bootstrap and
+/// each later one is exactly one committed named Apply (the invariant Headless
+/// enforces as program_activation_history_incomplete).
+bool ManagerSourceHistoryIsOneGeneration(
+    const content_identity::CanonicalValue &payload) {
+  const auto generation =
+      RequiredMember(RequiredMember(RequiredMember(payload, "active"),
+                                    "publication"),
+                     "publication_generation")
+          .as_number();
+  double committed = 0.0;
+  for (const auto &record :
+       RequiredMember(RequiredMember(payload, "apply"), "records").as_array()) {
+    if (RequiredMember(record, "committed").as_bool()) {
+      committed += 1.0;
+    }
+  }
+  return committed + 1.0 == generation;
+}
+
 const std::string &RequiredText(const content_identity::CanonicalValue &value,
                                 const std::string_view name) {
   const auto *text =
@@ -1100,8 +1121,7 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
        "scenario.test",
        core::ContentDigest("sha256:1414141414141414141414141414141414141414141414"
                            "141414141414141414"),
-       "optional", content_identity::CanonicalValue(
-                       content_identity::CanonicalValue::Object{})},
+       "optional"},
       candidate, model_map, *program, fixture.program_role_assignment,
       catalogs, raw_artifacts);
   static_cast<void>(
@@ -2643,12 +2663,21 @@ TEST(ManagerDaemonProcess,
     // from the authoritative inventory alone.
     SendCommandAndDisconnect(directory.socket_path(), request);
     std::string applied;
+    // Every value Manager publishes while the Apply progresses is one
+    // generation: a committed Apply is never shown beside the predecessor
+    // publication (the transition lane once paired its last pre-Apply
+    // runtime with a journal that already held the Apply's receipt).
+    std::optional<std::string> split_generation;
     const auto apply_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < apply_deadline) {
       const auto observed = manager_source.Read();
       if (observed.has_value()) {
         applied = content_identity::canonical_json(observed->payload);
+        if (!split_generation.has_value() &&
+            !ManagerSourceHistoryIsOneGeneration(observed->payload)) {
+          split_generation = applied;
+        }
         if (applied.find(R"("request_id":"manager-program-apply.1")") !=
                 std::string::npos &&
             applied.find(R"("terminal_state":"succeeded")") !=
@@ -2680,6 +2709,14 @@ TEST(ManagerDaemonProcess,
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(split_generation.has_value())
+        << split_generation.value_or("");
+    {
+      const auto settled = manager_source.Read();
+      ASSERT_TRUE(settled.has_value());
+      EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(settled->payload))
+          << content_identity::canonical_json(settled->payload);
     }
     SCOPED_TRACE(applied);
     EXPECT_NE(applied.find(R"("terminal_state":"succeeded")"),

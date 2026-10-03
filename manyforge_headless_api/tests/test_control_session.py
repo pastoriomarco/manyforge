@@ -99,7 +99,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
     }
     capture.update(
         {
-            "schema_version": "manyforge.program_run_capture.v1",
+            "schema_version": "manyforge.program_run_capture.v2",
             "program_run_id": "run.1",
             "scenario_id": "pick",
             "program_id": "program.pick",

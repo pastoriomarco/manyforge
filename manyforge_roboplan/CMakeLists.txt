@@ -405,6 +405,7 @@ target_link_libraries(manyforge_roboplan_cell_admission_command_codec
 # headless API; it is not a second public execution contract.
 add_executable(manyforge_native_execution_host
   src/product_backed_runtime_participant_resolver.cpp
+  src/managed_projection_registry.cpp
   src/native_execution_host_main.cpp)
 target_include_directories(manyforge_native_execution_host PRIVATE
   "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
@@ -437,7 +438,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   # never select an execution backend through an in-process runtime switch.
   add_executable(manyforge_ros2_control_execution_host
     src/product_backed_runtime_participant_resolver.cpp
-    src/native_execution_host_main.cpp)
+    src/managed_projection_registry.cpp
+  src/native_execution_host_main.cpp)
   target_include_directories(manyforge_ros2_control_execution_host PRIVATE
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
   target_compile_definitions(manyforge_ros2_control_execution_host PRIVATE
@@ -485,6 +487,7 @@ if(BUILD_TESTING)
     # owner. The installed host above never compiles this fixture.
     add_executable(manyforge_native_execution_host_pick_place_planning_fixture
       src/product_backed_runtime_participant_resolver.cpp
+      src/managed_projection_registry.cpp
       src/native_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
     target_include_directories(
@@ -520,7 +523,8 @@ if(BUILD_TESTING)
     # deterministic Idle facts solely to exercise real CCLC claim mechanics.
     add_executable(manyforge_native_execution_host_admission_fixture
       src/product_backed_runtime_participant_resolver.cpp
-      src/native_execution_host_main.cpp)
+      src/managed_projection_registry.cpp
+  src/native_execution_host_main.cpp)
     target_include_directories(
       manyforge_native_execution_host_admission_fixture PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
@@ -554,6 +558,7 @@ if(BUILD_TESTING)
     # native adapter cases that request injection.
     add_executable(manyforge_native_execution_host_projection_fixture
       src/product_backed_runtime_participant_resolver.cpp
+      src/managed_projection_registry.cpp
       src/native_execution_host_main.cpp
       src/retained_planner_scene_projection.cpp)
     set_target_properties(
@@ -618,6 +623,24 @@ if(BUILD_TESTING)
     target_link_libraries(test_owner_settlement_readers PRIVATE
       manyforge_roboplan_cell_admission_command_codec GTest::gtest_main
       SQLite::SQLite3)
+
+    # The projection registry compiled alone, behind an injected asset source
+    # and clock; the installed hosts compile the same source unit.
+    add_executable(test_managed_projection_registry
+      src/managed_projection_registry.cpp
+      test/test_managed_projection_registry.cpp)
+    target_include_directories(test_managed_projection_registry PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+    target_compile_definitions(test_managed_projection_registry PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS)
+    target_link_libraries(test_managed_projection_registry PRIVATE
+      manyforge_roboplan_collision_projection
+      manyforge_roboplan_retained_consumer
+      manyforge_component_manager
+      manyforge_deployment
+      GTest::gtest_main
+      Threads::Threads)
 
     # Bounded qualification-only evidence capture. It is deliberately not a
     # production target and supplies no planner, factory, scene, execution, or
@@ -1233,6 +1256,10 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_owner_settlement_readers
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_managed_projection_registry
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

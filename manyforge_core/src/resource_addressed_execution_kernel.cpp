@@ -10,6 +10,7 @@
 #include <manyforge_core/detail/coordinated_execution_clock.hpp>
 #include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
+#include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
@@ -20,6 +21,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -1742,10 +1744,38 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
     });
   }
 
+  /// Exact Kernel-owned proof that this held operation can never have caused,
+  /// and can no longer cause, a physical effect: no participant crossed the
+  /// dispatch barrier, every slot is already terminal (so the barrier refuses
+  /// any late prepared product), and no preparation, advance, dispatch,
+  /// cancellation, reconciliation, control, recovery or Stop borrow is still
+  /// open. Progress values and observed poses are never part of this proof.
+  [[nodiscard]] bool never_dispatched_and_quiescent() const noexcept {
+    return !state.active_stop_id.has_value() && !stop_effect_in_flight &&
+           !recovery_effect_in_flight && !coordinated_cancellation_in_flight &&
+           !coordinated_dispatch_barrier_released && !pending_control.has_value() &&
+           std::all_of(participants.begin(), participants.end(), [](const auto& participant) {
+             return !participant.prepared_dispatch_released &&
+                    !participant.dispatch_effect_in_flight && !participant.prepare_in_flight &&
+                    !participant.prepared_advance_in_flight &&
+                    !participant.reconciliation_in_flight &&
+                    participant.slot_state == ResourceSlotState::kTerminal;
+           });
+  }
+
+  /// A failure held for intervention that never crossed the dispatch
+  /// barrier. It keeps its slots, recovery authority and admission exclusion,
+  /// but has no physical effect for Stop to contain or preview to wait for.
+  [[nodiscard]] bool held_without_physical_effect() const noexcept {
+    return state.state == OperationStateKind::kInterventionRequired &&
+           never_dispatched_and_quiescent();
+  }
+
   [[nodiscard]] bool containment_effect_uncertain() const noexcept {
     return stop_effect_in_flight || dispatch_effect_in_flight() ||
            state.state == OperationStateKind::kInterrupted ||
-           state.state == OperationStateKind::kInterventionRequired;
+           (state.state == OperationStateKind::kInterventionRequired &&
+            !held_without_physical_effect());
   }
 };
 
@@ -2031,6 +2061,24 @@ struct StopParticipantWork final {
   bool participant_settlement_complete{};
   std::optional<ErrorDTO> participant_settlement_error;
   bool terminal_projection_complete{};
+  /// The participant's own prepared owner reported kPreparationFailed for
+  /// this exact execution: nothing was dispatched, no effect crossed the
+  /// barrier, and the owner already committed its own failure terminal,
+  /// which this Stop neither settles nor rewrites.
+  bool preparation_failed{};
+  /// A non-Stopped motion terminal for this never-dispatched execution. An
+  /// already-failed preparation publishes the same failure terminal as a
+  /// failed cancellation; only the prepared owner's exact snapshot, read once
+  /// on demand outside the owner lock, classifies it.
+  std::optional<ErrorDTO> unclassified_prepared_terminal;
+  bool prepared_classification_requested{};
+
+  /// No subordinate terminal handoff exists for a never-dispatched participant
+  /// that either never received an execution identity or whose preparation
+  /// failed in its own owner before dispatch.
+  [[nodiscard]] bool settlement_not_required() const noexcept {
+    return cancelled_pre_dispatch && (prepared_execution_id == 0U || preparation_failed);
+  }
 };
 
 static void fail_prepared_cancellation(StopParticipantWork& work, ErrorDTO failure) {
@@ -2049,13 +2097,27 @@ static void observe_prepared_cancellation_terminal(StopParticipantWork& work,
     return;
   if (state == OperationStateKind::kStopped) {
     work.prepared_cancel_terminal_observed = true;
-  } else {
-    fail_prepared_cancellation(
-        work, failure.value_or(
-                  error(std::string(to_string(ErrorCode::kExecutionAborted)),
-                        "prepared participant failed while settling pre-dispatch cancellation",
-                        "prepared_cancel_terminal_failed")));
+    return;
   }
+  auto terminal_failure =
+      failure.value_or(error(std::string(to_string(ErrorCode::kExecutionAborted)),
+                             "prepared participant failed while settling pre-dispatch cancellation",
+                             "prepared_cancel_terminal_failed"));
+  if (work.payload_kind == OperationParticipantPayloadKind::kMotion) {
+    if (!work.unclassified_prepared_terminal.has_value())
+      work.unclassified_prepared_terminal = std::move(terminal_failure);
+    return;
+  }
+  fail_prepared_cancellation(work, std::move(terminal_failure));
+}
+
+static void settle_failed_preparation(StopParticipantWork& work, ErrorDTO failure) {
+  if (work.terminal) return;
+  work.preparation_failed = true;
+  work.prepared_cancel_terminal_observed = true;
+  work.contained = true;
+  work.terminal = true;
+  work.terminal_error = std::move(failure);
 }
 
 struct ResourceAddressedExecutionKernel::StopTransaction final {
@@ -2127,45 +2189,12 @@ namespace {
 constexpr std::uint64_t kMaximumKernelJsonInteger = 9'007'199'254'740'991ULL;
 constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
 // Recognized Stop authority is already linearized, and containment never
-// depends on this sole non-critical projection worker. The injected scheduler
-// wakes its existing worker after a short bounded delay when a concurrent
-// ordinary journal transaction still owns the journal critical section. This
-// preserves causal ordering without a second retry owner or queue.
-constexpr std::uint64_t kMaximumStopJournalProjectionAttempts = 10U;
-constexpr auto kStopJournalProjectionRetryDelay = std::chrono::milliseconds(20);
-constexpr TimePoint kStopJournalProjectionRetryDelayNs =
-    std::chrono::duration_cast<std::chrono::nanoseconds>(kStopJournalProjectionRetryDelay).count();
-
-[[nodiscard]] bool retryable_stop_journal_projection_error(
-    const std::optional<ErrorDTO>& error) noexcept {
-  if (!error.has_value()) {
-    return false;
-  }
-  const auto retryable = error->details.find("retryable");
-  return retryable != error->details.end() && retryable->second == "true";
-}
-
-template <typename Projection>
-struct StopJournalProjectionAttempt final {
-  Projection result;
-  std::uint64_t attempts{};
-};
-
-template <typename Project, typename AwaitRetry>
-[[nodiscard]] auto project_stop_journal_with_bounded_retry(Project&& project,
-                                                           AwaitRetry&& await_retry) {
-  auto result = project();
-  std::uint64_t attempts = 1U;
-  while (attempts < kMaximumStopJournalProjectionAttempts &&
-         retryable_stop_journal_projection_error(result.error)) {
-    if (!await_retry()) {
-      break;
-    }
-    result = project();
-    ++attempts;
-  }
-  return StopJournalProjectionAttempt<decltype(result)>{std::move(result), attempts};
-}
+// depends on this sole non-critical projection worker. Each Stop projection is
+// one journal attempt: the journal hands its writer to a waiting Stop
+// projection right after the one write in progress, so a failed attempt is a
+// genuine storage fault and fails closed through the persistence fault latch.
+// The status records that single attempt as its retry generation.
+constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] std::int64_t checked_deadline(std::int64_t now, std::int64_t duration) noexcept {
   if (now < 0 || duration <= 0 || duration > kMaximumStopDurationNs ||
@@ -2349,7 +2378,7 @@ template <typename Project, typename AwaitRetry>
   const auto& path = *binding.control_path;
   const auto terminal_settlement = [&] {
     using State = StopParticipantScopeFactsDTO::TerminalSettlementState;
-    if (item.cancelled_pre_dispatch && item.prepared_execution_id == 0U && item.contained) {
+    if (item.settlement_not_required() && item.contained) {
       return State::kNotRequired;
     }
     if (item.cancelled_pre_dispatch &&
@@ -2537,6 +2566,40 @@ template <typename Project, typename AwaitRetry>
   return 0;
 }
 
+/// Operations and resources a fault latch holds for physical recovery. A
+/// pre-dispatch-cancelled participant whose no-effect outcome settled
+/// (exactly the entries the terminal reducer does not count as unsettled) has
+/// no stop stage and no motion-rest obligation; its resources are only latched
+/// when another captured subject also covers them.
+[[nodiscard]] std::pair<std::vector<OperationId>, std::vector<ResourceId>> fault_latch_capture(
+    const StopCertificateDTO& certificate) {
+  using Settlement = StopParticipantScopeFactsDTO::TerminalSettlementState;
+  std::vector<OperationId> operations;
+  std::vector<ResourceId> resources;
+  operations.reserve(certificate.scope_entries.size());
+  resources.reserve(certificate.scope_entries.size());
+  for (const auto& entry : certificate.scope_entries) {
+    if (const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&entry.key.subject)) {
+      operations.push_back(participant->operation_id);
+      const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
+      const bool settled_without_effect =
+          entry.dispatch_state == StopScopeDispatchStateDTO::kNeverDispatchedCancelled &&
+          (facts.terminal_settlement == Settlement::kSettled ||
+           facts.terminal_settlement == Settlement::kNotRequired);
+      if (!settled_without_effect) {
+        resources.insert(resources.end(), facts.resources.begin(), facts.resources.end());
+      }
+    } else {
+      resources.push_back(std::get<ResourceId>(entry.key.subject));
+    }
+  }
+  std::sort(operations.begin(), operations.end());
+  operations.erase(std::unique(operations.begin(), operations.end()), operations.end());
+  std::sort(resources.begin(), resources.end());
+  resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+  return {std::move(operations), std::move(resources)};
+}
+
 [[nodiscard]] bool terminal_fault_required(const StopCertificateDTO& certificate,
                                            const bool persistence_degraded) noexcept {
   return persistence_degraded ||
@@ -2549,23 +2612,7 @@ template <typename Project, typename AwaitRetry>
     const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
     const StopCertificateDTO& certificate, const StopFaultLatchGeneration generation,
     StopDurableProjectionStatusDTO terminal_projection) {
-  std::vector<OperationId> operations;
-  std::vector<ResourceId> resources;
-  operations.reserve(certificate.scope_entries.size());
-  resources.reserve(certificate.scope_entries.size());
-  for (const auto& entry : certificate.scope_entries) {
-    if (const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&entry.key.subject)) {
-      operations.push_back(participant->operation_id);
-      const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
-      resources.insert(resources.end(), facts.resources.begin(), facts.resources.end());
-    } else {
-      resources.push_back(std::get<ResourceId>(entry.key.subject));
-    }
-  }
-  std::sort(operations.begin(), operations.end());
-  operations.erase(std::unique(operations.begin(), operations.end()), operations.end());
-  std::sort(resources.begin(), resources.end());
-  resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+  auto [operations, resources] = fault_latch_capture(certificate);
   const StopCertificateRefDTO reference{certificate.stop_certificate_id,
                                         certificate.stop_certificate_revision, certificate.stop_id,
                                         certificate.stop_generation};
@@ -2596,47 +2643,15 @@ template <typename Project, typename AwaitRetry>
 }  // namespace
 
 class ResourceAddressedExecutionKernel::StopProjectionWorker final {
-  class RetryGate;
-
  public:
-  StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner,
-                       IClock& clock, IScheduler& scheduler)
+  StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner)
       : capacity_(capacity),
         owner_(owner),
-        clock_(clock),
-        scheduler_(scheduler),
-        retry_gate_(std::make_shared<RetryGate>()),
         requested_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         delivered_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
         worker_([this](std::stop_token token) noexcept { Run(token); }) {
     while (!ready_.load(std::memory_order_acquire)) {
       ready_.wait(false, std::memory_order_acquire);
-    }
-  }
-
-  [[nodiscard]] bool AwaitRetry(const std::stop_token cancellation) noexcept {
-    try {
-      const auto now = clock_.now();
-      if (now < 0 ||
-          now > std::numeric_limits<TimePoint>::max() - kStopJournalProjectionRetryDelayNs) {
-        return false;
-      }
-      const auto gate = retry_gate_;
-      const auto generation = gate->Begin();
-      if (generation == 0U) {
-        return false;
-      }
-      try {
-        static_cast<void>(scheduler_.schedule(
-            now + kStopJournalProjectionRetryDelayNs,
-            [gate, generation] { gate->Complete(generation); }, SchedulerPriority::Background));
-      } catch (...) {
-        gate->Complete(generation);
-        return false;
-      }
-      return gate->Wait(generation, cancellation);
-    } catch (...) {
-      return false;
     }
   }
 
@@ -2703,45 +2718,6 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   }
 
  private:
-  class RetryGate final {
-   public:
-    [[nodiscard]] std::uint64_t Begin() {
-      std::lock_guard lock(mutex_);
-      if (next_generation_ == std::numeric_limits<std::uint64_t>::max()) {
-        return 0U;
-      }
-      return ++next_generation_;
-    }
-
-    void Complete(const std::uint64_t generation) noexcept {
-      try {
-        {
-          std::lock_guard lock(mutex_);
-          completed_generation_ = std::max(completed_generation_, generation);
-        }
-        changed_.notify_all();
-      } catch (...) {
-      }
-    }
-
-    [[nodiscard]] bool Wait(const std::uint64_t generation,
-                            const std::stop_token cancellation) noexcept {
-      try {
-        std::unique_lock lock(mutex_);
-        return changed_.wait(lock, cancellation,
-                             [&] { return completed_generation_ >= generation; });
-      } catch (...) {
-        return false;
-      }
-    }
-
-   private:
-    std::mutex mutex_;
-    std::condition_variable_any changed_;
-    std::uint64_t next_generation_{};
-    std::uint64_t completed_generation_{};
-  };
-
   void Wake() noexcept {
     wake_sequence_.fetch_add(1U, std::memory_order_release);
     wake_sequence_.notify_one();
@@ -2765,7 +2741,7 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
         }
         callback_in_flight_.store(true, std::memory_order_release);
         owner_.ProjectStop(
-            StopControlWorkToken{static_cast<StopControlSlotIndex>(index), requested}, stop_token);
+            StopControlWorkToken{static_cast<StopControlSlotIndex>(index), requested});
         callback_in_flight_.store(false, std::memory_order_release);
         delivered_[index].store(requested, std::memory_order_release);
         progressed = true;
@@ -2789,9 +2765,6 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
 
   std::size_t capacity_{};
   ResourceAddressedExecutionKernel& owner_;
-  IClock& clock_;
-  IScheduler& scheduler_;
-  std::shared_ptr<RetryGate> retry_gate_;
   std::unique_ptr<std::atomic_uint64_t[]> requested_;
   std::unique_ptr<std::atomic_uint64_t[]> delivered_;
   std::atomic_bool accepting_{true};
@@ -3025,11 +2998,8 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
     bool effect_uncertain = slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal;
     if (slot.owner.has_value()) {
       const auto* operation = find_active_operation_locked(slot.owner->operation_id);
-      effect_uncertain = effect_uncertain || operation == nullptr ||
-                         operation->stop_effect_in_flight ||
-                         operation->dispatch_effect_in_flight() ||
-                         operation->state.state == OperationStateKind::kInterrupted ||
-                         operation->state.state == OperationStateKind::kInterventionRequired;
+      effect_uncertain =
+          effect_uncertain || operation == nullptr || operation->containment_effect_uncertain();
     }
     snapshot.resources.push_back(
         StopScopeResourceSnapshotDTO{slot.resource_id, slot.stop_generation, effect_uncertain});
@@ -3212,8 +3182,8 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   for (std::size_t index = 0U; index < stop_projection_jobs_.size(); ++index) {
     stop_projection_jobs_[index] = std::make_unique<StopProjectionJob>();
   }
-  stop_projection_worker_ = std::make_unique<StopProjectionWorker>(stop_projection_jobs_.size(),
-                                                                   *this, clock_, scheduler_);
+  stop_projection_worker_ =
+      std::make_unique<StopProjectionWorker>(stop_projection_jobs_.size(), *this);
   stop_control_executor_ = std::make_unique<BoundedStopControlExecutor>(
       emergency_stop_reserve_.correlation_capacity() + 1U, clock_,
       static_cast<IStopControlWorkReceiver&>(*this));
@@ -5343,6 +5313,9 @@ Result<void> ResourceAddressedExecutionKernel::validate_preview_participant(
   }
   for (const auto& [id, operation] : active_operations_) {
     (void)id;
+    // Effect-free preview of a correction for a held, never-dispatched
+    // failure is the recovery workflow. Execution admission stays exclusive.
+    if (operation->held_without_physical_effect()) continue;
     for (const auto& participant : operation->participants) {
       if (participant.engine == registration.engine ||
           std::any_of(participant.resources.begin(), participant.resources.end(),
@@ -11934,8 +11907,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   return Result<StopAcceptedDTO>::Ok(std::move(*accepted));
 }
 
-void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken token,
-                                                   const std::stop_token cancellation) noexcept {
+void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken token) noexcept {
   StopProjectionJob job;
   try {
     {
@@ -11994,13 +11966,9 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         active_stop_fault_latch_ = job.terminal_fault_latch;
         motion_admission_closed_ = true;
       }
-      auto projection_attempt = project_stop_journal_with_bounded_retry(
-          [&] {
-            return journal_.RecordStopTerminal(config_.request_owner_epoch, *job.terminal_status,
-                                               *job.terminal_certificate, job.terminal_fault_latch);
-          },
-          [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
-      auto projected = std::move(projection_attempt.result);
+      auto projected =
+          journal_.RecordStopTerminal(config_.request_owner_epoch, *job.terminal_status,
+                                      *job.terminal_certificate, job.terminal_fault_latch);
       if (operation_state_projection_error.has_value() &&
           projected.state == StopForensicProjectionStateDTO::kRecorded) {
         projected = StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed,
@@ -12045,7 +12013,7 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
                                               "Stop terminal forensic projection failed",
                                               {}});
         (*record)->status.terminal_projection = StopDurableProjectionStatusDTO{
-            StopDurableProjectionStateDTO::kFailed, failure, projection_attempt.attempts};
+            StopDurableProjectionStateDTO::kFailed, failure, kStopJournalProjectionAttempt};
         if (!(*record)->fault_latch.has_value() && stop_retained_bundle_id_.has_value() &&
             stop_graph_revision_.has_value() &&
             cell_stop_fault_latch_generation_.value() < kMaximumKernelJsonInteger) {
@@ -12055,13 +12023,13 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
               config_.cell_id, config_.request_owner_epoch, *stop_retained_bundle_id_,
               *stop_graph_revision_, (*record)->certificate, cell_stop_fault_latch_generation_,
               StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure,
-                                             projection_attempt.attempts});
+                                             kStopJournalProjectionAttempt});
           (*record)->status.fault_latch = (*record)->fault_latch;
           active_stop_fault_latch_ = (*record)->fault_latch;
         }
         if ((*record)->fault_latch.has_value()) {
           (*record)->fault_latch->terminal_projection = StopDurableProjectionStatusDTO{
-              StopDurableProjectionStateDTO::kFailed, failure, projection_attempt.attempts};
+              StopDurableProjectionStateDTO::kFailed, failure, kStopJournalProjectionAttempt};
           (*record)->status.fault_latch = (*record)->fault_latch;
           if (active_stop_fault_latch_.has_value() &&
               active_stop_fault_latch_->latch_id == (*record)->fault_latch->latch_id) {
@@ -12079,14 +12047,9 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         return;
       }
       const auto projected_at_ns = clock_.now();
-      auto projection_attempt = project_stop_journal_with_bounded_retry(
-          [&] {
-            return journal_.RecordStopSurveillanceCheckpoint(
-                config_.request_owner_epoch, *job.surveillance_checkpoint,
-                *job.surveillance_fault_latch, projected_at_ns);
-          },
-          [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
-      const auto& projected = projection_attempt.result;
+      const auto projected = journal_.RecordStopSurveillanceCheckpoint(
+          config_.request_owner_epoch, *job.surveillance_checkpoint, *job.surveillance_fault_latch,
+          projected_at_ns);
       std::lock_guard state_lock(state_mutex_);
       const auto record = std::find_if(
           stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& candidate) {
@@ -12114,7 +12077,7 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
                      "Stop surveillance checkpoint projection failed",
                      {}});
         checkpoint_status = StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed,
-                                                           failure, projection_attempt.attempts};
+                                                           failure, kStopJournalProjectionAttempt};
         motion_admission_closed_ = true;
         if ((*record)->fault_latch.has_value()) {
           auto& latch = *(*record)->fault_latch;
@@ -12157,13 +12120,9 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
       return;
     }
 
-    auto projection_attempt = project_stop_journal_with_bounded_retry(
-        [&] {
-          return journal_.RecordStopAccepted(config_.request_owner_epoch, *job.acceptance,
-                                             *job.intent, *job.accepted, *job.affected_state);
-        },
-        [&] { return stop_projection_worker_->AwaitRetry(cancellation); });
-    const auto& projected = projection_attempt.result;
+    const auto projected =
+        journal_.RecordStopAccepted(config_.request_owner_epoch, *job.acceptance, *job.intent,
+                                    *job.accepted, *job.affected_state);
     const auto state = projected.projection_state == EmergencyStopProjectionStateDTO::kRecorded
                            ? EmergencyStopProjectionStateDTO::kRecorded
                            : EmergencyStopProjectionStateDTO::kFailed;
@@ -12176,8 +12135,15 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
                   projected.error.value_or(ErrorDTO{"operation_journal_stop_projection_failed",
                                                     "Stop acceptance forensic projection failed",
                                                     {}}),
-                  projection_attempt.attempts};
+                  kStopJournalProjectionAttempt};
+    // The Stop's acceptance projection is its creating request's recovery
+    // projection. A joined request's durable receipt can never upgrade that
+    // status; its failure still degrades the Stop fail-closed.
+    const bool publishes_acceptance_status =
+        job.acceptance->acceptance_path != EmergencyStopAcceptancePathDTO::kJoinedResident ||
+        state == EmergencyStopProjectionStateDTO::kFailed;
     const bool marked =
+        !publishes_acceptance_status ||
         emergency_stop_reserve_.mark_projection(job.acceptance->stop_id.value(), state);
     std::optional<StopControlWorkToken> terminal_projection;
     {
@@ -12187,7 +12153,7 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
             return candidate != nullptr && candidate->active && candidate->stop_id.has_value() &&
                    *candidate->stop_id == job.acceptance->stop_id;
           });
-      if (transaction != stop_transactions_.end()) {
+      if (transaction != stop_transactions_.end() && publishes_acceptance_status) {
         (*transaction)->acceptance_projection_state = state;
         if ((*transaction)->terminal_projection_token.has_value()) {
           auto& terminal_job =
@@ -12205,7 +12171,7 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
             return record != nullptr && record->certificate.stop_id == job.acceptance->stop_id &&
                    record->certificate.stop_generation == job.acceptance->stop_generation;
           });
-      if (terminal_record != stop_terminal_history_.end()) {
+      if (terminal_record != stop_terminal_history_.end() && publishes_acceptance_status) {
         (*terminal_record)->status.acceptance_projection = durable_status;
         if ((*terminal_record)->terminal_projection_token.has_value()) {
           const auto retained_token = *(*terminal_record)->terminal_projection_token;
@@ -12671,22 +12637,7 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       const StopCertificateRefDTO reference{certificate.stop_certificate_id,
                                             certificate.stop_certificate_revision,
                                             certificate.stop_id, certificate.stop_generation};
-      std::vector<OperationId> operations;
-      std::vector<ResourceId> resources;
-      operations.reserve(certificate.scope_entries.size());
-      for (const auto& entry : certificate.scope_entries) {
-        if (const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&entry.key.subject)) {
-          operations.push_back(participant->operation_id);
-          const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
-          resources.insert(resources.end(), facts.resources.begin(), facts.resources.end());
-        } else {
-          resources.push_back(std::get<ResourceId>(entry.key.subject));
-        }
-      }
-      std::sort(operations.begin(), operations.end());
-      operations.erase(std::unique(operations.begin(), operations.end()), operations.end());
-      std::sort(resources.begin(), resources.end());
-      resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+      auto [operations, resources] = fault_latch_capture(certificate);
       auto trigger = primary_fault_trigger(certificate, transaction.persistence_degraded);
       if (transaction.fault_latch.has_value() &&
           fault_trigger_priority(transaction.fault_latch->trigger) >
@@ -12936,6 +12887,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
     std::optional<std::int64_t> next_deadline;
     std::vector<StopControlWorkToken> dependents;
     std::vector<PreparedCancellation> prepared_cancellations;
+    std::vector<PreparedCancellation> prepared_classifications;
     std::vector<PreparedResumeCancellation> prepared_resume_cancellations;
     std::vector<AddressedParticipantStopSettlement> participant_settlements;
     std::vector<OperationControlEffectRequest> reset_effects;
@@ -13054,6 +13006,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      false,
                                      false,
                                      std::nullopt,
+                                     false,
+                                     false,
+                                     std::nullopt,
                                      false};
             work.retained_results.reserve(kMaxStopEscalationStages * 2U);
             transaction.participants.push_back(std::move(work));
@@ -13112,11 +13067,13 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                               item.payload_kind, item.prepared_motion_engine,
                                               item.execution_engine, item.prepared_execution_id});
           }
-          const bool waiting = preparation_in_flight ||
-                               (needs_cancellation &&
-                                (!item.prepared_cancel_complete ||
-                                 (item.payload_kind == OperationParticipantPayloadKind::kMotion &&
-                                  !item.prepared_cancel_terminal_observed)));
+          const bool waiting =
+              preparation_in_flight ||
+              (needs_cancellation &&
+               (!item.prepared_cancel_complete ||
+                (item.payload_kind == OperationParticipantPayloadKind::kMotion &&
+                 !item.prepared_cancel_terminal_observed &&
+                 !item.unclassified_prepared_terminal.has_value())));
           if ((needs_cancellation || preparation_in_flight) &&
               now >= transaction.outer_deadline_ns) {
             // No effect crossed the fence, but cleanup did not settle in the
@@ -13132,6 +13089,23 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                 ? transaction.outer_deadline_ns
                                 : std::min(*next_deadline, transaction.outer_deadline_ns);
             continue;
+          } else if (item.unclassified_prepared_terminal.has_value()) {
+            if (item.prepared_motion_engine == nullptr || item.prepared_execution_id == 0U) {
+              fail_prepared_cancellation(item, *item.unclassified_prepared_terminal);
+              motion_admission_closed_ = true;
+            } else {
+              if (!item.prepared_classification_requested) {
+                item.prepared_classification_requested = true;
+                prepared_classifications.push_back(
+                    {item.operation_id, item.plan.participant_id, item.payload_kind,
+                     item.prepared_motion_engine, item.execution_engine,
+                     item.prepared_execution_id});
+              }
+              next_deadline = !next_deadline.has_value()
+                                  ? transaction.outer_deadline_ns
+                                  : std::min(*next_deadline, transaction.outer_deadline_ns);
+              continue;
+            }
           } else {
             item.contained = true;
             item.terminal = true;
@@ -13324,8 +13298,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           motion_admission_closed_ = true;
           continue;
         }
-        const bool participant_settlement_required =
-            !(item.cancelled_pre_dispatch && item.prepared_execution_id == 0U);
+        const bool participant_settlement_required = !item.settlement_not_required();
         if (item.contained && participant_settlement_required &&
             !item.participant_settlement_complete) {
           if (item.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
@@ -13418,8 +13391,10 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             continue;
           }
         }
+        // A failed preparation keeps its owner's failure terminal and recovery
+        // authority; containment had nothing physical to stop.
         const bool participant_settled =
-            item.contained &&
+            item.contained && !item.preparation_failed &&
             (!participant_settlement_required || (item.participant_settlement_complete &&
                                                   !item.participant_settlement_error.has_value()));
         participant_state->state = participant_settled ? OperationStateKind::kStopped
@@ -13477,8 +13452,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                  (participant.terminal &&
                                   participant.terminal_projection_complete &&
                                   (!participant.contained ||
-                                   (participant.cancelled_pre_dispatch &&
-                                    participant.prepared_execution_id == 0U) ||
+                                   participant.settlement_not_required() ||
                                    participant.participant_settlement_complete));
                         })) {
           operation->stop_effect_in_flight = false;
@@ -13490,8 +13464,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                       [](const auto& participant) {
                         return participant.terminal && participant.terminal_projection_complete &&
                                (!participant.contained ||
-                                (participant.cancelled_pre_dispatch &&
-                                 participant.prepared_execution_id == 0U) ||
+                                participant.settlement_not_required() ||
                                 participant.participant_settlement_complete);
                       });
       const auto expected_participant_count = static_cast<std::size_t>(std::count_if(
@@ -13811,11 +13784,52 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         }
       }
     }
+    for (const auto& classification : prepared_classifications) {
+      // Read only after a failure terminal was observed. The prepared owner's
+      // exact snapshot proves an already-failed, never-dispatched preparation;
+      // anything else keeps the failed-cancellation classification.
+      std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared;
+      try {
+        auto snapshot = classification.engine->ObservePreparedMotion(classification.execution_id);
+        if (snapshot.ok()) prepared = std::move(snapshot.value());
+      } catch (...) {
+        prepared.reset();
+      }
+      std::lock_guard state_lock(state_mutex_);
+      if (token.slot >= stop_transactions_.size()) {
+        motion_admission_closed_ = true;
+        continue;
+      }
+      auto& transaction = *stop_transactions_[token.slot];
+      if (!transaction.active || transaction.token != token) continue;
+      const auto item =
+          std::find_if(transaction.participants.begin(), transaction.participants.end(),
+                       [&](const auto& candidate) {
+                         return candidate.operation_id == classification.operation_id &&
+                                candidate.plan.participant_id == classification.participant_id;
+                       });
+      if (item == transaction.participants.end() ||
+          item->prepared_execution_id != classification.execution_id ||
+          !item->unclassified_prepared_terminal.has_value()) {
+        motion_admission_closed_ = true;
+        continue;
+      }
+      if (prepared.has_value() && prepared->execution_id == classification.execution_id &&
+          prepared->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed &&
+          !prepared->last_dispatched_participant) {
+        settle_failed_preparation(
+            *item, prepared->error.value_or(*item->unclassified_prepared_terminal));
+      } else {
+        fail_prepared_cancellation(*item, *item->unclassified_prepared_terminal);
+        motion_admission_closed_ = true;
+      }
+    }
     for (const auto& cancellation : prepared_resume_cancellations) {
       cancel_prepared_resume(cancellation.operation_id, *cancellation.engine,
                              cancellation.execution_id);
     }
-    if (!prepared_cancellations.empty() || !participant_settlements.empty()) {
+    if (!prepared_cancellations.empty() || !prepared_classifications.empty() ||
+        !participant_settlements.empty()) {
       // The executor coalesces identical token publications. Finish the
       // bounded, effect-free cancellation pass directly after releasing the
       // state lock so this same callback can commit terminal no-effect truth
@@ -14741,7 +14755,15 @@ Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
 }
 
 OperationReadProjectionDTO ResourceAddressedExecutionKernel::operation_projection_locked(
-    const OperationStateDTO& state, const bool resident, const bool control_pending) const {
+    const OperationStateDTO& state, const bool active, const bool control_pending) const {
+  // Residency is the Kernel's authority over the operation, not table
+  // membership. A retired manual operation still holds its cell-admission
+  // claim until the owner releases it (advancing the admission generation);
+  // publishing non-resident earlier lets a reader capture a generation that
+  // the pending release is about to invalidate.
+  const bool resident =
+      active || (manual_operation_claim_.has_value() &&
+                 manual_operation_claim_->intent.owner_transaction_id == state.operation_id.value());
   const auto control = std::find_if(
       control_replay_ledger_.begin(), control_replay_ledger_.end(), [&](const auto& entry) {
         return entry.durable && entry.accepted.operation_id == state.operation_id;
@@ -14883,15 +14905,26 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     if (assessments.size() == 1U) {
       assessment = assessments.front();
     } else {
-      if (operation->recovery_assessment_inputs != assessments) {
-        if (operation->recovery_assessment_revision >= kMaximumKernelJsonInteger) {
-          return reject<OperationRecoveryProjectionDTO>(
-              "coordinated recovery assessment revision is exhausted",
-              "operation_recovery_unavailable", ErrorCode::kInternalError);
-        }
-        operation->recovery_assessment_inputs = assessments;
-        ++operation->recovery_assessment_revision;
+      // Only a semantic participant change is a new coordinated assessment.
+      // A newer equivalent observation sample (for example an extended
+      // freshness deadline) refreshes the retained inputs in place; the
+      // composed assessment publishes no observation deadline of its own, so
+      // its revision stays nameable by a recovery request across polls.
+      const auto& retained = operation->recovery_assessment_inputs;
+      bool semantic_change = retained.size() != assessments.size();
+      for (std::size_t index = 0U; !semantic_change && index < assessments.size(); ++index) {
+        semantic_change =
+            retained[index].assessment_revision != assessments[index].assessment_revision ||
+            recovery_assessment_semantically_differs(retained[index], assessments[index]);
       }
+      if (semantic_change &&
+          operation->recovery_assessment_revision >= kMaximumKernelJsonInteger) {
+        return reject<OperationRecoveryProjectionDTO>(
+            "coordinated recovery assessment revision is exhausted",
+            "operation_recovery_unavailable", ErrorCode::kInternalError);
+      }
+      operation->recovery_assessment_inputs = assessments;
+      if (semantic_change) ++operation->recovery_assessment_revision;
       assessment.schema_version = "manyforge.kernel_recovery_assessment.v1";
       assessment.assessment_revision = operation->recovery_assessment_revision;
       assessment.assessed_at_ns =

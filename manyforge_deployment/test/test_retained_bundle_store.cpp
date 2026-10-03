@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
@@ -45,6 +46,8 @@
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
+#include "posix_durability_internal.hpp"
+#include "verified_read_memo_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
@@ -1105,6 +1108,227 @@ TEST(FilesystemRetainedBundleRepositoryTest,
                   core::RetainedBundleId("not-a-digest")),
               nullptr);
   }
+}
+
+[[nodiscard]] std::size_t open_descriptor_count() {
+  std::size_t count = 0U;
+  for ([[maybe_unused]] const auto& entry :
+       std::filesystem::directory_iterator("/proc/self/fd")) {
+    ++count;
+  }
+  return count;
+}
+
+TEST(PosixExactRegularFileReadTest,
+     RefusedFilesReleaseTheirDescriptorAndOnlyTheBoundedSizeIsRead) {
+  namespace posix = detail::posix_durability;
+  const posix::ErrorPolicy errors{[](std::string_view message) {
+    return std::make_exception_ptr(RetainedBundleError(std::string(message)));
+  }};
+  const posix::ReadMessages messages{"open", "stat", "bound", "changed",
+                                     "grew"};
+  ScopedTrustedRoot root;
+  const auto exact = root.path() / "exact";
+  const auto oversized = root.path() / "oversized";
+  write_file(exact, "1234");
+  write_file(oversized, "12345");
+
+  const auto read = posix::read_exact_regular_file_with_identity(
+      exact, 4U, false, errors, messages);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->bytes, "1234");
+  EXPECT_EQ(read->identity.size, 4U);
+  EXPECT_EQ(posix::regular_file_identity(exact, 4U, false, errors, messages),
+            std::optional{read->identity});
+  EXPECT_FALSE(posix::regular_file_identity(root.path() / "missing", 4U, true,
+                                            errors, messages)
+                   .has_value());
+
+  const auto descriptors = open_descriptor_count();
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    EXPECT_THROW(static_cast<void>(posix::read_exact_regular_file(
+                     oversized, 4U, false, errors, messages)),
+                 RetainedBundleError);
+    EXPECT_THROW(static_cast<void>(posix::regular_file_identity(
+                     root.path(), 4U, false, errors, messages)),
+                 RetainedBundleError);
+    // procfs reports size 0 for content it then produces: only the bounded,
+    // observed size is allocated and the remaining bytes are refused.
+    EXPECT_THROW(static_cast<void>(posix::read_exact_regular_file_with_identity(
+                     "/proc/self/status", 4096U, false, errors, messages)),
+                 RetainedBundleError);
+  }
+  EXPECT_EQ(open_descriptor_count(), descriptors);
+}
+
+/// Waits until every file under `root` last changed more than the timestamp
+/// granularity bound ago: only such versions may be reused by the memos.
+void wait_until_settled(const std::filesystem::path& root) {
+  namespace posix = detail::posix_durability;
+  const posix::ErrorPolicy errors{[](std::string_view message) {
+    return std::make_exception_ptr(RetainedBundleError(std::string(message)));
+  }};
+  const posix::ReadMessages messages{"open", "stat", "bound", "changed",
+                                     "grew"};
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const auto identity = posix::regular_file_identity(
+        entry.path(), kMaxDurableRetainedBundleBytes, false, errors, messages);
+    while (!posix::identity_settled_before(*identity,
+                                           posix::realtime_now_ns())) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+}
+
+TEST(VerifiedReadMemoTest,
+     ReusesOnlySettledUnchangedNonEmptyResultsAndPropagatesNestedReads) {
+  namespace posix = detail::posix_durability;
+  const posix::ErrorPolicy errors{[](std::string_view message) {
+    return std::make_exception_ptr(RetainedBundleError(std::string(message)));
+  }};
+  const posix::ReadMessages messages{"open", "stat", "bound", "changed",
+                                     "grew"};
+  ScopedTrustedRoot root;
+  const auto inner_file = root.path() / "inner";
+  const auto outer_file = root.path() / "outer";
+  write_file(inner_file, "inner");
+  write_file(outer_file, "outer");
+  const auto read = [&](const std::filesystem::path& path) {
+    auto bytes = posix::read_exact_regular_file_with_identity(
+        path, 64U, false, errors, messages);
+    detail::VerifiedFileReadRecording::record(
+        {{path, 64U, bytes->identity}});
+    return std::make_shared<const std::string>(std::move(bytes->bytes));
+  };
+  detail::VerifiedReadMemo<std::shared_ptr<const std::string>> inner(4U);
+  detail::VerifiedReadMemo<std::shared_ptr<const std::string>> outer(4U);
+  int inner_runs = 0;
+  int outer_runs = 0;
+  const auto get_inner = [&] {
+    return inner.get("inner", errors, messages, [&] {
+      ++inner_runs;
+      return read(inner_file);
+    });
+  };
+  const auto get_outer = [&] {
+    return outer.get("outer", errors, messages, [&] {
+      ++outer_runs;
+      static_cast<void>(get_inner());
+      return read(outer_file);
+    });
+  };
+
+  // Freshly written files are never reused.
+  static_cast<void>(get_outer());
+  static_cast<void>(get_outer());
+  EXPECT_EQ(outer_runs, 2);
+  EXPECT_EQ(inner_runs, 2);
+
+  wait_until_settled(root.path());
+  const auto first = get_outer();
+  EXPECT_EQ(get_outer().get(), first.get());
+  EXPECT_EQ(outer_runs, 3);
+  EXPECT_EQ(inner_runs, 3);
+
+  // A change to a file read only by the nested verification invalidates the
+  // outer result too: the inner reads were recorded into the outer result.
+  std::filesystem::permissions(inner_file, std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::add);
+  write_file(inner_file, "changed");
+  EXPECT_NE(get_outer().get(), first.get());
+  EXPECT_EQ(outer_runs, 4);
+  EXPECT_EQ(inner_runs, 4);
+
+  // A missing file forces the full verification, which fails closed.
+  ASSERT_TRUE(std::filesystem::remove(inner_file));
+  EXPECT_ANY_THROW(static_cast<void>(get_inner()));
+  EXPECT_EQ(inner_runs, 5);
+
+  // Empty results are not remembered.
+  int empty_runs = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    EXPECT_EQ(inner.get("empty", errors, messages,
+                        [&]() -> std::shared_ptr<const std::string> {
+                          ++empty_runs;
+                          static_cast<void>(read(outer_file));
+                          return nullptr;
+                        }),
+              nullptr);
+  }
+  EXPECT_EQ(empty_runs, 2);
+}
+
+TEST(FilesystemVerifiedRetainedBundleSourceTest,
+     VerifiedEntryIsReusedUntilItsFileVersionChanges) {
+  ScopedTrustedRoot root;
+  const auto bundle =
+      materialize_durable_bundle(root.path(), "durable_bundle_memo");
+  const auto entry = bundle_path(root.path(), bundle->retained_bundle_id());
+  const auto read = [&] {
+    return FilesystemVerifiedRetainedBundleSource(root.path())
+        .get_verified(bundle->retained_bundle_id());
+  };
+
+  // A version changed within the timestamp granularity is never reused: an
+  // in-place rewrite in the same tick could keep its identity.
+  const auto fresh = read();
+  ASSERT_NE(fresh, nullptr);
+  EXPECT_NE(read().get(), fresh.get());
+
+  // Independent owners share one verified value of an unchanged, settled file.
+  wait_until_settled(root.path());
+  const auto first = read();
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(read().get(), first.get());
+
+  // A replaced file version is read and verified again, even with identical
+  // bytes; the new value is equal but not the memoized object.
+  const auto replacement = entry.string() + ".replacement";
+  write_file(replacement, bundle->canonical_bytes());
+  std::filesystem::rename(replacement, entry);
+  const auto reread = read();
+  ASSERT_NE(reread, nullptr);
+  EXPECT_NE(reread.get(), first.get());
+  EXPECT_EQ(reread->canonical_bytes(), bundle->canonical_bytes());
+
+  // An in-place rewrite to different bytes is never served from the memo.
+  std::filesystem::permissions(entry, std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::add);
+  write_file(entry, "{}");
+  EXPECT_THROW(static_cast<void>(read()), RetainedBundleError);
+}
+
+TEST(FilesystemVerifiedRetainedBundleSourceTest,
+     ReusedReferenceClosureStillDetectsMissingAndRewrittenArtifacts) {
+  ScopedTrustedRoot root;
+  const auto bundle =
+      materialize_durable_bundle(root.path(), "durable_bundle_closure_memo");
+  const auto& artifacts =
+      bundle->value().compiled_products.planning_collision_model.artifact_refs;
+  ASSERT_EQ(artifacts.size(), 3U);
+  wait_until_settled(root.path());
+  const FilesystemVerifiedRetainedBundleSource source(root.path());
+  ASSERT_NE(source.get_verified(bundle->retained_bundle_id()), nullptr);
+  ASSERT_NE(source.get_verified(bundle->retained_bundle_id()), nullptr);
+
+  // Same size, different bytes, rewritten in place after a reused closure.
+  const auto rewritten = raw_path(root.path(), artifacts.back());
+  const auto size = std::filesystem::file_size(rewritten);
+  std::filesystem::permissions(rewritten, std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::add);
+  write_file(rewritten, std::string(size, 'x'));
+  EXPECT_THROW(static_cast<void>(
+                   source.get_verified(bundle->retained_bundle_id())),
+               RetainedBundleError);
+
+  ASSERT_TRUE(std::filesystem::remove(rewritten));
+  EXPECT_THROW(static_cast<void>(
+                   source.get_verified(bundle->retained_bundle_id())),
+               RetainedBundleError);
 }
 
 TEST(FilesystemVerifiedRetainedBundleSourceTest,

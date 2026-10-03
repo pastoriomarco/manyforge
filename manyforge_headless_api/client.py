@@ -819,6 +819,17 @@ class HeadlessHttpClient:
             "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"
         )
 
+    def program_node_correction_preview(
+        self, program_run_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Effect-free native preview of one held motion node with proposals."""
+
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/node-correction-previews",
+            body=body,
+        )
+
     def program_runtime_control_action(
         self,
         program_run_id: str,
@@ -826,10 +837,6 @@ class HeadlessHttpClient:
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         allowed = {
-            "runtime-overrides",
-            "runtime-overrides/activate",
-            "runtime-overrides/clear",
-            "runtime-overrides/promote",
             "blackboard-values",
             "manual-result",
         }

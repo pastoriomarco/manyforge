@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:87540b07639df35b5b7b5fd29d61d8fb77c8517dcdd7125cd90a997553c19f3d
+program_revision: sha256:85659c07583581c7204a0699acbbfb1852747004da35eb1be0d77beda312a0b9
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: >-
@@ -91,7 +91,6 @@ parameters:
     type: float64
     default: 0.5
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for all moves.
 tree:
   node_id: sequence

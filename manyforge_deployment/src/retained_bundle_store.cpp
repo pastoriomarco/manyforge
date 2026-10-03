@@ -23,6 +23,7 @@
 #include "catalog_artifact_store_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "posix_durability_internal.hpp"
+#include "verified_read_memo_internal.hpp"
 #include "program_binding_internal.hpp"
 #include "manyforge_deployment/program_contract.hpp"
 #include "retained_bundle_internal.hpp"
@@ -362,18 +363,21 @@ class DurableFileCollection final {
     (void)detail::retained_digest_from_hex(hex);
     std::lock_guard process_lock(mutex_);
     const auto file_lock = lock_->acquire(LOCK_SH);
-    const auto bytes = posix::read_exact_regular_file(
-        data_directory_ / committed_filename(hex),
-        max_single_stored_entry_bytes_, true, kPosixErrors, kReadMessages);
-    if (!bytes.has_value()) {
+    const auto path = data_directory_ / committed_filename(hex);
+    auto read = posix::read_exact_regular_file_with_identity(
+        path, max_single_stored_entry_bytes_, true, kPosixErrors,
+        kReadMessages);
+    if (!read.has_value()) {
       return std::nullopt;
     }
-    (void)verify_entry_bytes(kind_, hex, *bytes);
+    (void)verify_entry_bytes(kind_, hex, read->bytes);
     // A successful point read adopts a visible immutable final left by a
     // writer that may have died after link + temporary unlink but before its
     // directory fsync.
     posix::sync_directory(data_directory_, kDirectorySyncMessages);
-    return bytes;
+    detail::VerifiedFileReadRecording::record(
+        {{path, max_single_stored_entry_bytes_, read->identity}});
+    return std::move(read->bytes);
   }
 
   [[nodiscard]] std::size_t size() {
@@ -818,19 +822,30 @@ FilesystemProgramRepository::get_verified(
   if (!hex.has_value()) {
     return nullptr;
   }
-  const auto bytes = storage_->files.get_verified(*hex);
-  if (!bytes.has_value()) {
-    return nullptr;
-  }
-  const auto program =
-      verify_program_binding_contract(*bytes, retained_bundle);
-  if (program->value().program_id != program_id ||
-      program->value().program_revision != program_revision) {
-    throw ProgramContractError(
-        "durable Program repository key/content or Program identity "
-        "mismatch");
-  }
-  return program;
+  // The verified Program is a pure function of its content-addressed entry
+  // and the content-addressed bundle; reuse it while the entry is unchanged.
+  static detail::VerifiedReadMemo<std::shared_ptr<const ProgramBindingContract>>
+      memo(16U);
+  return memo.get(
+      detail::verified_read_key(storage_->files.trusted_root().string(),
+                                std::string(*hex), program_id.value(),
+                                retained_bundle.retained_bundle_id().value()),
+      kPosixErrors, kReadMessages,
+      [&]() -> std::shared_ptr<const ProgramBindingContract> {
+        const auto bytes = storage_->files.get_verified(*hex);
+        if (!bytes.has_value()) {
+          return nullptr;
+        }
+        auto program =
+            verify_program_binding_contract(*bytes, retained_bundle);
+        if (program->value().program_id != program_id ||
+            program->value().program_revision != program_revision) {
+          throw ProgramContractError(
+              "durable Program repository key/content or Program identity "
+              "mismatch");
+        }
+        return program;
+      });
 }
 
 std::size_t FilesystemProgramRepository::size() const {
@@ -905,17 +920,31 @@ FilesystemProgramBindingRepository::get_verified(
   if (!hex.has_value()) {
     return nullptr;
   }
-  const auto bytes = storage_->files.get_verified(*hex);
-  if (!bytes.has_value()) {
-    return nullptr;
-  }
-  const auto binding = reload_verified_program_binding(
-      *bytes, retained_bundle, retained_model_map);
-  if (binding->program_binding_id() != program_binding_id) {
-    throw std::runtime_error(
-        "durable Program-Binding repository key/content mismatch");
-  }
-  return binding;
+  // The verified binding is a pure function of its content-addressed entry,
+  // the content-addressed bundle and that bundle's exact model map; reuse it
+  // while the entry is unchanged.
+  static detail::VerifiedReadMemo<std::shared_ptr<const ProgramBinding>> memo(
+      16U);
+  return memo.get(
+      detail::verified_read_key(
+          storage_->files.trusted_root().string(), std::string(*hex),
+          retained_bundle.retained_bundle_id().value(),
+          retained_model_map.query().retained_bundle_id.value(),
+          retained_model_map.query().product_id.value()),
+      kPosixErrors, kReadMessages,
+      [&]() -> std::shared_ptr<const ProgramBinding> {
+        const auto bytes = storage_->files.get_verified(*hex);
+        if (!bytes.has_value()) {
+          return nullptr;
+        }
+        auto binding = reload_verified_program_binding(
+            *bytes, retained_bundle, retained_model_map);
+        if (binding->program_binding_id() != program_binding_id) {
+          throw std::runtime_error(
+              "durable Program-Binding repository key/content mismatch");
+        }
+        return binding;
+      });
 }
 
 std::size_t FilesystemProgramBindingRepository::size() const {

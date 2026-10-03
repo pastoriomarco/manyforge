@@ -62,11 +62,11 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
         assert client.get("/api/program/draft").status_code == 200
 
 
-def test_all_19_tools_derive_action_schemas_from_real_routes(tmp_path):
+def test_all_18_tools_derive_action_schemas_from_real_routes(tmp_path):
     state = _mcp_state(object())
     app = create_app(state, security=_security(tmp_path))
     contracts = tool_contracts(app)
-    assert len(contracts) == len(TOOL_ROUTES) == 19
+    assert len(contracts) == len(TOOL_ROUTES) == 18
     api = app.openapi()
     for tool in contracts:
         jsonschema.Draft202012Validator.check_schema(tool["inputSchema"])
@@ -76,6 +76,14 @@ def test_all_19_tools_derive_action_schemas_from_real_routes(tmp_path):
             action = variant["properties"]["action"]["const"]
             method, path = actions[action]
             assert method.lower() in api["paths"][path]
+    # Runtime keys, controls and the advisory node preview are retained under
+    # the intervention tool; the removed runtime-override tool is not served.
+    assert "manyforge_runtime_override" not in TOOL_ROUTES
+    intervention = next(t for t in contracts if t["name"] == "manyforge_intervention")
+    assert {
+        variant["properties"]["action"]["const"]
+        for variant in intervention["inputSchema"]["oneOf"]
+    } == {"state", "recover", "manual_result", "runtime_controls", "blackboard", "node_preview"}
     validator = next(t for t in contracts if t["name"] == "manyforge_program_validate")
     assert validator["annotations"]["readOnlyHint"]
     assert next(t for t in contracts if t["name"] == "manyforge_skills")["annotations"][

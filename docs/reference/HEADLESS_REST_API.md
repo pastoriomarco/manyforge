@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-10-01 10:35:04 UTC
+  Last regenerated: 2026-10-02 12:41:46 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -207,14 +207,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |
 | `POST` | `/api/program/runs/{program_run_id}/motion-start` |  | Program Run Motion Start |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
+| `POST` | `/api/program/runs/{program_run_id}/node-correction-previews` |  | Program Node Correction Preview |
 | `POST` | `/api/program/runs/{program_run_id}/reset` |  | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` |  | Program Run Resume Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-motion` |  | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` |  | Program Runtime Controls |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides` |  | Stage Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/activate` |  | Activate Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/clear` |  | Clear Runtime Override |
-| `POST` | `/api/program/runs/{program_run_id}/runtime-overrides/promote` |  | Promote Runtime Override |
 | `POST` | `/api/program/runs/{program_run_id}/stop` |  | Program Run Stop |
 | `GET` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Program Persistent Values |
 | `POST` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Set Program Persistent Value |

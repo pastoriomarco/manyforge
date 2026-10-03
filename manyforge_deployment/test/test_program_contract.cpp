@@ -89,7 +89,6 @@ struct ProgramOptions final {
   bool duplicate_value_source_parameter{false};
   bool include_node_policy{false};
   bool explicit_default_node_policy{false};
-  bool include_allowed_skill{false};
 };
 
 [[nodiscard]] CanonicalValue
@@ -214,34 +213,11 @@ text_array(const std::vector<std::string> &values) {
   }
   if (options.include_node_policy || options.explicit_default_node_policy) {
     const bool defaults = options.explicit_default_node_policy;
-    CanonicalValue::Array actions;
-    CanonicalValue::Array skills;
-    if (!defaults) {
-      actions.emplace_back(options.include_allowed_skill ? "intervention"
-                                                         : "runtime_override");
-    }
-    if (options.include_allowed_skill) {
-      skills.emplace_back("retained-skill");
-    }
-    tree.emplace_back(
-        "modification_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"runtime_override",
-             CanonicalValue(defaults ? "forbidden" : "human_approval")},
-            {"persistent_edit",
-             CanonicalValue(defaults ? "forbidden" : "llm_allowed")},
-            {"intervention_delegate",
-             CanonicalValue(defaults ? "forbidden" : "human_only")},
-        }));
     tree.emplace_back(
         "recovery_policy",
         CanonicalValue(CanonicalValue::Object{
-            {"allow_intervention",
-             CanonicalValue(options.include_allowed_skill)},
-            {"allowed_recovery_actions", CanonicalValue(std::move(actions))},
+            {"allow_intervention", CanonicalValue(!defaults)},
             {"max_retries", CanonicalValue(defaults ? 0.0 : 2.0)},
-            {"allowed_skills", CanonicalValue(std::move(skills))},
-            {"persistence_ceiling", CanonicalValue("session_only")},
         }));
     tree.emplace_back("operator_stop_policy",
                       CanonicalValue(defaults ? "inherit" : "hold"));
@@ -300,7 +276,6 @@ text_array(const std::vector<std::string> &values) {
             {"parameter_id", CanonicalValue("wait_s")},
             {"type", CanonicalValue("float64")},
             {"default", CanonicalValue(0.5)},
-            {"runtime_mutability", CanonicalValue("before_run")},
         })}));
     const auto key = [](std::string name, std::string type) {
       return CanonicalValue::Object{
@@ -621,13 +596,8 @@ TEST(ProgramContractTest, ExtractsSparseCompleteNodePolicies) {
   ASSERT_EQ(contract->value().node_policies.size(), 1U);
   const auto &policy = contract->value().node_policies.front();
   EXPECT_EQ(policy.instance_id.value(), "root");
-  EXPECT_EQ(policy.modification_policy.runtime_override,
-            manyforge::core::ProgramModificationPolicyValue::kHumanApproval);
-  EXPECT_EQ(policy.modification_policy.persistent_edit,
-            manyforge::core::ProgramModificationPolicyValue::kLlmAllowed);
-  EXPECT_EQ(policy.recovery_policy.allowed_recovery_actions,
-            (std::vector<manyforge::core::ProgramRecoveryAction>{
-                manyforge::core::ProgramRecoveryAction::kRuntimeOverride}));
+  EXPECT_TRUE(policy.recovery_policy.allow_intervention);
+  EXPECT_EQ(policy.recovery_policy.max_retries, 2U);
   EXPECT_EQ(policy.operator_stop_policy,
             manyforge::core::ProgramOperatorStopPolicy::kHold);
 }
@@ -659,23 +629,21 @@ TEST(ProgramContractTest,
   EXPECT_TRUE(explicit_defaults->value().node_policies.empty());
 }
 
-TEST(ProgramContractTest, RejectsSkillIdsWithoutQualifiedRetainedReferents) {
+TEST(ProgramContractTest, ZeroRetryBudgetIsUnlimitedNotDefault) {
   ScopedTrustedRoot root;
   const auto bundle = make_bundle(root.path());
-  ProgramOptions options = valid_options(*bundle);
-  options.include_node_policy = true;
-  options.include_allowed_skill = true;
+  const auto contract = verify_program_binding_contract(
+      canonical_json(make_policy_program(*bundle, [](auto &tree) {
+        mutate_object_member(tree, "recovery_policy", [](auto &policy) {
+          replace_member(policy, "max_retries", CanonicalValue(0.0));
+        });
+      })),
+      *bundle);
 
-  try {
-    static_cast<void>(verify_program_binding_contract(
-        canonical_json(with_program_revision(make_program_root(options))),
-        *bundle));
-    FAIL() << "nonempty allowed_skills unexpectedly verified";
-  } catch (const ProgramContractError &error) {
-    EXPECT_NE(std::string(error.what())
-                  .find("exact revision-qualified retained skill referent"),
-              std::string::npos);
-  }
+  ASSERT_EQ(contract->value().node_policies.size(), 1U);
+  const auto &policy = contract->value().node_policies.front();
+  EXPECT_TRUE(policy.recovery_policy.allow_intervention);
+  EXPECT_EQ(policy.recovery_policy.max_retries, 0U);
 }
 
 TEST(ProgramContractTest,
@@ -691,37 +659,16 @@ TEST(ProgramContractTest,
 
   expect_rejected([](auto &tree) { erase_member(tree, "instance_id"); });
   expect_rejected([](auto &tree) {
-    replace_member(tree, "modification_policy", CanonicalValue(nullptr));
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &policy) {
-      erase_member(policy, "persistent_edit");
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &policy) {
-      policy.emplace_back("unexpected", CanonicalValue(true));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &policy) {
-      replace_member(policy, "runtime_override",
-                     CanonicalValue("operator_allowed"));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &policy) {
-      replace_member(policy, "intervention_delegate",
-                     CanonicalValue("operator"));
-    });
-  });
-
-  expect_rejected([](auto &tree) {
     replace_member(tree, "recovery_policy", CanonicalValue(nullptr));
   });
   expect_rejected([](auto &tree) {
     mutate_object_member(tree, "recovery_policy", [](auto &policy) {
       erase_member(policy, "max_retries");
+    });
+  });
+  expect_rejected([](auto &tree) {
+    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
+      erase_member(policy, "allow_intervention");
     });
   });
   expect_rejected([](auto &tree) {
@@ -736,51 +683,6 @@ TEST(ProgramContractTest,
   });
   expect_rejected([](auto &tree) {
     mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Object{}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention"),
-                         CanonicalValue("runtime_override"),
-                         CanonicalValue("runtime_override")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(
-          policy, "allowed_recovery_actions",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("unknown")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("runtime_override"),
-                         CanonicalValue("runtime_override")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("runtime_override"),
-                         CanonicalValue("intervention")}));
-      replace_member(policy, "allow_intervention", CanonicalValue(true));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue("intervention"));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
       replace_member(policy, "max_retries", CanonicalValue(true));
     });
   });
@@ -791,56 +693,12 @@ TEST(ProgramContractTest,
   });
   expect_rejected([](auto &tree) {
     mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(
-          policy, "allowed_skills",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("Upper")}));
+      replace_member(policy, "max_retries", CanonicalValue(-1.0));
     });
   });
   expect_rejected([](auto &tree) {
     mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(
-          policy, "allowed_skills",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("z-skill"),
-                                               CanonicalValue("a-skill")}));
-      replace_member(policy, "allow_intervention", CanonicalValue(true));
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(
-          policy, "allowed_skills",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("a-skill"),
-                                               CanonicalValue("a-skill")}));
-      replace_member(policy, "allow_intervention", CanonicalValue(true));
-      replace_member(policy, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allowed_skills",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue(std::string(129, 'a'))}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      CanonicalValue::Array skills;
-      for (std::size_t index = 0U; index < 257U; ++index) {
-        skills.emplace_back("skill-" + std::to_string(index));
-      }
-      replace_member(policy, "allowed_skills",
-                     CanonicalValue(std::move(skills)));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "persistence_ceiling",
-                     CanonicalValue("persistent"));
+      replace_member(policy, "max_retries", CanonicalValue(1.5));
     });
   });
   expect_rejected([](auto &tree) {
@@ -853,67 +711,26 @@ TEST(ProgramContractTest,
     replace_member(tree, "instance_id", CanonicalValue(std::string(129, 'a')));
   });
 
+  // Removed policy forms are refused, never reinterpreted.
+  expect_rejected([](auto &tree) {
+    tree.emplace_back(
+        "modification_policy",
+        CanonicalValue(CanonicalValue::Object{
+            {"intervention_delegate", CanonicalValue("forbidden")},
+            {"persistent_edit", CanonicalValue("forbidden")},
+            {"runtime_override", CanonicalValue("forbidden")},
+        }));
+  });
+  for (const char *removed : {"allowed_recovery_actions", "allowed_skills"}) {
+    expect_rejected([removed](auto &tree) {
+      mutate_object_member(tree, "recovery_policy", [removed](auto &policy) {
+        policy.emplace_back(removed, CanonicalValue(CanonicalValue::Array{}));
+      });
+    });
+  }
   expect_rejected([](auto &tree) {
     mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(policy, "allow_intervention", CanonicalValue(true));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &policy) {
-      replace_member(
-          policy, "allowed_skills",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("a-skill")}));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &policy) {
-      replace_member(policy, "runtime_override", CanonicalValue("forbidden"));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &modification) {
-      replace_member(modification, "runtime_override",
-                     CanonicalValue("forbidden"));
-    });
-    mutate_object_member(tree, "recovery_policy", [](auto &recovery) {
-      replace_member(recovery, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention")}));
-      replace_member(recovery, "allow_intervention", CanonicalValue(true));
-      replace_member(recovery, "persistence_ceiling",
-                     CanonicalValue("runtime_override"));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "modification_policy", [](auto &modification) {
-      replace_member(modification, "persistent_edit",
-                     CanonicalValue("forbidden"));
-    });
-    mutate_object_member(tree, "recovery_policy", [](auto &recovery) {
-      replace_member(recovery, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention")}));
-      replace_member(recovery, "allow_intervention", CanonicalValue(true));
-      replace_member(recovery, "persistence_ceiling",
-                     CanonicalValue("draft_patch"));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &recovery) {
-      replace_member(recovery, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{}));
-      replace_member(recovery, "max_retries", CanonicalValue(1.0));
-    });
-  });
-  expect_rejected([](auto &tree) {
-    mutate_object_member(tree, "recovery_policy", [](auto &recovery) {
-      replace_member(recovery, "allowed_recovery_actions",
-                     CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue("intervention")}));
-      replace_member(recovery, "allow_intervention", CanonicalValue(true));
-      replace_member(
-          recovery, "allowed_skills",
-          CanonicalValue(CanonicalValue::Array{CanonicalValue("a-skill")}));
+      policy.emplace_back("persistence_ceiling", CanonicalValue("session_only"));
     });
   });
 }
@@ -1014,6 +831,31 @@ TEST(ProgramContractTest, SealsClosedProgramValueSourceForms) {
     EXPECT_NO_THROW(static_cast<void>(verify_program_binding_contract(
         canonical_json(with_program_revision(make_program_root(options))),
         *bundle)));
+  }
+}
+
+TEST(ProgramContractTest, RejectsRemovedParameterRuntimeMutability) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  ProgramOptions options = valid_options(*bundle);
+  options.value_source_kind = "program_parameter";
+  auto members = make_program_root(options).as_object();
+  for (auto &[name, value] : members) {
+    if (name != "parameters") continue;
+    auto rows = value.as_array();
+    auto row = rows.front().as_object();
+    row.emplace_back("runtime_mutability", CanonicalValue("before_run"));
+    rows.front() = CanonicalValue(std::move(row));
+    value = CanonicalValue(std::move(rows));
+  }
+  try {
+    static_cast<void>(verify_program_binding_contract(
+        canonical_json(with_program_revision(CanonicalValue(std::move(members)))),
+        *bundle));
+    FAIL() << "a removed runtime_mutability field was accepted";
+  } catch (const ProgramContractError &error) {
+    EXPECT_NE(std::string(error.what()).find("runtime_mutability was removed"),
+              std::string::npos);
   }
 }
 
@@ -1482,7 +1324,6 @@ key_typed_program(const ProgramOptions &options, CanonicalValue tree,
         {"parameter_id", CanonicalValue(std::move(name))},
         {"type", CanonicalValue(std::move(type))},
         {"default", std::move(value)},
-        {"runtime_mutability", CanonicalValue("before_run")},
     });
   };
   auto members = make_program_root(options).as_object();

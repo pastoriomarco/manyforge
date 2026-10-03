@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_lite6_lite_gripper_pick_and_place
-program_revision: sha256:9ad011b3a0842880c1fe33fe1867875b41080ed06784486f7a3a6c955c8e8d3c
+program_revision: sha256:b75b070d84ebeb6117086e25a576b6b5f38fbf6fc438c05e2725f83fd5782f92
 program_profile: composable-cell-v1
 name: isaac_lite6_lite_gripper_pick_and_place
 description: >-
@@ -100,7 +100,6 @@ parameters:
     type: float64
     default: 0.4
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    runtime_mutability: before_run
     description: Velocity scale for all Lite6 moves.
 tree:
   node_id: sequence

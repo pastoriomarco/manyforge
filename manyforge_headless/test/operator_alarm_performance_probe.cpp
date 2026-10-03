@@ -128,7 +128,7 @@ AlarmConditionUpdate Update(const std::uint64_t sequence) {
 std::unique_ptr<AlarmLifecycleOwner>
 MakeOwner(const OperatorAlarmCatalog &catalog, const std::string &owner_epoch) {
   auto owner = std::make_unique<AlarmLifecycleOwner>(
-      catalog, "cell.performance", std::set<std::string>{}, "alarm.performance",
+      catalog, "cell.performance", "alarm.performance",
       owner_epoch, [] { return MonotonicNowNs(); },
       [] { return std::string("2026-08-05T00:00:00Z"); },
       std::set<std::string>{"runtime_health"});

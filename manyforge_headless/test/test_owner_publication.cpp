@@ -9,6 +9,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -345,6 +346,56 @@ TEST(ManagerSourcePublication,
   EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
   EXPECT_EQ(bytes.find("\"configuration_fence_id\":\""), std::string::npos);
+}
+
+TEST(ManagerSourcePublication,
+     RefusesARuntimeThatPredatesACommittedApplyPublication) {
+  // The live race: the Apply progression lane published a transition value
+  // from the last runtime observed before the Apply (active publication N)
+  // beside a journal that already held the Apply's receipt for publication
+  // N+1. Readers then saw a committed Apply that no publication accounted
+  // for (program_activation_history_incomplete). Such a pair is one
+  // generation apart and is never projected.
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  static_cast<void>(journal.EnsureIntent(ApplyIntent(admission)));
+  const auto runtime = Runtime(admission);
+  auto inventory = journal.ReadStatusInventory();
+  ASSERT_EQ(inventory.size(), 1U);
+  // Not yet published: the active publication accounts for it trivially.
+  EXPECT_TRUE(ManagerRuntimeAccountsForCommittedApplies(runtime, inventory));
+
+  auto committed = runtime.plan.active_publication;
+  committed.publication_generation = core::ActiveBundlePublicationGeneration(
+      runtime.plan.active_publication.publication_generation.value() + 1U);
+  committed.durable_public_pointer_content_digest =
+      core::ContentDigest(std::string(kDigestOne));
+  inventory.front().publication_receipt =
+      component_manager::PersistedManagerApplyPublicationReceipt{
+          component_manager::ManagerApplyPublicationReceiptDTO{
+              core::ContentDigest(std::string(kDigestOne)), committed},
+          core::ContentDigest(std::string(kDigestTwo)),
+      };
+  EXPECT_FALSE(ManagerRuntimeAccountsForCommittedApplies(runtime, inventory));
+  EXPECT_THROW(static_cast<void>(BuildManagerSourcePayload(
+                   admission.retained_bundle(), runtime, journal, inventory,
+                   ManagerApplyMutationAvailability::kAvailable)),
+               std::invalid_argument);
+
+  // Once the observed runtime holds that publication, the pair is current.
+  auto current = runtime;
+  current.plan.active_publication = committed;
+  EXPECT_TRUE(ManagerRuntimeAccountsForCommittedApplies(current, inventory));
+
+  // A receipt at the active generation must be that exact publication.
+  auto foreign = committed;
+  foreign.durable_public_pointer_content_digest =
+      core::ContentDigest(std::string(kDigestTwo));
+  inventory.front().publication_receipt->publication.publication_receipt =
+      foreign;
+  EXPECT_FALSE(ManagerRuntimeAccountsForCommittedApplies(current, inventory));
 }
 
 TEST(ManagerSourcePublication,

@@ -55,7 +55,7 @@ def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
+        api_version="manyforge.program_binding.v2",
     )
     return binding
 
@@ -218,7 +218,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v1",
+            "schema_version": "manyforge.program_run_capture.v2",
             "program_run_id": "program-run.1",
             "applied_record_digest": digest_c,
             "scenario_id": "cell-pick",
@@ -705,6 +705,8 @@ def headless_client() -> (
             }
         elif path.startswith("/api/program/scenarios/cell-pick/persistent-values"):
             payload = {"forwarded": path}
+        elif path == "/api/program/runs/program-run.7/node-correction-previews":
+            payload = {"forwarded": path}
         else:
             return httpx.Response(404, json={"detail": "unknown"}, request=request)
         return httpx.Response(200, json=payload, request=request)
@@ -873,7 +875,7 @@ def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> No
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
+        api_version="manyforge.program_binding.v2",
     )
     projection = {
         "program_binding": binding,
@@ -2124,3 +2126,62 @@ def test_composer_forwards_persistent_value_edits_as_strict_requests(
         ("POST", f"{base}/reset", edit),
         ("POST", f"{base}/clear", caller),
     ]
+
+
+def test_composer_forwards_the_node_correction_preview_as_a_strict_query(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    path = "/api/program/runs/program-run.7/node-correction-previews"
+    body = {
+        "schema_version": "manyforge.program_node_correction_preview_request.v1",
+        "request_id": "node-preview.1",
+        "program_run_id": "program-run.7",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "program_id": "lite6_program",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "a" * 64,
+        "node_instance_id": "move_to_pick",
+        "node_attempt_id": "attempt:1",
+        "proposed_inputs": [{"path": "goal.position_m[2]", "value": 0.25}],
+    }
+
+    with _composer(client) as composer:
+        response = composer.post(path, json=body)
+        mismatch = composer.post(
+            "/api/program/runs/program-run.8/node-correction-previews", json=body
+        )
+        # The browser cannot name a binding, robot or capability.
+        foreign = composer.post(
+            path, json={**body, "target_role_id": "other_arm"}
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"forwarded": path}
+    assert mismatch.status_code == 400
+    assert mismatch.json()["detail"]["code"] == "program_run_path_invalid"
+    assert foreign.status_code == 422
+    forwarded = [item for item in requests if item["path"].endswith("node-correction-previews")]
+    assert forwarded == [{"method": "POST", "path": path, "query": "", "body": body}]
+
+
+
+def test_composer_does_not_serve_removed_runtime_override_routes(headless_client) -> None:
+    client, requests, _node_environment = headless_client
+    removed = [
+        "/api/program/runs/program-run.7/runtime-overrides",
+        "/api/program/runs/program-run.7/runtime-overrides/activate",
+        "/api/program/runs/program-run.7/runtime-overrides/clear",
+        "/api/program/runs/program-run.7/runtime-overrides/promote",
+        "/api/program/draft/runtime-override-promotions",
+    ]
+    with _composer(client) as composer:
+        responses = [composer.post(path, json={}) for path in removed]
+        served = composer.app.openapi()["paths"]
+    # Only the generic unavailable-route answer remains; nothing is forwarded.
+    assert [response.status_code for response in responses] == [503] * len(removed)
+    assert {
+        response.json()["detail"]["code"] for response in responses
+    } == {"composable_cell_runtime_unavailable"}
+    assert not any("runtime-override" in path for path in served)
+    assert not any("runtime-override" in item["path"] for item in requests)

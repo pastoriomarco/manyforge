@@ -2,6 +2,7 @@ import type { ProgramBindingDocument } from './programBindingTransport.generated
 import type { Nanoseconds } from './nanoseconds';
 import type { AuthoringWorkspaceIdentity } from './headless';
 import type {
+  MotionPreviewReceipt,
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
 } from './robotControl';
@@ -200,34 +201,15 @@ export type ProgramValueSource =
   | { kind: 'blackboard_field'; reference: string; field: string }
   | { kind: 'expression'; expression: string };
 
-export type ProgramModificationPolicyValue =
-  | 'forbidden'
-  | 'human_approval'
-  | 'llm_allowed';
-export type ProgramInterventionDelegate =
-  | 'forbidden'
-  | 'human_only'
-  | 'llm_allowed'
-  | 'program_only';
-export type ProgramRecoveryAction = 'intervention' | 'runtime_override';
-export type ProgramPersistenceCeiling =
-  | 'session_only'
-  | 'runtime_override'
-  | 'draft_patch';
 export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
 
-export interface ProgramNodeModificationPolicy {
-  runtime_override: ProgramModificationPolicyValue;
-  persistent_edit: ProgramModificationPolicyValue;
-  intervention_delegate: ProgramInterventionDelegate;
-}
-
+/**
+ * The captured failure-recovery policy of one node. `max_retries` 0 is
+ * Unlimited, never "disabled"; intervention stays an explicit opt-in.
+ */
 export interface ProgramNodeRecoveryPolicy {
   allow_intervention: boolean;
-  allowed_recovery_actions: ProgramRecoveryAction[];
   max_retries: number;
-  allowed_skills: string[];
-  persistence_ceiling: ProgramPersistenceCeiling;
 }
 
 export interface ProgramTreeNode {
@@ -237,7 +219,6 @@ export interface ProgramTreeNode {
   value_sources?: Record<string, ProgramValueSource>;
   children: ProgramTreeNode[];
   metadata?: Record<string, JsonValue>;
-  modification_policy?: ProgramNodeModificationPolicy;
   recovery_policy?: ProgramNodeRecoveryPolicy;
   operator_stop_policy?: ProgramOperatorStopPolicy;
   execution_groups?: 'inherit' | 'all' | string[];
@@ -269,7 +250,6 @@ export interface ProgramParameterDeclaration {
   type: string;
   default: JsonValue;
   constraints?: Record<string, JsonValue>;
-  runtime_mutability: 'immutable' | 'before_run';
   description?: string;
 }
 
@@ -376,7 +356,6 @@ export interface ProgramDraftProjection {
 
 export interface ProgramDraftApplicability {
   applyReady: boolean;
-  affectedInstanceIds: string[];
   unavailableReason: RuntimeAvailability | null;
 }
 
@@ -480,7 +459,7 @@ export type ScenarioDocumentLoadResponse = ScenarioDocumentLoadResponseBase & (
  *
  * These are the facts an operator cannot re-derive from a Draft alone: the
  * selected project path, the Saved baseline identity, the source diagnostics and
- * the Program role assignment/typed overrides that were captured from the
+ * the Program role assignment that was captured from the
  * document. They are read once per observed workspace identity, together with
  * both Draft projections, so no consumer has to combine two reads.
  */
@@ -492,7 +471,6 @@ export interface AuthoringWorkspaceProjectFacts {
   sourceDiagnostics: ScenarioSourceDiagnostic[];
   sourceDocumentDigest: string | null;
   programRoleAssignment: Record<string, JsonValue> | null;
-  typedParameterOverrides: Record<string, JsonValue>;
   sourceProgramDigest: string | null;
   sourceDeploymentDigest: string | null;
 }
@@ -523,7 +501,7 @@ export interface AuthoringWorkspaceDeploymentDraft {
  * their existing owner projections.
  */
 export interface AuthoringWorkspaceSnapshot {
-  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1';
+  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2';
   workspaceEpoch: string;
   workspaceRevision: number;
   program: {
@@ -588,7 +566,7 @@ export interface DeploymentWorkspaceResponse {
 }
 
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v3' | 'manyforge.prepared_activation_input.v4';
+  schemaVersion: 'manyforge.prepared_activation_input.v5';
   preparedActivationId: string;
   scenarioId: string;
   sourceDocumentDigest: string;
@@ -604,7 +582,6 @@ export interface PreparedActivationInput {
   programBindingId: string | null;
   nodeEnvironmentDigest: string;
   assistantMode: 'required' | 'optional' | 'forbidden';
-  typedParameterOverrides: Record<string, JsonValue>;
 }
 
 export interface DeploymentCandidatePreparation {
@@ -684,7 +661,7 @@ export interface CurrentScenarioResponse {
 }
 
 export interface AppliedProgramSelection {
-  schemaVersion: 'manyforge.applied_program_selection.v2';
+  schemaVersion: 'manyforge.applied_program_selection.v3';
   scenarioId: string;
   sourceDocumentDigest: string;
   programId: string;
@@ -900,43 +877,6 @@ export interface PersistentKeyValuesCleared {
   removed: number;
 }
 
-export type RuntimeOverrideStatus = 'staged' | 'active' | 'cleared' | 'stale';
-
-export interface RuntimeOverrideRecord {
-  schemaVersion: 'manyforge.runtime_override.v1';
-  overrideId: string;
-  overrideRevision: number;
-  status: RuntimeOverrideStatus;
-  programRunId: string;
-  programRevision: string;
-  programBindingId: string;
-  retainedBundleId: string;
-  graphRevision: string;
-  nodeEnvironmentDigest: string;
-  nodeInstanceId: string;
-  nodeAttemptId: string;
-  parameterId: string;
-  value: JsonValue;
-  sourceObservationId: string | null;
-  sourceOwnerGeneration: number | null;
-}
-
-export interface RuntimeOverridePromotionProposal {
-  schemaVersion: 'manyforge.runtime_override_promotion.v1';
-  proposalId: string;
-  status: 'awaiting_reset' | 'ready';
-  programRunId: string;
-  overrideId: string;
-  programRevision: string;
-  programBindingId: string;
-  nodeInstanceId: string;
-  nodeId: string;
-  parameterId: string;
-  value: JsonValue;
-  expectedDraftId: string;
-  expectedDraftRevision: number;
-}
-
 export interface RuntimeControlAuditEvent {
   eventRevision: number;
   kind: string;
@@ -944,7 +884,7 @@ export interface RuntimeControlAuditEvent {
 }
 
 export interface ProgramRuntimeControlsSnapshot {
-  schemaVersion: 'manyforge.program_runtime_controls.v2';
+  schemaVersion: 'manyforge.program_runtime_controls.v3';
   programRunId: string;
   runtimeControlRevision: number;
   recoveryFences: {
@@ -953,11 +893,6 @@ export interface ProgramRuntimeControlsSnapshot {
     sceneAdmissionEpoch: number;
     poseSourceApplyGeneration: number;
   };
-  hasActiveRuntimeOverrides: boolean;
-  hasStagedRuntimeOverrides: boolean;
-  hasStaleRuntimeOverrides: boolean;
-  overrides: RuntimeOverrideRecord[];
-  promotionProposals: RuntimeOverridePromotionProposal[];
   retryCounts: Record<string, number>;
   audit: RuntimeControlAuditEvent[];
 }
@@ -980,7 +915,7 @@ export interface CycleRecoveryAction {
 }
 
 export interface CycleRecoveryOffer {
-  schemaVersion: 'manyforge.cycle_recovery_offer.v3';
+  schemaVersion: 'manyforge.cycle_recovery_offer.v4';
   offerId: string;
   offerRevision: number;
   generatedAtNs: Nanoseconds;
@@ -1020,22 +955,10 @@ export interface CycleRecoveryOffer {
    */
   reason: StructuredError;
   evidenceRefs: string[];
-  policy: Record<string, JsonValue>;
-}
-
-export interface RuntimeOverrideObservationCandidate {
-  schemaVersion: 'manyforge.runtime_override_observation_candidate.v1';
-  available: boolean;
-  reasonCode: string | null;
-  reason: string | null;
-  programRunId: string;
-  nodeInstanceId: string | null;
-  nodeAttemptId: string | null;
-  nodeId: string | null;
-  parameterId: string | null;
-  value: JsonValue | null;
-  sourceObservationId: string | null;
-  sourceOwnerGeneration: number | null;
+  /** The captured node policy; `maxRetries` 0 is Unlimited. */
+  policy: { allowIntervention: boolean; maxRetries: number };
+  /** Explicit failure retries of this node already used in the run. */
+  retriesUsed: number;
 }
 
 export interface ProgramExecutionSelectionControls {
@@ -1065,7 +988,7 @@ export interface ProgramGroupRuntimeScaleState {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v6';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v7';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;
@@ -1073,15 +996,6 @@ export interface ProgramRuntimeControlProjection {
   runtimeControls: ProgramRuntimeControlsSnapshot;
   recoveryOffer: CycleRecoveryOffer | null;
   executionSelections: ProgramExecutionSelectionControls;
-  observationOverrideCandidate: RuntimeOverrideObservationCandidate;
-}
-
-export interface RuntimeOverrideMaterializationResponse {
-  proposalId: string;
-  mutation: string;
-  details: Record<string, JsonValue>;
-  workspace: ProgramWorkspaceResponse;
-  authoringWorkspace: AuthoringWorkspaceSnapshot;
 }
 
 export type ProgramWorkspaceTransitionStatus =
@@ -1875,6 +1789,77 @@ export type ManagerApplyResponse =
   | ManagerApplyPendingResponse
   | ManagerApplySucceededResponse
   | ManagerApplyTerminalFailureResponse;
+
+/** One proposed value at one parameter value path of the held node. */
+export interface ProposedNodeInput {
+  path: string;
+  value: JsonValue;
+}
+
+export interface ProgramNodeCorrectionPreviewRequest {
+  schema_version: 'manyforge.program_node_correction_preview_request.v1';
+  request_id: string;
+  program_run_id: string;
+  /** The Program runner's owner epoch of the held run. */
+  expected_owner_epoch: string;
+  program_id: string;
+  program_revision: string;
+  program_binding_id: string;
+  node_instance_id: string;
+  /** The held attempt the proposal corrects. */
+  node_attempt_id: string;
+  proposed_inputs: ProposedNodeInput[];
+}
+
+/**
+ * Advisory, effect-free preview of one held motion node with proposed inputs.
+ * It grants no Retry, Reset, Draft or Apply authority (D4).
+ */
+export interface ProgramNodeCorrectionPreview {
+  schemaVersion: 'manyforge.program_node_correction_preview.v1';
+  requestId: string;
+  programRunId: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  programRunnerOwnerEpoch: string;
+  runRevision: number;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeId: string | null;
+  proposedPaths: string[];
+  parametersDigest: string | null;
+  target: {
+    targetRoleId: string;
+    componentRoleId: string;
+    controllableComponentId: string;
+    commandTargetId: string;
+  } | null;
+  unavailableReason: { code: string; message: string } | null;
+  previewCheck: 'trajectory_planned_and_collision_validated' | null;
+  /** The unchanged native motion-preview result, when one was requested. */
+  preview:
+    | { ok: true; receipt: MotionPreviewReceipt }
+    | { ok: false; error: StructuredError }
+    | null;
+}
+
+/** Composer's bounded log record of one confirmed Apply after Reset. */
+export interface ResetApplyContext {
+  schemaVersion: 'manyforge.composer_reset_apply_context.v1';
+  correlationId: string;
+  document: 'program' | 'deployment';
+  programRunId: string;
+  programRunnerOwnerEpoch: string;
+  cycleGeneration: number;
+  draftId: string;
+  draftRevision: number;
+  /** The Program revision or Deployment revision of the confirmed Draft. */
+  draftContentRevision: string | null;
+  appliedRevision: string | null;
+}
 
 export interface DraftMutationResponse {
   mutation: string;

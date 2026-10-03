@@ -378,6 +378,41 @@ TEST(
 }
 
 TEST(
+    ActiveBundlePublicationStoreIntegrity,
+    ReverifiesOnlyAfterAnOwnOrForeignCommitAndDetectsItImmediately) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "publication.sqlite3";
+  SqliteActiveBundlePublicationStore store(path, CellId{"cell-a"});
+  static_cast<void>(store.PublishActiveBundle(BootstrapRequest()));
+  const auto first = store.VerifyIntegrity();
+  const auto verified = store.complete_verification_count();
+
+  // Unchanged database: the complete verification is not repeated.
+  for (int read = 0; read < 2; ++read) {
+    const auto reused = store.VerifyIntegrity();
+    EXPECT_EQ(reused.receipt_count, first.receipt_count);
+    EXPECT_EQ(reused.current_generation, first.current_generation);
+    EXPECT_EQ(reused.current_pointer_digest, first.current_pointer_digest);
+  }
+  EXPECT_EQ(store.complete_verification_count(), verified);
+
+  // An own commit is verified completely on the next call.
+  static_cast<void>(store.PublishActiveBundle(ApplyRequest("apply-1", 1U)));
+  EXPECT_EQ(store.VerifyIntegrity().current_generation.value(), 2U);
+  EXPECT_EQ(store.complete_verification_count(), verified + 1U);
+
+  // A foreign commit that breaks the versioned schema is detected by the very
+  // next call, and keeps failing until repaired.
+  SqliteExecPath(path, "CREATE TABLE unexpected(value TEXT) STRICT;");
+  EXPECT_THROW(static_cast<void>(store.VerifyIntegrity()),
+               ActiveBundlePublicationIntegrityError);
+  EXPECT_THROW(static_cast<void>(store.VerifyIntegrity()),
+               ActiveBundlePublicationIntegrityError);
+  SqliteExecPath(path, "DROP TABLE unexpected;");
+  EXPECT_EQ(store.VerifyIntegrity().current_generation.value(), 2U);
+}
+
+TEST(
     ActiveBundlePublicationStore,
     IndependentWritersSerializeDuplicateBootstrapAndNextCas) {
   TemporaryDirectory directory;

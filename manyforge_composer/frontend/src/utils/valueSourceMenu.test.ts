@@ -49,9 +49,9 @@ const entry: CatalogEntry = {
 };
 
 const parameters: ProgramParameterDeclaration[] = [
-  { parameter_id: 'grasp_z', type: 'float64', default: 0.1, runtime_mutability: 'before_run' },
-  { parameter_id: 'count', type: 'int64', default: 2, runtime_mutability: 'before_run' },
-  { parameter_id: 'cycle_speed', type: 'float64', default: 0.5, runtime_mutability: 'before_run' },
+  { parameter_id: 'grasp_z', type: 'float64', default: 0.1 },
+  { parameter_id: 'count', type: 'int64', default: 2 },
+  { parameter_id: 'cycle_speed', type: 'float64', default: 0.5 },
 ];
 const keys: BlackboardKeyDeclaration[] = [
   { key: 'place_pose', type: 'stored_pose', access: 'read_write', persistence: 'run' },

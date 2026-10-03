@@ -45,8 +45,6 @@ namespace {
 
 using namespace manyforge::core;
 
-constexpr TimePoint kStopProjectionRetryDelayNs = 20'000'000;
-
 template <typename Predicate>
 bool wait_until(Predicate&& predicate,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
@@ -380,6 +378,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
             ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
                      "fake prepared execution already dispatched",
                      {{"reason", "prepared_motion_already_dispatched"}}});
+      }
+      // Like ExecutionKernel::CancelPreparedMotion, a preparation that has
+      // already failed is left unchanged and publishes no further terminal.
+      if (prepared_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed) {
+        return Result<void>::Ok();
       }
       prepared_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
     }
@@ -1390,20 +1393,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::map<std::uint64_t, EventCallback> callbacks;
 };
 
-class RejectingScheduler final : public IScheduler {
- public:
-  ScheduleHandle schedule(TimePoint, std::function<void()>, SchedulerPriority priority) override {
-    last_priority.store(static_cast<int>(priority), std::memory_order_release);
-    schedule_calls.fetch_add(1, std::memory_order_release);
-    throw std::runtime_error("test scheduler rejected callback");
-  }
-
-  void cancel(ScheduleHandle) override {}
-
-  std::atomic_int schedule_calls{};
-  std::atomic_int last_priority{-1};
-};
-
 class FakeOperationJournal final : public IOperationJournal {
  public:
   Result<OperationJournalRecoveryDTO> BeginOwnerEpoch(const RequestOwnerEpoch&, std::int64_t,
@@ -1458,16 +1447,6 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_accepted = accepted;
     last_stop_affected_state = affected_state;
     projected_stop_acceptances.push_back(accepted.stop_id);
-    if (retryable_stop_acceptance_failures > 0U) {
-      --retryable_stop_acceptance_failures;
-      ++stop_acceptance_calls;
-      return EmergencyStopAcceptanceProjectionResultDTO{
-          EmergencyStopProjectionStateDTO::kFailed, std::nullopt,
-          ErrorDTO{
-              "operation_journal_stop_projection_unavailable",
-              "Stop acceptance projection cannot wait for the operation journal",
-              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
-    }
     if (fail_next_kind == "stop_accepted") {
       fail_next_kind.reset();
       ++stop_acceptance_calls;
@@ -1493,15 +1472,6 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_fault_latch = fault_latch;
     projected_stop_terminals.push_back(certificate.stop_id);
     ++stop_terminal_calls;
-    if (retryable_stop_terminal_failures > 0U) {
-      --retryable_stop_terminal_failures;
-      return StopForensicProjectionResultDTO{
-          StopForensicProjectionStateDTO::kFailed, std::nullopt,
-          ErrorDTO{
-              "operation_journal_stop_projection_unavailable",
-              "Stop terminal projection cannot wait for the operation journal",
-              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
-    }
     if (fail_next_kind == "stop_terminal") {
       fail_next_kind.reset();
       return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
@@ -1522,15 +1492,6 @@ class FakeOperationJournal final : public IOperationJournal {
     last_stop_fault_latch = fault_latch;
     last_stop_surveillance_projected_at_ns = projected_at_ns;
     ++stop_surveillance_calls;
-    if (retryable_stop_surveillance_failures > 0U) {
-      --retryable_stop_surveillance_failures;
-      return StopForensicProjectionResultDTO{
-          StopForensicProjectionStateDTO::kFailed, std::nullopt,
-          ErrorDTO{
-              "operation_journal_stop_projection_unavailable",
-              "Stop surveillance projection cannot wait for the operation journal",
-              {{"reason", "operation_journal_critical_section_occupied"}, {"retryable", "true"}}}};
-    }
     if (fail_next_kind == "stop_surveillance_checkpoint") {
       fail_next_kind.reset();
       return StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed, std::nullopt,
@@ -1648,9 +1609,6 @@ class FakeOperationJournal final : public IOperationJournal {
   OperationJournalRecoveryDTO recovery;
   std::optional<std::string> fail_next_kind;
   bool fail_next_cell_release{};
-  std::size_t retryable_stop_acceptance_failures{};
-  std::size_t retryable_stop_terminal_failures{};
-  std::size_t retryable_stop_surveillance_failures{};
   std::vector<std::string> calls;
   std::atomic<int> stop_acceptance_calls{};
   std::atomic<int> stop_terminal_calls{};
@@ -3273,8 +3231,8 @@ TEST(ResourceAddressedExecutionKernelTest, ManualNoEffectAndTerminalReleaseRemai
         EXPECT_EQ(released.error().code, "operation_journal_test_failure");
         return true;
       }));
-      EXPECT_FALSE(
-          kernel.get_operation_projection(operation.value().operation_id).value().resident);
+      // Retired from the active table, but its claim is still held.
+      EXPECT_TRUE(kernel.get_operation_projection(operation.value().operation_id).value().resident);
       EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
     }
     ASSERT_TRUE(wait_until([&] {
@@ -3364,6 +3322,69 @@ TEST(ResourceAddressedExecutionKernelTest,
            kernel.GetAuthoringAdmission().authoring_allowed;
   }));
   EXPECT_TRUE(claim_program_execution(kernel).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetiredManualOperationStaysResidentUntilItsAdmissionClaimIsReleased) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto direct = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto operation = kernel.execute(motion_operation("manual.retired"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  const auto resident = [&] {
+    const auto projection = kernel.get_operation_projection(operation.value().operation_id);
+    const auto latest = kernel.get_latest_run_operations({ProgramRunId("run.1")});
+    EXPECT_TRUE(projection.ok());
+    EXPECT_EQ(latest.size(), 1U);
+    EXPECT_EQ(latest.front().resident, projection.value().resident);
+    return projection.value().resident;
+  };
+
+  // The automatic clean-terminal retirement leaves the active table, then
+  // the claim release fails: the operation keeps its admission authority.
+  journal.fail_next_cell_release = true;
+  ASSERT_TRUE(wait_until([&] {
+    const auto retired = kernel.reconcile_manual_operation_admission();
+    if (retired.ok()) return false;
+    EXPECT_EQ(retired.error().code, "operation_journal_test_failure");
+    return true;
+  }));
+  EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value().state,
+            OperationStateKind::kCompleted);
+  EXPECT_TRUE(kernel.get_resident_operations({ProgramRunId("run.1")}).empty());
+  EXPECT_TRUE(resident());
+  const auto held = kernel.GetAuthoringAdmission();
+  EXPECT_FALSE(held.authoring_allowed);
+
+  // Non-resident is published only with the release, so a generation read
+  // after observing it is the one a following claim must name.
+  ASSERT_TRUE(kernel.reconcile_manual_operation_admission().ok());
+  EXPECT_FALSE(resident());
+  const auto released = kernel.GetAuthoringAdmission();
+  EXPECT_TRUE(released.authoring_allowed);
+  EXPECT_GT(released.admission_generation.value(), held.admission_generation.value());
+  const auto next = kernel.AcquireCellAdmissionClaim(
+      {CellAdmissionClaimKindDTO::kAuthoringMutation,
+       CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+       RequestOwnerEpoch("authoring.owner"),
+       "edit.after.manual",
+       RequestId("edit.after.manual"),
+       ContentDigest(test_digest('1')),
+       released.admission_generation,
+       {},
+       {},
+       {}});
+  EXPECT_TRUE(next.ok()) << next.error().message;
 }
 
 #ifdef MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL
@@ -3664,6 +3685,122 @@ TEST(ResourceAddressedExecutionKernelTest, LongServiceJournalFailureCannotUndoNa
   const auto attempted_motion = kernel.execute(motion_operation("request.after-audit-loss"));
   EXPECT_FALSE(attempted_motion.ok());
   fail.store(false);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunStopJoiningPlanningStopBesideHeldFailureStaysDurableAndUnlatched) {
+  // Live incident 2026-10-02 (dual robot): robot B's IK failed before dispatch
+  // and is held for intervention; the Program cancelled robot A's still-planning
+  // sibling with an operation Stop, then stopped its run. The run Stop joins the
+  // resident operation Stop. Its durable receipt must not conflict with the
+  // creator's operation captures or recovery projection, so the ordinary Stop
+  // neither degrades persistence nor latches the cell.
+  TemporaryOperationJournal temporary;
+  const auto database = temporary.directory / "operation.sqlite3";
+  const auto epoch = RequestOwnerEpoch("kernel.epoch.1");
+  FakeClock clock;
+  ManualScheduler scheduler;
+  std::optional<StopAcceptedDTO> created;
+  {
+    FakeParticipantEngine planning_engine;
+    FakeParticipantEngine failed_engine;
+    planning_engine.defer_prepare_completion = true;
+    failed_engine.prepare_failure =
+        ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)), "IK has no solution",
+                 {{"reason", "native_ik_no_solution"}}};
+    const auto planning_binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto failed_binding = second_same_type_occurrence(planning_binding);
+    SqliteOperationJournal journal(database, CellId("cell.test"), 32U);
+    ResourceAddressedExecutionKernel kernel({registration(planning_binding, planning_engine),
+                                             registration(failed_binding, failed_engine)},
+                                            clock, scheduler, journal,
+                                            {epoch, CellId("cell.test"), 16U});
+
+    auto failed_intent = motion_operation("request.joined.ik-failed");
+    failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+    const auto failed = kernel.execute(failed_intent);
+    ASSERT_TRUE(failed.ok()) << failed.error().message;
+    const auto held = kernel.get_operation_state(failed.value().operation_id);
+    ASSERT_TRUE(held.ok()) << held.error().message;
+    ASSERT_EQ(held.value().state, OperationStateKind::kInterventionRequired);
+    const auto planning = kernel.execute(motion_operation("request.joined.planning"));
+    ASSERT_TRUE(planning.ok()) << planning.error().message;
+
+    // Keep the operation Stop resident while the run Stop arrives.
+    HeldSettlementCall cancellation;
+    planning_engine.cancel_prepared_motion_hook = cancellation.Blocker();
+    const auto operation_stop =
+        kernel.stop(stop_request("request.joined.operation-stop", planning.value(), 1U));
+    ASSERT_TRUE(operation_stop.ok()) << operation_stop.error().message;
+    ASSERT_TRUE(cancellation.Entered());
+    const auto run_stop = kernel.stop(program_run_stop_request("request.joined.run-stop", "run.1"));
+    ASSERT_TRUE(run_stop.ok()) << run_stop.error().message;
+    EXPECT_EQ(run_stop.value().stop_id, operation_stop.value().stop_id);
+    EXPECT_EQ(run_stop.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
+    ASSERT_EQ(run_stop.value().affected_operation_revisions.size(), 1U);
+    EXPECT_EQ(run_stop.value().affected_operation_revisions.front().operation_id,
+              planning.value().operation_id);
+    // Observe durable receipts through an independent WAL reader: the owner's
+    // journal API would contend with the projection worker it is observing.
+    const auto acceptance_receipts = [&] {
+      sqlite3* reader = nullptr;
+      std::size_t count = 0U;
+      if (sqlite3_open_v2(database.c_str(), &reader, SQLITE_OPEN_READONLY, nullptr) ==
+          SQLITE_OK) {
+        sqlite3_stmt* statement = nullptr;
+        if (sqlite3_prepare_v2(reader,
+                               "SELECT COUNT(*) FROM journal_records "
+                               "WHERE record_kind='stop_acceptance_projected'",
+                               -1, &statement, nullptr) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_ROW) {
+          count = static_cast<std::size_t>(sqlite3_column_int64(statement, 0));
+        }
+        sqlite3_finalize(statement);
+      }
+      sqlite3_close(reader);
+      return count;
+    };
+    EXPECT_TRUE(wait_until([&] { return acceptance_receipts() == 2U; }));
+    cancellation.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(operation_stop.value().stop_id);
+      return status.ok() &&
+             status.value().terminal_projection.state != StopDurableProjectionStateDTO::kPending;
+    }));
+
+    const auto status = kernel.get_stop_status(operation_stop.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    EXPECT_EQ(status.value().state, StopStatusStateDTO::kSucceeded);
+    EXPECT_EQ(status.value().acceptance_projection.state, StopDurableProjectionStateDTO::kRecorded)
+        << (status.value().acceptance_projection.error.has_value()
+                ? status.value().acceptance_projection.error->message
+                : std::string{});
+    EXPECT_EQ(status.value().terminal_projection.state, StopDurableProjectionStateDTO::kRecorded);
+    EXPECT_FALSE(status.value().fault_latch.has_value());
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    EXPECT_EQ(acceptance_receipts(), 2U);
+    EXPECT_EQ(failed_engine.translate_stop_stage_calls.load(), 0);
+    const auto retained = kernel.get_operation_state(failed.value().operation_id);
+    ASSERT_TRUE(retained.ok()) << retained.error().message;
+    EXPECT_EQ(retained.value().state, OperationStateKind::kInterventionRequired);
+    const auto stopped = kernel.get_operation_state(planning.value().operation_id);
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_EQ(stopped.value().state, OperationStateKind::kStopped);
+    created = operation_stop.value();
+    journal.Close();
+  }
+
+  // The creator's recovery projection, not the joined receipt, is the durable
+  // Stop truth a successor owner recovers.
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 32U);
+  const auto recovery = reopened.BeginOwnerEpoch(RequestOwnerEpoch("kernel.epoch.2"), clock.now(),
+                                                 16U, {ResourceId("arm")});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().recovered_stops.size(), 1U);
+  EXPECT_EQ(recovery.value().recovered_stops.front().accepted.request_id, created->request_id);
+  ASSERT_TRUE(recovery.value().recovered_stops.front().terminal_certificate.has_value());
+  EXPECT_FALSE(recovery.value().recovered_stops.front().fault_latch.has_value());
 }
 #endif
 
@@ -6530,6 +6667,339 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     UndispatchedPreparationFailureStaysRecoverableWhileDispatchedPeerStops) {
+  // Live incident 2026-10-02: one robot's IK failed before dispatch and was
+  // held for intervention; the Program failure pause then stopped the whole
+  // run. The never-dispatched attempt has no physical effect to contain, so
+  // the Stop must neither execute stages for it nor latch its resources.
+  for (const bool full : {false, true}) {
+    SCOPED_TRACE(full ? "full Stop" : "Program-run Stop");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine dispatched_engine;
+    FakeParticipantEngine failed_engine;
+    failed_engine.prepare_failure =
+        ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)), "IK has no solution",
+                 {{"reason", "native_ik_no_solution"}}};
+    const auto dispatched_binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto failed_binding = second_same_type_occurrence(dispatched_binding);
+    ResourceAddressedExecutionKernel kernel({registration(dispatched_binding, dispatched_engine),
+                                             registration(failed_binding, failed_engine)},
+                                            clock, scheduler, default_journal,
+                                            {RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 16U});
+
+    const auto dispatched = kernel.execute(motion_operation("request.incident.dispatched"));
+    ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
+    dispatched_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    auto failed_intent = motion_operation("request.incident.ik-failed");
+    failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+    const auto failed = kernel.execute(failed_intent);
+    ASSERT_TRUE(failed.ok()) << failed.error().message;
+    EXPECT_EQ(failed_engine.dispatch_prepared_motion_calls, 0);
+    const auto held = kernel.get_operation_state(failed.value().operation_id);
+    ASSERT_TRUE(held.ok()) << held.error().message;
+    ASSERT_EQ(held.value().state, OperationStateKind::kInterventionRequired);
+
+    // The dispatched peer still needs its own exact Stop evidence.
+    HeldSettlementCall peer_stage;
+    dispatched_engine.translate_stop_stage_hook = peer_stage.Blocker();
+    const auto stopped =
+        full ? kernel.full_stop(FullStopIntentDTO{
+                   PublicRequestContextDTO{RequestId("request.incident.full-stop"),
+                                           RequestOwnerEpoch("kernel.epoch.1"), "test",
+                                           std::nullopt},
+                   StopGeneration(0U),
+                   {}})
+             : kernel.stop(program_run_stop_request("request.incident.stop", "run.1"));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+    EXPECT_EQ(stopped.value().affected_operation_revisions.front().operation_id,
+              dispatched.value().operation_id);
+    ASSERT_TRUE(peer_stage.Entered());
+    const auto pending = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(pending.ok()) << pending.error().message;
+    EXPECT_FALSE(pending.value().stop_certificate.has_value());
+    peer_stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    EXPECT_EQ(status.value().state, StopStatusStateDTO::kSucceeded);
+    const auto certificate =
+        kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+    EXPECT_EQ(std::get<StopParticipantScopeKeyDTO>(
+                  certificate.value().scope_entries.front().key.subject)
+                  .operation_id,
+              dispatched.value().operation_id);
+    EXPECT_EQ(dispatched_engine.translate_stop_stage_calls.load(), 1);
+    EXPECT_EQ(failed_engine.translate_stop_stage_calls.load(), 0);
+    EXPECT_EQ(failed_engine.stop_calls.load(), 0);
+    EXPECT_EQ(failed_engine.cancel_prepared_motion_calls.load(), 0);
+
+    // The failed attempt keeps its exact failure and recovery authority.
+    const auto retained = kernel.get_operation_state(failed.value().operation_id);
+    ASSERT_TRUE(retained.ok()) << retained.error().message;
+    EXPECT_EQ(retained.value().state, OperationStateKind::kInterventionRequired);
+    EXPECT_FALSE(retained.value().active_stop_id.has_value());
+    ASSERT_TRUE(retained.value().participants.front().terminal_error.has_value());
+    EXPECT_EQ(retained.value().participants.front().terminal_error->details.at("reason"),
+              "native_ik_no_solution");
+    EXPECT_TRUE(kernel.get_operation_recovery_assessment(failed.value().operation_id).ok());
+
+    // A Stop naming only the failed attempt has nothing physical to contain.
+    const auto direct = kernel.stop(stop_request("request.incident.direct", failed.value(),
+                                                 retained.value().operation_revision.value()));
+    ASSERT_TRUE(direct.ok()) << direct.error().message;
+    EXPECT_EQ(direct.value().resolution_disposition,
+              StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+    EXPECT_TRUE(direct.value().affected_operation_revisions.empty());
+    EXPECT_EQ(failed_engine.translate_stop_stage_calls.load(), 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparationFailureRacingStopSettlesWithoutLatchAndStaysRecoverable) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine dispatched_engine;
+  FakeParticipantEngine failed_engine;
+  failed_engine.defer_prepare_completion = true;
+  const auto dispatched_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto failed_binding = second_same_type_occurrence(dispatched_binding);
+  ResourceAddressedExecutionKernel kernel({registration(dispatched_binding, dispatched_engine),
+                                           registration(failed_binding, failed_engine)},
+                                          clock, scheduler, default_journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto dispatched = kernel.execute(motion_operation("request.race.dispatched"));
+  ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
+  dispatched_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  auto failed_intent = motion_operation("request.race.planning");
+  failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+  const auto failed = kernel.execute(failed_intent);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+
+  // Stop captures the still-planning attempt; its IK failure lands, with the
+  // owner's Failed terminal, before the Stop's idempotent cancellation returns.
+  HeldSettlementCall cancellation;
+  failed_engine.cancel_prepared_motion_hook = cancellation.Blocker();
+  const auto stopped = kernel.stop(program_run_stop_request("request.race.stop", "run.1"));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 2U);
+  ASSERT_TRUE(cancellation.Entered());
+  failed_engine.prepare_failure =
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)), "IK has no solution",
+               {{"reason", "native_ik_no_solution"}}};
+  ASSERT_TRUE(failed_engine.complete_preparation().ok());
+  failed_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed);
+  cancellation.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().state, StopStatusStateDTO::kSucceeded);
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
+  for (const auto& entry : certificate.value().scope_entries) {
+    const auto& key = std::get<StopParticipantScopeKeyDTO>(entry.key.subject);
+    const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
+    if (key.operation_id == failed.value().operation_id) {
+      EXPECT_EQ(entry.dispatch_state, StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+      EXPECT_EQ(facts.terminal_settlement,
+                StopParticipantScopeFactsDTO::TerminalSettlementState::kNotRequired);
+    } else {
+      EXPECT_EQ(entry.dispatch_state, StopScopeDispatchStateDTO::kDispatched);
+    }
+  }
+  EXPECT_EQ(dispatched_engine.translate_stop_stage_calls.load(), 1);
+  EXPECT_EQ(failed_engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_EQ(failed_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(failed_engine.participant_stop_settlement_calls.load(), 0);
+
+  const auto retained = kernel.get_operation_state(failed.value().operation_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  EXPECT_EQ(retained.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(retained.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(retained.value().participants.front().terminal_error->details.at("reason"),
+            "native_ik_no_solution");
+  EXPECT_TRUE(kernel.get_operation_recovery_assessment(failed.value().operation_id).ok());
+  const auto peer = kernel.get_operation_state(dispatched.value().operation_id);
+  ASSERT_TRUE(peer.ok()) << peer.error().message;
+  EXPECT_EQ(peer.value().state, OperationStateKind::kStopped);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopFaultLatchHoldsNoRestObligationForSettledNeverDispatchedParticipant) {
+  // A planning participant cancelled before dispatch has no Stop stage and so
+  // no motion-rest source. When a dispatched peer escalates, the latch keeps
+  // the peer's resources for physical recovery but must not hold the
+  // never-dispatched robot's resources hostage to an observation that cannot
+  // exist.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine dispatched_engine;
+  FakeParticipantEngine planning_engine;
+  planning_engine.defer_prepare_completion = true;
+  dispatched_engine.next_stop_result =
+      StopResultDTO{false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
+  const auto dispatched_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto planning_binding = second_same_type_occurrence(dispatched_binding);
+  ResourceAddressedExecutionKernel kernel({registration(dispatched_binding, dispatched_engine),
+                                           registration(planning_binding, planning_engine)},
+                                          clock, scheduler, default_journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto dispatched = kernel.execute(motion_operation("request.latch.dispatched"));
+  ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
+  dispatched_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  auto planning_intent = motion_operation("request.latch.planning");
+  planning_intent.program_binding_id = planning_binding.value().program_binding_id;
+  const auto planning = kernel.execute(planning_intent);
+  ASSERT_TRUE(planning.ok()) << planning.error().message;
+
+  // The nominal stage is rejected; the stronger prepared stage contains.
+  dispatched_engine.translate_stop_stage_hook = [&, calls = std::make_shared<unsigned>(0U)] {
+    if ((*calls)++ > 0U) dispatched_engine.next_stop_result = StopResultDTO{true, std::nullopt};
+  };
+  const auto stopped = kernel.stop(program_run_stop_request("request.latch.stop", "run.1"));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 2U);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  std::vector<ResourceId> dispatched_resources;
+  std::vector<ResourceId> planning_resources;
+  for (const auto& entry : certificate.value().scope_entries) {
+    const auto& key = std::get<StopParticipantScopeKeyDTO>(entry.key.subject);
+    const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
+    if (key.operation_id == planning.value().operation_id) {
+      EXPECT_EQ(entry.dispatch_state, StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+      EXPECT_EQ(facts.terminal_settlement,
+                StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled);
+      planning_resources = facts.resources;
+    } else {
+      dispatched_resources = facts.resources;
+    }
+  }
+  ASSERT_FALSE(dispatched_resources.empty());
+  ASSERT_FALSE(planning_resources.empty());
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+  EXPECT_EQ(latch->captured_resources, dispatched_resources);
+  std::vector<OperationId> operations{dispatched.value().operation_id,
+                                      planning.value().operation_id};
+  std::sort(operations.begin(), operations.end());
+  EXPECT_EQ(latch->captured_operation_ids, operations);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RacingOrUncertainDispatchNeverTakesTheNoEffectStopShortcut) {
+  {
+    SCOPED_TRACE("coordinated pre-dispatch abort still owns a sibling borrow");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine;
+    FakeParticipantEngine second_engine;
+    FakeOperationJournal journal;
+    second_engine.defer_prepare_completion = true;
+    const auto first =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto second = coordinated_occurrence(first, "2");
+    ResourceAddressedExecutionKernel kernel(
+        {registration(first, first_engine), registration(second, second_engine)}, clock,
+        scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    const auto operation = kernel.execute(coordinated_motion_operation("request.racing.abort"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    second_engine.prepare_failure = ErrorDTO{"preparation_failed", "injected failure", {}};
+    // Like ExecutionKernel, the local status names the prepared execution, so
+    // a terminal published before Stop work exists is still read.
+    first_engine.status.execution_id = first_engine.next_execution_id;
+    second_engine.status.execution_id = second_engine.next_execution_id;
+    HeldSettlementCall held;
+    first_engine.cancel_prepared_motion_hook = held.Blocker();
+    auto failing =
+        std::async(std::launch::async, [&] { return second_engine.complete_preparation(); });
+    ASSERT_TRUE(held.Entered());
+    // ExecutionKernel commits the failed preparation's own Failed terminal.
+    second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed);
+    const auto before = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(before.ok()) << before.error().message;
+    ASSERT_EQ(before.value().state, OperationStateKind::kInterventionRequired);
+    const auto stopped = kernel.stop(program_run_stop_request("request.racing.stop", "run.1"));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_NE(stopped.value().resolution_disposition,
+              StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+    EXPECT_EQ(stopped.value().affected_operation_revisions.front().operation_id,
+              operation.value().operation_id);
+    held.Release();
+    EXPECT_TRUE(failing.get().ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 0);
+    EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 0);
+  }
+  {
+    SCOPED_TRACE("dispatched work later held for intervention");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation("request.uncertain.dispatched"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired);
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = kernel.get_operation_state(operation.value().operation_id);
+      return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+    }));
+    const auto stopped = kernel.stop(program_run_stop_request("request.uncertain.stop", "run.1"));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_NE(stopped.value().resolution_disposition,
+              StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+    ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 1; }));
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ProgramRunStopClosesKnownIdleRunUntilExactSuccessfulRelease) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -8088,6 +8558,122 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_TRUE(retried.value().accepted);
     EXPECT_EQ(engine.recovery_action_calls.load(), 1);
   }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedRecoveryRevisionIgnoresEquivalentObservationSamples) {
+  // Participant owners refresh an unchanged recovery assessment in place with
+  // each newer observation sample (only the freshness deadline moves). The
+  // composed coordinated assessment must keep the revision a recovery request
+  // names; only a semantic participant change may advance it.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(coordinated_motion_operation("coordinated.equivalent"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped =
+      kernel.stop(stop_request("coordinated.equivalent.stop", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+
+  const auto ready = [](FakeParticipantEngine& engine, std::int64_t sample_ns) {
+    engine.recovery_assessment.assessment_revision = 3U;
+    engine.recovery_assessment.control_command_epoch = 5U;
+    engine.recovery_assessment.execution_state = ExecutionState::kStopped;
+    engine.recovery_assessment.recovery_class = RecoveryClass::kOrdinaryOperatorStop;
+    engine.recovery_assessment.status = RecoveryAssessmentStatus::kRetryReady;
+    engine.recovery_assessment.retry_admissible = true;
+    engine.recovery_assessment.backend_stop_confirmed = true;
+    engine.recovery_assessment.observed_state_available = true;
+    engine.recovery_assessment.observed_state_fresh = true;
+    engine.recovery_assessment.observed_state_at_rest = true;
+    engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryMotionFromCurrentState};
+    engine.recovery_assessment.reason_code = "ordinary_operator_stop_ready";
+    engine.recovery_assessment.assessed_at_ns = sample_ns;
+    engine.recovery_assessment.observed_state_valid_until_ns = sample_ns + 500'000'000;
+  };
+  ready(first_engine, 100);
+  ready(second_engine, 100);
+  const auto initial = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  const auto revision = initial.value().assessment.assessment_revision;
+  for (std::int64_t sample = 120; sample <= 200; sample += 20) {
+    ready(first_engine, sample);
+    ready(second_engine, sample + 5);
+    const auto polled = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(polled.ok()) << polled.error().message;
+    EXPECT_EQ(polled.value().assessment.assessment_revision, revision);
+    EXPECT_EQ(polled.value().assessment.status, RecoveryAssessmentStatus::kRetryReady);
+  }
+
+  // A recovery naming that revision is accepted after further equivalent samples.
+  ready(first_engine, 240);
+  ready(second_engine, 245);
+  const auto& composed = initial.value().assessment;
+  const KernelRecoveryActionRequestDTO recovery{"coordinated.equivalent.recover",
+                                                RecoveryAction::kRetryMotionFromCurrentState,
+                                                "operator.test",
+                                                revision,
+                                                composed.control_command_epoch,
+                                                composed.execution_id,
+                                                composed.latch_id,
+                                                composed.stop_certificate_id,
+                                                composed.stop_owner_generation,
+                                                "test"};
+  first_engine.next_recovery_result =
+      KernelRecoveryActionResultDTO{recovery.request_id, recovery.action, true, {}, std::nullopt};
+  second_engine.next_recovery_result = first_engine.next_recovery_result;
+  const auto recovered = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, initial.value().operation_revision, recovery);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  EXPECT_TRUE(recovered.value().accepted)
+      << (recovered.value().error.has_value() ? recovered.value().error->code : std::string{});
+  EXPECT_EQ(first_engine.recovery_action_calls.load(), 1);
+  EXPECT_EQ(second_engine.recovery_action_calls.load(), 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedRecoveryRevisionAdvancesOnSemanticParticipantChange) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(coordinated_motion_operation("coordinated.semantic"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped = kernel.stop(stop_request("coordinated.semantic.stop", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto before = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(before.ok()) << before.error().message;
+  second_engine.recovery_assessment.observed_state_fresh =
+      !second_engine.recovery_assessment.observed_state_fresh;
+  const auto after = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_EQ(after.value().assessment.assessment_revision,
+            before.value().assessment.assessment_revision + 1U);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RecoveryWaitsForSharedStopCertificateBeforeRetirement) {
@@ -14140,153 +14726,6 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     RetryableAcceptanceProjectionContentionProgressesWithoutAClientCommand) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  journal.retryable_stop_acceptance_failures = 1U;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.acceptance-retry.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.acceptance-retry.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-
-  ASSERT_TRUE(wait_until([&] {
-    return journal.stop_acceptance_calls.load() == 1 &&
-           scheduler.pending_count(SchedulerPriority::Background) == 1U;
-  }));
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
-  clock.set(kStopProjectionRetryDelayNs);
-  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
-  ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() &&
-           status.value().acceptance_projection.state == StopDurableProjectionStateDTO::kRecorded &&
-           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
-  }));
-  EXPECT_EQ(journal.stop_acceptance_calls.load(), 2);
-  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
-  EXPECT_EQ(engine.stop_calls.load(), 1);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
-     RetryableTerminalProjectionContentionProgressesWithoutAClientCommand) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  journal.retryable_stop_terminal_failures = 1U;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.terminal-retry.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.terminal-retry.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-
-  ASSERT_TRUE(wait_until([&] {
-    return journal.stop_terminal_calls.load() == 1 &&
-           scheduler.pending_count(SchedulerPriority::Background) == 1U;
-  }));
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
-  clock.set(kStopProjectionRetryDelayNs);
-  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
-  ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() &&
-           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
-  }));
-  EXPECT_EQ(journal.stop_terminal_calls.load(), 2);
-  EXPECT_EQ(engine.stop_calls.load(), 1);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
-     RetryableTerminalProjectionExhaustionIsBoundedAndFailsClosed) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  journal.retryable_stop_terminal_failures = 100U;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.terminal-exhaust.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.terminal-exhaust.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-
-  for (std::int64_t attempt = 1; attempt < 10; ++attempt) {
-    ASSERT_TRUE(wait_until([&] {
-      return journal.stop_terminal_calls.load() == attempt &&
-             scheduler.pending_count(SchedulerPriority::Background) == 1U;
-    }));
-    clock.set(attempt * kStopProjectionRetryDelayNs);
-    scheduler.advance_to(clock.now(), SchedulerPriority::Background);
-  }
-  ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() &&
-           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
-  }));
-  const auto status = kernel.get_stop_status(stopped.value().stop_id);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
-  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 10U);
-  EXPECT_EQ(journal.stop_terminal_calls.load(), 10);
-  ASSERT_TRUE(status.value().fault_latch.has_value());
-  EXPECT_TRUE(status.value().fault_latch->persistence_degraded);
-  EXPECT_EQ(engine.stop_calls.load(), 1);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
-     RetryableTerminalProjectionFailsClosedWhenRetrySchedulingIsUnavailable) {
-  FakeClock clock;
-  RejectingScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  journal.retryable_stop_terminal_failures = 1U;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.retry-schedule.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.retry-schedule.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-
-  ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() &&
-           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
-  }));
-  const auto status = kernel.get_stop_status(stopped.value().stop_id);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
-  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 1U);
-  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
-  EXPECT_EQ(scheduler.schedule_calls.load(std::memory_order_acquire), 1);
-  EXPECT_EQ(scheduler.last_priority.load(std::memory_order_acquire),
-            static_cast<int>(SchedulerPriority::Background));
-  ASSERT_TRUE(status.value().fault_latch.has_value());
-  EXPECT_TRUE(status.value().fault_latch->persistence_degraded);
-  EXPECT_EQ(engine.stop_calls.load(), 1);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
      TerminalProjectionFailureRetainsCertificateAndLatchesPersistenceFault) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -14319,6 +14758,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(status.value().fault_latch->trigger, StopFaultTriggerDTO::kPersistenceDegraded);
   EXPECT_EQ(status.value().fault_latch->terminal_projection.state,
             StopDurableProjectionStateDTO::kFailed);
+  // One projection attempt: a journal failure is a storage fault, never
+  // retried on a timer.
+  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
+  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 1U);
+  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
+  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Background), 0U);
   EXPECT_EQ(engine.stop_calls.load(), 1);
 }
 
@@ -14549,22 +14994,11 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   EXPECT_EQ(latch->recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
 
   observer.evidence_state = StopEvidenceItemStateDTO::kSatisfied;
-  {
-    std::lock_guard lock(journal.mutex);
-    journal.retryable_stop_surveillance_failures = 1U;
-  }
   clock.set(120);
   scheduler.advance_to(120);
   ASSERT_TRUE(wait_until([&] {
-    return journal.stop_surveillance_calls.load() == 2 &&
-           scheduler.pending_count(SchedulerPriority::Background) == 1U;
-  }));
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Background);
-  clock.set(120 + kStopProjectionRetryDelayNs);
-  scheduler.advance_to(clock.now(), SchedulerPriority::Background);
-  ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped->stop_id);
-    return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
+    return journal.stop_surveillance_calls.load() >= 2 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
                StopPostTerminalSurveillanceStateDTO::kMonitoring &&
@@ -14572,9 +15006,10 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   }));
   {
     std::lock_guard lock(journal.mutex);
-    EXPECT_EQ(journal.stop_surveillance_calls.load(), 3);
+    EXPECT_EQ(journal.stop_surveillance_calls.load(), 2);
     ASSERT_TRUE(journal.last_stop_surveillance_projected_at_ns.has_value());
     EXPECT_EQ(*journal.last_stop_surveillance_projected_at_ns, 120);
+    EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Background), 0U);
   }
   // The retained evidence contract requires 100 ms of continuous rest. A
   // first satisfied sample cannot collapse that dwell into one observation.
@@ -14582,7 +15017,7 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
   scheduler.advance_to(100'000'120);
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped->stop_id);
-    return journal.stop_surveillance_calls.load() >= 4 && status.ok() &&
+    return journal.stop_surveillance_calls.load() >= 3 && status.ok() &&
            status.value().surveillance.has_value() &&
            status.value().surveillance->state ==
                StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved &&
@@ -17397,6 +17832,139 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.subscription_count(), 0U);
   EXPECT_EQ(std::find(journal.calls.begin(), journal.calls.end(), "owner_closed"),
             journal.calls.end());
+}
+
+// V13.7.5 verification: native motion-preview admission while a failed
+// motion is held. A pre-dispatch failure stays resident (intervention
+// required) until recovery or Reset and keeps execution admission exclusive.
+// Because it provably never dispatched, an effect-free preview of a corrected
+// target for the same robot is admitted; a held failure with a dispatched or
+// uncertain effect still refuses preview.
+TEST(ResourceAddressedExecutionKernelTest,
+     HeldPreDispatchFailureAdmitsSameTargetPreviewButNotExecution) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeParticipantEngine other_engine;
+  FakeOperationJournal journal;
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "injected IK failure", {{"reason", "native_ik_no_solution"}}};
+  engine.recovery_assessment.assessment_revision = 7U;
+  engine.recovery_assessment.control_command_epoch = 11U;
+  engine.recovery_assessment.execution_id = 41U;
+  engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
+  engine.recovery_assessment.allowed_actions = {RecoveryAction::kAcknowledgeAndContinue};
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = second_same_type_occurrence(first);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, engine), registration(second, other_engine)}, clock, scheduler,
+      journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  const auto failed = kernel.execute(motion_operation("request.held.failure"));
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  const auto held = kernel.get_operation_state(failed.value().operation_id);
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  ASSERT_EQ(held.value().state, OperationStateKind::kInterventionRequired);
+
+  {
+    auto same = kernel.begin_motion_preview_session(motion_operation("preview.same"));
+    ASSERT_TRUE(same.ok()) << same.error().message;
+  }
+  auto disjoint = motion_operation("preview.disjoint");
+  disjoint.program_binding_id = second.value().program_binding_id;
+  disjoint.participants.front().component_role_id = second.value().component_role_id;
+  disjoint.participants.front().target_role_id = second.value().target_role_id;
+  EXPECT_TRUE(kernel.begin_motion_preview_session(disjoint).ok());
+  // Preview had no effect: the held failure, its revision and the robot's
+  // execution exclusion are unchanged.
+  const auto after_preview = kernel.get_operation_state(failed.value().operation_id);
+  ASSERT_TRUE(after_preview.ok()) << after_preview.error().message;
+  EXPECT_EQ(after_preview.value(), held.value());
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  const auto started = kernel.execute(motion_operation("request.held.second-start"));
+  EXPECT_FALSE(started.ok());
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_EQ(kernel.get_operation_state(failed.value().operation_id).value().state,
+            OperationStateKind::kInterventionRequired);
+
+  const auto projection = kernel.get_operation_recovery_assessment(failed.value().operation_id);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  const KernelRecoveryActionRequestDTO request{"request.recovery.preview",
+                                               RecoveryAction::kAcknowledgeAndContinue,
+                                               "operator.test",
+                                               projection.value().assessment.assessment_revision,
+                                               projection.value().assessment.control_command_epoch,
+                                               projection.value().assessment.execution_id,
+                                               projection.value().assessment.latch_id,
+                                               projection.value().assessment.stop_certificate_id,
+                                               projection.value().assessment.stop_owner_generation,
+                                               "release the held failure"};
+  auto resulting = projection.value().assessment;
+  resulting.assessment_revision = 8U;
+  resulting.status = RecoveryAssessmentStatus::kUnavailable;
+  engine.next_recovery_result =
+      KernelRecoveryActionResultDTO{request.request_id, request.action, true, resulting, std::nullopt};
+  const auto recovered = kernel.apply_operation_recovery_action(
+      failed.value().operation_id, held.value().operation_revision, request);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+
+  const auto released = kernel.begin_motion_preview_session(motion_operation("preview.released"));
+  EXPECT_TRUE(released.ok()) << (released.ok() ? "" : released.error().message);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(other_engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, HeldFailureWithDispatchedEffectStillRefusesPreview) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.held.dispatched"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  const auto preview = kernel.begin_motion_preview_session(motion_operation("preview.dispatched"));
+  ASSERT_FALSE(preview.ok());
+  EXPECT_EQ(preview.error().details.at("reason"), "motion_preview_operation_busy");
+}
+
+// V13.7.5 verification: an unresolved Stop fault latch closes preview like
+// every other motion admission.
+TEST(ResourceAddressedExecutionKernelTest, StopFaultLatchClosesMotionPreview) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  engine.prepared_cancel_terminal_state = ExecutionState::kFailed;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.motion.latched"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto stopped =
+      kernel.stop(stop_request("request.stop.latched", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_fault_latch().has_value(); }));
+
+  const auto preview = kernel.begin_motion_preview_session(motion_operation("preview.latched"));
+  ASSERT_FALSE(preview.ok());
+  EXPECT_EQ(preview.error().details.at("reason"), "motion_admission_closed");
 }
 
 }  // namespace

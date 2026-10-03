@@ -5,13 +5,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1544,7 +1548,10 @@ TEST(SqliteOperationJournalTest,
 }
 
 TEST(SqliteOperationJournalTest,
-     StopProjectionDoesNotWaitForOccupiedProductionJournalCriticalSection) {
+     StopProjectionWaitsForOccupiedProductionJournalCriticalSectionAndRecords) {
+  // A production ordinary write (cell admission) owns the journal writer when
+  // the Stop projection arrives. The Stop registers as waiting and records as
+  // soon as that one write finishes; it is not failed by the occupied writer.
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const RequestOwnerEpoch epoch("execution-host.epoch.stop-contention");
@@ -1558,6 +1565,9 @@ TEST(SqliteOperationJournalTest,
                                    if (operation == "cell_admission_acquire") {
                                      entered_promise.set_value();
                                      release.wait();
+                                   }
+                                   if (operation == "stop_projection_writer_wait") {
+                                     release_promise.set_value();
                                    }
                                  });
   auto recovery = journal.BeginOwnerEpoch(epoch, 1, 8U, inventory);
@@ -1587,16 +1597,15 @@ TEST(SqliteOperationJournalTest,
   const auto acceptance =
       StopAcceptanceRecord(epoch, intent.request_context.request_id.value(),
                            "stop:execution-host.epoch.stop-contention:1", 1U, 10);
+  // The admission write is released only by the Stop's own registration as a
+  // waiter, so the projection below can succeed only by waiting for it.
   const auto projected =
       ProjectStopAccepted(journal, epoch, acceptance, EmergencyStopProjectedIntentDTO(intent),
                           StopAffectedState({}, inventory));
-  release_promise.set_value();
   const auto admission_result = admission.get();
-  ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kFailed);
-  ASSERT_TRUE(projected.error.has_value());
-  EXPECT_EQ(projected.error->code, "operation_journal_stop_projection_unavailable");
-  EXPECT_EQ(projected.error->details.at("retryable"), "true");
-  EXPECT_TRUE(admission_result.ok());
+  ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+      << (projected.error.has_value() ? projected.error->message : std::string{});
+  EXPECT_TRUE(admission_result.ok()) << admission_result.error().message;
 }
 
 TEST(SqliteOperationJournalTest, CleanExecutionCloseRetainsIndependentAuthoringClaims) {
@@ -2025,6 +2034,309 @@ TEST(SqliteOperationJournalTest, ScopedStopProjectionRetainsOriginAndVersionOnRe
   EXPECT_EQ(recovered.value().historical_operations.front().participants.front().execution_scope,
             state.participants.front().execution_scope);
   EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
+}
+
+TEST(SqliteOperationJournalTest, JoinedStopReceiptKeepsCreatorCaptureAndRecoveryProjection) {
+  // Live incident 2026-10-02: a Program-run Stop joined a resident operation
+  // Stop. Its receipt carries the creator's exact operation capture (same
+  // capture order) in different record bytes; it must be durable in either
+  // projection order without re-anchoring the capture or claiming the Stop's
+  // recovery projection.
+  for (const bool joined_first : {false, true}) {
+    SCOPED_TRACE(joined_first ? "joined receipt projected first" : "creator projected first");
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "joined-stop.sqlite3";
+    const CellId cell("cell.test");
+    const RequestOwnerEpoch epoch("owner.joined-stop");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    auto state = OperationState("operation.joined-stop", OperationStateKind::kPlanning, 10);
+    state.journal_capture_order = 1U;
+    state.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+    {
+      SqliteOperationJournal journal(database, cell, 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      auto command = CommandIntent("joined-command", epoch.value());
+      command.participants.front().execution_scope = state.participants.front().execution_scope;
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+      state.operation_revision = OperationRevision(2U);
+      state.state = OperationStateKind::kStopping;
+      state.participants.front().state = OperationStateKind::kStopping;
+      state.journal_capture_order = 2U;
+      state.active_stop_id = StopId("stop.joined");
+      state.active_stop_generation = StopGeneration(1U);
+      const auto affected = StopAffectedState({state}, inventory);
+
+      const StopIntentDTO creator_intent{
+          {RequestId("creator-stop"), epoch, "test", {}},
+          std::vector<StopOperationTargetDTO>{
+              StopOperationTargetDTO{state.operation_id, OperationRevision(1U), StopGeneration(0U)}},
+          std::nullopt};
+      const StopIntentDTO joined_intent{
+          {RequestId("joined-stop"), epoch, "test", {}},
+          std::vector<StopProgramRunTargetDTO>{StopProgramRunTargetDTO{ProgramRunId("run.1")}},
+          std::nullopt};
+      const auto creator = StopAcceptanceRecord(epoch, "creator-stop", "stop.joined", 1U, 20);
+      const auto joined =
+          StopAcceptanceRecord(epoch, "joined-stop", "stop.joined", 1U, 25,
+                               StopResolutionDispositionDTO::kExact,
+                               EmergencyStopAcceptancePathDTO::kJoinedResident);
+      const auto project_creator = [&] {
+        return ProjectStopAccepted(journal, epoch, creator,
+                                   EmergencyStopProjectedIntentDTO(creator_intent), affected);
+      };
+      const auto project_joined = [&] {
+        return ProjectStopAccepted(journal, epoch, joined,
+                                   EmergencyStopProjectedIntentDTO(joined_intent), affected);
+      };
+      const auto first = joined_first ? project_joined() : project_creator();
+      ASSERT_EQ(first.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+          << (first.error.has_value() ? first.error->message : std::string{});
+      const auto second = joined_first ? project_creator() : project_joined();
+      ASSERT_EQ(second.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+          << (second.error.has_value() ? second.error->message : std::string{});
+      const auto& joined_result = joined_first ? first : second;
+
+      // An exact joined retry is idempotent; a receipt naming another
+      // physical scope for the same Stop is a conflict.
+      const auto replay = project_joined();
+      ASSERT_EQ(replay.projection_state, EmergencyStopProjectionStateDTO::kRecorded);
+      EXPECT_EQ(replay.journal_sequence, joined_result.journal_sequence);
+      auto foreign = StopAcceptanceRecord(epoch, "foreign-stop", "stop.joined", 1U, 30,
+                                          StopResolutionDispositionDTO::kExact,
+                                          EmergencyStopAcceptancePathDTO::kJoinedResident);
+      foreign.captured_scope_digest = Digest('e');
+      const StopIntentDTO foreign_intent{
+          {RequestId("foreign-stop"), epoch, "test", {}},
+          std::vector<StopProgramRunTargetDTO>{StopProgramRunTargetDTO{ProgramRunId("run.1")}},
+          std::nullopt};
+      const auto rejected = ProjectStopAccepted(
+          journal, epoch, foreign, EmergencyStopProjectedIntentDTO(foreign_intent), affected);
+      EXPECT_EQ(rejected.projection_state, EmergencyStopProjectionStateDTO::kFailed);
+
+      const auto events = journal.ReadEvents(epoch, 0U, 8U);
+      ASSERT_TRUE(events.ok());
+      EXPECT_EQ(std::count_if(events.value().events.begin(), events.value().events.end(),
+                              [](const auto& event) {
+                                return event.record_kind == "stop_acceptance_projected";
+                              }),
+                2);
+      journal.Close();
+    }
+    SqliteOperationJournal replacement(database, cell, 8U);
+    const auto recovered =
+        replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.joined-stop.2"), 30, 8U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
+    EXPECT_EQ(recovered.value().recovered_stops.front().accepted.request_id,
+              RequestId("creator-stop"));
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    EXPECT_EQ(recovered.value().historical_operations.front().journal_capture_order, 3U);
+    EXPECT_EQ(recovered.value().historical_operations.front().state,
+              OperationStateKind::kInterventionRequired);
+  }
+}
+
+TEST(SqliteOperationJournalTest, StopProjectionRecordsWhileAnEventReaderHoldsItsSnapshot) {
+  // A Stop projection never waits for the journal writer lock. An event
+  // reader (the history pump) must therefore not hold that lock: a Stop
+  // projected while a reader is inside its snapshot still records, and the
+  // reader's page stays the snapshot it opened.
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "reader-stop.sqlite3";
+  const CellId cell("cell.test");
+  const RequestOwnerEpoch epoch("owner.reader-stop");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  SqliteOperationJournal* owner = nullptr;
+  std::function<EmergencyStopAcceptanceProjectionResultDTO()> project_during_read;
+  std::optional<EmergencyStopAcceptanceProjectionResultDTO> projected_during_read;
+  SqliteOperationJournal journal(
+      database, cell, 8U, [] { return std::string("2026-10-02T17:58:03.000000001Z"); },
+      [&](std::string_view section) {
+        if (section == "read_events" && project_during_read && !projected_during_read) {
+          projected_during_read = project_during_read();
+        }
+      });
+  owner = &journal;
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+  auto state = OperationState("operation.reader-stop", OperationStateKind::kExecuting, 10);
+  state.journal_capture_order = 1U;
+  const auto command = CommandIntent("reader-command", epoch.value());
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+  state.operation_revision = OperationRevision(2U);
+  state.state = OperationStateKind::kStopping;
+  state.participants.front().state = OperationStateKind::kStopping;
+  state.journal_capture_order = 2U;
+  state.active_stop_id = StopId("stop.reader");
+  state.active_stop_generation = StopGeneration(1U);
+  const FullStopIntentDTO stop{{RequestId("reader-stop"), epoch, "test", {}}, StopGeneration(0U),
+                               {}};
+  project_during_read = [&] {
+    return ProjectStopAccepted(*owner, epoch,
+                               StopAcceptanceRecord(epoch, "reader-stop", "stop.reader", 1U, 20),
+                               EmergencyStopProjectedIntentDTO(stop),
+                               StopAffectedState({state}, inventory));
+  };
+
+  const auto page = journal.ReadEvents(epoch, 0U, 8U);
+  ASSERT_TRUE(page.ok()) << page.error().message;
+  ASSERT_TRUE(projected_during_read.has_value());
+  EXPECT_EQ(projected_during_read->projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+      << (projected_during_read->error.has_value() ? projected_during_read->error->message
+                                                   : std::string{});
+  EXPECT_EQ(page.value().events.size(), 1U);
+  project_during_read = nullptr;
+  const auto after = journal.ReadEvents(epoch, 0U, 8U);
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  ASSERT_EQ(after.value().events.size(), 2U);
+  EXPECT_EQ(after.value().events.back().record_kind, "stop_acceptance_projected");
+
+  // Closing retires the reader: reads fail closed, never on a stale handle.
+  journal.Close();
+  EXPECT_FALSE(journal.ReadEvents(epoch, 0U, 8U).ok());
+}
+
+TEST(SqliteOperationJournalTest, StopProjectionPrecedesQueuedOrdinaryWritersAfterWriteInProgress) {
+  // Strict writer handoff: several ordinary writers are already queued for
+  // the journal writer while one ordinary write is in progress when a Stop
+  // projection registers. The Stop must acquire the writer immediately after
+  // that in-progress write, ahead of every queued writer, however long the
+  // in-progress write takes (there is no wall-clock bound to exceed). If the
+  // in-progress write fails, it releases the writer and the Stop still
+  // records. Ordering is established only through critical-section
+  // observations; nothing sleeps.
+  constexpr std::size_t kQueuedWriters = 3U;
+  constexpr auto kTestGuard = std::chrono::seconds(30);
+  for (const bool in_progress_write_fails : {false, true}) {
+    SCOPED_TRACE(in_progress_write_fails ? "in-progress write fails" : "in-progress write commits");
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "writer-stop.sqlite3";
+    const CellId cell("cell.test");
+    const RequestOwnerEpoch epoch("owner.writer-stop");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    std::mutex observed_mutex;
+    std::condition_variable observed_changed;
+    std::size_t ordinary_writers_waiting = 0U;
+    bool stop_waiting = false;
+    std::function<void()> during_ordinary_write;
+    SqliteOperationJournal journal(
+        database, cell, 8U, [] { return std::string("2026-10-02T17:58:03.000000001Z"); },
+        [&](std::string_view section) {
+          if (section == "ordinary_writer_wait" || section == "stop_projection_writer_wait") {
+            {
+              std::lock_guard lock(observed_mutex);
+              if (section == "ordinary_writer_wait") {
+                ++ordinary_writers_waiting;
+              } else {
+                stop_waiting = true;
+              }
+            }
+            observed_changed.notify_all();
+          }
+          // Only ever invoked while the observing thread holds the writer.
+          if (section == "ordinary_write" && during_ordinary_write) {
+            auto run = std::exchange(during_ordinary_write, nullptr);
+            run();
+          }
+        });
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    auto state = OperationState("operation.writer-stop", OperationStateKind::kExecuting, 10);
+    state.journal_capture_order = 1U;
+    const auto command = CommandIntent("writer-command", epoch.value());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+    std::vector<OperationStateDTO> queued_states;
+    for (std::size_t index = 0U; index < kQueuedWriters; ++index) {
+      const auto suffix = std::to_string(index);
+      auto queued = OperationState("operation.queued." + suffix, OperationStateKind::kExecuting, 10);
+      queued.journal_capture_order = 1U;
+      const auto queued_command = CommandIntent("queued-command." + suffix, epoch.value());
+      ASSERT_TRUE(journal
+                      .RecordOperationAccepted(epoch, queued_command,
+                                               Acceptance(queued_command, queued), queued)
+                      .ok());
+      queued.journal_capture_order = 2U;
+      queued.updated_at_ns = 12;
+      queued_states.push_back(queued);
+    }
+    const std::size_t accepted_events = 1U + kQueuedWriters;
+    auto stopping = state;
+    stopping.operation_revision = OperationRevision(2U);
+    stopping.state = OperationStateKind::kStopping;
+    stopping.participants.front().state = OperationStateKind::kStopping;
+    stopping.journal_capture_order = 3U;
+    stopping.active_stop_id = StopId("stop.writer");
+    stopping.active_stop_generation = StopGeneration(1U);
+    const FullStopIntentDTO stop{{RequestId("writer-stop"), epoch, "test", {}},
+                                 StopGeneration(0U), {}};
+
+    std::vector<std::future<Result<std::uint64_t>>> queued_writes;
+    std::future<EmergencyStopAcceptanceProjectionResultDTO> projected;
+    during_ordinary_write = [&] {
+      // This thread now holds the writer. Queue several ordinary writers.
+      for (const auto& queued : queued_states) {
+        queued_writes.push_back(std::async(std::launch::async, [&journal, &epoch, &queued] {
+          return journal.RecordOperationState(epoch, queued, nullptr,
+                                              "subordinate_state_observed");
+        }));
+      }
+      {
+        std::unique_lock lock(observed_mutex);
+        ASSERT_TRUE(observed_changed.wait_for(lock, kTestGuard, [&] {
+          return ordinary_writers_waiting == kQueuedWriters;
+        }));
+      }
+      // Only now does the Stop projection arrive and register.
+      projected = std::async(std::launch::async, [&] {
+        return ProjectStopAccepted(journal, epoch,
+                                   StopAcceptanceRecord(epoch, "writer-stop", "stop.writer", 1U, 20),
+                                   EmergencyStopProjectedIntentDTO(stop),
+                                   StopAffectedState({stopping}, inventory));
+      });
+      {
+        std::unique_lock lock(observed_mutex);
+        ASSERT_TRUE(observed_changed.wait_for(lock, kTestGuard, [&] { return stop_waiting; }));
+      }
+      if (in_progress_write_fails) {
+        throw std::runtime_error("injected in-progress write failure");
+      }
+    };
+    auto observed = state;
+    observed.journal_capture_order = 2U;
+    observed.updated_at_ns = 11;
+    const auto in_progress =
+        journal.RecordOperationState(epoch, observed, nullptr, "subordinate_state_observed");
+    EXPECT_EQ(in_progress.ok(), !in_progress_write_fails);
+    ASSERT_TRUE(projected.valid());
+    const auto result = projected.get();
+    ASSERT_EQ(queued_writes.size(), kQueuedWriters);
+    for (auto& queued_write : queued_writes) {
+      const auto written = queued_write.get();
+      EXPECT_TRUE(written.ok()) << written.error().message;
+    }
+    ASSERT_EQ(result.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+        << (result.error.has_value() ? result.error->message : std::string{});
+
+    // Journal order is writer-acquisition order: the in-progress write (when
+    // it committed), then the Stop, then every queued ordinary writer.
+    const auto events = journal.ReadEvents(epoch, 0U, 16U);
+    ASSERT_TRUE(events.ok()) << events.error().message;
+    const std::size_t stop_index = accepted_events + (in_progress_write_fails ? 0U : 1U);
+    ASSERT_EQ(events.value().events.size(), stop_index + 1U + kQueuedWriters);
+    if (!in_progress_write_fails) {
+      EXPECT_EQ(events.value().events[stop_index - 1U].record_kind, "state_observed");
+      EXPECT_EQ(events.value().events[stop_index - 1U].operation_id, state.operation_id);
+    }
+    EXPECT_EQ(events.value().events[stop_index].record_kind, "stop_acceptance_projected");
+    ASSERT_TRUE(result.journal_sequence.has_value());
+    EXPECT_EQ(events.value().events[stop_index].sequence, *result.journal_sequence);
+    for (std::size_t index = stop_index + 1U; index < events.value().events.size(); ++index) {
+      EXPECT_EQ(events.value().events[index].record_kind, "state_observed");
+      EXPECT_NE(events.value().events[index].operation_id, state.operation_id);
+    }
+  }
 }
 
 TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryCompaction) {

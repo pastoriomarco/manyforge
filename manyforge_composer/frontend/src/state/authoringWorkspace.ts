@@ -12,7 +12,11 @@ import type {
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
+import { heldRunMotionStopped, manualOperationSettled } from './heldRunAuthoring';
 import type { WorkbenchNotice } from './workbenchNotices';
+
+/** Component reason the alarm owner issues for active alarms it can report. */
+const ACTIVE_FUNCTIONAL_ALARM_REASON = 'active_functional_alarm';
 
 /**
  * One installed composite authoring publication.
@@ -55,7 +59,7 @@ export function programActionUnavailableReason(
   if (workspace === null) return 'Program workspace is not loaded.';
   if (action === 'discard') {
     return !workspace.applied.available ? 'No Applied Program is available.'
-      : workspace.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : null;
+      : workspace.hasUnappliedChanges !== true ? 'Nothing to apply: the Program Draft matches Applied.' : null;
   }
   if (action === 'revert') {
     return !workspace.saved.available ? 'No Saved Program is available.'
@@ -65,7 +69,7 @@ export function programActionUnavailableReason(
   }
   return !workspace.draft.program || !workspace.applicability.applyReady
     ? 'Complete the Draft before Apply.'
-    : workspace.applied.matchesDraft === true ? 'Draft already matches Applied.' : null;
+    : workspace.applied.matchesDraft === true ? 'Nothing to apply: the Program Draft matches Applied.' : null;
 }
 
 export function authoringWorkspaceIdentity(
@@ -127,12 +131,31 @@ export function authoringUnavailableReason(
       return `Program execution is ${snapshot!.programCycle.state.replaceAll('_', ' ')}; authoring requires Idle.`;
     case 'not_admitted':
       return snapshot?.executionControlStatus?.manualOperations.some((operation) => (
-        operation.resident && ['queued', 'resolving', 'planning', 'validating', 'prepared', 'dispatching', 'executing', 'paused', 'stopping'].includes(operation.state)
+        operation.resident && !manualOperationSettled(operation)
       ))
         ? 'Authoring is locked while a manual operation is active.'
         : ADMISSION_REASON_ALLOWED;
     case null: return null;
   }
+}
+
+/**
+ * Why editing the Draft (Program, Scene or Deployment, including Discard) is
+ * unavailable, or ``null``. Unlike the other authoring actions, an edit only
+ * changes the Draft, so it is also available while a Program run exists with
+ * all its motion confirmed stopped (`heldRunMotionStopped`); the edits then
+ * reach the robot only through Apply, which Resets the run first.
+ */
+export function draftEditUnavailableReason(
+  published: PublishedAuthoringWorkspace | null,
+  snapshot: ComposerHeadlessState | null,
+): string | null {
+  if (authoringUnavailableCause(published, snapshot) !== 'execution_active') {
+    return authoringUnavailableReason(published, snapshot);
+  }
+  return heldRunMotionStopped(snapshot)
+    ? null
+    : `Program execution is ${snapshot!.programCycle.state.replaceAll('_', ' ')}; editing requires Idle or all Program motion stopped (Stop, Halt, a failure pause, or Executed but not yet Run).`;
 }
 
 /**
@@ -164,10 +187,17 @@ export function authoringUnavailableCause(
  * A fault that first appears during a known controlled transition is its
  * expected, related gap (spec 450 §5.3); one present before it began, or one
  * that outlasts it, stays an error.
+ *
+ * The functional-alarm component also reports `fault` when the reconciled
+ * alarm owner is available and merely carries active alarms
+ * (`active_functional_alarm`). Those alarms are presented by the alarm surface
+ * itself; they are not an unavailable component, so only an unavailable alarm
+ * owner becomes a notice here.
  */
 export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | null): WorkbenchNotice[] {
   return (snapshot?.componentOverview.components ?? [])
     .filter((component) => component.required && ['fault', 'offline'].includes(component.status))
+    .filter((component) => component.reasonCode !== ACTIVE_FUNCTIONAL_ALARM_REASON)
     .map((component) => ({
       id: `component.health.${component.id}`,
       severity: 'error',
@@ -299,7 +329,7 @@ export function withSharedDeploymentAuthoring(
   };
 }
 
-function deploymentRevisionOf(
+export function deploymentRevisionOf(
   document: Record<string, JsonValue> | null,
 ): string | null {
   const revision = document?.deployment_revision;

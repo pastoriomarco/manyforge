@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -33,9 +34,11 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -770,6 +773,184 @@ WaitForAuthoringAdmission(
       bootstrap_query.canonical_empty_target));
   return true;
 }
+
+// Holds one native projection construction operation of the projection test
+// target at its construction boundary until Release(). Declare it after the
+// adapter: assertion unwinding then releases construction before the adapter
+// drains its child, and restores the inherited environment.
+class ProjectionConstructionHold final {
+public:
+  ProjectionConstructionHold(std::filesystem::path root, std::string operation)
+      : root_(std::move(root)), operation_(std::move(operation)),
+        previous_control_(
+            Environment("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR")),
+        previous_hold_(Environment("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD")) {}
+
+  ProjectionConstructionHold(const ProjectionConstructionHold &) = delete;
+  ProjectionConstructionHold &
+  operator=(const ProjectionConstructionHold &) = delete;
+
+  ~ProjectionConstructionHold() {
+    static_cast<void>(Release());
+    Restore("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR", previous_control_);
+    Restore("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD", previous_hold_);
+  }
+
+  [[nodiscard]] bool Configure() const {
+    return ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR",
+                    root_.string().c_str(), 1) == 0 &&
+           ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD",
+                    operation_.c_str(), 1) == 0;
+  }
+
+  [[nodiscard]] std::filesystem::path Entered() const {
+    return root_ / (operation_ + ".entered");
+  }
+
+  [[nodiscard]] bool Release() const noexcept {
+    try {
+      std::ofstream marker(root_ / (operation_ + ".release"));
+      marker << "release\n";
+      return static_cast<bool>(marker);
+    } catch (...) {
+      return false;
+    }
+  }
+
+private:
+  static std::optional<std::string> Environment(const char *name) {
+    const auto *value = std::getenv(name);
+    return value != nullptr ? std::optional<std::string>(value) : std::nullopt;
+  }
+
+  static void Restore(const char *name,
+                      const std::optional<std::string> &value) noexcept {
+    if (value.has_value())
+      static_cast<void>(::setenv(name, value->c_str(), 1));
+    else
+      static_cast<void>(::unsetenv(name));
+  }
+
+  std::filesystem::path root_;
+  std::string operation_;
+  std::optional<std::string> previous_control_;
+  std::optional<std::string> previous_hold_;
+};
+
+// The Manager's periodic liveness lane for one exact required set.
+//
+// A native receiver lease stays current for `expiry_timeout_ns` after its last
+// accepted heartbeat, and the Manager owns renewing it every
+// `heartbeat_period_ns` for as long as anything relies on it. A test standing
+// in for the Manager must keep that cadence: one heartbeat followed by a wait
+// on asynchronous child work (composition, Kernel attachment, route recovery)
+// lets the lease expire by contract once that work outlasts the expiry under
+// load. Expiry fences admission for the whole Manager epoch, and the receiver
+// then rejects every later renewal of that epoch.
+class ManagerHeartbeatLane final {
+public:
+  // `accepted` is the request whose heartbeat the receiver already accepted;
+  // the lane continues that Manager epoch with the next sequence.
+  ManagerHeartbeatLane(
+      component_manager::RetainedNativeRuntimeUnitAdapter &adapter,
+      component_manager::ManagerLivenessTransportRequestDTO accepted)
+      : adapter_(adapter), request_(std::move(accepted)),
+        accepted_sequence_(request_.heartbeat.heartbeat_sequence),
+        worker_([this](const std::stop_token stop) { Run(stop); }) {}
+
+  ManagerHeartbeatLane(const ManagerHeartbeatLane &) = delete;
+  ManagerHeartbeatLane &operator=(const ManagerHeartbeatLane &) = delete;
+
+  ~ManagerHeartbeatLane() { Stop(); }
+
+  void Stop() {
+    worker_.request_stop();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  // Waits for the receiver's own acknowledgement of `sequence`. The bound is
+  // diagnostic only; a rejected renewal ends the wait immediately.
+  [[nodiscard]] std::optional<core::ManagerLivenessObservationDTO>
+  WaitForAccepted(const std::uint64_t sequence,
+                  const std::chrono::steady_clock::duration diagnostic_bound) {
+    std::unique_lock lock(mutex_);
+    changed_.wait_for(lock, diagnostic_bound, [&] {
+      return failure_.has_value() || accepted_sequence_ >= sequence;
+    });
+    if (accepted_sequence_ < sequence) {
+      return std::nullopt;
+    }
+    return last_;
+  }
+
+  [[nodiscard]] std::string Failure() const {
+    std::lock_guard lock(mutex_);
+    return failure_.value_or("Manager liveness lane has not failed");
+  }
+
+private:
+  void Run(const std::stop_token stop) {
+    const std::chrono::nanoseconds period(request_.policy.heartbeat_period_ns);
+    auto request = request_;
+    auto due = std::chrono::steady_clock::now() + period;
+    for (;;) {
+      {
+        std::unique_lock lock(mutex_);
+        static_cast<void>(
+            changed_.wait_until(lock, stop, due, [] { return false; }));
+        if (stop.stop_requested()) {
+          return;
+        }
+      }
+      due += period;
+      ++request.heartbeat.heartbeat_sequence;
+      std::optional<std::string> failure;
+      std::optional<core::ManagerLivenessObservationDTO> observation;
+      try {
+        observation = adapter_.RenewManagerLiveness(request);
+        if (observation->status.state !=
+                core::ManagerLivenessStateDTO::kCurrent ||
+            observation->status.command_fenced ||
+            observation->status.last_accepted_heartbeat_sequence !=
+                request.heartbeat.heartbeat_sequence) {
+          failure = "Manager liveness renewal " +
+                    std::to_string(request.heartbeat.heartbeat_sequence) +
+                    " left the receiver non-current";
+        }
+      } catch (const std::exception &error) {
+        failure = "Manager liveness renewal " +
+                  std::to_string(request.heartbeat.heartbeat_sequence) +
+                  " failed: " + error.what();
+      }
+      const bool failed = failure.has_value();
+      {
+        std::lock_guard lock(mutex_);
+        if (failed) {
+          failure_ = std::move(failure);
+        } else {
+          accepted_sequence_ = request.heartbeat.heartbeat_sequence;
+          last_ = std::move(observation);
+        }
+      }
+      changed_.notify_all();
+      if (failed) {
+        return;
+      }
+    }
+  }
+
+  component_manager::RetainedNativeRuntimeUnitAdapter &adapter_;
+  const component_manager::ManagerLivenessTransportRequestDTO request_;
+  mutable std::mutex mutex_;
+  std::condition_variable_any changed_;
+  std::uint64_t accepted_sequence_;
+  std::optional<core::ManagerLivenessObservationDTO> last_;
+  std::optional<std::string> failure_;
+  // Last member: the worker starts only after every field it reads exists.
+  std::jthread worker_;
+};
 
 TEST(RetainedPlanningSceneSynchronizer,
      StableOwnerForwardsToItsCurrentTarget) {
@@ -1875,15 +2056,20 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       required_set.active_bundle_id,
       required_set_digest,
       core::ContentDigest(std::string(kIntentDigest))};
-  const auto liveness = adapter.RenewManagerLiveness(
-      {fixture.query->plan.runtime_unit_id, publication.publication_generation,
-       publication.request.candidate_graph_revision,
-       publication.durable_public_pointer_content_digest, required_set,
-       liveness_policy, heartbeat, reconciliation});
+  const component_manager::ManagerLivenessTransportRequestDTO liveness_request{
+      fixture.query->plan.runtime_unit_id, publication.publication_generation,
+      publication.request.candidate_graph_revision,
+      publication.durable_public_pointer_content_digest, required_set,
+      liveness_policy, heartbeat, reconciliation};
+  const auto liveness = adapter.RenewManagerLiveness(liveness_request);
   EXPECT_EQ(liveness.active_bundle_id, required_set.active_bundle_id);
   EXPECT_EQ(liveness.required_runtime_set_digest, required_set_digest);
-  EXPECT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
-  EXPECT_FALSE(liveness.status.command_fenced);
+  ASSERT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
+  ASSERT_FALSE(liveness.status.command_fenced);
+  // From here on the test is the Manager of this required set. The child keeps
+  // attaching its composition asynchronously, so the lease is renewed at the
+  // policy cadence rather than assumed to outlast that work.
+  ManagerHeartbeatLane heartbeat_lane(adapter, liveness_request);
 
   EXPECT_FALSE(adapter.GetAuthoringAdmission().authoring_allowed);
   core::ManagerLivenessStatusDTO program_runner_status{
@@ -1909,7 +2095,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 
   const auto authoring_admission =
       WaitForAuthoringAdmission(adapter, std::chrono::seconds(30), true);
-  ASSERT_TRUE(authoring_admission.has_value());
+  ASSERT_TRUE(authoring_admission.has_value()) << heartbeat_lane.Failure();
   ASSERT_TRUE(authoring_admission->authoring_allowed);
   EXPECT_GT(authoring_admission->admission_generation,
             updated.value().admission_generation);
@@ -1967,15 +2153,14 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
             first_epoch.value());
 
-  auto renewed_heartbeat = heartbeat;
-  renewed_heartbeat.heartbeat_sequence = 2U;
-  const auto renewed_liveness = adapter.RenewManagerLiveness(
-      {fixture.query->plan.runtime_unit_id, publication.publication_generation,
-       publication.request.candidate_graph_revision,
-       publication.durable_public_pointer_content_digest, required_set,
-       liveness_policy, renewed_heartbeat, reconciliation});
-  ASSERT_EQ(renewed_liveness.status.state,
+  // The same Manager epoch keeps renewing the receiver it reconciled.
+  const auto renewed_liveness =
+      heartbeat_lane.WaitForAccepted(heartbeat.heartbeat_sequence + 1U,
+                                     std::chrono::seconds(30));
+  ASSERT_TRUE(renewed_liveness.has_value()) << heartbeat_lane.Failure();
+  ASSERT_EQ(renewed_liveness->status.state,
             core::ManagerLivenessStateDTO::kCurrent);
+  EXPECT_FALSE(renewed_liveness->status.command_fenced);
 
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
   const auto &control_binding =
@@ -2077,6 +2262,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       core::CapabilityProviderBindingRevision("foreign-binding-revision");
   EXPECT_FALSE(adapter.ResolveProjection(foreign).ok());
 
+  // The restarted child below is a new receiver epoch outside this required
+  // set; this Manager lane ends with the epoch it renewed.
+  heartbeat_lane.Stop();
+  EXPECT_EQ(heartbeat_lane.Failure(), "Manager liveness lane has not failed");
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
   EXPECT_THROW(static_cast<void>(resolved.value()->ProjectionHealth()),
@@ -2179,56 +2368,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto publication = PublishActiveFixture(fixture);
   ScopedTemporaryRoot projection_control;
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT);
-  // Declared after adapter: assertion unwinding releases construction before
-  // the adapter drains its child, and restores the inherited environment.
-  class ProjectionRebuildHold final {
-  public:
-    explicit ProjectionRebuildHold(std::filesystem::path root)
-        : root_(std::move(root)),
-          previous_control_(Environment(
-              "MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR")),
-          previous_hold_(Environment("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD")) {}
-
-    ~ProjectionRebuildHold() {
-      static_cast<void>(Release());
-      Restore("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR", previous_control_);
-      Restore("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD", previous_hold_);
-    }
-
-    bool Configure() const {
-      return ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR",
-                      root_.string().c_str(), 1) == 0 &&
-             ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD", "rebuild", 1) == 0;
-    }
-
-    bool Release() const noexcept {
-      try {
-        std::ofstream marker(root_ / "rebuild.release");
-        marker << "release\n";
-        return static_cast<bool>(marker);
-      } catch (...) {
-        return false;
-      }
-    }
-
-  private:
-    static std::optional<std::string> Environment(const char *name) {
-      const auto *value = std::getenv(name);
-      return value != nullptr ? std::optional<std::string>(value) : std::nullopt;
-    }
-
-    static void Restore(const char *name,
-                        const std::optional<std::string> &value) noexcept {
-      if (value.has_value())
-        static_cast<void>(::setenv(name, value->c_str(), 1));
-      else
-        static_cast<void>(::unsetenv(name));
-    }
-
-    std::filesystem::path root_;
-    std::optional<std::string> previous_control_;
-    std::optional<std::string> previous_hold_;
-  } projection_hold(projection_control.path());
+  ProjectionConstructionHold projection_hold(projection_control.path(),
+                                             "rebuild");
   ASSERT_TRUE(projection_hold.Configure());
   const auto started = adapter.EnsureRunning(*fixture.query);
   ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
@@ -2302,7 +2443,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
               accepted.result == core::ProjectionCommitResultStateDTO::kCommitted);
   const auto rebuild_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  const auto entered = projection_control.path() / "rebuild.entered";
+  const auto entered = projection_hold.Entered();
   while (!std::filesystem::exists(entered) &&
          std::chrono::steady_clock::now() < rebuild_deadline) {
     std::this_thread::yield();
@@ -2316,8 +2457,17 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             component_manager::ProcessPresenceState::kPresent);
   EXPECT_EQ(pending_preparation.process_incarnation(),
             started.process_incarnation());
-  EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  // The child itself refuses the other model; an adapter-side failure such as
+  // a response timeout would stop the child and is not this refusal.
+  try {
+    static_cast<void>(adapter.EnsureRunning(*fixture.query));
+    ADD_FAILURE() << "conflicting projection preparation was admitted";
+  } catch (const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
+    EXPECT_NE(std::string(error.what()).find(
+                  "conflicts with progressing projection work"),
+              std::string::npos)
+        << error.what();
+  }
   EXPECT_EQ(adapter.ObserveProcess(*successor.query).process_incarnation(),
             started.process_incarnation());
   ASSERT_TRUE(projection_hold.Release());
@@ -2382,6 +2532,66 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(candidate_lease_replay.value(), candidate_retained.value());
   projection.ReleaseProjection(candidate_lease);
   EXPECT_EQ(adapter.EnsureStopped(*successor.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     TimedOutExchangeForgetsItsReapedChildSoConvergenceRelaunches) {
+  NativeFixture fixture;
+  static_cast<void>(PublishActiveFixture(fixture));
+  ScopedTemporaryRoot projection_control;
+  auto adapter =
+      MakeAdapter(fixture, MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT);
+  ProjectionConstructionHold bootstrap_hold(projection_control.path(),
+                                            "bootstrap_rebuild");
+  ASSERT_TRUE(bootstrap_hold.Configure());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch first_epoch(started.process_incarnation());
+  const auto binding = NativeProjectionBinding(fixture, first_epoch);
+  const auto resolved = adapter.ResolveProjection(binding);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+
+  const auto initial_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
+  const core::ProjectionRevisionDTO initial_revision{
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      initial_scene.shared()->revision};
+  const core::NativeProjectionBootstrapRebuildDTO bootstrap{
+      core::BootstrapId("native-adapter-bootstrap"),
+      core::BootstrapGeneration(1U),
+      binding,
+      initial_revision,
+      fixture.bundle->value().compiled_products.planning_collision_model,
+      initial_scene};
+  // The held synchronous bootstrap never answers within the adapter's bounded
+  // response budget. The adapter stops and reaps that exact child itself.
+  try {
+    static_cast<void>(resolved.value()->RebuildBootstrapProjection(bootstrap));
+    ADD_FAILURE() << "held bootstrap rebuild returned a response";
+  } catch (
+      const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
+    EXPECT_NE(std::string(error.what()).find("response timed out"),
+              std::string::npos)
+        << error.what();
+  }
+  EXPECT_TRUE(std::filesystem::exists(bootstrap_hold.Entered()));
+  ASSERT_TRUE(bootstrap_hold.Release());
+
+  // A reaped PID is no longer the adapter's child and may be reused by the
+  // system. Observation must report the stopped epoch absent instead of
+  // waiting on that PID again, so ordinary convergence starts a fresh epoch.
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  EXPECT_FALSE(adapter.ResolveProjection(binding).ok());
+  EXPECT_THROW(static_cast<void>(resolved.value()->ProjectionHealth()),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  const auto relaunched = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(relaunched.state(),
+            component_manager::ProcessPresenceState::kPresent);
+  EXPECT_NE(relaunched.process_incarnation(), started.process_incarnation());
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
 

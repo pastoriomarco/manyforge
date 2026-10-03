@@ -36,7 +36,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <stop_token>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -121,6 +120,9 @@ struct StopSurveillanceExecutionConfig final {
 /// separate admission and recovery projections retain their own authority.
 struct OperationReadProjectionDTO final {
   OperationStateDTO operation;
+  /// True while the Kernel retains any authority over the operation: it is
+  /// active, or its retired manual operation still holds a cell-admission
+  /// claim. False only after that claim's release is visible in admission.
   bool resident{};
   RequestOwnerEpoch request_owner_epoch;
   std::optional<OperationControlAcceptedDTO> last_control{};
@@ -708,7 +710,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] const ActiveOperation* find_active_operation_locked(
       const OperationId& operation_id) const noexcept;
   [[nodiscard]] OperationReadProjectionDTO operation_projection_locked(
-      const OperationStateDTO& state, bool resident, bool control_pending) const;
+      const OperationStateDTO& state, bool active, bool control_pending) const;
   [[nodiscard]] std::optional<OperationId> find_event_operation_locked(
       const IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id) const;
   void on_engine_event(IResolvedParticipantExecutionEngine* engine, const KernelEvent& event);
@@ -793,7 +795,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void cancel_prepared_resume(const OperationId& operation_id,
                               IResolvedPreparedParticipantExecutionEngine& engine,
                               std::uint64_t subordinate_id);
-  void ProjectStop(StopControlWorkToken token, std::stop_token cancellation) noexcept;
+  void ProjectStop(StopControlWorkToken token) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;
   void ScheduleStopSurveillance(StopCertificateId certificate_id,

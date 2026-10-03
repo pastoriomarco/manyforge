@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -39,6 +40,7 @@
 #include "posix_durability_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
+#include "verified_read_memo_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -145,6 +147,74 @@ require_read_only_catalog_data(const std::filesystem::path &trusted_root) {
   return *data;
 }
 
+/// Process-wide memo of verified retained-bundle entries.
+///
+/// A retained-bundle entry is content-addressed: its file name is the bundle
+/// identity, reload re-derives that identity from the bytes and rejects any
+/// key/content mismatch, and entries are published once with
+/// hard-link-no-replace and never rewritten. One entry therefore needs one
+/// verification per identity, not one per point read. The memo is keyed on
+/// both the requested identity and the exact identity of the opened file
+/// version (device, inode, size, mtime, ctime): a replaced or rewritten file
+/// changes that tuple, so its bytes are read and verified again before use.
+/// A version is remembered only once its last change is older than any
+/// timestamp granularity, so a later in-place rewrite cannot keep the tuple.
+/// A hit performs the same no-follow open and bound checks as a read.
+class VerifiedBundleEntryMemo final {
+public:
+  [[nodiscard]] std::shared_ptr<const RetainedBundle>
+  find(const posix::RegularFileIdentity &file,
+       const core::RetainedBundleId &retained_bundle_id) {
+    std::lock_guard lock(mutex_);
+    for (auto &entry : entries_) {
+      if (entry.file == file &&
+          entry.bundle->retained_bundle_id() == retained_bundle_id) {
+        entry.last_use = ++clock_;
+        return entry.bundle;
+      }
+    }
+    return nullptr;
+  }
+
+  void remember(const posix::RegularFileIdentity &file,
+                std::shared_ptr<const RetainedBundle> bundle) {
+    std::lock_guard lock(mutex_);
+    // A newer version of the same file supersedes its earlier entry.
+    std::erase_if(entries_, [&](const Entry &entry) {
+      return entry.file.device == file.device &&
+             entry.file.inode == file.inode;
+    });
+    if (entries_.size() == kCapacity) {
+      entries_.erase(std::min_element(
+          entries_.begin(), entries_.end(),
+          [](const Entry &left, const Entry &right) {
+            return left.last_use < right.last_use;
+          }));
+    }
+    entries_.push_back(Entry{file, std::move(bundle), ++clock_});
+  }
+
+private:
+  // A process reads its active, candidate and predecessor bundles; a small
+  // bound keeps old Deployment generations from accumulating.
+  static constexpr std::size_t kCapacity = 8U;
+
+  struct Entry final {
+    posix::RegularFileIdentity file;
+    std::shared_ptr<const RetainedBundle> bundle;
+    std::uint64_t last_use;
+  };
+
+  std::mutex mutex_;
+  std::vector<Entry> entries_;
+  std::uint64_t clock_{};
+};
+
+[[nodiscard]] VerifiedBundleEntryMemo &verified_bundle_entries() {
+  static VerifiedBundleEntryMemo memo;
+  return memo;
+}
+
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
 read_verified_bundle_entry(const std::filesystem::path &bundle_data,
                            const core::RetainedBundleId &retained_bundle_id) {
@@ -152,16 +222,35 @@ read_verified_bundle_entry(const std::filesystem::path &bundle_data,
   if (!hex.has_value()) {
     return nullptr;
   }
-  const auto bytes = posix::read_exact_regular_file(
-      bundle_data / (std::string(*hex) + ".json"),
-      kMaxDurableRetainedBundleBytes, true, kPosixErrors, kReadMessages);
-  if (!bytes.has_value()) {
+  const auto path = bundle_data / (std::string(*hex) + ".json");
+  const auto current = posix::regular_file_identity(
+      path, kMaxDurableRetainedBundleBytes, true, kPosixErrors, kReadMessages);
+  if (!current.has_value()) {
     return nullptr;
   }
-  const auto bundle = detail::RetainedBundleReloadAuthority::reload(*bytes);
+  if (auto known = verified_bundle_entries().find(*current, retained_bundle_id);
+      known != nullptr) {
+    detail::VerifiedFileReadRecording::record(
+        {{path, kMaxDurableRetainedBundleBytes, *current}});
+    return known;
+  }
+  const auto started = posix::realtime_now_ns();
+  const auto read = posix::read_exact_regular_file_with_identity(
+      path, kMaxDurableRetainedBundleBytes, true, kPosixErrors, kReadMessages);
+  if (!read.has_value()) {
+    return nullptr;
+  }
+  auto bundle = detail::RetainedBundleReloadAuthority::reload(read->bytes);
   if (bundle->retained_bundle_id() != retained_bundle_id) {
     detail::fail_retained_bundle(
         "read-only retained-bundle key/content mismatch");
+  }
+  detail::VerifiedFileReadRecording::record(
+      {{path, kMaxDurableRetainedBundleBytes, read->identity}});
+  // A version changed within one timestamp tick of this read could still be
+  // rewritten without changing its identity; it is verified again next time.
+  if (posix::identity_settled_before(read->identity, started)) {
+    verified_bundle_entries().remember(read->identity, bundle);
   }
   return bundle;
 }
@@ -216,6 +305,21 @@ normalize_activation_root(
   return installed_package_root;
 }
 
+/// Reads one referenced immutable file and records its exact version for
+/// the verification results that depend on it.
+[[nodiscard]] std::optional<std::string>
+read_reference_file(const std::filesystem::path &path,
+                    const std::uint64_t maximum_bytes) {
+  auto read = posix::read_exact_regular_file_with_identity(
+      path, maximum_bytes, true, kPosixErrors, kReadMessages);
+  if (!read.has_value()) {
+    return std::nullopt;
+  }
+  detail::VerifiedFileReadRecording::record(
+      {{path, maximum_bytes, read->identity}});
+  return std::move(read->bytes);
+}
+
 [[nodiscard]] std::string
 read_verified_raw_reference(const std::filesystem::path &raw_data,
                             const core::ContentAddressedStoreKey &key,
@@ -228,9 +332,8 @@ read_verified_raw_reference(const std::filesystem::path &raw_data,
         std::string(reference_label) +
         " has an inconsistent digest-derived raw-CAS key");
   }
-  auto bytes = posix::read_exact_regular_file(
-      raw_data / (std::string(*hex) + ".blob"), kMaxDurableRetainedBlobBytes,
-      true, kPosixErrors, kReadMessages);
+  auto bytes = read_reference_file(raw_data / (std::string(*hex) + ".blob"),
+                                   kMaxDurableRetainedBlobBytes);
   if (!bytes.has_value()) {
     detail::fail_retained_bundle(
         std::string(reference_label) +
@@ -266,10 +369,10 @@ read_verified_catalog_entry(const std::filesystem::path &catalog_data,
   const std::uint64_t maximum_envelope_bytes =
       maximum_single_payload_bytes +
       detail::kMaximumCatalogArtifactEnvelopeOverhead;
-  auto envelope = posix::read_exact_regular_file(
+  auto envelope = read_reference_file(
       catalog_data / (std::string(*storage_hex) +
                       std::string(detail::kCatalogArtifactFileSuffix)),
-      maximum_envelope_bytes, true, kPosixErrors, kReadMessages);
+      maximum_envelope_bytes);
   if (!envelope.has_value()) {
     return std::nullopt;
   }
@@ -1718,6 +1821,23 @@ void require_verified_bundle_references(
   }
 }
 
+/// Verifies the complete reference closure of one bundle. Closure
+/// verification is a pure function of the content-addressed bundle value and
+/// the referenced raw and catalog files it reads, so a prior verification is
+/// reused only while every one of those files keeps its exact identity.
+void require_verified_bundle_reference_closure(
+    const std::filesystem::path &trusted_root,
+    const std::filesystem::path &raw_data, const RetainedBundle &bundle) {
+  static detail::VerifiedReadMemo<bool> memo(8U);
+  static_cast<void>(memo.get(
+      detail::verified_read_key(trusted_root.string(),
+                                bundle.retained_bundle_id().value()),
+      kPosixErrors, kReadMessages, [&] {
+        require_verified_bundle_references(trusted_root, raw_data, bundle);
+        return true;
+      }));
+}
+
 [[nodiscard]] const core::RetainedProductDTO *
 find_exact_product(const core::RetainedBundleDTO &bundle,
                    const RetainedProductArtifactQuery &query) {
@@ -2356,7 +2476,8 @@ FilesystemVerifiedRetainedBundleSource::get_verified(
   if (bundle == nullptr) {
     return nullptr;
   }
-  require_verified_bundle_references(current_root, paths.raw_data, *bundle);
+  require_verified_bundle_reference_closure(current_root, paths.raw_data,
+                                            *bundle);
   return bundle;
 }
 
@@ -2713,62 +2834,74 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
       "read-only retained model-map");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
-  const auto bundle =
-      read_verified_bundle_entry(paths.bundle_data, query.retained_bundle_id);
-  if (bundle == nullptr) {
-    return std::nullopt;
-  }
+  // The verified map is a pure function of the content-addressed bundle and
+  // the map artifact it names; reuse it while both files are unchanged.
+  static detail::VerifiedReadMemo<std::optional<VerifiedRetainedModelMap>>
+      memo(8U);
+  return memo.get(
+      detail::verified_read_key(current_root.string(),
+                                query.retained_bundle_id.value(),
+                                query.product_id.value()),
+      kPosixErrors, kReadMessages,
+      [&]() -> std::optional<VerifiedRetainedModelMap> {
+        const auto bundle =
+            read_verified_bundle_entry(paths.bundle_data, query.retained_bundle_id);
+        if (bundle == nullptr) {
+          return std::nullopt;
+        }
 
-  const RetainedProductArtifactQuery exact_product_query{
-      query.retained_bundle_id, query.product_id,
-      core::RetainedProductKind::kSymbolRoleMap,
-      core::ArtifactRoleId(
-          std::string(detail::kComposedModelSymbolRoleMapArtifactRole))};
-  const core::RetainedProductDTO *product =
-      find_exact_product(bundle->value(), exact_product_query);
-  if (product == nullptr) {
-    return std::nullopt;
-  }
-  const core::RetainedArtifactRefDTO *selected = nullptr;
-  for (const auto &artifact : product->artifact_refs) {
-    if (artifact.artifact_role_id != exact_product_query.artifact_role_id) {
-      continue;
-    }
-    if (selected != nullptr) {
-      detail::fail_retained_bundle(
-          "retained model-map product repeats its required artifact role");
-    }
-    selected = &artifact;
-  }
-  if (selected == nullptr) {
-    return std::nullopt;
-  }
-  if (selected->media_type != detail::kComposedModelSymbolRoleMapMediaType) {
-    detail::fail_retained_bundle(
-        "retained model-map artifact has an incoherent media type");
-  }
+        const RetainedProductArtifactQuery exact_product_query{
+            query.retained_bundle_id, query.product_id,
+            core::RetainedProductKind::kSymbolRoleMap,
+            core::ArtifactRoleId(
+                std::string(detail::kComposedModelSymbolRoleMapArtifactRole))};
+        const core::RetainedProductDTO *product =
+            find_exact_product(bundle->value(), exact_product_query);
+        if (product == nullptr) {
+          return std::nullopt;
+        }
+        const core::RetainedArtifactRefDTO *selected = nullptr;
+        for (const auto &artifact : product->artifact_refs) {
+          if (artifact.artifact_role_id != exact_product_query.artifact_role_id) {
+            continue;
+          }
+          if (selected != nullptr) {
+            detail::fail_retained_bundle(
+                "retained model-map product repeats its required artifact role");
+          }
+          selected = &artifact;
+        }
+        if (selected == nullptr) {
+          return std::nullopt;
+        }
+        if (selected->media_type != detail::kComposedModelSymbolRoleMapMediaType) {
+          detail::fail_retained_bundle(
+              "retained model-map artifact has an incoherent media type");
+        }
 
-  const std::string bytes = read_verified_raw_reference(
-      paths.raw_data, selected->content_addressed_store_key,
-      selected->content_digest, selected->byte_size,
-      "selected retained model-map artifact");
-  const CanonicalValue parsed =
-      detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-  require_symbol_role_map_matches_retained_graph(parsed,
-                                                 bundle->value().cell_graph);
-  DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
-  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
-      build_runtime_kinematic_paths(decoded, bundle->value().cell_graph);
+        const std::string bytes = read_verified_raw_reference(
+            paths.raw_data, selected->content_addressed_store_key,
+            selected->content_digest, selected->byte_size,
+            "selected retained model-map artifact");
+        const CanonicalValue parsed =
+            detail::parse_and_verify_composed_model_symbol_role_map(bytes);
+        require_symbol_role_map_matches_retained_graph(parsed,
+                                                       bundle->value().cell_graph);
+        DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
+        std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
+            build_runtime_kinematic_paths(decoded, bundle->value().cell_graph);
 
-  return VerifiedRetainedModelMap(
-      query, product->product_contract_id, product->product_contract_revision,
-      std::move(decoded.cell_frame), std::move(decoded.model_occurrences),
-      std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
-      std::move(decoded.references), std::move(decoded.coordinates),
-      std::move(decoded.control_bindings), std::move(decoded.fixed_connections),
-      std::move(decoded.frame_paths), std::move(kinematic_frame_paths),
-      std::move(decoded.targets));
+        return VerifiedRetainedModelMap(
+            query, product->product_contract_id, product->product_contract_revision,
+            std::move(decoded.cell_frame), std::move(decoded.model_occurrences),
+            std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
+            std::move(decoded.references), std::move(decoded.coordinates),
+            std::move(decoded.control_bindings), std::move(decoded.fixed_connections),
+            std::move(decoded.frame_paths), std::move(kinematic_frame_paths),
+            std::move(decoded.targets));
+      });
 }
+
 
 FilesystemVerifiedRetainedPlanningModelSource::
     FilesystemVerifiedRetainedPlanningModelSource(
@@ -2806,7 +2939,8 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
 
   // Verify every explicit retained reference before returning a narrower
   // projection, then independently retrieve the selected product roles.
-  require_verified_bundle_references(current_root, paths.raw_data, *bundle);
+  require_verified_bundle_reference_closure(current_root, paths.raw_data,
+                                            *bundle);
   const auto &resource_map_ref = require_exact_artifact_role(
       product, detail::kPlanningResourceMapArtifactRole);
   const auto &urdf_ref = require_exact_artifact_role(product, "urdf");
@@ -2889,7 +3023,8 @@ FilesystemVerifiedRetainedViewerModelSource::get_verified(
   // Full reference verification proves the code-owned viewer product has the
   // exact same compiled URDF and resource map as the authoritative planning
   // product. The narrower reader below then reconstructs only viewer inputs.
-  require_verified_bundle_references(current_root, paths.raw_data, *bundle);
+  require_verified_bundle_reference_closure(current_root, paths.raw_data,
+                                            *bundle);
   const auto &resource_map_ref = require_exact_artifact_role(
       *product, detail::kPlanningResourceMapArtifactRole);
   const auto &urdf_ref = require_exact_artifact_role(*product, "urdf");

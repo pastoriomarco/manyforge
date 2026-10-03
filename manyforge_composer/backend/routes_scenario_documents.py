@@ -346,7 +346,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             authoring = captured_workspace["program"]["authoring"]
             deployment = captured_workspace["deployment"]["document"]
             assignment = project["program_role_assignment"]
-            overrides = project["typed_parameter_overrides"]
             complete = (
                 isinstance(authoring, dict)
                 and isinstance(deployment, dict)
@@ -359,7 +358,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 program_draft=authoring,
                 deployment_draft=deployment,
                 program_role_assignment=assignment,
-                typed_parameter_overrides=overrides,
                 manyforge_version=_version(),
                 last_known_status="unknown" if complete else "incomplete",
             )
@@ -540,7 +538,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     name=body.name.strip(), description="", program_draft=authoring,
                     deployment_draft=deployment,
                     program_role_assignment={"component_roles": [], "target_roles": []},
-                    typed_parameter_overrides={}, manyforge_version=_version(),
+                    manyforge_version=_version(),
                     last_known_status="incomplete",
                 )
                 scenario_document, target, members, manifest = prepare_scenario_artifact(
@@ -612,7 +610,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 deployment, project_root=Path(source_path)
             )
             assignment = deepcopy(scenario_document["program_role_assignment"])
-            overrides = deepcopy(scenario_document["typed_parameter_overrides"])
             captured_digest = raw_sha256_digest(
                 canonical_json_bytes(
                     {
@@ -622,7 +619,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "model_source_closure": source_closure,
                         "program": program.to_dict() if program is not None else None,
                         "program_role_assignment": assignment,
-                        "typed_parameter_overrides": overrides,
                     }
                 )
             )
@@ -641,7 +637,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "program": program.to_dict() if program is not None else None,
                 "program_authoring": deepcopy(authoring),
                 "program_role_assignment": assignment,
-                "typed_parameter_overrides": overrides,
                 "expected_manager_current": {
                     "retained_bundle_id": bundle,
                     "graph_revision": graph,
@@ -657,11 +652,13 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "draft_revision": body.expected_draft_revision,
             }
             # Load is the operator's deliberate confirmation to replace the
-            # current Scenario and activate this exact captured candidate. Keep
-            # the Manager's confirmation token internal; it is revalidated
-            # under the one authoring claim before the local workspace commit.
+            # current Scenario and activate this exact captured candidate, so
+            # its one preparation already accepts a disruptive or destructive
+            # impact. Manager rechecks the exact preview receipt and current
+            # publication when it accepts the operation.
             activation_preview = state.execute_authored_deployment_candidate(
-                activation_intent, None, apply=True, prepare_only=True
+                activation_intent, None, apply=True, prepare_only=True,
+                confirmed=True,
             )
             if creating:
                 # The dialog authorizes exactly keep-all or remove-all for the
@@ -679,31 +676,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "New would change components beyond the confirmed Deployment choice",
                         status_code=409,
                     )
-            if activation_preview.get("confirmation_required") is True:
-                token = activation_preview.get("confirmation_token")
-                if not isinstance(token, str) or not token:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_confirmation_unavailable",
-                        "Deployment confirmation has no exact preview identity",
-                        status_code=503,
-                    )
-                activation_intent["confirmation_token"] = token
-                confirmed_preview = state.execute_authored_deployment_candidate(
-                    activation_intent, None, apply=True, prepare_only=True
-                )
-                if (
-                    confirmed_preview.get("confirmation_required") is not False
-                    or confirmed_preview.get("prepared_activation")
-                    != activation_preview.get("prepared_activation")
-                    or confirmed_preview.get("candidate_preview")
-                    != activation_preview.get("candidate_preview")
-                ):
-                    raise ScenarioArtifactError(
-                        "scenario_activation_preview_changed",
-                        "Deployment preview changed while confirming this Load",
-                        status_code=409,
-                    )
-                activation_preview = confirmed_preview
             # Both retained Draft replacements are validated outside every
             # owner lock, and the whole load commits as one workspace
             # replacement: the successor Program and Deployment identities and
@@ -934,7 +906,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 program_draft=captured_workspace["program"]["authoring"],
                 deployment_draft=captured_workspace["deployment"]["document"],
                 program_role_assignment=project["program_role_assignment"],
-                typed_parameter_overrides=project["typed_parameter_overrides"],
                 manyforge_version=_version(),
                 last_known_status="unknown",
             )

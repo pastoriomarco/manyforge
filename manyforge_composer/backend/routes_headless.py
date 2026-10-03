@@ -44,15 +44,13 @@ from manyforge_headless_api.models import (
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
     ProgramCycleResetRequest,
+    ProgramNodeCorrectionPreviewRequest,
     CycleRecoveryActionRequest,
     ManualResultStageRequest,
     PersistentKeyValueResetRequest,
     PersistentKeyValueSetRequest,
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
-    RuntimeOverrideActionRequest,
-    RuntimeOverridePromotionRequest,
-    RuntimeOverrideStageRequest,
     SkillExpansionRequest,
 )
 from manyforge_headless_api.history_query import (
@@ -153,8 +151,26 @@ def _call(callback):
         raise _translate(error) from error
 
 
+# Every recovery action except Reset resumes the run (Retry, continue).
+_RESETTING_RECOVERY_ACTIONS = frozenset({"reset_cycle"})
+
+
+def _resumes_execution(command_kind: str, payload: Any) -> bool:
+    """Commands that start or resume Program progression or motion."""
+
+    if command_kind == "execution_recovery":
+        action = payload.get("action_id") if isinstance(payload, dict) else None
+        return action not in _RESETTING_RECOVERY_ACTIONS
+    return command_kind.startswith("program_")
+
+
 def _require_applied_authoring_drafts(state: ComposerState) -> None:
-    """Refuse new execution while Program or Deployment edits are unapplied."""
+    """Refuse Execute, Run, Resume and Retry while Draft edits are unapplied.
+
+    Composer owns the Draft, so it admits these commands only when the Draft
+    is exactly what is Applied; the edits must be Applied (which Resets a
+    held run first) or Discarded.
+    """
 
     draft = state.deployment_draft_session.snapshot()["draft"]["document"]
     program_snapshot = state.draft_session.snapshot()
@@ -164,7 +180,10 @@ def _require_applied_authoring_drafts(state: ComposerState) -> None:
             status_code=409,
             detail={
                 "code": "execution_program_draft_unapplied",
-                "message": "Complete or discard Program edits before starting execution",
+                "message": (
+                    "Apply or Discard first: the Program Draft has unapplied "
+                    "changes"
+                ),
             },
         )
     if draft is None and program_revision is None:
@@ -183,7 +202,10 @@ def _require_applied_authoring_drafts(state: ComposerState) -> None:
             status_code=409,
             detail={
                 "code": "execution_program_draft_unapplied",
-                "message": "Apply or discard Program edits before starting execution",
+                "message": (
+                    "Apply or Discard first: the Program Draft has unapplied "
+                    "changes"
+                ),
             },
         )
     if draft is None:
@@ -198,7 +220,10 @@ def _require_applied_authoring_drafts(state: ComposerState) -> None:
             status_code=409,
             detail={
                 "code": "execution_deployment_draft_unapplied",
-                "message": "Apply or discard Deployment edits before starting execution",
+                "message": (
+                    "Apply or Discard first: the Deployment Draft has unapplied "
+                    "changes"
+                ),
             },
         )
 
@@ -427,71 +452,16 @@ def create_headless_router(
                 },
             )
 
-    @router.post("/api/program/runs/{program_run_id}/runtime-overrides")
-    async def stage_runtime_override(
+    @router.post("/api/program/runs/{program_run_id}/node-correction-previews")
+    def program_node_correction_preview(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideStageRequest,
+        body: ProgramNodeCorrectionPreviewRequest,
     ) -> dict[str, Any]:
+        """Advisory preview only: not an execution command or Draft change."""
         require_control_path(program_run_id, body)
-        return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id, "runtime-overrides", body.model_dump(mode="json")
-            )
-        )
-
-    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/activate")
-    async def activate_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideActionRequest,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id,
-                "runtime-overrides/activate",
-                body.model_dump(mode="json"),
-            )
-        )
-
-    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/clear")
-    async def clear_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverrideActionRequest,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id,
-                "runtime-overrides/clear",
-                body.model_dump(mode="json"),
-            )
-        )
-
-    @router.post("/api/program/runs/{program_run_id}/runtime-overrides/promote")
-    async def promote_runtime_override(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: RuntimeOverridePromotionRequest,
-    ) -> dict[str, Any]:
-        require_control_path(program_run_id, body)
-        try:
-            state.draft_session.require_current(
-                draft_id=body.expected_draft_id,
-                expected_revision=body.expected_draft_revision,
-            )
-        except DraftSessionError as error:
-            raise HTTPException(
-                status_code=error.status_code,
-                detail={
-                    "code": error.code,
-                    "message": str(error),
-                    "details": error.detail,
-                },
-            ) from error
-        return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id,
-                "runtime-overrides/promote",
-                body.model_dump(mode="json"),
+        return _call(
+            lambda: client.program_node_correction_preview(
+                program_run_id, body.model_dump(mode="json")
             )
         )
 
@@ -569,8 +539,16 @@ def create_headless_router(
     async def cycle_recovery_action(
         body: CycleRecoveryActionRequest,
     ) -> dict[str, Any]:
+        payload = body.model_dump(mode="json")
+
+        def submit():
+            if _resumes_execution("execution_recovery", payload):
+                _require_applied_authoring_drafts(state)
+            return client.cycle_recovery_action(payload)
+
+        assert state.authoring_admission is not None
         return await control_call(
-            lambda: client.cycle_recovery_action(body.model_dump(mode="json"))
+            lambda: state.authoring_admission.submit_execution_start(submit)
         )
 
     @router.get("/api/program/runs/{program_run_id}")
@@ -778,14 +756,18 @@ def create_headless_router(
     async def submit_control_command(
         body: ExecutionCommandRequestDTO,
     ) -> JSONResponse:
-        start = body.command_envelope.command_kind in {
+        kind = body.command_envelope.command_kind
+        start = kind in {
             "program_run", "program_motion_start", "program_motion_resume",
             "program_resume_full_stop", "operation_start", "operation_resume",
+            "execution_recovery",
         }
+        request = body.model_dump(mode="json")
+
         def submit():
-            if start and body.command_envelope.command_kind.startswith("program_"):
+            if start and _resumes_execution(kind, request.get("payload")):
                 _require_applied_authoring_drafts(state)
-            return client.submit_control_command(body.model_dump(mode="json"))
+            return client.submit_control_command(request)
 
         assert state.authoring_admission is not None
         return await control_call(
@@ -793,7 +775,7 @@ def create_headless_router(
                 state.authoring_admission.submit_execution_start(submit)
                 if start else submit()
             ),
-            stop=is_stop_command(body.command_envelope.command_kind),
+            stop=is_stop_command(kind),
         )
 
     @router.post("/api/execution/operations")

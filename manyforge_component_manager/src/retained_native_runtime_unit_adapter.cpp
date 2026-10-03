@@ -783,6 +783,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   struct Child final {
     pid_t pid;
+    // Set by whichever stop or observation path consumed this child's exit
+    // status. A reaped PID is no longer this adapter's child and may already
+    // name an unrelated process, so it is never waited on again; the stale
+    // registry row is observed as absent and erased by its next observer.
+    bool reaped{};
     RuntimeEpoch runtime_epoch;
     UniqueFd channel;
     std::string product_identity;
@@ -1017,6 +1022,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   }
 
   [[nodiscard]] bool ChildIsLive(Child &child) {
+    if (child.reaped) {
+      child.channel.Reset();
+      return false;
+    }
     int status = 0;
     pid_t result = -1;
     do {
@@ -1036,6 +1045,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         std::cerr << "native runtime child stopped unexpectedly: pid="
                   << child.pid << '\n';
       }
+      child.reaped = true;
       child.channel.Reset();
       return false;
     }
@@ -1571,7 +1581,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     try {
       StopChild(child);
     } catch (...) {
-      KillAndReap(child.pid);
+      if (!child.reaped) {
+        KillAndReap(child.pid);
+        child.reaped = true;
+      }
     }
     child.channel.Reset();
   }
@@ -1618,6 +1631,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
       Fail("native runtime child reap returned a foreign PID");
     }
+    std::cerr << "native runtime child killed after bounded stop: pid="
+              << child.pid << '\n';
+    child.reaped = true;
     child.channel.Reset();
   }
 
@@ -1892,10 +1908,20 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       EraseChild(found);
       return std::nullopt;
     }
-    SendPacket(found->second.channel.get(), "status", kStatusTimeout);
-    const auto packet =
-        ReceivePacket(found->second.channel.get(),
-                      kStatusTimeout);
+    // A killed child closes its private channel before the kernel makes it
+    // waitable, so ChildIsLive can still report it live. A failed channel
+    // exchange is the same child loss as an unanswered status: contain it
+    // (stop and reap) and report no source evidence, never an observation
+    // failure of the whole runtime.
+    std::optional<std::string> packet;
+    try {
+      SendPacket(found->second.channel.get(), "status", kStatusTimeout);
+      packet = ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    } catch (const RetainedNativeRuntimeUnitAdapterError &error) {
+      std::cerr << "native runtime child private channel failed: pid="
+                << found->second.pid << ": " << error.what() << '\n';
+      packet.reset();
+    }
     if (!packet.has_value()) {
       found->second.channel.Reset();
       StopChildNoThrow(found->second);

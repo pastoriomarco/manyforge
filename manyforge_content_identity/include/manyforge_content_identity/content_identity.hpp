@@ -26,6 +26,14 @@ inline constexpr std::string_view kContentIdentityPrefix =
     std::string_view identity_domain, std::string_view api_version,
     const CanonicalValue& normalized_payload);
 
+/// The same framing over bytes the caller already holds as the exact RFC 8785
+/// serialization of a normalized value, e.g. a member span of input that
+/// `parse_canonical_json` accepted. Passing any other bytes yields an identity
+/// no conforming producer can match.
+[[nodiscard]] std::string framed_sha256_of_canonical_json(
+    std::string_view identity_domain, std::string_view api_version,
+    std::string_view canonical_payload);
+
 /// Constant-time equality for two exact digest spellings.
 [[nodiscard]] bool digest_equal(std::string_view left,
                                 std::string_view right) noexcept;

@@ -2,6 +2,11 @@ import { resolveStructuralAssetUrl } from './client';
 import type { SnapshotRequestView } from '../components/SnapshotResponder';
 
 const RECONNECT_DELAY_MS = 1_000;
+// Composer binds one snapshot observer and refuses others with 1013. Another
+// open workbench holding the binding is a steady state, not an outage: back
+// off instead of an accept/close cycle on both sides every second.
+const OBSERVER_BOUND_ELSEWHERE_CODE = 1013;
+const BOUND_ELSEWHERE_MAXIMUM_DELAY_MS = 30_000;
 const MAXIMUM_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
 function objectAt(value: unknown, label: string): Record<string, unknown> {
@@ -92,6 +97,7 @@ export function subscribeSnapshotObserver(
   let active = true;
   let socket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let boundElsewhereDelayMs = RECONNECT_DELAY_MS;
   const connect = () => {
     if (!active) return;
     let candidate: WebSocket;
@@ -110,9 +116,19 @@ export function subscribeSnapshotObserver(
         candidate.close(1002, 'invalid snapshot request');
       }
     };
-    candidate.onclose = () => {
+    candidate.onclose = (event) => {
       if (active && socket === candidate) {
-        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+        let delayMs = RECONNECT_DELAY_MS;
+        if (event.code === OBSERVER_BOUND_ELSEWHERE_CODE) {
+          boundElsewhereDelayMs = Math.min(
+            boundElsewhereDelayMs * 2,
+            BOUND_ELSEWHERE_MAXIMUM_DELAY_MS,
+          );
+          delayMs = boundElsewhereDelayMs;
+        } else {
+          boundElsewhereDelayMs = RECONNECT_DELAY_MS;
+        }
+        reconnectTimer = setTimeout(connect, delayMs);
       }
     };
   };

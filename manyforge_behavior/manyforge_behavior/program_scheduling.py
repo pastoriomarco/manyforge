@@ -676,6 +676,9 @@ class ProgramRunTickHost:
                 or self._owner.failure_pause_stop_pending(
                     snapshot.capture.program_run_id
                 )
+                or self._owner.failure_assessment_refresh_required(
+                    snapshot.capture.program_run_id
+                )
             )
         )
 

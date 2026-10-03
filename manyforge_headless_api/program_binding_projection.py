@@ -31,7 +31,6 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "scenario_id",
         "schema_version",
         "source",
-        "typed_parameter_overrides",
     }
 )
 _APPLIED_SOURCE_FIELDS = frozenset(
@@ -119,8 +118,8 @@ def validate_applied_program_selection(
 
     if not isinstance(value, dict) or set(value) != _APPLIED_SELECTION_FIELDS:
         _fail(label, "the closed Applied Program selection record")
-    if value.get("schema_version") != "manyforge.applied_program_selection.v2":
-        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v2")
+    if value.get("schema_version") != "manyforge.applied_program_selection.v3":
+        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v3")
     if value.get("assistant_mode") not in {"required", "optional", "forbidden"}:
         _fail(f"{label}.assistant_mode", "a supported assistant mode")
     if value.get("assistant_projection") is not None and not isinstance(
@@ -140,8 +139,6 @@ def validate_applied_program_selection(
         _text(identity.get("owner_epoch"), f"{owner_label}.owner_epoch", 256)
     if owner_roles != sorted(set(owner_roles)):
         _fail(f"{label}.owner_identities", "strictly role-sorted unique identities")
-    if not isinstance(value.get("typed_parameter_overrides"), dict):
-        _fail(f"{label}.typed_parameter_overrides", "an object")
     if not isinstance(value.get("program"), dict):
         _fail(f"{label}.program", "an object")
     for field in (

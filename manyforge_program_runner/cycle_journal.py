@@ -22,137 +22,13 @@ import rfc8785
 from .liveness import RetainedLiveness
 
 
-LEGACY_SCHEMA_VERSION: Final = 3
-# Version 4 lacks only the completed persistent-value request table; an
-# existing version 4 journal is upgraded in place when it is opened.
-V4_SCHEMA_VERSION: Final = 4
-# Version 5 retains Program-run status v2 records; an existing version 5
-# journal is carried to version 6 (status v3) when it is opened.
-V5_SCHEMA_VERSION: Final = 5
-SCHEMA_VERSION: Final = 6
-# The retained Program-run status shapes carried by the version 6 migration.
-_RUN_STATUS_V2: Final = "manyforge.program_run_status.v2"
-_RUN_STATUS_V3: Final = "manyforge.program_run_status.v3"
-_RUN_STATUS_V2_FIELDS: Final = frozenset(
-    {
-        "schema_version",
-        "owner_id",
-        "owner_epoch",
-        "run_revision",
-        "state",
-        "capture",
-        "tree_status",
-        "node_status_revision",
-        "node_statuses",
-        "active_operation_count",
-        "reason_code",
-        "message",
-    }
-)
+# Development-only cutover: this runner creates and opens exactly this
+# journal version. Older and newer journals are refused unchanged, before any
+# write; their run history is not migrated or reinterpreted.
+SCHEMA_VERSION: Final = 7
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
-_LEGACY_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
-    "program_cycle_metadata": (
-        ("singleton", "INTEGER", 0, 1),
-        ("schema_version", "INTEGER", 1, 0),
-    ),
-    "program_cycle": (
-        ("singleton", "INTEGER", 0, 1),
-        ("cycle_generation", "INTEGER", 1, 0),
-        ("state", "TEXT", 1, 0),
-        ("owner_epoch", "TEXT", 1, 0),
-        ("program_run_id", "TEXT", 0, 0),
-        ("claim_json", "TEXT", 0, 0),
-        ("capture_identities_json", "TEXT", 0, 0),
-        ("terminal_reference", "TEXT", 0, 0),
-        ("start_settlement_json", "TEXT", 0, 0),
-        ("release_intent_json", "TEXT", 0, 0),
-        ("reset_result_json", "TEXT", 0, 0),
-        ("reconciliation_required", "INTEGER", 1, 0),
-        ("acquisition_pending_json", "TEXT", 0, 0),
-        ("reconciliation_evidence_digest", "TEXT", 0, 0),
-    ),
-    "program_cycle_requests": (
-        ("request_owner_epoch", "TEXT", 1, 1),
-        ("request_id", "TEXT", 1, 2),
-        ("request_kind", "TEXT", 1, 0),
-        ("intent_json", "TEXT", 1, 0),
-        ("cycle_generation", "INTEGER", 1, 0),
-        ("result_json", "TEXT", 0, 0),
-        ("error_json", "TEXT", 0, 0),
-    ),
-    "program_runner_liveness": (
-        ("singleton", "INTEGER", 0, 1),
-        ("manager_runtime_epoch", "TEXT", 0, 0),
-        ("manager_owner_epoch", "TEXT", 0, 0),
-        ("predecessor_expired", "INTEGER", 1, 0),
-        ("fault_reference", "TEXT", 0, 0),
-    ),
-    "program_run_history": (
-        ("program_run_id", "TEXT", 0, 1),
-        ("run_revision", "INTEGER", 1, 0),
-        ("snapshot_json", "TEXT", 1, 0),
-        ("terminal", "INTEGER", 1, 0),
-    ),
-}
-_LEGACY_TABLE_SQL: Final[dict[str, str]] = {
-    "program_cycle_metadata": f"""
-        CREATE TABLE program_cycle_metadata (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          schema_version INTEGER NOT NULL CHECK(schema_version={LEGACY_SCHEMA_VERSION})
-        )
-    """,
-    "program_cycle": """
-        CREATE TABLE program_cycle (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
-          state TEXT NOT NULL,
-          owner_epoch TEXT NOT NULL,
-          program_run_id TEXT,
-          claim_json TEXT,
-          capture_identities_json TEXT,
-          terminal_reference TEXT,
-          start_settlement_json TEXT,
-          release_intent_json TEXT,
-          reset_result_json TEXT,
-          reconciliation_required INTEGER NOT NULL
-            CHECK(reconciliation_required IN (0,1)),
-          acquisition_pending_json TEXT,
-          reconciliation_evidence_digest TEXT
-        )
-    """,
-    "program_cycle_requests": """
-        CREATE TABLE program_cycle_requests (
-          request_owner_epoch TEXT NOT NULL,
-          request_id TEXT NOT NULL,
-          request_kind TEXT NOT NULL,
-          intent_json TEXT NOT NULL,
-          cycle_generation INTEGER NOT NULL,
-          result_json TEXT,
-          error_json TEXT,
-          PRIMARY KEY(request_owner_epoch, request_id)
-        )
-    """,
-    "program_runner_liveness": """
-        CREATE TABLE program_runner_liveness (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          manager_runtime_epoch TEXT,
-          manager_owner_epoch TEXT,
-          predecessor_expired INTEGER NOT NULL
-            CHECK(predecessor_expired IN (0,1)),
-          fault_reference TEXT
-        )
-    """,
-    "program_run_history": """
-        CREATE TABLE program_run_history (
-          program_run_id TEXT PRIMARY KEY,
-          run_revision INTEGER NOT NULL CHECK(run_revision>0),
-          snapshot_json TEXT NOT NULL,
-          terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
-        )
-    """,
-}
-_V4_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
+_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
     "program_cycle_metadata": (
         ("singleton", "INTEGER", 0, 1),
         ("schema_version", "INTEGER", 1, 0),
@@ -188,11 +64,19 @@ _V4_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
         ("intent_json", "TEXT", 1, 0),
         ("cycle_generation", "INTEGER", 1, 0),
     ),
-    "program_runner_liveness": _LEGACY_TABLE_SHAPES["program_runner_liveness"],
-    "program_run_history": _LEGACY_TABLE_SHAPES["program_run_history"],
-}
-_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
-    **_V4_TABLE_SHAPES,
+    "program_runner_liveness": (
+        ("singleton", "INTEGER", 0, 1),
+        ("manager_runtime_epoch", "TEXT", 0, 0),
+        ("manager_owner_epoch", "TEXT", 0, 0),
+        ("predecessor_expired", "INTEGER", 1, 0),
+        ("fault_reference", "TEXT", 0, 0),
+    ),
+    "program_run_history": (
+        ("program_run_id", "TEXT", 0, 1),
+        ("run_revision", "INTEGER", 1, 0),
+        ("snapshot_json", "TEXT", 1, 0),
+        ("terminal", "INTEGER", 1, 0),
+    ),
     "program_persistent_value_requests": (
         ("request_owner_epoch", "TEXT", 1, 1),
         ("request_id", "TEXT", 1, 2),
@@ -201,21 +85,15 @@ _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] 
         ("position", "INTEGER", 1, 0),
     ),
 }
-
-
-def _metadata_sql(schema_version: int) -> str:
-    return f"""
-        CREATE TABLE "program_cycle_metadata" (
+_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
+    "program_cycle_metadata": f"""
+        CREATE TABLE program_cycle_metadata (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          schema_version INTEGER NOT NULL CHECK(schema_version={schema_version})
+          schema_version INTEGER NOT NULL CHECK(schema_version={SCHEMA_VERSION})
         )
-    """
-
-
-_V4_TABLE_SQL: Final[dict[str, str]] = {
-    "program_cycle_metadata": _metadata_sql(V4_SCHEMA_VERSION),
+    """,
     "program_cycle": """
-        CREATE TABLE "program_cycle" (
+        CREATE TABLE program_cycle (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
           cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
           state TEXT NOT NULL,
@@ -252,31 +130,38 @@ _V4_TABLE_SQL: Final[dict[str, str]] = {
           PRIMARY KEY(request_owner_epoch, request_id)
         )
     """,
-    "program_runner_liveness": _LEGACY_TABLE_SQL["program_runner_liveness"],
-    "program_run_history": _LEGACY_TABLE_SQL["program_run_history"],
-}
-# Identities of completed persistent-value requests (Set, Reset, Clear), so a
-# resend is refused instead of applied again. Bounded: the oldest rows by
-# insertion `position` are trimmed. Node writes carry no request and never
-# appear here.
-_PERSISTENT_VALUE_REQUESTS_SQL: Final = """
-    CREATE TABLE program_persistent_value_requests (
-      request_owner_epoch TEXT NOT NULL,
-      request_id TEXT NOT NULL,
-      action TEXT NOT NULL CHECK(action IN ('set','reset','clear')),
-      outcome TEXT NOT NULL CHECK(outcome IN ('applied','storage_uncertain')),
-      position INTEGER NOT NULL UNIQUE CHECK(position>0),
-      PRIMARY KEY(request_owner_epoch, request_id)
-    )
-"""
-_V5_TABLE_SQL: Final[dict[str, str]] = {
-    **_V4_TABLE_SQL,
-    "program_cycle_metadata": _metadata_sql(V5_SCHEMA_VERSION),
-    "program_persistent_value_requests": _PERSISTENT_VALUE_REQUESTS_SQL,
-}
-_REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
-    **_V5_TABLE_SQL,
-    "program_cycle_metadata": _metadata_sql(SCHEMA_VERSION),
+    "program_runner_liveness": """
+        CREATE TABLE program_runner_liveness (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          manager_runtime_epoch TEXT,
+          manager_owner_epoch TEXT,
+          predecessor_expired INTEGER NOT NULL
+            CHECK(predecessor_expired IN (0,1)),
+          fault_reference TEXT
+        )
+    """,
+    "program_run_history": """
+        CREATE TABLE program_run_history (
+          program_run_id TEXT PRIMARY KEY,
+          run_revision INTEGER NOT NULL CHECK(run_revision>0),
+          snapshot_json TEXT NOT NULL,
+          terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
+        )
+    """,
+    # Identities of completed persistent-value requests (Set, Reset, Clear),
+    # so a resend is refused instead of applied again. Bounded: the oldest
+    # rows by insertion `position` are trimmed. Node writes carry no request
+    # and never appear here.
+    "program_persistent_value_requests": """
+        CREATE TABLE program_persistent_value_requests (
+          request_owner_epoch TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          action TEXT NOT NULL CHECK(action IN ('set','reset','clear')),
+          outcome TEXT NOT NULL CHECK(outcome IN ('applied','storage_uncertain')),
+          position INTEGER NOT NULL UNIQUE CHECK(position>0),
+          PRIMARY KEY(request_owner_epoch, request_id)
+        )
+    """,
 }
 _SCHEMA_SQL: Final = (
     ";\n".join(statement.strip() for statement in _REQUIRED_TABLE_SQL.values()) + ";"
@@ -296,10 +181,6 @@ _REQUEST_KINDS: Final = frozenset(
     {
         "start",
         "reset",
-        "runtime_override_stage",
-        "runtime_override_activate",
-        "runtime_override_clear",
-        "runtime_override_promote",
         "runtime_blackboard_write",
         "manual_result_stage",
         "recovery_action",
@@ -334,23 +215,6 @@ def _bounded_identity(value: object) -> bool:
         and unicodedata.normalize("NFC", value) == value
         and len(value.encode("utf-8")) <= 256
     )
-
-
-def _run_status_v3(snapshot: object) -> dict[str, Any]:
-    """One retained Program-run status v2 record as status v3."""
-
-    if (
-        not isinstance(snapshot, dict)
-        or set(snapshot) != _RUN_STATUS_V2_FIELDS
-        or snapshot["schema_version"] != _RUN_STATUS_V2
-    ):
-        raise RuntimeError("Program-run history row is corrupt")
-    return {
-        **snapshot,
-        "schema_version": _RUN_STATUS_V3,
-        "details": None,
-        "origin": None,
-    }
 
 
 def _settlement_reference(settlement: Mapping[str, Any]) -> str:
@@ -393,6 +257,25 @@ def _strict_object(
     if not isinstance(decoded, dict):
         raise RuntimeError("Program-cycle journal JSON value is not an object")
     return decoded
+
+
+class ProgramCycleJournalVersionError(RuntimeError):
+    """An existing journal of another (older or newer) schema version.
+
+    Development run history is not migrated: the journal is left unchanged
+    and the runner refuses to start until it is replaced by a fresh one.
+    """
+
+    def __init__(self, found_version: int) -> None:
+        self.found_version = found_version
+        super().__init__(
+            f"Program-cycle journal schema version {found_version} is "
+            f"unsupported; this Program runner opens only version "
+            f"{SCHEMA_VERSION} and does not migrate earlier run history. The "
+            "journal was left unchanged. Stop the development workbench "
+            "(./scripts/compose-dev.sh stop, or stop --keep-evidence to keep "
+            "an incident bundle) and start it again for fresh runtime state."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -763,7 +646,7 @@ class ProgramCycleJournal:
         path: Path,
         *,
         parent_descriptor: int,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int]:
         """Validate existing durable state through a strictly read-only handle."""
 
         try:
@@ -824,24 +707,17 @@ class ProgramCycleJournal:
             metadata_rows = database.execute(
                 "SELECT singleton,schema_version FROM program_cycle_metadata"
             ).fetchall()
-            if metadata_rows == [(1, LEGACY_SCHEMA_VERSION)]:
-                schema_version = LEGACY_SCHEMA_VERSION
-                expected_shapes = _LEGACY_TABLE_SHAPES
-                expected_sql = _LEGACY_TABLE_SQL
-            elif metadata_rows == [(1, V4_SCHEMA_VERSION)]:
-                schema_version = V4_SCHEMA_VERSION
-                expected_shapes = _V4_TABLE_SHAPES
-                expected_sql = _V4_TABLE_SQL
-            elif metadata_rows == [(1, V5_SCHEMA_VERSION)]:
-                schema_version = V5_SCHEMA_VERSION
-                expected_shapes = _REQUIRED_TABLE_SHAPES
-                expected_sql = _V5_TABLE_SQL
-            elif metadata_rows == [(1, SCHEMA_VERSION)]:
-                schema_version = SCHEMA_VERSION
-                expected_shapes = _REQUIRED_TABLE_SHAPES
-                expected_sql = _REQUIRED_TABLE_SQL
-            else:
-                raise RuntimeError("Program-cycle journal schema is unsupported")
+            if (
+                len(metadata_rows) == 1
+                and metadata_rows[0][0] == 1
+                and type(metadata_rows[0][1]) is int
+                and metadata_rows[0][1] != SCHEMA_VERSION
+            ):
+                raise ProgramCycleJournalVersionError(metadata_rows[0][1])
+            if metadata_rows != [(1, SCHEMA_VERSION)]:
+                raise RuntimeError("Program-cycle journal metadata is corrupt")
+            expected_shapes = _REQUIRED_TABLE_SHAPES
+            expected_sql = _REQUIRED_TABLE_SQL
             expected_tables = set(expected_shapes)
             if tables != expected_tables:
                 raise RuntimeError(
@@ -901,87 +777,62 @@ class ProgramCycleJournal:
             for index in (5, 6, 8, 9, 10, 12):
                 _strict_object(cycle_rows[0][index])
 
-            if schema_version != LEGACY_SCHEMA_VERSION:
-                if (
-                    type(cycle_rows[0][14]) is not int
-                    or not 1 <= cycle_rows[0][14] <= 9_007_199_254_740_991
-                    or any(
-                        value is not None and not _bounded_identity(value)
-                        for value in cycle_rows[0][15:19]
-                    )
-                ):
-                    raise RuntimeError("Program-cycle control identity is corrupt")
-                _strict_object(cycle_rows[0][19])
-                if cycle_rows[0][20] is not None and not _bounded_identity(
-                    cycle_rows[0][20]
-                ):
-                    raise RuntimeError("Program-cycle reset phase is corrupt")
-                _strict_object(cycle_rows[0][21])
+            if (
+                type(cycle_rows[0][14]) is not int
+                or not 1 <= cycle_rows[0][14] <= 9_007_199_254_740_991
+                or any(
+                    value is not None and not _bounded_identity(value)
+                    for value in cycle_rows[0][15:19]
+                )
+            ):
+                raise RuntimeError("Program-cycle control identity is corrupt")
+            _strict_object(cycle_rows[0][19])
+            if cycle_rows[0][20] is not None and not _bounded_identity(
+                cycle_rows[0][20]
+            ):
+                raise RuntimeError("Program-cycle reset phase is corrupt")
+            _strict_object(cycle_rows[0][21])
 
             request_count = 0
-            command_table = (
-                "program_cycle_requests"
-                if schema_version == LEGACY_SCHEMA_VERSION
-                else "program_cycle_inflight_commands"
-            )
-            selected_columns = (
-                "request_owner_epoch,request_id,request_kind,intent_json,"
-                "cycle_generation,result_json,error_json"
-                if schema_version == LEGACY_SCHEMA_VERSION
-                else "request_owner_epoch,request_id,request_kind,intent_json,"
-                "cycle_generation"
-            )
             reset_request_count = 0
             for request in database.execute(
-                f"SELECT {selected_columns} FROM {command_table}"
+                "SELECT request_owner_epoch,request_id,request_kind,intent_json,"
+                "cycle_generation FROM program_cycle_inflight_commands"
             ):
                 request_count += 1
                 reset_request_count += request[2] == "reset"
                 if (
                     (
                         request_count > 4_096
-                        and (
-                            schema_version == LEGACY_SCHEMA_VERSION
-                            or request_count > 4_097
-                            or reset_request_count != 1
-                        )
+                        and (request_count > 4_097 or reset_request_count != 1)
                     )
                     or not _bounded_identity(request[0])
                     or not _bounded_identity(request[1])
                     or request[2] not in _REQUEST_KINDS
                     or type(request[4]) is not int
                     or request[4] < 1
-                    or (
-                        schema_version == LEGACY_SCHEMA_VERSION
-                        and request[5] is not None
-                        and request[6] is not None
-                    )
                 ):
                     raise RuntimeError("Program-cycle request ledger is corrupt")
                 _strict_object(request[3], required=True)
-                if schema_version == LEGACY_SCHEMA_VERSION:
-                    _strict_object(request[5])
-                    _strict_object(request[6])
 
-            if schema_version in {V5_SCHEMA_VERSION, SCHEMA_VERSION}:
-                completed_count = 0
-                for completed in database.execute(
-                    "SELECT request_owner_epoch,request_id,action,outcome,position "
-                    "FROM program_persistent_value_requests"
+            completed_count = 0
+            for completed in database.execute(
+                "SELECT request_owner_epoch,request_id,action,outcome,position "
+                "FROM program_persistent_value_requests"
+            ):
+                completed_count += 1
+                if (
+                    completed_count > MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
+                    or not _bounded_identity(completed[0])
+                    or not _bounded_identity(completed[1])
+                    or completed[2] not in _PERSISTENT_VALUE_ACTIONS.values()
+                    or completed[3] not in _PERSISTENT_VALUE_OUTCOMES
+                    or type(completed[4]) is not int
+                    or completed[4] < 1
                 ):
-                    completed_count += 1
-                    if (
-                        completed_count > MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
-                        or not _bounded_identity(completed[0])
-                        or not _bounded_identity(completed[1])
-                        or completed[2] not in _PERSISTENT_VALUE_ACTIONS.values()
-                        or completed[3] not in _PERSISTENT_VALUE_OUTCOMES
-                        or type(completed[4]) is not int
-                        or completed[4] < 1
-                    ):
-                        raise RuntimeError(
-                            "Program-cycle persistent-value request table is corrupt"
-                        )
+                    raise RuntimeError(
+                        "Program-cycle persistent-value request table is corrupt"
+                    )
 
             liveness_rows = database.execute(
                 "SELECT singleton,manager_runtime_epoch,manager_owner_epoch,"
@@ -1051,7 +902,7 @@ class ProgramCycleJournal:
             if database is not None:
                 database.close()
             snapshot_stack.close()
-        return metadata.st_dev, metadata.st_ino, schema_version
+        return metadata.st_dev, metadata.st_ino
 
     def __init__(
         self,
@@ -1115,14 +966,11 @@ class ProgramCycleJournal:
                     ) from error
                 new_database = not exists
                 expected_identity: tuple[int, int]
-                existing_schema_version = SCHEMA_VERSION
                 if exists:
-                    preflight = self._preflight_existing(
+                    expected_identity = self._preflight_existing(
                         path,
                         parent_descriptor=parent_descriptor,
                     )
-                    expected_identity = preflight[:2]
-                    existing_schema_version = preflight[2]
                 else:
                     orphaned_sidecars: list[str] = []
                     for suffix in ("-journal", "-wal", "-shm"):
@@ -1247,13 +1095,6 @@ class ProgramCycleJournal:
             self._database.execute("PRAGMA synchronous=FULL")
             if new_database:
                 self._database.executescript(_SCHEMA_SQL)
-            else:
-                if existing_schema_version == LEGACY_SCHEMA_VERSION:
-                    self._migrate_v3()
-                if existing_schema_version in {LEGACY_SCHEMA_VERSION, V4_SCHEMA_VERSION}:
-                    self._migrate_v4()
-                if existing_schema_version != SCHEMA_VERSION:
-                    self._migrate_v5()
             with self._transaction():
                 if new_database:
                     self._database.execute(
@@ -1336,184 +1177,6 @@ class ProgramCycleJournal:
             os.close(self._parent_descriptor)
             self._parent_descriptor = -1
             raise
-
-    def _migrate_v3(self) -> None:
-        """Atomically narrow v3's lifetime ledger to current/in-flight state."""
-
-        self._database.execute("BEGIN IMMEDIATE")
-        try:
-            self._database.execute(
-                """
-                CREATE TABLE program_cycle_v4 (
-                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                  cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
-                  state TEXT NOT NULL,
-                  owner_epoch TEXT NOT NULL,
-                  program_run_id TEXT,
-                  claim_json TEXT,
-                  capture_identities_json TEXT,
-                  terminal_reference TEXT,
-                  start_settlement_json TEXT,
-                  release_intent_json TEXT,
-                  reset_result_json TEXT,
-                  reconciliation_required INTEGER NOT NULL
-                    CHECK(reconciliation_required IN (0,1)),
-                  acquisition_pending_json TEXT,
-                  reconciliation_evidence_digest TEXT,
-                  execution_control_revision INTEGER NOT NULL
-                    CHECK(execution_control_revision>0),
-                  causal_correlation_id TEXT,
-                  causal_session_id TEXT,
-                  causal_client_sequence TEXT,
-                  current_command_kind TEXT,
-                  failure_json TEXT,
-                  reset_phase TEXT,
-                  runtime_controls_json TEXT
-                )
-                """
-            )
-            self._database.execute(
-                """
-                INSERT INTO program_cycle_v4
-                SELECT singleton,cycle_generation,state,owner_epoch,program_run_id,
-                       claim_json,capture_identities_json,terminal_reference,
-                       start_settlement_json,release_intent_json,
-                       reset_result_json,reconciliation_required,
-                       acquisition_pending_json,reconciliation_evidence_digest,
-                       1,NULL,NULL,NULL,NULL,NULL,NULL,NULL
-                FROM program_cycle
-                """
-            )
-            self._database.execute(
-                """
-                CREATE TABLE program_cycle_inflight_commands (
-                  request_owner_epoch TEXT NOT NULL,
-                  request_id TEXT NOT NULL,
-                  request_kind TEXT NOT NULL,
-                  intent_json TEXT NOT NULL,
-                  cycle_generation INTEGER NOT NULL,
-                  PRIMARY KEY(request_owner_epoch, request_id)
-                )
-                """
-            )
-            self._database.execute(
-                """
-                INSERT INTO program_cycle_inflight_commands
-                SELECT request_owner_epoch,request_id,request_kind,intent_json,
-                       cycle_generation
-                FROM program_cycle_requests
-                WHERE result_json IS NULL AND error_json IS NULL
-                """
-            )
-            self._database.execute("DROP TABLE program_cycle_requests")
-            self._database.execute("DROP TABLE program_cycle")
-            self._database.execute(
-                "ALTER TABLE program_cycle_v4 RENAME TO program_cycle"
-            )
-            self._database.execute(
-                """
-                CREATE TABLE program_cycle_metadata_v4 (
-                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                  schema_version INTEGER NOT NULL CHECK(schema_version=4)
-                )
-                """
-            )
-            self._database.execute("INSERT INTO program_cycle_metadata_v4 VALUES(1,4)")
-            self._database.execute("DROP TABLE program_cycle_metadata")
-            self._database.execute(
-                "ALTER TABLE program_cycle_metadata_v4 "
-                "RENAME TO program_cycle_metadata"
-            )
-        except BaseException:
-            self._database.execute("ROLLBACK")
-            raise
-        self._database.execute("COMMIT")
-
-    def _migrate_v4(self) -> None:
-        """Atomically add v5's completed persistent-value request table."""
-
-        self._database.execute("BEGIN IMMEDIATE")
-        try:
-            self._database.execute(_PERSISTENT_VALUE_REQUESTS_SQL)
-            self._replace_metadata(V5_SCHEMA_VERSION)
-        except BaseException:
-            self._database.execute("ROLLBACK")
-            raise
-        self._database.execute("COMMIT")
-
-    def _migrate_v5(self) -> None:
-        """Atomically carry v5's retained run records to Program-run status v3.
-
-        Status v3 adds the failure's bounded ``details`` and ``origin``. A
-        retained v2 record carries no structured failure, so both are null.
-        Every retained record is rewritten: the run history, and the
-        terminal run a Start settlement embeds together with the
-        ``terminal_reference`` digest that covers that settlement (the
-        runtime verifies the settlement against both). Anything that is not
-        exactly the v2 shape fails closed and nothing is changed.
-        """
-
-        self._database.execute("BEGIN IMMEDIATE")
-        try:
-            history = self._database.execute(
-                "SELECT program_run_id,snapshot_json FROM program_run_history"
-            ).fetchall()
-            for program_run_id, encoded in history:
-                self._database.execute(
-                    "UPDATE program_run_history SET snapshot_json=? "
-                    "WHERE program_run_id=?",
-                    (
-                        self._dump(
-                            _run_status_v3(_strict_object(encoded, required=True))
-                        ),
-                        program_run_id,
-                    ),
-                )
-            reference, encoded_settlement = self._database.execute(
-                "SELECT terminal_reference,start_settlement_json "
-                "FROM program_cycle WHERE singleton=1"
-            ).fetchone()
-            settlement = _strict_object(encoded_settlement)
-            if (
-                settlement is not None
-                and settlement.get("kind") == "terminal_effects_settled"
-            ):
-                if reference != _settlement_reference(settlement):
-                    raise RuntimeError("Program-cycle journal owner row is corrupt")
-                try:
-                    terminal_run = _run_status_v3(settlement.get("terminal_run"))
-                except RuntimeError as error:
-                    raise RuntimeError(
-                        "Program-cycle journal owner row is corrupt"
-                    ) from error
-                migrated = {**settlement, "terminal_run": terminal_run}
-                self._database.execute(
-                    "UPDATE program_cycle SET start_settlement_json=?,"
-                    "terminal_reference=? WHERE singleton=1",
-                    (self._dump(migrated), _settlement_reference(migrated)),
-                )
-            self._replace_metadata(SCHEMA_VERSION)
-        except BaseException:
-            self._database.execute("ROLLBACK")
-            raise
-        self._database.execute("COMMIT")
-
-    def _replace_metadata(self, schema_version: int) -> None:
-        """Within a migration: replace the metadata row's fixed version."""
-
-        replacement = f"program_cycle_metadata_v{schema_version}"
-        self._database.execute(
-            _metadata_sql(schema_version).replace(
-                '"program_cycle_metadata"', replacement
-            )
-        )
-        self._database.execute(
-            f"INSERT INTO {replacement} VALUES(1,?)", (schema_version,)
-        )
-        self._database.execute("DROP TABLE program_cycle_metadata")
-        self._database.execute(
-            f"ALTER TABLE {replacement} RENAME TO program_cycle_metadata"
-        )
 
     @staticmethod
     def _safe_parent(metadata: os.stat_result) -> bool:
@@ -2827,9 +2490,9 @@ class ProgramCycleJournal:
 __all__ = [
     "CycleRecord",
     "MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS",
+    "ProgramCycleJournalVersionError",
     "ProgramCycleJournal",
     "RequestRecord",
     "SCHEMA_VERSION",
-    "V5_SCHEMA_VERSION",
     "STATES",
 ]

@@ -505,7 +505,10 @@
   border: 2px solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
-  animation: notification-busy-spin 0.9s linear infinite;
+  /* Eight discrete positions instead of a continuous spin: the indicator
+     stays visibly alive while the compositor repaints ~9 times per second,
+     not at the display rate, for as long as a busy row stays open. */
+  animation: notification-busy-spin 0.9s steps(8) infinite;
 }
 
 @keyframes notification-busy-spin {

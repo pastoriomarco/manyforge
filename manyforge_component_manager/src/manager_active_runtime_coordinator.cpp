@@ -318,8 +318,16 @@ DurableManagerActiveRuntimePlanSource::ReadCurrentPlan() const {
       runtime_intent->runtime_convergence_intent_digest,
       runtime_intent->runtime_convergence_intent.runtime_units,
   };
-  if (!result.valid()) {
-    Fail("durable active runtime plan is invalid");
+  // Validity is a pure function of the value: a plan exactly equal to the
+  // last one accepted here is not re-validated (no runtime-contract digest is
+  // recomputed for unchanged durable evidence).
+  std::lock_guard verified_lock(verified_plan_mutex_);
+  if (verified_plan_ != result) {
+    verified_plan_.reset();
+    if (!result.valid()) {
+      Fail("durable active runtime plan is invalid");
+    }
+    verified_plan_ = result;
   }
   return result;
 }
@@ -374,7 +382,11 @@ ManagerActiveRuntimeConvergenceResult
 ManagerActiveRuntimeCoordinator::Converge(const ConvergenceMode mode) {
   std::lock_guard operation_lock(operation_mutex_);
   auto plan = plan_source_.ReadCurrentPlan();
-  if (!plan.valid()) {
+  // observation_plan_ holds only a plan this check already accepted; validity
+  // is a pure function of the value, so an exactly equal plan is not
+  // re-validated (its runtime-contract digests are not recomputed).
+  if ((!observation_plan_.has_value() || *observation_plan_ != plan) &&
+      !plan.valid()) {
     Fail("active runtime plan source returned an invalid plan");
   }
   const auto order = DependencyOrder(plan.runtime_units);
