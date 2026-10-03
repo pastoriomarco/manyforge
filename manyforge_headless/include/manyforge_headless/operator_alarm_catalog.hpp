@@ -34,8 +34,12 @@ struct OperatorAlarmDefinition final {
   std::string clear_authority;
   std::string adapter_id;
   std::vector<std::string> runtime_modes;
+  /// False selects the ISA-18.2 no-acknowledgement path: activation enters
+  /// active_acknowledged without attribution and return is terminal.
   bool acknowledgement_required;
   bool acknowledgement_reason_required;
+  /// Motion gating: an acknowledgement-required definition gates while
+  /// unacknowledged; one without acknowledgement gates exactly while active.
   bool requires_motion_attention;
   std::uint64_t max_evidence_refs;
 

@@ -441,6 +441,7 @@ function alarmSnapshotFixture(): Record<string, unknown> {
     consequence: 'Runtime state may be incomplete.',
     operator_response: 'Inspect the source.',
     occurrence_count: 2,
+    acknowledgement_required: true,
     requires_motion_attention: false,
     subject: {
       subject_kind: 'cell',

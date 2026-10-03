@@ -224,8 +224,10 @@ OperatorAlarmDefinition DecodeDefinition(const CanonicalValue &root) {
           "max_evidence_refs must be between 1 and 32");
   const bool acknowledgement_required =
       RequiredBool(root, "acknowledgement_required");
-  Require(acknowledgement_required,
-          "every initial alarm definition requires acknowledgement");
+  const bool acknowledgement_reason_required =
+      RequiredBool(root, "acknowledgement_reason_required");
+  Require(acknowledgement_required || !acknowledgement_reason_required,
+          "acknowledgement_reason_required needs acknowledgement_required");
   auto message_template =
       RequiredString(root, "message_template", kMaximumDefinitionTextBytes);
   ValidateMessageTemplate(message_template);
@@ -255,7 +257,7 @@ OperatorAlarmDefinition DecodeDefinition(const CanonicalValue &root) {
       std::move(adapter_id),
       std::move(runtime_modes),
       acknowledgement_required,
-      RequiredBool(root, "acknowledgement_reason_required"),
+      acknowledgement_reason_required,
       RequiredBool(root, "requires_motion_attention"),
       max_evidence_refs,
   };

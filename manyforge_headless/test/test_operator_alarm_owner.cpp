@@ -429,6 +429,86 @@ TEST_F(AlarmOwnerTest,
 }
 
 TEST_F(AlarmOwnerTest,
+       ConditionWithoutAcknowledgementGatesMotionExactlyWhileActive) {
+  auto owner = MakeOwner({"motion", "runtime_health", "scene"});
+  RegisterAll(*owner);
+  CompleteAll(*owner);
+  const auto scope_update = [](const std::uint64_t sequence,
+                               const bool active) {
+    auto update = CellGlobalUpdate(sequence, active);
+    update.definition_id = "manyforge.runtime.alarm_scope_unavailable";
+    return update;
+  };
+
+  // Activation needs no acknowledgement: it enters the standing state with no
+  // acknowledgement attribution, yet gates every reservation while active.
+  const auto activated = owner->Submit(scope_update(1U, true));
+  EXPECT_EQ(activated.status, "activated");
+  const auto scope = activated.records.front();
+  EXPECT_FALSE(scope.acknowledgement_required);
+  EXPECT_EQ(scope.lifecycle_state, AlarmLifecycleState::kActiveAcknowledged);
+  EXPECT_FALSE(scope.acknowledged_at_ns.has_value());
+  EXPECT_FALSE(scope.acknowledgement_attribution.has_value());
+  EXPECT_TRUE(GatesMotion(scope));
+  auto snapshot = owner->Snapshot();
+  EXPECT_EQ(snapshot.unacknowledged_count, 0U);
+  EXPECT_TRUE(snapshot.unacknowledged_membership.empty());
+  EXPECT_EQ(snapshot.motion_attention_count, 1U);
+  ASSERT_EQ(snapshot.motion_attention_membership.size(), 1U);
+  EXPECT_EQ(snapshot.motion_attention_membership.front()
+                .acknowledgement.condition_id,
+            scope.condition_id);
+  EXPECT_EQ(owner->Metrics().motion_attention, 1U);
+  auto decision = owner->EvaluateMotionAttention({"resource.arm.b"});
+  EXPECT_TRUE(decision.blocked);
+  ASSERT_EQ(decision.matching_alarms.size(), 1U);
+  EXPECT_EQ(decision.matching_alarms.front().condition_id, scope.condition_id);
+
+  // An acknowledgement attempt changes nothing; only the cause clears it.
+  const auto attempted =
+      owner->Acknowledge(scope.condition_id, scope.activation_id,
+                         scope.record_revision, Caller(), std::nullopt, true);
+  EXPECT_EQ(attempted.status, "already_acknowledged");
+  EXPECT_FALSE(attempted.changed);
+  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+
+  // An acknowledgement-required alarm keeps the ISA-18.2 rule beside it:
+  // acknowledging it releases its own gate while the condition still gates.
+  const auto provider =
+      owner->Submit(CellGlobalUpdate(1U, true)).records.front();
+  EXPECT_TRUE(provider.acknowledgement_required);
+  EXPECT_EQ(owner->Snapshot().motion_attention_count, 2U);
+  static_cast<void>(owner->Acknowledge(provider.condition_id,
+                                       provider.activation_id,
+                                       provider.record_revision, Caller(),
+                                       std::nullopt, true));
+  decision = owner->EvaluateMotionAttention({"resource.arm.b"});
+  ASSERT_EQ(decision.matching_alarms.size(), 1U);
+  EXPECT_EQ(decision.matching_alarms.front().condition_id, scope.condition_id);
+
+  // Return to normal ends the gate at once and leaves the live list without
+  // a returned-unacknowledged state.
+  const auto returned = owner->Submit(scope_update(2U, false));
+  EXPECT_EQ(returned.status, "returned");
+  EXPECT_EQ(returned.records.front().lifecycle_state,
+            AlarmLifecycleState::kReturnedAcknowledged);
+  EXPECT_FALSE(GatesMotion(returned.records.front()));
+  snapshot = owner->Snapshot();
+  EXPECT_EQ(snapshot.motion_attention_count, 0U);
+  EXPECT_EQ(snapshot.live_count, 1U);
+  EXPECT_EQ(snapshot.alarms.front().condition_id, provider.condition_id);
+  EXPECT_FALSE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+  ASSERT_EQ(owner->TerminalRecords().size(), 1U);
+  EXPECT_EQ(owner->TerminalRecords().front().condition_id, scope.condition_id);
+
+  const auto recurred = owner->Submit(scope_update(3U, true));
+  EXPECT_EQ(recurred.status, "recurred");
+  EXPECT_EQ(recurred.records.front().lifecycle_state,
+            AlarmLifecycleState::kActiveAcknowledged);
+  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.a"}).blocked);
+}
+
+TEST_F(AlarmOwnerTest,
        ResourceScopeFollowsTheActiveConfigurationAndRetainsReplacedAlarms) {
   auto owner = std::make_unique<AlarmLifecycleOwner>(
       OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),

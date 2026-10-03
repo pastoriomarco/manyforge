@@ -8,6 +8,8 @@
 
 namespace manyforge::roboplan_backend {
 
+struct RoboPlanWorkerModelDTO;
+
 struct RoboPlanCandidateProjectionDTO final {
   core::ProjectionLeaseBindingDTO projection_binding;
   core::CollisionWorldSnapshotPtr world;
@@ -43,6 +45,13 @@ class IRoboPlanCandidateClient {
       const RoboPlanCandidateProjectionDTO&) {
     return core::Result<void>::Ok();
   }
+
+  /// Replace the cell planning model a retained-projection worker is built
+  /// from. The worker is retired and the projection selection cleared, so no
+  /// later request can plan before its exact projection is reselected against
+  /// the replacement model. Fixed-model clients have no replaceable model.
+  [[nodiscard]] virtual core::Result<void> replace_retained_model(
+      const RoboPlanWorkerModelDTO& model);
 
   /// Non-blocking cancellation of only the currently active request.
   virtual void request_cancel() noexcept = 0;
@@ -88,6 +97,13 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   [[nodiscard]] core::Result<void> RebindProjection(
       const core::ProjectionLeaseBindingDTO& expected_predecessor,
       core::ProjectionLeaseBindingDTO candidate);
+
+  /// Replace the cell planning model of this unchanged planner under the
+  /// Manager's Apply fence, when a retained controller's candidate product
+  /// carries another cell planning model. An in-flight plan/IK query finishes
+  /// on its predecessor model before the replacement becomes visible.
+  [[nodiscard]] core::Result<void> ReplaceRetainedModel(
+      const RoboPlanWorkerModelDTO& model);
 
   [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding() const noexcept {
     return candidate_binding_;

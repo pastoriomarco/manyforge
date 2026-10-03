@@ -7234,6 +7234,10 @@ function parseOperatorAlarmRecord(
       record.occurrence_count,
       `${path}.occurrence_count`,
     ),
+    acknowledgementRequired: booleanAt(
+      record.acknowledgement_required,
+      `${path}.acknowledgement_required`,
+    ),
     requiresMotionAttention: booleanAt(
       record.requires_motion_attention,
       `${path}.requires_motion_attention`,

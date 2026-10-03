@@ -8,7 +8,6 @@ import type {
   HeadlessStateSource,
 } from '../hooks/useHeadlessState';
 import type {
-  AlarmLifecycleState,
   AlarmPriority,
   HistorianStoredEvent,
   HistorianDetail,
@@ -46,12 +45,14 @@ export interface ClientOperationalError {
 }
 
 
-function lifecycleLabel(state: AlarmLifecycleState): string {
-  switch (state) {
+function lifecycleLabel(alarm: OperatorAlarmRecord): string {
+  switch (alarm.lifecycleState) {
     case 'active_unacknowledged':
       return 'ACTIVE — ACKNOWLEDGEMENT REQUIRED';
     case 'active_acknowledged':
-      return 'ACTIVE — ACKNOWLEDGED';
+      return alarm.acknowledgementRequired
+        ? 'ACTIVE — ACKNOWLEDGED'
+        : 'ACTIVE — NO ACKNOWLEDGEMENT REQUIRED';
     case 'returned_unacknowledged':
       return 'RESOLVED — ACKNOWLEDGEMENT REQUIRED';
     case 'returned_acknowledged':
@@ -83,7 +84,7 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
     activationId: alarm.activationId,
     recordRevision: alarm.recordRevision,
     definitionId: alarm.definitionId,
-    lifecycleLabel: lifecycleLabel(alarm.lifecycleState),
+    lifecycleLabel: lifecycleLabel(alarm),
     priorityLabel: `${alarm.priority.toUpperCase()} PRIORITY`,
     severity: alarmSeverity(alarm.priority),
     title: alarm.title,
@@ -623,10 +624,10 @@ export function HeadlessRuntimeSurfacesView({
           <header className="runtime-observability-section-header">
             <div>
               <strong>Active conditions</strong>
-              <small>Standing owner-issued conditions already acknowledged by the operator.</small>
+              <small>Standing owner-issued conditions that need no further acknowledgement.</small>
             </div>
           </header>
-          {standing.length === 0 && <p className="muted">No acknowledged alarm remains active.</p>}
+          {standing.length === 0 && <p className="muted">No standing alarm remains active.</p>}
           {standing.map((alarm) => (
             <OperatorAlarmPanel
               key={alarm.activationId}

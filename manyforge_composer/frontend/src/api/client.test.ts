@@ -1068,6 +1068,7 @@ describe('headless intent client', () => {
       operatorResponse: 'Inspect the source.',
       occurrenceCount: 1,
       activatedAtNs: 100,
+      acknowledgementRequired: true,
       requiresMotionAttention: false,
       subject: { subjectKind: 'cell', subjectId: 'cell-1', resourceIds: [] },
       details: {},

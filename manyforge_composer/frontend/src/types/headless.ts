@@ -63,6 +63,7 @@ export interface OperatorAlarmRecord extends AlarmMembership {
   consequence: string;
   operatorResponse: string;
   occurrenceCount: number;
+  acknowledgementRequired: boolean;
   requiresMotionAttention: boolean;
   subject: AlarmSubject;
   details: Record<string, unknown>;

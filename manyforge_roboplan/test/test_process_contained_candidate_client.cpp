@@ -16,6 +16,7 @@
 #include <optional>
 #include <roboplan/core/scene.hpp>
 #include <roboplan_example_models/resources.hpp>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -719,6 +720,98 @@ TEST(ProcessContainedCandidateClientTest,
             std::string::npos);
   EXPECT_NE(planned.error().message.find("manyforge_scene_"),
             std::string::npos);
+}
+
+// A retained planner keeps its worker client across an Apply whose candidate
+// carries another whole-cell planning model. The replaced model, not the
+// worker's first one, must define what the next plan collides with.
+TEST(ProcessContainedCandidateClientTest,
+     ReplacedRetainedModelDefinesTheNextWorkerCollisionWorld) {
+  auto fixture = make_fixture();
+  const auto goal_tool =
+      fixture.reference_scene->forwardKinematics(fixture.goal, "tool0");
+  const auto model_root =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-replaced-model-" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove_all(model_root, ignored);
+  std::filesystem::create_directories(model_root);
+  auto urdf = roboplan::loadTextFile(fixture.model.urdf_path);
+  const auto robot_end = urdf.rfind("</robot>");
+  ASSERT_NE(robot_end, std::string::npos);
+  std::ostringstream obstacle;
+  obstacle << "  <link name=\"replacement_obstacle\">\n"
+              "    <collision><geometry><sphere radius=\"0.08\"/></geometry>"
+              "</collision>\n  </link>\n"
+              "  <joint name=\"replacement_obstacle_joint\" type=\"fixed\">\n"
+              "    <parent link=\"world\"/>\n"
+              "    <child link=\"replacement_obstacle\"/>\n"
+              "    <origin rpy=\"0 0 0\" xyz=\""
+           << goal_tool(0, 3) << ' ' << goal_tool(1, 3) << ' '
+           << goal_tool(2, 3) << "\"/>\n  </joint>\n";
+  urdf.insert(robot_end, obstacle.str());
+  auto replacement = fixture.model;
+  replacement.urdf_path = model_root / "replacement.urdf";
+  {
+    std::ofstream output(replacement.urdf_path);
+    output << urdf;
+  }
+  const auto replacement_scene = make_roboplan_scene(RoboPlanSceneInput{
+      "replacement-reference", urdf,
+      roboplan::loadTextFile(replacement.srdf_path), replacement.package_paths,
+      replacement.joint_limits});
+  ASSERT_FALSE(replacement_scene->hasCollisions(fixture.start));
+  ASSERT_TRUE(replacement_scene->hasCollisions(fixture.goal));
+
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+  ASSERT_TRUE(client.select_retained_projection(projection()).ok());
+  const auto first = client.compute(request(fixture));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+
+  const auto replaced = client.replace_retained_model(replacement);
+  ASSERT_TRUE(replaced.ok()) << replaced.error().message;
+  const auto unselected = client.compute(request(fixture));
+  ASSERT_FALSE(unselected.ok());
+  EXPECT_EQ(unselected.error().details.at("reason"),
+            "native_planner_projection_not_selected");
+  ASSERT_TRUE(client.select_retained_projection(projection()).ok());
+  const auto blocked = client.compute(request(fixture));
+  EXPECT_FALSE(blocked.ok());
+
+  ASSERT_TRUE(client.replace_retained_model(fixture.model).ok());
+  ASSERT_TRUE(client.select_retained_projection(projection()).ok());
+  const auto restored = client.compute(request(fixture));
+  ASSERT_TRUE(restored.ok()) << restored.error().message;
+  EXPECT_EQ(restored.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+
+  auto projected = replacement;
+  projected.geometries.push_back(RoboPlanWorkerGeometryDTO{
+      "projected", "base", BoxShapeDTO{{0.1, 0.1, 0.1}}, identity_pose(),
+      std::nullopt});
+  const auto rejected = client.replace_retained_model(projected);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "native_planner_model_replacement_invalid");
+  std::filesystem::remove_all(model_root, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     FixedModelClientCannotReplaceItsModel) {
+  auto fixture = make_fixture();
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  const auto rejected = client.replace_retained_model(fixture.model);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "native_planner_model_replacement_unavailable");
 }
 
 TEST(ProcessContainedCandidateClientTest,

@@ -312,6 +312,20 @@ RoboPlanJointLimitsFromRetainedModel(
   return result;
 }
 
+// The RoboPlan worker reloads this base model by path whenever it restarts;
+// the stage that owns those files must outlive every worker generation.
+[[nodiscard]] RoboPlanWorkerModelDTO NativeWorkerBaseModel(
+    const RetainedPlanningModelStage &stage,
+    std::vector<RoboPlanJointLimitInput> joint_limits) {
+  return RoboPlanWorkerModelDTO{"manyforge_i6_native_execution_worker",
+                                stage.loader_urdf_path(),
+                                stage.srdf_path(),
+                                stage.package_paths(),
+                                std::move(joint_limits),
+                                {},
+                                {}};
+}
+
 [[nodiscard]] std::filesystem::path
 ExistingDirectory(std::filesystem::path path, std::string_view label) {
   Require(!path.empty(), std::string(label) + " cannot be empty");
@@ -6321,10 +6335,15 @@ struct Composition final {
   CanonicalValue direct_control_motion_descriptor;
   CanonicalValue direct_control_gripper_descriptor;
   std::optional<core::Duration> operator_confirmation_validity_ns;
-  // The staged planning-model files that `runtime` was built from. Its
-  // RoboPlan worker reloads them by path whenever it restarts, so a retained
-  // runtime shares this stage with every composition that retains it.
+  // The staged cell planning-model files of this composition's product. The
+  // runtime's RoboPlan worker reloads them by path whenever it restarts, so a
+  // retained runtime shares this stage with every composition that retains it
+  // while the cell planning model is unchanged.
   std::shared_ptr<const RetainedPlanningModelStage> stage;
+  // Present only for a retained motion runtime whose candidate product
+  // carries another cell planning model: the worker base model staged in
+  // `stage`, installed into the retained planner under the exact Apply fence.
+  std::optional<RoboPlanWorkerModelDTO> candidate_planner_model;
   std::shared_ptr<RetainedNativeRuntime> runtime;
   // Managed native cells keep this owner independently of any motion engine.
   // A component view may instead hold an independently managed gripper.
@@ -6822,6 +6841,8 @@ struct RetainedNativeComponentSnapshot final {
   std::shared_ptr<RetainedNativeRuntime> runtime;
   std::shared_ptr<RetainedNativeGripperRuntime> gripper_runtime;
   std::shared_ptr<const RetainedPlanningModelStage> stage;
+  // The cell planning-model product `stage` was staged from.
+  core::RetainedProductDTO planning_model_product;
   std::optional<core::JointLimitsDTO> joint_limits;
   CanonicalValue motion_descriptor;
   CanonicalValue gripper_descriptor;
@@ -7487,6 +7508,29 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
               .product_id});
   Require(retained_model.has_value() && input.collision_shared_model != nullptr,
           "retained native view has no verified candidate model");
+  // Runtime identity excludes the shared cell planning model (other
+  // components, passive models, root poses). The retained worker plans in
+  // that whole-cell model, so a changed product stages the candidate model
+  // here and replaces the worker's model under the Apply fence.
+  auto planning_stage = predecessor->second.stage;
+  std::optional<RoboPlanWorkerModelDTO> candidate_planner_model;
+  if (predecessor->second.planning_model_product !=
+      input.bundle->value().compiled_products.planning_collision_model) {
+    auto candidate_stage = std::make_shared<const RetainedPlanningModelStage>(
+        RetainedPlanningModelStage::create_verified(*retained_model,
+                                                    input.execution_run_root));
+    const auto candidate_srdf = retained_model->srdf_bytes();
+    const auto candidate_documents =
+        deployment::parse_model_documents_for_projection(
+            retained_model->urdf_bytes(),
+            candidate_srdf.empty()
+                ? std::optional<std::string_view>{}
+                : std::optional<std::string_view>{candidate_srdf});
+    candidate_planner_model = NativeWorkerBaseModel(
+        *candidate_stage,
+        RoboPlanJointLimitsFromRetainedModel(candidate_documents.urdf));
+    planning_stage = std::move(candidate_stage);
+  }
   std::vector<RetainedSceneFrameStateSourceInput> state_sources;
   const auto add_state_source = [&](const auto &channel) {
     if (channel == nullptr)
@@ -7558,10 +7602,11 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       std::move(physical.gripper_program), std::move(physical.motion.value()),
       std::move(physical.gripper), predecessor->second.joint_limits,
       predecessor->second.motion_descriptor,
-      predecessor->second.gripper_descriptor, predecessor->second.stage,
+      predecessor->second.gripper_descriptor, std::move(planning_stage),
       predecessor->second.runtime, std::move(input.projection_revision),
       input.publication_generation, std::move(*physical.status_motion_role),
       physical.status_gripper_role);
+  composition->candidate_planner_model = std::move(candidate_planner_model);
   composition->operator_confirmation_validity_ns =
       predecessor->second.operator_confirmation_validity_ns;
   composition->target_resolver = std::move(target_resolver);
@@ -8142,13 +8187,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       CandidateBinding(direct_control_motion_binding.value());
   auto candidate_client =
       std::make_unique<ProcessContainedRoboPlanCandidateClient>(
-          RoboPlanWorkerModelDTO{"manyforge_i6_native_execution_worker",
-                                 stage.loader_urdf_path(),
-                                 stage.srdf_path(),
-                                 stage.package_paths(),
-                                 roboplan_joint_limits,
-                                 {},
-                                 {}},
+          NativeWorkerBaseModel(stage, roboplan_joint_limits),
           candidate_binding,
           RoboPlanCandidateComputerConfig{
               .rng_seed = retained_runtime_configuration.planner_rng_seed},
@@ -9017,6 +9056,47 @@ void RefreshRetainedNativeCandidateCollision(
         view.candidate_validation_collision_engines;
     runtime.lookahead_collision_engines =
         view.candidate_lookahead_collision_engines;
+  }
+}
+
+// A retained planner keeps its worker client, but plans in the candidate's
+// whole-cell planning model. The candidate composition owns the stage whose
+// files the replacement worker loads.
+void ReplaceRetainedNativeCandidatePlanningModels(
+    Composition &candidate,
+    const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+        &request,
+    core::IResourceOperationAdmissionGate &admission_gate) {
+  std::map<core::ControllableComponentId, Composition *> selected;
+  selected.emplace(candidate.controllable_component_id, &candidate);
+  for (auto &component : candidate.participant_compositions) {
+    Require(component != nullptr &&
+                selected.emplace(component->controllable_component_id,
+                                 component.get()).second,
+            "retained native planning-model candidate repeats an owner");
+  }
+  for (const auto &component_id : RetainedNativeComponentIds(request)) {
+    const auto found = selected.find(component_id);
+    Require(found != selected.end(),
+            "retained native planning-model owner is absent");
+    auto &view = *found->second;
+    if (!view.candidate_planner_model.has_value())
+      continue;
+    Require(view.runtime != nullptr && view.runtime->planner != nullptr &&
+                view.stage != nullptr &&
+                view.candidate_planner_model->urdf_path ==
+                    view.stage->loader_urdf_path(),
+            "retained native planner has no staged candidate model");
+    Require(admission_gate.exact_fence_is_held(
+                request.configuration_fence_id,
+                request.configuration_fence_scope),
+            "retained native planner lost the exact parent Apply fence");
+    const auto replaced =
+        view.runtime->planner->ReplaceRetainedModel(*view.candidate_planner_model);
+    if (!replaced.ok())
+      Fail("retained native planner rejected the candidate planning model: " +
+           replaced.error().message);
+    view.candidate_planner_model.reset();
   }
 }
 #endif
@@ -12180,6 +12260,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 row.controllable_component_id,
                 RetainedNativeComponentSnapshot{
                     owner->runtime, owner->gripper_runtime, owner->stage,
+                    owner->bundle->value()
+                        .compiled_products.planning_collision_model,
                     owner->direct_control_joint_limits,
                     owner->direct_control_motion_descriptor,
                     owner->direct_control_gripper_descriptor,
@@ -12518,6 +12600,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     *prepared, *active_managed_composition, request,
                     admission_gate);
                 RefreshRetainedNativeCandidateCollision(
+                    *prepared, request, admission_gate);
+                ReplaceRetainedNativeCandidatePlanningModels(
                     *prepared, request, admission_gate);
                 if (prepared->runtime != nullptr) {
                   std::vector<std::shared_ptr<RetainedNativeRuntime>> peers;

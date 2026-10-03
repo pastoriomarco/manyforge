@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import json
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -629,7 +630,9 @@ def _write_mixed_variants(
     stack: ProcessStack, kinds: tuple[str, ...]
 ) -> dict[str, Path]:
     """Writes GROUPED variants: `single` keeps only lite6, `replace` changes
-    only ur5e's controller input so lite6 is retained by the component delta."""
+    only ur5e's controller input so lite6 is retained by the component delta,
+    and `move` changes only ur5e's root pose, which is shared cell planning
+    model rather than controller identity, so both robots are retained."""
     # Keep Composer out of native-only test collection. These helpers are
     # required only by owner-connected scenario tests.
     from manyforge_composer.backend.scenario_artifacts import (
@@ -653,6 +656,11 @@ def _write_mixed_variants(
             candidate["deployment_draft"]["components"] = [
                 row for row in components if row["component_id"] == "lite6_robot"
             ]
+        elif kind == "move":
+            ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
+            # Near the wall the UR5e start keeps about 9 cm of clearance, while
+            # its Program goal reaches about 6 cm through the wall.
+            ur5e["root_pose_in_cell"]["position_m"] = [-0.2, 0.68, 0.0]
         else:
             assert kind == "replace", kind
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
@@ -715,6 +723,58 @@ def test_retained_robot_plans_after_apply_retires_its_first_composition() -> Non
             )
             assert terminal["state"] == "succeeded", terminal
             _reset_cycle(client, program_run_id)
+
+
+def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
+    # Moving ur5e changes the whole-cell planning model but neither controller
+    # identity, so both runtimes and their RoboPlan workers are retained. The
+    # retained ur5e worker must plan in the moved cell, where the goal is in
+    # collision with the wall. A worker still planning in the first
+    # composition's cell would plan the motion and leave the collision for
+    # pre-dispatch validation to reject.
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        robots = ("lite6_robot", "ur5e_robot")
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            survivors = {robot: headless.cclc_component(robot) for robot in robots}
+        paths = _write_mixed_variants(stack, ("move",))
+        applied, source_document_digest = _load_scenario(
+            stack, "mixed_move", scenario_path=paths["move"]
+        )
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            for robot in robots:
+                retained = headless.cclc_component(robot)
+                assert (
+                    retained["provider_occurrences"]
+                    == survivors[robot]["provider_occurrences"]
+                ), robot
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=applied["scenario_id"],
+                source_document_digest=source_document_digest,
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _start_motion(client, started, request_id="ui6i.moved.motion-start")
+            terminal = _wait_run_state(
+                client,
+                program_run_id,
+                {"succeeded", "failed", "intervention_required", "stopped"},
+            )
+        assert terminal["state"] != "succeeded", terminal
+        ur5e_operations = {
+            event["operation_id"]
+            for event in _native_events(stack)
+            if event["record_kind"] == "operation_accepted"
+            and event["payload"]["intent"]["participants"][0]["target_role_id"]
+            == "ur5e_arm"
+        }
+        assert len(ur5e_operations) == 1, ur5e_operations
+        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        evidence = json.dumps(native.read(ur5e_operations.pop()), sort_keys=True)
+        assert "native_goal_state_collision" in evidence, evidence
+        assert "validation_collision" not in evidence, evidence
 
 
 def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:

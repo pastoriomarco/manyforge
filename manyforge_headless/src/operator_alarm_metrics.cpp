@@ -165,10 +165,8 @@ OperatorAlarmMetrics AlarmLifecycleOwner::Metrics() const {
     ++counts_by_state[std::string(ToString(record.lifecycle_state))];
     ++counts_by_priority[record.priority];
     ++counts_by_class[record.alarm_class];
-    if (RequiresAttention(record.lifecycle_state)) {
-      ++attention;
-      motion_attention += record.requires_motion_attention ? 1U : 0U;
-    }
+    attention += RequiresAttention(record.lifecycle_state) ? 1U : 0U;
+    motion_attention += GatesMotion(record) ? 1U : 0U;
     if (record.lifecycle_state == AlarmLifecycleState::kActiveAcknowledged) {
       ++active_standing;
       if (record.acknowledged_at_ns.has_value()) {

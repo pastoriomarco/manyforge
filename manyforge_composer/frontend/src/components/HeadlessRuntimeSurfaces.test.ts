@@ -72,6 +72,7 @@ describe('headless Composer presentation adapters', () => {
       consequence: 'Runtime facts are incomplete.',
       operatorResponse: 'Inspect the provider.',
       occurrenceCount: 2,
+      acknowledgementRequired: true,
       requiresMotionAttention: true,
       subject: { subjectKind: 'cell', subjectId: 'cell-1', resourceIds: [] },
       details: {},
@@ -82,6 +83,35 @@ describe('headless Composer presentation adapters', () => {
     expect(view.lifecycleLabel).toBe('RESOLVED — ACKNOWLEDGEMENT REQUIRED');
     expect(view.severity).toBe('critical');
     expect(view.details.occurrence_count).toBe(2);
+  });
+
+  it('labels an active condition interlock as needing no acknowledgement', () => {
+    const alarm: OperatorAlarmRecord = {
+      conditionId: 'condition-scope',
+      activationId: 'activation-scope',
+      recordRevision: 1,
+      activatedAtNs: 100,
+      definitionId: 'manyforge.runtime.alarm_scope_unavailable',
+      lifecycleState: 'active_acknowledged',
+      active: true,
+      acknowledged: true,
+      priority: 'high',
+      alarmClass: 'runtime_health',
+      title: 'Fault alarm scope unavailable',
+      message: 'A current fault could not be raised as its own alarm.',
+      consequence: 'Motion is blocked while it is active.',
+      operatorResponse: 'Resolve the refused faults.',
+      occurrenceCount: 1,
+      acknowledgementRequired: false,
+      requiresMotionAttention: true,
+      subject: { subjectKind: 'cell', subjectId: 'cell-1', resourceIds: [] },
+      details: {},
+    };
+
+    expect(operatorAlarmView(alarm).lifecycleLabel)
+      .toBe('ACTIVE — NO ACKNOWLEDGEMENT REQUIRED');
+    expect(operatorAlarmView({ ...alarm, acknowledgementRequired: true }).lifecycleLabel)
+      .toBe('ACTIVE — ACKNOWLEDGED');
   });
 
   it('selects attention panels by newest activation rather than server priority', () => {
@@ -101,6 +131,7 @@ describe('headless Composer presentation adapters', () => {
       consequence: 'Runtime facts are incomplete.',
       operatorResponse: 'Inspect the provider.',
       occurrenceCount: 1,
+      acknowledgementRequired: true,
       requiresMotionAttention: true,
       subject: { subjectKind: 'cell', subjectId: 'cell-1', resourceIds: [] },
       details: {},
@@ -164,6 +195,7 @@ describe('headless Composer presentation adapters', () => {
       consequence: 'New planning is unavailable.',
       operatorResponse: 'Inspect the planner provider.',
       occurrenceCount: 1,
+      acknowledgementRequired: true,
       requiresMotionAttention: true,
       subject: { subjectKind: 'component', subjectId: 'planner-1', resourceIds: [] },
       details: {},
@@ -179,6 +211,7 @@ describe('headless Composer presentation adapters', () => {
       acknowledged: true,
       priority: 'medium',
       title: 'Reduced capability',
+      acknowledgementRequired: true,
       requiresMotionAttention: false,
     };
     const snapshot: ComposerHeadlessState = {

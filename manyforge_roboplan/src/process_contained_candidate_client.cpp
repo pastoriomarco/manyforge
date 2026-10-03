@@ -746,9 +746,16 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
         current && current->matches(projection)) {
       return core::Result<void>::Ok();
     }
+    RoboPlanWorkerModelDTO source;
+    std::uint64_t source_generation = 0U;
+    {
+      std::lock_guard lock(request_mutex);
+      source = base_model;
+      source_generation = base_model_generation;
+    }
     RoboPlanWorkerModelDTO projected;
     try {
-      projected = project_worker_model(base_model, config.scene_asset_root,
+      projected = project_worker_model(source, config.scene_asset_root,
                                        config.retained_package_root_fd,
                                        projection);
     } catch (const std::exception &exception) {
@@ -765,6 +772,12 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                 "RoboPlan worker projection changed during an active request",
                 "native_planner_projection_selection_busy"));
     }
+    if (source_generation != base_model_generation) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker model changed during projection selection",
+                "native_planner_projection_selection_busy"));
+    }
     if (const auto current = selection.load(std::memory_order_acquire);
         current && current->matches(projection)) {
       return core::Result<void>::Ok();
@@ -776,6 +789,42 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             projection.projection_binding.projection_revision,
             projection.world->revision, projection.policy->revision}),
         std::memory_order_release);
+    return core::Result<void>::Ok();
+  }
+
+  [[nodiscard]] core::Result<void>
+  replace_model(const RoboPlanWorkerModelDTO &replacement) {
+    if (!config.require_retained_projection) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "Fixed RoboPlan worker cannot replace its planning model",
+                "native_planner_model_replacement_unavailable"));
+    }
+    if (replacement.native_scene_name.empty() ||
+        !replacement.urdf_path.is_absolute() ||
+        !replacement.srdf_path.is_absolute() ||
+        replacement.package_paths.empty() ||
+        !replacement.geometries.empty() ||
+        !replacement.allowed_collision_pairs.empty()) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan model replacement is not one base model",
+                "native_planner_model_replacement_invalid"));
+    }
+    std::lock_guard lock(request_mutex);
+    if (active_request.load(std::memory_order_acquire)) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker model changed during an active request",
+                "native_planner_model_replacement_busy"));
+    }
+    // The selected projection was resolved against the previous model. Clear
+    // it with the worker so the next request reprojects onto this model.
+    shutdown_worker();
+    base_model = replacement;
+    ++base_model_generation;
+    model = replacement;
+    selection.store(nullptr, std::memory_order_release);
     return core::Result<void>::Ok();
   }
 
@@ -1049,7 +1098,9 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
   }
 
+  // base_model and its generation are guarded by request_mutex.
   RoboPlanWorkerModelDTO base_model;
+  std::uint64_t base_model_generation{0U};
   RoboPlanWorkerModelDTO model;
   RoboPlanCandidateBindingDTO binding;
   RoboPlanCandidateComputerConfig candidate_config;
@@ -1115,6 +1166,12 @@ core::Result<void>
 ProcessContainedRoboPlanCandidateClient::select_retained_projection(
     const RoboPlanCandidateProjectionDTO &projection) {
   return impl_->select_projection(projection);
+}
+
+core::Result<void>
+ProcessContainedRoboPlanCandidateClient::replace_retained_model(
+    const RoboPlanWorkerModelDTO &model) {
+  return impl_->replace_model(model);
 }
 
 void ProcessContainedRoboPlanCandidateClient::request_cancel() noexcept {

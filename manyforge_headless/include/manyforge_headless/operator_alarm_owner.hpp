@@ -136,6 +136,7 @@ struct OperatorAlarmRecord final {
   std::string message;
   std::string consequence;
   std::string operator_response;
+  bool acknowledgement_required;
   bool requires_motion_attention;
   AlarmLifecycleState lifecycle_state;
   std::uint64_t activation_count;
@@ -162,6 +163,11 @@ struct OperatorAlarmRecord final {
   std::vector<std::string> evidence_refs;
   manyforge::content_identity::CanonicalValue correlations;
 };
+
+/// Whether `record` is a motion-attention member: a motion-attention
+/// definition that requires acknowledgement gates while unacknowledged; one
+/// that does not gates exactly while active.
+[[nodiscard]] bool GatesMotion(const OperatorAlarmRecord &record) noexcept;
 
 struct AlarmLifecycleFact final {
   std::string event_type;

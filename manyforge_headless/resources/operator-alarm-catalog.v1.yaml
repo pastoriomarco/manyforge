@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.2.0
-descriptor_digest: sha256:c8c0bfebd53655ae7b0acbd30c6ad55df50c63745cd5f4868892e49339b808b6
+catalog_version: 2.3.0
+descriptor_digest: sha256:2b8fe7064ba33f340ed83a39eb498a79f17d1bd79967fe0caadd4fdb8b1429bd
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -192,7 +192,7 @@ definitions:
     max_evidence_refs: 32
 
   - definition_id: manyforge.runtime.alarm_scope_unavailable
-    version: 1
+    version: 2
     title: Fault alarm scope unavailable
     message_template: "A current fault in {subject_id} could not be raised as its own alarm"
     alarm_class: runtime_health
@@ -207,7 +207,8 @@ definitions:
     operator_response: >-
       Review the refused faults named in the alarm details and History, then
       apply a configuration that contains their resources or recover or reset
-      the faults; the alarm returns to normal when no refused fault remains.
+      the faults. No acknowledgement is required: the alarm blocks motion
+      exactly while active and returns to normal when no refused fault remains.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.headless.alarm_scope_refusal_condition
     clear_authority: manyforge.headless.alarm_scope_refusal_condition
@@ -215,7 +216,7 @@ definitions:
     runtime_modes:
       - program
       - direct_control
-    acknowledgement_required: true
+    acknowledgement_required: false
     acknowledgement_reason_required: false
     requires_motion_attention: true
     max_evidence_refs: 16

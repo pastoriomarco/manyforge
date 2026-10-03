@@ -85,6 +85,8 @@ class ProcessContainedRoboPlanCandidateClient final : public IRoboPlanCandidateC
   [[nodiscard]] bool requires_retained_projection() const noexcept override;
   [[nodiscard]] core::Result<void> select_retained_projection(
       const RoboPlanCandidateProjectionDTO& projection) override;
+  [[nodiscard]] core::Result<void> replace_retained_model(
+      const RoboPlanWorkerModelDTO& model) override;
   void request_cancel() noexcept override;
 
  private:

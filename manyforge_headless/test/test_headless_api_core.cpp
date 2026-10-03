@@ -3020,11 +3020,10 @@ TEST(HeadlessApiCore,
                                        "operation.kept", "operation.startup"};
   EXPECT_EQ(active_subjects(), admitted);
   {
-    // No refusal remains retained: the alarm-scope condition returns.
+    // No refusal remains retained: the alarm-scope condition returns and,
+    // needing no acknowledgement, leaves the live list at once.
     const auto snapshot = core.AlarmSnapshot();
-    ASSERT_NE(ScopeAlarm(snapshot), nullptr);
-    EXPECT_EQ(Text(*ScopeAlarm(snapshot), "lifecycle_state"),
-              "returned_unacknowledged");
+    EXPECT_EQ(ScopeAlarm(snapshot), nullptr);
     EXPECT_TRUE(RefusedSubjects(snapshot).empty());
   }
 
@@ -3060,7 +3059,7 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Unsigned(*ScopeAlarm(snapshot), "activation_count"), 3U);
   EXPECT_EQ(Unsigned(*ScopeAlarm(snapshot), "occurrence_count"), 2U);
   EXPECT_EQ(Text(*ScopeAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
+            "active_acknowledged");
   EXPECT_TRUE(motion_reconciled());
 
   const auto totals = Member(core.AlarmMetrics(), "totals");
@@ -3116,7 +3115,17 @@ TEST(HeadlessApiCore,
     ASSERT_EQ(Array(refused, "alarms").size(), 1U);
     const auto &scope = OnlyAlarm(refused);
     EXPECT_EQ(Text(scope, "definition_id"), kAlarmScopeDefinition);
-    EXPECT_EQ(Text(scope, "lifecycle_state"), "active_unacknowledged");
+    // A condition interlock: no acknowledgement is owed, yet it is the one
+    // cell-global motion-attention member while active.
+    EXPECT_EQ(Text(scope, "lifecycle_state"), "active_acknowledged");
+    EXPECT_FALSE(
+        std::get<bool>(Member(scope, "acknowledgement_required").storage()));
+    EXPECT_EQ(Unsigned(refused, "unacknowledged_count"), 0U);
+    EXPECT_EQ(Unsigned(refused, "motion_attention_count"), 1U);
+    const auto &gating = Array(refused, "motion_attention_membership");
+    ASSERT_EQ(gating.size(), 1U);
+    EXPECT_EQ(Text(gating.front(), "condition_id"),
+              Text(scope, "condition_id"));
     EXPECT_EQ(Text(Member(scope, "subject"), "subject_kind"), "cell");
     EXPECT_TRUE(Array(Member(scope, "subject"), "resource_ids").empty());
     EXPECT_EQ(Unsigned(scope, "activation_count"), 1U);
@@ -3135,10 +3144,11 @@ TEST(HeadlessApiCore,
 
   // Manager publishes the configuration; the next observation of the
   // projection reconsiders the still-current fault once and admits it, and
-  // the alarm-scope condition returns to normal.
+  // the alarm-scope condition returns to normal, leaving the live list and
+  // the motion gate without an acknowledgement.
   PublishActiveConfiguration(directory, *configurations.single, 1U);
   const auto admitted = core.AlarmSnapshot();
-  ASSERT_EQ(Array(admitted, "alarms").size(), 2U);
+  ASSERT_EQ(Array(admitted, "alarms").size(), 1U);
   const CanonicalValue *fault = nullptr;
   for (const auto &alarm : Array(admitted, "alarms")) {
     if (Text(alarm, "definition_id") == "manyforge.motion.execution_fault") {
@@ -3148,14 +3158,14 @@ TEST(HeadlessApiCore,
   ASSERT_NE(fault, nullptr);
   EXPECT_EQ(Text(*fault, "lifecycle_state"), "active_unacknowledged");
   EXPECT_EQ(Text(Member(*fault, "subject"), "subject_id"), "operation.early");
-  ASSERT_NE(ScopeAlarm(admitted), nullptr);
-  EXPECT_EQ(Text(*ScopeAlarm(admitted), "lifecycle_state"),
-            "returned_unacknowledged");
-  EXPECT_EQ(Unsigned(Member(*ScopeAlarm(admitted), "details"),
-                     "refused_condition_count"),
-            0U);
+  EXPECT_EQ(ScopeAlarm(admitted), nullptr);
+  EXPECT_EQ(Unsigned(admitted, "motion_attention_count"), 1U);
+  const auto &gating = Array(admitted, "motion_attention_membership");
+  ASSERT_EQ(gating.size(), 1U);
+  EXPECT_EQ(Text(gating.front(), "condition_id"),
+            Text(*fault, "condition_id"));
   static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 1U));
-  EXPECT_EQ(Array(core.AlarmSnapshot(), "alarms").size(), 2U);
+  EXPECT_EQ(Array(core.AlarmSnapshot(), "alarms").size(), 1U);
 
   // Its normal terminal state returns it like any admitted fault.
   const auto completed = OperationJournalPayload(

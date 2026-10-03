@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -86,15 +87,16 @@ std::string Redigest(std::string source) {
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.2.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.3.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "c8c0bfebd53655ae7b0acbd30c6ad55df50c63745cd5f4868892e49339b808b6");
+            "2b8fe7064ba33f340ed83a39eb498a79f17d1bd79967fe0caadd4fdb8b1429bd");
   ASSERT_EQ(catalog.definitions().size(), 8U);
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
   EXPECT_TRUE(collision->requires_motion_attention);
+  EXPECT_TRUE(collision->acknowledgement_required);
   EXPECT_EQ(collision->max_evidence_refs, 32U);
   const auto *scope = catalog.Find("manyforge.runtime.alarm_scope_unavailable");
   ASSERT_NE(scope, nullptr);
@@ -102,6 +104,9 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(scope->adapter_id,
             "manyforge.alarm_adapter.runtime_health_condition");
   EXPECT_TRUE(scope->requires_motion_attention);
+  EXPECT_FALSE(scope->acknowledgement_required);
+  EXPECT_FALSE(scope->acknowledgement_reason_required);
+  EXPECT_EQ(scope->version, 2U);
   EXPECT_EQ(catalog.Find("manyforge.unknown"), nullptr);
 }
 
@@ -163,6 +168,39 @@ TEST(OperatorAlarmCatalog,
   invalid_mode.replace(mode, std::string("      - program\n").size(),
                        "      - Invalid\n");
   EXPECT_THROW(OperatorAlarmCatalog::Decode(Redigest(invalid_mode)),
+               OperatorAlarmCatalogError);
+}
+
+TEST(OperatorAlarmCatalog, AcknowledgementPolicyIsPerDefinition) {
+  const auto source = ReadFile(PackagedCatalog());
+  constexpr std::string_view kRequired = "    acknowledgement_required: true\n";
+  constexpr std::string_view kNotRequired =
+      "    acknowledgement_required: false\n";
+
+  // The first definition may drop acknowledgement like the alarm-scope one.
+  auto no_ack = source;
+  const auto first = no_ack.find(kRequired);
+  ASSERT_NE(first, std::string::npos);
+  no_ack.replace(first, kRequired.size(), kNotRequired);
+  const auto decoded = OperatorAlarmCatalog::Decode(Redigest(no_ack));
+  EXPECT_FALSE(
+      decoded.Find("manyforge.motion.runtime_collision")->acknowledgement_required);
+
+  // A required acknowledgement reason needs a required acknowledgement.
+  auto reason = no_ack;
+  constexpr std::string_view kNoReason =
+      "    acknowledgement_reason_required: false\n";
+  const auto reason_field = reason.find(kNoReason, first);
+  ASSERT_NE(reason_field, std::string::npos);
+  reason.replace(reason_field, kNoReason.size(),
+                 "    acknowledgement_reason_required: true\n");
+  EXPECT_THROW(OperatorAlarmCatalog::Decode(Redigest(reason)),
+               OperatorAlarmCatalogError);
+
+  auto not_boolean = source;
+  not_boolean.replace(first, kRequired.size(),
+                      "    acknowledgement_required: until_acknowledged\n");
+  EXPECT_THROW(OperatorAlarmCatalog::Decode(Redigest(not_boolean)),
                OperatorAlarmCatalogError);
 }
 

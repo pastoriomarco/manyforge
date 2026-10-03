@@ -922,8 +922,7 @@ AlarmLifecycleOwner::Snapshot(const std::optional<std::size_t> limit,
     active_acknowledged_count +=
         record.lifecycle_state == AlarmLifecycleState::kActiveAcknowledged ? 1U
                                                                            : 0U;
-    if (record.requires_motion_attention &&
-        RequiresAttention(record.lifecycle_state)) {
+    if (GatesMotion(record)) {
       motion_membership.push_back({
           AlarmAcknowledgementMember{condition_id, record.activation_id,
                                      record.record_revision},
@@ -1053,8 +1052,7 @@ AlarmAttentionDecision AlarmLifecycleOwner::EvaluateMotionAttention(
   }
   std::vector<AlarmAcknowledgementMember> matching;
   for (const auto &[condition_id, point] : points_) {
-    if (!point.record.has_value() || !point.record->requires_motion_attention ||
-        !RequiresAttention(point.record->lifecycle_state)) {
+    if (!point.record.has_value() || !GatesMotion(*point.record)) {
       continue;
     }
     const auto &subject = point.record->subject;

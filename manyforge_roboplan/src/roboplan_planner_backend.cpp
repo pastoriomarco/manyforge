@@ -353,6 +353,20 @@ core::Result<void> RoboPlanPlannerBackend::RebindProjection(
   return core::Result<void>::Ok();
 }
 
+core::Result<void> IRoboPlanCandidateClient::replace_retained_model(
+    const RoboPlanWorkerModelDTO &) {
+  return core::Result<void>::Err(error(
+      ErrorCode::kInvalidStateTransition,
+      "Fixed RoboPlan candidate client cannot replace its planning model",
+      "native_planner_model_replacement_unavailable"));
+}
+
+core::Result<void>
+RoboPlanPlannerBackend::ReplaceRetainedModel(const RoboPlanWorkerModelDTO &model) {
+  std::unique_lock lock(projection_mutex_);
+  return candidate_client_->replace_retained_model(model);
+}
+
 core::PlanResultDTO
 RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
   std::shared_lock projection_lock(projection_mutex_);

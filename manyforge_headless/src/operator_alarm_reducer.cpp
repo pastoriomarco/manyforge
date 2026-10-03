@@ -394,6 +394,13 @@ bool RequiresAttention(const AlarmLifecycleState state) noexcept {
          state == AlarmLifecycleState::kReturnedUnacknowledged;
 }
 
+bool GatesMotion(const OperatorAlarmRecord &record) noexcept {
+  return record.requires_motion_attention &&
+         (record.acknowledgement_required
+              ? RequiresAttention(record.lifecycle_state)
+              : IsActive(record.lifecycle_state));
+}
+
 bool operator<(const AlarmAcknowledgementMember &left,
                const AlarmAcknowledgementMember &right) noexcept {
   return std::tie(left.condition_id, left.activation_id, left.record_revision) <
@@ -517,8 +524,11 @@ AlarmTransitionResult ReduceAlarmConditionUpdate(
         RenderMessage(definition, update.subject),
         definition.consequence,
         definition.operator_response,
+        definition.acknowledgement_required,
         definition.requires_motion_attention,
-        AlarmLifecycleState::kActiveUnacknowledged,
+        definition.acknowledgement_required
+            ? AlarmLifecycleState::kActiveUnacknowledged
+            : AlarmLifecycleState::kActiveAcknowledged,
         point.activation_count + 1U,
         1U,
         point.record.has_value() ? point.record->record_revision + 1U : 1U,
@@ -646,6 +656,8 @@ CanonicalValue OperatorAlarmRecordValue(const OperatorAlarmRecord &record) {
       {"acknowledgement_attribution",
        OptionalCaller(record.acknowledgement_attribution)},
       {"acknowledgement_reason", OptionalString(record.acknowledgement_reason)},
+      {"acknowledgement_required",
+       CanonicalValue(record.acknowledgement_required)},
       {"activated_at_ns", Number(record.activated_at_ns, "activated_at_ns")},
       {"activated_at_wall", CanonicalValue(record.activated_at_wall)},
       {"activation_count",
