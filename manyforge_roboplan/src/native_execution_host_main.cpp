@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <future>
@@ -32,6 +33,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/time/host_boot_identity.hpp>
 #include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
@@ -93,6 +95,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -164,6 +167,11 @@ constexpr int kReconcilePeriodMilliseconds = 5;
 // existing noncritical lane, independently of browser requests.
 constexpr core::Duration kRecoveryObservationPeriodNs = 50'000'000;
 constexpr int kClientPacketDeadlineMilliseconds = 100;
+// Requests the ordinary socket handed to one deferred lane and that are not
+// yet answered: the one executing plus those queued behind it. Upstream
+// admits one preview per cell target; this host-side bound keeps a
+// misbehaving client from accumulating sockets behind long work.
+constexpr std::size_t kMaximumPendingDeferredCommands = 8U;
 constexpr int kManagerSceneDeadlineMilliseconds = 5000;
 constexpr std::size_t kPlanningSceneSynchronizationAttempts = 32U;
 constexpr auto kPlanningSceneSynchronizationRetryDelay =
@@ -324,6 +332,38 @@ RoboPlanJointLimitsFromRetainedModel(
                                 std::move(joint_limits),
                                 {},
                                 {}};
+}
+
+// One candidate RoboPlan scene and its exact state projector for the given
+// bindings, built from the staged candidate whole-cell planning model.
+struct CandidateRetainedModelScene final {
+  std::shared_ptr<roboplan::Scene> scene;
+  std::shared_ptr<std::mutex> scene_mutex;
+  std::shared_ptr<RetainedKinematicStateProjector> state_projector;
+};
+
+template <typename RetainedBundle, typename ModelMap, typename PlanningModel>
+[[nodiscard]] CandidateRetainedModelScene BuildCandidateRetainedModelScene(
+    std::string_view scene_name, const RetainedPlanningModelStage &stage,
+    const PlanningModel &planning_model, const RetainedBundle &bundle,
+    const ModelMap &model_map,
+    std::vector<core::RuntimeParticipantBinding> bindings) {
+  const auto srdf = planning_model.srdf_bytes();
+  const auto documents = deployment::parse_model_documents_for_projection(
+      planning_model.urdf_bytes(),
+      srdf.empty() ? std::optional<std::string_view>{}
+                   : std::optional<std::string_view>{srdf});
+  CandidateRetainedModelScene result;
+  result.scene = make_roboplan_scene(RoboPlanSceneInput{
+      std::string(scene_name), std::string(stage.loader_urdf_bytes()),
+      std::string(stage.srdf_bytes()), stage.package_paths(),
+      RoboPlanJointLimitsFromRetainedModel(documents.urdf)});
+  result.scene_mutex = std::make_shared<std::mutex>();
+  result.state_projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          result.scene, result.scene_mutex, bundle, model_map, planning_model,
+          std::move(bindings), 0));
+  return result;
 }
 
 [[nodiscard]] std::filesystem::path
@@ -2013,6 +2053,7 @@ enum class CommandKind {
   kReadProgramExecutionScope,
   kStartProgramSelection,
   kReleaseProgramSelection,
+  kCheckProgramNodeMotionAttention,
   kReleaseProgramRunStopFence,
   kFullStop,
   kMalformedStop,
@@ -2030,6 +2071,72 @@ enum class CommandLane {
   kStop,
   kObservation,
 };
+
+/// Commands whose addressed-Kernel entry takes its submission ordering. A
+/// motion-preview session (and pick/place planning built on one) retains that
+/// ordering for its whole planning transaction, so these commands run on the
+/// submission-ordered lane, FIFO in accept order, and never occupy the
+/// ordinary lane that serves Stop status, Reset, events, cell admission and
+/// operator-alarm attention.
+[[nodiscard]] bool IsSubmissionOrdered(const CommandKind kind) noexcept {
+  switch (kind) {
+  case CommandKind::kPreviewMotion:
+  case CommandKind::kPlanPick:
+  case CommandKind::kPlanPlace:
+  case CommandKind::kPreviewCapabilityCommand:
+  case CommandKind::kReadManualHandover:
+  case CommandKind::kSubmit:
+  case CommandKind::kSetRuntimeScaleControl:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Ordinary projections that first read the live Scene revision from Manager.
+/// That round trip waits on Manager (for example during an Apply), so it runs
+/// on the Scene-read lane and never occupies the ordinary lane.
+[[nodiscard]] bool ReadsManagerScene(const CommandKind kind) noexcept {
+  return kind == CommandKind::kIdentity || kind == CommandKind::kStatus ||
+         kind == CommandKind::kTargets || kind == CommandKind::kControlState;
+}
+
+/// In-memory Stop-progression reads of the stable Kernel. They are served
+/// beside Stop on the independent control socket, never on the ordinary one.
+[[nodiscard]] bool IsStopLaneRead(const CommandKind kind) noexcept {
+  return kind == CommandKind::kReadStop || kind == CommandKind::kGetStopFault;
+}
+
+/// Every Stop form preempts advisory planning before it is dispatched: a
+/// preview is effect-free and re-requestable, and containment never waits
+/// for one. An accepted Reset preempts it after acceptance (a refused Reset
+/// changed nothing a preview depends on).
+[[nodiscard]] bool PreemptsPlanning(const CommandKind kind) noexcept {
+  switch (kind) {
+  case CommandKind::kStop:
+  case CommandKind::kStopProgramRun:
+  case CommandKind::kStopProgramSelection:
+  case CommandKind::kFullStop:
+  case CommandKind::kMalformedStop:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// A component-lifecycle claim is a whole-cell configuration mutation: the
+/// Kernel serializes it with the submission lock a preview session retains
+/// for its whole planning time. Like Stop, it preempts advisory planning
+/// before it is dispatched instead of waiting behind it. Other claim kinds
+/// never take that lock.
+[[nodiscard]] bool PreemptsPlanning(
+    const component_manager::detail::KernelCellAdmissionRpcPacket
+        &packet) noexcept {
+  const auto *intent =
+      std::get_if<core::CellAdmissionClaimIntentDTO>(&packet.request);
+  return intent != nullptr &&
+         intent->claim_kind == core::CellAdmissionClaimKindDTO::kComponentLifecycle;
+}
 
 struct MalformedStopCommand final {
   core::RequestId request_id;
@@ -2086,6 +2193,7 @@ struct Command final {
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
   std::optional<core::ProgramExecutionSelectionRequestDTO> program_selection;
+  std::optional<core::ProgramNodeMotionAttentionCheckDTO> program_node_attention;
   std::uint64_t expected_selection_revision{};
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
@@ -2162,6 +2270,31 @@ struct Command final {
     if (start || release)
       decoded.expected_selection_revision =
           Counter(root, "expected_selection_revision", 0U);
+    return decoded;
+  }
+  if (command == "check_program_node_motion_attention") {
+    RequireExactObjectSize(root, 4U, "Program node motion-attention check");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Program node check requires internal owner attribution");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 6U, "Program node check request");
+    Require(Text(request, "schema_version") ==
+                "manyforge.program_node_motion_attention_check.v1",
+            "Program node check request schema is unsupported");
+    Command decoded{CommandKind::kCheckProgramNodeMotionAttention};
+    decoded.program_node_attention = core::ProgramNodeMotionAttentionCheckDTO{
+        DecodeRequestContext(Member(request, "request_context")),
+        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        core::CellAdmissionClaimGeneration(
+            Counter(request, "claim_generation", 1U)),
+        core::ProgramRunId(Text(request, "program_run_id")),
+        core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
+        attribution};
     return decoded;
   }
   if (command == "read_program_execution_scope") {
@@ -6340,10 +6473,17 @@ struct Composition final {
   // retained runtime shares this stage with every composition that retains it
   // while the cell planning model is unchanged.
   std::shared_ptr<const RetainedPlanningModelStage> stage;
-  // Present only for a retained motion runtime whose candidate product
-  // carries another cell planning model: the worker base model staged in
-  // `stage`, installed into the retained planner under the exact Apply fence.
+  // Present only for a retained component whose candidate product carries
+  // another cell planning model. Every model-dependent computation is
+  // prepared from `stage` before the fence and installed under it: a motion
+  // controller's worker base model and its complete kinematic generation
+  // (scene, state projector, kinematics, validator, collision projector); an
+  // independently owned model-backed gripper's state projector.
   std::optional<RoboPlanWorkerModelDTO> candidate_planner_model;
+  std::shared_ptr<const RetainedKinematicModelGeneration>
+      candidate_model_generation;
+  std::shared_ptr<RetainedKinematicStateProjector>
+      candidate_tool_state_projector;
   std::shared_ptr<RetainedNativeRuntime> runtime;
   // Managed native cells keep this owner independently of any motion engine.
   // A component view may instead hold an independently managed gripper.
@@ -6764,7 +6904,10 @@ void InstallDirectSceneFrameResolver(ManagedProjectionRegistry &projections,
 struct ExecutionCompositionAccess final {
   mutable std::shared_mutex mutex;
   Composition *current{};
-  core::ResourceAddressedExecutionKernel *addressed_kernel{};
+  // The stable cell Kernel. It is installed once and outlives every
+  // composition; the Stop lane and cell admission read it without the
+  // composition lock.
+  std::atomic<core::ResourceAddressedExecutionKernel *> addressed_kernel{};
 
   void replace_current(Composition *replacement) {
     // Caller holds mutex exclusively and keeps the predecessor alive. A new
@@ -6811,6 +6954,8 @@ struct ExecutionCompositionAccess final {
   }
 };
 
+class ExecutionCommandSurface;
+
 struct ManagedExecutionSurfaceControl final {
   std::filesystem::path run_root;
   ExecutionCompositionAccess *composition_access{};
@@ -6821,6 +6966,9 @@ struct ManagedExecutionSurfaceControl final {
   std::condition_variable state_changed;
   bool ready{};
   std::exception_ptr failure;
+  // The running surface, guarded by `state_mutex`; null before it is ready
+  // and once it has stopped.
+  ExecutionCommandSurface *surface{};
 
   ManagedExecutionSurfaceControl(
       std::filesystem::path selected_run_root,
@@ -6836,6 +6984,11 @@ struct ManagedExecutionSurfaceControl final {
 
 void RunManagedExecutionCommandSurface(ManagedExecutionSurfaceControl &control,
                                        std::stop_token stop_token) noexcept;
+
+/// Preempts the running surface's advisory planning; a no-op while no
+/// surface runs.
+void PreemptManagedExecutionSurfacePlanning(
+    ManagedExecutionSurfaceControl &control) noexcept;
 
 struct RetainedNativeComponentSnapshot final {
   std::shared_ptr<RetainedNativeRuntime> runtime;
@@ -7412,6 +7565,36 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         predecessor->second.gripper_runtime->state_channel());
     Require(old_channel != nullptr,
             "retained gripper has no observed-state channel");
+    // A model-backed gripper projects its observations into a scene of the
+    // whole-cell model. When that model changes, its candidate projector is
+    // prepared here and replaces the predecessor's under the Apply fence.
+    auto gripper_stage = predecessor->second.stage;
+    std::shared_ptr<RetainedKinematicStateProjector> candidate_tool_projector;
+    if (old_channel->kinematic_projector() != nullptr &&
+        predecessor->second.planning_model_product !=
+            input.bundle->value().compiled_products.planning_collision_model) {
+      auto candidate_stage = std::make_shared<const RetainedPlanningModelStage>(
+          RetainedPlanningModelStage::create_verified(
+              *retained_model, input.execution_run_root));
+      auto candidate_scene = BuildCandidateRetainedModelScene(
+          "manyforge_i6_native_gripper_host", *candidate_stage,
+          *retained_model, *input.bundle, input.model_map,
+          {*physical.gripper});
+      const auto limits =
+          predecessor->second.gripper_runtime->position_limits();
+      const auto &resource = physical.gripper->value().resources.front();
+      const auto joint =
+          candidate_scene.scene->getJointInfo(resource.compiled_resource_name);
+      Require(limits.has_value() && joint.has_value() &&
+                  joint->limits.min_position.size() == 1U &&
+                  joint->limits.max_position.size() == 1U &&
+                  limits->coordinate_kind == resource.coordinate_kind &&
+                  limits->lower_position == joint->limits.min_position[0] &&
+                  limits->upper_position == joint->limits.max_position[0],
+              "candidate cell model changes the retained gripper limits");
+      candidate_tool_projector = std::move(candidate_scene.state_projector);
+      gripper_stage = std::move(candidate_stage);
+    }
     std::vector<RetainedSceneFrameStateSourceInput> state_sources;
     const auto gripper_binding =
         predecessor->second.gripper_runtime->binding();
@@ -7460,11 +7643,13 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         nullptr, std::move(physical.gripper_program), std::nullopt,
         std::move(physical.gripper), std::nullopt,
         CanonicalValue(nullptr), predecessor->second.gripper_descriptor,
-        predecessor->second.stage, nullptr,
+        std::move(gripper_stage), nullptr,
         std::move(input.projection_revision),
         input.publication_generation, std::nullopt,
         physical.status_gripper_role);
     composition->gripper_runtime = predecessor->second.gripper_runtime;
+    composition->candidate_tool_state_projector =
+        std::move(candidate_tool_projector);
     composition->target_resolver = std::move(target_resolver);
     composition->candidate_control_representatives =
         std::move(physical.representatives);
@@ -7512,8 +7697,14 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
   // components, passive models, root poses). The retained worker plans in
   // that whole-cell model, so a changed product stages the candidate model
   // here and replaces the worker's model under the Apply fence.
+  // The same holds for every in-process model consumer (scene, state
+  // projector, kinematics, validator, collision projector): all of them are
+  // prepared here from the candidate model and the candidate bindings that
+  // the re-seal installs, and replace the predecessor generation together.
   auto planning_stage = predecessor->second.stage;
   std::optional<RoboPlanWorkerModelDTO> candidate_planner_model;
+  std::shared_ptr<const RetainedKinematicModelGeneration>
+      candidate_model_generation;
   if (predecessor->second.planning_model_product !=
       input.bundle->value().compiled_products.planning_collision_model) {
     auto candidate_stage = std::make_shared<const RetainedPlanningModelStage>(
@@ -7529,6 +7720,20 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     candidate_planner_model = NativeWorkerBaseModel(
         *candidate_stage,
         RoboPlanJointLimitsFromRetainedModel(candidate_documents.urdf));
+    std::vector<core::RuntimeParticipantBinding> projected_bindings{
+        physical.motion.value()};
+    if (physical.gripper.has_value() &&
+        physical.gripper->value().resources.front().source_joint_name
+            .has_value())
+      projected_bindings.push_back(*physical.gripper);
+    auto candidate_scene = BuildCandidateRetainedModelScene(
+        "manyforge_i6_native_execution_host", *candidate_stage,
+        *retained_model, *input.bundle, input.model_map,
+        std::move(projected_bindings));
+    candidate_model_generation = make_retained_motion_model_generation(
+        physical.motion.value(), std::move(candidate_scene.scene),
+        std::move(candidate_scene.scene_mutex),
+        std::move(candidate_scene.state_projector));
     planning_stage = std::move(candidate_stage);
   }
   std::vector<RetainedSceneFrameStateSourceInput> state_sources;
@@ -7607,6 +7812,8 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       input.publication_generation, std::move(*physical.status_motion_role),
       physical.status_gripper_role);
   composition->candidate_planner_model = std::move(candidate_planner_model);
+  composition->candidate_model_generation =
+      std::move(candidate_model_generation);
   composition->operator_confirmation_validity_ns =
       predecessor->second.operator_confirmation_validity_ns;
   composition->target_resolver = std::move(target_resolver);
@@ -8471,7 +8678,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     input.operation_admission_gate->BindResourceTable(
         runtime->addressed_kernel->resource_admission_table());
   }
-  auto direct_control_joint_limits = runtime->kinematics->joint_limits(
+  auto direct_control_joint_limits = runtime->kinematic_model->joint_limits(
       direct_control_motion_binding.value()
           .value()
           .controllable_component_id.value(),
@@ -9059,27 +9266,67 @@ void RefreshRetainedNativeCandidateCollision(
   }
 }
 
-// A retained planner keeps its worker client, but plans in the candidate's
-// whole-cell planning model. The candidate composition owns the stage whose
-// files the replacement worker loads.
-void ReplaceRetainedNativeCandidatePlanningModels(
+// A retained controller keeps its identities (controller, Kernel, planner
+// client, observed sources) but every model-dependent computation follows the
+// candidate's whole-cell planning model: the worker's base model, the
+// in-process scene with its kinematics, validator and collision projector,
+// and each model-backed state projector. The candidate composition owns the
+// stage whose files the replacement worker loads. Collision resources were
+// installed just before; this completes one coherent model generation and
+// reads it back before admission can reopen. A failure is rethrown as the
+// Apply failure; nothing is restored and the fence keeps admission closed.
+void RefreshRetainedNativeCandidateModels(
     Composition &candidate,
     const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
         &request,
-    core::IResourceOperationAdmissionGate &admission_gate) {
+    core::IResourceOperationAdmissionGate &admission_gate,
+    core::IClock &clock) {
   std::map<core::ControllableComponentId, Composition *> selected;
   selected.emplace(candidate.controllable_component_id, &candidate);
   for (auto &component : candidate.participant_compositions) {
     Require(component != nullptr &&
                 selected.emplace(component->controllable_component_id,
                                  component.get()).second,
-            "retained native planning-model candidate repeats an owner");
+            "retained native model candidate repeats an owner");
   }
   for (const auto &component_id : RetainedNativeComponentIds(request)) {
     const auto found = selected.find(component_id);
     Require(found != selected.end(),
-            "retained native planning-model owner is absent");
+            "retained native model owner is absent");
     auto &view = *found->second;
+    Require(admission_gate.exact_fence_is_held(
+                request.configuration_fence_id,
+                request.configuration_fence_scope),
+            "retained native model refresh lost the exact parent Apply fence");
+    if (view.gripper_runtime != nullptr) {
+      if (view.candidate_tool_state_projector == nullptr)
+        continue;
+      const auto channel =
+          std::dynamic_pointer_cast<RetainedObservedStateChannel>(
+              view.gripper_runtime->state_channel());
+      const auto *backend = view.gripper_runtime->backend();
+      Require(channel != nullptr && backend != nullptr,
+              "retained gripper has no model-backed observed-state owner");
+      Require(backend
+                      ->get_gripper_status(view.gripper_runtime->binding()
+                                               .value()
+                                               .command_target_id.value())
+                      .state != core::GripperCommandState::kExecuting,
+              "retained gripper has active command work during model refresh");
+      const auto replaced = channel->ReplaceKinematicProjector(
+          view.candidate_tool_state_projector, clock.now());
+      if (!replaced.ok())
+        Fail("retained gripper rejected the candidate cell model: " +
+             replaced.error().message);
+      Require(channel->kinematic_projector() ==
+                  view.candidate_tool_state_projector,
+              "retained gripper does not read back the candidate model");
+      view.candidate_tool_state_projector.reset();
+      continue;
+    }
+    Require(view.candidate_planner_model.has_value() ==
+                (view.candidate_model_generation != nullptr),
+            "retained native model candidate is incomplete");
     if (!view.candidate_planner_model.has_value())
       continue;
     Require(view.runtime != nullptr && view.runtime->planner != nullptr &&
@@ -9087,16 +9334,22 @@ void ReplaceRetainedNativeCandidatePlanningModels(
                 view.candidate_planner_model->urdf_path ==
                     view.stage->loader_urdf_path(),
             "retained native planner has no staged candidate model");
-    Require(admission_gate.exact_fence_is_held(
-                request.configuration_fence_id,
-                request.configuration_fence_scope),
-            "retained native planner lost the exact parent Apply fence");
     const auto replaced =
         view.runtime->planner->ReplaceRetainedModel(*view.candidate_planner_model);
     if (!replaced.ok())
       Fail("retained native planner rejected the candidate planning model: " +
            replaced.error().message);
+    const auto refreshed = refresh_retained_native_runtime_model_for_apply(
+        *view.runtime,
+        RetainedNativeRuntimeModelRefreshInput{
+            view.candidate_model_generation, request.configuration_fence_id,
+            request.configuration_fence_scope, admission_gate});
+    if (!refreshed.ok())
+      Fail("retained native model consumers rejected the candidate cell "
+           "model: " +
+           refreshed.error().message);
     view.candidate_planner_model.reset();
+    view.candidate_model_generation.reset();
   }
 }
 #endif
@@ -11312,6 +11565,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   };
 #endif
   bootstrap_kernel_config.cell_admission_claim_capacity = 1024U;
+  // The managed cell hosts the Headless Alarm Lifecycle Owner: Run/Resume
+  // and motion-producing recovery evaluate its published attention. The
+  // control plane is single-host: only projections from this host boot are
+  // accepted, so owner incarnations are comparable (spec 530 §11).
+  bootstrap_kernel_config.operator_alarm_attention =
+      core::OperatorAlarmAttentionPolicyDTO{
+          core::kOperatorAlarmAttentionMaximumSnapshotAgeNs,
+          core::ReadHostBootStamp().boot_id};
   bootstrap_kernel_config.cell_admission_reconcile_validator =
       BuildOwnerReconciliationValidator(
           config.manager_state_root /
@@ -12601,8 +12862,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     admission_gate);
                 RefreshRetainedNativeCandidateCollision(
                     *prepared, request, admission_gate);
-                ReplaceRetainedNativeCandidatePlanningModels(
-                    *prepared, request, admission_gate);
+                RefreshRetainedNativeCandidateModels(
+                    *prepared, request, admission_gate,
+                    *stable_cell_runtime_owner->clock());
                 if (prepared->runtime != nullptr) {
                   std::vector<std::shared_ptr<RetainedNativeRuntime>> peers;
                   peers.reserve(prepared->participant_compositions.size());
@@ -13354,6 +13616,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
                 request);
         response_command = decoded.command;
+        if (PreemptsPlanning(decoded)) {
+          PreemptManagedExecutionSurfacePlanning(execution_surface_control);
+        }
         core::ResourceAddressedExecutionKernel *owner = nullptr;
         {
           std::lock_guard lock(managed_composition_mutex);
@@ -13494,6 +13759,11 @@ VerifyPickReferenceTargets(const ProductBackedRuntimeParticipantResolver &resolv
 }
 
 class ExecutionCommandSurface final {
+  // The Manager channel's component-lifecycle claim preempts planning as
+  // the ordinary socket's does.
+  friend void PreemptManagedExecutionSurfacePlanning(
+      ManagedExecutionSurfaceControl &control) noexcept;
+
 public:
   ExecutionCommandSurface(
       std::filesystem::path run_root,
@@ -13525,6 +13795,13 @@ public:
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
       RunReconciliationLane(stop_token);
     });
+    std::jthread submission_ordered_thread(
+        [this](std::stop_token stop_token) {
+          RunDeferredLane(submission_ordered_lane_, stop_token);
+        });
+    std::jthread scene_read_thread([this](std::stop_token stop_token) {
+      RunDeferredLane(scene_read_lane_, stop_token);
+    });
     while (g_stop_requested == 0 && !stop_token.stop_requested() &&
            !reconciliation_lane_failed_.load(std::memory_order_acquire)) {
       short revents = 0;
@@ -13554,6 +13831,10 @@ public:
     reconciliation_thread.request_stop();
     control_thread.request_stop();
     observation_thread.request_stop();
+    submission_ordered_thread.request_stop();
+    scene_read_thread.request_stop();
+    submission_ordered_thread.join();
+    scene_read_thread.join();
     reconciliation_thread.join();
     control_thread.join();
     observation_thread.join();
@@ -14168,7 +14449,7 @@ private:
     CanonicalValue value;
     if (frame_query) {
       if (selected.runtime == nullptr ||
-          selected.runtime->kinematics == nullptr)
+          selected.runtime->kinematic_model == nullptr)
         return ErrorResponse(
             "execution_target_frame_unavailable",
             "target has no native kinematics owner for frame observation");
@@ -14206,7 +14487,7 @@ private:
       }
       // Empty base retains the existing logical-cell-frame query semantics.
       const auto pose =
-          selected.runtime->kinematics->forward_kinematics(core::FkRequestDTO{
+          selected.runtime->kinematic_model->forward_kinematics(core::FkRequestDTO{
               core::RobotStateDTO{state.joint_names, std::move(positions), {}},
               frame->compiled_frame_name, std::move(base_frame)});
       if (!pose.ok())
@@ -14461,7 +14742,7 @@ private:
                 tcp_frame != binding.frame_bindings.end(),
             "direct-control observation has no exact base/TCP frame binding");
     const auto current_tcp =
-        composition.runtime->kinematics->forward_kinematics(core::FkRequestDTO{
+        composition.runtime->kinematic_model->forward_kinematics(core::FkRequestDTO{
             core::RobotStateDTO{observed_state.joint_names,
                                 std::move(observed_positions_rad),
                                 {}},
@@ -15606,7 +15887,8 @@ private:
 
   [[nodiscard]] CanonicalValue
   Execute(const Command &command, Composition &composition,
-          const core::ProjectionRevisionDTO &projection) {
+          const core::ProjectionRevisionDTO &projection,
+          const std::stop_token planning_stop_token) {
     if (command.kind == CommandKind::kReadProgramExecutionScope) {
       const auto result =
           composition.active_addressed_kernel()
@@ -15687,9 +15969,6 @@ private:
           {"ok", CanonicalValue(true)},
       });
     }
-    if (command.kind == CommandKind::kReadStop) {
-      return ReadStop(command, *composition.active_addressed_kernel());
-    }
     if (command.kind == CommandKind::kStop ||
         command.kind == CommandKind::kStopProgramRun ||
         command.kind == CommandKind::kStopProgramSelection ||
@@ -15701,11 +15980,11 @@ private:
     const bool read_only = command.kind == CommandKind::kQueryTarget ||
                            command.kind == CommandKind::kQueryOperation ||
                            command.kind == CommandKind::kObservation ||
-                           command.kind == CommandKind::kGetStopFault ||
                            command.kind == CommandKind::kRead ||
-                           command.kind == CommandKind::kReadStop ||
                            command.kind == CommandKind::kGetOperationRecovery ||
-                           command.kind == CommandKind::kGetRuntimeScaleControl;
+                           command.kind == CommandKind::kGetRuntimeScaleControl ||
+                           command.kind ==
+                               CommandKind::kCheckProgramNodeMotionAttention;
     const auto liveness_command =
         read_only
             ? component_manager::detail::ManagerLivenessCommandClass::kReadOnly
@@ -15722,9 +16001,6 @@ private:
     }
     if (command.kind == CommandKind::kQueryOperation) {
       return QueryOperationResponse(*command.operation_query, composition);
-    }
-    if (command.kind == CommandKind::kGetStopFault) {
-      return ReadStopFault(*composition.active_addressed_kernel());
     }
     if (command.kind == CommandKind::kRecoverStopFault) {
       Require(command.stop_fault_recovery.has_value(),
@@ -15970,9 +16246,9 @@ private:
             {"ok", CanonicalValue(false)},
         });
       }
-      auto preview =
-          session.value()->preview_motion(preview_intent, std::move(*inventory),
-                                          std::move(start_state.value()));
+      auto preview = session.value()->preview_motion(
+          preview_intent, std::move(*inventory),
+          std::move(start_state.value()), 0U, planning_stop_token);
       if (!preview.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -16015,9 +16291,9 @@ private:
       const auto result =
           command.kind == CommandKind::kPlanPick
               ? composition.pick_place_planning_owner->PlanPick(
-                    *command.pick_planning)
+                    *command.pick_planning, planning_stop_token)
               : composition.pick_place_planning_owner->PlanPlace(
-                    *command.place_planning);
+                    *command.place_planning, planning_stop_token);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -16197,6 +16473,20 @@ private:
           {"ok", CanonicalValue(true)},
           {"scope", ProgramExecutionScopeValue(result.value())}});
     }
+    if (command.kind == CommandKind::kCheckProgramNodeMotionAttention) {
+      const auto result =
+          composition.active_addressed_kernel()
+              ->check_program_node_motion_attention(
+                  *command.program_node_attention);
+      if (!result.ok())
+        return ErrorResponse(result.error().code, result.error().message,
+                             result.error().details);
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command",
+           CanonicalValue("check_program_node_motion_attention")},
+          {"ok", CanonicalValue(true)}});
+    }
     if (command.kind == CommandKind::kReleaseProgramRunStopFence) {
       const auto result =
           composition.active_addressed_kernel()
@@ -16256,6 +16546,7 @@ private:
       case CommandKind::kReadProgramExecutionScope:
       case CommandKind::kStartProgramSelection:
       case CommandKind::kReleaseProgramSelection:
+      case CommandKind::kCheckProgramNodeMotionAttention:
       case CommandKind::kReleaseProgramRunStopFence:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:
@@ -16537,6 +16828,7 @@ private:
         } while (count < 0 && errno == EINTR);
         CanonicalValue response;
         std::optional<std::string> cell_admission_command;
+        std::optional<std::pair<DeferredLane *, Command>> deferred;
         if (count <= 0 || (message.msg_flags & MSG_TRUNC) != 0) {
           response =
               ErrorResponse("execution_command_invalid",
@@ -16549,7 +16841,8 @@ private:
                  {"cell_admission_get", "cell_admission_update_readiness",
                   "cell_admission_acquire", "cell_admission_release",
                   "cell_admission_reconcile",
-                  "cell_admission_recovery_receipt"}) {
+                  "cell_admission_recovery_receipt",
+                  "cell_admission_publish_operator_alarm_attention"}) {
               if (bytes.find(std::string("\"command\":\"") + candidate +
                              "\"") != std::string_view::npos) {
                 cell_admission_command = candidate;
@@ -16558,106 +16851,102 @@ private:
             }
             const auto cell_admission =
                 detail::TryDecodeCellAdmissionCommand(bytes);
-            std::shared_lock composition_lock(composition_access_.mutex);
-            if (cell_admission.has_value() && lane != CommandLane::kOrdinary) {
-              const bool stop_lane = lane == CommandLane::kStop;
-              response = detail::CellAdmissionResponseValue(
-                  cell_admission->command,
-                  core::ErrorDTO{
-                      stop_lane ? "execution_control_command_unsupported"
-                                : "execution_observation_command_unsupported",
-                      stop_lane
-                          ? "the independent Stop control socket accepts only "
-                            "Stop"
-                          : "the independent observation socket accepts only "
-                            "observation",
-                      {}});
-            } else if (cell_admission.has_value()) {
-              auto *const owner = composition_access_.addressed_kernel;
-              Require(owner != nullptr,
-                      "stable addressed execution Kernel is not installed");
-              auto result =
-                  component_manager::detail::DispatchKernelCellAdmissionRpc(
-                      *owner, *cell_admission);
-              response = detail::CellAdmissionResponseValue(
-                  cell_admission->command, result);
+            if (cell_admission.has_value()) {
+              const bool attention =
+                  cell_admission->command ==
+                  component_manager::detail::
+                      kPublishOperatorAlarmAttentionCommand;
+              if (lane == CommandLane::kObservation) {
+                response = detail::CellAdmissionResponseValue(
+                    cell_admission->command,
+                    core::ErrorDTO{
+                        "execution_observation_command_unsupported",
+                        "the independent observation socket accepts only "
+                        "observation",
+                        {}});
+              } else if (lane == CommandLane::kStop && !attention) {
+                response = detail::CellAdmissionResponseValue(
+                    cell_admission->command,
+                    core::ErrorDTO{
+                        "execution_control_command_unsupported",
+                        "the independent Stop control socket accepts only "
+                        "Stop, Stop status and operator-alarm attention",
+                        {}});
+              } else if (lane == CommandLane::kOrdinary && attention) {
+                response = detail::CellAdmissionResponseValue(
+                    cell_admission->command,
+                    core::ErrorDTO{
+                        "execution_ordinary_command_unsupported",
+                        "operator-alarm attention is published on the "
+                        "independent Stop control socket",
+                        {}});
+              } else {
+                // Cell admission is owned by the stable cell Kernel and never
+                // reads the composition, so an Apply holding the composition
+                // exclusively does not delay it.
+                if (PreemptsPlanning(*cell_admission)) {
+                  PreemptPlanning();
+                }
+                auto result =
+                    component_manager::detail::DispatchKernelCellAdmissionRpc(
+                        StableKernel(), *cell_admission);
+                response = detail::CellAdmissionResponseValue(
+                    cell_admission->command, result);
+              }
             } else {
               const auto command = DecodeCommand(bytes);
-              if (lane == CommandLane::kObservation &&
-                  command.kind != CommandKind::kObservation) {
+              if (lane != CommandLane::kObservation &&
+                  PreemptsPlanning(command.kind)) {
+                PreemptPlanning();
+              }
+              if (lane == CommandLane::kStop) {
+                // Stop and its in-memory progression reads reach the stable
+                // Kernel without the composition lock. It owns exact scope
+                // resolution, journal fences and unavailable evidence, also
+                // while no physical product is composed; the host cannot
+                // infer rest from the absence of one.
+                auto &owner = StableKernel();
+                response = command.kind == CommandKind::kReadStop
+                               ? ReadStop(command, owner)
+                           : command.kind == CommandKind::kGetStopFault
+                               ? ReadStopFault(owner)
+                               : ExecuteStop(command, owner);
+              } else if (lane == CommandLane::kObservation &&
+                         command.kind != CommandKind::kObservation) {
                 response = ErrorResponse(
                     "execution_observation_command_unsupported",
                     "the independent observation socket accepts only "
                     "observation");
-              } else if (composition_access_.current == nullptr) {
-                auto *const owner = composition_access_.addressed_kernel;
-                Require(owner != nullptr,
-                        "stable addressed execution Kernel is not installed");
-                if (lane == CommandLane::kStop) {
-                  // All containment requests reach the stable Kernel during
-                  // reconstruction. It owns exact scope resolution, journal
-                  // fences and unavailable evidence; the host cannot infer
-                  // rest from the absence of a composed physical product.
-                  response = ExecuteStop(command, *owner);
-                } else if (lane == CommandLane::kOrdinary &&
-                           command.kind == CommandKind::kReadStop) {
-                  response = ReadStop(command, *owner);
-                } else if (lane == CommandLane::kOrdinary &&
-                           command.kind == CommandKind::kGetStopFault) {
-                  response = ReadStopFault(*owner);
-                } else if (lane == CommandLane::kOrdinary &&
-                           command.kind == CommandKind::kIdentity) {
-                  response = ExecutionOwnerNotReadyIdentityResponse(
-                      *owner, owner_epoch_);
-                } else {
-                  response =
-                      ErrorResponse("execution_owner_not_ready",
-                                    "the managed execution owner has no active "
-                                    "physical product",
-                                    {{"owner_epoch", owner_epoch_.value()}});
-                }
+              } else if (IsStopLaneRead(command.kind)) {
+                response = ErrorResponse(
+                    "execution_ordinary_command_unsupported",
+                    "Stop status and Stop-fault reads are served by the "
+                    "independent Stop control socket");
               } else {
-                if (lane == CommandLane::kObservation &&
-                    command.observation_cursor_supplied) {
+                std::shared_lock composition_lock(composition_access_.mutex);
+                if (composition_access_.current == nullptr) {
+                  response = OwnerNotReadyResponse(command);
+                } else if (lane == CommandLane::kObservation &&
+                           command.observation_cursor_supplied) {
                   composition_lock.unlock();
                   response = ObservationResponseAfter(command, client.get(),
                                                       stop_token);
+                } else if (ordinary && IsSubmissionOrdered(command.kind)) {
+                  deferred.emplace(&submission_ordered_lane_, command);
+                } else if (ordinary && ReadsManagerScene(command.kind)) {
+                  deferred.emplace(&scene_read_lane_, command);
                 } else {
-                  auto projection =
-                      composition_access_.current->projection_revision;
-                  if (ordinary &&
-                      (command.kind == CommandKind::kIdentity ||
-                       command.kind == CommandKind::kStatus ||
-                       command.kind == CommandKind::kTargets ||
-                       command.kind == CommandKind::kControlState)) {
-                    const auto scene =
-                        composition_access_.current->scene_authority_proxy;
-                    const auto generation =
-                        composition_access_.current->publication_generation;
-                    if (scene != nullptr) {
-                      // Manager may be waiting to replace this composition.
-                      // Never retain its lock across a request back to Manager.
-                      // The shared proxy outlives the unlocked read; only the
-                      // exact captured publication may consume its result.
-                      composition_lock.unlock();
-                      projection = scene->CurrentProjectionRevision(stop_token);
-                      composition_lock.lock();
-                      Require(composition_access_.current != nullptr &&
-                                  composition_access_.current
-                                          ->publication_generation ==
-                                      generation &&
-                                  composition_access_.current
-                                          ->scene_authority_proxy == scene,
-                              "execution identity changed during Scene read");
+                  response = Execute(
+                      command, *composition_access_.current,
+                      composition_access_.current->projection_revision,
+                      std::stop_token{});
+                  if (command.kind == CommandKind::kReset) {
+                    const auto *accepted = response.find_object_member("ok");
+                    if (accepted != nullptr && accepted->is_bool() &&
+                        accepted->as_bool()) {
+                      PreemptPlanning();
                     }
                   }
-                  response =
-                      lane == CommandLane::kStop
-                          ? ExecuteStop(command,
-                                        *composition_access_.current
-                                             ->active_addressed_kernel())
-                          : Execute(command, *composition_access_.current,
-                                    projection);
                 }
               }
             }
@@ -16671,38 +16960,229 @@ private:
                     : ErrorResponse("execution_command_invalid", error.what());
           }
         }
-        auto bytes = content_identity::canonical_json(response);
-        if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
-          const core::ErrorDTO error{
-              "execution_command_response_oversized",
-              "execution owner result exceeds the bounded private transport",
-              {}};
-          bytes = content_identity::canonical_json(
-              cell_admission_command.has_value()
-                  ? detail::CellAdmissionResponseValue(*cell_admission_command,
-                                                       error)
-                  : ErrorResponse(error.code, error.message));
+        if (deferred.has_value()) {
+          // The composition lock is released: the deferred lane takes its own
+          // while it executes.
+          auto &[deferred_lane, deferred_command] = *deferred;
+          if (EnqueueDeferred(*deferred_lane, client,
+                              std::move(deferred_command))) {
+            return;
+          }
+          response = ErrorResponse(
+              std::string(deferred_lane->busy_code),
+              "the execution owner already holds its bounded number of "
+              "pending requests on this lane");
         }
-        pollfd outbound{client.get(), POLLOUT, 0};
-        int response_ready = -1;
-        do {
-          response_ready =
-              ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
-        } while (response_ready < 0 && errno == EINTR);
-        Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
-                "execution command client did not accept a response in time");
-        ssize_t sent = -1;
-        do {
-          sent = ::send(client.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
-        } while (sent < 0 && errno == EINTR);
-        Require(sent == static_cast<ssize_t>(bytes.size()),
-                "execution command response was not sent atomically");
+        SendResponse(client.get(), response, cell_admission_command);
         if (lane != CommandLane::kObservation) {
           return;
         }
       }
     } catch (...) {
       // A malformed/disappearing private client cannot retire the sole owner.
+    }
+  }
+
+  void SendResponse(
+      const int client, const CanonicalValue &response,
+      const std::optional<std::string> &cell_admission_command) const {
+    auto bytes = content_identity::canonical_json(response);
+    if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+      const core::ErrorDTO error{
+          "execution_command_response_oversized",
+          "execution owner result exceeds the bounded private transport",
+          {}};
+      bytes = content_identity::canonical_json(
+          cell_admission_command.has_value()
+              ? detail::CellAdmissionResponseValue(*cell_admission_command,
+                                                   error)
+              : ErrorResponse(error.code, error.message));
+    }
+    pollfd outbound{client, POLLOUT, 0};
+    int response_ready = -1;
+    do {
+      response_ready = ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
+    } while (response_ready < 0 && errno == EINTR);
+    Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
+            "execution command client did not accept a response in time");
+    ssize_t sent = -1;
+    do {
+      sent = ::send(client, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    Require(sent == static_cast<ssize_t>(bytes.size()),
+            "execution command response was not sent atomically");
+  }
+
+  /// Lane and ordering contract of the execution sockets.
+  ///
+  /// Every ordinary and control connection carries one request and its
+  /// response, so a client that needs A before B already waits for A's
+  /// response; requests on different connections or sockets are ordered by
+  /// nothing but the owner fences below, never by arrival.
+  ///
+  /// - Control socket: Stop, Program Stop, Program-selection Stop, full and
+  ///   malformed Stop, plus the in-memory reads Stop progression needs
+  ///   (Stop status, Stop fault) and the operator-alarm attention heartbeat.
+  ///   It reaches only the stable Kernel, without the composition lock, so
+  ///   neither planning nor an Apply delays it. Each request is a bounded
+  ///   copy under the Kernel's state lock.
+  /// - Ordinary socket: operation controls (Reset, Pause, Resume,
+  ///   acknowledgement), events, reads, Program selection and capture, cell
+  ///   admission and recovery. It never waits for planning, submission
+  ///   ordering or a Manager round trip; those go to deferred lanes.
+  /// - Submission-ordered lane: requests whose Kernel entry takes submission
+  ///   ordering (IsSubmissionOrdered). One worker, FIFO in accept order, one
+  ///   in flight, as the single ordinary lane executed them before.
+  /// - Scene-read lane: projections that first read the live Scene revision
+  ///   from Manager (ReadsManagerScene). One worker, FIFO.
+  ///
+  /// Cross-lane fences: Reset, recovery and Stop-fence release name the
+  /// exact operation revision, Stop id and generation, or Stop-fault latch
+  /// they act on, and their clients issue them only after reading that state
+  /// on the control socket. A stale name is refused (the Program owner also
+  /// refuses a cycle Reset while its Stop is not terminal); a Kernel Reset of
+  /// a participant still stopping hard-stops it first, so no ordering of the
+  /// two sockets lets Reset restart motion or release a newer Stop. Alarm
+  /// attention is fenced by owner epoch, incarnation and monotonic generation
+  /// and evaluated at admission only by age, so admission on another lane
+  /// observes either the previous or the new publication, both valid. Event
+  /// pages are journal-sequence ordered.
+  [[nodiscard]] core::ResourceAddressedExecutionKernel &StableKernel() const {
+    auto *const owner = composition_access_.addressed_kernel.load();
+    Require(owner != nullptr,
+            "stable addressed execution Kernel is not installed");
+    return *owner;
+  }
+
+  [[nodiscard]] CanonicalValue
+  OwnerNotReadyResponse(const Command &command) const {
+    if (command.kind == CommandKind::kIdentity) {
+      return ExecutionOwnerNotReadyIdentityResponse(StableKernel(),
+                                                    owner_epoch_);
+    }
+    return ErrorResponse("execution_owner_not_ready",
+                         "the managed execution owner has no active physical "
+                         "product",
+                         {{"owner_epoch", owner_epoch_.value()}});
+  }
+
+  struct PendingDeferredCommand final {
+    FileDescriptor client;
+    Command command;
+    std::stop_source cancellation;
+  };
+
+  struct DeferredLane final {
+    explicit DeferredLane(const std::string_view busy) : busy_code(busy) {}
+    const std::string_view busy_code;
+    std::mutex mutex;
+    std::condition_variable_any ready;
+    std::deque<PendingDeferredCommand> queue;
+    std::optional<std::stop_source> in_flight;
+  };
+
+  [[nodiscard]] bool EnqueueDeferred(DeferredLane &lane, FileDescriptor &client,
+                                     Command command) {
+    {
+      std::lock_guard lock(lane.mutex);
+      const auto pending =
+          lane.queue.size() + (lane.in_flight.has_value() ? 1U : 0U);
+      if (pending >= kMaximumPendingDeferredCommands) {
+        return false;
+      }
+      lane.queue.push_back(PendingDeferredCommand{
+          std::move(client), std::move(command), std::stop_source{}});
+    }
+    lane.ready.notify_one();
+    return true;
+  }
+
+  /// Cancels every advisory planning query already accepted, executing or
+  /// queued; a queued one then reaches the Kernel already cancelled. Only
+  /// planning consults the token: a queued submit or read is unaffected.
+  /// Called before a Stop or a component-lifecycle cell-admission claim is
+  /// dispatched and after a Reset is accepted; none waits for the cancelled
+  /// planning to return. (The Kernel's own
+  /// Reset of a participant additionally preempts that participant's preview
+  /// before taking its lifecycle lock.)
+  void PreemptPlanning() noexcept {
+    std::lock_guard lock(submission_ordered_lane_.mutex);
+    for (auto &pending : submission_ordered_lane_.queue) {
+      pending.cancellation.request_stop();
+    }
+    if (submission_ordered_lane_.in_flight.has_value()) {
+      submission_ordered_lane_.in_flight->request_stop();
+    }
+  }
+
+  [[nodiscard]] CanonicalValue
+  DeferredResponse(const Command &command, const std::stop_token cancellation,
+                   const std::stop_token lane_stop_token) {
+    std::shared_lock composition_lock(composition_access_.mutex);
+    if (composition_access_.current == nullptr) {
+      return OwnerNotReadyResponse(command);
+    }
+    auto projection = composition_access_.current->projection_revision;
+    const auto scene = composition_access_.current->scene_authority_proxy;
+    if (ReadsManagerScene(command.kind) && scene != nullptr) {
+      const auto generation =
+          composition_access_.current->publication_generation;
+      // Manager may be waiting to replace this composition. Never retain
+      // its lock across a request back to Manager. The shared proxy
+      // outlives the unlocked read; only the exact captured publication may
+      // consume its result.
+      composition_lock.unlock();
+      projection = scene->CurrentProjectionRevision(lane_stop_token);
+      composition_lock.lock();
+      Require(composition_access_.current != nullptr &&
+                  composition_access_.current->publication_generation ==
+                      generation &&
+                  composition_access_.current->scene_authority_proxy == scene,
+              "execution identity changed during Scene read");
+    }
+    return Execute(command, *composition_access_.current, projection,
+                   cancellation);
+  }
+
+  void RunDeferredLane(DeferredLane &lane,
+                       const std::stop_token stop_token) noexcept {
+    for (;;) {
+      std::optional<PendingDeferredCommand> pending;
+      {
+        std::unique_lock lock(lane.mutex);
+        if (!lane.ready.wait(lock, stop_token,
+                             [&lane] { return !lane.queue.empty(); })) {
+          // Closing the queued clients is their answer: the owner is leaving.
+          lane.queue.clear();
+          return;
+        }
+        pending.emplace(std::move(lane.queue.front()));
+        lane.queue.pop_front();
+        lane.in_flight = pending->cancellation;
+      }
+      const std::stop_callback cancel_on_shutdown(
+          stop_token, [source = pending->cancellation]() mutable {
+            source.request_stop();
+          });
+      try {
+        CanonicalValue response;
+        try {
+          response = DeferredResponse(pending->command,
+                                      pending->cancellation.get_token(),
+                                      stop_token);
+        } catch (const std::exception &error) {
+          response = ErrorResponse("execution_command_invalid", error.what());
+        }
+        {
+          std::lock_guard lock(lane.mutex);
+          lane.in_flight.reset();
+        }
+        SendResponse(pending->client.get(), response, std::nullopt);
+      } catch (...) {
+        // A disappearing private client cannot retire the sole owner.
+        std::lock_guard lock(lane.mutex);
+        lane.in_flight.reset();
+      }
     }
   }
 
@@ -16722,6 +17202,8 @@ private:
   mutable std::mutex reconcile_error_mutex_;
   std::optional<core::ErrorDTO> last_reconcile_error_;
   std::exception_ptr reconciliation_lane_failure_;
+  DeferredLane submission_ordered_lane_{"execution_submission_lane_busy"};
+  DeferredLane scene_read_lane_{"execution_scene_read_lane_busy"};
 };
 
 void RunManagedExecutionCommandSurface(
@@ -16735,8 +17217,17 @@ void RunManagedExecutionCommandSurface(
     ExecutionCommandSurface surface(
         control.run_root, *control.composition_access,
         *control.manager_liveness_admission, control.owner_epoch);
+    // Unpublish the surface before it is destroyed, also when Run throws.
+    struct Unpublish final {
+      ManagedExecutionSurfaceControl &control;
+      ~Unpublish() {
+        std::lock_guard lock(control.state_mutex);
+        control.surface = nullptr;
+      }
+    } const unpublish{control};
     {
       std::lock_guard lock(control.state_mutex);
+      control.surface = &surface;
       control.ready = true;
     }
     control.state_changed.notify_all();
@@ -16747,6 +17238,14 @@ void RunManagedExecutionCommandSurface(
       control.failure = std::current_exception();
     }
     control.state_changed.notify_all();
+  }
+}
+
+void PreemptManagedExecutionSurfacePlanning(
+    ManagedExecutionSurfaceControl &control) noexcept {
+  std::lock_guard lock(control.state_mutex);
+  if (control.surface != nullptr) {
+    control.surface->PreemptPlanning();
   }
 }
 

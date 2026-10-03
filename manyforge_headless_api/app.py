@@ -115,6 +115,10 @@ from .native import (
 from .service import HeadlessService, TrustedAttribution
 from .program_runner_client import ProgramRunnerHttpClient
 from .cell_admission import CellAdmissionClient
+from .alarm_attention import (
+    PUBLICATION_DEADLINE_SECONDS,
+    OperatorAlarmAttentionPublisher,
+)
 from .activation_preparer import ActivationPreparer
 
 
@@ -426,6 +430,7 @@ def create_app(
         raise ValueError("provide exactly one of config or service")
     owns_core = service is None
     event_pump: ExecutionEventPump | None = None
+    alarm_attention: OperatorAlarmAttentionPublisher | None = None
     program_runner_client: ProgramRunnerHttpClient | None = None
     if service is None:
         assert config is not None
@@ -479,6 +484,18 @@ def create_app(
             core,
             event_execution,
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
+        )
+        # Its own thread, reading the owner's published projection without the
+        # core lock: neither event-pump work nor any core call can delay the
+        # Kernel heartbeat; each publication ends by its deadline D < P.
+        alarm_attention = OperatorAlarmAttentionPublisher(
+            core,
+            CellAdmissionClient(
+                config.execution_run_root,
+                timeout_seconds=min(
+                    config.execution_timeout_seconds, PUBLICATION_DEADLINE_SECONDS
+                ),
+            ),
         )
     assert service is not None
     execution_controls = ExecutionControlClient(
@@ -621,6 +638,8 @@ def create_app(
     async def lifespan(_app: FastAPI):
         if event_pump is not None:
             event_pump.start()
+        if alarm_attention is not None:
+            alarm_attention.start()
         try:
             yield
         finally:
@@ -630,8 +649,12 @@ def create_app(
                 await control_state_source.close()
                 if owns_core:
                     try:
-                        if event_pump is not None:
-                            event_pump.shutdown()
+                        try:
+                            if alarm_attention is not None:
+                                alarm_attention.shutdown()
+                        finally:
+                            if event_pump is not None:
+                                event_pump.shutdown()
                     finally:
                         try:
                             if program_runner_client is not None:

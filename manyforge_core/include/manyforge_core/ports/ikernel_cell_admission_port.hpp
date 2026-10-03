@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
+#include <manyforge_core/types/operator_alarm_attention.hpp>
 
 namespace manyforge::core {
 
@@ -20,6 +21,16 @@ class IKernelCellAdmissionPort {
     return Result<void>::Err(
         ErrorDTO{"cell_admission_liveness_publication_unsupported",
                  "Kernel cell-admission liveness publication is unsupported",
+                 {}});
+  }
+  /// Headless Alarm Lifecycle Owner publication of its generation-fenced
+  /// motion-attention projection. Only the Kernel evaluates it at admission.
+  [[nodiscard]] virtual Result<OperatorAlarmAttentionAcceptedDTO> PublishOperatorAlarmAttention(
+      const OperatorAlarmAttentionSnapshotDTO& snapshot) {
+    static_cast<void>(snapshot);
+    return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+        ErrorDTO{"cell_admission_operator_alarm_attention_unsupported",
+                 "Kernel operator-alarm attention publication is unsupported",
                  {}});
   }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(

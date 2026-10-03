@@ -50,6 +50,17 @@ export interface AlarmMembership {
   recordRevision: number;
 }
 
+/**
+ * One record that gates motion (spec 530 §10.1 `motion_attention_membership`):
+ * an acknowledgement-gated record while unacknowledged, a condition interlock
+ * while active. The complete, unpaginated set.
+ */
+export interface AlarmMotionAttentionMember extends AlarmMembership {
+  lifecycleState: AlarmLifecycleState;
+  definitionId: string;
+  subject: AlarmSubject;
+}
+
 export interface OperatorAlarmRecord extends AlarmMembership {
   activatedAtNs: Nanoseconds;
   definitionId: string;
@@ -82,6 +93,7 @@ export interface OperatorAlarmSnapshot {
   activeCount: number;
   activeAcknowledgedCount: number;
   motionAttentionCount: number;
+  motionAttentionMembership: AlarmMotionAttentionMember[];
   unacknowledgedMembership: AlarmMembership[];
   alarms: OperatorAlarmRecord[];
   truncated: boolean;

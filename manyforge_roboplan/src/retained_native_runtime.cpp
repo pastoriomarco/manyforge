@@ -1319,9 +1319,11 @@ create_retained_native_runtime_participants(
       std::move(input.direct_control_joint_limits);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
-  runtime->scene = std::move(input.scene);
-  runtime->scene_mutex = std::move(input.scene_mutex);
-  runtime->state_projector = std::move(input.state_projector);
+  runtime->kinematic_model = std::make_shared<RetainedKinematicModelProxy>(
+      make_retained_motion_model_generation(
+          runtime->motion_binding, std::move(input.scene),
+          std::move(input.scene_mutex), std::move(input.state_projector)));
+  const auto model_generation = runtime->kinematic_model->current_generation();
   runtime->collision_publisher = std::move(input.collision_publisher);
 
   runtime->clock = shared_clock != nullptr ? std::move(shared_clock)
@@ -1340,7 +1342,7 @@ create_retained_native_runtime_participants(
                               : std::make_shared<RetainedObservationWake>();
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
-          runtime->motion_binding, runtime->state_projector,
+          runtime->motion_binding, model_generation->state_projector,
           std::move(motion_state_config), runtime->clock.get(),
           observation_wake);
   const auto initial_timestamp_ns = runtime->clock->now();
@@ -1360,10 +1362,8 @@ create_retained_native_runtime_participants(
   runtime->angular_observed_state =
       std::make_unique<core::AddressedAngularObservedRobotStateAdapter>(
           runtime->motion_state_channel->publication());
-  runtime->kinematics = std::make_unique<RetainedRoboPlanKinematicsAdapter>(
-      runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled) {
-    auto limits = runtime->kinematics->joint_limits(
+    auto limits = runtime->kinematic_model->joint_limits(
         motion_value.controllable_component_id.value(),
         motion_value.command_target_id.value());
     if (!limits.ok())
@@ -1394,11 +1394,6 @@ create_retained_native_runtime_participants(
     motion_participant_policy = std::move(selected.value());
     runtime->motion_participant_policy = motion_participant_policy;
   }
-  runtime->trajectory_validator = RoboPlanTrajectoryValidator::create(
-      runtime->motion_binding, runtime->scene, runtime->scene_mutex);
-  runtime->collision_trajectory_projector =
-      RoboPlanCollisionTrajectoryProjector::create(
-          runtime->motion_binding, runtime->scene, runtime->scene_mutex);
 
   if (runtime->gripper_binding.has_value()) {
     const auto &gripper_value = runtime->gripper_binding->value();
@@ -1418,7 +1413,7 @@ create_retained_native_runtime_participants(
     runtime->gripper_state_channel =
         std::make_shared<RetainedObservedStateChannel>(
             *runtime->gripper_binding,
-            model_backed ? runtime->state_projector : nullptr,
+            model_backed ? model_generation->state_projector : nullptr,
             detail::select_retained_state_channel_config(
                 std::move(input.gripper_state_channel_config),
                 *runtime->gripper_binding),
@@ -1432,7 +1427,8 @@ create_retained_native_runtime_participants(
             "native gripper state could not be seeded from the retained model");
       }
       runtime->gripper_position_limits =
-          retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
+          retained_gripper_limits(*model_generation->scene,
+                                  *runtime->gripper_binding);
     }
   }
 
@@ -1565,10 +1561,10 @@ create_retained_native_runtime_participants(
             std::move(input.planning_scene_synchronizer));
   }
   core::ExecutionKernelPorts ports{*runtime->angular_observed_state,
-                                   *runtime->kinematics,
+                                   *runtime->kinematic_model,
                                    *runtime->reference_resolver_proxy,
-                                   *runtime->trajectory_validator,
-                                   *runtime->collision_trajectory_projector,
+                                   *runtime->kinematic_model,
+                                   *runtime->kinematic_model,
                                    nullptr,
                                    nullptr,
                                    runtime->planning_scene_synchronizer.get()};
@@ -2398,6 +2394,149 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
       runtime.direct_control_joint_limits =
           registration->direct_control_joint_limits;
     }
+  }
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> refresh_retained_native_runtime_model_for_apply(
+    RetainedNativeRuntime &runtime,
+    RetainedNativeRuntimeModelRefreshInput input) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (input.apply_fence_id.empty() || !input.apply_scope.valid() ||
+      !input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_model_refresh_fence_not_held",
+                "retained model refresh requires the exact held Apply fence");
+  }
+  // Route readers and route publication serialize on the cell root; model
+  // consumers are replaced under the same order as the re-seal.
+  auto *const cell_root = runtime.cell_runtime_root != nullptr
+                              ? runtime.cell_runtime_root
+                              : &runtime;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  if (!input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_model_refresh_fence_changed",
+                "retained model refresh lost its exact Apply fence");
+  }
+  const auto &candidate = input.candidate;
+  if (candidate == nullptr || candidate->scene == nullptr ||
+      candidate->state_projector == nullptr ||
+      candidate->kinematics == nullptr ||
+      candidate->trajectory_validator == nullptr ||
+      candidate->collision_trajectory_projector == nullptr ||
+      runtime.kinematic_model == nullptr || runtime.clock == nullptr ||
+      runtime.motion_state_channel == nullptr ||
+      runtime.participant_engine == nullptr ||
+      runtime.gripper_binding.has_value() !=
+          (runtime.gripper_state_channel != nullptr)) {
+    return fail("native_model_refresh_incomplete",
+                "retained model refresh has no complete candidate generation");
+  }
+
+  // Drain: no planning, validation, execution or gripper command may span
+  // the generation change. Admission is already closed by the fence.
+  const auto motion_status = runtime.participant_engine->get_status();
+  if (motion_status.state == core::ExecutionState::kPlanning ||
+      motion_status.state == core::ExecutionState::kValidating ||
+      motion_status.state == core::ExecutionState::kExecuting ||
+      motion_status.state == core::ExecutionState::kInterrupted ||
+      motion_status.state == core::ExecutionState::kPaused ||
+      motion_status.state == core::ExecutionState::kStopping ||
+      motion_status.state == core::ExecutionState::kInterventionRequired) {
+    return fail("native_model_refresh_motion_not_idle",
+                "retained controller has active or unresolved motion work");
+  }
+  if (runtime.gripper_binding.has_value() && runtime.gripper != nullptr) {
+    const auto gripper_status = runtime.gripper->get_gripper_status(
+        runtime.gripper_binding->value().command_target_id.value());
+    if (gripper_status.state == core::GripperCommandState::kExecuting) {
+      return fail("native_model_refresh_gripper_not_idle",
+                  "retained gripper has active command work");
+    }
+  }
+
+  // Retaining the controller is valid only while its own model facts are
+  // unchanged; only their placement in the whole cell may differ.
+  const auto &motion = runtime.motion_binding.value();
+  const auto &component = motion.controllable_component_id.value();
+  const auto &target = motion.command_target_id.value();
+  const auto current_limits =
+      runtime.kinematic_model->joint_limits(component, target);
+  const auto candidate_limits =
+      candidate->kinematics->joint_limits(component, target);
+  const auto current_names = runtime.kinematic_model->group_joint_names(target);
+  const auto candidate_names = candidate->kinematics->group_joint_names(target);
+  if (!current_limits.ok() || !candidate_limits.ok() || !current_names.ok() ||
+      !candidate_names.ok() ||
+      current_names.value() != candidate_names.value() ||
+      current_limits.value().joint_names !=
+          candidate_limits.value().joint_names ||
+      current_limits.value().position_lower_rad !=
+          candidate_limits.value().position_lower_rad ||
+      current_limits.value().position_upper_rad !=
+          candidate_limits.value().position_upper_rad ||
+      current_limits.value().velocity_max_rad_s !=
+          candidate_limits.value().velocity_max_rad_s ||
+      current_limits.value().acceleration_max_rad_s2 !=
+          candidate_limits.value().acceleration_max_rad_s2) {
+    return fail("native_model_refresh_controller_model_changed",
+                "candidate cell model changes the retained controller's own "
+                "kinematic target");
+  }
+  const bool gripper_model_backed =
+      runtime.gripper_state_channel != nullptr &&
+      runtime.gripper_state_channel->kinematic_projector() != nullptr;
+  if (gripper_model_backed) {
+    std::optional<RetainedGripperPositionLimits> candidate_gripper_limits;
+    try {
+      candidate_gripper_limits =
+          retained_gripper_limits(*candidate->scene, *runtime.gripper_binding);
+    } catch (const std::exception &) {
+    }
+    if (!runtime.gripper_position_limits.has_value() ||
+        !candidate_gripper_limits.has_value() ||
+        candidate_gripper_limits->coordinate_kind !=
+            runtime.gripper_position_limits->coordinate_kind ||
+        candidate_gripper_limits->lower_position !=
+            runtime.gripper_position_limits->lower_position ||
+        candidate_gripper_limits->upper_position !=
+            runtime.gripper_position_limits->upper_position) {
+      return fail("native_model_refresh_controller_model_changed",
+                  "candidate cell model changes the retained gripper limits");
+    }
+  }
+
+  // Install. The proxy waits for in-flight host/Kernel model calls; each
+  // channel waits for its in-flight projection, then projects its latest
+  // owner sample into the candidate scene.
+  runtime.kinematic_model->ReplaceGeneration(candidate);
+  const auto now_ns = runtime.clock->now();
+  if (auto replaced = runtime.motion_state_channel->ReplaceKinematicProjector(
+          candidate->state_projector, now_ns);
+      !replaced.ok()) {
+    return core::Result<void>::Err(replaced.error());
+  }
+  if (gripper_model_backed) {
+    if (auto replaced =
+            runtime.gripper_state_channel->ReplaceKinematicProjector(
+                candidate->state_projector, now_ns);
+        !replaced.ok()) {
+      return core::Result<void>::Err(replaced.error());
+    }
+  }
+  if (runtime.kinematic_model->current_generation() != candidate ||
+      runtime.motion_state_channel->kinematic_projector() !=
+          candidate->state_projector ||
+      (gripper_model_backed &&
+       runtime.gripper_state_channel->kinematic_projector() !=
+           candidate->state_projector)) {
+    return fail("native_model_refresh_readback_mismatch",
+                "retained model consumers do not read back one candidate "
+                "generation");
   }
   return core::Result<void>::Ok();
 }

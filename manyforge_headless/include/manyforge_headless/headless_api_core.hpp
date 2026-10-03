@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -41,6 +42,20 @@ inline constexpr std::string_view kSourceModelContextSchemaVersion =
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
     "manyforge.assistant_mode_context.v1";
 inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
+inline constexpr std::string_view kAlarmSourceRefreshSchemaVersion =
+    "manyforge.alarm_source_refresh.v1";
+/// Alarm-source currency (spec 530 §11). Source health, the scene adapter and
+/// the active resource registry that decide motion-attention reconciliation
+/// are re-evaluated by `RefreshAlarmSources` at most once per period R; the
+/// execution event pump calls it on every pump iteration.
+inline constexpr std::int64_t kAlarmSourceRefreshPeriodNs = 250'000'000;
+/// Bound C on the age of the last completed alarm-source refresh. A read of
+/// the motion-attention projection that finds the refresh older than C names
+/// owner health `operator_alarm_source_refresh_overdue`, so the projection
+/// reports not-reconciled (a new generation) instead of silently old facts.
+inline constexpr std::int64_t kAlarmSourceCurrencyBoundNs = 2'000'000'000;
+inline constexpr std::string_view kAlarmSourceRefreshOverdueHealthCode =
+    "operator_alarm_source_refresh_overdue";
 
 class HeadlessApiOwnerLock;
 
@@ -210,6 +225,19 @@ public:
       const std::set<AlarmLifecycleState> &states = {},
       AlarmSnapshotOrdering ordering = AlarmSnapshotOrdering::kDefault);
   [[nodiscard]] manyforge::content_identity::CanonicalValue AlarmMetrics();
+  /// The generation-fenced motion-attention projection the native Kernel
+  /// evaluates at admission (`manyforge.operator_alarm_motion_attention.v3`).
+  /// Reads the alarm owner's published projection without the core
+  /// coordination lock and without refreshing sources; its currency is
+  /// bounded by `kAlarmSourceCurrencyBoundNs` instead.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  OperatorAlarmMotionAttention();
+  /// Re-evaluate the alarm sources (runtime health, scene, active resource
+  /// registry) when the last completed refresh is at least
+  /// `kAlarmSourceRefreshPeriodNs` old; otherwise return without the core
+  /// lock. Reports whether it refreshed and the current refresh time.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RefreshAlarmSources();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AcknowledgeAlarm(std::string condition_id, std::string activation_id,
                    std::uint64_t expected_record_revision,
@@ -429,7 +457,10 @@ private:
   std::string previous_node_environment_digest_;
   std::uint64_t source_model_generation_{};
   std::string previous_source_model_digest_;
-  bool shutdown_{};
+  /// Monotonic observation time of the last completed `RefreshLocked`;
+  /// negative before the first. Read without `mutex_` by the attention read.
+  std::atomic<std::int64_t> alarm_sources_refreshed_at_ns_{-1};
+  std::atomic<bool> shutdown_{};
 };
 
 [[nodiscard]] HeadlessApiCoreClocks ProductionHeadlessApiClocks();

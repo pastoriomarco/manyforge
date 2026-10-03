@@ -41,6 +41,24 @@ CanonicalValue Object(std::string key, std::string value) {
   });
 }
 
+/// Condition ids of one gate kind in the Kernel-bound projection.
+std::vector<std::string>
+GateMembers(const AlarmMotionAttentionProjection &projection,
+            const bool condition_interlock) {
+  std::vector<std::string> result;
+  for (const auto &member : projection.members) {
+    if (member.condition_interlock == condition_interlock) {
+      result.push_back(member.acknowledgement.condition_id);
+    }
+  }
+  return result;
+}
+
+std::vector<std::string> SortedIds(std::vector<std::string> ids) {
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
 class AlarmOwnerTest : public ::testing::Test {
 protected:
   std::unique_ptr<AlarmLifecycleOwner>
@@ -52,6 +70,7 @@ protected:
     auto owner = std::make_unique<AlarmLifecycleOwner>(
         OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
         std::string(kCellId), "alarm.owner", std::move(owner_epoch),
+        manyforge::core::HostBootStamp{"boot.test", 7U},
         [this]() { return ++monotonic_ns_; },
         [this]() {
           return "2026-08-05T00:00:" + std::to_string(monotonic_ns_ % 60) + "Z";
@@ -389,29 +408,42 @@ TEST_F(AlarmOwnerTest,
       owner->Submit(MotionUpdate(1U, true, "operation.a", {"resource.arm.a"}))
           .records.front();
   const auto global = owner->Submit(CellGlobalUpdate(1U, true)).records.front();
-  auto unrelated = owner->EvaluateMotionAttention({"resource.arm.b"});
-  EXPECT_TRUE(unrelated.available);
-  EXPECT_TRUE(unrelated.blocked);
-  ASSERT_EQ(unrelated.matching_alarms.size(), 1U);
-  EXPECT_EQ(unrelated.matching_alarms.front().condition_id,
-            global.condition_id);
+  // The Kernel evaluates this exact projection; Headless only publishes it.
+  auto projection = *owner->MotionAttentionProjection();
+  EXPECT_EQ(projection.cell_id, kCellId);
+  EXPECT_EQ(projection.owner_epoch, "alarm.owner.epoch.1");
+  EXPECT_EQ(projection.owner_incarnation.boot_id, "boot.test");
+  EXPECT_EQ(projection.owner_incarnation.boottime_us, 7U);
+  EXPECT_EQ(projection.generation, owner->Snapshot().generation);
+  EXPECT_TRUE(projection.reconciled);
+  const auto wire = content_identity::canonical_json(
+      OperatorAlarmMotionAttentionValue(projection));
+  EXPECT_NE(wire.find("\"owner_host_boot_id\":\"boot.test\""), std::string::npos);
+  EXPECT_NE(wire.find("\"owner_incarnation_us\":7"), std::string::npos);
+  EXPECT_NE(wire.find("manyforge.operator_alarm_motion_attention.v3"),
+            std::string::npos);
+  EXPECT_TRUE(GateMembers(projection, true).empty());
+  EXPECT_EQ(GateMembers(projection, false),
+            (SortedIds({global.condition_id, scoped.condition_id})));
+  for (const auto &member : projection.members) {
+    EXPECT_EQ(member.subject, member.acknowledgement.condition_id ==
+                                      global.condition_id
+                                  ? global.subject
+                                  : scoped.subject);
+  }
 
   static_cast<void>(
       owner->Acknowledge(global.condition_id, global.activation_id,
                          global.record_revision, Caller(), std::nullopt, true));
-  unrelated = owner->EvaluateMotionAttention({"resource.arm.b"});
-  EXPECT_TRUE(unrelated.available);
-  EXPECT_FALSE(unrelated.blocked);
-  const auto intersecting = owner->EvaluateMotionAttention({"resource.arm.a"});
-  EXPECT_TRUE(intersecting.blocked);
-  ASSERT_EQ(intersecting.matching_alarms.size(), 1U);
-  EXPECT_EQ(intersecting.matching_alarms.front().condition_id,
-            scoped.condition_id);
+  projection = *owner->MotionAttentionProjection();
+  EXPECT_EQ(GateMembers(projection, false),
+            std::vector<std::string>{scoped.condition_id});
+  ASSERT_EQ(projection.members.size(), 1U);
+  EXPECT_EQ(projection.members.front().subject.resource_ids,
+            std::vector<std::string>{"resource.arm.a"});
 
   owner->MarkSourceQualityUnknown("motion.source", "motion.epoch.1");
-  const auto unavailable = owner->EvaluateMotionAttention({"resource.arm.b"});
-  EXPECT_FALSE(unavailable.available);
-  EXPECT_TRUE(unavailable.blocked);
+  EXPECT_FALSE(owner->MotionAttentionProjection()->reconciled);
 
   auto replacement = MakeOwner({"motion", "runtime_health", "scene"}, 4096U,
                                8192U, "alarm.owner.epoch.2");
@@ -426,6 +458,71 @@ TEST_F(AlarmOwnerTest,
   EXPECT_FALSE(replacement->Snapshot().reconciled);
   CompleteAll(*replacement);
   EXPECT_TRUE(replacement->Snapshot().reconciled);
+}
+
+TEST_F(AlarmOwnerTest,
+       PublishedMotionAttentionNamesEveryGenerationAndStaysImmutable) {
+  auto owner = MakeOwner({"motion", "runtime_health", "scene"});
+  RegisterAll(*owner);
+  CompleteAll(*owner);
+  const auto before = owner->MotionAttentionProjection();
+  EXPECT_EQ(before->generation, owner->Snapshot().generation);
+  EXPECT_TRUE(before->reconciled);
+  EXPECT_TRUE(before->members.empty());
+
+  static_cast<void>(
+      owner->Submit(MotionUpdate(1U, true, "operation.a", {"resource.arm.a"})));
+  const auto gating = owner->MotionAttentionProjection();
+  EXPECT_EQ(gating->generation, owner->Snapshot().generation);
+  ASSERT_EQ(gating->members.size(), 1U);
+  // A reader keeps the exact publication it obtained.
+  EXPECT_TRUE(before->members.empty());
+
+  // An unknown-quality observation of a condition at normal changes only
+  // reconciliation; it is still published under its own generation.
+  auto unknown = MotionUpdate(1U, false, "operation.b", {"resource.arm.b"});
+  unknown.quality = AlarmConditionQuality::kUnknown;
+  static_cast<void>(owner->Submit(unknown));
+  const auto degraded = owner->MotionAttentionProjection();
+  EXPECT_FALSE(degraded->reconciled);
+  EXPECT_FALSE(owner->Snapshot().reconciled);
+  EXPECT_GT(degraded->generation, gating->generation);
+  EXPECT_EQ(degraded->generation, owner->Snapshot().generation);
+
+  owner->MarkHealthUnavailable("test.health", "unavailable");
+  EXPECT_EQ(owner->MotionAttentionProjection()->generation,
+            owner->Snapshot().generation);
+}
+
+TEST_F(AlarmOwnerTest,
+       RestatedHealthFactKeepsTheAcknowledgementGenerationFence) {
+  auto owner = MakeOwner();
+  RegisterScene(*owner);
+  static_cast<void>(owner->Submit(SceneUpdate(1U, true, "box.a")));
+  owner->MarkHealthUnavailable("alarm_source_refresh_overdue", "overdue");
+  const auto marked = owner->Snapshot();
+
+  // A periodic reader restating the same fact (e.g. a 4 Hz publisher while
+  // sources stay overdue) must not advance the generation.
+  for (int read = 0; read < 8; ++read) {
+    owner->MarkHealthUnavailable("alarm_source_refresh_overdue", "overdue");
+    owner->MarkHealthUnavailableIf("alarm_source_refresh_overdue", "overdue",
+                                   []() { return true; });
+  }
+  EXPECT_EQ(owner->Snapshot().generation, marked.generation);
+  EXPECT_EQ(owner->MotionAttentionProjection()->generation, marked.generation);
+  const auto acknowledged = owner->AcknowledgeAll(
+      marked.unacknowledged_membership, marked.owner_epoch, marked.generation,
+      Caller(), std::nullopt, true);
+  EXPECT_EQ(acknowledged.status, "acknowledged_all");
+
+  // A changed message, or a false predicate, is decided exactly.
+  const auto before_change = owner->Snapshot().generation;
+  owner->MarkHealthUnavailableIf("alarm_source_refresh_overdue", "changed",
+                                 []() { return false; });
+  EXPECT_EQ(owner->Snapshot().generation, before_change);
+  owner->MarkHealthUnavailable("alarm_source_refresh_overdue", "changed");
+  EXPECT_GT(owner->Snapshot().generation, before_change);
 }
 
 TEST_F(AlarmOwnerTest,
@@ -459,10 +556,10 @@ TEST_F(AlarmOwnerTest,
                 .acknowledgement.condition_id,
             scope.condition_id);
   EXPECT_EQ(owner->Metrics().motion_attention, 1U);
-  auto decision = owner->EvaluateMotionAttention({"resource.arm.b"});
-  EXPECT_TRUE(decision.blocked);
-  ASSERT_EQ(decision.matching_alarms.size(), 1U);
-  EXPECT_EQ(decision.matching_alarms.front().condition_id, scope.condition_id);
+  auto projection = *owner->MotionAttentionProjection();
+  EXPECT_TRUE(GateMembers(projection, false).empty());
+  EXPECT_EQ(GateMembers(projection, true),
+            std::vector<std::string>{scope.condition_id});
 
   // An acknowledgement attempt changes nothing; only the cause clears it.
   const auto attempted =
@@ -470,7 +567,8 @@ TEST_F(AlarmOwnerTest,
                          scope.record_revision, Caller(), std::nullopt, true);
   EXPECT_EQ(attempted.status, "already_acknowledged");
   EXPECT_FALSE(attempted.changed);
-  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), true),
+            std::vector<std::string>{scope.condition_id});
 
   // An acknowledgement-required alarm keeps the ISA-18.2 rule beside it:
   // acknowledging it releases its own gate while the condition still gates.
@@ -478,13 +576,21 @@ TEST_F(AlarmOwnerTest,
       owner->Submit(CellGlobalUpdate(1U, true)).records.front();
   EXPECT_TRUE(provider.acknowledgement_required);
   EXPECT_EQ(owner->Snapshot().motion_attention_count, 2U);
+  // Both block: the interlock reason wins deterministically, and both
+  // memberships are reported so a client can show both remedies.
+  projection = *owner->MotionAttentionProjection();
+  EXPECT_EQ(GateMembers(projection, true),
+            std::vector<std::string>{scope.condition_id});
+  EXPECT_EQ(GateMembers(projection, false),
+            std::vector<std::string>{provider.condition_id});
   static_cast<void>(owner->Acknowledge(provider.condition_id,
                                        provider.activation_id,
                                        provider.record_revision, Caller(),
                                        std::nullopt, true));
-  decision = owner->EvaluateMotionAttention({"resource.arm.b"});
-  ASSERT_EQ(decision.matching_alarms.size(), 1U);
-  EXPECT_EQ(decision.matching_alarms.front().condition_id, scope.condition_id);
+  projection = *owner->MotionAttentionProjection();
+  EXPECT_TRUE(GateMembers(projection, false).empty());
+  EXPECT_EQ(GateMembers(projection, true),
+            std::vector<std::string>{scope.condition_id});
 
   // Return to normal ends the gate at once and leaves the live list without
   // a returned-unacknowledged state.
@@ -497,7 +603,9 @@ TEST_F(AlarmOwnerTest,
   EXPECT_EQ(snapshot.motion_attention_count, 0U);
   EXPECT_EQ(snapshot.live_count, 1U);
   EXPECT_EQ(snapshot.alarms.front().condition_id, provider.condition_id);
-  EXPECT_FALSE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+  projection = *owner->MotionAttentionProjection();
+  EXPECT_TRUE(projection.reconciled);
+  EXPECT_TRUE(projection.members.empty());
   ASSERT_EQ(owner->TerminalRecords().size(), 1U);
   EXPECT_EQ(owner->TerminalRecords().front().condition_id, scope.condition_id);
 
@@ -505,7 +613,8 @@ TEST_F(AlarmOwnerTest,
   EXPECT_EQ(recurred.status, "recurred");
   EXPECT_EQ(recurred.records.front().lifecycle_state,
             AlarmLifecycleState::kActiveAcknowledged);
-  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.a"}).blocked);
+  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), true),
+            std::vector<std::string>{scope.condition_id});
 }
 
 TEST_F(AlarmOwnerTest,
@@ -513,6 +622,7 @@ TEST_F(AlarmOwnerTest,
   auto owner = std::make_unique<AlarmLifecycleOwner>(
       OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
       std::string(kCellId), "alarm.owner", "alarm.owner.epoch.1",
+      manyforge::core::HostBootStamp{"boot.test", 7U},
       [this]() { return ++monotonic_ns_; },
       [this]() { return "2026-08-05T00:00:00Z"; },
       std::set<std::string>{"motion"});
@@ -521,6 +631,14 @@ TEST_F(AlarmOwnerTest,
                         "motion.epoch.1", 1U);
   owner->CompleteSourceSnapshot("motion.source", "motion.epoch.1",
                                 AlarmConditionQuality::kGood);
+  // The projection names the configuration its subjects were judged against;
+  // none before one is observed.
+  EXPECT_FALSE(
+      owner->MotionAttentionProjection()->active_configuration.has_value());
+  EXPECT_NE(content_identity::canonical_json(OperatorAlarmMotionAttentionValue(
+                *owner->MotionAttentionProjection()))
+                .find("\"active_configuration\":null"),
+            std::string::npos);
 
   // Empty startup: no configuration is active, so no resource is either.
   ExpectAlarmError(
@@ -540,8 +658,24 @@ TEST_F(AlarmOwnerTest,
   // The replacement configuration names other resources. The admitted
   // alarm is kept; a new activation on a removed resource is refused and
   // does not disturb the current feed or its retained member.
+  const auto before_replacement = owner->Snapshot().generation;
   owner->ReplaceResourceRegistry(Registry("bundle.b", {"resource.arm.b"}));
   EXPECT_EQ(owner->Snapshot().live_count, 1U);
+  // A new configuration identity advances the generation and is published.
+  const auto replaced = owner->MotionAttentionProjection();
+  EXPECT_GT(replaced->generation, before_replacement);
+  EXPECT_EQ(replaced->generation, owner->Snapshot().generation);
+  ASSERT_TRUE(replaced->active_configuration.has_value());
+  EXPECT_EQ(*replaced->active_configuration,
+            (AlarmConfigurationIdentity{"bundle.b", "graph.bundle.b"}));
+  EXPECT_NE(content_identity::canonical_json(
+                OperatorAlarmMotionAttentionValue(*replaced))
+                .find("\"active_configuration\":{\"graph_revision\":"
+                      "\"graph.bundle.b\",\"retained_bundle_id\":\"bundle.b\"}"),
+            std::string::npos);
+  // Re-observing the same configuration is not a new identity.
+  owner->ReplaceResourceRegistry(Registry("bundle.b", {"resource.arm.b"}));
+  EXPECT_EQ(owner->Snapshot().generation, replaced->generation);
   ExpectAlarmError(
       [&]() {
         static_cast<void>(owner->Submit(
@@ -554,9 +688,10 @@ TEST_F(AlarmOwnerTest,
   auto snapshot = owner->Snapshot();
   EXPECT_TRUE(snapshot.reconciled);
   EXPECT_EQ(snapshot.live_count, 2U);
-  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
-  EXPECT_EQ(owner->EvaluateMotionAttention({"resource.arm.a"}).reason_code,
-            "operator_alarm_admission_scope_invalid");
+  // Both gate: the retained alarm keeps its admitted resources after the
+  // replacement configuration no longer names them.
+  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), false),
+            (SortedIds({retained.condition_id, replacement.condition_id})));
 
   // The retained alarm still follows its lifecycle: its own return to normal
   // is accepted, and it can be acknowledged.
@@ -575,7 +710,7 @@ TEST_F(AlarmOwnerTest,
 
   const auto metrics = owner->Metrics();
   EXPECT_EQ(metrics.totals.at("scope_rejections"), 2U);
-  EXPECT_EQ(metrics.totals.at("resource_registry_replacements"), 2U);
+  EXPECT_EQ(metrics.totals.at("resource_registry_replacements"), 3U);
 }
 
 TEST_F(AlarmOwnerTest, CapacityAndTerminalRetentionNeverEvictLiveAttention) {
@@ -591,7 +726,7 @@ TEST_F(AlarmOwnerTest, CapacityAndTerminalRetentionNeverEvictLiveAttention) {
   auto snapshot = owner->Snapshot();
   EXPECT_EQ(snapshot.live_count, 2U);
   EXPECT_FALSE(snapshot.health_errors.empty());
-  EXPECT_TRUE(owner->EvaluateMotionAttention({"resource.arm.b"}).blocked);
+  EXPECT_FALSE(owner->MotionAttentionProjection()->reconciled);
 
   owner->ReconcileHealth("operator_alarm_condition_capacity_exhausted");
   const auto terminalize = snapshot.alarms.front();

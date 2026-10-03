@@ -2,14 +2,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -1098,6 +1102,155 @@ TEST(HeadlessApiCore, CommittedActivationRefusesAHistoryThatMissesAPublication) 
   } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "program_activation_history_incomplete");
   }
+}
+
+/// A monotonic clock that parks one chosen thread inside its read. A parked
+/// `RefreshLocked` holds the core coordination lock for as long as wanted.
+struct ParkingMonotonicClock final {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::optional<std::thread::id> parked_thread;
+  bool parked{};
+  std::atomic<std::int64_t> now_ns{1000};
+
+  std::int64_t Read() {
+    std::unique_lock lock(mutex);
+    if (parked_thread == std::this_thread::get_id()) {
+      parked = true;
+      changed.notify_all();
+      changed.wait(lock, [this]() { return !parked_thread.has_value(); });
+      parked = false;
+    }
+    return now_ns.load();
+  }
+};
+
+TEST(HeadlessApiCore,
+     MotionAttentionIsReadWithoutTheCoreLockAndReportsOverdueSources) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto clock = std::make_shared<ParkingMonotonicClock>();
+  HeadlessApiCore core(
+      Config(directory, "api.epoch.1"),
+      HeadlessApiCoreClocks{
+          []() {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+          },
+          [clock]() { return clock->Read(); },
+          []() { return "2026-08-05T00:00:00Z"; },
+      });
+  const auto attention = [&core]() {
+    const auto value = core.OperatorAlarmMotionAttention();
+    return std::pair{std::get<bool>(Member(value, "reconciled").storage()),
+                     Unsigned(value, "generation")};
+  };
+
+  // Before any completed refresh the sources' currency is unknown.
+  EXPECT_FALSE(attention().first);
+  const auto first = core.RefreshAlarmSources();
+  EXPECT_TRUE(std::get<bool>(Member(first, "refreshed").storage()));
+  static_cast<void>(
+      core.CompleteOperationEventSnapshot("execution-host.epoch.idle", 0U));
+  const auto [current, current_generation] = attention();
+  EXPECT_TRUE(current);
+  // Within the period R a refresh is not repeated and takes no core lock.
+  EXPECT_FALSE(std::get<bool>(
+      Member(core.RefreshAlarmSources(), "refreshed").storage()));
+
+  // A reader's refresh holds the core coordination lock, parked inside it.
+  std::thread holder([&core, clock]() {
+    {
+      std::lock_guard lock(clock->mutex);
+      clock->parked_thread = std::this_thread::get_id();
+    }
+    static_cast<void>(core.RuntimeSnapshot());
+  });
+  {
+    std::unique_lock lock(clock->mutex);
+    ASSERT_TRUE(clock->changed.wait_for(lock, std::chrono::seconds(10),
+                                        [&clock]() { return clock->parked; }));
+  }
+  // The attention read neither waits for that lock nor refreshes.
+  EXPECT_EQ(attention(), std::pair(true, current_generation));
+  // Sources older than the currency bound C are reported, never served as
+  // current: a new generation that is not reconciled.
+  clock->now_ns += kAlarmSourceCurrencyBoundNs + 1;
+  const auto [overdue, overdue_generation] = attention();
+  EXPECT_FALSE(overdue);
+  EXPECT_GT(overdue_generation, current_generation);
+  // Repeated overdue reads name the same health fact: no generation churn.
+  EXPECT_EQ(attention(), std::pair(false, overdue_generation));
+  {
+    std::lock_guard lock(clock->mutex);
+    clock->parked_thread.reset();
+  }
+  clock->changed.notify_all();
+  holder.join();
+
+  // The completed refresh observed the sources now: currency is restored.
+  const auto [restored, restored_generation] = attention();
+  EXPECT_TRUE(restored);
+  EXPECT_GT(restored_generation, overdue_generation);
+  clock->now_ns += kAlarmSourceRefreshPeriodNs;
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RefreshAlarmSources(), "refreshed").storage()));
+}
+
+TEST(HeadlessApiCore,
+     OverdueMarkIsRedecidedAgainstARefreshThatCompletedMeanwhile) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  // A monotonic clock that runs one injected action inside a chosen read,
+  // interleaving a completed refresh between the attention read's overdue
+  // observation and its health mark, deterministically on one thread.
+  struct InterleavingClock final {
+    std::int64_t now_ns{1000};
+    std::function<void()> on_next_read;
+  };
+  auto clock = std::make_shared<InterleavingClock>();
+  HeadlessApiCore core(
+      Config(directory, "api.epoch.1"),
+      HeadlessApiCoreClocks{
+          []() {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+          },
+          [clock]() {
+            if (auto action = std::exchange(clock->on_next_read, nullptr)) {
+              action();
+            }
+            return clock->now_ns;
+          },
+          []() { return "2026-08-05T00:00:00Z"; },
+      });
+  static_cast<void>(core.RefreshAlarmSources());
+  static_cast<void>(
+      core.CompleteOperationEventSnapshot("execution-host.epoch.idle", 0U));
+  const auto attention = [&core]() {
+    const auto value = core.OperatorAlarmMotionAttention();
+    return std::pair{std::get<bool>(Member(value, "reconciled").storage()),
+                     Unsigned(value, "generation")};
+  };
+  ASSERT_TRUE(attention().first);
+
+  // The attention read loads the old refresh time, then reads the clock; a
+  // refresh completes inside that clock read, so the stale observation says
+  // overdue although the sources are current when the mark is decided.
+  clock->now_ns += kAlarmSourceCurrencyBoundNs + 1;
+  std::optional<std::uint64_t> refreshed_generation;
+  clock->on_next_read = [&core, &refreshed_generation, &attention]() {
+    ASSERT_TRUE(std::get<bool>(
+        Member(core.RefreshAlarmSources(), "refreshed").storage()));
+    refreshed_generation = attention().second;
+  };
+  const auto [reconciled, generation] = attention();
+  ASSERT_TRUE(refreshed_generation.has_value());
+  EXPECT_TRUE(reconciled);
+  EXPECT_EQ(generation, *refreshed_generation);
+  EXPECT_EQ(attention(), std::pair(true, *refreshed_generation));
 }
 
 TEST(HeadlessApiCore,

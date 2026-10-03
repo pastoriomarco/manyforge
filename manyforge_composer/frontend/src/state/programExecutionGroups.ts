@@ -204,6 +204,8 @@ export function appliedExecutionSelectionRows(
         resumeUnavailableReason: 'program_run_not_active',
         runtimeScaleSelector: scale.selector,
         runtimeScaleUnavailableReason: scale.reason,
+        // No run reserves anything yet; release is unavailable regardless.
+        resourceIds: [],
       } satisfies ProgramExecutionSelectionRow;
     });
 }

@@ -268,6 +268,42 @@ class ProgramRunAttemptSource:
         )
 
 
+def _effectful_target_roles(entry: Any, parameters: Mapping[str, Any]) -> frozenset[str]:
+    """Target roles a node's effectful target-binding requirements name.
+
+    The same rule the Kernel's captured node table uses for a node's
+    effectful target effects: a ``when`` condition and the target parameter
+    take the node's literal value, else the catalog default.
+    """
+
+    defaults = {
+        parameter.id: parameter.default
+        for parameter in entry.parameters
+        if parameter.has_default
+    }
+
+    def effective(parameter_id: str) -> Any:
+        return parameters[parameter_id] if parameter_id in parameters else defaults.get(parameter_id)
+
+    roles: set[str] = set()
+    for requirement in entry.required_capabilities:
+        if (
+            requirement.scope != "target_binding"
+            or not requirement.effectful
+            or requirement.target_parameter is None
+        ):
+            continue
+        if (
+            requirement.when_parameter is not None
+            and effective(requirement.when_parameter) != requirement.when_equals
+        ):
+            continue
+        role = effective(requirement.target_parameter)
+        if isinstance(role, str) and role:
+            roles.add(role)
+    return frozenset(roles)
+
+
 def _program_node_ids(node: ProgramTreeNode) -> tuple[str, ...]:
     result = {node.node_id}
     for child in node.children:
@@ -336,6 +372,7 @@ class ExecutableProgramRun:
         self._environment = environment
         self._capture = capture
         motion_target_by_node: dict[str, str] = {}
+        effect_targets_by_node: dict[str, frozenset[str]] = {}
         pending_nodes = [program.tree]
         while pending_nodes:
             node = pending_nodes.pop()
@@ -343,7 +380,18 @@ class ExecutableProgramRun:
                 target_role = node.parameters.get("target_role")
                 if isinstance(target_role, str) and target_role:
                     motion_target_by_node[node.instance_id] = target_role
+            effect_targets_by_node[node.instance_id] = _effectful_target_roles(
+                environment.catalog.get(node.node_id), node.parameters
+            )
             pending_nodes.extend(node.children)
+        self._selection_effect_target_roles = MappingProxyType({
+            group_id: tuple(sorted({
+                role
+                for node_id in node_ids
+                for role in effect_targets_by_node.get(node_id, ())
+            }))
+            for group_id, node_ids in program.execution_selections.items()
+        })
         self._selection_motion_target_roles = MappingProxyType({
             group_id: tuple(sorted({
                 motion_target_by_node[node_id]
@@ -925,6 +973,23 @@ class ExecutableProgramRun:
                 "execution selection is not in this capture"
             ) from error
 
+    def execution_selection_effect_target_roles(
+        self, group_id: str
+    ) -> tuple[str, ...]:
+        """Return the target roles of every effectful node in one selection.
+
+        With the sealed Program Binding these name the exact resources the
+        Kernel reserves for the selection's Run/Resume; presentation uses
+        them to anticipate operator-alarm motion attention (spec 450 §5.2).
+        """
+
+        try:
+            return self._selection_effect_target_roles[group_id]
+        except KeyError as error:
+            raise ProgramRuntimeError(
+                "execution selection is not in this capture"
+            ) from error
+
     def execution_selection_request(
         self, group_id: str | list[str], request_id: str
     ) -> dict[str, Any]:
@@ -943,6 +1008,29 @@ class ExecutableProgramRun:
                 "request_id": request_id,
                 "request_owner_epoch": kernel_epoch,
                 "source_label": "program_selection_control",
+                "correlation_id": None,
+            },
+        }
+
+    def node_motion_attention_request(
+        self, node_instance_id: str, request_id: str
+    ) -> dict[str, Any]:
+        """Kernel no-effect attention check for one captured node."""
+        if self._scope_identity is None:
+            raise ProgramRuntimeError("Program execution scope is not captured")
+        if node_instance_id not in self._authored_nodes:
+            raise ProgramRuntimeError("node is not in this capture")
+        kernel_epoch, runner_epoch, claim = self._scope_identity
+        return {
+            "schema_version": "manyforge.program_node_motion_attention_check.v1",
+            "program_runner_owner_epoch": runner_epoch,
+            "claim_generation": claim,
+            "program_run_id": self._capture.program_run_id,
+            "node_instance_id": node_instance_id,
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": kernel_epoch,
+                "source_label": "program_recovery_control",
                 "correlation_id": None,
             },
         }

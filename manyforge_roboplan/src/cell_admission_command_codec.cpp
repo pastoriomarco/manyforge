@@ -327,6 +327,73 @@ core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(const Value &v) {
   return result;
 }
 
+core::OperatorAlarmAttentionSnapshotDTO
+OperatorAlarmAttention(const Value &v) {
+  Exact(v, 9U);
+  Require(Text(v, "schema_version") == core::kOperatorAlarmAttentionSchemaVersion,
+          "operator-alarm attention schema is unsupported");
+  core::OperatorAlarmAttentionSnapshotDTO snapshot;
+  snapshot.active_configuration =
+      Optional<core::OperatorAlarmAttentionConfigurationDTO>(
+          v, "active_configuration", [](const Value &x) {
+            Exact(x, 2U);
+            return core::OperatorAlarmAttentionConfigurationDTO{
+                core::RetainedBundleId(
+                    Text(x, "retained_bundle_id",
+                         core::kMaximumOperatorAlarmAttentionTextBytes)),
+                core::GraphRevision(
+                    Text(x, "graph_revision",
+                         core::kMaximumOperatorAlarmAttentionTextBytes))};
+          });
+  snapshot.cell_id = core::CellId(
+      Text(v, "cell_id", core::kMaximumOperatorAlarmAttentionTextBytes));
+  snapshot.owner_epoch =
+      Text(v, "owner_epoch", core::kMaximumOperatorAlarmAttentionTextBytes);
+  snapshot.owner_host_boot_id = Text(
+      v, "owner_host_boot_id", core::kMaximumOperatorAlarmAttentionTextBytes);
+  snapshot.owner_incarnation_us = Counter(v, "owner_incarnation_us", 1U);
+  snapshot.generation = Counter(v, "generation");
+  snapshot.reconciled = Bool(v, "reconciled");
+  const auto &members = Member(v, "members");
+  Require(members.is_array() &&
+              members.as_array().size() <=
+                  core::kMaximumOperatorAlarmAttentionMembers,
+          "operator-alarm attention membership is malformed or oversized");
+  for (const auto &row : members.as_array()) {
+    Exact(row, 5U);
+    core::OperatorAlarmAttentionMemberDTO member;
+    member.condition_id =
+        Text(row, "condition_id", core::kMaximumOperatorAlarmAttentionTextBytes);
+    member.activation_id = Text(row, "activation_id",
+                                core::kMaximumOperatorAlarmAttentionTextBytes);
+    member.record_revision = Counter(row, "record_revision", 1U);
+    const auto gate = Text(row, "gate");
+    Require(gate == "condition_interlock" || gate == "acknowledgement",
+            "operator-alarm attention gate is unsupported");
+    member.gate = gate == "condition_interlock"
+                      ? core::OperatorAlarmAttentionGateDTO::kConditionInterlock
+                      : core::OperatorAlarmAttentionGateDTO::kAcknowledgement;
+    const auto &subject = Member(row, "subject");
+    Exact(subject, 3U);
+    member.subject_kind = Text(subject, "subject_kind",
+                               core::kMaximumOperatorAlarmAttentionTextBytes);
+    member.subject_id = Text(subject, "subject_id",
+                             core::kMaximumOperatorAlarmAttentionTextBytes);
+    const auto &resources = Member(subject, "resource_ids");
+    Require(resources.is_array() &&
+                resources.as_array().size() <=
+                    core::kMaximumOperatorAlarmSubjectResources,
+            "operator-alarm subject resources are malformed or oversized");
+    for (const auto &resource : resources.as_array()) {
+      Require(resource.is_string(),
+              "operator-alarm subject resource has the wrong type");
+      member.resource_ids.emplace_back(resource.as_string());
+    }
+    snapshot.members.push_back(std::move(member));
+  }
+  return snapshot;
+}
+
 Value OptionalValue(const auto &v, auto encode) {
   return v.has_value() ? encode(*v) : Value(nullptr);
 }
@@ -480,7 +547,8 @@ bool IsCommand(std::string_view v) {
          v == "cell_admission_update_readiness" ||
          v == "cell_admission_acquire" || v == "cell_admission_release" ||
          v == "cell_admission_reconcile" ||
-         v == "cell_admission_recovery_receipt";
+         v == "cell_admission_recovery_receipt" ||
+         v == cm::kPublishOperatorAlarmAttentionCommand;
 }
 } // namespace
 
@@ -531,6 +599,9 @@ TryDecodeCellAdmissionCommand(std::string_view bytes) {
     return cm::KernelCellAdmissionRpcPacket{command, Release(request)};
   if (command == "cell_admission_recovery_receipt")
     return cm::KernelCellAdmissionRpcPacket{command, RecoveryQuery(request)};
+  if (command == cm::kPublishOperatorAlarmAttentionCommand)
+    return cm::KernelCellAdmissionRpcPacket{command,
+                                            OperatorAlarmAttention(request)};
   return cm::KernelCellAdmissionRpcPacket{command, Reconcile(request)};
 }
 
@@ -554,6 +625,14 @@ Value CellAdmissionResponseValue(
                std::get_if<core::CellAdmissionRecoveryReceiptDTO>(&response))
     result.emplace_back("recovery_receipt",
                         RecoveryReceiptValue(*receipt));
+  else if (const auto *attention =
+               std::get_if<core::OperatorAlarmAttentionAcceptedDTO>(&response))
+    result.emplace_back(
+        "operator_alarm_attention",
+        Value(Value::Object{
+            {"generation",
+             Value(static_cast<double>(attention->generation))},
+            {"owner_epoch", Value(attention->owner_epoch)}}));
   else
     result.emplace_back(
         "authoring_admission",

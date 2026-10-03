@@ -170,6 +170,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
           startAllowed: false, startUnavailableReason: null,
           resumeAllowed: true, resumeUnavailableReason: null,
           runtimeScaleSelector: null, runtimeScaleUnavailableReason: null,
+          resourceIds: [],
         }],
       },
     },

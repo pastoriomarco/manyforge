@@ -1,4 +1,5 @@
 import type { StructuredError } from '../types/api';
+import { refusalMembershipConditionIds } from './operatorAlarmRefusal';
 
 /**
  * The one display projection of a StructuredError: run status, recovery offer
@@ -78,6 +79,16 @@ export function structuredErrorRows({ details, origin }: FailureContext): Struct
     });
     // A null path or reference is part of this row, not a separate detail.
     shown.add('path').add('source_reference').add('input_problem');
+  }
+  // Operator-alarm attention refusals carry both gating memberships.
+  for (const [key, label] of [
+    ['interlock_alarms', 'Alarm interlocks'],
+    ['unacknowledged_alarms', 'Unacknowledged alarms'],
+  ] as const) {
+    const membership = text(key);
+    if (membership === null) continue;
+    const conditions = refusalMembershipConditionIds(membership);
+    if (conditions.length > 0) rows.push({ label, value: conditions.join(', ') });
   }
   const requiredAction = text('required_action');
   if (requiredAction !== null) {

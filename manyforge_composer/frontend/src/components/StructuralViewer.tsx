@@ -4096,6 +4096,7 @@ function StructuralViewerContent({
                     <button
                       type="button"
                       disabled={selectedCameraTarget === null}
+                      title="Move the camera to the selected item. Nothing is changed."
                       onClick={() => issueCameraCommand('frame_selection')}
                     >Frame selection</button>
                     {selectedObject !== null && (

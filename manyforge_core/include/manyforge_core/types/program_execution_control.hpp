@@ -19,6 +19,21 @@ struct ProgramExecutionSelectionRequestDTO final {
                          const ProgramExecutionSelectionRequestDTO&) = default;
 };
 
+/// Internal no-effect operator-alarm attention check for one captured Program
+/// node: the held node a motion-producing recovery would move again. Only
+/// that node's effectful target resources are tested (spec 450 §5.2), so an
+/// alarm on disjoint resources does not block its recovery.
+struct ProgramNodeMotionAttentionCheckDTO final {
+  PublicRequestContextDTO request_context;
+  RequestOwnerEpoch program_runner_owner_epoch;
+  CellAdmissionClaimGeneration claim_generation;
+  ProgramRunId program_run_id;
+  ProgramNodeInstanceId node_instance_id;
+  RequestAttributionDTO attribution;
+  friend bool operator==(const ProgramNodeMotionAttentionCheckDTO&,
+                         const ProgramNodeMotionAttentionCheckDTO&) = default;
+};
+
 enum class ProgramNodeHoldStateDTO : std::uint8_t {
   kRunning,
   kReady,

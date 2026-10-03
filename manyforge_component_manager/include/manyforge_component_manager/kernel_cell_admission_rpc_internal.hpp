@@ -24,7 +24,14 @@ using KernelCellAdmissionRpcRequest =
                  manyforge::core::CellAdmissionReconcileDTO,
                  manyforge::core::CellAdmissionRecoveryReceiptQueryDTO,
                  manyforge::core::ProgramResetSceneAuthorizationDTO,
-                 manyforge::core::ManagerLivenessObservationDTO>;
+                 manyforge::core::ManagerLivenessObservationDTO,
+                 manyforge::core::OperatorAlarmAttentionSnapshotDTO>;
+
+/// `cell_admission_publish_operator_alarm_attention` is accepted only on the
+/// execution command socket (Headless to Kernel). It is never forwarded over
+/// the Manager-child binary channel, whose codec refuses it.
+inline constexpr std::string_view kPublishOperatorAlarmAttentionCommand =
+    "cell_admission_publish_operator_alarm_attention";
 
 struct KernelCellAdmissionRpcPacket final {
   std::string command;
@@ -36,7 +43,8 @@ using KernelCellAdmissionRpcResponse =
                  manyforge::core::AuthoringAdmissionDTO,
                  manyforge::core::CellAdmissionClaimDTO,
                  manyforge::core::CellAdmissionRecoveryReceiptDTO,
-                 manyforge::core::ErrorDTO>;
+                 manyforge::core::ErrorDTO,
+                 manyforge::core::OperatorAlarmAttentionAcceptedDTO>;
 
 struct KernelCellAdmissionRpcResponsePacket final {
   std::string command;

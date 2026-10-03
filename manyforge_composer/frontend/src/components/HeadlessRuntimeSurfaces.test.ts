@@ -5,6 +5,7 @@ import {
   HeadlessRuntimeSurfacesView,
   attentionAlarmsNewestFirst,
   historianEventView,
+  motionInterlockMessage,
   operatorAlarmView,
   runtimeAttentionSummary,
 } from './HeadlessRuntimeSurfaces';
@@ -110,8 +111,23 @@ describe('headless Composer presentation adapters', () => {
 
     expect(operatorAlarmView(alarm).lifecycleLabel)
       .toBe('ACTIVE — NO ACKNOWLEDGEMENT REQUIRED');
-    expect(operatorAlarmView({ ...alarm, acknowledgementRequired: true }).lifecycleLabel)
+    expect(operatorAlarmView(alarm).operatorResponse).toBe(
+      'Motion blocked by an active interlock: Fault alarm scope unavailable; '
+        + 'resolve its cause — acknowledgement does not release it. '
+        + 'Resolve the refused faults.',
+    );
+    const acknowledgementGated = { ...alarm, acknowledgementRequired: true };
+    expect(operatorAlarmView(acknowledgementGated).lifecycleLabel)
       .toBe('ACTIVE — ACKNOWLEDGED');
+    expect(motionInterlockMessage(acknowledgementGated)).toBeNull();
+    expect(operatorAlarmView(acknowledgementGated).operatorResponse)
+      .toBe('Resolve the refused faults.');
+    const returned = {
+      ...alarm,
+      lifecycleState: 'returned_acknowledged' as const,
+      active: false,
+    };
+    expect(motionInterlockMessage(returned)).toBeNull();
   });
 
   it('selects attention panels by newest activation rather than server priority', () => {
@@ -309,6 +325,7 @@ describe('headless Composer presentation adapters', () => {
         activeCount: 2,
         activeAcknowledgedCount: 1,
         motionAttentionCount: 1,
+        motionAttentionMembership: [],
         unacknowledgedMembership: [{
           conditionId: attentionAlarm.conditionId,
           activationId: attentionAlarm.activationId,
@@ -426,6 +443,7 @@ describe('headless Composer presentation adapters', () => {
             unacknowledgedCount: 0,
             activeCount: 1,
             motionAttentionCount: 0,
+            motionAttentionMembership: [],
             unacknowledgedMembership: [],
             alarms: [standingAlarm],
           },

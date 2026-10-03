@@ -2730,7 +2730,9 @@ TEST(ResourceAddressedExecutionKernelTest,
                                      physical.controllable_component_id,
                                      physical.command_target_id,
                                      {},
-                                     {},
+                                     {{ResourceRoleId("arm_joints"),
+                                       {physical.resources.front().resource_id},
+                                       {physical.resources.front().compiled_resource_name}}},
                                      {},
                                      {}};
   binding->target_role_bindings.push_back(std::move(target));
@@ -17965,6 +17967,1101 @@ TEST(ResourceAddressedExecutionKernelTest, StopFaultLatchClosesMotionPreview) {
   const auto preview = kernel.begin_motion_preview_session(motion_operation("preview.latched"));
   ASSERT_FALSE(preview.ok());
   EXPECT_EQ(preview.error().details.at("reason"), "motion_admission_closed");
+}
+
+// --- Operator-alarm motion attention (spec 450 §5.2, spec 530 §11) -------
+
+constexpr Duration kAttentionMaximumAgeNs = 2'000'000'000;
+constexpr const char* kAttentionHostBootId = "boot.test";
+
+[[nodiscard]] OperatorAlarmAttentionMemberDTO alarm_member(
+    std::string condition, OperatorAlarmAttentionGateDTO gate,
+    std::vector<std::string> resources) {
+  OperatorAlarmAttentionMemberDTO member;
+  member.condition_id = std::move(condition);
+  member.activation_id = member.condition_id + ".activation.1";
+  member.record_revision = 1U;
+  member.gate = gate;
+  member.subject_kind = resources.empty() ? "cell" : "component";
+  member.subject_id = resources.empty() ? "cell.test" : "robot";
+  for (auto& resource : resources) member.resource_ids.emplace_back(std::move(resource));
+  return member;
+}
+
+/// The active configuration every `make_binding` registration declares.
+[[nodiscard]] OperatorAlarmAttentionConfigurationDTO kernel_active_configuration() {
+  return {RetainedBundleId(test_digest('6')), GraphRevision(test_digest('7'))};
+}
+
+[[nodiscard]] OperatorAlarmAttentionSnapshotDTO attention_snapshot(
+    std::uint64_t generation, std::vector<OperatorAlarmAttentionMemberDTO> members = {},
+    bool reconciled = true, std::string owner_epoch = "alarm.owner.1",
+    std::uint64_t owner_incarnation_us = 1U,
+    std::optional<OperatorAlarmAttentionConfigurationDTO> active_configuration =
+        kernel_active_configuration()) {
+  OperatorAlarmAttentionSnapshotDTO snapshot;
+  snapshot.active_configuration = std::move(active_configuration);
+  snapshot.cell_id = CellId("cell.test");
+  snapshot.owner_epoch = std::move(owner_epoch);
+  snapshot.owner_host_boot_id = kAttentionHostBootId;
+  snapshot.owner_incarnation_us = owner_incarnation_us;
+  snapshot.generation = generation;
+  snapshot.reconciled = reconciled;
+  std::sort(members.begin(), members.end(),
+            [](const auto& left, const auto& right) { return left.condition_id < right.condition_id; });
+  snapshot.members = std::move(members);
+  return snapshot;
+}
+
+[[nodiscard]] bool all_slots_free(const ResourceAddressedExecutionKernel& kernel) {
+  const auto slots = kernel.resource_snapshot();
+  return std::all_of(slots.begin(), slots.end(),
+                     [](const auto& slot) { return slot.state == ResourceSlotState::kFree; });
+}
+
+[[nodiscard]] ResourceAddressedExecutionKernelConfig attention_config() {
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.operator_alarm_attention = OperatorAlarmAttentionPolicyDTO{kAttentionMaximumAgeNs,
+                                                                    kAttentionHostBootId};
+  return config;
+}
+
+[[nodiscard]] ProgramNodeMotionAttentionCheckDTO node_attention_check(std::string request_id,
+                                                                     std::string node) {
+  const auto selection = program_selection_request(std::move(request_id), "all");
+  return {selection.request_context,       selection.program_runner_owner_epoch,
+          selection.claim_generation,      selection.program_run_id,
+          ProgramNodeInstanceId(std::move(node)), {}};
+}
+
+/// The canonical JSON membership carried in a refusal's details.
+[[nodiscard]] std::vector<std::string> refusal_conditions(const ErrorDTO& error,
+                                                         const std::string& key) {
+  const auto& text = error.details.at(key);
+  std::vector<std::string> conditions;
+  const std::string marker = "\"condition_id\":\"";
+  for (auto at = text.find(marker); at != std::string::npos; at = text.find(marker, at)) {
+    at += marker.size();
+    conditions.push_back(text.substr(at, text.find('"', at) - at));
+  }
+  return conditions;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     InterlockAndAcknowledgementGatesRejectIntersectingRunReportingBothMemberships) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+
+  // An acknowledged condition interlock is still published as gating; the
+  // Kernel rejects with the interlock reason and carries both memberships.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      3U, {alarm_member("interlock.arm", OperatorAlarmAttentionGateDTO::kConditionInterlock,
+                                        {"robot.joint_1"}),
+                           alarm_member("ack.arm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto both = kernel.execute(motion_operation("alarm.both"));
+  ASSERT_FALSE(both.ok());
+  EXPECT_EQ(both.error().code, "operator_alarm_interlock_active");
+  EXPECT_EQ(both.error().details.at("reason"), "operator_alarm_interlock_active");
+  EXPECT_EQ(both.error().details.at("owner_epoch"), "alarm.owner.1");
+  EXPECT_EQ(both.error().details.at("generation"), "3");
+  EXPECT_EQ(refusal_conditions(both.error(), "interlock_alarms"),
+            std::vector<std::string>{"interlock.arm"});
+  EXPECT_EQ(refusal_conditions(both.error(), "unacknowledged_alarms"),
+            std::vector<std::string>{"ack.arm"});
+
+  // Acknowledging cannot release the interlock: only its clear does.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      4U, {alarm_member("interlock.arm",
+                                        OperatorAlarmAttentionGateDTO::kConditionInterlock,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto interlock = kernel.execute(motion_operation("alarm.interlock"));
+  ASSERT_FALSE(interlock.ok());
+  EXPECT_EQ(interlock.error().code, "operator_alarm_interlock_active");
+  EXPECT_TRUE(refusal_conditions(interlock.error(), "unacknowledged_alarms").empty());
+
+  // An acknowledgement-gated record gates until it is acknowledged.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      5U, {alarm_member("ack.arm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto unacknowledged = kernel.execute(motion_operation("alarm.unacknowledged"));
+  ASSERT_FALSE(unacknowledged.ok());
+  EXPECT_EQ(unacknowledged.error().code, "unacknowledged_operator_alarms");
+  EXPECT_TRUE(refusal_conditions(unacknowledged.error(), "interlock_alarms").empty());
+  EXPECT_EQ(engine.prepare_motion_calls, 0);
+  EXPECT_TRUE(all_slots_free(kernel));
+
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(6U)).ok());
+  const auto admitted = kernel.execute(motion_operation("alarm.acknowledged"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     DisjointResourcesContinueWhileCellGlobalSubjectBlocksEveryRun) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      1U, {alarm_member("other.robot",
+                                        OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.9.joint_1"})}))
+                  .ok());
+  const auto disjoint = kernel.execute(motion_operation("alarm.disjoint"));
+  ASSERT_TRUE(disjoint.ok()) << disjoint.error().message;
+
+  FakeParticipantEngine second_engine;
+  ResourceAddressedExecutionKernel blocked(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          second_engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(blocked
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      1U, {alarm_member("cell.scope", OperatorAlarmAttentionGateDTO::kConditionInterlock,
+                                        {})}))
+                  .ok());
+  const auto cell = blocked.execute(motion_operation("alarm.cell"));
+  ASSERT_FALSE(cell.ok());
+  EXPECT_EQ(cell.error().code, "operator_alarm_interlock_active");
+  EXPECT_EQ(refusal_conditions(cell.error(), "interlock_alarms"),
+            std::vector<std::string>{"cell.scope"});
+  EXPECT_EQ(second_engine.prepare_motion_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     CoordinatedAdmissionUsesTheUnionOfParticipantResources) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      1U, {alarm_member("second.robot",
+                                        OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.2.joint_1"})}))
+                  .ok());
+  const auto rejected = kernel.execute(coordinated_motion_operation("alarm.coordinated"));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "unacknowledged_operator_alarms");
+  EXPECT_EQ(first_engine.prepare_motion_calls, 0);
+  EXPECT_EQ(second_engine.prepare_motion_calls, 0);
+  EXPECT_TRUE(all_slots_free(kernel));
+  // The first participant alone is disjoint from the alarm and continues.
+  const auto single = kernel.execute(motion_operation("alarm.first.only"));
+  ASSERT_TRUE(single.ok()) << single.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     FinalPreDispatchRecheckRefusesAnAlarmRaisedAfterAdmission) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+  const auto accepted = kernel.execute(motion_operation("alarm.predispatch"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("late.arm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  ASSERT_TRUE(engine.complete_preparation().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = kernel.get_operation_projection(accepted.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.cancel_prepared_motion_calls, 1);
+  EXPECT_TRUE(all_slots_free(kernel));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(state.value().participants.front().terminal_error->code,
+            "unacknowledged_operator_alarms");
+}
+
+/// Publishes a blocking alarm, or ages the projection past its bound, while
+/// the Kernel's prepared-state journal write has released its state lock.
+void raise_attention_during_write(ResourceAddressedExecutionKernel& kernel, FakeClock& clock,
+                                  const bool stale) {
+  if (stale) {
+    clock.advance(kAttentionMaximumAgeNs + 1);
+    return;
+  }
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("late.arm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.2.joint_1", "robot.joint_1"})}))
+                  .ok());
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     AttentionRaisedDuringThePreparedStateWriteRefusesDispatch) {
+  for (const bool stale : {false, true}) {
+    SCOPED_TRACE(stale ? "projection aged out" : "blocking alarm published");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    engine.defer_prepare_completion = true;
+    FakeOperationJournal journal;
+    HeldSettlementCall held;
+    journal.record_hook = [&, block = held.Blocker()](std::string_view kind) {
+      if (kind == "state:subordinate_motion_prepared") block();
+    };
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, attention_config());
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+    const auto accepted = kernel.execute(motion_operation("alarm.write.window"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    auto prepared = std::async(std::launch::async, [&] { return engine.complete_preparation(); });
+    ASSERT_TRUE(held.Entered());
+    raise_attention_during_write(kernel, clock, stale);
+    held.Release();
+    ASSERT_TRUE(prepared.get().ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto projection = kernel.get_operation_projection(accepted.value().operation_id);
+      return projection.ok() && !projection.value().resident;
+    }));
+    EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
+    EXPECT_EQ(engine.execute_calls, 0);
+    EXPECT_EQ(engine.cancel_prepared_motion_calls, 1);
+    EXPECT_TRUE(all_slots_free(kernel));
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok()) << state.error().message;
+    EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+    ASSERT_EQ(state.value().participants.size(), 1U);
+    ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+    EXPECT_EQ(state.value().participants.front().terminal_error->code,
+              stale ? "operator_alarm_state_unavailable" : "unacknowledged_operator_alarms");
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     AttentionRaisedDuringTheCoordinatedBarrierWriteCancelsEveryParticipant) {
+  for (const bool stale : {false, true}) {
+    SCOPED_TRACE(stale ? "projection aged out" : "blocking alarm published");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine;
+    FakeParticipantEngine second_engine;
+    first_engine.defer_prepare_completion = second_engine.defer_prepare_completion = true;
+    FakeOperationJournal journal;
+    HeldSettlementCall held;
+    journal.record_hook = [&, block = held.Blocker()](std::string_view kind) {
+      if (kind == "state:coordinated_prepare_barrier_complete") block();
+    };
+    const auto first =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    ResourceAddressedExecutionKernel kernel(
+        {registration(first, first_engine),
+         registration(coordinated_occurrence(first, "2"), second_engine)},
+        clock, scheduler, journal, attention_config());
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+    const auto accepted = kernel.execute(coordinated_motion_operation("alarm.barrier.window"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    auto prepared = std::async(std::launch::async, [&] {
+      const auto first_prepared = first_engine.complete_preparation();
+      return first_prepared.ok() ? second_engine.complete_preparation() : first_prepared;
+    });
+    ASSERT_TRUE(held.Entered());
+    raise_attention_during_write(kernel, clock, stale);
+    held.Release();
+    ASSERT_TRUE(prepared.get().ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto projection = kernel.get_operation_projection(accepted.value().operation_id);
+      return projection.ok() && !projection.value().resident;
+    }));
+    for (const auto* engine : {&first_engine, &second_engine}) {
+      EXPECT_EQ(engine->dispatch_prepared_motion_calls, 0);
+      EXPECT_EQ(engine->cancel_prepared_motion_calls, 1);
+    }
+    EXPECT_TRUE(all_slots_free(kernel));
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok()) << state.error().message;
+    EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+    ASSERT_EQ(state.value().participants.size(), 2U);
+    for (const auto& participant : state.value().participants) {
+      ASSERT_TRUE(participant.terminal_error.has_value());
+      EXPECT_EQ(participant.terminal_error->code,
+                stale ? "operator_alarm_state_unavailable" : "unacknowledged_operator_alarms");
+    }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     AttentionRaisedDuringTheResumeAcceptanceWriteRefusesItsDispatch) {
+  for (const bool stale : {false, true}) {
+    SCOPED_TRACE(stale ? "projection aged out" : "blocking alarm published");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, attention_config());
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+    const auto admitted = kernel.execute(motion_operation("alarm.resume.window"));
+    ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      return engine.execute_calls == 1 && engine.get_status().state == ExecutionState::kPlanning;
+    }));
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    ASSERT_TRUE(kernel.pause(control_request("alarm.resume.window.pause", admitted.value(), 1U))
+                    .ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return engine.pause_calls.load() == 1 && state.ok() &&
+             state.value().state == OperationStateKind::kStopping;
+    }));
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return state.ok() && state.value().state == OperationStateKind::kPaused;
+    }));
+    // Resume admission passes; the attention changes while its durable
+    // acceptance write runs without the state lock.
+    HeldSettlementCall held;
+    journal.control_acceptance_hook = held.Blocker();
+    auto resumed = std::async(std::launch::async, [&] {
+      return kernel.resume(control_request("alarm.resume.window.resume", admitted.value(), 2U));
+    });
+    ASSERT_TRUE(held.Entered());
+    raise_attention_during_write(kernel, clock, stale);
+    held.Release();
+    const auto accepted = resumed.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      return engine.cancel_prepared_resume_motion_calls.load() == 1;
+    }));
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+    }));
+    EXPECT_EQ(engine.prepare_resume_motion_calls.load(), 1);
+    EXPECT_EQ(engine.dispatch_prepared_resume_motion_calls.load(), 0);
+    EXPECT_EQ(engine.resume_calls.load(), 0);
+    const auto state = kernel.get_operation_state(admitted.value().operation_id);
+    ASSERT_TRUE(state.ok()) << state.error().message;
+    ASSERT_EQ(state.value().participants.size(), 1U);
+    ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+    EXPECT_EQ(state.value().participants.front().terminal_error->code,
+              stale ? "operator_alarm_state_unavailable" : "unacknowledged_operator_alarms");
+  }
+}
+
+/// The final pre-dispatch recheck sits in the lock hold that releases the
+/// first prepared Resume, not at the barrier claim: attention that changes
+/// after the claim (a blocking alarm published, or the projection aging out)
+/// must still refuse every dispatch and cancel every prepared participant.
+/// The seam runs exactly inside that claim-to-release window.
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     AttentionChangedAfterThePreparedResumeBarrierClaimRefusesEveryDispatch) {
+  for (const bool coordinated : {false, true}) {
+    for (const bool stale : {false, true}) {
+      SCOPED_TRACE(std::string(coordinated ? "coordinated" : "single") + " Resume, " +
+                   (stale ? "projection aged out" : "blocking alarm published"));
+      FakeClock clock;
+      ManualScheduler scheduler;
+      FakeParticipantEngine first_engine;
+      FakeParticipantEngine second_engine;
+      std::atomic<int> pause_returns{};
+      first_engine.pause_return_hook = [&] { ++pause_returns; };
+      second_engine.pause_return_hook = [&] { ++pause_returns; };
+      ResourceAddressedExecutionKernel* resumed_kernel = nullptr;
+      std::atomic<int> barrier_claims{};
+      std::atomic<int> dispatches_at_claim{-1};
+      auto config = attention_config();
+      config.prepared_resume_barrier_claimed_seam = [&](const OperationId&) {
+        dispatches_at_claim = first_engine.dispatch_prepared_resume_motion_calls.load() +
+                              second_engine.dispatch_prepared_resume_motion_calls.load();
+        ++barrier_claims;
+        raise_attention_during_write(*resumed_kernel, clock, stale);
+      };
+      const auto first =
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      std::vector<FakeParticipantEngine*> engines{&first_engine};
+      std::vector<RuntimeParticipantExecutionRegistration> registrations{
+          registration(first, first_engine)};
+      if (coordinated) {
+        engines.push_back(&second_engine);
+        registrations.push_back(registration(coordinated_occurrence(first, "2"), second_engine));
+      }
+      ResourceAddressedExecutionKernel kernel(std::move(registrations), clock, scheduler,
+                                              default_journal, config);
+      resumed_kernel = &kernel;
+      ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+      const auto admitted =
+          kernel.execute(coordinated ? coordinated_motion_operation("alarm.barrier.claim")
+                                     : motion_operation("alarm.barrier.claim"));
+      ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+      ASSERT_TRUE(wait_until([&] {
+        return std::all_of(engines.begin(), engines.end(), [](const auto* engine) {
+          return engine->execute_calls == 1 &&
+                 engine->get_status().state == ExecutionState::kPlanning;
+        });
+      }));
+      for (auto* engine : engines) {
+        engine->emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+      }
+      ASSERT_TRUE(
+          kernel.pause(control_request("alarm.barrier.claim.pause", admitted.value(), 1U)).ok());
+      ASSERT_TRUE(wait_until(
+          [&] { return pause_returns.load() == static_cast<int>(engines.size()); }));
+      for (auto* engine : engines) {
+        engine->emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+      }
+      ASSERT_TRUE(wait_until([&] {
+        (void)kernel.reconcile_subordinate_state();
+        const auto state = kernel.get_operation_state(admitted.value().operation_id);
+        return state.ok() && state.value().state == OperationStateKind::kPaused;
+      }));
+      // Resume admission and its prepared barrier both pass; attention
+      // changes only after the barrier is claimed. (Resume is retried while
+      // the settled Pause control is still being retired.)
+      ASSERT_TRUE(wait_until([&] {
+        return kernel
+            .resume(control_request("alarm.barrier.claim.resume", admitted.value(), 2U))
+            .ok();
+      }));
+      ASSERT_TRUE(wait_until([&] {
+        (void)kernel.reconcile_subordinate_state();
+        const auto state = kernel.get_operation_state(admitted.value().operation_id);
+        return state.ok() && state.value().state == OperationStateKind::kInterventionRequired &&
+               std::all_of(engines.begin(), engines.end(), [](const auto* engine) {
+                 return engine->cancel_prepared_resume_motion_calls.load() == 1;
+               });
+      }));
+      EXPECT_EQ(barrier_claims.load(), 1);
+      EXPECT_EQ(dispatches_at_claim.load(), 0);
+      for (const auto* engine : engines) {
+        EXPECT_EQ(engine->prepare_resume_motion_calls.load(), 1);
+        EXPECT_EQ(engine->dispatch_prepared_resume_motion_calls.load(), 0);
+        EXPECT_EQ(engine->resume_calls.load(), 0);
+        EXPECT_EQ(engine->cancel_prepared_resume_motion_calls.load(), 1);
+      }
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      ASSERT_TRUE(state.ok()) << state.error().message;
+      ASSERT_EQ(state.value().participants.size(), engines.size());
+      const auto refusal =
+          stale ? "operator_alarm_state_unavailable" : "unacknowledged_operator_alarms";
+      EXPECT_TRUE(std::any_of(state.value().participants.begin(),
+                              state.value().participants.end(), [&](const auto& participant) {
+                                return participant.terminal_error.has_value() &&
+                                       participant.terminal_error->code == refusal;
+                              }));
+    }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     MissingUnreconciledOrStaleProjectionFailsClosed) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  const auto availability = [&](const std::string& request) {
+    const auto result = kernel.execute(motion_operation(request));
+    EXPECT_FALSE(result.ok());
+    if (result.ok()) return std::string("admitted");
+    EXPECT_EQ(result.error().code, "operator_alarm_state_unavailable");
+    return result.error().details.at("availability");
+  };
+  EXPECT_EQ(availability("alarm.missing"), "missing");
+  ASSERT_TRUE(
+      kernel.PublishOperatorAlarmAttention(attention_snapshot(1U, {}, /*reconciled=*/false)).ok());
+  EXPECT_EQ(availability("alarm.unreconciled"), "unreconciled");
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(2U)).ok());
+  clock.advance(kAttentionMaximumAgeNs + 1);
+  EXPECT_EQ(availability("alarm.stale"), "stale");
+  EXPECT_EQ(engine.prepare_motion_calls, 0);
+  // A same-generation heartbeat refreshes freshness.
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(2U)).ok());
+  const auto admitted = kernel.execute(motion_operation("alarm.fresh"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     PublicationIsGenerationAndOwnerEpochFenced) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  const auto accepted = kernel.PublishOperatorAlarmAttention(attention_snapshot(7U));
+  ASSERT_TRUE(accepted.ok());
+  EXPECT_EQ(accepted.value().owner_epoch, "alarm.owner.1");
+  EXPECT_EQ(accepted.value().generation, 7U);
+  const auto older = kernel.PublishOperatorAlarmAttention(attention_snapshot(
+      6U, {alarm_member("old", OperatorAlarmAttentionGateDTO::kAcknowledgement, {"robot.joint_1"})}));
+  ASSERT_FALSE(older.ok());
+  EXPECT_EQ(older.error().details.at("reason"), "operator_alarm_attention_generation_stale");
+  // One generation names one content: identical content is the heartbeat,
+  // different content under the retained generation is refused.
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(7U)).ok());
+  const auto conflicting = kernel.PublishOperatorAlarmAttention(attention_snapshot(
+      7U, {alarm_member("same.generation", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                        {"robot.joint_1"})}));
+  ASSERT_FALSE(conflicting.ok());
+  EXPECT_EQ(conflicting.error().code, "operator_alarm_attention_conflict");
+  EXPECT_EQ(conflicting.error().details.at("reason"),
+            "operator_alarm_attention_generation_conflict");
+  // A restarted owner (greater incarnation) replaces the retained epoch; the
+  // older incarnation cannot return.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(
+                      attention_snapshot(1U, {}, true, "alarm.owner.2", 2U))
+                  .ok());
+  const auto replaced = kernel.PublishOperatorAlarmAttention(attention_snapshot(8U));
+  ASSERT_FALSE(replaced.ok());
+  EXPECT_EQ(replaced.error().details.at("reason"),
+            "operator_alarm_attention_owner_incarnation_stale");
+  auto foreign = attention_snapshot(2U, {}, true, "alarm.owner.2", 2U);
+  foreign.cell_id = CellId("cell.other");
+  EXPECT_FALSE(kernel.PublishOperatorAlarmAttention(foreign).ok());
+  // Single-host precondition: another host boot is refused, never compared.
+  auto other_host = attention_snapshot(1U, {}, true, "alarm.owner.3", 3U);
+  other_host.owner_host_boot_id = "boot.other";
+  const auto other_host_refused = kernel.PublishOperatorAlarmAttention(other_host);
+  ASSERT_FALSE(other_host_refused.ok());
+  EXPECT_EQ(other_host_refused.error().details.at("reason"),
+            "operator_alarm_attention_host_mismatch");
+  auto invalid = attention_snapshot(
+      2U, {alarm_member("bad", OperatorAlarmAttentionGateDTO::kAcknowledgement, {})}, true,
+      "alarm.owner.2", 2U);
+  invalid.members.front().subject_id = "cell.other";
+  EXPECT_FALSE(kernel.PublishOperatorAlarmAttention(invalid).ok());
+  ASSERT_TRUE(kernel.execute(motion_operation("alarm.after.fence")).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     OwnerEpochsAreOrderedByIncarnationWithoutAnyReplacementBound) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  const auto epoch = [](std::size_t index) { return "alarm.owner." + std::to_string(index); };
+  // Far more than any former retirement bound: every newer incarnation wins.
+  constexpr std::size_t kReplacements = 200U;
+  for (std::size_t index = 0U; index <= kReplacements; ++index) {
+    ASSERT_TRUE(kernel
+                    .PublishOperatorAlarmAttention(
+                        attention_snapshot(1U, {}, true, epoch(index), 1'000U + index))
+                    .ok())
+        << index;
+  }
+  // Every older incarnation is refused, however long ago it was replaced.
+  for (const std::size_t older : {std::size_t{0U}, std::size_t{1U}, kReplacements - 1U}) {
+    const auto refused = kernel.PublishOperatorAlarmAttention(
+        attention_snapshot(9U, {}, true, epoch(older), 1'000U + older));
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "operator_alarm_attention_owner_incarnation_stale");
+  }
+  // An equal incarnation under another epoch is a conflict, not a successor.
+  const auto equal = kernel.PublishOperatorAlarmAttention(
+      attention_snapshot(1U, {}, true, "alarm.owner.impostor", 1'000U + kReplacements));
+  ASSERT_FALSE(equal.ok());
+  EXPECT_EQ(equal.error().details.at("reason"),
+            "operator_alarm_attention_owner_incarnation_conflict");
+  // The retained epoch cannot change its incarnation either.
+  const auto reincarnated = kernel.PublishOperatorAlarmAttention(
+      attention_snapshot(2U, {}, true, epoch(kReplacements), 5'000U));
+  ASSERT_FALSE(reincarnated.ok());
+  EXPECT_EQ(reincarnated.error().details.at("reason"),
+            "operator_alarm_attention_owner_incarnation_conflict");
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(
+                      attention_snapshot(2U, {}, true, epoch(kReplacements), 1'000U + kReplacements))
+                  .ok());
+  ASSERT_TRUE(kernel.execute(motion_operation("alarm.after.rollover")).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     ProgramRunReleaseAndItsNoEffectCheckUseTheSelectedNodesResources) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto config = attention_config();
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      1U, {alarm_member("arm.alarm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+
+  // The timer node has no effectful target and is not gated.
+  EXPECT_TRUE(kernel.check_program_node_motion_attention(node_attention_check("check.timer", "timer"))
+                  .ok());
+  const auto check =
+      kernel.check_program_node_motion_attention(node_attention_check("check.move", "move"));
+  ASSERT_FALSE(check.ok());
+  EXPECT_EQ(check.error().code, "unacknowledged_operator_alarms");
+  const auto unknown =
+      kernel.check_program_node_motion_attention(node_attention_check("check.unknown", "absent"));
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().details.at("reason"), "program_node_unknown");
+  const auto refused = kernel.start_program_selection(program_selection_request("run.arm", "arm"),
+                                                      initial.value().selection_revision);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "unacknowledged_operator_alarms");
+  const auto unchanged = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(unchanged.ok());
+  EXPECT_EQ(unchanged.value().selection_revision, initial.value().selection_revision);
+
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(2U)).ok());
+  const auto started = kernel.start_program_selection(
+      program_selection_request("run.arm.acknowledged", "arm"), initial.value().selection_revision);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  const auto admitted = kernel.execute(scoped_motion_operation("alarm.scoped.motion"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, ResumeIsRefusedWhileAnIntersectingAlarmGates) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+  const auto admitted = kernel.execute(motion_operation("alarm.resume.motion"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return engine.execute_calls == 1 && engine.get_status().state == ExecutionState::kPlanning;
+  }));
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  ASSERT_TRUE(kernel.pause(control_request("alarm.pause", admitted.value(), 1U)).ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(admitted.value().operation_id);
+    return engine.pause_calls.load() == 1 && state.ok() &&
+           state.value().state == OperationStateKind::kStopping;
+  }));
+  engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto state = kernel.get_operation_state(admitted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kPaused;
+  }));
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("arm.alarm", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto refused = kernel.resume(control_request("alarm.resume", admitted.value(), 2U));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "unacknowledged_operator_alarms");
+  EXPECT_EQ(engine.prepare_resume_motion_calls.load(), 0);
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(3U)).ok());
+  std::string resume_error;
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto resumed =
+        kernel.resume(control_request("alarm.resume.acknowledged", admitted.value(), 2U));
+    if (!resumed.ok()) resume_error = resumed.error().message;
+    return resumed.ok();
+  })) << resume_error;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     MotionProducingRecoveryIsRefusedWhileNonMovingAcknowledgeContinues) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "injected preparation failure",
+                                    {{"reason", "injected_preparation_failure"}}};
+  engine.recovery_assessment.assessment_revision = 7U;
+  engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
+  engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryMotionFromCurrentState,
+                                                RecoveryAction::kAcknowledgeAndContinue};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+  const auto accepted = kernel.execute(motion_operation("alarm.recovery.motion"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  ASSERT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
+  const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  const auto request = [&](std::string id, RecoveryAction action) {
+    const auto& assessment = projection.value().assessment;
+    return KernelRecoveryActionRequestDTO{std::move(id),
+                                          action,
+                                          "operator.test",
+                                          assessment.assessment_revision,
+                                          assessment.control_command_epoch,
+                                          assessment.execution_id,
+                                          assessment.latch_id,
+                                          assessment.stop_certificate_id,
+                                          assessment.stop_owner_generation,
+                                          "after alarm"};
+  };
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("arm.fault", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto refused = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision,
+      request("alarm.recovery.retry", RecoveryAction::kRetryMotionFromCurrentState));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "unacknowledged_operator_alarms");
+  EXPECT_EQ(engine.recovery_action_calls, 0);
+
+  // Acknowledge-and-continue moves nothing and stays available.
+  const auto acknowledge = request("alarm.recovery.continue", RecoveryAction::kAcknowledgeAndContinue);
+  auto resulting = projection.value().assessment;
+  resulting.assessment_revision = 8U;
+  resulting.status = RecoveryAssessmentStatus::kUnavailable;
+  engine.next_recovery_result =
+      KernelRecoveryActionResultDTO{acknowledge.request_id, acknowledge.action, true, resulting,
+                                    std::nullopt};
+  const auto continued = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, operation.value().operation_revision, acknowledge);
+  ASSERT_TRUE(continued.ok()) << continued.error().message;
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     RecoveryCheckTestsOnlyTheHeldNodesResources) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto config = attention_config();
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  // Robot A's node "move" and robot B's node "move.b" in one captured run.
+  auto capture = program_execution_capture();
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  auto robot_b = binding->target_role_bindings.front();
+  robot_b.target_role_id = TargetRoleId("arm_b");
+  robot_b.resource_role_bindings.front().resource_ids = {ResourceId("robot.b.joint_1")};
+  binding->target_role_bindings.push_back(std::move(robot_b));
+  capture.binding = std::move(binding);
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes.insert(table->nodes.begin() + 1,
+                      {ProgramNodeInstanceId("move.b"),
+                       "kernel.operation",
+                       {{TargetRoleId("arm_b"), CapabilityId("execution.trajectory.execute"),
+                         true}}});
+  table->named_selections = {{"arm", {0U, 1U}}, {"supervision", {2U}}};
+  capture.table = std::move(table);
+  ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+
+  // B's alarm does not block recovery of A's held node.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      1U, {alarm_member("robot_b.alarm",
+                                        OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.b.joint_1"})}))
+                  .ok());
+  EXPECT_TRUE(
+      kernel.check_program_node_motion_attention(node_attention_check("recover.a", "move")).ok());
+  const auto b_refused =
+      kernel.check_program_node_motion_attention(node_attention_check("recover.b", "move.b"));
+  ASSERT_FALSE(b_refused.ok());
+  EXPECT_EQ(b_refused.error().code, "unacknowledged_operator_alarms");
+
+  // A's own alarm does.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("robot_a.alarm",
+                                        OperatorAlarmAttentionGateDTO::kConditionInterlock,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto a_refused =
+      kernel.check_program_node_motion_attention(node_attention_check("recover.a.own", "move"));
+  ASSERT_FALSE(a_refused.ok());
+  EXPECT_EQ(a_refused.error().code, "operator_alarm_interlock_active");
+  EXPECT_TRUE(
+      kernel.check_program_node_motion_attention(node_attention_check("recover.b.clear", "move.b"))
+          .ok());
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     ManualOperationIsNeverAttentionGatedAtExecuteResumeOrRecovery) {
+  // The manual identity is fixed at admission (intrinsic direct control), so
+  // every motion-producing path of the same operation agrees with Execute.
+  const auto manual_kernel_config = [] {
+    auto config = attention_config();
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    return config;
+  };
+  const auto gating = [](std::uint64_t generation) {
+    return attention_snapshot(
+        generation,
+        {alarm_member("arm.interlock", OperatorAlarmAttentionGateDTO::kConditionInterlock,
+                      {"robot.joint_1"}),
+         alarm_member("arm.fault", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                      {"robot.joint_1"})});
+  };
+  {
+    SCOPED_TRACE("Execute and Resume");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    auto direct = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    direct.intrinsic_direct_control = true;
+    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal,
+                                            manual_kernel_config());
+    ASSERT_TRUE(ready_cell_admission(kernel).ok());
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(1U)).ok());
+    const auto admitted = kernel.execute(motion_operation("manual.alarm.motion"));
+    ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      return engine.execute_calls == 1 && engine.get_status().state == ExecutionState::kPlanning;
+    }));
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    ASSERT_TRUE(kernel.pause(control_request("manual.alarm.pause", admitted.value(), 1U)).ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return engine.pause_calls.load() == 1 && state.ok() &&
+             state.value().state == OperationStateKind::kStopping;
+    }));
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kPaused);
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      return state.ok() && state.value().state == OperationStateKind::kPaused;
+    }));
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(2U)).ok());
+    std::string resume_error;
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      const auto resumed =
+          kernel.resume(control_request("manual.alarm.resume", admitted.value(), 2U));
+      if (!resumed.ok()) resume_error = resumed.error().code + ": " + resumed.error().message;
+      return resumed.ok();
+    })) << resume_error;
+  }
+  {
+    SCOPED_TRACE("motion-producing recovery");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                      "injected preparation failure",
+                                      {{"reason", "injected_preparation_failure"}}};
+    engine.recovery_assessment.assessment_revision = 7U;
+    engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
+    engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryMotionFromCurrentState};
+    auto direct = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    direct.intrinsic_direct_control = true;
+    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal,
+                                            manual_kernel_config());
+    ASSERT_TRUE(ready_cell_admission(kernel).ok());
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(1U)).ok());
+    const auto accepted = kernel.execute(motion_operation("manual.alarm.recovery"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    ASSERT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
+    const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(projection.ok()) << projection.error().message;
+    const auto& assessment = projection.value().assessment;
+    const KernelRecoveryActionRequestDTO retry{"manual.alarm.retry",
+                                               RecoveryAction::kRetryMotionFromCurrentState,
+                                               "operator.test",
+                                               assessment.assessment_revision,
+                                               assessment.control_command_epoch,
+                                               assessment.execution_id,
+                                               assessment.latch_id,
+                                               assessment.stop_certificate_id,
+                                               assessment.stop_owner_generation,
+                                               "manual retry under alarm"};
+    auto resulting = assessment;
+    resulting.assessment_revision = 8U;
+    resulting.status = RecoveryAssessmentStatus::kUnavailable;
+    engine.next_recovery_result =
+        KernelRecoveryActionResultDTO{retry.request_id, retry.action, true, resulting, std::nullopt};
+    ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(2U)).ok());
+    const auto recovered = kernel.apply_operation_recovery_action(
+        accepted.value().operation_id, operation.value().operation_revision, retry);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().code << ": " << recovered.error().message;
+    EXPECT_EQ(engine.recovery_action_calls, 1);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     AttentionJudgedAgainstAnotherConfigurationIsUnavailable) {
+  // An Apply renamed the robot's resources (robot.old.joint_1 is now
+  // robot.joint_1). Until the owner observes that configuration, its
+  // unacknowledged fault still names the old ids and cannot be tested against
+  // this Kernel's resources: Run is refused instead of admitted as disjoint.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  const OperatorAlarmAttentionConfigurationDTO previous{RetainedBundleId(test_digest('4')),
+                                                         GraphRevision(test_digest('5'))};
+  const auto fault = alarm_member("arm.fault", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                  {"robot.old.joint_1"});
+  for (const auto& [generation, configuration] :
+       std::vector<std::pair<std::uint64_t, std::optional<OperatorAlarmAttentionConfigurationDTO>>>{
+           {1U, previous}, {2U, std::nullopt}}) {
+    ASSERT_TRUE(kernel
+                    .PublishOperatorAlarmAttention(attention_snapshot(
+                        generation, {fault}, true, "alarm.owner.1", 1U, configuration))
+                    .ok());
+    const auto refused = kernel.execute(motion_operation("alarm.renamed." +
+                                                         std::to_string(generation)));
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().code, "operator_alarm_state_unavailable");
+    EXPECT_EQ(refused.error().details.at("availability"), "configuration_mismatch");
+    EXPECT_EQ(refused.error().details.at("generation"), std::to_string(generation));
+    EXPECT_EQ(engine.prepare_motion_calls, 0);
+    EXPECT_TRUE(all_slots_free(kernel));
+  }
+
+  // The owner reconciled to the Kernel's configuration: a fault naming the
+  // renamed robot's current resources gates until acknowledged.
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      3U, {alarm_member("arm.fault", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto unacknowledged = kernel.execute(motion_operation("alarm.renamed.unacknowledged"));
+  ASSERT_FALSE(unacknowledged.ok());
+  EXPECT_EQ(unacknowledged.error().code, "unacknowledged_operator_alarms");
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(4U)).ok());
+  const auto admitted = kernel.execute(motion_operation("alarm.renamed.acknowledged"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
+     RefusalMembershipDetailsAreBoundedByWholeEntries) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, attention_config());
+  std::vector<OperatorAlarmAttentionMemberDTO> members;
+  for (std::size_t index = 0U; index < kMaximumOperatorAlarmAttentionMembers; ++index) {
+    auto id = std::to_string(index);
+    id.insert(0U, 4U - id.size(), '0');
+    members.push_back(alarm_member("arm.fault." + id + std::string(512U, 'x'),
+                                   OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                   {"robot.joint_1"}));
+  }
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U, members)).ok());
+  const auto refused = kernel.execute(motion_operation("alarm.many"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "unacknowledged_operator_alarms");
+  const auto& membership = refused.error().details.at("unacknowledged_alarms");
+  EXPECT_LE(membership.size(), kMaximumOperatorAlarmRefusalMembershipBytes);
+  const auto conditions = refusal_conditions(refused.error(), "unacknowledged_alarms");
+  ASSERT_FALSE(conditions.empty());
+  EXPECT_LT(conditions.size(), members.size());
+  EXPECT_EQ(conditions.front(), members.front().condition_id);
+  EXPECT_EQ(refused.error().details.at("alarm_membership_truncated"), "true");
+
+  ASSERT_TRUE(kernel
+                  .PublishOperatorAlarmAttention(attention_snapshot(
+                      2U, {alarm_member("arm.fault", OperatorAlarmAttentionGateDTO::kAcknowledgement,
+                                        {"robot.joint_1"})}))
+                  .ok());
+  const auto single = kernel.execute(motion_operation("alarm.single"));
+  ASSERT_FALSE(single.ok());
+  EXPECT_FALSE(single.error().details.contains("alarm_membership_truncated"));
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, CompositionWithoutAlarmOwnerIsNotGated) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+  ASSERT_TRUE(kernel.execute(motion_operation("alarm.unconfigured")).ok());
 }
 
 }  // namespace

@@ -7,7 +7,10 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <map>
 #include <numbers>
+#include <set>
+#include <shared_mutex>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -160,10 +163,11 @@ RetainedRoboPlanKinematicsAdapter::forward_kinematics(
   }
   try {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    Eigen::VectorXd q = vector_from_std(request.robot_state.positions_rad);
-    if (q.size() != scene_->getCurrentJointPositions().size()) {
-      q = scene_->toFullJointPositions(compiled_group_name_, q);
-    }
+    // The state is exactly this target's group in group order; equal counts
+    // with the whole model never make it a full-model vector.
+    const Eigen::VectorXd q = scene_->toFullJointPositions(
+        compiled_group_name_,
+        vector_from_std(request.robot_state.positions_rad));
     const Eigen::Matrix4d root_from_target =
         is_world_frame(request.target_frame)
             ? Eigen::Matrix4d::Identity()
@@ -210,10 +214,8 @@ RetainedRoboPlanKinematicsAdapter::forward_kinematics_batch(
           std::move(result));
     }
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    Eigen::VectorXd q = vector_from_std(robot_state.positions_rad);
-    if (q.size() != scene_->getCurrentJointPositions().size()) {
-      q = scene_->toFullJointPositions(compiled_group_name_, q);
-    }
+    const Eigen::VectorXd q = scene_->toFullJointPositions(
+        compiled_group_name_, vector_from_std(robot_state.positions_rad));
     Eigen::Matrix4d base_from_root = Eigen::Matrix4d::Identity();
     if (!is_world_frame(base_frame)) {
       base_from_root = scene_->forwardKinematics(q, base_frame).inverse();
@@ -732,6 +734,13 @@ RoboPlanTrajectoryValidator::validate_non_collision(
   std::optional<double> peak_tcp_linear_speed_mps;
   if (options.max_tcp_linear_speed_mps > 0.0 &&
       !options.tcp_frame.empty() && trajectory.waypoints.size() >= 2) {
+    if (trajectory.joint_names.size() != model_joint_names_.size()) {
+      return validation_error(
+          core::ErrorCode::kInvalidRequest,
+          "TCP-speed validation requires every qualified group joint by name",
+          "trajectory_joint_group_incomplete",
+          {{"group_id", group_name_}});
+    }
     const auto speed_started = std::chrono::steady_clock::now();
     try {
       std::lock_guard<std::mutex> lock(*scene_mutex_);
@@ -746,10 +755,15 @@ RoboPlanTrajectoryValidator::validate_non_collision(
           return cancelled();
         }
         const auto& waypoint = trajectory.waypoints[waypoint_index];
-        auto q = vector_from_std(waypoint.positions_rad);
-        if (q.size() != scene_->getCurrentJointPositions().size()) {
-          q = scene_->toFullJointPositions(group_name_, q);
+        Eigen::VectorXd group_q(
+            static_cast<Eigen::Index>(model_joint_names_.size()));
+        for (std::size_t joint_index = 0;
+             joint_index < trajectory.joint_names.size(); ++joint_index) {
+          group_q[static_cast<Eigen::Index>(model_index_for(joint_index))] =
+              waypoint.positions_rad[joint_index];
         }
+        const Eigen::VectorXd q =
+            scene_->toFullJointPositions(group_name_, group_q);
         const Eigen::Matrix4d robot_base_from_tcp =
             scene_->forwardKinematics(q, options.tcp_frame);
         Eigen::Matrix4d requested_base_from_robot_base =
@@ -842,21 +856,6 @@ RoboPlanCollisionTrajectoryProjector::expand_for_collision(
       return core::Result<core::TrajectoryDTO>::Ok(trajectory);
     }
 
-    Eigen::VectorXd baseline =
-        vector_from_std(observed_start_state.positions_rad);
-    if (baseline.size() != current_q.size()) {
-      baseline = scene_->toFullJointPositions(group_name_, baseline);
-    }
-    if (baseline.size() != current_q.size() || !baseline.allFinite()) {
-      return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
-          core::kErrorValidationCollision,
-          "Observed start state cannot seed full collision coordinates",
-          {{"reason", "collision_projection_observed_state_invalid"},
-           {"expected_position_count", std::to_string(full_q_size)},
-           {"observed_position_count",
-            std::to_string(observed_start_state.positions_rad.size())}}});
-    }
-
     const auto& model = scene_->getModel();
     std::vector<std::string> full_joint_names(full_q_size);
     for (pinocchio::JointIndex joint_id = 1;
@@ -877,17 +876,6 @@ RoboPlanCollisionTrajectoryProjector::expand_for_collision(
       if (full_joint_names[index].empty()) {
         full_joint_names[index] = "q[" + std::to_string(index) + "]";
       }
-    }
-
-    const bool positions_already_full = std::all_of(
-        trajectory.waypoints.begin(), trajectory.waypoints.end(),
-        [&](const auto& waypoint) {
-          return waypoint.positions_rad.size() == full_q_size;
-        });
-    if (positions_already_full) {
-      auto expanded = trajectory;
-      expanded.joint_names = std::move(full_joint_names);
-      return core::Result<core::TrajectoryDTO>::Ok(std::move(expanded));
     }
 
     const auto group = scene_->getJointGroupInfo(group_name_);
@@ -911,7 +899,7 @@ RoboPlanCollisionTrajectoryProjector::expand_for_collision(
     for (std::size_t index = 0; index < group->joint_names.size(); ++index) {
       const auto q_index =
           group->q_indices[static_cast<Eigen::Index>(index)];
-      if (q_index < 0 || q_index >= baseline.size()) {
+      if (q_index < 0 || q_index >= current_q.size()) {
         return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
             core::kErrorValidationCollision,
             "Collision projection joint index is out of range",
@@ -920,6 +908,41 @@ RoboPlanCollisionTrajectoryProjector::expand_for_collision(
              {"joint", group->joint_names[index]}}});
       }
       q_index_by_joint.emplace(group->joint_names[index], q_index);
+    }
+
+    // Coordinates are mapped by name. A state or trajectory whose length
+    // equals the full model is still never taken as full-model positional.
+    Eigen::VectorXd baseline = current_q;
+    const auto& observed_names = observed_start_state.joint_names;
+    const auto& observed_positions = observed_start_state.positions_rad;
+    bool observed_valid = observed_names.size() == observed_positions.size();
+    if (observed_valid && observed_names == full_joint_names) {
+      baseline = vector_from_std(observed_positions);
+    } else if (observed_valid &&
+               observed_names.size() == q_index_by_joint.size()) {
+      std::set<std::string> seen;
+      for (std::size_t index = 0; observed_valid && index < observed_names.size();
+           ++index) {
+        const auto found = q_index_by_joint.find(observed_names[index]);
+        observed_valid = found != q_index_by_joint.end() &&
+                         seen.insert(observed_names[index]).second;
+        if (observed_valid) baseline[found->second] = observed_positions[index];
+      }
+    } else {
+      observed_valid = false;
+    }
+    if (!observed_valid || !baseline.allFinite()) {
+      return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+          core::kErrorValidationCollision,
+          "Observed start state cannot seed full collision coordinates",
+          {{"reason", "collision_projection_observed_state_invalid"},
+           {"expected_position_count", std::to_string(full_q_size)},
+           {"observed_position_count",
+            std::to_string(observed_positions.size())}}});
+    }
+
+    if (trajectory.joint_names == full_joint_names) {
+      return core::Result<core::TrajectoryDTO>::Ok(trajectory);
     }
 
     core::TrajectoryDTO expanded;
@@ -963,6 +986,108 @@ RoboPlanCollisionTrajectoryProjector::expand_for_collision(
         {{"reason", "collision_projection_exception"},
          {"exception", error.what()}}});
   }
+}
+
+std::shared_ptr<const RetainedKinematicModelGeneration>
+make_retained_motion_model_generation(
+    const core::RuntimeParticipantBinding& motion_binding,
+    std::shared_ptr<roboplan::Scene> scene,
+    std::shared_ptr<std::mutex> scene_mutex,
+    std::shared_ptr<RetainedKinematicStateProjector> state_projector) {
+  if (!scene || !scene_mutex || !state_projector) {
+    throw std::invalid_argument(
+        "retained model generation requires one scene, mutex and projector");
+  }
+  auto generation = std::make_shared<RetainedKinematicModelGeneration>();
+  generation->kinematics = std::make_shared<RetainedRoboPlanKinematicsAdapter>(
+      motion_binding, scene, scene_mutex);
+  generation->trajectory_validator =
+      RoboPlanTrajectoryValidator::create(motion_binding, scene, scene_mutex);
+  generation->collision_trajectory_projector =
+      RoboPlanCollisionTrajectoryProjector::create(motion_binding, scene,
+                                                   scene_mutex);
+  generation->scene = std::move(scene);
+  generation->scene_mutex = std::move(scene_mutex);
+  generation->state_projector = std::move(state_projector);
+  return generation;
+}
+
+RetainedKinematicModelProxy::RetainedKinematicModelProxy(
+    std::shared_ptr<const RetainedKinematicModelGeneration> generation)
+    : generation_(std::move(generation)) {
+  if (!generation_ || !generation_->kinematics ||
+      !generation_->trajectory_validator ||
+      !generation_->collision_trajectory_projector) {
+    throw std::invalid_argument(
+        "retained kinematic model proxy requires one complete generation");
+  }
+}
+
+void RetainedKinematicModelProxy::ReplaceGeneration(
+    std::shared_ptr<const RetainedKinematicModelGeneration> candidate) {
+  if (!candidate || !candidate->kinematics ||
+      !candidate->trajectory_validator ||
+      !candidate->collision_trajectory_projector) {
+    throw std::invalid_argument(
+        "retained kinematic model replacement is incomplete");
+  }
+  std::unique_lock lock(mutex_);
+  generation_ = std::move(candidate);
+}
+
+std::shared_ptr<const RetainedKinematicModelGeneration>
+RetainedKinematicModelProxy::current_generation() const {
+  std::shared_lock lock(mutex_);
+  return generation_;
+}
+
+core::Result<core::Pose3DTO> RetainedKinematicModelProxy::forward_kinematics(
+    const core::FkRequestDTO& request) const {
+  std::shared_lock lock(mutex_);
+  return generation_->kinematics->forward_kinematics(request);
+}
+
+core::Result<std::map<std::string, core::Pose3DTO>>
+RetainedKinematicModelProxy::forward_kinematics_batch(
+    const core::RobotStateDTO& robot_state,
+    const std::vector<std::string>& target_frames,
+    const std::string& base_frame) const {
+  std::shared_lock lock(mutex_);
+  return generation_->kinematics->forward_kinematics_batch(
+      robot_state, target_frames, base_frame);
+}
+
+core::Result<core::JointLimitsDTO> RetainedKinematicModelProxy::joint_limits(
+    const std::string& component_id,
+    const std::string& command_target_id) const {
+  std::shared_lock lock(mutex_);
+  return generation_->kinematics->joint_limits(component_id,
+                                               command_target_id);
+}
+
+core::Result<std::vector<std::string>>
+RetainedKinematicModelProxy::group_joint_names(
+    const std::string& command_target_id) const {
+  std::shared_lock lock(mutex_);
+  return generation_->kinematics->group_joint_names(command_target_id);
+}
+
+core::ValidationResultDTO RetainedKinematicModelProxy::validate_non_collision(
+    const core::TrajectoryDTO& trajectory,
+    const core::ValidationOptionsDTO& options,
+    const core::CollisionCancellationToken& cancel) const {
+  std::shared_lock lock(mutex_);
+  return generation_->trajectory_validator->validate_non_collision(
+      trajectory, options, cancel);
+}
+
+core::Result<core::TrajectoryDTO>
+RetainedKinematicModelProxy::expand_for_collision(
+    const core::TrajectoryDTO& trajectory,
+    const core::RobotStateDTO& observed_start_state) const {
+  std::shared_lock lock(mutex_);
+  return generation_->collision_trajectory_projector->expand_for_collision(
+      trajectory, observed_start_state);
 }
 
 }  // namespace manyforge::roboplan_backend

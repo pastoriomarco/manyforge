@@ -10,6 +10,9 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
+import { alarmSnapshot, gatingMember } from '../testFixtures/operatorAlarms';
+import { motionAttentionBlock } from '../state/operatorAlarmMotionAttention';
+import type { AlarmMotionAttentionMember } from '../types/headless';
 import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
 import {
   deriveTransportGuidance,
@@ -100,7 +103,8 @@ function ordinaryMotionStopControls(): NonNullable<
           componentRoleId: 'robot',
           targetRoleId: 'arm',
         },
-        runtimeScaleUnavailableReason: null }],
+        runtimeScaleUnavailableReason: null,
+        resourceIds: ['robot.joint_1'] }],
     },
   } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
 }
@@ -164,6 +168,7 @@ function controller(
   return {
     commandAllowed: vi.fn(() => true),
     commandDisabledReason: vi.fn(() => null),
+    motionAttentionBlock: vi.fn(() => null),
     draftUnappliedReason: null,
     state: {
       currentScenario: null,
@@ -642,6 +647,63 @@ describe('Program runtime projection', () => {
     expect(render()).toMatch(
       /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry move.1 and let all the Program&#x27;s motion continue."[^>]*>Retry<\/button>/,
     );
+  });
+
+  it('disables Resume and a motion-producing Retry from operator-alarm attention, naming the remedy', () => {
+    const withAlarms = (
+      program: ProgramRuntimeController,
+      members: AlarmMotionAttentionMember[],
+    ): ProgramRuntimeController => ({
+      ...program,
+      motionAttentionBlock: (resourceIds) => motionAttentionBlock(alarmSnapshot(members), resourceIds),
+    });
+    const stopped = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    stopped.state.controls = controls;
+    const render = (program: ProgramRuntimeController) => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+
+    // Another robot's alarm leaves this selection's Resume available.
+    expect(render(withAlarms(stopped, [
+      gatingMember('other', 'active_unacknowledged', ['robot.2.joint_1']),
+    ]))).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+    // An unacknowledged alarm on the selection's resources: acknowledge.
+    expect(render(withAlarms(stopped, [
+      gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']),
+    ]))).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by unacknowledged alarms. Acknowledge them, then try again."[^>]*>Resume<\/button>/,
+    );
+    // A cell-global condition interlock: resolve the cause.
+    expect(render(withAlarms(stopped, [gatingMember('scope', 'active_acknowledged', [])]))).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by an active alarm condition. Resolve its cause; acknowledging the alarm does not release it."[^>]*>Resume<\/button>/,
+    );
+
+    // Retry is tested against the held operation's exact resources.
+    const paused = controller('intervention_required');
+    const failed = ordinaryMotionStopControls();
+    const offer = failed.recoveryOffer!;
+    offer.recoveryClass = 'operation_failure' as typeof offer.recoveryClass;
+    offer.nodeInstanceId = 'move.1';
+    offer.participants = [{ operation_participant_id: 'p1', resource_ids: ['robot.joint_1'] }];
+    offer.actions = [{
+      actionId: 'retry_motion_from_current_state',
+      labelKey: 'recovery.retry_motion_from_current_state',
+      requiresConfirmation: false,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    }];
+    paused.state.controls = failed;
+    expect(render(withAlarms(paused, [
+      gatingMember('arm', 'returned_unacknowledged', ['robot.joint_1']),
+    ]))).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by unacknowledged alarms. Acknowledge them, then try again."[^>]*>Retry<\/button>/,
+    );
+    expect(render(withAlarms(paused, [
+      gatingMember('other', 'returned_unacknowledged', ['robot.2.joint_1']),
+    ]))).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Retry<\/button>/);
   });
 
   it('labels a group with stopped and never-started work Resume', () => {

@@ -315,6 +315,27 @@ struct RetainedNativeRuntimeResealInput final {
 [[nodiscard]] core::Result<void> reseal_retained_native_runtime_for_apply(
     RetainedNativeRuntime &runtime, RetainedNativeRuntimeResealInput input);
 
+/// Candidate whole-cell model computations for an already re-sealed retained
+/// motion component. The generation was built before the fence from the
+/// candidate planning model and the candidate (re-sealed) bindings.
+struct RetainedNativeRuntimeModelRefreshInput final {
+  std::shared_ptr<const RetainedKinematicModelGeneration> candidate;
+  core::ConfigurationFenceId apply_fence_id;
+  core::ConfigurationFenceScopeDTO apply_scope;
+  core::IResourceOperationAdmissionGate &admission_gate;
+};
+
+/// Install one candidate model generation into a retained runtime under the
+/// exact Apply fence: verify that the controller's own model facts are
+/// unchanged, drain in-flight model users, select the generation in the
+/// stable Kernel/host proxy and in every model-backed state channel, and
+/// read the selection back. Controller, Kernel, planner-client and
+/// observed-source identities are preserved. A failure is returned as is;
+/// no predecessor generation is restored and admission stays closed.
+[[nodiscard]] core::Result<void> refresh_retained_native_runtime_model_for_apply(
+    RetainedNativeRuntime &runtime,
+    RetainedNativeRuntimeModelRefreshInput input);
+
 /// Owning native composition root. Destruction order is deliberate: the public
 /// addressed owner unsubscribes first, then the subordinate Kernel quiesces,
 /// then backends/scheduler/state/model resources retire.
@@ -343,9 +364,6 @@ struct RetainedNativeRuntime final
   std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
   std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
   std::optional<core::CellId> addressed_cell_id;
-  std::shared_ptr<roboplan::Scene> scene;
-  std::shared_ptr<std::mutex> scene_mutex;
-  std::shared_ptr<RetainedKinematicStateProjector> state_projector;
   std::shared_ptr<RetainedObservedStateChannel> motion_state_channel;
   std::shared_ptr<RetainedObservedStateChannel> gripper_state_channel;
   /// Owner-local current controller proof. The enclosing composition pins
@@ -370,10 +388,12 @@ struct RetainedNativeRuntime final
       reference_resolver_proxy;
   std::unique_ptr<core::AddressedAngularObservedRobotStateAdapter>
       angular_observed_state;
-  std::unique_ptr<RetainedRoboPlanKinematicsAdapter> kinematics;
-  std::unique_ptr<RoboPlanTrajectoryValidator> trajectory_validator;
-  std::unique_ptr<RoboPlanCollisionTrajectoryProjector>
-      collision_trajectory_projector;
+  /// Stable kinematics, non-collision validator and collision-state
+  /// projector installed into the Kernel and used by direct host queries.
+  /// It selects one whole-cell model generation (scene, state projector and
+  /// the target's model computations); a retained controller refreshes it
+  /// under the Apply fence when the cell planning model changes.
+  std::shared_ptr<RetainedKinematicModelProxy> kinematic_model;
   std::shared_ptr<core::IExecutionBackend> execution;
   std::shared_ptr<core::IGripperCommandBackend> gripper;
   std::shared_ptr<RetainedPlanningSceneSynchronizer>
@@ -497,6 +517,9 @@ private:
   friend core::Result<void> reseal_retained_native_runtime_for_apply(
       RetainedNativeRuntime &runtime,
       RetainedNativeRuntimeResealInput input);
+  friend core::Result<void> refresh_retained_native_runtime_model_for_apply(
+      RetainedNativeRuntime &runtime,
+      RetainedNativeRuntimeModelRefreshInput input);
   friend core::Result<void> rejoin_retained_native_runtime_participants(
       const std::shared_ptr<RetainedNativeRuntime> &primary,
       std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,

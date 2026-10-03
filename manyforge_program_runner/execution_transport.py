@@ -110,19 +110,27 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             if command.get("command") in {
                 "start_program_selection",
                 "release_program_selection",
+                "check_program_node_motion_attention",
             } and error.details.get("reason") in {
                 "program_selection_stale",
                 "program_selection_unknown",
+                "program_node_unknown",
                 "program_selection_revision_stale",
                 "program_selection_not_ready",
                 "program_selection_not_releasable",
                 "program_selection_recovery_required",
                 "program_children_unsettled",
                 "program_run_admission_in_flight",
+                # Operator-alarm motion attention (spec 450 §5.2).
+                "operator_alarm_interlock_active",
+                "unacknowledged_operator_alarms",
+                "operator_alarm_state_unavailable",
             }:
                 # These closed Kernel rejections all precede release. A lost,
                 # malformed or exceptional reply remains outcome-unknown.
-                raise ProgramSelectionReleaseRejectedError(str(error)) from error
+                raise ProgramSelectionReleaseRejectedError(
+                    str(error), code=error.code, details=error.details
+                ) from error
             raise
 
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -208,6 +216,18 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "attribution": self._request_attribution(None),
                 "request": dict(body),
                 "expected_selection_revision": expected_selection_revision,
+            }
+        )
+
+    def check_program_node_motion_attention(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "check_program_node_motion_attention",
+                "attribution": self._request_attribution(None),
+                "request": dict(body),
             }
         )
 

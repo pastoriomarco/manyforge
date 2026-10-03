@@ -374,6 +374,11 @@ class _ScopePort:
         self.selection_revision = 0
         self.held = False
         self.ready = False
+        self.attention_refusal: ProgramSelectionReleaseRejectedError | None = None
+        # Kernel stand-in for the per-node resource test: a node is refused
+        # only while an alarm gates one of its own target resources.
+        self.alarmed_nodes: set[str] = set()
+        self.attention_checks: list[dict] = []
 
     def bind(self, context: ProgramRunPortContext) -> None:
         pending = [context.program["tree"]]
@@ -424,8 +429,18 @@ class _ScopePort:
             "selection_error": None,
         }
 
+    def check_node_motion_attention(self, request):
+        self.attention_checks.append(request)
+        if (
+            self.attention_refusal is not None
+            and request["node_instance_id"] in self.alarmed_nodes
+        ):
+            raise self.attention_refusal
+
     def release_selection(self, request, expected_selection_revision):
         self.last_selection_release = request
+        if self.attention_refusal is not None:
+            raise self.attention_refusal
         if self.selection_revision != expected_selection_revision:
             raise ProgramSelectionReleaseRejectedError("selection revision changed")
         if self.state is not ProgramRunScopeState.SETTLED:
@@ -2235,6 +2250,39 @@ def test_selection_status_never_settles_an_observed_completed_task():
     assert task.starts == 1 and task.cancels == 0
 
 
+def test_execution_selection_names_the_exact_resources_its_release_reserves():
+    """Group resources follow the Kernel's rule: effectful target effects of
+    the selected nodes through the sealed binding, nothing else."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    binding = deepcopy(dict(admission.program_binding))
+
+    def target(role: str, resources: list[str]) -> dict[str, Any]:
+        return {
+            "target_role_id": role,
+            "resource_role_bindings": [
+                {
+                    "resource_role_id": f"{role}_joints",
+                    "resource_ids": resources,
+                    "compiled_resource_names": resources,
+                }
+            ],
+        }
+
+    binding["target_role_bindings"] = [
+        target("arm", ["robot.joint_2", "robot.joint_1"]),
+        # A bound role no selected node addresses effectfully is not reserved.
+        target("spare", ["spare.joint_1"]),
+    ]
+    scope.ready = True
+    scope.node_count = 3
+    started = owner.start(replace(admission, program_binding=binding))
+    groups = owner.execution_selection_controls(started.capture.program_run_id)["groups"]
+    assert groups[0]["group_id"] == "all"
+    assert groups[0]["resource_ids"] == ["robot.joint_1", "robot.joint_2"]
+
+
 def test_initial_motion_run_releases_ready_scope_without_recovery():
     owner, admission, task, scope, events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE
@@ -2267,6 +2315,89 @@ def test_initial_motion_run_releases_ready_scope_without_recovery():
     assert running["state"] == "running"
     assert not running["start_allowed"]
     assert running["stop_allowed"]
+
+
+def test_operator_alarm_refusal_keeps_the_kernel_code_and_releases_nothing():
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    started = owner.start(admission)
+    run_id = started.capture.program_run_id
+    details = {
+        "reason": "operator_alarm_interlock_active",
+        "interlock_alarms": '[{"activation_id":"a","condition_id":"c","record_revision":1}]',
+        "unacknowledged_alarms": "[]",
+    }
+    scope.attention_refusal = ProgramSelectionReleaseRejectedError(
+        "an active operator-alarm condition interlock gates this motion",
+        code="operator_alarm_interlock_active",
+        details=details,
+    )
+    scope.alarmed_nodes = {"move_to_pick"}
+    with pytest.raises(ProgramRunOwnerError) as checked:
+        owner.check_motion_attention(run_id, "move_to_pick", "retry.check")
+    assert checked.value.code == "operator_alarm_interlock_active"
+    assert checked.value.details == details
+    check = scope.attention_checks[-1]
+    assert check["schema_version"] == "manyforge.program_node_motion_attention_check.v1"
+    assert check["node_instance_id"] == "move_to_pick"
+    assert check["program_run_id"] == run_id
+    assert check["request_context"]["request_id"] == "retry.check"
+
+    controls = owner.execution_selection_controls(run_id)
+    with pytest.raises(ProgramRunOwnerError) as refused:
+        owner.start_motion(
+            run_id,
+            expected_run_revision=started.run_revision,
+            expected_selection_revision=controls["selection_revision"],
+            request_id="initial.motion.refused",
+        )
+    assert refused.value.code == "operator_alarm_interlock_active"
+    assert scope.ready
+    assert "scope_stop_release" not in events
+
+    scope.attention_refusal = None
+    owner.check_motion_attention(run_id, "move_to_pick", "retry.check.cleared")
+    released = owner.start_motion(
+        run_id,
+        expected_run_revision=owner.read(run_id).run_revision,
+        expected_selection_revision=controls["selection_revision"],
+        request_id="initial.motion.after.clear",
+    )
+    assert released.state is ProgramRunState.RUNNING
+    assert events[-1] == "scope_stop_release"
+
+
+def test_recovery_attention_check_names_only_the_held_node():
+    """An alarm on another node's resources does not block this recovery."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    scope.attention_refusal = ProgramSelectionReleaseRejectedError(
+        "an unacknowledged operator alarm gates this motion",
+        code="unacknowledged_operator_alarms",
+        details={"reason": "unacknowledged_operator_alarms"},
+    )
+    # Robot B's alarm (another node's resources): the held node continues.
+    scope.alarmed_nodes = {"remove_table"}
+    owner.check_motion_attention(run_id, "move_to_pick", "recover.a")
+    assert [row["node_instance_id"] for row in scope.attention_checks] == [
+        "move_to_pick"
+    ]
+    # The held node's own alarm refuses with the Kernel's code.
+    scope.alarmed_nodes = {"move_to_pick"}
+    with pytest.raises(ProgramRunOwnerError) as refused:
+        owner.check_motion_attention(run_id, "move_to_pick", "recover.a.alarmed")
+    assert refused.value.code == "unacknowledged_operator_alarms"
+    # A node outside the capture is refused before any Kernel call.
+    with pytest.raises(ProgramRunOwnerError):
+        owner.check_motion_attention(run_id, "not_a_node", "recover.unknown")
+    assert len(scope.attention_checks) == 2
 
 
 def test_halt_before_run_then_execute_keeps_motion_ready_for_run():

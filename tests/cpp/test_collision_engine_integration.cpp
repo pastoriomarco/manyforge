@@ -240,6 +240,100 @@ TEST(CollisionEngineSelfCoverage, MasterOnlyGroupIncludesItsCrossBranchMimic) {
   }
 }
 
+// Coordinates are identified by joint name against the engine's current
+// model. A named state whose length equals model.nq is still mapped by name,
+// so a reordered (or foreign) state can never be read positionally.
+TEST(CollisionEngineSelfCoverage, NamedStateMapsByNameEvenWhenItsCountEqualsTheModel) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  TemporaryModel temporary;
+  const auto urdf = temporary.root / "model.urdf";
+  const auto srdf = temporary.root / "model.srdf";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="pair">
+      <link name="base"/>
+      <link name="near"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="far"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <joint name="a_near" type="prismatic"><parent link="base"/><child link="near"/>
+        <origin xyz="1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <joint name="b_far" type="prismatic"><parent link="base"/><child link="far"/>
+        <origin xyz="-1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <link name="idle"/>
+      <joint name="c_idle" type="prismatic"><parent link="base"/><child link="idle"/>
+        <axis xyz="0 0 1"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      </robot>)";
+    std::ofstream semantic(srdf);
+    semantic << R"(<robot name="pair"><group name="arm"><joint name="a_near"/><joint name="b_far"/></group></robot>)";
+  }
+  const auto shared = ManyForgeCollisionEngine::load_shared_model("pair", urdf, srdf, {}, "arm");
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto* frame : {"near", "far"})
+    bodies.push_back({core::ControllableComponentId("pair"), core::ModelInstanceId("model"),
+                      core::ModelRevision("r1"), core::CollisionBodyRoleId(frame), 0, frame});
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> frames{
+      {core::ControllableComponentId("pair"), core::ModelInstanceId("model"),
+       core::ModelRevision("r1"), core::FrameRoleId("base"), "base"}};
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, frames);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projection.value().component_bodies;
+  snapshot.component_model_frames = projection.value().component_model_frames;
+  core::CollisionWorldBody obstacle;
+  obstacle.body_id = "scene/obstacle/shape/0";
+  obstacle.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  obstacle.frame_id = "world";
+  obstacle.pose.position_m = {-1, .4, 0};
+  core::CollisionGeometryDescriptor shape;
+  shape.body_id = obstacle.body_id;
+  shape.owner_kind = obstacle.owner_kind;
+  shape.geometry_kind = core::CollisionGeometryKind::kBox;
+  shape.box_dimensions_m = core::Vector3DTO{.04, .04, .04};
+  obstacle.geometries.push_back(shape);
+  snapshot.bodies.push_back(obstacle);
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = 3;
+
+  const auto query = [](std::vector<std::string> names, std::vector<double> positions) {
+    CollisionQuery result;
+    result.query_id = "named-coordinates";
+    result.robot_state.joint_names = std::move(names);
+    result.robot_state.positions_rad = std::move(positions);
+    return result;
+  };
+  // Reordered names whose count equals model.nq: only b_far reaches the
+  // obstacle. Read positionally, the same vector would move a_near instead
+  // and report no collision.
+  const auto reordered =
+      check(engine, snapshot, query({"b_far", "c_idle", "a_near"}, {.4, 0., .1}));
+  ASSERT_EQ(reordered.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(reordered.in_collision);
+  const auto canonical =
+      check(engine, snapshot, query({"a_near", "c_idle", "b_far"}, {.4, 0., .1}));
+  ASSERT_EQ(canonical.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_FALSE(canonical.in_collision);
+
+  const auto refused = [&](CollisionQuery refused_query, const std::string& reason) {
+    const auto result = check(engine, snapshot, std::move(refused_query));
+    EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete) << reason;
+    EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail) << reason;
+    EXPECT_EQ(result.raw_diagnostics.at("robot_state_error_reason"), reason);
+  };
+  // Equal counts never establish identity: a foreign name, a repeated name, a
+  // name/position count mismatch, or an unnamed full vector are refused.
+  refused(query({"b_far", "c_foreign", "a_near"}, {.4, 0., .1}), "robot_state_joint_unknown");
+  refused(query({"b_far", "b_far", "a_near"}, {.4, 0., .1}), "robot_state_joint_duplicate");
+  refused(query({"b_far", "a_near"}, {.4, 0., .1}), "robot_state_joint_name_count_mismatch");
+  refused(query({}, {.4, 0., .1}), "robot_state_joint_names_required");
+  // An unnamed state is accepted only in the model's own SRDF group order.
+  const auto group = check(engine, snapshot, query({}, {.1, .4}));
+  EXPECT_EQ(group.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_TRUE(group.in_collision);
+}
+
 TEST(CollisionEngineSelfCoverage, RetainsEverySrdfEnabledSelfPairAndMatchesIndependentQueries) {
   namespace core = manyforge::core;
   namespace collision = manyforge::collision;

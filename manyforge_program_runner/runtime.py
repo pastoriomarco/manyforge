@@ -44,6 +44,7 @@ from manyforge_behavior.orchestration_values import (
     input_failure_reason,
 )
 from manyforge_behavior.program import (
+    CANONICAL_DEFAULT_RECOVERY_POLICY,
     BlackboardKeyDeclaration,
     Program,
     ProgramValidationError,
@@ -139,6 +140,16 @@ PROGRAM_NODE_PREVIEW_INTENT_VERSION: Final = (
     "manyforge.program_node_correction_preview_intent.v1"
 )
 _MAX_INFLIGHT_COMMANDS: Final = 4_096
+# Recovery actions that release Program motion; the non-moving
+# acknowledge_and_continue and the Reset path stay available (spec 450 §5.2).
+_MOTION_PRODUCING_RECOVERY_ACTIONS: Final = frozenset(
+    {
+        "retry_motion_from_current_state",
+        "retry_after_scene_repair",
+        "replan_from_stopped_state",
+        "retry_runtime_step",
+    }
+)
 
 
 class ProgramRunnerError(RuntimeError):
@@ -1769,7 +1780,12 @@ class ProgramRuntime:
         policy = live.capture.node_policy_by_instance_id.get(
             intervention.identity.node_instance_id
         )
-        recovery_policy = {} if policy is None else dict(policy.recovery_policy)
+        # The capture omits nodes whose policy is the canonical default.
+        recovery_policy = dict(
+            CANONICAL_DEFAULT_RECOVERY_POLICY
+            if policy is None
+            else policy.recovery_policy
+        )
         selection_revision = None
         if intervention.policy_parameter == "operator_stop_policy":
             if selection_scope is None:
@@ -1791,14 +1807,18 @@ class ProgramRuntime:
     def _captured_recovery_policy(
         self, program_run_id: str, node_instance_id: str
     ) -> dict[str, Any]:
-        """The run-start captured recovery policy of one node; empty is default."""
+        """The run-start captured recovery policy of one node, default included."""
 
         try:
             live = self._owner.read(program_run_id)
         except ProgramRunOwnerError as error:
             raise ProgramRunnerError("program_run_not_found", str(error)) from error
         policy = live.capture.node_policy_by_instance_id.get(node_instance_id)
-        return {} if policy is None else dict(policy.recovery_policy)
+        return dict(
+            CANONICAL_DEFAULT_RECOVERY_POLICY
+            if policy is None
+            else policy.recovery_policy
+        )
 
     @staticmethod
     def _run_recovery_fences(
@@ -3210,7 +3230,7 @@ class ProgramRuntime:
         execution_selections: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v7",
+            "schema_version": "manyforge.program_runtime_control_projection.v8",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
@@ -3968,7 +3988,11 @@ class ProgramRuntime:
                 )
             allowed, disabled_reason = manual_result_availability(
                 intervention,
-                {} if policy is None else policy.recovery_policy,
+                (
+                    CANONICAL_DEFAULT_RECOVERY_POLICY
+                    if policy is None
+                    else policy.recovery_policy
+                ),
             )
             if not allowed:
                 raise ProgramRunnerError(
@@ -4105,6 +4129,32 @@ class ProgramRuntime:
                         "held Program attempt is no longer current",
                     )
                 )
+            if request.action_id in _MOTION_PRODUCING_RECOVERY_ACTIONS:
+                # Spec 450 §5.2: the Kernel refuses these while operator-alarm
+                # attention gates the held node's resources. Ask it before any
+                # effect so a refusal leaves the held attempt untouched; an
+                # alarm on disjoint resources does not block this recovery.
+                try:
+                    self._owner.check_motion_attention(
+                        program_run_id,
+                        intervention.identity.node_instance_id,
+                        request.request_id,
+                    )
+                except ProgramRunOwnerError as error:
+                    reject(
+                        ProgramRunnerError(
+                            getattr(error, "code", "cycle_recovery_action_rejected"),
+                            str(error),
+                            details=getattr(error, "details", None),
+                        )
+                    )
+                except Exception as error:
+                    reject(
+                        ProgramRunnerError(
+                            "cycle_recovery_action_rejected",
+                            f"motion attention could not be evaluated: {error}",
+                        )
+                    )
             controls = self._controls(program_run_id)
             effect_started = False
             owner_effect_accepted = False

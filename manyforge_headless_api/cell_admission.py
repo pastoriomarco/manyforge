@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import time
 from typing import Any, Final
 
 import rfc8785
@@ -22,6 +23,9 @@ from .private_transport import (
 
 
 EXECUTION_SOCKET_FILE: Final = "execution-command.sock"
+# The operator-alarm attention heartbeat is served beside Stop on the
+# independent control socket; it never waits behind ordinary traffic.
+EXECUTION_CONTROL_SOCKET_FILE: Final = "execution-control.sock"
 EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v1"
 MAXIMUM_PACKET_BYTES: Final = 1024 * 1024
@@ -34,16 +38,12 @@ _COMMANDS: Final = frozenset(
         "cell_admission_release",
         "cell_admission_reconcile",
         "cell_admission_recovery_receipt",
+        "cell_admission_publish_operator_alarm_attention",
     }
 )
+_ATTENTION_ACCEPTED_KEYS: Final = frozenset({"generation", "owner_epoch"})
 _ERROR_RESPONSE_KEYS: Final = frozenset(
     {"api_version", "command", "error", "ok"}
-)
-_ADMISSION_RESPONSE_KEYS: Final = frozenset(
-    {"api_version", "authoring_admission", "command", "ok"}
-)
-_CLAIM_RESPONSE_KEYS: Final = frozenset(
-    {"api_version", "claim", "command", "ok"}
 )
 _ERROR_KEYS: Final = frozenset({"code", "details", "message"})
 _AUTHORING_KEYS: Final = frozenset(
@@ -175,7 +175,23 @@ class CellAdmissionClient:
             )
         return value
 
-    def _exchange(self, packet: dict[str, Any]) -> dict[str, Any]:
+    def _socket_timeout(self, deadline: float | None) -> float:
+        """Per-operation timeout, never past an overall monotonic deadline."""
+
+        if deadline is None:
+            return self._timeout_seconds
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("cell-admission command deadline elapsed")
+        return min(remaining, self._timeout_seconds)
+
+    def _exchange(
+        self,
+        packet: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        socket_file: str = EXECUTION_SOCKET_FILE,
+    ) -> dict[str, Any]:
         try:
             encoded = rfc8785.dumps(packet)
         except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as error:
@@ -189,16 +205,16 @@ class CellAdmissionClient:
                 "cell-admission command exceeds its byte bound",
             )
         try:
-            with self._run_root.socket_address(
-                EXECUTION_SOCKET_FILE
-            ) as socket_address:
+            with self._run_root.socket_address(socket_file) as socket_address:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                    client.settimeout(self._timeout_seconds)
                     client.setsockopt(
                         socket.SOL_SOCKET,
                         socket.SO_RCVBUF,
                         MAXIMUM_RESPONSE_BYTES,
                     )
+                    # With a deadline every blocking step (connect, send,
+                    # receive) gets only the time that remains of it.
+                    client.settimeout(self._socket_timeout(deadline))
                     client.connect(socket_address)
                     if hasattr(socket, "SO_PEERCRED"):
                         credentials = client.getsockopt(
@@ -207,8 +223,10 @@ class CellAdmissionClient:
                         _pid, peer_uid, _gid = struct.unpack("3i", credentials)
                         if peer_uid != os.geteuid():
                             raise OSError("peer is not owned by the current user")
+                    client.settimeout(self._socket_timeout(deadline))
                     if client.send(encoded) != len(encoded):
                         raise OSError("command packet was truncated")
+                    client.settimeout(self._socket_timeout(deadline))
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAXIMUM_RESPONSE_BYTES
                     )
@@ -236,7 +254,11 @@ class CellAdmissionClient:
             raise
 
     def _call(
-        self, command: str, request: Mapping[str, Any] | None
+        self,
+        command: str,
+        request: Mapping[str, Any] | None,
+        *,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         if command not in _COMMANDS:
             raise ValueError("unsupported cell-admission command")
@@ -251,7 +273,15 @@ class CellAdmissionClient:
             if not isinstance(request, Mapping):
                 raise TypeError("cell-admission request must be a mapping")
             packet["request"] = dict(request)
-        response = self._exchange(packet)
+        response = self._exchange(
+            packet,
+            deadline=deadline,
+            socket_file=(
+                EXECUTION_CONTROL_SOCKET_FILE
+                if command == "cell_admission_publish_operator_alarm_attention"
+                else EXECUTION_SOCKET_FILE
+            ),
+        )
         if (
             response.get("api_version") != EXECUTION_RESPONSE_VERSION
             or response.get("command") != command
@@ -286,31 +316,14 @@ class CellAdmissionClient:
             raise CellAdmissionError(
                 error["code"], error["message"], error["details"]
             )
-        result_key = (
-            "claim"
-            if command == "cell_admission_acquire"
-            else (
-                "recovery_receipt"
-                if command == "cell_admission_recovery_receipt"
-                else "authoring_admission"
-            )
-        )
-        expected_keys = (
-            _CLAIM_RESPONSE_KEYS
-            if command == "cell_admission_acquire"
-            else (
-                frozenset(
-                    {
-                        "api_version",
-                        "command",
-                        "ok",
-                        "recovery_receipt",
-                    }
-                )
-                if command == "cell_admission_recovery_receipt"
-                else _ADMISSION_RESPONSE_KEYS
-            )
-        )
+        result_key = {
+            "cell_admission_acquire": "claim",
+            "cell_admission_recovery_receipt": "recovery_receipt",
+            "cell_admission_publish_operator_alarm_attention": (
+                "operator_alarm_attention"
+            ),
+        }.get(command, "authoring_admission")
+        expected_keys = frozenset({"api_version", "command", "ok", result_key})
         if set(response) != expected_keys or not isinstance(
             response.get(result_key), dict
         ):
@@ -403,6 +416,32 @@ class CellAdmissionClient:
                 "execution_command_response_invalid",
                 "native recovery receipt is malformed",
                 outcome_unknown=True,
+            )
+        return result
+
+    def publish_operator_alarm_attention(
+        self, projection: Mapping[str, Any], *, deadline: float
+    ) -> dict[str, Any]:
+        """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
+
+        The Kernel retains the newest generation of one owner epoch and alone
+        evaluates it at Run/Resume/recovery admission (spec 450 §5.2). The
+        whole exchange (connect, send, receive) ends by the monotonic
+        ``deadline``; a later Kernel acceptance is then unobserved here.
+        """
+        result = self._call(
+            "cell_admission_publish_operator_alarm_attention",
+            projection,
+            deadline=deadline,
+        )
+        if (
+            set(result) != _ATTENTION_ACCEPTED_KEYS
+            or result.get("owner_epoch") != projection.get("owner_epoch")
+            or result.get("generation") != projection.get("generation")
+        ):
+            raise CellAdmissionError(
+                "execution_command_response_invalid",
+                "native operator-alarm attention acceptance is malformed",
             )
         return result
 

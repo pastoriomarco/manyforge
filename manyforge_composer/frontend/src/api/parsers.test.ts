@@ -463,6 +463,7 @@ function alarmSnapshotFixture(): Record<string, unknown> {
     active_count: 1,
     active_acknowledged_count: 0,
     motion_attention_count: 0,
+    motion_attention_membership: [],
     unacknowledged_membership: [{
       condition_id: 'condition-1',
       activation_id: 'activation-1',
@@ -882,7 +883,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v7',
+      schema_version: 'manyforge.program_runtime_control_projection.v8',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
@@ -913,7 +914,8 @@ describe('Program product projections', () => {
             component_role_id: 'robot',
             target_role_id: 'arm',
           },
-          runtime_scale_unavailable_reason: null }],
+          runtime_scale_unavailable_reason: null,
+          resource_ids: ['robot.joint_1', 'robot.joint_2'] }],
       },
     };
   }
@@ -1221,6 +1223,18 @@ describe('Program product projections', () => {
 
     expect(projection.recoveryOffer).toBeNull();
     expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('carries each selection\'s exact reserved resources, sorted and unique', () => {
+    const projection = parseProgramRuntimeControlProjection(runtimeControlsProjection());
+    expect(projection.executionSelections.groups[0].resourceIds)
+      .toEqual(['robot.joint_1', 'robot.joint_2']);
+    for (const resourceIds of [['robot.joint_2', 'robot.joint_1'], ['robot.joint_1', 'robot.joint_1'], ['']]) {
+      const input = runtimeControlsProjection();
+      const selections = input.execution_selections as { groups: Record<string, unknown>[] };
+      selections.groups[0].resource_ids = resourceIds;
+      expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/sorted unique resource IDs/);
+    }
   });
 
   it('accepts one Run/Resume eligibility for ready, held and mixed groups', () => {
@@ -2656,6 +2670,33 @@ describe('headless projection parsers', () => {
     expect(runtime.sections.logicalScene.sourceOwnerEpoch).toBe('source-epoch-1');
     expect(alarms.alarms[0]?.lifecycleState).toBe('active_unacknowledged');
     expect(alarms.unacknowledgedMembership[0]?.recordRevision).toBe(3);
+    expect(alarms.motionAttentionMembership).toEqual([]);
+  });
+
+  it('parses the complete motion-attention membership with each canonical subject', () => {
+    const wire = alarmSnapshotFixture();
+    wire.motion_attention_membership = [{
+      activation_id: 'activation-2',
+      condition_id: 'condition-2',
+      definition_id: 'manyforge.motion.runtime_collision',
+      lifecycle_state: 'returned_unacknowledged',
+      record_revision: 4,
+      subject: {
+        resource_ids: ['robot.joint_1'],
+        subject_id: 'operation-1',
+        subject_kind: 'operation',
+      },
+    }];
+    expect(parseOperatorAlarmSnapshot(wire).motionAttentionMembership).toEqual([{
+      conditionId: 'condition-2',
+      activationId: 'activation-2',
+      recordRevision: 4,
+      lifecycleState: 'returned_unacknowledged',
+      definitionId: 'manyforge.motion.runtime_collision',
+      subject: { subjectKind: 'operation', subjectId: 'operation-1', resourceIds: ['robot.joint_1'] },
+    }]);
+    delete wire.motion_attention_membership;
+    expect(() => parseOperatorAlarmSnapshot(wire)).toThrow(/motion_attention_membership/);
   });
 
   it('rejects unsafe fence numbers and unknown alarm lifecycle values', () => {

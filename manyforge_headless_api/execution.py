@@ -685,7 +685,11 @@ class ExecutionCommandClient:
         return response
 
     def stop_status(self, stop_id: str) -> dict[str, Any]:
-        """Read one exact aggregate Stop result for the internal Program owner."""
+        """Read one exact aggregate Stop result for the internal Program owner.
+
+        Served beside Stop on the independent control socket, so Stop
+        settlement never waits behind ordinary or planning traffic.
+        """
 
         if self._attribution_transport != "internal":
             raise HeadlessApiError(
@@ -698,7 +702,7 @@ class ExecutionCommandClient:
             or len(stop_id.encode("utf-8")) > 2_048
         ):
             raise ValueError("Stop identity must be bounded non-empty NFC text")
-        response = self._exchange(
+        response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(None),
@@ -2096,7 +2100,8 @@ class ExecutionCommandClient:
         return bool(expectations)
 
     def stop_fault(self) -> dict[str, Any]:
-        response = self._exchange(
+        # An in-memory Stop-progression read: served on the control socket.
+        response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "command": "get_stop_fault",
@@ -2225,6 +2230,7 @@ class ExecutionEventPump:
         self._progress_rows: dict[str, dict[str, Any]] = {}
         self._progress_dirty = False
         self._progress_sent_at = float("-inf")
+        self._alarm_refresh_failing = False
 
     def set_progress_observer(
         self, observer: Callable[[list[dict[str, Any]]], None] | None,
@@ -2273,6 +2279,28 @@ class ExecutionEventPump:
             # Like _notify_change: a missed refresh is repaired by the next
             # meaningful control change and never backpressures ingestion.
             pass
+
+    def _refresh_alarm_sources(self) -> None:
+        """Keep the alarm sources within their currency bound (spec 530 §11).
+
+        Every pump iteration offers the refresh; the core performs it at most
+        once per period R and otherwise returns without its lock. A failed
+        refresh is not an operation-feed failure: the motion-attention read
+        reports sources older than the bound C as not reconciled.
+        """
+
+        try:
+            self._core.refresh_alarm_sources()
+        except Exception:
+            if not self._alarm_refresh_failing:
+                self._alarm_refresh_failing = True
+                logging.getLogger(__name__).warning(
+                    "alarm source refresh failed", exc_info=True
+                )
+            return
+        if self._alarm_refresh_failing:
+            self._alarm_refresh_failing = False
+            logging.getLogger(__name__).info("alarm source refresh recovered")
 
     def _notify_change(self) -> None:
         observer = self._change_observer
@@ -2511,6 +2539,7 @@ class ExecutionEventPump:
                 self._notify_change()
 
         while not self._stop.is_set():
+            self._refresh_alarm_sources()
             try:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()

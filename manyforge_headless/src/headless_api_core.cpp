@@ -647,6 +647,8 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       alarm_owner_(OperatorAlarmCatalog::Load(config_.alarm_catalog_path),
                    config_.cell_id, config_.owner_id + ".alarm",
                    config_.owner_epoch,
+                   // Captured once: this owner instance's incarnation.
+                   manyforge::core::ReadHostBootStamp(),
                    clocks_.monotonic_time_ns, clocks_.wall_time_text,
                    // Headless currently owns operation and runtime-health
                    // alarm adapters.  Scene-initialization faults use the
@@ -1203,6 +1205,64 @@ CanonicalValue HeadlessApiCore::AlarmMetrics() {
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   static_cast<void>(RefreshLocked());
   return OperatorAlarmMetricsValue(alarm_owner_.Metrics());
+}
+
+CanonicalValue HeadlessApiCore::OperatorAlarmMotionAttention() {
+  // Deliberately outside `mutex_`: the publisher's period must not wait on a
+  // source refresh, a bundle verification or any other long core operation.
+  // The owner publishes an immutable projection at every generation advance;
+  // this read only copies that pointer.
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto overdue = [this]() {
+    const auto refreshed_at_ns =
+        alarm_sources_refreshed_at_ns_.load(std::memory_order_acquire);
+    return refreshed_at_ns < 0 || clocks_.monotonic_time_ns() -
+                                          refreshed_at_ns >
+                                      kAlarmSourceCurrencyBoundNs;
+  };
+  if (overdue()) {
+    // The facts deciding reconciliation may be older than C. Name that as
+    // owner health: the owner advances its generation and the projection
+    // reports not-reconciled until the next completed refresh clears it.
+    // `RefreshLocked` stores the refresh time before it reconciles inside
+    // the owner, so re-deciding there never re-marks a completed refresh.
+    alarm_owner_.MarkHealthUnavailableIf(
+        std::string(kAlarmSourceRefreshOverdueHealthCode),
+        "alarm sources were not refreshed within the currency bound", overdue);
+  }
+  return OperatorAlarmMotionAttentionValue(
+      *alarm_owner_.MotionAttentionProjection());
+}
+
+CanonicalValue HeadlessApiCore::RefreshAlarmSources() {
+  const auto due = [this]() {
+    const auto refreshed_at_ns =
+        alarm_sources_refreshed_at_ns_.load(std::memory_order_acquire);
+    return refreshed_at_ns < 0 || clocks_.monotonic_time_ns() -
+                                          refreshed_at_ns >=
+                                      kAlarmSourceRefreshPeriodNs;
+  };
+  bool refreshed = false;
+  // A refresh by any reader within the period already made the sources
+  // current; only a due refresh takes the coordination lock.
+  if (due()) {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    if (due()) {
+      static_cast<void>(RefreshLocked());
+      refreshed = true;
+    }
+  }
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return CanonicalValue(CanonicalValue::Object{
+      {"refreshed", CanonicalValue(refreshed)},
+      {"refreshed_at_ns",
+       Number(static_cast<std::uint64_t>(alarm_sources_refreshed_at_ns_.load(
+                  std::memory_order_acquire)),
+              "refreshed_at_ns")},
+      {"schema_version",
+       CanonicalValue(std::string(kAlarmSourceRefreshSchemaVersion))},
+  });
 }
 
 CanonicalValue HeadlessApiCore::AcknowledgeAlarm(
@@ -2416,6 +2476,11 @@ HeadlessRuntimeSnapshot HeadlessApiCore::RefreshLocked() {
   RefreshRuntimeHealthAdapterLocked(runtime);
   RefreshSceneAdapterLocked(runtime);
   SynchronizeHistorianHealthLocked();
+  // Only a refresh that completed every alarm source makes them current, as
+  // of the instant the sources were observed (never later).
+  alarm_sources_refreshed_at_ns_.store(runtime.projected_at_ns,
+                                       std::memory_order_release);
+  alarm_owner_.ReconcileHealth(kAlarmSourceRefreshOverdueHealthCode);
   return runtime;
 }
 

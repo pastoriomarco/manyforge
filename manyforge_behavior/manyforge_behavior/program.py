@@ -455,7 +455,7 @@ def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
     return parsed
 
 
-_CANONICAL_DEFAULT_RECOVERY_POLICY: Final = {
+CANONICAL_DEFAULT_RECOVERY_POLICY: Final = {
     "allow_intervention": False,
     "max_retries": 0,
 }
@@ -505,7 +505,7 @@ def _normalize_canonical_node_policies(
     if "recovery_policy" in node:
         recovery = _parse_canonical_recovery_policy(node["recovery_policy"], path=path)
     else:
-        recovery = dict(_CANONICAL_DEFAULT_RECOVERY_POLICY)
+        recovery = dict(CANONICAL_DEFAULT_RECOVERY_POLICY)
     if "operator_stop_policy" in node:
         operator_stop = node["operator_stop_policy"]
         if (
@@ -518,7 +518,7 @@ def _normalize_canonical_node_policies(
     else:
         operator_stop = "inherit"
     normalized_recovery = (
-        None if recovery == _CANONICAL_DEFAULT_RECOVERY_POLICY else recovery
+        None if recovery == CANONICAL_DEFAULT_RECOVERY_POLICY else recovery
     )
     normalized_stop = None if operator_stop == "inherit" else operator_stop
     return normalized_recovery, normalized_stop
@@ -1313,11 +1313,11 @@ def program_node_policies(program: "Program") -> tuple[ProgramNodePolicy, ...]:
 
     def visit(node: ProgramTreeNode) -> None:
         recovery = {
-            **_CANONICAL_DEFAULT_RECOVERY_POLICY,
+            **CANONICAL_DEFAULT_RECOVERY_POLICY,
             **({} if node.recovery_policy is None else dict(node.recovery_policy)),
         }
         stop = node.operator_stop_policy or "inherit"
-        if recovery != _CANONICAL_DEFAULT_RECOVERY_POLICY or stop != "inherit":
+        if recovery != CANONICAL_DEFAULT_RECOVERY_POLICY or stop != "inherit":
             rows.append(
                 ProgramNodePolicy(
                     instance_id=node.instance_id,

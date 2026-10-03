@@ -48,6 +48,10 @@ class ExecutionTransport(Protocol):
         self, body: Mapping[str, Any], expected_selection_revision: int
     ) -> dict[str, Any]: ...
 
+    def check_program_node_motion_attention(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
     def read(self, operation_id: str) -> dict[str, Any]: ...
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
@@ -490,6 +494,18 @@ class KernelClient:
                 "Program selection initial Run omitted its scope"
             )
         return scope
+
+    def check_program_node_motion_attention(
+        self, request: Mapping[str, Any]
+    ) -> None:
+        response = self._successful(
+            self._transport.check_program_node_motion_attention(request),
+            label="Program node motion attention",
+        )
+        if response.get("command") != "check_program_node_motion_attention":
+            raise KernelClientResponseError(
+                "Program node motion attention omitted its command"
+            )
 
     def release_program_run_stop_fence(
         self, program_run_id: str, stop_id: str, stop_generation: int

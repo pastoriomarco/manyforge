@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import os
+import socket
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -47,7 +51,7 @@ def test_response_envelope_rejects_wrong_packet_version(
     monkeypatch.setattr(
         client,
         "_exchange",
-        lambda _packet: {
+        lambda _packet, **_kwargs: {
             "api_version": "manyforge.execution_command_response.v0",
             "command": "cell_admission_get",
             "ok": True,
@@ -86,7 +90,7 @@ def test_exact_native_get_request_and_admission_response(
     client = CellAdmissionClient(tmp_path)
     packets: list[dict[str, Any]] = []
 
-    def exchange(packet: dict[str, Any]) -> dict[str, Any]:
+    def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
             "api_version": "manyforge.execution_command_response.v1",
@@ -118,7 +122,7 @@ def test_exact_native_acquire_request_and_claim_response(
     intent = _intent()
     packets: list[dict[str, Any]] = []
 
-    def exchange(packet: dict[str, Any]) -> dict[str, Any]:
+    def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
             "api_version": "manyforge.execution_command_response.v1",
@@ -150,7 +154,7 @@ def test_exact_native_error_is_preserved_as_known_outcome(
     monkeypatch.setattr(
         client,
         "_exchange",
-        lambda _packet: {
+        lambda _packet, **_kwargs: {
             "api_version": "manyforge.execution_command_response.v1",
             "command": "cell_admission_acquire",
             "error": {
@@ -193,8 +197,142 @@ def test_legacy_generic_response_envelopes_are_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path, response: dict[str, Any]
 ) -> None:
     client = CellAdmissionClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _packet: response)
+    monkeypatch.setattr(client, "_exchange", lambda _packet, **_kwargs: response)
     with pytest.raises(CellAdmissionError) as invalid:
         client.get()
     assert invalid.value.code == "execution_command_response_invalid"
     assert invalid.value.outcome_unknown is True
+
+
+def _attention_projection(generation: int = 4) -> dict[str, Any]:
+    return {
+        "active_configuration": {
+            "graph_revision": "graph.1",
+            "retained_bundle_id": "bundle.1",
+        },
+        "cell_id": "cell.test",
+        "generation": generation,
+        "members": [
+            {
+                "activation_id": "activation.1",
+                "condition_id": "condition.1",
+                "gate": "acknowledgement",
+                "record_revision": 1,
+                "subject": {
+                    "resource_ids": ["robot.joint_1"],
+                    "subject_id": "robot",
+                    "subject_kind": "component",
+                },
+            }
+        ],
+        "owner_epoch": "alarm.owner.1",
+        "owner_host_boot_id": "boot.test",
+        "owner_incarnation_us": 42,
+        "reconciled": True,
+        "schema_version": "manyforge.operator_alarm_motion_attention.v3",
+    }
+
+
+def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    client = CellAdmissionClient(tmp_path)
+    sent: list[dict[str, Any]] = []
+    deadlines: list[float | None] = []
+    socket_files: list[str | None] = []
+    command = "cell_admission_publish_operator_alarm_attention"
+
+    def exchange(packet: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        sent.append(packet)
+        deadlines.append(kwargs.get("deadline"))
+        socket_files.append(kwargs.get("socket_file"))
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": command,
+            "ok": True,
+            "operator_alarm_attention": {
+                "generation": 4,
+                "owner_epoch": "alarm.owner.1",
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    projection = _attention_projection()
+    deadline = time.monotonic() + 0.2
+    assert client.publish_operator_alarm_attention(projection, deadline=deadline) == {
+        "generation": 4,
+        "owner_epoch": "alarm.owner.1",
+    }
+    # The overall publication deadline reaches the socket exchange, and the
+    # heartbeat travels beside Stop on the independent control socket.
+    assert deadlines == [deadline]
+    assert socket_files == [cell_admission.EXECUTION_CONTROL_SOCKET_FILE]
+    assert sent == [
+        {
+            "api_version": "manyforge.execution_command.v1",
+            "command": command,
+            "request": projection,
+        }
+    ]
+    # An acceptance naming another fence is not this publication.
+    monkeypatch.setattr(
+        client,
+        "_exchange",
+        lambda _packet, **_kwargs: {
+            **exchange(_packet),
+            "operator_alarm_attention": {"generation": 3, "owner_epoch": "alarm.owner.1"},
+        },
+    )
+    with pytest.raises(CellAdmissionError) as mismatched:
+        client.publish_operator_alarm_attention(
+            projection, deadline=time.monotonic() + 0.2
+        )
+    assert mismatched.value.code == "execution_command_response_invalid"
+
+
+def test_publication_deadline_bounds_the_whole_exchange_not_each_step(
+    tmp_path,
+) -> None:
+    """A peer that accepts but never answers ends the call at its deadline.
+
+    The per-operation timeout (1 s here) would let connect, send and receive
+    each take that long; the overall monotonic deadline caps them together.
+    """
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(run_root / cell_admission.EXECUTION_CONTROL_SOCKET_FILE))
+    os.chmod(run_root / cell_admission.EXECUTION_CONTROL_SOCKET_FILE, 0o600)
+    listener.listen(1)
+    accepted: list[socket.socket] = []
+
+    def accept() -> None:
+        connection, _address = listener.accept()
+        accepted.append(connection)
+        connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)  # never answers
+
+    peer = threading.Thread(target=accept, daemon=True)
+    peer.start()
+    try:
+        client = CellAdmissionClient(run_root, timeout_seconds=1.0)
+        started = time.monotonic()
+        with pytest.raises(CellAdmissionError) as failed:
+            client.publish_operator_alarm_attention(
+                _attention_projection(), deadline=started + 0.15
+            )
+        elapsed = time.monotonic() - started
+        assert failed.value.code == "execution_owner_unavailable"
+        assert failed.value.outcome_unknown
+        assert 0.15 <= elapsed < 0.5
+        # An already elapsed deadline sends nothing.
+        with pytest.raises(CellAdmissionError) as elapsed_deadline:
+            client.publish_operator_alarm_attention(
+                _attention_projection(), deadline=time.monotonic()
+            )
+        assert "deadline elapsed" in str(elapsed_deadline.value)
+        assert len(accepted) == 1
+    finally:
+        peer.join(timeout=5.0)
+        for connection in accepted:
+            connection.close()
+        listener.close()

@@ -475,6 +475,10 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
+def _ordinary_lane_forbidden(command: dict[str, Any]) -> dict[str, Any]:
+    raise AssertionError(f"{command['command']} reached the ordinary socket")
+
+
 def test_execution_client_reads_one_exact_internal_stop_status(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -496,7 +500,10 @@ def test_execution_client_reads_one_exact_internal_stop_status(
             },
         }
 
-    monkeypatch.setattr(client, "_exchange", exchange)
+    # Stop status is read beside Stop on the control socket, never on the
+    # ordinary one.
+    monkeypatch.setattr(client, "_exchange", _ordinary_lane_forbidden)
+    monkeypatch.setattr(client, "_exchange_control", exchange)
     assert client.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
     assert captured == {
         "api_version": "manyforge.execution_command.v1",
@@ -692,7 +699,17 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
             },
         }
 
-    monkeypatch.setattr(client, "_exchange", exchange)
+    def ordinary_exchange(command: dict[str, Any]) -> dict[str, Any]:
+        assert command["command"] != "get_stop_fault"
+        return exchange(command)
+
+    def control_exchange(command: dict[str, Any]) -> dict[str, Any]:
+        assert command["command"] == "get_stop_fault"
+        return exchange(command)
+
+    # The Stop-fault read is served on the control socket; recovery is not.
+    monkeypatch.setattr(client, "_exchange", ordinary_exchange)
+    monkeypatch.setattr(client, "_exchange_control", control_exchange)
     offer = client.stop_fault()["stop_fault"]
     recovery = StopFaultRecoveryIntentRequest.model_validate(
         {
@@ -1155,6 +1172,14 @@ class _RecordingCore:
         self.completed_calls: list[dict[str, Any]] = []
         self.completed = threading.Event()
         self.unknown = threading.Event()
+        self.alarm_refreshes = 0
+        self.alarm_refresh_failure: Exception | None = None
+
+    def refresh_alarm_sources(self) -> dict[str, Any]:
+        self.alarm_refreshes += 1
+        if self.alarm_refresh_failure is not None:
+            raise self.alarm_refresh_failure
+        return {"refreshed": True}
 
     def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]:
         self.ingested.append(kwargs)
@@ -1825,3 +1850,31 @@ def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
     assert not ExecutionEventPump._operation_is_settled(  # noqa: SLF001
         {"record_kind": "stop_acceptance_projected", "payload": {}}
     )
+
+
+def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
+    """The pump is the alarm-source refresh cadence (spec 530 §11).
+
+    It offers the refresh on every iteration, also while the execution owner
+    is failing, and a failing refresh never degrades the operation feed.
+    """
+    core = _RecordingCore()
+    execution = _PagedExecution()
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    core.alarm_refresh_failure = RuntimeError("source publication invalid")
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    assert not core.unknown.is_set()
+    assert pump.last_error is None
+    core.alarm_refresh_failure = None
+    execution.fail = True
+    assert core.unknown.wait(timeout=1.0)
+    refreshes = core.alarm_refreshes
+    for _ in range(100):
+        if core.alarm_refreshes >= refreshes + 3:
+            break
+        threading.Event().wait(0.01)
+    pump.shutdown()
+    assert core.alarm_refreshes >= refreshes + 3

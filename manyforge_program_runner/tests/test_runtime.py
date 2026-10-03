@@ -382,6 +382,15 @@ class _Owner:
     def __init__(self) -> None:
         self.rows: dict[str, _Snapshot] = {}
         self.reads = 0
+        self.attention_refusal: ProgramRunOwnerError | None = None
+        self.attention_checks: list[tuple[str, str, str]] = []
+
+    def check_motion_attention(
+        self, program_run_id: str, node_instance_id: str, request_id: str
+    ) -> None:
+        self.attention_checks.append((program_run_id, node_instance_id, request_id))
+        if self.attention_refusal is not None:
+            raise self.attention_refusal
 
     def list_snapshots(
         self,
@@ -5324,6 +5333,8 @@ def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
         ("retry_motion_from_current_state", "resolve_rejected"),
         ("retry_runtime_step", "forbidden"),
         ("retry_motion_from_current_state", "exhausted"),
+        ("retry_runtime_step", "alarm"),
+        ("retry_motion_from_current_state", "alarm"),
     ],
 )
 def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
@@ -5416,6 +5427,36 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
     )
     owner_action = None if action_id == "retry_runtime_step" else action_id
     try:
+        if case == "alarm":
+            # The Kernel's operator-alarm attention refuses the motion this
+            # Retry would release, before any owner effect (spec 450 §5.2).
+            refusal = ProgramRunOwnerError(
+                "unacknowledged operator alarms gate this motion; acknowledge them"
+            )
+            refusal.code = "unacknowledged_operator_alarms"  # type: ignore[attr-defined]
+            refusal.details = {  # type: ignore[attr-defined]
+                "reason": "unacknowledged_operator_alarms",
+                "interlock_alarms": "[]",
+                "unacknowledged_alarms": '[{"activation_id":"a","condition_id":"c",'
+                '"record_revision":1}]',
+            }
+            owner.attention_refusal = refusal
+            with pytest.raises(ProgramRunnerError) as refused:
+                runtime.apply_recovery_action(request)
+            assert refused.value.code == "unacknowledged_operator_alarms"
+            assert refused.value.details["unacknowledged_alarms"].startswith("[{")
+            # Only the held node's resources are tested, not the whole run.
+            assert owner.attention_checks == [("program-cycle.1", "move.1", "retry.1")]
+            assert calls == []
+            assert journal.read().state == "running"
+            assert not journal.read().reconciliation_required
+            # Acknowledged: the same offer's Retry proceeds.
+            owner.attention_refusal = None
+            result = runtime.apply_recovery_action(
+                request.model_copy(update={"request_id": "retry.after.ack"})
+            )
+            assert result["cycle_resumed"] is True
+            return
         if case in {"forbidden", "exhausted"}:
             # The command revalidates the same captured-policy predicate as
             # the offer, before any effect, whatever the caller's label.

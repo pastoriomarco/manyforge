@@ -981,6 +981,7 @@ describe('Program authoring panels', () => {
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
+      motionAttentionBlock: vi.fn(() => null),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace
@@ -1162,6 +1163,7 @@ describe('Program authoring panels', () => {
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
+      motionAttentionBlock: vi.fn(() => null),
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>

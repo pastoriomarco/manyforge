@@ -11,6 +11,10 @@ import type {
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import {
+  MOTION_PRODUCING_RECOVERY_ACTIONS,
+  recoveryOfferResourceIds,
+} from '../state/operatorAlarmMotionAttention';
+import {
   appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
   executionGroupTargetLabels, executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
   executionSelectionIsQuiescent, type ExecutionGroupFallback, type ExecutionGroupScope,
@@ -999,9 +1003,16 @@ export function ProgramTransportControls({
     ?? null;
   const retryPending = retryAction !== null
     && state.controlPending === `recovery:${retryAction.actionId}`;
+  // A motion-producing Retry is refused by operator-alarm attention on the
+  // held operation's exact resources; Composer disables it with the remedy.
+  const retryAlarmBlock = retryAction !== null && failureOffer !== null
+    && MOTION_PRODUCING_RECOVERY_ACTIONS.has(retryAction.actionId)
+    ? program.motionAttentionBlock(recoveryOfferResourceIds(failureOffer))
+    : null;
   const canRetry = enabled
     && retryAction !== null
     && retryAction.enabled
+    && retryAlarmBlock === null
     && state.pending === null
     && state.controlPending === null
     && program.draftUnappliedReason === null;
@@ -1186,6 +1197,11 @@ export function ProgramTransportControls({
               && group.state !== 'ready'
               && group.state !== 'stopping'
               && program.commandAllowed('program_motion_stop');
+            // Run/Resume of this group is refused while a gating alarm is
+            // cell-global or names a resource the release would reserve.
+            const releaseAlarmBlock = group.resumeAllowed
+              ? program.motionAttentionBlock(group.resourceIds)
+              : null;
             const canGroupRelease = enabled
               && state.runnerAvailable
               && cycleState === 'running'
@@ -1194,6 +1210,7 @@ export function ProgramTransportControls({
               && state.pending === null
               && !selectionTransitionPending
               && group.resumeAllowed
+              && releaseAlarmBlock === null
               && !releasePending
               && state.controlPending === null
               && program.commandAllowed('program_motion_resume');
@@ -1239,6 +1256,7 @@ export function ProgramTransportControls({
                   title={retryAction !== null && failureOffer !== null
                     ? retryAction.enabled
                       ? program.draftUnappliedReason
+                        ?? retryAlarmBlock?.message
                         ?? `Retry ${failureOffer.nodeInstanceId} and let all the Program's motion continue.`
                       : retryAction.disabledReasonCode === 'failure_pause_containment_unconfirmed'
                         ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
@@ -1248,6 +1266,7 @@ export function ProgramTransportControls({
                       : group.state === 'running'
                         ? `${group.groupId} motion is running.`
                         : program.draftUnappliedReason
+                          ?? releaseAlarmBlock?.message
                           ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
                           ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {

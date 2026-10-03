@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -17,6 +18,7 @@ from typing import Any, Callable, Mapping
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+import rfc8785
 
 from manyforge_behavior.kernel_client import (
     KernelClient,
@@ -27,7 +29,10 @@ from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.cclc import CCLCOpenRequestClient
-from manyforge_headless_api.cell_admission import CellAdmissionClient
+from manyforge_headless_api.cell_admission import (
+    CellAdmissionClient,
+    CellAdmissionError,
+)
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import (
     EXECUTION_COMMAND_VERSION,
@@ -43,6 +48,7 @@ from manyforge_headless_api.models import (
     TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.private_transport import PinnedRunRoot
 from manyforge_headless_api.service import HeadlessService
 
 
@@ -2143,6 +2149,15 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
         observed = client.read(accepted["operation_id"])
         assert observed["operation"]["state"] == "stopped"
 
+        # Cross-lane fence: Stop and its status travel the control socket,
+        # the release travels the ordinary one and acts only on the exact
+        # Stop identity and generation it names, never on arrival order.
+        stale_release = client.release_program_run_stop_fence(
+            "program-run.stop-process-test",
+            stopped["accepted"]["stop_id"],
+            stopped["accepted"]["stop_generation"] + 1,
+        )
+        assert stale_release["ok"] is False, stale_release
         released = client.release_program_run_stop_fence(
             "program-run.stop-process-test",
             stopped["accepted"]["stop_id"],
@@ -4264,7 +4279,10 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "error": {
                 "code": "execution_control_command_unsupported",
                 "details": {},
-                "message": "the independent Stop control socket accepts only Stop",
+                "message": (
+                    "the independent Stop control socket accepts only Stop, "
+                    "Stop status and operator-alarm attention"
+                ),
             },
             "ok": False,
         }
@@ -4704,8 +4722,8 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         stopped = headless.stop_operations(stop_request)
         assert stopped["accepted"]["resolution_disposition"] == ("promoted_to_full")
         assert stopped["accepted"]["resolution_reason"] == "unknown_operation"
-        assert not preview_done.is_set()
 
+        # Stop preempted the blocked preview instead of waiting for it.
         preview_thread.join(timeout=3.0)
         assert preview_done.is_set()
         assert not preview_error
@@ -4714,15 +4732,23 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         assert replay["replay_status"] == "replayed_exact", replay
         for field in ("stop_id", "stop_generation"):
             assert replay[field] == stopped["accepted"][field]
-        with sqlite3.connect(
-            f"file:{execution_state_root / 'operation-journal.sqlite3'}?mode=ro",
-            uri=True,
-        ) as journal:
-            records = journal.execute(
-                "SELECT sequence,payload_json FROM journal_records "
-                "WHERE record_kind='stop_acceptance_projected' AND request_id=?",
-                (stop_request["request_context"]["request_id"],),
-            ).fetchall()
+        # The Stop-control worker projects the acceptance after the
+        # acknowledgement; the cancelled preview no longer delays this check.
+        deadline = time.monotonic() + 5.0
+        records: list[Any] = []
+        while not records and time.monotonic() < deadline:
+            with sqlite3.connect(
+                f"file:{execution_state_root / 'operation-journal.sqlite3'}?mode=ro",
+                uri=True,
+            ) as journal:
+                records = journal.execute(
+                    "SELECT sequence,payload_json FROM journal_records "
+                    "WHERE record_kind='stop_acceptance_projected' "
+                    "AND request_id=?",
+                    (stop_request["request_context"]["request_id"],),
+                ).fetchall()
+            if not records:
+                time.sleep(0.01)
         assert len(records) == 1, records
         sequence, payload_json = records[0]
         payload = json.loads(payload_json)
@@ -4745,6 +4771,354 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         if preview_thread is not None:
             preview_thread.join(timeout=3.0)
         raw_api.close()
+
+
+def _preview_packet(intent: Mapping[str, Any]) -> bytes:
+    return rfc8785.dumps(
+        {
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "attribution": {
+                "assurance": "unverified",
+                "principal_id": None,
+                "transport": "http",
+            },
+            "command": "preview_motion",
+            "operation": OperationIntentRequest.model_validate(intent).model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+def test_blocked_preview_leaves_control_traffic_served_and_program_stop_preempts_it(
+    tmp_path: Path,
+) -> None:
+    """A planning preview never occupies the lane of control-relevant traffic.
+
+    The fake candidate worker blocks the first planning request until it is
+    cancelled, so every assertion below is causal rather than timed: before
+    the submission-ordered lane existed, each ordinary request here waited for
+    the blocked preview and failed at its transport deadline.
+    """
+
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    marker = tmp_path / "blocked-preview-worker"
+    process = _start_host(
+        fixture_root,
+        state_root,
+        run_root,
+        manifest,
+        candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
+        fake_worker_marker=marker,
+    )
+    # Ordinary requests get a short transport deadline; the blocked preview
+    # itself must outlive every step before its preemption.
+    execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+    internal = ExecutionCommandClient(
+        run_root, timeout_seconds=2.0, attribution_transport="internal"
+    )
+    admission = CellAdmissionClient(run_root, timeout_seconds=2.0)
+    pinned = PinnedRunRoot(run_root)
+    preview_done = threading.Event()
+    preview_response: list[dict[str, Any]] = []
+    preview_error: list[Exception] = []
+    preview_thread: threading.Thread | None = None
+    queued: list[socket.socket] = []
+    try:
+        status = execution.diagnostics()["status"]
+        identity = status["identity"]
+        positions = [
+            float(position)
+            for position in _status_observation(status, presentation="motion")[
+                "positions_rad"
+            ]
+        ]
+        positions[0] = 0.03
+        target = _status_target(status, presentation="motion")[1]
+
+        def intent(request_id: str) -> dict[str, Any]:
+            return _direct_control_joint_operation(
+                identity, target, request_id=request_id, positions_rad=positions
+            )
+
+        def run_preview() -> None:
+            try:
+                preview_response.append(
+                    planning.preview_motion(
+                        OperationIntentRequest.model_validate(
+                            intent("blocked-lane-preview")
+                        ),
+                        trusted_principal_id=None,
+                    )
+                )
+            except Exception as error:  # surfaced after the causal assertion
+                preview_error.append(error)
+            finally:
+                preview_done.set()
+
+        preview_thread = threading.Thread(target=run_preview, daemon=True)
+        preview_thread.start()
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert marker.exists()
+
+        # Stop status, events, reads, cell admission and operator-alarm
+        # attention are all served while the preview is still planning.
+        assert execution.identity()["ok"] is True
+        assert "events" in execution.events(identity["owner_epoch"], 0, limit=1)
+        assert internal.stop_status("no-such-stop")["ok"] is False
+        assert "authoring_allowed" in admission.get()
+        attention = {
+            "active_configuration": None,
+            "cell_id": manifest["cell_id"],
+            "generation": 1,
+            "members": [],
+            "owner_epoch": "alarm.owner.lane-test",
+            "owner_host_boot_id": Path("/proc/sys/kernel/random/boot_id")
+            .read_text("ascii")
+            .strip(),
+            "owner_incarnation_us": 1,
+            "reconciled": True,
+            "schema_version": "manyforge.operator_alarm_motion_attention.v3",
+        }
+        assert admission.publish_operator_alarm_attention(
+            attention, deadline=time.monotonic() + 2.0
+        ) == {"generation": 1, "owner_epoch": "alarm.owner.lane-test"}
+        # Those Stop-lane requests have no second path on the ordinary socket.
+        for moved in (
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": {
+                    "assurance": "unverified",
+                    "principal_id": None,
+                    "transport": "internal",
+                },
+                "command": "read_stop",
+                "stop_id": "no-such-stop",
+            },
+            {"api_version": EXECUTION_COMMAND_VERSION, "command": "get_stop_fault"},
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "cell_admission_publish_operator_alarm_attention",
+                "request": attention,
+            },
+        ):
+            refused_ordinary = execution._exchange(moved)
+            assert refused_ordinary["ok"] is False, refused_ordinary
+            assert refused_ordinary["error"]["code"] == (
+                "execution_ordinary_command_unsupported"
+            ), refused_ordinary
+        assert not preview_done.is_set()
+
+        # Submission-ordered requests queue FIFO behind the blocked preview up
+        # to the host bound. The ordinary lane accepts connections in order and
+        # enqueues each before accepting the next, so the request beyond the
+        # bound is refused deterministically instead of occupying the lane.
+        for index in range(7):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            client.settimeout(5.0)
+            with pinned.socket_address("execution-command.sock") as address:
+                client.connect(address)
+            client.send(_preview_packet(intent(f"queued-lane-preview-{index}")))
+            queued.append(client)
+        overflow = execution.preview_motion(
+            OperationIntentRequest.model_validate(intent("overflow-lane-preview")),
+            trusted_principal_id=None,
+        )
+        assert overflow["ok"] is False
+        assert overflow["error"]["code"] == "execution_submission_lane_busy"
+        assert not preview_done.is_set()
+
+        def reset(operation_id: str, revision: int, request_id: str) -> dict[str, Any]:
+            return execution.reset(
+                OperationControlRequest.model_validate(
+                    {
+                        "request_context": {
+                            "request_id": request_id,
+                            "request_owner_epoch": identity["owner_epoch"],
+                            "source_label": "native-lane-test",
+                        },
+                        "operation_id": operation_id,
+                        "expected_operation_revision": revision,
+                    }
+                ),
+                trusted_principal_id=None,
+            )
+
+        # A refused Reset is served at once and changes nothing a preview
+        # depends on, so the preview keeps planning.
+        assert reset("non-resident-operation", 1, "lane-test-refused")["ok"] is False
+        assert not preview_done.is_set()
+
+        # Program Stop preempts planning before it is dispatched and never
+        # waits for it.
+        preempting = internal.stop_program_run(
+            ProgramRunStopIntentRequest.model_validate(
+                {
+                    "request_context": {
+                        "request_id": "lane-test-program-stop",
+                        "request_owner_epoch": identity["owner_epoch"],
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": "program-run.lane-test",
+                    },
+                    "program_run_id": "program-run.lane-test",
+                    "reason": "preempt the blocked preview",
+                }
+            )
+        )
+        assert preempting["ok"] is True, preempting
+
+        # The preempting command did not wait for planning; the preview and
+        # every queued one now end cancelled.
+        preview_thread.join(timeout=5.0)
+        assert preview_done.is_set()
+        assert not preview_error, preview_error
+        assert preview_response[0]["ok"] is False
+        assert preview_response[0]["error"]["details"]["reason"] == (
+            "motion_preview_cancelled"
+        ), preview_response[0]
+        # A queued preview reaches the Kernel already cancelled; after a
+        # Program Stop the Kernel may refuse it earlier at its closed motion
+        # admission. Neither plans.
+        not_planned = {"motion_preview_cancelled", "motion_admission_closed"}
+        for client in queued:
+            payload = client.recv(4 * 1024 * 1024)
+            response = json.loads(payload)
+            assert response["ok"] is False, response
+            assert response["error"]["details"]["reason"] in not_planned, response
+    finally:
+        for client in queued:
+            client.close()
+        _stop_host(process)
+        if preview_thread is not None:
+            preview_thread.join(timeout=3.0)
+
+
+def test_component_lifecycle_claim_preempts_blocked_preview(tmp_path: Path) -> None:
+    """A component-lifecycle claim never waits behind a planning preview.
+
+    The Kernel serializes the claim with the submission lock the preview
+    retains while it plans. The fake candidate worker blocks planning until it
+    is cancelled, so the claim completes only because it preempted the
+    preview, like Stop: the in-flight and queued previews end cancelled.
+    """
+
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    marker = tmp_path / "blocked-preview-worker"
+    process = _start_host(
+        fixture_root,
+        state_root,
+        run_root,
+        manifest,
+        candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
+        fake_worker_marker=marker,
+    )
+    execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+    admission = CellAdmissionClient(run_root, timeout_seconds=2.0)
+    pinned = PinnedRunRoot(run_root)
+    preview_done = threading.Event()
+    preview_response: list[dict[str, Any]] = []
+    preview_error: list[Exception] = []
+    preview_thread: threading.Thread | None = None
+    queued: socket.socket | None = None
+    try:
+        status = execution.diagnostics()["status"]
+        identity = status["identity"]
+        positions = [
+            float(position)
+            for position in _status_observation(status, presentation="motion")[
+                "positions_rad"
+            ]
+        ]
+        positions[0] = 0.03
+        target = _status_target(status, presentation="motion")[1]
+
+        def intent(request_id: str) -> dict[str, Any]:
+            return _direct_control_joint_operation(
+                identity, target, request_id=request_id, positions_rad=positions
+            )
+
+        def run_preview() -> None:
+            try:
+                preview_response.append(
+                    planning.preview_motion(
+                        OperationIntentRequest.model_validate(
+                            intent("lifecycle-blocked-preview")
+                        ),
+                        trusted_principal_id=None,
+                    )
+                )
+            except Exception as error:  # surfaced after the causal assertion
+                preview_error.append(error)
+            finally:
+                preview_done.set()
+
+        preview_thread = threading.Thread(target=run_preview, daemon=True)
+        preview_thread.start()
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert marker.exists()
+        queued = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        queued.settimeout(5.0)
+        with pinned.socket_address("execution-command.sock") as address:
+            queued.connect(address)
+        queued.send(_preview_packet(intent("lifecycle-queued-preview")))
+        # Other cell-admission commands do not preempt planning.
+        current = admission.get()
+        lifecycle_owner_epoch = CCLCOpenRequestClient(
+            run_root, timeout_seconds=2.0
+        ).owner_identity()["request_owner_epoch"]
+        assert not preview_done.is_set()
+
+        lifecycle_intent = {
+            "claim_kind": "component_lifecycle",
+            "owner_role": "component_lifecycle_owner",
+            "owner_epoch": lifecycle_owner_epoch,
+            "owner_transaction_id": "lifecycle-preempt.transaction",
+            "request_id": "claim.lifecycle-preempt",
+            "request_payload_digest": "sha256:" + "b" * 64,
+            "expected_admission_generation": current["admission_generation"],
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        }
+        # Accepted, not refused at a transport deadline: before preemption
+        # the claim waited for the blocked preview's submission lock.
+        claim = admission.acquire(lifecycle_intent)
+        assert claim["intent"] == lifecycle_intent
+
+        preview_thread.join(timeout=5.0)
+        assert preview_done.is_set()
+        assert not preview_error, preview_error
+        assert preview_response[0]["ok"] is False
+        assert preview_response[0]["error"]["details"]["reason"] == (
+            "motion_preview_cancelled"
+        ), preview_response[0]
+        response = json.loads(queued.recv(4 * 1024 * 1024))
+        assert response["ok"] is False, response
+        assert response["error"]["details"]["reason"] == (
+            "motion_preview_cancelled"
+        ), response
+    finally:
+        if queued is not None:
+            queued.close()
+        _stop_host(process)
+        if preview_thread is not None:
+            preview_thread.join(timeout=3.0)
 
 
 @pytest.mark.parametrize("active_target", ["arm", "gripper"])

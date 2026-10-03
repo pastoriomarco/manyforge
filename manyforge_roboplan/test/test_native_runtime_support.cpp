@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/writer_preferring_shared_gate.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -530,4 +531,50 @@ TEST(NativeSchedulerTest, DrainForTimesOutWhileRuntimeSafetyCallbackIsBlocked) {
   EXPECT_TRUE(
       scheduler.drain_for(SchedulerPriority::RuntimeSafety,
                           std::chrono::seconds(1)));
+}
+
+TEST(WriterPreferringSharedGateTest, WaitingWriterBlocksNewReadersAndIsBounded) {
+  WriterPreferringSharedGate gate;
+  // A reader is in flight (e.g. a host frame query on the current model).
+  gate.lock_shared();
+  ASSERT_TRUE(gate.try_lock_shared());  // readers share while no writer waits
+  gate.unlock_shared();
+
+  std::atomic<bool> replaced{false};
+  std::thread writer([&] {
+    gate.lock();
+    replaced.store(true);
+    gate.unlock();
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!gate.writer_claimed()) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::yield();
+  }
+  // Once the writer waits, a new reader cannot overlap the in-flight one and
+  // extend the writer's wait; the writer waits only for the reader it found.
+  EXPECT_FALSE(gate.try_lock_shared());
+  EXPECT_FALSE(replaced.load());
+  gate.unlock_shared();
+  writer.join();
+  EXPECT_TRUE(replaced.load());
+  EXPECT_FALSE(gate.writer_claimed());
+  ASSERT_TRUE(gate.try_lock_shared());
+  gate.unlock_shared();
+}
+
+TEST(WriterPreferringSharedGateTest, BlockedReaderProceedsAfterTheWriter) {
+  WriterPreferringSharedGate gate;
+  gate.lock();
+  std::atomic<bool> read{false};
+  std::thread reader([&] {
+    gate.lock_shared();
+    read.store(true);
+    gate.unlock_shared();
+  });
+  EXPECT_FALSE(gate.try_lock_shared());
+  EXPECT_FALSE(read.load());
+  gate.unlock();
+  reader.join();
+  EXPECT_TRUE(read.load());
 }

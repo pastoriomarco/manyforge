@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
+import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
   parseApiErrorDto,
@@ -701,7 +702,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             acknowledged = response.status >= 400 && response.status < 500;
             const error = parseApiErrorDto(body);
             throw new Error(
-              error?.message || error?.code
+              operatorAlarmRefusalMessage(error?.code, error?.details)
+                || error?.message || error?.code
                 || `Execution command rejected (HTTP ${response.status}).`,
             );
           }
@@ -735,7 +737,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             const cause = record.result;
             const detail = cause !== null && typeof cause === 'object'
               && !Array.isArray(cause) ? cause as Record<string, unknown> : null;
-            throw new Error(`${value.code}: ${typeof detail?.message === 'string'
+            const ownerError = detail?.error !== null && typeof detail?.error === 'object'
+              && !Array.isArray(detail.error) ? detail.error as Record<string, unknown> : detail;
+            const ownerDetails = ownerError?.details !== null
+              && typeof ownerError?.details === 'object' && !Array.isArray(ownerError.details)
+              ? ownerError.details as Record<string, unknown> : null;
+            const alarmRefusal = operatorAlarmRefusalMessage(value.code as string, ownerDetails);
+            throw new Error(alarmRefusal ?? `${value.code}: ${typeof detail?.message === 'string'
               ? detail.message : value.code}`);
           }
           return {

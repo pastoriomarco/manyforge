@@ -3472,6 +3472,9 @@ class _NativeKernelProgramScopePort:
     ) -> Mapping[str, Any]:
         return self._owner._kernel.start_program_selection(request, expected_selection_revision)
 
+    def check_node_motion_attention(self, request: Mapping[str, Any]) -> None:
+        self._owner._kernel.check_program_node_motion_attention(request)
+
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
         with self._owner._lock:
             stop = self._owner._scope_stops.get(program_run_id)

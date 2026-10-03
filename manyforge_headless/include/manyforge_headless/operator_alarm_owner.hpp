@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -15,12 +16,17 @@
 
 #include <manyforge_content_identity/canonical_value.hpp>
 
+#include <manyforge_core/time/host_boot_identity.hpp>
 #include <manyforge_headless/operator_alarm_catalog.hpp>
 
 namespace manyforge::headless {
 
 inline constexpr std::string_view kOperatorAlarmSnapshotApiVersion =
     "manyforge.operator_alarm_snapshot.v2";
+/// Wire schema of the Kernel-bound motion-attention publication; equal to
+/// manyforge::core::kOperatorAlarmAttentionSchemaVersion.
+inline constexpr std::string_view kOperatorAlarmMotionAttentionApiVersion =
+    "manyforge.operator_alarm_motion_attention.v3";
 inline constexpr std::string_view kOperatorAlarmMetricsApiVersion =
     "manyforge.operator_alarm_metrics.v1";
 inline constexpr std::size_t kDefaultAlarmConditionCapacity = 8192U;
@@ -268,12 +274,43 @@ struct OperatorAlarmSnapshot final {
   std::int64_t timestamp_ns;
 };
 
-struct AlarmAttentionDecision final {
-  bool available;
-  bool blocked;
-  std::string reason_code;
-  std::uint64_t owner_generation;
-  std::vector<AlarmAcknowledgementMember> matching_alarms;
+/// One record that gates motion (`GatesMotion`) with its canonical subject.
+/// A condition interlock (`acknowledgement_required=false`) gates exactly
+/// while active; any other record gates while unacknowledged.
+struct AlarmConfigurationIdentity final {
+  std::string retained_bundle_id;
+  std::string graph_revision;
+
+  friend bool operator==(const AlarmConfigurationIdentity &,
+                         const AlarmConfigurationIdentity &) = default;
+};
+
+struct AlarmMotionAttentionGate final {
+  AlarmAcknowledgementMember acknowledgement;
+  bool condition_interlock;
+  AlarmSubject subject;
+};
+
+/// The generation-fenced motion-attention projection published to the
+/// Kernel. The Kernel alone evaluates it against an operation's exact
+/// reserved resources at admission (spec 450 §5.2, spec 530 §11).
+struct AlarmMotionAttentionProjection final {
+  std::string cell_id;
+  std::string owner_epoch;
+  /// This owner instance's incarnation (host boot id and CLOCK_BOOTTIME at
+  /// construction): the Kernel accepts a new owner epoch only from a strictly
+  /// later incarnation of the same host boot.
+  manyforge::core::HostBootStamp owner_incarnation;
+  std::uint64_t generation;
+  /// False while unreconciled or unhealthy: no trustworthy scope exists.
+  bool reconciled;
+  /// The active configuration (retained bundle and graph revision) whose
+  /// resource registry judged these subjects; absent before one is observed.
+  /// The Kernel treats attention as available only when this equals its own
+  /// active configuration (spec 530 §11).
+  std::optional<AlarmConfigurationIdentity> active_configuration;
+  /// Complete membership sorted by condition id.
+  std::vector<AlarmMotionAttentionGate> members;
 };
 
 struct AlarmDurationSummary final {
@@ -354,8 +391,8 @@ public:
 
   AlarmLifecycleOwner(
       OperatorAlarmCatalog catalog, std::string cell_id, std::string owner_id,
-      std::string owner_epoch, MonotonicClock monotonic_clock,
-      WallClock wall_clock,
+      std::string owner_epoch, manyforge::core::HostBootStamp owner_incarnation,
+      MonotonicClock monotonic_clock, WallClock wall_clock,
       std::set<std::string> required_domains = {"motion", "runtime_health",
                                                 "scene"},
       std::size_t terminal_retention = kDefaultTerminalAlarmRetention,
@@ -373,7 +410,8 @@ public:
 
   /// Replace the active-configuration resource inventory. Existing condition
   /// points are retained unchanged, including those naming resources that the
-  /// new configuration no longer contains.
+  /// new configuration no longer contains. A changed configuration identity
+  /// advances the generation, so the projection names the new identity.
   void ReplaceResourceRegistry(AlarmResourceRegistry registry);
 
   [[nodiscard]] AlarmMutation Submit(AlarmConditionUpdate update);
@@ -395,14 +433,27 @@ public:
       AlarmSnapshotOrdering ordering = AlarmSnapshotOrdering::kDefault) const;
   [[nodiscard]] std::vector<OperatorAlarmRecord>
   TerminalRecords(std::optional<std::size_t> limit = std::nullopt) const;
-  [[nodiscard]] AlarmAttentionDecision EvaluateMotionAttention(
-      const std::set<std::string> &reserved_resource_ids) const;
+  /// The latest published motion-attention projection. The owner rebuilds
+  /// it in the same critical section as every generation advance and swaps
+  /// it in under its own short publication lock, so this read never waits on
+  /// an owner mutation, a snapshot, or any caller's coordination lock.
+  [[nodiscard]] std::shared_ptr<const AlarmMotionAttentionProjection>
+  MotionAttentionProjection() const;
   [[nodiscard]] OperatorAlarmMetrics Metrics() const;
 
+  /// Name an owner health fact. Restating an identical fact is a no-op; only
+  /// a newly named code or a changed message advances the generation.
   void MarkHealthUnavailable(std::string code, std::string message);
+  /// As `MarkHealthUnavailable`, but only when `still_unavailable` holds when
+  /// evaluated inside the owner's critical section (it must be cheap and must
+  /// not call back into the owner).
+  void MarkHealthUnavailableIf(std::string code, std::string message,
+                               const std::function<bool()> &still_unavailable);
   void ReconcileHealth(std::string_view code);
 
 private:
+  void MarkHealthUnavailableLocked(std::string code, std::string message);
+
   struct SourceRegistration final {
     std::string domain;
     std::string source_id;
@@ -439,12 +490,16 @@ private:
                      std::optional<std::string> reason, bool confirmed);
   void RecordRejectedUpdateLocked(std::string_view code);
   void RecordIngestLatencyLocked(std::uint64_t started_ns);
+  /// Advance the owner generation and publish the projection it names.
+  /// Called only after the critical section's state changes are complete.
+  void AdvanceGenerationLocked();
 
   OperatorAlarmCatalog catalog_;
   std::string cell_id_;
   std::optional<AlarmResourceRegistry> resource_registry_;
   std::string owner_id_;
   std::string owner_epoch_;
+  manyforge::core::HostBootStamp owner_incarnation_;
   MonotonicClock monotonic_clock_;
   WallClock wall_clock_;
   std::set<std::string> required_domains_;
@@ -465,6 +520,9 @@ private:
   std::uint64_t generation_{};
   std::uint64_t state_revision_{};
   std::uint64_t activation_serial_{};
+  /// Guards only the swap of `motion_attention_`; never held across work.
+  mutable std::mutex motion_attention_mutex_;
+  std::shared_ptr<const AlarmMotionAttentionProjection> motion_attention_;
 };
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -475,5 +533,8 @@ AlarmLifecycleFactValue(const AlarmLifecycleFact &fact);
 OperatorAlarmSnapshotValue(const OperatorAlarmSnapshot &snapshot);
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 OperatorAlarmMetricsValue(const OperatorAlarmMetrics &metrics);
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+OperatorAlarmMotionAttentionValue(
+    const AlarmMotionAttentionProjection &projection);
 
 } // namespace manyforge::headless

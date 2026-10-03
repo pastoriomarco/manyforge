@@ -304,6 +304,16 @@ public:
     return Invoke([this]() { return core_->AlarmMetrics(); });
   }
 
+  std::string OperatorAlarmMotionAttention() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->OperatorAlarmMotionAttention(); });
+  }
+
+  std::string RefreshAlarmSources() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->RefreshAlarmSources(); });
+  }
+
   std::string Acknowledge(
       std::string condition_id, std::string activation_id,
       const std::uint64_t expected_record_revision, std::string request_id,
@@ -1017,6 +1027,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("states") = std::vector<std::string>{},
            py::arg("ordering") = "default")
       .def("alarm_metrics", &HeadlessApiBridge::AlarmMetrics)
+      .def("operator_alarm_motion_attention",
+           &HeadlessApiBridge::OperatorAlarmMotionAttention)
+      .def("refresh_alarm_sources", &HeadlessApiBridge::RefreshAlarmSources)
       .def("acknowledge_alarm", &HeadlessApiBridge::Acknowledge,
            py::arg("condition_id"), py::arg("activation_id"),
            py::arg("expected_record_revision"), py::arg("request_id"),

@@ -18,6 +18,10 @@ import type {
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
+  type MotionAttentionBlock,
+  motionAttentionBlock as evaluateMotionAttention,
+} from '../state/operatorAlarmMotionAttention';
+import {
   browserStableIdentity,
   CommandDeliveryUnconfirmedError,
   type ExecutionControlCommandKind,
@@ -1677,12 +1681,24 @@ export function useProgramRuntime(
     )?.disabledReason ?? null
   ), [draftUnappliedReason, snapshot]);
 
+  const alarms = snapshot?.alarms ?? null;
+  /** Operator-alarm attention that refuses Program motion on the exact
+   * resources an operation reserves (spec 450 §5.2), from the owner's
+   * control-state alarm projection. Never applied to manual Robot Control. */
+  const motionAttentionBlock = useCallback(
+    (resourceIds: readonly string[]): MotionAttentionBlock | null => (
+      evaluateMotionAttention(alarms, resourceIds)
+    ),
+    [alarms],
+  );
+
   return useMemo(() => ({
     state,
     cycleState,
     cycleFailure,
     commandAllowed,
     commandDisabledReason,
+    motionAttentionBlock,
     draftUnappliedReason,
     active,
     refresh,
@@ -1709,6 +1725,7 @@ export function useProgramRuntime(
     cycleState,
     commandAllowed,
     commandDisabledReason,
+    motionAttentionBlock,
     draftUnappliedReason,
     persistentValues,
     refresh,

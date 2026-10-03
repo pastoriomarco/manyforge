@@ -1169,9 +1169,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       fixture.execution_run_root.path() / "execution-command.sock";
   const auto priority =
       fixture.execution_run_root.path() / "execution-control.sock";
+  // Stop-progression reads are served beside Stop on the control socket.
   const auto read_stop_fault = [&] {
     return ExecutionPacket(
-        ordinary,
+        priority,
         R"({"api_version":"manyforge.execution_command.v1","command":"get_stop_fault"})");
   };
   const auto identity = ExecutionPacket(
@@ -1278,7 +1279,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ASSERT_NE(reply.find_object_member("accepted"), nullptr) << encoded;
     const auto *accepted = reply.find_object_member("accepted");
     const auto read = ExecutionPacket(
-        ordinary, "{\"api_version\":\"manyforge.execution_command.v1\","
+        priority, "{\"api_version\":\"manyforge.execution_command.v1\","
                   "\"command\":\"read_stop\",\"stop_id\":\"" +
                       TextMember(*accepted, "stop_id") + "\"," + attribution +
                       "}");

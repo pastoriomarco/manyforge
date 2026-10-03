@@ -47,6 +47,7 @@ add_library(manyforge_core
   src/kernel_cell_admission_owner.cpp
   src/manager_liveness.cpp
   src/manager_liveness_receiver.cpp
+  src/operator_alarm_attention.cpp
   src/component_lifecycle_journal_codec.cpp
   src/component_lifecycle_plan_catalog_codec.cpp
   src/component_lifecycle_plan_evaluator.cpp

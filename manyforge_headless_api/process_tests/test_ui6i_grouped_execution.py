@@ -31,6 +31,9 @@ CELL_ID = "ui6i_ur5e_lite6_wall_cell"
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
 GROUPED_SCENARIO = "ur5e_lite6_wall_grouped"
 ISOLATION_SCENARIO = "ur5e_lite6_wall_isolation"
+# Near the wall the UR5e start keeps about 9 cm of clearance, while its
+# Program goal reaches about 6 cm through the wall.
+MOVED_UR5E_ROOT_POSITION_M = [-0.2, 0.68, 0.0]
 
 
 @contextmanager
@@ -629,10 +632,12 @@ def test_repeated_project_activation_replaces_one_coherent_publication() -> None
 def _write_mixed_variants(
     stack: ProcessStack, kinds: tuple[str, ...]
 ) -> dict[str, Path]:
-    """Writes GROUPED variants: `single` keeps only lite6, `replace` changes
-    only ur5e's controller input so lite6 is retained by the component delta,
-    and `move` changes only ur5e's root pose, which is shared cell planning
-    model rather than controller identity, so both robots are retained."""
+    """Writes GROUPED variants: `single` keeps only lite6, `solo` also keeps
+    only lite6's Program branch so the survivor stays executable, `replace`
+    changes only ur5e's controller input so lite6 is retained by the
+    component delta, and `move` changes only ur5e's root pose, which is
+    shared cell planning model rather than controller identity, so both
+    robots are retained."""
     # Keep Composer out of native-only test collection. These helpers are
     # required only by owner-connected scenario tests.
     from manyforge_composer.backend.scenario_artifacts import (
@@ -652,20 +657,37 @@ def _write_mixed_variants(
         candidate["scenario_id"] = f"mixed_{kind}"
         candidate["name"] = f"Mixed Apply {kind}"
         components = candidate["deployment_draft"]["components"]
-        if kind == "single":
+        if kind in ("single", "solo"):
             candidate["deployment_draft"]["components"] = [
                 row for row in components if row["component_id"] == "lite6_robot"
             ]
+        if kind == "solo":
+            program = candidate["program_draft"]
+            for root in program["forest"]:
+                root["children"] = [
+                    child for child in root["children"]
+                    if child["instance_id"] != "ur5e_joint_motion"
+                ]
+            del program["component_roles"]["ur5e_robot"]
+            del program["target_roles"]["ur5e_arm"]
+            assignment = candidate["program_role_assignment"]
+            assignment["component_roles"] = [
+                row for row in assignment["component_roles"]
+                if row["component_role_id"] != "ur5e_robot"
+            ]
+            assignment["target_roles"] = [
+                row for row in assignment["target_roles"]
+                if row["target_role_id"] != "ur5e_arm"
+            ]
         elif kind == "move":
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
-            # Near the wall the UR5e start keeps about 9 cm of clearance, while
-            # its Program goal reaches about 6 cm through the wall.
-            ur5e["root_pose_in_cell"]["position_m"] = [-0.2, 0.68, 0.0]
-        else:
-            assert kind == "replace", kind
+            ur5e["root_pose_in_cell"]["position_m"] = list(MOVED_UR5E_ROOT_POSITION_M)
+        elif kind == "replace":
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
             # Change only B's controller input; A must survive unchanged.
             ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
+        else:
+            assert kind == "single", kind
         target = variants / f"mixed_{kind}.scenario"
         candidate = build_scenario_document(
             scenario_id=candidate["scenario_id"],
@@ -775,6 +797,46 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         evidence = json.dumps(native.read(ur5e_operations.pop()), sort_keys=True)
         assert "native_goal_state_collision" in evidence, evidence
         assert "validation_collision" not in evidence, evidence
+
+
+def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
+    # Removing ur5e removes its joints from the whole-cell planning model, so
+    # every retained lite6 model coordinate changes index. The retained lite6
+    # controller, Kernel and observed source survive; its planner, scene,
+    # kinematics, validator, collision and state projections follow the
+    # candidate model, and its Program motion succeeds.
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            survivor = headless.cclc_component("lite6_robot")
+        paths = _write_mixed_variants(stack, ("solo",))
+        applied, source_document_digest = _load_scenario(
+            stack, "mixed_solo", scenario_path=paths["solo"]
+        )
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            retained = headless.cclc_component("lite6_robot")
+        assert retained["provider_occurrences"] == survivor["provider_occurrences"]
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=applied["scenario_id"],
+                source_document_digest=source_document_digest,
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _start_motion(client, started, request_id="ui6i.solo.motion-start")
+            accepted = _operation_acceptances(stack, program_run_id, minimum=1)
+            assert {
+                event["payload"]["intent"]["participants"][0]["target_role_id"]
+                for event in accepted
+            } == {"lite6_arm"}
+            terminal = _wait_run_state(
+                client,
+                program_run_id,
+                {"succeeded", "failed", "intervention_required", "stopped"},
+            )
+            assert terminal["state"] == "succeeded", terminal
+            _reset_cycle(client, program_run_id)
 
 
 def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:

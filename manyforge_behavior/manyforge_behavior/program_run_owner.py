@@ -47,6 +47,7 @@ from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
     ProgramRunCapture,
     ProgramRunOwnerIdentity,
+    ProgramRuntimeError,
 )
 from manyforge_behavior.orchestration_values import ProgramValueError
 
@@ -82,6 +83,15 @@ class ProgramRunOwnerStaleRevisionError(ProgramRunOwnerError):
             "expected_run_revision": expected,
             "current_run_revision": current,
         }
+
+
+def _release_refused(error: ProgramSelectionReleaseRejectedError) -> ProgramRunOwnerError:
+    """Keep the Kernel's stable refusal code and details for the caller."""
+    refused = ProgramRunOwnerError(str(error))
+    if error.code is not None:
+        refused.code = error.code  # type: ignore[attr-defined]
+        refused.details = dict(error.details)  # type: ignore[attr-defined]
+    return refused
 
 
 class ProgramRunOwnerOutcomeUnknownError(ProgramRunOwnerError):
@@ -176,6 +186,34 @@ def _runtime_scale_selector_for_group(
     else:
         selector["group_targets"] = ordered
     return selector, None
+
+
+def _selection_resource_ids(
+    run: ExecutableProgramRun,
+    program_binding: Mapping[str, Any],
+    group_id: str,
+) -> list[str]:
+    """The exact resources the Kernel reserves for one selection's release.
+
+    The Kernel's rule (spec 450 §5.2): every effectful target effect of the
+    selection's nodes, resolved through the sealed Program Binding. Composer
+    tests operator-alarm motion attention against this set; the Kernel stays
+    the enforcement point.
+    """
+
+    roles = set(run.execution_selection_effect_target_roles(group_id))
+    resources: set[str] = set()
+    for target in program_binding.get("target_role_bindings", ()):
+        if not isinstance(target, Mapping) or target.get("target_role_id") not in roles:
+            continue
+        for resource_role in target.get("resource_role_bindings", ()):
+            if isinstance(resource_role, Mapping):
+                resources.update(
+                    resource
+                    for resource in resource_role.get("resource_ids", ())
+                    if isinstance(resource, str)
+                )
+    return sorted(resources)
 
 
 @dataclass(frozen=True, slots=True)
@@ -889,6 +927,27 @@ class ProgramRunOwner:
             raise ProgramRunOwnerError("stopped task lost its intervention registry")
         return port.refresh_owner_assessment(intervention.identity, assessment)
 
+    def check_motion_attention(
+        self, program_run_id: str, node_instance_id: str, request_id: str
+    ) -> None:
+        """No-effect Kernel check of operator-alarm attention for the held node
+        a motion-producing recovery would move, before any effect.
+
+        Only that node's target resources are tested (spec 450 §5.2): an alarm
+        on disjoint resources does not block this recovery, just as disjoint
+        operations continue.
+        """
+        with self._lock:
+            run = self._entry(program_run_id).run
+        try:
+            request = run.node_motion_attention_request(node_instance_id, request_id)
+        except ProgramRuntimeError as error:
+            raise ProgramRunOwnerError(str(error)) from error
+        try:
+            self._scope.check_node_motion_attention(request)
+        except ProgramSelectionReleaseRejectedError as error:
+            raise _release_refused(error) from error
+
     def operator_stop_scope(self, program_run_id: str):
         """Return the current scheduling view, not a new owner read."""
         with self._lock:
@@ -1485,6 +1544,9 @@ class ProgramRunOwner:
                         "resume_unavailable_reason": release_reason,
                         "runtime_scale_selector": scale_selector,
                         "runtime_scale_unavailable_reason": scale_reason,
+                        "resource_ids": _selection_resource_ids(
+                            run, program_binding, group_id
+                        ),
                     }
                 )
             return live, {
@@ -1734,7 +1796,7 @@ class ProgramRunOwner:
                             notify_observation=False,
                         )
                     except ProgramSelectionReleaseRejectedError as error:
-                        raise ProgramRunOwnerError(str(error)) from error
+                        raise _release_refused(error) from error
                     except Exception as error:
                         raise ProgramRunOwnerOutcomeUnknownError(
                             f"Retry release outcome is unconfirmed: {error}"
@@ -1860,7 +1922,7 @@ class ProgramRunOwner:
                             notify_observation=False,
                         )
                     except ProgramSelectionReleaseRejectedError as error:
-                        raise ProgramRunOwnerError(str(error)) from error
+                        raise _release_refused(error) from error
                     except Exception as error:
                         raise ProgramRunOwnerOutcomeUnknownError(
                             f"selected release outcome is unconfirmed: {error}"

@@ -145,8 +145,11 @@ class HeadlessApiConfig:
             raise ValueError("execution_timeout_seconds must be in (0, 30]")
         if not 0 < self.cclc_timeout_seconds <= 30:
             raise ValueError("cclc_timeout_seconds must be in (0, 30]")
-        if not 10 <= self.execution_event_poll_milliseconds <= 5_000:
-            raise ValueError("execution_event_poll_milliseconds must be between 10 and 5000")
+        # The event pump also drives the alarm-source refresh (period R =
+        # 250 ms); a slower pump would let alarm sources exceed their
+        # currency bound and hold Program motion unreconciled.
+        if not 10 <= self.execution_event_poll_milliseconds <= 250:
+            raise ValueError("execution_event_poll_milliseconds must be between 10 and 250")
         if self.program_runner_url is not None:
             parsed_runner_url = urlsplit(self.program_runner_url)
             if (
@@ -244,6 +247,10 @@ class HeadlessCorePort(Protocol):
     ) -> dict[str, Any]: ...
 
     def alarm_metrics(self) -> dict[str, Any]: ...
+
+    def operator_alarm_motion_attention(self) -> dict[str, Any]: ...
+
+    def refresh_alarm_sources(self) -> dict[str, Any]: ...
 
     def acknowledge_alarm(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -637,6 +644,18 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("alarm_metrics"),
             method="alarm_metrics",
+        )
+
+    def operator_alarm_motion_attention(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("operator_alarm_motion_attention"),
+            method="operator_alarm_motion_attention",
+        )
+
+    def refresh_alarm_sources(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("refresh_alarm_sources"),
+            method="refresh_alarm_sources",
         )
 
     def acknowledge_alarm(self, **kwargs: Any) -> dict[str, Any]:

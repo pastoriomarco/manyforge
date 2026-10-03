@@ -1623,6 +1623,25 @@ struct ActiveOperationParticipant final {
   std::size_t continuation_node_index{};
 };
 
+/// Exact reserved resource set of one operation: the union over its
+/// participants (spec 450 §5.2 coordinated rule).
+[[nodiscard]] static std::vector<ResourceId> operation_resources(
+    const std::vector<ActiveOperationParticipant>& participants) {
+  std::set<ResourceId> resources;
+  for (const auto& participant : participants) {
+    resources.insert(participant.resources.begin(), participant.resources.end());
+  }
+  return {resources.begin(), resources.end()};
+}
+
+/// The motion-producing recovery actions gated by operator-alarm attention
+/// (spec 450 §5.2); acknowledge_and_continue moves nothing and stays open.
+[[nodiscard]] static bool motion_producing_recovery(const RecoveryAction action) noexcept {
+  return action == RecoveryAction::kRetryMotionFromCurrentState ||
+         action == RecoveryAction::kRetryAfterSceneRepair ||
+         action == RecoveryAction::kReplanFromStoppedState;
+}
+
 struct PendingPreparedResume final {
   OperationParticipantId participant_id;
   IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
@@ -1698,6 +1717,11 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   // A newer Stop cannot borrow its predecessor's result.
   std::optional<SettledStop> settled_stop{};
   std::shared_ptr<const ResolvedManualProgramHandover> manual_handover{};
+  // Manual Robot Control identity, fixed at admission from the binding's
+  // intrinsic direct control. Spec 450 §5.2 / spec 530 §11 gate ordinary
+  // Run/Resume and motion-producing recovery; they never gate a manual
+  // operation, whether or not a manual cell-admission claim still names it.
+  bool manual{};
   std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
   mutable std::uint64_t recovery_assessment_revision{};
@@ -3128,6 +3152,12 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     throw std::invalid_argument(
         "bootstrap resource inventory lacks one exact empty-runtime product");
   }
+  if (config_.operator_alarm_attention.has_value() &&
+      (config_.operator_alarm_attention->maximum_snapshot_age_ns <= 0 ||
+       config_.operator_alarm_attention->host_boot_id.empty())) {
+    throw std::invalid_argument(
+        "operator-alarm attention policy needs a positive age bound and the host boot id");
+  }
   if (config_.request_owner_epoch.empty() || config_.cell_id.empty() ||
       config_.request_replay_capacity == 0U ||
       config_.request_replay_capacity > kMaxI6OperationReplayEntries ||
@@ -3958,6 +3988,144 @@ Result<void> ResourceAddressedExecutionKernel::Publish(
   // Deliberately bypasses the operation admission mutex: receiver-local
   // containment and Stop acceptance must not wait on liveness publication.
   return cell_admission_owner_->Publish(observation);
+}
+
+Result<OperatorAlarmAttentionAcceptedDTO>
+ResourceAddressedExecutionKernel::PublishOperatorAlarmAttention(
+    const OperatorAlarmAttentionSnapshotDTO& snapshot) {
+  if (auto valid = validate_operator_alarm_attention_snapshot(snapshot); !valid.ok()) {
+    return Result<OperatorAlarmAttentionAcceptedDTO>::Err(valid.error());
+  }
+  if (snapshot.cell_id != config_.cell_id) {
+    return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+        error("operator_alarm_attention_cell_mismatch",
+              "operator-alarm attention projection names another cell",
+              "operator_alarm_attention_cell_mismatch"));
+  }
+  // Single-host precondition (spec 530 §11): owner incarnations are
+  // CLOCK_BOOTTIME stamps, comparable only within the Kernel's own host boot.
+  // A projection from another host or boot is refused, never compared.
+  if (config_.operator_alarm_attention.has_value() &&
+      snapshot.owner_host_boot_id != config_.operator_alarm_attention->host_boot_id) {
+    return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+        error("operator_alarm_attention_host_mismatch",
+              "operator-alarm attention was published from another host boot",
+              "operator_alarm_attention_host_mismatch"));
+  }
+  // A small bounded copy under the state lock that admission reads; Stop
+  // acceptance never waits on any I/O here.
+  //
+  // Fencing contract (spec 530 §11). Owner epochs are ordered by their
+  // incarnation alone, so the Kernel keeps no list of replaced epochs: a new
+  // epoch is accepted only with a strictly greater incarnation than the
+  // retained one; an equal incarnation under another epoch, or a smaller one,
+  // is refused. Within one epoch the incarnation is fixed, generations are
+  // monotonic, and one generation names exactly one content: identical
+  // content is the heartbeat that refreshes the receipt time, while different
+  // content under the same generation is refused.
+  std::lock_guard state_lock(state_mutex_);
+  if (operator_alarm_attention_.has_value()) {
+    const auto& retained = operator_alarm_attention_->snapshot;
+    if (retained.owner_epoch == snapshot.owner_epoch) {
+      if (snapshot.owner_host_boot_id != retained.owner_host_boot_id ||
+          snapshot.owner_incarnation_us != retained.owner_incarnation_us) {
+        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+            error("operator_alarm_attention_conflict",
+                  "operator-alarm owner epoch was republished with another incarnation",
+                  "operator_alarm_attention_owner_incarnation_conflict"));
+      }
+      if (snapshot.generation < retained.generation) {
+        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+            error("operator_alarm_attention_stale",
+                  "operator-alarm attention generation precedes the retained one",
+                  "operator_alarm_attention_generation_stale"));
+      }
+      if (snapshot.generation == retained.generation && snapshot != retained) {
+        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+            error("operator_alarm_attention_conflict",
+                  "operator-alarm attention generation was republished with different content",
+                  "operator_alarm_attention_generation_conflict"));
+      }
+    } else if (snapshot.owner_incarnation_us == retained.owner_incarnation_us) {
+      return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+          error("operator_alarm_attention_conflict",
+                "another operator-alarm owner epoch claims the retained incarnation",
+                "operator_alarm_attention_owner_incarnation_conflict"));
+    } else if (snapshot.owner_incarnation_us < retained.owner_incarnation_us) {
+      return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+          error("operator_alarm_attention_stale",
+                "operator-alarm attention names an older owner incarnation",
+                "operator_alarm_attention_owner_incarnation_stale"));
+    }
+  }
+  operator_alarm_attention_ = RetainedOperatorAlarmAttentionDTO{snapshot, clock_.now()};
+  return Result<OperatorAlarmAttentionAcceptedDTO>::Ok(
+      OperatorAlarmAttentionAcceptedDTO{snapshot.owner_epoch, snapshot.generation});
+}
+
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::operator_alarm_attention_refusal_locked(
+    const std::vector<ResourceId>& reserved_resources) const {
+  if (!config_.operator_alarm_attention.has_value()) return std::nullopt;
+  std::optional<OperatorAlarmAttentionConfigurationDTO> active_configuration;
+  if (stop_retained_bundle_id_.has_value() && stop_graph_revision_.has_value()) {
+    active_configuration =
+        OperatorAlarmAttentionConfigurationDTO{*stop_retained_bundle_id_, *stop_graph_revision_};
+  }
+  return evaluate_operator_alarm_motion_attention(
+      operator_alarm_attention_, *config_.operator_alarm_attention, config_.cell_id,
+      active_configuration, clock_.now(), reserved_resources);
+}
+
+std::vector<ResourceId> ResourceAddressedExecutionKernel::program_selection_resources_locked(
+    const std::vector<std::uint32_t>& node_indices) const {
+  std::set<ResourceId> resources;
+  if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+      !program_cycle_claim_run_->capture->table || !program_cycle_claim_run_->capture->binding) {
+    return {};
+  }
+  const auto& capture = *program_cycle_claim_run_->capture;
+  const auto& nodes = capture.table->nodes;
+  for (const auto index : node_indices) {
+    if (index >= nodes.size()) continue;
+    for (const auto& effect : nodes[index].target_effects) {
+      if (!effect.effectful) continue;
+      // The exact sealed Program Binding names each target role's resources.
+      for (const auto& target : capture.binding->target_role_bindings) {
+        if (target.target_role_id != effect.target_role_id) continue;
+        for (const auto& role : target.resource_role_bindings) {
+          resources.insert(role.resource_ids.begin(), role.resource_ids.end());
+        }
+      }
+    }
+  }
+  return {resources.begin(), resources.end()};
+}
+
+Result<void> ResourceAddressedExecutionKernel::check_program_node_motion_attention(
+    const ProgramNodeMotionAttentionCheckDTO& request) const {
+  std::lock_guard state_lock(state_mutex_);
+  if (request.request_context.request_owner_epoch != config_.request_owner_epoch ||
+      !program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+      !program_cycle_claim_run_->capture->table ||
+      request.program_run_id != program_cycle_claim_run_->program_run_id ||
+      request.program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
+      request.claim_generation != program_cycle_claim_run_->claim_generation) {
+    return reject<void>("Program node check does not name the current captured owner/claim",
+                        "program_selection_stale", ErrorCode::kInvalidStateTransition);
+  }
+  const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+  const auto node = std::lower_bound(
+      nodes.begin(), nodes.end(), request.node_instance_id,
+      [](const auto& row, const auto& id) { return row.instance_id < id; });
+  if (node == nodes.end() || node->instance_id != request.node_instance_id) {
+    return reject<void>("Program node is not present in the captured Program",
+                        "program_node_unknown", ErrorCode::kInvalidRequest);
+  }
+  if (auto refusal = operator_alarm_attention_refusal_locked(program_selection_resources_locked(
+          {static_cast<std::uint32_t>(node - nodes.begin())}))) {
+    return Result<void>::Err(std::move(*refusal));
+  }
+  return Result<void>::Ok();
 }
 
 void ResourceAddressedExecutionKernel::LatchAndContain(
@@ -6706,6 +6874,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                         std::move(initial_runtime_scale_status)}));
     stamp_operation_capture_locked(*staging.at(operation_id), operation_state_dto);
     staging.at(operation_id)->manual_handover = manual_handover;
+    staging.at(operation_id)->manual = resolved.value().intrinsic_direct_control;
     staging.at(operation_id)->state = operation_state_dto;
     prepared_operation = staging.extract(operation_id);
   } catch (...) {
@@ -6730,6 +6899,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     }
     if (const auto scope = validate_program_execution_scope_locked(intent); !scope.ok()) {
       return Result<OperationAcceptedDTO>::Err(scope.error());
+    }
+    // Ordinary Run work only; Manual Robot Control is not attention-gated.
+    if (!resolved.value().intrinsic_direct_control) {
+      if (auto refusal = operator_alarm_attention_refusal_locked(resources)) {
+        return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+      }
     }
     if (manual_handover) {
       const auto current_hold = validate_manual_program_handover_locked(*manual_handover);
@@ -7434,6 +7609,11 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     if (const auto scope = validate_program_execution_scope_locked(intent); !scope.ok()) {
       return Result<OperationAcceptedDTO>::Err(scope.error());
     }
+    // One intersecting participant rejects the complete coordinated admission.
+    if (auto refusal = operator_alarm_attention_refusal_locked(
+            std::vector<ResourceId>(selected_resources.begin(), selected_resources.end()))) {
+      return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+    }
     if (program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
         program_cycle_claim_run_->program_run_id == intent.program_run_id) {
       const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
@@ -7635,7 +7815,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
           settle_completed_control_locked(operation_id);
         }
       }
-      (void)fail_coordinated_pre_dispatch(operation_id, admission.registration.engine,
+      (void)fail_pre_dispatch(operation_id, admission.registration.engine,
                                           prepared.error());
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
@@ -7772,7 +7952,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
     if (!admitted.ok()) {
-      (void)fail_coordinated_pre_dispatch(operation_id, admission.registration.engine,
+      (void)fail_pre_dispatch(operation_id, admission.registration.engine,
                                           admitted.error());
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
@@ -7781,7 +7961,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             ? advance_prepared_motion(operation_id, admission.registration.engine)
             : advance_prepared_capability_command(operation_id, admission.registration.engine);
     if (!advanced.ok()) {
-      (void)fail_coordinated_pre_dispatch(operation_id, admission.registration.engine,
+      (void)fail_pre_dispatch(operation_id, admission.registration.engine,
                                           advanced.error());
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
@@ -7938,6 +8118,12 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       auto scope =
           validate_program_resume_scope_locked(active_operation->intent, request.execution_scope);
       if (!scope.ok()) return Result<OperationControlAcceptedDTO>::Err(scope.error());
+      if (!active_operation->manual) {
+        if (auto refusal = operator_alarm_attention_refusal_locked(
+                operation_resources(active_operation->participants))) {
+          return Result<OperationControlAcceptedDTO>::Err(std::move(*refusal));
+        }
+      }
       if (active_operation->runtime_scale_status.has_value() &&
           (active_operation->runtime_scale_status->state == RuntimeScaleApplicationState::kFailed ||
            active_operation->runtime_scale_status->state ==
@@ -9562,6 +9748,7 @@ ResourceAddressedExecutionKernel::resolve_program_selection_locked(
   using Indices = std::vector<std::uint32_t>;
   if (request.request_context.request_owner_epoch != config_.request_owner_epoch ||
       !program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+      !program_cycle_claim_run_->capture->table ||
       request.program_run_id != program_cycle_claim_run_->program_run_id ||
       request.program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
       request.claim_generation != program_cycle_claim_run_->claim_generation) {
@@ -10075,6 +10262,12 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
             "program_selection_recovery_required", ErrorCode::kInvalidStateTransition);
       }
     }
+  }
+  // Ordinary Run/Resume: the released nodes' bound resources are the
+  // candidate scope; each later operation is rechecked at its own admission.
+  if (auto refusal =
+          operator_alarm_attention_refusal_locked(program_selection_resources_locked(selection.value()))) {
+    return Result<ProgramExecutionScopeStateDTO>::Err(std::move(*refusal));
   }
   // All selected eligibility was checked before any node is released. An
   // unrelated branch may keep executing; there is no per-group lock to clear.
@@ -15127,6 +15320,13 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
                    {{"reason", "active_stop_fault_requires_reset"},
                     {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
     }
+    if (motion_producing_recovery(request.action) &&
+        !operation->manual) {
+      if (auto refusal =
+              operator_alarm_attention_refusal_locked(operation_resources(operation->participants))) {
+        return Result<KernelRecoveryActionResultDTO>::Err(std::move(*refusal));
+      }
+    }
     if (!operation->stop_allows_retirement()) {
       return reject<KernelRecoveryActionResultDTO>(
           "operation recovery awaits its exact successful Stop certificate",
@@ -15476,6 +15676,13 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
                    {{"reason", "active_stop_fault_requires_reset"},
                     {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
     }
+    if (motion_producing_recovery(request.action) &&
+        !operation->manual) {
+      if (auto refusal =
+              operator_alarm_attention_refusal_locked(operation_resources(operation->participants))) {
+        return Result<KernelRecoveryActionResultDTO>::Err(std::move(*refusal));
+      }
+    }
     if (!operation->stop_allows_retirement()) {
       return reject<KernelRecoveryActionResultDTO>(
           "operation recovery awaits its exact successful Stop certificate",
@@ -15723,7 +15930,7 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
   return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
 }
 
-Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(
+Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
     ErrorDTO failure) {
   struct Cancellation final {
@@ -15733,9 +15940,11 @@ Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(
   };
   std::vector<Cancellation> cancellations;
   std::vector<ResourceSlotReservationOwnerDTO> reservation_rows;
+  const bool admission_refusal = failing_engine == nullptr;
   const auto stop_owns_failure_locked = [&](ActiveOperation* operation) {
     if (operation == nullptr ||
-        operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll) {
+        (!admission_refusal &&
+         operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll)) {
       return true;
     }
     if (operation->state.active_stop_id.has_value()) {
@@ -15791,7 +16000,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(
     operation->coordinated_cancellation_in_flight = true;
     for (auto& participant : operation->participants) {
       participant.stop_cancelled_pre_dispatch = true;
-      if (participant.engine == failing_engine) {
+      if (admission_refusal || participant.engine == failing_engine) {
         participant.last_subordinate_error = failure;
       }
       if (participant.prepared_motion_engine != nullptr && participant.subordinate_id != 0U) {
@@ -15807,10 +16016,13 @@ Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(
           });
       const bool failed =
           participant != operation->participants.end() && participant->engine == failing_engine;
-      row.state = failed ? OperationStateKind::kInterventionRequired
-                         : OperationStateKind::kCancelledPreDispatch;
+      // An admission refusal applies to every participant alike and takes
+      // the same no-effect failure outcome as a failed preparation.
+      row.state = failed || admission_refusal ? OperationStateKind::kInterventionRequired
+                                              : OperationStateKind::kCancelledPreDispatch;
       row.progress = 0.0;
-      row.terminal_error = failed ? std::optional(failure) : std::nullopt;
+      row.terminal_error =
+          failed || admission_refusal ? std::optional(failure) : std::nullopt;
     }
     operation->state.state = OperationStateKind::kInterventionRequired;
     operation->state.updated_at_ns = clock_.now();
@@ -15845,10 +16057,11 @@ Result<void> ResourceAddressedExecutionKernel::fail_coordinated_pre_dispatch(
     }
   }
   auto captured = operation->state;
-  auto durable = record_operation_state_locked(state_lock, captured, nullptr,
-                                               cancellation_failure.has_value()
-                                                   ? "coordinated_prepare_cancel_failed"
-                                                   : "coordinated_prepare_failed_before_dispatch");
+  auto durable = record_operation_state_locked(
+      state_lock, captured, nullptr,
+      cancellation_failure.has_value() ? "coordinated_prepare_cancel_failed"
+      : admission_refusal              ? "admission_refused_before_dispatch"
+                                       : "coordinated_prepare_failed_before_dispatch");
   if (!durable.ok()) {
     motion_admission_closed_ = true;
     return Result<void>::Err(durable.error());
@@ -16182,6 +16395,9 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_resume(
   if (dispatch_targets.empty()) {
     return Result<void>::Ok();
   }
+  if (config_.prepared_resume_barrier_claimed_seam) {
+    config_.prepared_resume_barrier_claimed_seam(operation_id);
+  }
 
   for (const auto& dispatch : dispatch_targets) {
     bool dispatch_owned = false;
@@ -16222,6 +16438,19 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_resume(
         auto scope =
             validate_program_resume_scope_locked(operation->intent, pending.execution_scope);
         if (!scope.ok()) dispatch_invariant_failure = scope.error();
+      }
+      if (!dispatch_invariant_failure.has_value() && !pending.superseded_by_stop &&
+          !operation->state.active_stop_id.has_value() &&
+          !operation->manual &&
+          std::none_of(pending.prepared_resumes.begin(), pending.prepared_resumes.end(),
+                       [](const auto& row) { return row.dispatch_released; })) {
+        // Final pre-dispatch recheck of Resume (spec 450 §5.2, spec 530 §11),
+        // in the same lock hold that releases the first prepared Resume: no
+        // window separates the last attention evaluation from dispatch. Once
+        // one coordinated participant is released the barrier is committed.
+        // The shared failure path cancels every prepared Resume.
+        dispatch_invariant_failure =
+            operator_alarm_attention_refusal_locked(operation_resources(operation->participants));
       }
       if (!dispatch_invariant_failure.has_value() && !pending.superseded_by_stop &&
           !operation->state.active_stop_id.has_value()) {
@@ -16411,7 +16640,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
           cancelled ? OperationStateKind::kStopped : OperationStateKind::kInterventionRequired, 0.0,
           cancelled ? std::optional<ErrorDTO>{} : std::optional(failure));
     }
-    return fail_coordinated_pre_dispatch(operation_id, target->engine, failure);
+    return fail_pre_dispatch(operation_id, target->engine, failure);
   }
 
   if (!snapshot.value().participant || !snapshot.value().backend_prepare_result ||
@@ -16442,7 +16671,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
   }
   if (common_time_law_missing) {
     release_claim();
-    return fail_coordinated_pre_dispatch(
+    return fail_pre_dispatch(
         operation_id, target->engine,
         error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
               "Coordinated trajectories require a qualified common time-law preparation",
@@ -16608,6 +16837,23 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           return Result<void>::Err(durable.error());
         }
         if (!durable.value()) return Result<void>::Ok();
+        // Final pre-dispatch recheck (spec 450 §5.2, spec 530 §11). The
+        // prepared-state write above released state_mutex_, so attention is
+        // evaluated only here, in the same lock hold that transitions the
+        // slots and releases dispatch: an alarm published or a projection
+        // aged out at any earlier instant is observed. Dispatch none; the
+        // shared pre-dispatch path cancels every prepared participant.
+        if (!operation->manual) {
+          if (auto refusal = operator_alarm_attention_refusal_locked(
+                  operation_resources(operation->participants))) {
+            operation->state = std::move(prepared_state);
+            participant = operation->participant_for(engine);
+            if (participant != nullptr) participant->prepared_advance_in_flight = false;
+            state_lock.unlock();
+            commit.release();
+            return fail_pre_dispatch(operation_id, nullptr, std::move(*refusal));
+          }
+        }
 
         std::vector<ResourceSlotReservationOwnerDTO> rows;
         rows.reserve(operation->participants.size());
@@ -17056,7 +17302,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_comma
       return Result<void>::Ok();
     }
     if (coordinated) {
-      return fail_coordinated_pre_dispatch(operation_id, target->engine, failure);
+      return fail_pre_dispatch(operation_id, target->engine, failure);
     }
     return apply_subordinate_state(
         operation_id, target->engine, target->preparation_id,
@@ -17481,7 +17727,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     // The execution owner's terminal event is decisive even if its private
     // prepared-session cleanup follows that event. An earlier error alone
     // was not decisive. Reuse the abort claim, including recursive callbacks.
-    (void)fail_coordinated_pre_dispatch(*operation_id, engine,
+    (void)fail_pre_dispatch(*operation_id, engine,
                                         std::move(*coordinated_pre_dispatch_failure));
     return;
   }

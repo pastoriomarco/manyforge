@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <set>
 #include <string>
 #include <tuple>
@@ -191,11 +192,31 @@ CanonicalValue MotionMemberValue(const AlarmMotionAttentionMember &member) {
   });
 }
 
-bool Intersects(const std::vector<std::string> &left,
-                const std::set<std::string> &right) {
-  return std::any_of(left.begin(), left.end(), [&right](const auto &value) {
-    return right.find(value) != right.end();
-  });
+std::shared_ptr<const AlarmMotionAttentionProjection> BuildMotionAttention(
+    const std::string &cell_id, const std::string &owner_epoch,
+    const manyforge::core::HostBootStamp &owner_incarnation,
+    const std::uint64_t generation, const bool reconciled,
+    const std::optional<AlarmResourceRegistry> &registry,
+    const std::map<std::string, AlarmPointState> &points) {
+  std::optional<AlarmConfigurationIdentity> active_configuration;
+  if (registry.has_value()) {
+    active_configuration = AlarmConfigurationIdentity{
+        registry->retained_bundle_id, registry->graph_revision};
+  }
+  auto projection = std::make_shared<AlarmMotionAttentionProjection>(
+      AlarmMotionAttentionProjection{cell_id, owner_epoch, owner_incarnation,
+                                     generation, reconciled,
+                                     std::move(active_configuration), {}});
+  for (const auto &[condition_id, point] : points) {
+    if (!point.record.has_value() || !GatesMotion(*point.record)) {
+      continue;
+    }
+    projection->members.push_back(
+        {AlarmAcknowledgementMember{condition_id, point.record->activation_id,
+                                    point.record->record_revision},
+         !point.record->acknowledgement_required, point.record->subject});
+  }
+  return projection;
 }
 
 } // namespace
@@ -206,12 +227,14 @@ void ValidateAlarmCallerAttribution(const AlarmCallerAttribution &caller) {
 
 AlarmLifecycleOwner::AlarmLifecycleOwner(
     OperatorAlarmCatalog catalog, std::string cell_id, std::string owner_id,
-    std::string owner_epoch, MonotonicClock monotonic_clock,
-    WallClock wall_clock, std::set<std::string> required_domains,
+    std::string owner_epoch, manyforge::core::HostBootStamp owner_incarnation,
+    MonotonicClock monotonic_clock, WallClock wall_clock,
+    std::set<std::string> required_domains,
     const std::size_t terminal_retention, const std::size_t condition_capacity,
     const std::size_t live_alarm_capacity)
     : catalog_(std::move(catalog)), cell_id_(std::move(cell_id)),
       owner_id_(std::move(owner_id)), owner_epoch_(std::move(owner_epoch)),
+      owner_incarnation_(std::move(owner_incarnation)),
       monotonic_clock_(std::move(monotonic_clock)),
       wall_clock_(std::move(wall_clock)),
       required_domains_(std::move(required_domains)),
@@ -221,6 +244,11 @@ AlarmLifecycleOwner::AlarmLifecycleOwner(
   ValidateText(cell_id_, "cell_id", kMaximumIdentityBytes);
   ValidateText(owner_id_, "owner_id", kMaximumIdentityBytes);
   ValidateText(owner_epoch_, "owner_epoch", kMaximumIdentityBytes);
+  ValidateText(owner_incarnation_.boot_id, "owner_host_boot_id",
+               kMaximumIdentityBytes);
+  Require(owner_incarnation_.boottime_us != 0U,
+          "operator_alarm_configuration_invalid",
+          "the owner incarnation must be a positive boot-time stamp");
   Require(static_cast<bool>(monotonic_clock_) && static_cast<bool>(wall_clock_),
           "operator_alarm_configuration_invalid",
           "both alarm-owner clocks are required");
@@ -245,6 +273,21 @@ AlarmLifecycleOwner::AlarmLifecycleOwner(
   static_cast<void>(MonotonicNow());
   static_cast<void>(WallNow());
   metrics_.insert_or_assign("owner_restarts", 1U);
+  motion_attention_ = BuildMotionAttention(
+      cell_id_, owner_epoch_, owner_incarnation_, generation_,
+      ReconciledLocked(), resource_registry_, points_);
+}
+
+void AlarmLifecycleOwner::AdvanceGenerationLocked() {
+  Advance(generation_, "owner generation");
+  // Rebuilt under the owner lock, so it names exactly this generation's
+  // state; only the pointer swap takes the publication lock.
+  auto projection =
+      BuildMotionAttention(cell_id_, owner_epoch_, owner_incarnation_,
+                           generation_, ReconciledLocked(), resource_registry_,
+                           points_);
+  std::lock_guard publication(motion_attention_mutex_);
+  motion_attention_ = std::move(projection);
 }
 
 void AlarmLifecycleOwner::ReplaceResourceRegistry(
@@ -260,8 +303,16 @@ void AlarmLifecycleOwner::ReplaceResourceRegistry(
     ValidateText(resource, "resource_id", kMaximumIdentityBytes);
   }
   std::lock_guard lock(mutex_);
+  const bool identity_changed =
+      !resource_registry_.has_value() ||
+      resource_registry_->retained_bundle_id != registry.retained_bundle_id ||
+      resource_registry_->graph_revision != registry.graph_revision;
   resource_registry_ = std::move(registry);
   Increment(metrics_, "resource_registry_replacements");
+  if (identity_changed) {
+    AdvanceGenerationLocked();
+    Advance(state_revision_, "state revision");
+  }
 }
 
 std::int64_t AlarmLifecycleOwner::MonotonicNow() const {
@@ -321,7 +372,7 @@ void AlarmLifecycleOwner::RegisterSource(
                          std::move(adapter_id), std::move(source_epoch),
                          source_epoch_order, AlarmConditionQuality::kUnknown,
                          false});
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
 }
 
@@ -343,7 +394,7 @@ void AlarmLifecycleOwner::CompleteSourceSnapshot(
   if (quality == AlarmConditionQuality::kUnknown) {
     Increment(metrics_, "source_quality_unknown_observations");
   }
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
 }
 
@@ -363,7 +414,7 @@ void AlarmLifecycleOwner::MarkSourceQualityUnknown(
   found->second.snapshot_complete = false;
   found->second.quality = AlarmConditionQuality::kUnknown;
   Increment(metrics_, "source_quality_unknown_observations");
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
 }
 
@@ -384,7 +435,7 @@ void AlarmLifecycleOwner::EnsureConditionCapacityLocked(
           "operator_alarm_condition_capacity_exhausted",
           "condition capacity is exhausted; existing live attention was "
           "retained");
-      Advance(generation_, "owner generation");
+      AdvanceGenerationLocked();
       Advance(state_revision_, "state revision");
       AlarmFail("operator_alarm_condition_capacity_exhausted",
                 "condition capacity is exhausted");
@@ -414,7 +465,7 @@ void AlarmLifecycleOwner::EnsureLiveAlarmCapacityLocked(
       "operator_alarm_condition_capacity_exhausted",
       "live alarm capacity is exhausted; existing live attention was "
       "retained");
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
   AlarmFail("operator_alarm_condition_capacity_exhausted",
             "live alarm capacity is exhausted");
@@ -574,7 +625,11 @@ AlarmLifecycleOwner::SubmitImpl(AlarmConditionUpdate update,
   if (transition.terminal_record.has_value()) {
     AppendTerminalLocked(*transition.terminal_record);
   }
+  bool reconciliation_changed = false;
   if (update.quality == AlarmConditionQuality::kUnknown) {
+    reconciliation_changed = source->second.snapshot_complete ||
+                             source->second.quality !=
+                                 AlarmConditionQuality::kUnknown;
     source->second.quality = AlarmConditionQuality::kUnknown;
     source->second.snapshot_complete = false;
     Increment(metrics_, "source_quality_unknown_observations");
@@ -619,8 +674,10 @@ AlarmLifecycleOwner::SubmitImpl(AlarmConditionUpdate update,
   // source cursor. It cannot change acknowledgement membership or motion
   // attention, so invalidating the public membership generation here would
   // make a human-confirmed acknowledge-all race harmless status polling.
-  if (transition.status != "normal_observed") {
-    Advance(generation_, "owner generation");
+  // An unknown-quality observation does change reconciliation, which the
+  // published motion-attention projection carries under a new generation.
+  if (transition.status != "normal_observed" || reconciliation_changed) {
+    AdvanceGenerationLocked();
   }
   Advance(state_revision_, "state revision");
   StampFactsLocked(transition.lifecycle_facts);
@@ -694,7 +751,7 @@ AlarmMutation AlarmLifecycleOwner::AcknowledgeImpl(
   while (acknowledgement_latency_ns_.size() > kMetricSampleRetention) {
     acknowledgement_latency_ns_.pop_front();
   }
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
   StampFactsLocked(transition.lifecycle_facts);
   return {transition.status,
@@ -811,7 +868,7 @@ AlarmMutation AlarmLifecycleOwner::AcknowledgeAllImpl(
   while (acknowledgement_latency_ns_.size() > kMetricSampleRetention) {
     acknowledgement_latency_ns_.pop_front();
   }
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
 
   std::vector<AlarmLifecycleFact> facts;
@@ -1034,41 +1091,10 @@ std::vector<OperatorAlarmRecord> AlarmLifecycleOwner::TerminalRecords(
   return result;
 }
 
-AlarmAttentionDecision AlarmLifecycleOwner::EvaluateMotionAttention(
-    const std::set<std::string> &reserved_resource_ids) const {
-  std::lock_guard lock(mutex_);
-  if (!ReconciledLocked()) {
-    return {false, true, "operator_alarm_state_unavailable", generation_, {}};
-  }
-  for (const auto &resource : reserved_resource_ids) {
-    if (!resource_registry_.has_value() ||
-        !resource_registry_->resource_ids.contains(resource)) {
-      return {false,
-              true,
-              "operator_alarm_admission_scope_invalid",
-              generation_,
-              {}};
-    }
-  }
-  std::vector<AlarmAcknowledgementMember> matching;
-  for (const auto &[condition_id, point] : points_) {
-    if (!point.record.has_value() || !GatesMotion(*point.record)) {
-      continue;
-    }
-    const auto &subject = point.record->subject;
-    const bool cell_global = subject.subject_kind == "cell" &&
-                             subject.subject_id == cell_id_ &&
-                             subject.resource_ids.empty();
-    if (cell_global ||
-        Intersects(subject.resource_ids, reserved_resource_ids)) {
-      matching.push_back({condition_id, point.record->activation_id,
-                          point.record->record_revision});
-    }
-  }
-  std::sort(matching.begin(), matching.end());
-  return {true, !matching.empty(),
-          matching.empty() ? "available" : "unacknowledged_operator_alarms",
-          generation_, std::move(matching)};
+std::shared_ptr<const AlarmMotionAttentionProjection>
+AlarmLifecycleOwner::MotionAttentionProjection() const {
+  std::lock_guard publication(motion_attention_mutex_);
+  return motion_attention_;
 }
 
 void AlarmLifecycleOwner::MarkHealthUnavailable(std::string code,
@@ -1076,15 +1102,35 @@ void AlarmLifecycleOwner::MarkHealthUnavailable(std::string code,
   ValidateText(code, "health code", 256U);
   ValidateText(message, "health message", kMaximumHealthMessageBytes);
   std::lock_guard lock(mutex_);
-  if (health_errors_.find(code) != health_errors_.end() &&
-      health_errors_.find(code)->second == message) {
+  MarkHealthUnavailableLocked(std::move(code), std::move(message));
+}
+
+void AlarmLifecycleOwner::MarkHealthUnavailableIf(
+    std::string code, std::string message,
+    const std::function<bool()> &still_unavailable) {
+  ValidateText(code, "health code", 256U);
+  ValidateText(message, "health message", kMaximumHealthMessageBytes);
+  std::lock_guard lock(mutex_);
+  // Decided in the same critical section as `ReconcileHealth`, so a fact
+  // reconciled concurrently is never re-marked from a stale observation.
+  if (still_unavailable()) {
+    MarkHealthUnavailableLocked(std::move(code), std::move(message));
+  }
+}
+
+void AlarmLifecycleOwner::MarkHealthUnavailableLocked(std::string code,
+                                                      std::string message) {
+  // Only a new or changed health fact advances the generation; restating
+  // the same fact must not invalidate generation-fenced acknowledgements.
+  const auto existing = health_errors_.find(code);
+  if (existing != health_errors_.end() && existing->second == message) {
     return;
   }
   if (code.find("historian") != std::string::npos) {
     Increment(metrics_, "historian_delivery_failures");
   }
   health_errors_.insert_or_assign(std::move(code), std::move(message));
-  Advance(generation_, "owner generation");
+  AdvanceGenerationLocked();
   Advance(state_revision_, "state revision");
 }
 
@@ -1094,9 +1140,53 @@ void AlarmLifecycleOwner::ReconcileHealth(const std::string_view code) {
     if (code.find("historian") != std::string_view::npos) {
       Increment(metrics_, "historian_delivery_recoveries");
     }
-    Advance(generation_, "owner generation");
+    AdvanceGenerationLocked();
     Advance(state_revision_, "state revision");
   }
+}
+
+CanonicalValue OperatorAlarmMotionAttentionValue(
+    const AlarmMotionAttentionProjection &projection) {
+  CanonicalValue::Array members;
+  members.reserve(projection.members.size());
+  for (const auto &member : projection.members) {
+    members.emplace_back(CanonicalValue::Object{
+        {"activation_id",
+         CanonicalValue(member.acknowledgement.activation_id)},
+        {"condition_id", CanonicalValue(member.acknowledgement.condition_id)},
+        {"gate", CanonicalValue(member.condition_interlock
+                                    ? "condition_interlock"
+                                    : "acknowledgement")},
+        {"record_revision",
+         Number(member.acknowledgement.record_revision, "record_revision",
+                true)},
+        {"subject", SubjectValue(member.subject)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"active_configuration",
+       projection.active_configuration.has_value()
+           ? CanonicalValue(CanonicalValue::Object{
+                 {"graph_revision",
+                  CanonicalValue(projection.active_configuration->graph_revision)},
+                 {"retained_bundle_id",
+                  CanonicalValue(
+                      projection.active_configuration->retained_bundle_id)},
+             })
+           : CanonicalValue(nullptr)},
+      {"cell_id", CanonicalValue(projection.cell_id)},
+      {"generation", Number(projection.generation, "generation")},
+      {"members", CanonicalValue(std::move(members))},
+      {"owner_epoch", CanonicalValue(projection.owner_epoch)},
+      {"owner_host_boot_id",
+       CanonicalValue(projection.owner_incarnation.boot_id)},
+      {"owner_incarnation_us",
+       Number(projection.owner_incarnation.boottime_us, "owner_incarnation_us",
+              true)},
+      {"reconciled", CanonicalValue(projection.reconciled)},
+      {"schema_version",
+       CanonicalValue(std::string(kOperatorAlarmMotionAttentionApiVersion))},
+  });
 }
 
 CanonicalValue

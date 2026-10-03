@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <cerrno>
 #include <string>
 #include <variant>
@@ -131,9 +132,48 @@ public:
          claim, std::nullopt, std::nullopt, {claim},
          {{query.intent.owner_role, query.intent.owner_epoch}}});
   }
+  core::Result<core::OperatorAlarmAttentionAcceptedDTO>
+  PublishOperatorAlarmAttention(
+      const core::OperatorAlarmAttentionSnapshotDTO &snapshot) override {
+    ++calls;
+    attention = snapshot;
+    return core::Result<core::OperatorAlarmAttentionAcceptedDTO>::Ok(
+        {snapshot.owner_epoch, snapshot.generation});
+  }
   mutable std::size_t calls{};
   std::size_t acquire_calls{};
+  std::optional<core::OperatorAlarmAttentionSnapshotDTO> attention;
 };
+
+Value AttentionMember(std::string gate, Value::Array resources,
+                      std::string subject_kind, std::string subject_id) {
+  return Value(Value::Object{
+      {"activation_id", Value("activation.1")},
+      {"condition_id", Value("condition.1")},
+      {"gate", Value(std::move(gate))},
+      {"record_revision", Value(2.0)},
+      {"subject",
+       Value(Value::Object{{"resource_ids", Value(std::move(resources))},
+                           {"subject_id", Value(std::move(subject_id))},
+                           {"subject_kind", Value(std::move(subject_kind))}})}});
+}
+
+Value Attention(Value member,
+               Value configuration = Value(Value::Object{
+                   {"graph_revision", Value("graph.1")},
+                   {"retained_bundle_id", Value("bundle.1")}})) {
+  return Value(Value::Object{
+      {"active_configuration", std::move(configuration)},
+      {"cell_id", Value("cell.test")},
+      {"generation", Value(5.0)},
+      {"members", Value(Value::Array{std::move(member)})},
+      {"owner_epoch", Value("alarm.owner.1")},
+      {"owner_host_boot_id", Value("boot.test")},
+      {"owner_incarnation_us", Value(42.0)},
+      {"reconciled", Value(true)},
+      {"schema_version",
+       Value(std::string(core::kOperatorAlarmAttentionSchemaVersion))}});
+}
 
 TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
   RecordingKernel kernel;
@@ -156,6 +196,60 @@ TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
     EXPECT_FALSE(std::holds_alternative<core::ErrorDTO>(response));
   }
   EXPECT_EQ(kernel.calls, 6U);
+}
+
+TEST(CellAdmissionCommandCodec,
+     OperatorAlarmAttentionReachesTheKernelPortOnlyOverJson) {
+  RecordingKernel kernel;
+  const auto decoded = TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
+               Attention(AttentionMember("condition_interlock",
+                                         {Value("robot.joint_1")}, "operation",
+                                         "operation.1")))));
+  ASSERT_TRUE(decoded.has_value());
+  const auto response = cm::DispatchKernelCellAdmissionRpc(kernel, *decoded);
+  ASSERT_TRUE(kernel.attention.has_value());
+  EXPECT_EQ(kernel.attention->owner_epoch, "alarm.owner.1");
+  EXPECT_EQ(kernel.attention->owner_host_boot_id, "boot.test");
+  EXPECT_EQ(kernel.attention->owner_incarnation_us, 42U);
+  EXPECT_EQ(kernel.attention->generation, 5U);
+  ASSERT_EQ(kernel.attention->members.size(), 1U);
+  EXPECT_EQ(kernel.attention->members.front().gate,
+            core::OperatorAlarmAttentionGateDTO::kConditionInterlock);
+  EXPECT_EQ(kernel.attention->members.front().resource_ids,
+            std::vector<core::ResourceId>{core::ResourceId("robot.joint_1")});
+  ASSERT_TRUE(kernel.attention->active_configuration.has_value());
+  EXPECT_EQ(kernel.attention->active_configuration->retained_bundle_id.value(),
+            "bundle.1");
+  EXPECT_EQ(kernel.attention->active_configuration->graph_revision.value(),
+            "graph.1");
+  // Before the owner observed a configuration it publishes null.
+  const auto unobserved = TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
+               Attention(AttentionMember("acknowledgement",
+                                         {Value("robot.joint_1")}, "operation",
+                                         "operation.1"),
+                         Value(nullptr)))));
+  ASSERT_TRUE(unobserved.has_value());
+  EXPECT_FALSE(std::get<core::OperatorAlarmAttentionSnapshotDTO>(
+                   unobserved->request)
+                   .active_configuration.has_value());
+  EXPECT_EQ(ci::canonical_json(CellAdmissionResponseValue(decoded->command,
+                                                          response)),
+            "{\"api_version\":\"manyforge.execution_command_response.v1\","
+            "\"command\":\"cell_admission_publish_operator_alarm_attention\","
+            "\"ok\":true,\"operator_alarm_attention\":{\"generation\":5,"
+            "\"owner_epoch\":\"alarm.owner.1\"}}");
+  // The Manager-child binary channel never forwards this publication.
+  EXPECT_THROW(static_cast<void>(cm::EncodeKernelCellAdmissionRpcRequest(*decoded)),
+               std::exception);
+  // Closed shape: an unknown gate is rejected before the Kernel sees it.
+  EXPECT_THROW(
+      static_cast<void>(TryDecodeCellAdmissionCommand(ci::canonical_json(
+          Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
+                   Attention(AttentionMember("advisory", {Value("robot.joint_1")},
+                                             "operation", "operation.1")))))),
+      std::exception);
 }
 
 TEST(CellAdmissionCommandCodec, ProgramNodeEvidenceIsExactAcrossBothTransports) {

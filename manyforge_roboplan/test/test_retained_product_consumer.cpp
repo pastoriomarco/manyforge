@@ -3627,7 +3627,21 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(native_default.authority_generation, 1U);
 }
 
-void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
+enum class Lite6AggregateCheck { kCompose, kResealInventory, kRefreshCellModel };
+
+void check_refreshed_cell_model(
+    RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
+    const RetainedPlanningModelStage &stage,
+    const deployment::RetainedBundle &bundle,
+    const deployment::VerifiedRetainedModelMap &model_map,
+    const deployment::VerifiedRetainedPlanningModel &retained,
+    const core::RuntimeParticipantBinding &arm_binding,
+    const core::RuntimeParticipantBinding &gripper_binding,
+    const std::string &tcp_frame);
+
+void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
+  const bool reseal_capability_inventory =
+      check == Lite6AggregateCheck::kResealInventory;
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -3962,7 +3976,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
       core::CoordinateKind::kLinear);
 
   const auto &motion_value = runtime->motion_binding.value();
-  const auto joint_names = runtime->kinematics->group_joint_names(
+  const auto joint_names = runtime->kinematic_model->group_joint_names(
       motion_value.command_target_id.value());
   ASSERT_TRUE(joint_names.ok()) << joint_names.error().message;
   std::vector<std::string> expected_joint_names;
@@ -3970,7 +3984,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
     expected_joint_names.push_back(resource.compiled_resource_name);
   }
   EXPECT_EQ(joint_names.value(), expected_joint_names);
-  const auto limits = runtime->kinematics->joint_limits(
+  const auto limits = runtime->kinematic_model->joint_limits(
       motion_value.controllable_component_id.value(),
       motion_value.command_target_id.value());
   ASSERT_TRUE(limits.ok()) << limits.error().message;
@@ -4003,7 +4017,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
       joint_names.value(),
       std::vector<double>(joint_names.value().size(), 0.0),
       {}};
-  const auto tcp_pose = runtime->kinematics->forward_kinematics(
+  const auto tcp_pose = runtime->kinematic_model->forward_kinematics(
       core::FkRequestDTO{zero_arm_state, tcp_frame.compiled_frame_name,
                          base_frame.compiled_frame_name});
   ASSERT_TRUE(tcp_pose.ok()) << tcp_pose.error().message;
@@ -4019,7 +4033,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
        core::TrajectoryWaypointDTO{
            1.0, std::vector<double>(joint_names.value().size(), 0.0), {}, {}}}};
   core::CollisionCancellationToken cancellation;
-  const auto validation = runtime->trajectory_validator->validate_non_collision(
+  const auto validation = runtime->kinematic_model->validate_non_collision(
       stationary_trajectory, core::ValidationOptionsDTO{0.0, {}, {}, false},
       cancellation);
   ASSERT_TRUE(validation.valid)
@@ -4053,7 +4067,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
   measured_trajectory.waypoints[2].velocities_rad_s[0] = 0.02;
   measured_trajectory.waypoints[1].accelerations_rad_s2[0] = 0.03;
   const auto measured_validation =
-      runtime->trajectory_validator->validate_non_collision(
+      runtime->kinematic_model->validate_non_collision(
           measured_trajectory,
           core::ValidationOptionsDTO{0.15, tcp_frame.compiled_frame_name,
                                      base_frame.compiled_frame_name, false},
@@ -4079,7 +4093,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
   over_speed_trajectory.waypoints.back().time_from_start_s = 0.1;
   over_speed_trajectory.waypoints.back().positions_rad.front() = 1.0;
   const auto over_speed_validation =
-      runtime->trajectory_validator->validate_non_collision(
+      runtime->kinematic_model->validate_non_collision(
           over_speed_trajectory, core::ValidationOptionsDTO{0.0, {}, {}, false},
           cancellation);
   ASSERT_FALSE(over_speed_validation.valid);
@@ -4089,7 +4103,7 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
   EXPECT_NEAR(std::stod(over_speed_validation.error->details.at("limit")), 2.14,
               1e-12);
   const auto expanded =
-      runtime->collision_trajectory_projector->expand_for_collision(
+      runtime->kinematic_model->expand_for_collision(
           stationary_trajectory, zero_arm_state);
   ASSERT_TRUE(expanded.ok()) << expanded.error().message;
   ASSERT_EQ(expanded.value().waypoints.size(), 2U);
@@ -4115,16 +4129,235 @@ void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
   EXPECT_EQ(idle.affected_active_operation_count, 0U);
   EXPECT_EQ(runtime->participant_engine->get_metrics().executions_completed,
             0U);
+  if (check == Lite6AggregateCheck::kRefreshCellModel)
+    check_refreshed_cell_model(*runtime, admission_gate, stage,
+                               *materialized.bundle, model_map, retained,
+                               arm_binding, gripper_binding,
+                               tcp_frame.compiled_frame_name);
+}
+
+// The retained controller's whole-cell model changes around it: its root is
+// moved in the cell and a peer joint is added ahead of it, shifting every one
+// of its model coordinates. The controller's own model facts are unchanged.
+void check_refreshed_cell_model(
+    RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
+    const RetainedPlanningModelStage &stage,
+    const deployment::RetainedBundle &bundle,
+    const deployment::VerifiedRetainedModelMap &model_map,
+    const deployment::VerifiedRetainedPlanningModel &retained,
+    const core::RuntimeParticipantBinding &arm_binding,
+    const core::RuntimeParticipantBinding &gripper_binding,
+    const std::string &tcp_frame) {
+  const std::string predecessor_urdf(stage.loader_urdf_bytes());
+  const std::string srdf(stage.srdf_bytes());
+  const auto cell_start = predecessor_urdf.find("<link name=\"mf1_cell_");
+  ASSERT_NE(cell_start, std::string::npos);
+  const auto cell_name_start = cell_start + std::string("<link name=\"").size();
+  const auto cell_link = predecessor_urdf.substr(
+      cell_name_start, predecessor_urdf.find('"', cell_name_start) -
+                           cell_name_start);
+  const auto moved_root = [&](std::string urdf) {
+    const auto parent =
+        urdf.find("<parent link=\"" + cell_link + "\"/>");
+    const auto joint_open = urdf.rfind("<joint ", parent);
+    const auto joint_body = urdf.find('>', joint_open) + 1U;
+    urdf.insert(joint_body, "<origin xyz=\"0.3 -0.2 0.1\"/>");
+    return urdf;
+  };
+  const auto with_peer = [&](std::string urdf) {
+    const auto first_joint = urdf.find("<joint ");
+    urdf.insert(first_joint,
+                "<link name=\"peer_link\"><collision><geometry><sphere "
+                "radius=\"0.05\"/></geometry></collision></link>"
+                "<joint name=\"aaa_peer_joint\" type=\"revolute\"><origin "
+                "xyz=\"1 0 0\"/><parent link=\"" +
+                    cell_link +
+                    "\"/><child link=\"peer_link\"/><axis xyz=\"0 0 1\"/>"
+                    "<limit lower=\"-1\" upper=\"1\" effort=\"1\" "
+                    "velocity=\"1\" acceleration=\"1\"/></joint>");
+    return urdf;
+  };
+  const auto make_candidate =
+      [&](const std::string &urdf,
+          std::vector<RoboPlanJointLimitInput> limits,
+          std::vector<core::RuntimeParticipantBinding> projected) {
+        auto scene = make_roboplan_scene(RoboPlanSceneInput{
+            "retained_lite6_candidate_cell", urdf, srdf, stage.package_paths(),
+            std::move(limits)});
+        auto scene_mutex = std::make_shared<std::mutex>();
+        auto projector = std::make_shared<RetainedKinematicStateProjector>(
+            RetainedKinematicStateProjector::create_verified(
+                scene, scene_mutex, bundle, model_map, retained,
+                std::move(projected), 0));
+        return make_retained_motion_model_generation(
+            arm_binding, std::move(scene), std::move(scene_mutex),
+            std::move(projector));
+      };
+  const auto candidate_urdf = with_peer(moved_root(predecessor_urdf));
+  // Limits are read from the closure-local retained URDF, edited identically.
+  const std::string retained_urdf(retained.urdf_bytes());
+  const auto limits_of = [&](const std::string &urdf) {
+    return retained_joint_limit_rows(
+        urdf, retained.srdf_bytes().empty()
+                  ? std::optional<std::string_view>{}
+                  : std::optional<std::string_view>{retained.srdf_bytes()});
+  };
+  const auto candidate_limits =
+      limits_of(with_peer(moved_root(retained_urdf)));
+  const std::vector<core::RuntimeParticipantBinding> both{arm_binding,
+                                                          gripper_binding};
+  const auto candidate = make_candidate(candidate_urdf, candidate_limits, both);
+
+  const auto predecessor = runtime.kinematic_model->current_generation();
+  const auto predecessor_projector =
+      runtime.motion_state_channel->kinematic_projector();
+  ASSERT_EQ(predecessor_projector, predecessor->state_projector);
+  const auto &motion = arm_binding.value();
+  const auto joint_names =
+      runtime.kinematic_model->group_joint_names(motion.command_target_id.value());
+  ASSERT_TRUE(joint_names.ok());
+  const core::RobotStateDTO zero_state{
+      joint_names.value(), std::vector<double>(joint_names.value().size(), 0.0),
+      {}};
+  const auto world_tcp_before = runtime.kinematic_model->forward_kinematics(
+      core::FkRequestDTO{zero_state, tcp_frame, ""});
+  ASSERT_TRUE(world_tcp_before.ok()) << world_tcp_before.error().message;
+
+  const core::ConfigurationFenceId fence_id("cell-model.refresh.apply");
+  const core::ConfigurationFenceScopeDTO scope{};
+  const auto refresh = [&](auto generation) {
+    return refresh_retained_native_runtime_model_for_apply(
+        runtime, RetainedNativeRuntimeModelRefreshInput{
+                     std::move(generation), fence_id, scope, admission_gate});
+  };
+  const auto unfenced = refresh(candidate);
+  ASSERT_FALSE(unfenced.ok());
+  EXPECT_EQ(unfenced.error().details.at("reason"),
+            "native_model_refresh_fence_not_held");
+  EXPECT_EQ(runtime.kinematic_model->current_generation(), predecessor);
+  admission_gate.RestoreFence(fence_id, scope);
+
+  // A candidate that changes the controller's own kinematic target is not a
+  // retain; it is refused before any consumer changes.
+  auto slower_limits = candidate_limits;
+  for (auto &row : slower_limits)
+    if (row.joint_name == joint_names.value().front())
+      row.maximum_velocity = {1.0};
+  const auto changed = refresh(make_candidate(candidate_urdf, slower_limits, both));
+  ASSERT_FALSE(changed.ok());
+  EXPECT_EQ(changed.error().details.at("reason"),
+            "native_model_refresh_controller_model_changed");
+  EXPECT_EQ(runtime.kinematic_model->current_generation(), predecessor);
+  EXPECT_EQ(runtime.motion_state_channel->kinematic_projector(),
+            predecessor_projector);
+
+  const auto refreshed = refresh(candidate);
+  ASSERT_TRUE(refreshed.ok()) << refreshed.error().message;
+  EXPECT_EQ(runtime.kinematic_model->current_generation(), candidate);
+  EXPECT_EQ(runtime.motion_state_channel->kinematic_projector(),
+            candidate->state_projector);
+  EXPECT_EQ(runtime.gripper_state_channel->kinematic_projector(),
+            candidate->state_projector);
+  EXPECT_TRUE(admission_gate.exact_fence_is_held(fence_id, scope));
+
+  // World-frame FK follows the moved root exactly.
+  const auto world_tcp_after = runtime.kinematic_model->forward_kinematics(
+      core::FkRequestDTO{zero_state, tcp_frame, ""});
+  ASSERT_TRUE(world_tcp_after.ok()) << world_tcp_after.error().message;
+  EXPECT_NEAR(world_tcp_after.value().position_m.x_m -
+                  world_tcp_before.value().position_m.x_m, 0.3, 1e-9);
+  EXPECT_NEAR(world_tcp_after.value().position_m.y_m -
+                  world_tcp_before.value().position_m.y_m, -0.2, 1e-9);
+  EXPECT_NEAR(world_tcp_after.value().position_m.z_m -
+                  world_tcp_before.value().position_m.z_m, 0.1, 1e-9);
+
+  // Observations project into the candidate scene at the candidate's own
+  // coordinate indices: the arm and the model-backed gripper.
+  const std::vector<double> arm_positions{0.1, -0.2, 1.2, 0.3, -0.4, 0.5};
+  const auto now = runtime.clock->now();
+  ASSERT_TRUE(runtime.motion_state_channel
+                  ->publish_and_project(arm_positions,
+                                        std::vector<double>(6U, 0.0), now, now)
+                  .applied());
+  ASSERT_TRUE(runtime.gripper_state_channel
+                  ->publish_and_project(std::vector<double>{0.004},
+                                        std::vector<double>{0.0}, now, now)
+                  .applied());
+  const auto arm_context = runtime.motion_state_channel->query_context();
+  const auto arm_state = candidate->state_projector->current_state(
+      arm_context.control_binding_id, arm_context.control_binding_revision);
+  ASSERT_TRUE(arm_state.ok()) << arm_state.error().message;
+  for (std::size_t index = 0U; index < arm_positions.size(); ++index)
+    EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(
+                         arm_state.value().positions[index]).value_rad,
+                     arm_positions[index]);
+  const auto gripper_context = runtime.gripper_state_channel->query_context();
+  const auto gripper_state = candidate->state_projector->current_state(
+      gripper_context.control_binding_id,
+      gripper_context.control_binding_revision);
+  ASSERT_TRUE(gripper_state.ok()) << gripper_state.error().message;
+  EXPECT_DOUBLE_EQ(std::get<core::LinearPositionDTO>(
+                       gripper_state.value().positions.front()).value_m,
+                   0.004);
+
+  // Collision expansion names every candidate coordinate and places the
+  // target's values by name, including the added peer.
+  const core::TrajectoryDTO trajectory{
+      motion.resources.empty() ? std::vector<core::ResourceId>{}
+                               : [&] {
+                                   std::vector<core::ResourceId> ids;
+                                   for (const auto &resource : motion.resources)
+                                     ids.push_back(resource.resource_id);
+                                   return ids;
+                                 }(),
+      joint_names.value(),
+      {core::TrajectoryWaypointDTO{0.0, arm_positions, {}, {}}}};
+  const auto expanded = runtime.kinematic_model->expand_for_collision(
+      trajectory, core::RobotStateDTO{joint_names.value(), arm_positions, {}});
+  ASSERT_TRUE(expanded.ok()) << expanded.error().message;
+  const auto &names = expanded.value().joint_names;
+  EXPECT_EQ(std::count(names.begin(), names.end(), "aaa_peer_joint"), 1);
+  for (std::size_t index = 0U; index < joint_names.value().size(); ++index) {
+    const auto found =
+        std::find(names.begin(), names.end(), joint_names.value()[index]);
+    ASSERT_NE(found, names.end());
+    EXPECT_DOUBLE_EQ(expanded.value().waypoints.front().positions_rad
+                         [static_cast<std::size_t>(found - names.begin())],
+                     arm_positions[index]);
+  }
+
+  // Peer removal: the next candidate drops the peer again. A candidate whose
+  // projector omits the gripper target fails after the arm consumers were
+  // installed; the failure is returned as is, nothing is restored and the
+  // Apply fence keeps admission closed.
+  const auto removed_urdf = moved_root(predecessor_urdf);
+  const auto removed = make_candidate(
+      removed_urdf,
+      limits_of(moved_root(retained_urdf)),
+      {arm_binding});
+  const auto partial = refresh(removed);
+  ASSERT_FALSE(partial.ok());
+  EXPECT_EQ(partial.error().details.at("reason"),
+            "retained_state_projector_target_mismatch");
+  EXPECT_EQ(runtime.kinematic_model->current_generation(), removed);
+  EXPECT_EQ(runtime.gripper_state_channel->kinematic_projector(),
+            candidate->state_projector);
+  EXPECT_TRUE(admission_gate.exact_fence_is_held(fence_id, scope));
 }
 
 TEST(RetainedProductCrossConsumer,
      PredictedLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
-  check_predicted_lite6_aggregate(false);
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kCompose);
+}
+
+TEST(RetainedProductCrossConsumer,
+     RetainedControllerRefreshesEveryModelConsumerWithTheCellModel) {
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
 }
 
 TEST(RetainedProductCrossConsumer,
      SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
-  check_predicted_lite6_aggregate(true);
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
 }
 
 TEST(RetainedProductCrossConsumer,

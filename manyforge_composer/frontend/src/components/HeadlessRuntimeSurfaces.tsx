@@ -78,7 +78,16 @@ export function attentionAlarmsNewestFirst(
       || left.conditionId.localeCompare(right.conditionId));
 }
 
+/** An active condition interlock gates motion until its cause clears;
+ * acknowledgement cannot release it (spec 530 §4.2). */
+export function motionInterlockMessage(alarm: OperatorAlarmRecord): string | null {
+  return alarm.active && alarm.requiresMotionAttention && !alarm.acknowledgementRequired
+    ? `Motion blocked by an active interlock: ${alarm.title}; resolve its cause — acknowledgement does not release it`
+    : null;
+}
+
 export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView {
+  const interlock = motionInterlockMessage(alarm);
   return {
     conditionId: alarm.conditionId,
     activationId: alarm.activationId,
@@ -89,7 +98,9 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
     severity: alarmSeverity(alarm.priority),
     title: alarm.title,
     message: alarm.message,
-    operatorResponse: alarm.operatorResponse,
+    operatorResponse: interlock === null
+      ? alarm.operatorResponse
+      : `${interlock}. ${alarm.operatorResponse}`,
     details: {
       ...alarm.details,
       alarm_class: alarm.alarmClass,

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <shared_mutex>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -227,6 +228,21 @@ public:
   RebindRoute(core::RuntimeParticipantBinding binding,
               std::int64_t transition_time_ns);
 
+  /// Retarget this stable physical source to the state projector of a
+  /// candidate whole-cell model generation. The caller holds the Apply fence
+  /// and has already rebound the route, so the candidate must register this
+  /// channel's current publication context exactly once. In-flight
+  /// projections finish on the predecessor first; the latest owner sample is
+  /// then projected into the candidate scene and must apply.
+  [[nodiscard]] core::Result<void> ReplaceKinematicProjector(
+      std::shared_ptr<RetainedKinematicStateProjector> candidate,
+      std::int64_t now_ns);
+
+  /// The projector currently selected for model projection; empty for a
+  /// component-local source.
+  [[nodiscard]] std::shared_ptr<const RetainedKinematicStateProjector>
+  kinematic_projector() const;
+
   /// Publish exact target-order SI values and project them into the shared
   /// retained model. The source kind and target namespace are construction-time
   /// facts and cannot be changed per call.
@@ -323,8 +339,16 @@ public:
 private:
   friend class RetainedObservedStateChannelTestAccess;
 
+  // One selected projector and the exact context it registered for this
+  // source. Replacement swaps both together under projection_mutex_.
+  struct KinematicProjection final {
+    std::shared_ptr<RetainedKinematicStateProjector> projector;
+    core::ObservedStateQueryContextDTO registered_context;
+  };
+
   core::RuntimeParticipantBinding current_binding_;
-  std::shared_ptr<RetainedKinematicStateProjector> projector_;
+  mutable std::shared_mutex projection_mutex_;
+  std::shared_ptr<const KinematicProjection> projection_;
   RetainedObservedStateChannelConfig config_;
   core::IClock *clock_{};
   core::AddressedObservedStatePublication publication_;

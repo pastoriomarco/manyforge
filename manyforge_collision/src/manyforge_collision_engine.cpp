@@ -1841,8 +1841,9 @@ core::CollisionResult ManyForgeCollisionEngine::check(
 
   try {
     std::string configuration_error;
-    auto configuration =
-        full_configuration_from_query(query, configuration_error);
+    std::string configuration_error_reason;
+    auto configuration = full_configuration_from_query(
+        query, configuration_error, configuration_error_reason);
     if (!configuration.has_value()) {
       finish_with_duration();
       result.engine_status =
@@ -1850,6 +1851,8 @@ core::CollisionResult ManyForgeCollisionEngine::check(
       result.decision = core::CollisionDecisionResult::kInconclusiveFail;
       result.raw_diagnostics["robot_state_error"] =
           std::move(configuration_error);
+      result.raw_diagnostics["robot_state_error_reason"] =
+          std::move(configuration_error_reason);
       return result;
     }
     std::lock_guard<std::mutex> scene_lock(scene_mutex_);
@@ -2324,63 +2327,72 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
 std::optional<Eigen::VectorXd>
 ManyForgeCollisionEngine::full_configuration_from_query(
     const core::CollisionQuery& query,
-    std::string& error) const {
+    std::string& error,
+    std::string& reason) const {
   const auto& positions = query.robot_state.positions_rad;
-  if (positions.empty()) {
-    error = "robot_state.positions_rad is empty";
-    return std::nullopt;
-  }
-  if (static_cast<Eigen::Index>(positions.size()) == shared_model_->model.nq) {
-    Eigen::VectorXd q(shared_model_->model.nq);
-    for (std::size_t i = 0; i < positions.size(); ++i) {
-      q(static_cast<Eigen::Index>(i)) = positions[i];
-    }
-    return q;
-  }
-
-  Eigen::VectorXd q = pinocchio::neutral(shared_model_->model);
-  auto fill_joint = [&](const std::string& joint_name,
-                        double value) -> bool {
-    if (!shared_model_->model.existJointName(joint_name)) {
-      error = "joint not present in model: " + joint_name;
-      return false;
-    }
-    const auto joint_id = shared_model_->model.getJointId(joint_name);
-    if (joint_id >= shared_model_->model.idx_qs.size() ||
-        joint_id >= shared_model_->model.nqs.size()) {
-      error = "joint index out of range for: " + joint_name;
-      return false;
-    }
-    if (shared_model_->model.nqs[joint_id] != 1) {
-      error = "joint is not scalar in current primitive profile: " + joint_name;
-      return false;
-    }
-    q(shared_model_->model.idx_qs[joint_id]) = value;
-    return true;
+  const auto& names = query.robot_state.joint_names;
+  const auto& model = shared_model_->model;
+  const auto refuse = [&](std::string refused_reason, std::string message) {
+    reason = std::move(refused_reason);
+    error = std::move(message);
+    return std::optional<Eigen::VectorXd>{};
   };
-
-  if (query.robot_state.joint_names.size() == positions.size()) {
-    for (std::size_t i = 0; i < positions.size(); ++i) {
-      if (!fill_joint(query.robot_state.joint_names[i], positions[i])) {
-        return std::nullopt;
-      }
+  if (positions.empty()) {
+    return refuse("robot_state_positions_empty",
+                  "robot_state.positions_rad is empty");
+  }
+  if (!names.empty() && names.size() != positions.size()) {
+    return refuse("robot_state_joint_name_count_mismatch",
+                  "robot_state.joint_names count " +
+                      std::to_string(names.size()) +
+                      " differs from robot_state.positions_rad count " +
+                      std::to_string(positions.size()));
+  }
+  // Coordinates are identified only by joint name against this model. A
+  // vector whose length happens to equal model.nq (or the SRDF group size)
+  // carries no coordinate identity of its own; an unnamed state may use only
+  // the current model's own SRDF group order.
+  const std::vector<std::string>* selected = &names;
+  if (names.empty()) {
+    if (shared_model_->group_joint_names.size() != positions.size()) {
+      return refuse(
+          "robot_state_joint_names_required",
+          "unnamed robot_state.positions_rad count " +
+              std::to_string(positions.size()) +
+              " does not match SRDF group '" + shared_model_->group_name +
+              "'; full or foreign coordinates require joint names");
     }
-    return q;
+    selected = &shared_model_->group_joint_names;
   }
 
-  if (shared_model_->group_joint_names.size() == positions.size()) {
-    for (std::size_t i = 0; i < positions.size(); ++i) {
-      if (!fill_joint(shared_model_->group_joint_names[i], positions[i])) {
-        return std::nullopt;
-      }
+  Eigen::VectorXd q = pinocchio::neutral(model);
+  std::vector<bool> assigned(static_cast<std::size_t>(model.nq), false);
+  for (std::size_t i = 0; i < positions.size(); ++i) {
+    const auto& joint_name = (*selected)[i];
+    if (joint_name.empty() || !model.existJointName(joint_name)) {
+      return refuse("robot_state_joint_unknown",
+                    "joint not present in model: " + joint_name);
     }
-    return q;
+    const auto joint_id = model.getJointId(joint_name);
+    if (joint_id >= model.idx_qs.size() || joint_id >= model.nqs.size()) {
+      return refuse("robot_state_joint_index_invalid",
+                    "joint index out of range for: " + joint_name);
+    }
+    if (model.nqs[joint_id] != 1) {
+      return refuse("robot_state_joint_not_scalar",
+                    "joint is not scalar in current primitive profile: " +
+                        joint_name);
+    }
+    const auto q_index = model.idx_qs[joint_id];
+    if (q_index < 0 || q_index >= model.nq ||
+        assigned[static_cast<std::size_t>(q_index)]) {
+      return refuse("robot_state_joint_duplicate",
+                    "joint is named more than once: " + joint_name);
+    }
+    assigned[static_cast<std::size_t>(q_index)] = true;
+    q(q_index) = positions[i];
   }
-
-  error = "robot_state.positions_rad size " + std::to_string(positions.size()) +
-          " does not match model.nq " + std::to_string(shared_model_->model.nq) +
-          ", robot_state.joint_names, or SRDF group '" + shared_model_->group_name + "'";
-  return std::nullopt;
+  return q;
 }
 
 std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(

@@ -32,7 +32,22 @@ class OwnerTaskObservationUnavailableError(RuntimeError):
 
 
 class ProgramSelectionReleaseRejectedError(RuntimeError):
-    """The owner explicitly refused a selection release before changing holds."""
+    """The owner explicitly refused a selection release before changing holds.
+
+    ``code`` and ``details`` carry the owner's stable refusal (for example an
+    operator-alarm attention reason with its memberships) when it named one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
 
 
 class ProgramRunScopeState(Enum):
@@ -556,6 +571,12 @@ class ProgramRunScopePort(Protocol):
         self, request: Mapping[str, Any], expected_selection_revision: int
     ) -> Mapping[str, Any]:
         """Release only the selected initial Ready nodes."""
+        ...
+
+    def check_node_motion_attention(self, request: Mapping[str, Any]) -> None:
+        """Ask the Kernel, without effect, whether operator-alarm attention
+        gates the resources of this one captured node; raise its refusal if
+        so."""
         ...
 
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:

@@ -302,6 +302,16 @@ struct ResourceAddressedExecutionKernelConfig final {
   CellAdmissionSettlementValidator cell_admission_settlement_validator;
   CellAdmissionReconcileValidator cell_admission_reconcile_validator;
   std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set;
+  /// Present exactly in compositions that host the Headless Alarm Lifecycle
+  /// Owner. Program Run/Resume, motion-producing recovery and the final
+  /// pre-dispatch recheck then evaluate the published motion-attention
+  /// projection and fail closed while it is missing, unreconciled or stale.
+  std::optional<OperatorAlarmAttentionPolicyDTO> operator_alarm_attention;
+  /// Qualification seam; production compositions leave it empty. Invoked
+  /// without the state lock after a prepared Resume barrier is claimed and
+  /// before its first participant's dispatch is released: the window that
+  /// the final pre-dispatch attention recheck must close (spec 530 §11).
+  std::function<void(const OperationId&)> prepared_resume_barrier_claimed_seam;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -468,6 +478,19 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const override;
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
+  /// Retain the newest generation of one Alarm Lifecycle Owner epoch. A new
+  /// owner epoch replaces the retained one only with a strictly greater
+  /// incarnation from this host boot. A projection from another host boot, an
+  /// equal or smaller incarnation under another epoch, a lower generation, or
+  /// different content under the retained generation is refused; identical
+  /// content refreshes the receipt time (heartbeat).
+  [[nodiscard]] Result<OperatorAlarmAttentionAcceptedDTO> PublishOperatorAlarmAttention(
+      const OperatorAlarmAttentionSnapshotDTO& snapshot) override;
+  /// No-effect evaluation of the operator-alarm attention test against one
+  /// captured node's effectful target resources. The Program owner uses it
+  /// before a motion-producing recovery of that held node takes effect.
+  [[nodiscard]] Result<void> check_program_node_motion_attention(
+      const ProgramNodeMotionAttentionCheckDTO& request) const;
   void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
@@ -667,6 +690,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct PreviewSession;
 
   [[nodiscard]] bool operation_control_reconfiguration_busy_locked() const;
+  /// Spec 450 §5.2 attention test for Program work over exact resources.
+  /// No refusal when the composition carries no alarm-attention policy.
+  [[nodiscard]] std::optional<ErrorDTO> operator_alarm_attention_refusal_locked(
+      const std::vector<ResourceId>& reserved_resources) const;
+  /// Union of the resources that the captured Program Binding binds to every
+  /// effectful target of the selected captured Program nodes.
+  [[nodiscard]] std::vector<ResourceId> program_selection_resources_locked(
+      const std::vector<std::uint32_t>& node_indices) const;
   /// The one eligibility predicate shared by single, coordinated, manual,
   /// Program, arm and gripper dispatch. A domain without route authority has
   /// no lifecycle projection to consult. Returns the refusal, if any.
@@ -736,7 +767,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product);
   [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
       const OperationIntentDTO& intent);
-  [[nodiscard]] Result<void> fail_coordinated_pre_dispatch(
+  /// Dispatch none, cancel every prepared participant and release the
+  /// reservation. A coordinated participant failure names its engine; a null
+  /// engine is a whole-operation admission refusal (single or coordinated)
+  /// that ends every participant InterventionRequired with `failure`.
+  [[nodiscard]] Result<void> fail_pre_dispatch(
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
       ErrorDTO failure);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
@@ -942,6 +977,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::optional<StopFaultLatchDTO> active_stop_fault_latch_;
   bool manager_liveness_motion_inhibited_{};
   bool motion_admission_closed_{};
+  std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };
 
 }  // namespace manyforge::core

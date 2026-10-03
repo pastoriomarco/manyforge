@@ -300,6 +300,7 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
 import type {
   AlarmLifecycleState,
   AlarmMembership,
+  AlarmMotionAttentionMember,
   AlarmPriority,
   AlarmSubject,
   AuthoringWorkspaceIdentity,
@@ -4800,7 +4801,8 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     exactKeysAt(row, ['group_id', 'node_count', 'held_node_count', 'state',
       'stop_allowed', 'start_allowed', 'start_unavailable_reason',
       'resume_allowed', 'resume_unavailable_reason',
-      'runtime_scale_selector', 'runtime_scale_unavailable_reason'], key);
+      'runtime_scale_selector', 'runtime_scale_unavailable_reason',
+      'resource_ids'], key);
     const groupId = stringAt(row.group_id, `${key}.group_id`);
     if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(groupId) || groupId === 'inherit' || groupId <= previous) {
       return fail(key, 'canonical unique captured group IDs');
@@ -4837,6 +4839,13 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
         'a complete runtime-scale selector or an owner unavailability reason',
       );
     }
+    const resourceIds = boundedArrayAt(row.resource_ids, `${key}.resource_ids`, 4096)
+      .map((item, resourceIndex) => stringAt(item, `${key}.resource_ids[${resourceIndex}]`));
+    if (resourceIds.some((resource, resourceIndex) => (
+      resource.length === 0 || (resourceIndex > 0 && resource <= resourceIds[resourceIndex - 1])
+    ))) {
+      return fail(`${key}.resource_ids`, 'sorted unique resource IDs');
+    }
     if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
       || (state === 'running' && heldNodeCount !== 0)
       || (state === 'held' && heldNodeCount !== nodeCount)
@@ -4854,7 +4863,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       state: state as ProgramExecutionSelectionControls['groups'][number]['state'],
       stopAllowed, startAllowed, startUnavailableReason,
       resumeAllowed, resumeUnavailableReason,
-      runtimeScaleSelector, runtimeScaleUnavailableReason };
+      runtimeScaleSelector, runtimeScaleUnavailableReason, resourceIds };
   });
   if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
   return { selectionRevision, groups };
@@ -4871,10 +4880,10 @@ export function parseProgramRuntimeControlProjection(
     'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v7') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v8') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v7',
+      'manyforge.program_runtime_control_projection.v8',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -7206,6 +7215,22 @@ function parseAlarmMembership(value: unknown, path: string): AlarmMembership {
   };
 }
 
+function parseAlarmMotionAttentionMember(
+  value: unknown,
+  path: string,
+): AlarmMotionAttentionMember {
+  const record = objectAt(value, path);
+  return {
+    ...parseAlarmMembership(record, path),
+    lifecycleState: alarmLifecycleStateAt(
+      record.lifecycle_state,
+      `${path}.lifecycle_state`,
+    ),
+    definitionId: stringAt(record.definition_id, `${path}.definition_id`),
+    subject: parseAlarmSubject(record.subject, `${path}.subject`),
+  };
+}
+
 function parseOperatorAlarmRecord(
   value: unknown,
   path: string,
@@ -7281,6 +7306,14 @@ export function parseOperatorAlarmSnapshot(
       record.motion_attention_count,
       'alarms.motion_attention_count',
     ),
+    motionAttentionMembership: boundedArrayAt(
+      record.motion_attention_membership,
+      'alarms.motion_attention_membership',
+      256,
+    ).map((item, index) => parseAlarmMotionAttentionMember(
+      item,
+      `alarms.motion_attention_membership[${index}]`,
+    )),
     unacknowledgedMembership: arrayAt(
       record.unacknowledged_membership,
       'alarms.unacknowledged_membership',

@@ -473,6 +473,9 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
     return adopt(kernel.GetCellAdmissionRecoveryReceipt(
         std::get<core::CellAdmissionRecoveryReceiptQueryDTO>(
             request.request)));
+  if (request.command == kPublishOperatorAlarmAttentionCommand)
+    return adopt(kernel.PublishOperatorAlarmAttention(
+        std::get<core::OperatorAlarmAttentionSnapshotDTO>(request.request)));
   if (request.command == "cell_admission_validate_program_reset_scene") {
     const auto validated = kernel.ValidateProgramResetSceneAuthorization(
         std::get<core::ProgramResetSceneAuthorizationDTO>(request.request));
@@ -542,6 +545,9 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
           else if constexpr (std::is_same_v<
                                  T, core::ProgramResetSceneAuthorizationDTO>)
             ProgramResetSceneAuthorization(w, v);
+          else if constexpr (std::is_same_v<
+                                 T, core::OperatorAlarmAttentionSnapshotDTO>)
+            Fail("operator-alarm attention is not a Manager-channel command");
           else
             RecoveryQuery(w, v);
         }
@@ -635,6 +641,9 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
                                  T, core::CellAdmissionRecoveryReceiptDTO>) {
           w.Byte(3);
           RecoveryReceipt(w, v);
+        } else if constexpr (std::is_same_v<
+                                 T, core::OperatorAlarmAttentionAcceptedDTO>) {
+          Fail("operator-alarm attention is not a Manager-channel response");
         } else {
           w.Byte(2);
           w.String(v.code);

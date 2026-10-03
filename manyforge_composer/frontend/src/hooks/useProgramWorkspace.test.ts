@@ -431,6 +431,7 @@ function authoringSnapshot(
       activeCount: 0,
       activeAcknowledgedCount: 0,
       motionAttentionCount: 0,
+      motionAttentionMembership: [],
       unacknowledgedMembership: [],
       alarms: [],
       truncated: false,

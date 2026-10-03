@@ -664,7 +664,9 @@ function AttachObjectControls({
       <button
         type="button"
         disabled={disabled || !attachmentFence.available || selected === null || busy}
-        title={attachmentFence.available ? undefined : attachmentFence.reason}
+        title={attachmentFence.available
+          ? 'Attach this object to the selected robot frame in the live Scene; it then moves with the robot.'
+          : attachmentFence.reason}
         onClick={() => {
           if (selected === null || !attachmentFence.available) return;
           setBusy(true);
@@ -3028,12 +3030,14 @@ export function SceneAuthoringWorkspace({
               disabled={selectedObject === null || livePose === null || editReason !== null
                 || selectedMutationAvailability?.transform !== true
                 || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.transformReason ?? undefined}
+              title={selectedMutationAvailability?.transformReason
+                ?? 'Send the pose and shape in these fields to the live Scene now. The Program is not changed.'}
               onClick={() => void commitLiveObject()}
             >Commit object edit</button>
             <button
               type="button"
               disabled={selectedObject?.placement.kind !== 'cell_fixed' || commitState.kind === 'busy'}
+              title="Throw away the uncommitted changes in these fields and show the live Scene values again."
               onClick={() => {
                 setLivePose(selectedObject?.placement.kind === 'cell_fixed'
                   ? selectedObject.placement.pose_in_cell
@@ -3048,6 +3052,10 @@ export function SceneAuthoringWorkspace({
             <button
               type="button"
               disabled={draftPoseForLive === null || editReason !== null || commitState.kind === 'busy'}
+              title={editReason
+                ?? (draftPoseForLive === null
+                  ? 'This object is not in the Program Draft.'
+                  : 'Fill these fields with the pose the Program Draft stores for this object. Uncommitted field changes are replaced; nothing is sent until Commit.')}
               onClick={() => {
                 if (draftPoseForLive !== null) setLivePose(draftPoseForLive);
               }}
@@ -3061,7 +3069,7 @@ export function SceneAuthoringWorkspace({
                 || !programController.mutationAvailable
               }
               title={programController.mutationAvailable
-                ? 'Replace this Program scene resource with the exact current owner-observed object.'
+                ? 'Copy this object as it is now in the live Scene into the Program Draft, replacing the Draft copy. Apply or Save to keep it.'
                 : programController.mutationUnavailableReason ?? undefined}
               onClick={() => {
                 if (selectedObject?.placement.kind === 'cell_fixed') void programController.mutate('program_draft_store_observed_scene_resource', {
@@ -3076,7 +3084,8 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.duplicate !== true
                 || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.duplicateReason ?? undefined}
+              title={selectedMutationAvailability?.duplicateReason
+                ?? 'Create a copy of this object in the live Scene.'}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void duplicateObject(selectedOwnerObjectId);
               }}
@@ -3086,7 +3095,8 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.detach !== true
                 || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.detachReason ?? undefined}
+              title={selectedMutationAvailability?.detachReason
+                ?? 'Release this object from the robot and leave it where it is now.'}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void detachObject(selectedOwnerObjectId);
               }}
@@ -3097,7 +3107,8 @@ export function SceneAuthoringWorkspace({
               disabled={selectedOwnerObjectId === null
                 || mutationAvailability[selectedOwnerObjectId]?.remove !== true
                 || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.removeReason ?? undefined}
+              title={selectedMutationAvailability?.removeReason
+                ?? 'Delete this object from the live Scene.'}
               onClick={() => {
                 if (selectedOwnerObjectId !== null) void removeObject(selectedOwnerObjectId);
               }}

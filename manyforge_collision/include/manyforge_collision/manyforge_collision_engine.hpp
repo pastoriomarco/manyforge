@@ -297,9 +297,12 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       const core::CollisionWorldSnapshot* snapshot,
       const core::CollisionCancellationToken* cancel,
       const Eigen::VectorXd& configuration);
+  /// Map one query state onto this model by joint name. Equal counts never
+  /// establish coordinate identity; a refusal sets a stable reason code.
   std::optional<Eigen::VectorXd> full_configuration_from_query(
       const core::CollisionQuery& query,
-      std::string& error) const;
+      std::string& error,
+      std::string& reason) const;
 };
 
 }  // namespace manyforge::collision

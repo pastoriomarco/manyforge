@@ -976,6 +976,8 @@ export interface ProgramExecutionSelectionControls {
     /** Exact captured motion scope used by the runtime-scale owner. */
     runtimeScaleSelector: RuntimeScaleControlSelector | null;
     runtimeScaleUnavailableReason: string | null;
+    /** Exact resources the Kernel reserves to release this selection. */
+    resourceIds: string[];
   }>;
 }
 
@@ -988,7 +990,7 @@ export interface ProgramGroupRuntimeScaleState {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v7';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v8';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;

@@ -194,14 +194,14 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
     std::shared_ptr<RetainedKinematicStateProjector> projector,
     RetainedObservedStateChannelConfig config, core::IClock *clock,
     std::shared_ptr<RetainedObservationWake> render_wake)
-    : current_binding_(std::move(binding)), projector_(std::move(projector)),
+    : current_binding_(std::move(binding)),
       config_(std::move(config)), clock_(clock),
       publication_(publication_config(current_binding_, config_)),
       projection_context_(publication_.query_context()),
       render_wake_(render_wake ? std::move(render_wake)
                                : std::make_shared<RetainedObservationWake>()),
       last_render_positions_(projection_context_.resources.size()) {
-  if (!projector_) {
+  if (!projector) {
     if (!current_binding_.value().model_groups.empty() ||
         std::any_of(current_binding_.value().resources.begin(),
                     current_binding_.value().resources.end(),
@@ -222,11 +222,55 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
         "projected observed-state channel contains a component-local resource");
   }
   const auto &context = publication_.query_context();
-  const auto contexts = projector_->query_contexts();
+  const auto contexts = projector->query_contexts();
   if (std::count(contexts.begin(), contexts.end(), context) != 1) {
     throw std::invalid_argument("retained observed-state channel target is not "
                                 "registered exactly once");
   }
+  projection_ = std::make_shared<const KinematicProjection>(
+      KinematicProjection{std::move(projector), context});
+}
+
+core::Result<void> RetainedObservedStateChannel::ReplaceKinematicProjector(
+    std::shared_ptr<RetainedKinematicStateProjector> candidate,
+    const std::int64_t now_ns) {
+  if (candidate == nullptr) {
+    return core::Result<void>::Err(
+        channel_error("retained_state_projector_missing",
+                      "candidate kinematic state projector is absent"));
+  }
+  const auto context = publication_.query_context();
+  const auto contexts = candidate->query_contexts();
+  if (std::count(contexts.begin(), contexts.end(), context) != 1) {
+    return core::Result<void>::Err(channel_error(
+        "retained_state_projector_target_mismatch",
+        "candidate model does not register this source's current target"));
+  }
+  {
+    std::unique_lock lock(projection_mutex_);
+    if (projection_ == nullptr) {
+      return core::Result<void>::Err(channel_error(
+          "component_local_state_has_no_model_projection",
+          "component-local state has no model projection to replace"));
+    }
+    projection_ = std::make_shared<const KinematicProjection>(
+        KinematicProjection{std::move(candidate), context});
+  }
+  auto projected =
+      project_latest(now_ns, RetainedStateProjectionMode::kBlocking);
+  if (!projected.applied()) {
+    return core::Result<void>::Err(
+        projected.error.value_or(channel_error(
+            "retained_state_projection_not_applied",
+            "latest owner state did not project into the candidate model")));
+  }
+  return core::Result<void>::Ok();
+}
+
+std::shared_ptr<const RetainedKinematicStateProjector>
+RetainedObservedStateChannel::kinematic_projector() const {
+  std::shared_lock lock(projection_mutex_);
+  return projection_ != nullptr ? projection_->projector : nullptr;
 }
 
 core::Result<void> RetainedObservedStateChannel::RebindRoute(
@@ -289,13 +333,14 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
 RetainedStateProjectionResult
 RetainedObservedStateChannel::initialize_from_projection(
     const std::int64_t timestamp_ns) {
-  if (!projector_) {
+  const auto projector = kinematic_projector();
+  if (!projector) {
     return {
         RetainedStateProjectionStatus::kRejected,
         channel_error("component_local_state_has_no_model_projection",
                       "component-local state cannot be seeded from a model")};
   }
-  auto state = projector_->current_state(
+  auto state = projector->current_state(
       publication_.query_context().control_binding_id,
       publication_.query_context().control_binding_revision);
   if (!state.ok()) {
@@ -492,16 +537,20 @@ RetainedStateProjectionResult RetainedObservedStateChannel::project_latest(
   if (!snapshot.ok()) {
     return {RetainedStateProjectionStatus::kFailed, snapshot.error()};
   }
-  if (!projector_) {
+  std::shared_lock projection_lock(projection_mutex_);
+  if (!projection_) {
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
+  // The scene projection is keyed by the route identity the selected
+  // projector registered; owner route publication never re-keys it.
+  const auto &registered = projection_->registered_context;
   auto projected = std::move(snapshot.value());
-  projected.control_route_id = projection_context_.control_route_id;
+  projected.control_route_id = registered.control_route_id;
   projected.active_control_configuration_id =
-      projection_context_.active_control_configuration_id;
+      registered.active_control_configuration_id;
   projected.active_control_configuration_generation =
-      projection_context_.active_control_configuration_generation;
-  return projector_->apply(projected, now_ns, mode);
+      registered.active_control_configuration_generation;
+  return projection_->projector->apply(projected, now_ns, mode);
 }
 
 core::Result<core::ObservedStateSnapshotDTO>
