@@ -23,7 +23,8 @@ import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
-import { ProgramRunSetup } from './ProgramRunSetup';
+import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
+import { api } from '../api/client';
 import {
   BlackboardValueEditor,
   blackboardValueDraft,
@@ -941,6 +942,30 @@ export function ProgramTransportControls({
   const haltButton = useRef<HTMLButtonElement>(null);
   const resetButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
+  // Run details reads the owner-admitted speeds only while it is open, and
+  // again when the run advances; it never estimates one.
+  const [admittedSpeeds, setAdmittedSpeeds] = useState<AdmittedSpeedsView>({ kind: 'no_run' });
+  const detailsRunId = state.run?.capture.programRunId ?? null;
+  const detailsRunRevision = state.run?.runRevision ?? null;
+  useEffect(() => {
+    if (!detailsOpen) return undefined;
+    if (detailsRunId === null) {
+      setAdmittedSpeeds({ kind: 'no_run' });
+      return undefined;
+    }
+    const controller = new AbortController();
+    setAdmittedSpeeds((current) => (current.kind === 'ready' && current.speeds.programRunId === detailsRunId
+      ? current
+      : { kind: 'loading' }));
+    api.execution.admittedSpeeds(detailsRunId, controller.signal).then(
+      (speeds) => setAdmittedSpeeds({ kind: 'ready', speeds }),
+      (error: unknown) => {
+        if (controller.signal.aborted) return;
+        setAdmittedSpeeds({ kind: 'unavailable', reason: error instanceof Error ? error.message : String(error) });
+      },
+    );
+    return () => controller.abort();
+  }, [detailsOpen, detailsRunId, detailsRunRevision]);
   const {
     selections, allGroup, visibleGroups, hiddenGroupCount, fallback: groupFallback, groupTitle,
   } = useTransportGroups(program);
@@ -1584,6 +1609,7 @@ export function ProgramTransportControls({
           <ProgramRunSetup
             applied={state.applied}
             targets={robot.currentStatus?.directControlTargets ?? []}
+            admitted={admittedSpeeds}
             groups={selections.map((group) => {
               const scale = program.groupRuntimeScales[group.groupId];
               const requested = scale?.draft ?? scale?.status?.requestedScale ?? null;

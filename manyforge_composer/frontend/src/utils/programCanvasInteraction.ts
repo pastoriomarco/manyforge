@@ -28,6 +28,20 @@ export function readProgramPaletteDrag(
   return getData(PROGRAM_NODE_DRAG_MIME) || getData('text/plain');
 }
 
+/**
+ * Flow position of a node dropped from the palette: the drag preview is
+ * centred on the pointer, so the node is placed with its centre there too.
+ */
+export function programPaletteDropPosition(
+  pointer: { x: number; y: number },
+  nodeSize: { width: number; height: number },
+): { x: number; y: number } {
+  return {
+    x: pointer.x - nodeSize.width / 2,
+    y: pointer.y - nodeSize.height / 2,
+  };
+}
+
 export type ProgramDraftMutation = {
   mutation:
     | 'tree_draft_insert_node'

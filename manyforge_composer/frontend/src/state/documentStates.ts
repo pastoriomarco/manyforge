@@ -97,11 +97,13 @@ export function deploymentActionUnavailableReason(
   if (workspace === null) return 'Deployment workspace is not loaded.';
   if (action === 'discard') return deploymentUnapplied(workspace)
     ? null : 'Nothing to apply: the Deployment Draft matches Manager Applied.';
+  // Revert reloads Saved and applies it, so it exists only while Saved
+  // differs from Applied; Draft-only edits over that baseline are Discard.
   if (action === 'revert') return workspace.savedScenarioCandidates.length === 0
     ? 'No saved Deployment is available.'
-    : !workspace.draft.differsFromSaved
+    : workspace.saved.deploymentRevision !== null
       && workspace.saved.deploymentRevision === workspace.managerApplied.deploymentRevision
-      ? 'Saved already matches Draft and Applied.' : null;
+      ? 'Nothing to revert: the Saved Deployment matches Manager Applied.' : null;
   return !workspace.draft.document ? 'No Deployment Draft is loaded.'
     : deploymentMatchesApplied(workspace) ? 'Nothing to apply: the Deployment Draft matches Manager Applied.' : null;
 }

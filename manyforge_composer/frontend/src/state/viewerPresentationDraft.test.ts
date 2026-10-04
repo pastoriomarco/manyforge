@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_VIEWER_PRESENTATION_DRAFT,
-  programDraftPreviewActive,
   sceneSourceIsDraft,
   programViewerMetadata,
   viewerPresentationDraftReducer,
@@ -9,19 +8,18 @@ import {
 } from './viewerPresentationDraft';
 
 describe('viewer presentation draft reducer', () => {
-  it('never treats an unknown owner scene as an empty owner scene', () => {
-    expect(programDraftPreviewActive(false, 0, 3)).toBe(false);
-    expect(programDraftPreviewActive(true, 0, 3)).toBe(true);
-    expect(programDraftPreviewActive(true, 1, 3)).toBe(false);
-  });
-
-  it('shows a loaded Draft beside a nonempty Applied Scene without changing authority', () => {
-    expect(sceneSourceIsDraft('auto', true, true, true, false)).toBe(true);
-    expect(sceneSourceIsDraft('applied', true, true, true, false)).toBe(false);
+  it('shows the Draft Scene only while it differs from Applied, with a pure view override', () => {
+    // Unapplied changes: the Draft Scene; no difference: the runtime Scene.
+    expect(sceneSourceIsDraft('auto', true, true, true, true)).toBe(true);
+    expect(sceneSourceIsDraft('auto', true, true, true, false)).toBe(false);
+    // The manual override is a pure view choice either way.
+    expect(sceneSourceIsDraft('applied', true, true, true, true)).toBe(false);
     expect(sceneSourceIsDraft('draft', true, true, true, false)).toBe(true);
-    // A leftover Draft choice cannot keep a hidden Draft view once they match.
-    expect(sceneSourceIsDraft('draft', true, true, false, false)).toBe(false);
-    expect(sceneSourceIsDraft('draft', false, true, true, false)).toBe(false);
+    // A Draft that cannot be edited (for example while running) is not shown.
+    expect(sceneSourceIsDraft('draft', true, true, false, true)).toBe(false);
+    // No Draft, or an unknown owner scene, never flashes the Draft presentation.
+    expect(sceneSourceIsDraft('auto', true, false, true, true)).toBe(false);
+    expect(sceneSourceIsDraft('auto', false, true, true, true)).toBe(false);
   });
 
   it('retains independent frame and object-axis visibility edits', () => {

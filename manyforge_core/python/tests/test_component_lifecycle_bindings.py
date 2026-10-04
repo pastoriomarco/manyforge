@@ -196,155 +196,6 @@ def _provider_occurrence():
     )
 
 
-def _component_scope():
-    return core.ConfigurationFenceScopeDTO(
-        (core.ControllableComponentId("component-1"),),
-        (
-            core.ConfigurationFenceDomainScopeDTO(
-                core.ControlDomainId("domain-1"),
-                core.ControlDomainRevision("domain-revision-1"),
-            ),
-        ),
-        (
-            core.ConfigurationFenceBindingScopeDTO(
-                core.ControlBindingId("binding-1"),
-                core.ControlBindingRevision("binding-revision-1"),
-            ),
-            core.ConfigurationFenceBindingScopeDTO(
-                core.ControlBindingId("binding-2"),
-                core.ControlBindingRevision("binding-revision-1"),
-            ),
-        ),
-        (core.ResourceId("resource-1"),),
-    )
-
-
-def _current_configuration_rows():
-    return (
-        core.CurrentDomainActiveControlConfigurationDTO(
-            core.ControlDomainId("domain-1"),
-            _expected_configuration(),
-        ),
-    )
-
-
-def _component_expectation():
-    receipt = _publication_receipt()
-    return core.DisableHandoffComponentScopeExpectationDTO(
-        core.ContentDigest("component-snapshot-1"),
-        receipt.publication_generation,
-        receipt.durable_public_pointer_content_digest,
-        receipt.request.candidate_retained_bundle_id,
-        receipt.request.candidate_graph_revision,
-        core.ComponentLifecycleGeneration(2),
-        _component_scope(),
-        _current_configuration_rows(),
-    )
-
-
-def _admission_snapshot():
-    expectation = _component_expectation()
-    return core.DisableHandoffAdmissionSnapshotDTO(
-        core.DisableHandoffAdmissionQueryDTO(
-            core.ControllableComponentId("component-1"),
-            core.DisableHandoffScopeRequestKindDTO.kResolvedComponentScope,
-            expectation,
-        ),
-        core.RequestOwnerEpoch("kernel-owner-1"),
-        core.DisableHandoffScopeResolutionDTO.kExact,
-        expectation.component_scope,
-        expectation.active_publication_generation,
-        expectation.active_public_pointer_digest,
-        expectation.retained_bundle_id,
-        expectation.graph_revision,
-        7,
-        core.ConfigurationFenceGeneration(3),
-        expectation.current_active_control_configurations,
-        core.ContentDigest("disable-admission-1"),
-    )
-
-
-def _handoff_request():
-    snapshot = _admission_snapshot()
-    expectation = snapshot.query.component_expectation
-    assert expectation is not None
-    return core.DisableHandoffRequestDTO(
-        core.PublicRequestContextDTO(
-            core.RequestId("kernel-disable-request-1"),
-            snapshot.request_owner_epoch,
-            "cclc",
-            "public-request-1",
-        ),
-        core.RequestId("public-request-1"),
-        core.LifecycleTransactionId("transaction-1"),
-        core.LifecycleTransactionGeneration(1),
-        core.ControllableComponentId("component-1"),
-        snapshot.scope_resolution,
-        snapshot.current_scope,
-        snapshot.snapshot_digest,
-        snapshot.active_publication_generation,
-        snapshot.active_public_pointer_digest,
-        snapshot.graph_revision,
-        snapshot.retained_bundle_id,
-        expectation.component_lifecycle_generation,
-        snapshot.operation_resource_generation,
-        snapshot.configuration_fence_generation,
-        snapshot.current_active_control_configurations,
-    )
-
-
-def _ready_handoff():
-    request = _handoff_request()
-    scope_digest = core.ContentDigest("component-scope-1")
-    fence_id = core.ConfigurationFenceId("fence-1")
-    fence_handle = core.ConfigurationFenceHandleDTO(
-        fence_id,
-        request.expected_fence_generation,
-        request.lifecycle_transaction_id,
-        request.lifecycle_transaction_generation,
-        request.controllable_component_id,
-        request.affected_scope,
-        "component Disable",
-        core.ConfigurationFenceState.kHeld,
-    )
-    return core.DisableHandoffStatusDTO(
-        lifecycle_transaction_id=request.lifecycle_transaction_id,
-        lifecycle_transaction_generation=request.lifecycle_transaction_generation,
-        controllable_component_id=request.controllable_component_id,
-        scope_resolution=request.scope_resolution,
-        component_scope_digest=scope_digest,
-        configuration_fence_id=fence_id,
-        configuration_fence_generation=request.expected_fence_generation,
-        state=core.DisableHandoffStateDTO.kReady,
-        scope=request.affected_scope,
-        configuration_fence_handle=fence_handle,
-    )
-
-
-def _release_request():
-    handoff = _ready_handoff()
-    snapshot = _admission_snapshot()
-    expectation = snapshot.query.component_expectation
-    assert expectation is not None
-    return core.DisableFenceReleaseRequestDTO(
-        core.PublicRequestContextDTO(
-            core.RequestId("kernel-release-request-1"),
-            snapshot.request_owner_epoch,
-            "cclc",
-            "public-request-1",
-        ),
-        core.RequestId("public-request-1"),
-        handoff.lifecycle_transaction_id,
-        handoff.lifecycle_transaction_generation,
-        handoff.controllable_component_id,
-        handoff,
-        2,
-        core.ContentDigest("release-precondition-1"),
-        expectation,
-        snapshot,
-    )
-
-
 def test_first_prepare_absence_and_shared_route_are_representable():
     expected = _expected_domain()
     assert expected.locally_valid()
@@ -528,66 +379,7 @@ def test_current_component_snapshot_projects_exact_immutable_owner_facts():
         snapshot.component_lifecycle_state = core.ComponentLifecycleStateDTO.kFaulted
 
 
-def test_disable_admission_handoff_and_lost_response_values_are_exact():
-    snapshot = _admission_snapshot()
-    request = _handoff_request()
-    status = _ready_handoff()
-    acceptance = core.DisableHandoffAcceptedDTO(
-        request.owner_request_context.request_id,
-        core.RequestReplayStatusDTO.kAcceptedNew,
-        request.lifecycle_transaction_id,
-        request.lifecycle_transaction_generation,
-        request.controllable_component_id,
-        request.scope_resolution,
-        status.component_scope_digest,
-        status.configuration_fence_id,
-        status.configuration_fence_generation,
-    )
-    reconciliation = core.DisableHandoffAttemptReconciliationDTO(
-        request,
-        core.DisableHandoffAttemptDispositionDTO.kAcceptedExact,
-        acceptance,
-        status,
-    )
-    full_stop_query = core.DisableHandoffAdmissionQueryDTO(
-        core.ControllableComponentId("component-1"),
-        core.DisableHandoffScopeRequestKindDTO.kFullStopRequired,
-    )
-    invalid_full_stop_query = core.DisableHandoffAdmissionQueryDTO(
-        core.ControllableComponentId("component-1"),
-        core.DisableHandoffScopeRequestKindDTO.kFullStopRequired,
-        _component_expectation(),
-    )
-
-    assert snapshot.locally_valid()
-    assert request.locally_valid()
-    assert acceptance.locally_valid()
-    assert acceptance.matches(request)
-    assert status.locally_valid()
-    assert reconciliation.locally_valid()
-    assert full_stop_query.locally_valid()
-    assert not invalid_full_stop_query.locally_valid()
-    assert isinstance(request.expected_active_control_configurations, tuple)
-    with pytest.raises(AttributeError):
-        request.scope_resolution = core.DisableHandoffScopeResolutionDTO.kPromotedToFull
-
-
-def test_disable_fence_release_receipt_and_terminal_status_are_projected():
-    release_request = _release_request()
-    released = core.DisableFenceReleasedDTO(
-        release_request,
-        core.RequestReplayStatusDTO.kAcceptedNew,
-        200,
-        release_request.ready_handoff.configuration_fence_id,
-        release_request.ready_handoff.configuration_fence_generation,
-        release_request.ready_handoff.component_scope_digest,
-        core.ContentDigest("release-receipt-1"),
-    )
-    reconciliation = core.DisableFenceReleaseAttemptReconciliationDTO(
-        release_request,
-        core.DisableFenceReleaseAttemptDispositionDTO.kReleasedExact,
-        released,
-    )
+def test_idle_disable_terminal_status_carries_no_stop_handoff():
     public_context = core.PublicRequestContextDTO(
         core.RequestId("public-request-1"),
         core.RequestOwnerEpoch("public-owner-1"),
@@ -604,8 +396,8 @@ def test_disable_fence_release_receipt_and_terminal_status_are_projected():
     acceptance = core.ComponentLifecycleAcceptedDTO(
         public_context.request_id,
         core.RequestReplayStatusDTO.kAcceptedNew,
-        release_request.lifecycle_transaction_id,
-        release_request.lifecycle_transaction_generation,
+        core.LifecycleTransactionId("lifecycle-transaction-1"),
+        core.LifecycleTransactionGeneration(1),
         core.ComponentLifecycleGeneration(2),
         100,
         1_000_000,
@@ -628,17 +420,6 @@ def test_disable_fence_release_receipt_and_terminal_status_are_projected():
         reconciliation_evidence=None,
         error=None,
     )
-    held_fence = release_request.ready_handoff.configuration_fence_handle
-    released_fence = core.ConfigurationFenceHandleDTO(
-        held_fence.configuration_fence_id,
-        held_fence.configuration_fence_generation,
-        held_fence.lifecycle_transaction_id,
-        held_fence.lifecycle_transaction_generation,
-        held_fence.controllable_component_id,
-        held_fence.scope,
-        held_fence.reason,
-        core.ConfigurationFenceState.kReleased,
-    )
     status = core.ComponentLifecycleStatusDTO(
         acceptance=acceptance,
         accepted_intent=intent,
@@ -649,9 +430,6 @@ def test_disable_fence_release_receipt_and_terminal_status_are_projected():
         requested_state=requested_state,
         phase=core.ComponentLifecycleTransactionPhaseDTO.kSucceeded,
         domains=(domain,),
-        configuration_fence=released_fence,
-        disable_handoff=release_request.ready_handoff,
-        disable_fence_released=released,
         reconciliation_required=False,
         terminal_result=core.ComponentLifecycleTerminalResultDTO.kSucceeded,
         error=None,
@@ -660,12 +438,9 @@ def test_disable_fence_release_receipt_and_terminal_status_are_projected():
         remaining_duration_ns=0,
     )
 
-    assert release_request.locally_valid()
-    assert released.locally_valid()
-    assert released.matches(release_request)
-    assert reconciliation.locally_valid()
     assert status.locally_valid()
     assert domain.resolved_provider_occurrence == _provider_occurrence()
-    assert status.disable_fence_released == released
-    with pytest.raises(AttributeError):
-        released.receipt_digest = core.ContentDigest("replacement")
+    for removed in ("configuration_fence", "disable_handoff", "disable_fence_released"):
+        assert not hasattr(status, removed)
+    for removed in ("DisableHandoffRequestDTO", "DisableFenceReleasedDTO", "ConfigurationFenceHandleDTO"):
+        assert not hasattr(core, removed)

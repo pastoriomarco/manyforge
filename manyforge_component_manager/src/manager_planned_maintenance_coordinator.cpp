@@ -125,8 +125,9 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
   try {
     const auto plan = plan_source_.ReadCurrentPlan();
     if (!plan.valid() ||
-        !(plan.active_publication.request.candidate_projection_revision ==
-          expected_predecessor)) {
+        !manyforge::core::SameActiveDeployment(
+            plan.active_publication.request.candidate_projection_revision,
+            expected_predecessor)) {
       return RefusedBeforeEffect(
           "planned_maintenance_predecessor_stale",
           "active configuration changed before planned reconfiguration");

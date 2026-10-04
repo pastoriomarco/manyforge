@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any, Final
 
 import yaml
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    load_strict_json_yaml_bytes,
+)
 
 
 ZERO_DIGEST: Final = "sha256:" + "0" * 64
@@ -52,13 +56,11 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
+    # JSON-model scalars only; YAML 1.1 typing misreads JSON numbers.
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        return load_strict_json_yaml_bytes(path.read_bytes(), source=str(path))
+    except (OSError, StrictArtifactError) as error:
         raise GenerationError(f"cannot read {path}: {error}") from error
-    if type(value) is not dict:
-        raise GenerationError(f"{path} must contain an object")
-    return value
 
 
 def unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -675,7 +677,9 @@ def main() -> int:
             (GROUPED_PROGRAM_SOURCE, GROUPED_SCENARIO_SOURCE),
             (ISOLATION_PROGRAM_SOURCE, ISOLATION_SCENARIO_SOURCE),
         ):
-            program = yaml.safe_load(outputs[root / program_source])
+            program = load_strict_json_yaml_bytes(
+                outputs[root / program_source], source=program_source
+            )
             project_root = root / scenario_source
             component_inputs = (
                 (

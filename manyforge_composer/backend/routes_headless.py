@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -1132,6 +1133,15 @@ def create_headless_router(
     @router.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:
         return _call(client.historian_health)
+
+    @router.get("/api/execution/program-runs/{program_run_id}/admitted-speeds")
+    def program_run_admitted_speeds(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=1024)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.request(
+            "GET",
+            f"/api/execution/program-runs/{quote(program_run_id, safe='')}/admitted-speeds",
+        ))
 
     @router.get("/api/skills")
     def skills() -> dict[str, Any]:

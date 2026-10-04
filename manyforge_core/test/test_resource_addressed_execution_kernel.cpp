@@ -6212,90 +6212,6 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     DisableHandoffRuntimeSnapshotResolvesExactStaleAndConservativeFullScopes) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  clock.set(1234);
-  FakeParticipantEngine engine;
-  const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
-      {registration(binding, engine)}, clock, scheduler, default_journal,
-      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
-                                             CellId("cell.test"), 8U});
-
-  const auto component_id = binding.value().controllable_component_id;
-  const DisableHandoffAdmissionQueryDTO full_query{
-      component_id, DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
-  const auto full = kernel.capture_disable_handoff_runtime_snapshot(full_query);
-  ASSERT_TRUE(full.ok()) << full.error().message;
-  EXPECT_EQ(full.value().scope_resolution, DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  EXPECT_EQ(full.value().current_scope.controllable_component_ids,
-            std::vector<ControllableComponentId>{component_id});
-  EXPECT_EQ(full.value().current_cell_stop_generation, StopGeneration(0U));
-  EXPECT_TRUE(full.value().affected_queued_operations.empty());
-  EXPECT_EQ(full.value().affected_active_operation_count, 0U);
-
-  DisableHandoffComponentScopeExpectationDTO expectation{
-      ContentDigest("component-snapshot-1"),
-      ActiveBundlePublicationGeneration(1U),
-      ContentDigest("public-pointer-1"),
-      binding.value().retained_bundle_id,
-      binding.value().graph_revision,
-      ComponentLifecycleGeneration(1U),
-      full.value().current_scope,
-      full.value().current_active_control_configurations};
-  DisableHandoffAdmissionQueryDTO exact_query{
-      component_id, DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation};
-  const auto exact = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
-  ASSERT_TRUE(exact.ok()) << exact.error().message;
-  EXPECT_EQ(exact.value().scope_resolution, DisableHandoffScopeResolutionDTO::kExact);
-
-  DisableHandoffRequestDTO persisted_request{
-      {RequestId("request.disable.1"), RequestOwnerEpoch("kernel.epoch.1"), "cclc", std::nullopt},
-      RequestId("request.public.disable.1"),
-      LifecycleTransactionId("lifecycle.disable.1"),
-      LifecycleTransactionGeneration(1U),
-      component_id,
-      exact.value().scope_resolution,
-      exact.value().current_scope,
-      ContentDigest("disable-admission-snapshot-1"),
-      ActiveBundlePublicationGeneration(1U),
-      ContentDigest("public-pointer-1"),
-      exact.value().graph_revision,
-      exact.value().retained_bundle_id,
-      expectation.component_lifecycle_generation,
-      exact.value().operation_resource_generation,
-      ConfigurationFenceGeneration(0U),
-      exact.value().current_active_control_configurations};
-  ASSERT_TRUE(persisted_request.locally_valid());
-  const auto revalidated = kernel.revalidate_disable_handoff_request(persisted_request);
-  ASSERT_TRUE(revalidated.ok()) << revalidated.error().message;
-  EXPECT_EQ(revalidated.value().scope_resolution, DisableHandoffScopeResolutionDTO::kExact);
-
-  persisted_request.expected_component_lifecycle_generation = ComponentLifecycleGeneration(2U);
-  const auto advanced_generation = kernel.revalidate_disable_handoff_request(persisted_request);
-  ASSERT_TRUE(advanced_generation.ok()) << advanced_generation.error().message;
-  EXPECT_EQ(advanced_generation.value().scope_resolution,
-            DisableHandoffScopeResolutionDTO::kExact);
-
-  exact_query.component_expectation->component_lifecycle_generation =
-      ComponentLifecycleGeneration(2U);
-  const auto current_cclc_generation = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
-  ASSERT_TRUE(current_cclc_generation.ok()) << current_cclc_generation.error().message;
-  EXPECT_EQ(current_cclc_generation.value().scope_resolution,
-            DisableHandoffScopeResolutionDTO::kExact);
-
-  exact_query.controllable_component_id = ControllableComponentId("unknown.component");
-  exact_query.component_expectation->component_scope.controllable_component_ids = {
-      exact_query.controllable_component_id};
-  const auto promoted = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
-  ASSERT_TRUE(promoted.ok()) << promoted.error().message;
-  EXPECT_EQ(promoted.value().scope_resolution, DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  EXPECT_EQ(promoted.value().current_scope, full.value().current_scope);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
      RetainsUnqualifiedRegistrationForObservationButRefusesMotionAdmission) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -16802,16 +16718,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "runtime_route_publication_required");
   EXPECT_EQ(engine.execute_calls, 0);
-  const DisableHandoffAdmissionQueryDTO bootstrap_query{
-      binding.value().controllable_component_id,
-      DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
-  const auto bootstrap = kernel.capture_disable_handoff_runtime_snapshot(bootstrap_query);
+  ASSERT_TRUE(binding.value().control_path.has_value());
+  const auto bootstrap =
+      kernel.current_runtime_route_configuration(binding.value().control_path->control_domain_id);
   ASSERT_TRUE(bootstrap.ok()) << bootstrap.error().message;
-  ASSERT_EQ(bootstrap.value().current_active_control_configurations.size(), 1U);
-  EXPECT_EQ(bootstrap.value()
-                .current_active_control_configurations.front()
-                .active_control_configuration.presence,
-            ExpectedActiveControlConfigurationPresenceDTO::kAbsent);
+  EXPECT_FALSE(bootstrap.value().has_value());
 
   const auto qualified = registration(binding, engine);
   const auto published =
@@ -17067,20 +16978,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(readback.ok()) << readback.error().message;
   ASSERT_TRUE(readback.value().has_value());
   EXPECT_EQ(*readback.value(), adopted.value());
-
-  const DisableHandoffAdmissionQueryDTO query{
-      current_binding.value().value().controllable_component_id,
-      DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
-  const auto snapshot = kernel.capture_disable_handoff_runtime_snapshot(query);
-  ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
-  ASSERT_EQ(snapshot.value().current_active_control_configurations.size(), 1U);
-  const auto& current =
-      snapshot.value().current_active_control_configurations.front().active_control_configuration;
-  EXPECT_EQ(current.presence, ExpectedActiveControlConfigurationPresenceDTO::kPresent);
-  EXPECT_EQ(current.active_control_configuration_id,
-            predecessor_configuration.active_control_configuration_id);
-  EXPECT_EQ(current.active_control_configuration_generation,
-            predecessor_configuration.active_control_configuration_generation);
 
   auto intent = motion_operation("request.motion.predecessor-closed");
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.2");

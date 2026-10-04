@@ -24,7 +24,6 @@ namespace manyforge::core {
 namespace {
 
 inline constexpr std::size_t kMaxLifecycleWorkerCount = 64U;
-inline constexpr std::size_t kMaxKernelWorkerCount = 16U;
 inline constexpr std::size_t kMaxCoordinatorActiveTransactions = 64U;
 inline constexpr std::size_t kMaximumAdmissionResolutionAttempts = 3U;
 
@@ -263,23 +262,6 @@ class FixedWorkerPool final {
   return status.acceptance.accepted_at_ns + status.acceptance.timeout_duration_ns;
 }
 
-[[nodiscard]] std::optional<std::int64_t> disable_plan_timeout(
-    const BrandLifecyclePlanCatalogDTO& catalog) noexcept {
-  if (!catalog.locally_valid()) {
-    return std::nullopt;
-  }
-  const auto match = std::find_if(catalog.plans.begin(), catalog.plans.end(), [](const auto& plan) {
-    return plan.intent == ComponentLifecycleIntentKindDTO::kDisable;
-  });
-  if (match == catalog.plans.end() ||
-      std::find_if(std::next(match), catalog.plans.end(), [](const auto& plan) {
-        return plan.intent == ComponentLifecycleIntentKindDTO::kDisable;
-      }) != catalog.plans.end()) {
-    return std::nullopt;
-  }
-  return match->timeout_duration_ns;
-}
-
 [[nodiscard]] std::int64_t checked_schedule_time(std::int64_t now_ns,
                                                  std::int64_t delay_ns) noexcept {
   if (now_ns < 0 || delay_ns <= 0 || now_ns > std::numeric_limits<std::int64_t>::max() - delay_ns) {
@@ -345,57 +327,6 @@ enum class UncertainEffectResolution : std::uint8_t {
   return UncertainEffectResolution::kUnresolved;
 }
 
-[[nodiscard]] bool handoff_pair_matches_request(const DisableHandoffRequestDTO& request,
-                                                const DisableHandoffAcceptedDTO& acceptance,
-                                                const DisableHandoffStatusDTO& status) noexcept {
-  return acceptance.matches(request) && DisableHandoffPreservesOrWidensScope(request, status) &&
-         status.lifecycle_transaction_id == acceptance.lifecycle_transaction_id &&
-         status.lifecycle_transaction_generation == acceptance.lifecycle_transaction_generation &&
-         status.controllable_component_id == acceptance.controllable_component_id &&
-         status.scope_resolution == acceptance.scope_resolution &&
-         status.component_scope_digest == acceptance.component_scope_digest &&
-         status.configuration_fence_id == acceptance.configuration_fence_id &&
-         status.configuration_fence_generation == acceptance.configuration_fence_generation;
-}
-
-[[nodiscard]] bool snapshot_is_within_fence(
-    const ComponentLifecycleCurrentSnapshotDTO& snapshot,
-    const ConfigurationFenceScopeDTO& fence_scope) noexcept {
-  if (!snapshot.locally_valid() || !fence_scope.valid() ||
-      !std::binary_search(fence_scope.controllable_component_ids.begin(),
-                          fence_scope.controllable_component_ids.end(),
-                          snapshot.controllable_component_id)) {
-    return false;
-  }
-  for (const auto& domain : snapshot.domains) {
-    const auto fenced_domain = std::lower_bound(
-        fence_scope.domains.begin(), fence_scope.domains.end(), domain.control_domain_id,
-        [](const auto& candidate, const auto& id) { return candidate.control_domain_id < id; });
-    if (fenced_domain == fence_scope.domains.end() ||
-        fenced_domain->control_domain_id != domain.control_domain_id ||
-        fenced_domain->predecessor_control_domain_revision !=
-            std::optional(domain.control_domain_revision)) {
-      return false;
-    }
-    for (const auto& binding : domain.current_control_bindings) {
-      const auto fenced_binding = std::lower_bound(
-          fence_scope.bindings.begin(), fence_scope.bindings.end(), binding.control_binding_id,
-          [](const auto& candidate, const auto& id) { return candidate.control_binding_id < id; });
-      if (fenced_binding == fence_scope.bindings.end() ||
-          fenced_binding->control_binding_id != binding.control_binding_id ||
-          fenced_binding->predecessor_control_binding_revision !=
-              std::optional(binding.control_binding_revision)) {
-        return false;
-      }
-    }
-    if (!std::includes(fence_scope.resources.begin(), fence_scope.resources.end(),
-                       domain.current_resources.begin(), domain.current_resources.end())) {
-      return false;
-    }
-  }
-  return true;
-}
-
 [[nodiscard]] bool terminal(const ComponentLifecycleStatusDTO& status) noexcept {
   return status.phase == ComponentLifecycleTransactionPhaseDTO::kSucceeded ||
          status.phase == ComponentLifecycleTransactionPhaseDTO::kFailed;
@@ -409,7 +340,6 @@ bool ComponentLifecycleCoordinatorConfig::locally_valid() const noexcept {
          request_membership_capacity > 0U &&
          request_membership_capacity <= kMaximumCCLCRequestMembership &&
          lifecycle_worker_count > 0U && lifecycle_worker_count <= kMaxLifecycleWorkerCount &&
-         kernel_worker_count > 0U && kernel_worker_count <= kMaxKernelWorkerCount &&
          observation_poll_period_ns > 0 &&
          observation_poll_period_ns <= kMaxLifecycleTransactionTimeoutNs &&
          route_selection_timeout_duration_ns > 0 &&
@@ -428,8 +358,8 @@ class ComponentLifecycleCoordinator::Impl final {
        const ICCLCCurrentComponentSnapshotSource& current_snapshot_source,
        const ICCLCLifecyclePlanCatalogSource& lifecycle_plan_catalog_source,
        const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
-       ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
-       IScheduler& scheduler, IKernelCellAdmissionPort* kernel_cell_admission_port,
+       IKernelCellAdmissionPort& kernel_cell_admission_port, IClock& clock,
+       IScheduler& scheduler,
        std::optional<ComponentLifecycleCoordinatorRouteServices> route_services,
        ICCLCComponentCommandReadinessPort* component_command_readiness_port)
       : config_(std::move(config)),
@@ -439,22 +369,17 @@ class ComponentLifecycleCoordinator::Impl final {
         current_snapshot_source_(current_snapshot_source),
         lifecycle_plan_catalog_source_(lifecycle_plan_catalog_source),
         lifecycle_port_resolver_(lifecycle_port_resolver),
-        kernel_disable_handoff_port_(kernel_disable_handoff_port),
+        kernel_cell_admission_port_(kernel_cell_admission_port),
         clock_(clock),
         scheduler_(scheduler),
-        kernel_cell_admission_port_(
-            kernel_cell_admission_port != nullptr
-                ? kernel_cell_admission_port
-                : dynamic_cast<IKernelCellAdmissionPort*>(&kernel_disable_handoff_port)),
         component_command_readiness_port_(component_command_readiness_port),
         route_services_(std::move(route_services)),
-        worker_pool_(kMaxCoordinatorActiveTransactions),
-        kernel_worker_pool_(kMaxCoordinatorActiveTransactions) {}
+        worker_pool_(kMaxCoordinatorActiveTransactions) {}
 
   ~Impl() { Shutdown(); }
 
   [[nodiscard]] Result<void> Start() {
-    if (!config_.locally_valid() || kernel_cell_admission_port_ == nullptr ||
+    if (!config_.locally_valid() ||
         (route_services_.has_value() && !route_services_->locally_valid())) {
       return Result<void>::Err(coordinator_error(
           "component_lifecycle_coordinator_configuration_invalid",
@@ -487,15 +412,6 @@ class ComponentLifecycleCoordinator::Impl final {
       return Result<void>::Err(coordinator_error(
           "component_lifecycle_worker_start_failed",
           "the bounded lifecycle worker pool could not start", "worker_start_failed"));
-    }
-    if (!kernel_worker_pool_.Start(config_.kernel_worker_count)) {
-      worker_pool_.Stop();
-      std::lock_guard lock(state_mutex_);
-      starting_ = false;
-      return Result<void>::Err(
-          coordinator_error("component_lifecycle_kernel_worker_start_failed",
-                            "the bounded Kernel lifecycle worker pool could not start",
-                            "kernel_worker_start_failed"));
     }
 
     std::int64_t now_ns = -1;
@@ -547,7 +463,7 @@ class ComponentLifecycleCoordinator::Impl final {
               "component_lifecycle_claim_recovery_unknown",
               "Kernel predecessor claim receipt raised an exception", "claim_receipt_exception"));
       try {
-        receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+        receipt = kernel_cell_admission_port_.GetCellAdmissionRecoveryReceipt(
             {row.intent, row.claim, std::nullopt});
       } catch (...) {
       }
@@ -613,8 +529,8 @@ class ComponentLifecycleCoordinator::Impl final {
           receipt.value().status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact) {
         try {
           static_cast<void>(
-              kernel_cell_admission_port_->ReleaseCellAdmissionClaim(*recovery_release));
-          receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+              kernel_cell_admission_port_.ReleaseCellAdmissionClaim(*recovery_release));
+          receipt = kernel_cell_admission_port_.GetCellAdmissionRecoveryReceipt(
               {row.intent, row.claim, std::nullopt});
         } catch (...) {
         }
@@ -710,8 +626,8 @@ class ComponentLifecycleCoordinator::Impl final {
               throw;
             }
           }
-          auto runtime = std::make_shared<RuntimeState>(status, std::nullopt, false, std::nullopt,
-                                                        std::move(domains), std::nullopt);
+          auto runtime = std::make_shared<RuntimeState>(status, std::nullopt, std::move(domains),
+                                                        std::nullopt);
           const auto recovered_claim =
               std::find_if(recovered.value().cell_claims.begin(),
                            recovered.value().cell_claims.end(), [&](const auto& row) {
@@ -744,11 +660,7 @@ class ComponentLifecycleCoordinator::Impl final {
           if (unresolved != recovered.value().unresolved_effect_attempts.end()) {
             runtime->unresolved_recovery_effect = *unresolved;
           }
-          runtime->owner_wide_containment_gate =
-              runtime->permanent_containment_only ||
-              (runtime->status.disable_handoff.has_value() &&
-               runtime->status.disable_handoff->scope_resolution ==
-                   DisableHandoffScopeResolutionDTO::kPromotedToFull);
+          runtime->owner_wide_containment_gate = runtime->permanent_containment_only;
           if (runtime->owner_wide_containment_gate) {
             ++restored_owner_wide_gates;
           }
@@ -773,15 +685,9 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       restoration_committed = true;
       for (const auto& runtime : recovered_runtimes) {
-        const bool kernel_lane =
-            runtime->status.disable_handoff.has_value() ||
-            (runtime->unresolved_recovery_effect.has_value() &&
-             runtime->unresolved_recovery_effect->effect_kind !=
-                 CCLCEffectKindDTO::kBrandLifecyclePrimitive);
-        auto& pool = kernel_lane ? kernel_worker_pool_ : worker_pool_;
         bool submitted = false;
         try {
-          submitted = pool.Submit(
+          submitted = worker_pool_.Submit(
               [this, runtime](std::stop_token cancellation) { Process(runtime, cancellation); });
         } catch (...) {
         }
@@ -1128,12 +1034,6 @@ class ComponentLifecycleCoordinator::Impl final {
     if (!worker_pool_.DrainFor(timeout)) {
       return false;
     }
-    const auto after_lifecycle = std::chrono::steady_clock::now();
-    if (after_lifecycle >= deadline ||
-        !kernel_worker_pool_.DrainFor(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - after_lifecycle))) {
-      return false;
-    }
     std::unique_lock lock(state_mutex_);
     return state_changed_.wait_until(lock, deadline, [&] {
       return active_transactions_.empty() && active_route_transactions_.empty();
@@ -1185,7 +1085,7 @@ class ComponentLifecycleCoordinator::Impl final {
               "component_lifecycle_owner_epoch_reconciliation_failed",
               "Kernel lifecycle-owner receipt raised an exception", "recovery_receipt_exception"));
       try {
-        receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+        receipt = kernel_cell_admission_port_.GetCellAdmissionRecoveryReceipt(
             {probe, std::nullopt, std::nullopt});
       } catch (...) {
       }
@@ -1214,7 +1114,7 @@ class ComponentLifecycleCoordinator::Impl final {
                                                 receipt.value().held_claims, std::move(owners),
                                                 reconciliation_digest.value()};
       try {
-        const auto applied = kernel_cell_admission_port_->ReconcileCellAdmissionClaims(reconcile);
+        const auto applied = kernel_cell_admission_port_.ReconcileCellAdmissionClaims(reconcile);
         if (applied.ok()) return true;
         const auto reason = applied.error().details.find("reason");
         if (applied.error().code == "authoring_not_ready" &&
@@ -1227,7 +1127,7 @@ class ComponentLifecycleCoordinator::Impl final {
       } catch (...) {
       }
       try {
-        const auto observed = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(
+        const auto observed = kernel_cell_admission_port_.GetCellAdmissionRecoveryReceipt(
             {probe, std::nullopt, std::nullopt});
         return observed.ok() && matches(observed.value());
       } catch (...) {
@@ -1270,7 +1170,7 @@ class ComponentLifecycleCoordinator::Impl final {
         return UnstartedCapacityDeferral();
       }
     }
-    if (!worker_pool_.IsIdle() || !kernel_worker_pool_.IsIdle()) {
+    if (!worker_pool_.IsIdle()) {
       return UnstartedCapacityDeferral();
     }
     admission_lock.lock();
@@ -1311,14 +1211,10 @@ class ComponentLifecycleCoordinator::Impl final {
   struct RuntimeState final {
     RuntimeState(ComponentLifecycleStatusDTO initial_status,
                  std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> accepted_catalogs,
-                 bool accepted_lifecycle_mutation_eligible,
-                 std::optional<DisableHandoffAdmissionSnapshotDTO> accepted_disable_admission,
                  std::vector<ControlDomainId> accepted_reserved_domains,
                  std::optional<ComponentLifecycleCurrentSnapshotDTO> accepted_component_snapshot)
         : status(std::move(initial_status)),
           qualified_catalogs(std::move(accepted_catalogs)),
-          lifecycle_mutation_eligible(accepted_lifecycle_mutation_eligible),
-          disable_admission(std::move(accepted_disable_admission)),
           reserved_domains(std::move(accepted_reserved_domains)),
           accepted_snapshot(std::move(accepted_component_snapshot)),
           effective_deadline_ns(deadline_at(status)),
@@ -1333,8 +1229,6 @@ class ComponentLifecycleCoordinator::Impl final {
 
     ComponentLifecycleStatusDTO status;
     std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> qualified_catalogs;
-    bool lifecycle_mutation_eligible;
-    std::optional<DisableHandoffAdmissionSnapshotDTO> disable_admission;
     std::vector<ControlDomainId> reserved_domains;
     std::optional<ComponentLifecycleCurrentSnapshotDTO> accepted_snapshot;
     std::int64_t effective_deadline_ns;
@@ -1353,7 +1247,6 @@ class ComponentLifecycleCoordinator::Impl final {
     /// The Kernel closed this component's eligibility for this transaction;
     /// every terminal settlement must then publish its complete result.
     bool command_eligibility_closed = false;
-    bool lifecycle_lane_active = false;
     bool release_scheduled = false;
     bool release_retry_scheduled = false;
     bool recovering = false;
@@ -1445,9 +1338,9 @@ class ComponentLifecycleCoordinator::Impl final {
         return Result<CellAdmissionClaimDTO>::Err(attempt.error());
       }
       auto acquired = recovery_predecessor
-                          ? kernel_cell_admission_port_->AcquireRouteRecoveryCellAdmissionClaim(
+                          ? kernel_cell_admission_port_.AcquireRouteRecoveryCellAdmissionClaim(
                                 intent, *recovery_predecessor)
-                          : kernel_cell_admission_port_->AcquireCellAdmissionClaim(intent);
+                          : kernel_cell_admission_port_.AcquireCellAdmissionClaim(intent);
       if (!acquired.ok() || acquired.value().intent != intent) {
         const bool unstarted =
             !acquired.ok() && (acquired.error().code == "stale_generation" ||
@@ -3353,8 +3246,7 @@ class ComponentLifecycleCoordinator::Impl final {
         ComponentLifecycleGeneration(predecessor_value),
         accepted_at_ns,
         facts.current_snapshot,
-        facts.catalogs,
-        std::nullopt};
+        facts.catalogs};
     const auto prepared = PrepareComponentLifecycleAdmission(intent, candidate);
     if (!prepared.ok()) {
       return Result<CCLCLifecycleRequestResultDTO>::Err(prepared.error());
@@ -3437,7 +3329,6 @@ class ComponentLifecycleCoordinator::Impl final {
     try {
       runtime = std::make_shared<RuntimeState>(
           prepared.value().initial_status, prepared.value().qualified_lifecycle_plan_catalogs,
-          prepared.value().lifecycle_mutation_eligible, std::nullopt,
           prepared.value().reserved_control_domains, facts.current_snapshot);
     } catch (...) {
       release_on_failure();
@@ -3570,9 +3461,8 @@ class ComponentLifecycleCoordinator::Impl final {
         std::lock_guard lock(state_mutex_);
         active_transactions_.push_back(runtime);
       }
-      // Ordinary Disable is an idle lifecycle mutation under the same exact
-      // cell claim as Prepare and Enable. The Kernel Stop worker remains for
-      // reconciliation and release of durable pre-cutover handoff records.
+      // Disable is an idle lifecycle mutation under the same exact cell
+      // claim as Prepare and Enable; it never invokes a Kernel Stop.
       if (!worker_pool_.Submit(
               [this, runtime](std::stop_token cancellation) { Process(runtime, cancellation); })) {
         CloseAdmissionLocked();
@@ -3598,31 +3488,15 @@ class ComponentLifecycleCoordinator::Impl final {
         ProcessRecovered(runtime, cancellation);
         return;
       }
-      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-          runtime->status.disable_handoff.has_value() &&
-          !runtime->lifecycle_lane_active) {
-        ProcessDisable(runtime, cancellation);
-        return;
-      }
       if (!runtime->initialized && !Initialize(runtime)) {
         return;
       }
       RunCurrentDomain(runtime, cancellation);
     } catch (const std::exception& exception) {
-      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-          runtime->status.disable_handoff.has_value()) {
-        CloseAdmission();
-        return;
-      }
       FailBeforeEffect(
           runtime, coordinator_error("component_lifecycle_worker_exception",
                                      "the lifecycle worker caught an exception", exception.what()));
     } catch (...) {
-      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-          runtime->status.disable_handoff.has_value()) {
-        CloseAdmission();
-        return;
-      }
       FailBeforeEffect(runtime,
                        coordinator_error("component_lifecycle_worker_exception",
                                          "the lifecycle worker caught an unknown exception",
@@ -3648,10 +3522,7 @@ class ComponentLifecycleCoordinator::Impl final {
       return true;
     }
     auto adopted = runtime->status;
-    AdvanceStatus(runtime, adopted,
-                  adopted.disable_handoff.has_value()
-                      ? ComponentLifecycleTransactionPhaseDTO::kReconciling
-                      : ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown);
+    AdvanceStatus(runtime, adopted, ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown);
     adopted.reconciliation_required = true;
     adopted.error = OwnerReplacementError("recovery_observation_required");
     adopted.remaining_duration_ns = 0;
@@ -3706,60 +3577,7 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
     if (runtime->unresolved_recovery_effect.has_value()) {
-      const auto prepared = *runtime->unresolved_recovery_effect;
-      switch (runtime->unresolved_recovery_effect->effect_kind) {
-        case CCLCEffectKindDTO::kBrandLifecyclePrimitive:
-          CompleteRecoveredBrandPrepareAsUncertain(runtime, cancellation);
-          return;
-        case CCLCEffectKindDTO::kKernelDisableHandoff:
-          if (!AdoptRecoveredStatus(runtime)) {
-            return;
-          }
-          runtime->recovering = false;
-          runtime->unresolved_recovery_effect.reset();
-          ReconcilePreparedDisableHandoff(runtime, *prepared.disable_handoff_request);
-          return;
-        case CCLCEffectKindDTO::kKernelDisableFenceRelease:
-          if (!AdoptRecoveredStatus(runtime)) {
-            return;
-          }
-          runtime->recovering = false;
-          runtime->unresolved_recovery_effect.reset();
-          ReconcilePreparedDisableFenceRelease(runtime, *prepared.disable_fence_release_request);
-          return;
-      }
-    }
-
-    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-        runtime->status.disable_handoff.has_value()) {
-      if (!AdoptRecoveredStatus(runtime)) {
-        return;
-      }
-      runtime->recovering = false;
-      runtime->lifecycle_mutation_eligible = false;
-      // This branch resumes an existing durable handoff. Owner adoption
-      // preserves it; only prepared-effect reconciliation above may establish
-      // a successor after proving the previous effect absent.
-      if (runtime->status.disable_handoff->state == DisableHandoffStateDTO::kStopping) {
-        ScheduleKernelPoll(runtime);
-      } else if (runtime->status.disable_handoff->state == DisableHandoffStateDTO::kReady) {
-        const bool domains_resolved = std::all_of(
-            runtime->status.domains.begin(), runtime->status.domains.end(), [](const auto& domain) {
-              return (domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded ||
-                      domain.action_state == ComponentLifecycleDomainActionStateDTO::kFailed) &&
-                     domain.effect != ComponentLifecycleDomainEffectDTO::kEffectUncertain;
-            });
-        if (domains_resolved) {
-          if (ClearRecoveredDisableReconciliationForRelease(runtime)) {
-            ScheduleDisableRelease(runtime);
-          }
-        } else {
-          ResolveDisableWithoutVendorMutation(
-              runtime, OwnerReplacementError("disable_recovery_is_containment_only"));
-        }
-      } else {
-        CloseAdmission();
-      }
+      CompleteRecoveredBrandPrepareAsUncertain(runtime, cancellation);
       return;
     }
 
@@ -4013,1050 +3831,6 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     runtime->expected_observation_generation = observation.value().observation_generation;
     SchedulePoll(runtime);
-  }
-
-  [[nodiscard]] bool ClearRecoveredDisableReconciliationForRelease(
-      const std::shared_ptr<RuntimeState>& runtime) {
-    if (!runtime->status.reconciliation_required &&
-        runtime->status.phase == ComponentLifecycleTransactionPhaseDTO::kVerifying) {
-      return true;
-    }
-    auto resolved = runtime->status;
-    AdvanceStatus(runtime, resolved, ComponentLifecycleTransactionPhaseDTO::kVerifying);
-    ClearResolvedOwnerReplacementMarker(resolved);
-    resolved.reconciliation_required = false;
-    resolved.remaining_duration_ns = 0;
-    if (!resolved.locally_valid()) {
-      CloseAdmission();
-      return false;
-    }
-    const auto recorded_resolution = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), resolved);
-    if (!recorded_resolution.ok()) {
-      CloseAdmission();
-      return false;
-    }
-    runtime->status = std::move(resolved);
-    return true;
-  }
-
-  [[nodiscard]] Result<DisableHandoffRequestDTO> BuildDisableHandoffRequest(
-      const std::shared_ptr<RuntimeState>& runtime, std::uint64_t effect_sequence) const {
-    if (!runtime->disable_admission.has_value() || !runtime->disable_admission->locally_valid()) {
-      return Result<DisableHandoffRequestDTO>::Err(coordinator_error(
-          "component_lifecycle_disable_admission_missing",
-          "the accepted Disable transaction has no retained Kernel admission snapshot",
-          "disable_admission_absent"));
-    }
-    const auto& admission = *runtime->disable_admission;
-    DisableHandoffRequestDTO request{
-        {RequestId(
-             "cclc.disable.handoff." +
-             std::to_string(runtime->status.acceptance.lifecycle_transaction_generation.value()) +
-             "." + std::to_string(effect_sequence)),
-         admission.request_owner_epoch, "CCLC Disable handoff",
-         runtime->status.accepted_intent.request_context.request_id.value()},
-        runtime->status.accepted_intent.request_context.request_id,
-        runtime->status.acceptance.lifecycle_transaction_id,
-        runtime->status.acceptance.lifecycle_transaction_generation,
-        runtime->status.accepted_intent.controllable_component_id,
-        admission.scope_resolution,
-        admission.current_scope,
-        admission.snapshot_digest,
-        admission.active_publication_generation,
-        admission.active_public_pointer_digest,
-        admission.graph_revision,
-        admission.retained_bundle_id,
-        admission.query.component_expectation.has_value()
-            ? admission.query.component_expectation->component_lifecycle_generation
-            : runtime->status.accepted_intent.expected_component_lifecycle_generation,
-        admission.operation_resource_generation,
-        admission.configuration_fence_generation,
-        admission.current_active_control_configurations};
-    if (!request.locally_valid()) {
-      return Result<DisableHandoffRequestDTO>::Err(coordinator_error(
-          "component_lifecycle_disable_handoff_request_invalid",
-          "the retained admission facts cannot form an exact Disable handoff request",
-          "handoff_request_construction_failed"));
-    }
-    return Result<DisableHandoffRequestDTO>::Ok(std::move(request));
-  }
-
-  [[nodiscard]] CCLCEffectAttemptDTO PreparedDisableHandoffAttempt(
-      const DisableHandoffRequestDTO& request, std::uint64_t effect_sequence) const {
-    return {CCLCRequestKindDTO::kComponentLifecycle,
-            request.lifecycle_transaction_id,
-            request.lifecycle_transaction_generation,
-            effect_sequence,
-            CCLCEffectKindDTO::kKernelDisableHandoff,
-            CCLCEffectAttemptStateDTO::kPrepared,
-            std::nullopt,
-            std::nullopt,
-            request,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt};
-  }
-
-  void ProcessDisable(const std::shared_ptr<RuntimeState>& runtime, std::stop_token cancellation) {
-    if (cancellation.stop_requested()) {
-      return;
-    }
-    if (!runtime->status.disable_handoff.has_value()) {
-      StartDisableHandoff(runtime);
-      return;
-    }
-    switch (runtime->status.disable_handoff->state) {
-      case DisableHandoffStateDTO::kStopping:
-        PollDisableHandoff(runtime);
-        return;
-      case DisableHandoffStateDTO::kReady:
-        ContinueDisableAfterReady(runtime);
-        return;
-      case DisableHandoffStateDTO::kFailed:
-        CloseAdmission();
-        return;
-    }
-  }
-
-  void StartDisableHandoff(const std::shared_ptr<RuntimeState>& runtime) {
-    const auto effect_sequence = NextEffectSequence(runtime->effect_sequence);
-    if (!effect_sequence.ok()) {
-      CloseAdmission();
-      return;
-    }
-    const auto request = BuildDisableHandoffRequest(runtime, effect_sequence.value());
-    if (!request.ok()) {
-      CloseAdmission();
-      return;
-    }
-
-    auto prepared_status = runtime->status;
-    AdvanceStatus(runtime, prepared_status,
-                  ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains);
-    ClearResolvedOwnerReplacementMarker(prepared_status);
-    const auto prepared_attempt =
-        PreparedDisableHandoffAttempt(request.value(), effect_sequence.value());
-    const auto prepared =
-        journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
-    if (!prepared.ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->effect_sequence = effect_sequence.value();
-    runtime->status = std::move(prepared_status);
-
-    std::optional<DisableHandoffAcceptedDTO> acceptance;
-    std::optional<DisableHandoffStatusDTO> status;
-    try {
-      const auto begun = kernel_disable_handoff_port_.BeginDisableHandoff(request.value());
-      if (begun.ok() && begun.value().matches(request.value())) {
-        acceptance = begun.value();
-        const auto observed = kernel_disable_handoff_port_.DisableHandoffStatus(
-            request.value().lifecycle_transaction_id,
-            request.value().lifecycle_transaction_generation);
-        if (observed.ok() &&
-            handoff_pair_matches_request(request.value(), *acceptance, observed.value())) {
-          status = observed.value();
-        }
-      }
-    } catch (...) {
-      // The durable prepared row makes the effect uncertain. Resolve only
-      // through the exact read-only reconciliation operation below.
-    }
-    if (acceptance.has_value() && status.has_value()) {
-      CompleteDisableHandoff(runtime, request.value(), *acceptance, *status);
-      return;
-    }
-    ReconcilePreparedDisableHandoff(runtime, request.value());
-  }
-
-  void ReconcilePreparedDisableHandoff(const std::shared_ptr<RuntimeState>& runtime,
-                                       const DisableHandoffRequestDTO& request) {
-    AcquireUnresolvedEffectAdmissionGate(runtime);
-    try {
-      const auto reconciliation =
-          kernel_disable_handoff_port_.ReconcileDisableHandoffAttempt(request);
-      if (!reconciliation.ok()) {
-        AcquireUnresolvedEffectAdmissionGate(runtime);
-        ScheduleDisableHandoffReconciliation(runtime, request);
-        return;
-      }
-      if (!reconciliation.value().locally_valid() || reconciliation.value().request != request) {
-        CloseAdmission();
-        return;
-      }
-      if (reconciliation.value().disposition ==
-          DisableHandoffAttemptDispositionDTO::kAcceptedExact) {
-        CompleteDisableHandoff(runtime, request, *reconciliation.value().acceptance,
-                               *reconciliation.value().status);
-        return;
-      }
-      if (reconciliation.value().disposition == DisableHandoffAttemptDispositionDTO::kNotSeen) {
-        auto completed_status = runtime->status;
-        AdvanceStatus(runtime, completed_status,
-                      ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains);
-        ClearResolvedOwnerReplacementMarker(completed_status);
-        auto completed_attempt = PreparedDisableHandoffAttempt(request, runtime->effect_sequence);
-        completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
-        completed_attempt.disable_handoff_result = DisableHandoffEffectResultDTO{
-            request, DisableHandoffEffectDispositionDTO::kProvenNotSeen, std::nullopt};
-        const auto completed = journal_.RecordEffectCompleted(CurrentOwnerEpoch(),
-                                                              completed_attempt, completed_status);
-        if (!completed.ok()) {
-          CloseAdmission();
-          return;
-        }
-        runtime->status = std::move(completed_status);
-        if (!RefreshDisableAdmission(runtime)) {
-          ScheduleDisableHandoffSuccessor(runtime);
-          return;
-        }
-        StartDisableHandoff(runtime);
-        return;
-      }
-    } catch (...) {
-    }
-    AcquireUnresolvedEffectAdmissionGate(runtime);
-    ScheduleDisableHandoffReconciliation(runtime, request);
-  }
-
-  void ScheduleDisableHandoffReconciliation(const std::shared_ptr<RuntimeState>& runtime,
-                                            DisableHandoffRequestDTO request) {
-    if (runtime->scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->scheduled = true;
-    const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns),
-            [this, weak, request = std::move(request)] {
-              if (shutting_down_.load(std::memory_order_acquire)) {
-                return;
-              }
-              if (const auto state = weak.lock(); state) {
-                state->scheduled = false;
-                if (!kernel_worker_pool_.Submit(
-                        [this, state, request](std::stop_token cancellation) {
-                          if (!cancellation.stop_requested()) {
-                            ReconcilePreparedDisableHandoff(state, request);
-                          }
-                        })) {
-                  CloseAdmission();
-                }
-              }
-            })) {
-      runtime->scheduled = false;
-    }
-  }
-
-  void ScheduleDisableHandoffSuccessor(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->scheduled = true;
-    const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns), [this, weak] {
-              if (shutting_down_.load(std::memory_order_acquire)) {
-                return;
-              }
-              if (const auto state = weak.lock(); state) {
-                state->scheduled = false;
-                if (!kernel_worker_pool_.Submit([this, state](std::stop_token cancellation) {
-                      if (cancellation.stop_requested()) {
-                        return;
-                      }
-                      if (!RefreshDisableAdmission(state)) {
-                        ScheduleDisableHandoffSuccessor(state);
-                        return;
-                      }
-                      StartDisableHandoff(state);
-                    })) {
-                  CloseAdmission();
-                }
-              }
-            })) {
-      runtime->scheduled = false;
-    }
-  }
-
-  [[nodiscard]] bool RefreshDisableAdmission(const std::shared_ptr<RuntimeState>& runtime) {
-    try {
-      const bool full_stop = runtime->disable_admission.has_value() &&
-                             runtime->disable_admission->query.request_kind ==
-                                 DisableHandoffScopeRequestKindDTO::kFullStopRequired;
-      if (full_stop) {
-        const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(
-            {runtime->status.accepted_intent.controllable_component_id,
-             DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt});
-        if (!admission.ok() || !admission.value().locally_valid()) {
-          return false;
-        }
-        runtime->disable_admission = admission.value();
-        return true;
-      }
-      const auto snapshot = current_snapshot_source_.ReadCurrentComponentSnapshot(
-          runtime->status.accepted_intent.controllable_component_id);
-      if (!snapshot.ok()) {
-        return false;
-      }
-      const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot.value());
-      if (!expectation.ok()) {
-        return false;
-      }
-      const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(
-          {runtime->status.accepted_intent.controllable_component_id,
-           DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation.value()});
-      if (!admission.ok() || !admission.value().locally_valid()) {
-        return false;
-      }
-      runtime->disable_admission = admission.value();
-      return true;
-    } catch (...) {
-      return false;
-    }
-  }
-
-  void CompleteDisableHandoff(const std::shared_ptr<RuntimeState>& runtime,
-                              const DisableHandoffRequestDTO& request,
-                              const DisableHandoffAcceptedDTO& acceptance,
-                              const DisableHandoffStatusDTO& handoff) {
-    if (!handoff_pair_matches_request(request, acceptance, handoff)) {
-      CloseAdmission();
-      return;
-    }
-    auto completed_status = runtime->status;
-    AdvanceStatus(runtime, completed_status, ComponentLifecycleTransactionPhaseDTO::kContaining);
-    ClearResolvedOwnerReplacementMarker(completed_status);
-    completed_status.disable_handoff = handoff;
-    completed_status.configuration_fence = handoff.state == DisableHandoffStateDTO::kReady
-                                               ? std::optional(handoff.configuration_fence_handle)
-                                               : std::nullopt;
-    auto completed_attempt = PreparedDisableHandoffAttempt(request, runtime->effect_sequence);
-    completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
-    completed_attempt.disable_handoff_result = DisableHandoffEffectResultDTO{
-        request, DisableHandoffEffectDispositionDTO::kAccepted, acceptance};
-    const auto completed =
-        journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status);
-    if (!completed.ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->status = std::move(completed_status);
-    if (handoff.scope_resolution == DisableHandoffScopeResolutionDTO::kPromotedToFull) {
-      AcquireOwnerWideContainmentGate(runtime);
-    }
-    ReleaseUnresolvedEffectAdmissionGate(runtime);
-    if (handoff.state == DisableHandoffStateDTO::kReady) {
-      ContinueDisableAfterReady(runtime);
-    } else if (handoff.state == DisableHandoffStateDTO::kStopping) {
-      ScheduleKernelPoll(runtime);
-    } else {
-      CloseAdmission();
-    }
-  }
-
-  void PollDisableHandoff(const std::shared_ptr<RuntimeState>& runtime) {
-    Result<DisableHandoffStatusDTO> observed =
-        Result<DisableHandoffStatusDTO>::Err(coordinator_error(
-            "component_lifecycle_disable_handoff_status_unavailable",
-            "the Disable handoff status could not be observed", "status_call_failed"));
-    try {
-      observed = kernel_disable_handoff_port_.DisableHandoffStatus(
-          runtime->status.acceptance.lifecycle_transaction_id,
-          runtime->status.acceptance.lifecycle_transaction_generation);
-    } catch (...) {
-    }
-    if (!observed.ok() || !observed.value().locally_valid() ||
-        !runtime->status.disable_handoff.has_value()) {
-      ScheduleKernelPoll(runtime);
-      return;
-    }
-    const auto& prior = *runtime->status.disable_handoff;
-    const auto& current = observed.value();
-    if (current.lifecycle_transaction_id != prior.lifecycle_transaction_id ||
-        current.lifecycle_transaction_generation != prior.lifecycle_transaction_generation ||
-        current.controllable_component_id != prior.controllable_component_id ||
-        current.scope_resolution != prior.scope_resolution ||
-        current.component_scope_digest != prior.component_scope_digest ||
-        current.configuration_fence_id != prior.configuration_fence_id ||
-        current.configuration_fence_generation != prior.configuration_fence_generation ||
-        current.scope != prior.scope) {
-      CloseAdmission();
-      return;
-    }
-    auto successor = runtime->status;
-    AdvanceStatus(runtime, successor, ComponentLifecycleTransactionPhaseDTO::kContaining);
-    successor.disable_handoff = current;
-    successor.configuration_fence = current.state == DisableHandoffStateDTO::kReady
-                                        ? std::optional(current.configuration_fence_handle)
-                                        : std::nullopt;
-    if (!journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), successor).ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->status = std::move(successor);
-    if (current.state == DisableHandoffStateDTO::kReady) {
-      ContinueDisableAfterReady(runtime);
-    } else if (current.state == DisableHandoffStateDTO::kStopping) {
-      ScheduleKernelPoll(runtime);
-    } else {
-      CloseAdmission();
-    }
-  }
-
-  void ScheduleKernelPoll(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->scheduled = true;
-    const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns), [this, weak] {
-              if (shutting_down_.load(std::memory_order_acquire)) {
-                return;
-              }
-              if (const auto state = weak.lock(); state) {
-                state->scheduled = false;
-                if (!kernel_worker_pool_.Submit([this, state](std::stop_token cancellation) {
-                      Process(state, cancellation);
-                    })) {
-                  CloseAdmission();
-                }
-              }
-            })) {
-      runtime->scheduled = false;
-    }
-  }
-
-  [[nodiscard]] Result<void> ValidateDisableMutationClosure(
-      const std::shared_ptr<RuntimeState>& runtime) {
-    if (!runtime->lifecycle_mutation_eligible || runtime->permanent_containment_only ||
-        !runtime->status.disable_handoff.has_value() ||
-        runtime->status.disable_handoff->state != DisableHandoffStateDTO::kReady ||
-        runtime->status.disable_handoff->scope_resolution !=
-            DisableHandoffScopeResolutionDTO::kExact ||
-        runtime->status.acceptance.component_lifecycle_generation.value() !=
-            runtime->status.accepted_intent.expected_component_lifecycle_generation.value() + 1U) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_disable_mutation_not_eligible",
-          "the contained Disable transaction is not eligible for vendor lifecycle mutation",
-          "accepted_scope_or_plan_not_exact"));
-    }
-    const auto snapshot = current_snapshot_source_.ReadCurrentComponentSnapshot(
-        runtime->status.accepted_intent.controllable_component_id);
-    if (!snapshot.ok() || !snapshot.value().locally_valid() ||
-        snapshot.value().component_lifecycle_generation !=
-            runtime->status.acceptance.component_lifecycle_generation ||
-        snapshot.value().active_publication_receipt.request.candidate_graph_revision !=
-            runtime->status.accepted_intent.expected_graph_revision ||
-        snapshot.value().domains.size() != runtime->status.domains.size() ||
-        snapshot.value().domains.size() !=
-            runtime->status.accepted_intent.expected_control_domains.size() ||
-        snapshot.value().provider_occurrences.size() != runtime->status.domains.size()) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_disable_mutation_snapshot_mismatch",
-          "the under-fence component snapshot does not match the accepted Disable closure",
-          "under_fence_snapshot_mismatch"));
-    }
-    const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot.value());
-    if (!expectation.ok() ||
-        expectation.value().component_scope != runtime->status.disable_handoff->scope) {
-      return Result<void>::Err(
-          coordinator_error("component_lifecycle_disable_mutation_scope_mismatch",
-                            "the under-fence component scope differs from the ready Kernel fence",
-                            "under_fence_scope_mismatch"));
-    }
-    std::vector<BrandLifecyclePlanCatalogDTO> fresh_catalogs;
-    fresh_catalogs.reserve(runtime->status.domains.size());
-    std::optional<std::int64_t> later_plan_timeout_ns;
-    for (std::size_t index = 0U; index < runtime->status.domains.size(); ++index) {
-      const auto& domain = runtime->status.domains[index];
-      if (!domain.expected_domain.has_value() || !domain.current_scope.has_value() ||
-          !domain.resolved_provider_occurrence.has_value() ||
-          *domain.expected_domain !=
-              runtime->status.accepted_intent.expected_control_domains[index] ||
-          !ExpectedDomainMatchesResolvedScope(*domain.expected_domain,
-                                              snapshot.value().domains[index]) ||
-          *domain.current_scope != snapshot.value().domains[index] ||
-          *domain.resolved_provider_occurrence != snapshot.value().provider_occurrences[index]) {
-        return Result<void>::Err(coordinator_error(
-            "component_lifecycle_disable_mutation_domain_mismatch",
-            "the under-fence domain/provider closure differs from accepted Disable facts",
-            "under_fence_domain_or_provider_mismatch"));
-      }
-      const auto catalog = lifecycle_plan_catalog_source_.LoadExactLifecyclePlanCatalog(
-          snapshot.value().provider_occurrences[index].provider_manifest_id,
-          snapshot.value().provider_occurrences[index].provider_manifest_revision,
-          snapshot.value().provider_occurrences[index].lifecycle_plan_catalog_digest);
-      if (!catalog.ok() || !VerifyBrandLifecyclePlanCatalog(catalog.value()).ok() ||
-          catalog.value().provider_manifest_id !=
-              snapshot.value().provider_occurrences[index].provider_manifest_id ||
-          catalog.value().provider_manifest_revision !=
-              snapshot.value().provider_occurrences[index].provider_manifest_revision ||
-          catalog.value().catalog_digest !=
-              snapshot.value().provider_occurrences[index].lifecycle_plan_catalog_digest) {
-        return Result<void>::Err(
-            catalog.ok()
-                ? coordinator_error(
-                      "component_lifecycle_disable_mutation_catalog_mismatch",
-                      "the under-fence lifecycle catalog differs from the qualified closure",
-                      "under_fence_catalog_mismatch")
-                : catalog.error());
-      }
-      const auto timeout_ns = disable_plan_timeout(catalog.value());
-      if (!timeout_ns.has_value()) {
-        return Result<void>::Err(coordinator_error(
-            "component_lifecycle_disable_mutation_plan_unqualified",
-            "the fresh under-fence lifecycle catalog has no unique qualified Disable plan",
-            "under_fence_disable_plan_missing_or_ambiguous"));
-      }
-      if (runtime->qualified_catalogs.has_value() &&
-          (runtime->qualified_catalogs->size() != runtime->status.domains.size() ||
-           catalog.value() != (*runtime->qualified_catalogs)[index])) {
-        return Result<void>::Err(coordinator_error(
-            "component_lifecycle_disable_mutation_catalog_mismatch",
-            "the under-fence lifecycle catalog differs from the accepted qualified closure",
-            "under_fence_catalog_mismatch"));
-      }
-      later_plan_timeout_ns = later_plan_timeout_ns.has_value()
-                                  ? std::min(*later_plan_timeout_ns, *timeout_ns)
-                                  : *timeout_ns;
-      fresh_catalogs.push_back(catalog.value());
-    }
-    if (!later_plan_timeout_ns.has_value()) {
-      return Result<void>::Err(
-          coordinator_error("component_lifecycle_disable_mutation_plan_unqualified",
-                            "the fresh under-fence lifecycle catalog closure is empty",
-                            "under_fence_catalog_closure_empty"));
-    }
-    runtime->qualified_catalogs = std::move(fresh_catalogs);
-    const auto accepted_at_ns = runtime->status.acceptance.accepted_at_ns;
-    const auto later_deadline_ns =
-        accepted_at_ns > std::numeric_limits<std::int64_t>::max() - *later_plan_timeout_ns
-            ? std::numeric_limits<std::int64_t>::max()
-            : accepted_at_ns + *later_plan_timeout_ns;
-    runtime->effective_deadline_ns = std::min(runtime->effective_deadline_ns, later_deadline_ns);
-    if (clock_.now() >= runtime->effective_deadline_ns) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_disable_mutation_deadline_elapsed",
-          "the later-qualified Disable plan cannot widen the fixed containment deadline",
-          "later_plan_timeout_elapsed"));
-    }
-    return Result<void>::Ok();
-  }
-
-  void ContinueDisableAfterReady(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->lifecycle_lane_active) {
-      return;
-    }
-    runtime->lifecycle_lane_active = true;
-    if (!worker_pool_.Submit([this, runtime](std::stop_token cancellation) {
-          if (cancellation.stop_requested()) {
-            runtime->lifecycle_lane_active = false;
-            return;
-          }
-          try {
-            if (runtime->permanent_containment_only && !runtime->status.current_state.has_value()) {
-              const auto reconciled = ReconcilePromotedFullSnapshot(runtime);
-              if (!reconciled.ok()) {
-                // No external lifecycle effect is pending. Keep the Full-Stop
-                // fence held and retry only the read-only truth acquisition;
-                // this transaction can never enter vendor mutation.
-                runtime->lifecycle_lane_active = false;
-                SchedulePoll(runtime);
-              }
-              return;
-            }
-            const auto qualified = ValidateDisableMutationClosure(runtime);
-            if (!qualified.ok()) {
-              ResolveDisableWithoutVendorMutation(runtime, qualified.error());
-              return;
-            }
-            Process(runtime, cancellation);
-          } catch (const std::exception& exception) {
-            ResolveDisableWithoutVendorMutation(
-                runtime,
-                coordinator_error("component_lifecycle_disable_qualification_exception",
-                                  "the under-fence Disable qualification raised an exception",
-                                  exception.what()));
-          } catch (...) {
-            ResolveDisableWithoutVendorMutation(
-                runtime,
-                coordinator_error("component_lifecycle_disable_qualification_exception",
-                                  "the under-fence Disable qualification raised an exception",
-                                  "unknown_exception"));
-          }
-        })) {
-      runtime->lifecycle_lane_active = false;
-      CloseAdmission();
-    }
-  }
-
-  [[nodiscard]] Result<void> ReconcilePromotedFullSnapshot(
-      const std::shared_ptr<RuntimeState>& runtime) {
-    if (!runtime->permanent_containment_only || runtime->status.current_state.has_value() ||
-        !runtime->status.disable_handoff.has_value() ||
-        runtime->status.disable_handoff->scope_resolution !=
-            DisableHandoffScopeResolutionDTO::kPromotedToFull ||
-        runtime->status.disable_handoff->state != DisableHandoffStateDTO::kReady ||
-        !runtime->status.configuration_fence.has_value() ||
-        runtime->status.configuration_fence->state != ConfigurationFenceState::kHeld) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_full_stop_reconciliation_invalid",
-          "the promoted Full-Stop transaction is not ready for snapshot reconciliation",
-          "promoted_full_reconciliation_precondition_failed"));
-    }
-
-    const auto snapshot = current_snapshot_source_.ReadCurrentComponentSnapshot(
-        runtime->status.accepted_intent.controllable_component_id);
-    if (!snapshot.ok() || !snapshot.value().locally_valid() ||
-        snapshot.value().controllable_component_id !=
-            runtime->status.accepted_intent.controllable_component_id ||
-        snapshot.value().component_lifecycle_generation !=
-            runtime->status.acceptance.component_lifecycle_generation ||
-        !snapshot_is_within_fence(snapshot.value(), runtime->status.configuration_fence->scope)) {
-      return Result<void>::Err(
-          snapshot.ok() ? coordinator_error("component_lifecycle_full_stop_snapshot_mismatch",
-                                            "the fresh component snapshot is not an exact subset "
-                                            "of the held Full-Stop fence",
-                                            "promoted_full_snapshot_mismatch")
-                        : snapshot.error());
-    }
-
-    const ErrorDTO unsatisfied{
-        "component_lifecycle_disable_postcondition_not_observed",
-        "Kernel containment completed but the requested Disabled lifecycle state is not observed",
-        {{"reason", "containment_only_snapshot_not_disabled"}}};
-    const bool disabled =
-        snapshot.value().component_lifecycle_state == ComponentLifecycleStateDTO::kDisabled;
-    auto reconciled = runtime->status;
-    AdvanceStatus(runtime, reconciled, ComponentLifecycleTransactionPhaseDTO::kVerifying);
-    reconciled.previous_state = snapshot.value().component_lifecycle_state;
-    reconciled.current_state = snapshot.value().component_lifecycle_state;
-    reconciled.domains.clear();
-    reconciled.domains.reserve(runtime->status.accepted_intent.expected_control_domains.size() +
-                               snapshot.value().domains.size());
-
-    std::size_t expected_index = 0U;
-    std::size_t current_index = 0U;
-    bool all_succeeded = true;
-    while (expected_index < runtime->status.accepted_intent.expected_control_domains.size() ||
-           current_index < snapshot.value().domains.size()) {
-      const auto& expected_rows = runtime->status.accepted_intent.expected_control_domains;
-      const bool take_expected = current_index == snapshot.value().domains.size() ||
-                                 (expected_index < expected_rows.size() &&
-                                  expected_rows[expected_index].control_domain_id <
-                                      snapshot.value().domains[current_index].control_domain_id);
-      const bool take_current = expected_index == expected_rows.size() ||
-                                (current_index < snapshot.value().domains.size() &&
-                                 snapshot.value().domains[current_index].control_domain_id <
-                                     expected_rows[expected_index].control_domain_id);
-
-      std::optional<ExpectedControlDomainRevisionDTO> expected;
-      std::optional<ResolvedLifecycleControlDomainScopeDTO> current;
-      std::optional<ResolvedLifecycleProviderOccurrenceDTO> provider;
-      std::optional<ControlDomainId> domain_id;
-      if (take_expected) {
-        expected = expected_rows[expected_index++];
-        domain_id = expected->control_domain_id;
-      } else if (take_current) {
-        current = snapshot.value().domains[current_index];
-        provider = snapshot.value().provider_occurrences[current_index++];
-        domain_id = current->control_domain_id;
-      } else {
-        expected = expected_rows[expected_index++];
-        current = snapshot.value().domains[current_index];
-        provider = snapshot.value().provider_occurrences[current_index++];
-        domain_id = current->control_domain_id;
-      }
-
-      const bool domain_succeeded = current.has_value() && disabled;
-      all_succeeded = all_succeeded && domain_succeeded;
-      reconciled.domains.push_back(
-          {std::move(*domain_id),
-           std::move(expected),
-           std::move(current),
-           std::move(provider),
-           current.has_value() ? std::optional(snapshot.value().component_lifecycle_state)
-                               : std::nullopt,
-           current.has_value() ? std::optional(snapshot.value().component_lifecycle_state)
-                               : std::nullopt,
-           reconciled.requested_state,
-           domain_succeeded ? ComponentLifecycleDomainActionStateDTO::kSucceeded
-                            : ComponentLifecycleDomainActionStateDTO::kFailed,
-           ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
-           {},
-           std::nullopt,
-           domain_succeeded ? std::nullopt : std::optional(unsatisfied)});
-    }
-    reconciled.reconciliation_required = false;
-    reconciled.error = all_succeeded ? std::nullopt : std::optional(unsatisfied);
-    if (!reconciled.locally_valid()) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_full_stop_snapshot_invalid",
-          "the fresh Full-Stop snapshot cannot form a closed lifecycle reconciliation status",
-          "promoted_full_status_invalid"));
-    }
-    const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
-    if (!recorded.ok()) {
-      return Result<void>::Err(recorded.error());
-    }
-    runtime->status = std::move(reconciled);
-    ScheduleDisableRelease(runtime);
-    return Result<void>::Ok();
-  }
-
-  void ResolveDisableWithoutVendorMutation(const std::shared_ptr<RuntimeState>& runtime,
-                                           const ErrorDTO& error) {
-    auto resolved = runtime->status;
-    AdvanceStatus(runtime, resolved, ComponentLifecycleTransactionPhaseDTO::kVerifying);
-    for (auto& domain : resolved.domains) {
-      if (domain.action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded) {
-        domain.action_state = ComponentLifecycleDomainActionStateDTO::kFailed;
-        if (domain.effect == ComponentLifecycleDomainEffectDTO::kNone) {
-          domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
-        }
-        domain.error = error;
-      }
-    }
-    resolved.reconciliation_required = false;
-    resolved.error = error;
-    if (!resolved.locally_valid() ||
-        !journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), resolved).ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->status = std::move(resolved);
-    ScheduleDisableRelease(runtime);
-  }
-
-  void ScheduleDisableRelease(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->release_scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->release_scheduled = true;
-    if (!kernel_worker_pool_.Submit([this, runtime](std::stop_token cancellation) {
-          runtime->release_scheduled = false;
-          if (!cancellation.stop_requested()) {
-            StartDisableFenceRelease(runtime);
-          }
-        })) {
-      runtime->release_scheduled = false;
-      CloseAdmission();
-    }
-  }
-
-  [[nodiscard]] CCLCEffectAttemptDTO PreparedDisableFenceReleaseAttempt(
-      const DisableFenceReleaseRequestDTO& request, std::uint64_t effect_sequence) const {
-    return {CCLCRequestKindDTO::kComponentLifecycle,
-            request.lifecycle_transaction_id,
-            request.lifecycle_transaction_generation,
-            effect_sequence,
-            CCLCEffectKindDTO::kKernelDisableFenceRelease,
-            CCLCEffectAttemptStateDTO::kPrepared,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            request,
-            std::nullopt};
-  }
-
-  [[nodiscard]] Result<DisableFenceReleaseRequestDTO> BuildDisableFenceReleaseRequest(
-      const std::shared_ptr<RuntimeState>& runtime, std::uint64_t effect_sequence) const {
-    if (!runtime->status.disable_handoff.has_value() ||
-        runtime->status.disable_handoff->state != DisableHandoffStateDTO::kReady ||
-        !runtime->status.configuration_fence.has_value() ||
-        runtime->status.configuration_fence->state != ConfigurationFenceState::kHeld) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(
-          coordinator_error("component_lifecycle_disable_release_not_ready",
-                            "the Disable transaction has no exact ready held fence to release",
-                            "ready_fence_absent"));
-    }
-    const auto snapshot = current_snapshot_source_.ReadCurrentComponentSnapshot(
-        runtime->status.accepted_intent.controllable_component_id);
-    if (!snapshot.ok()) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(snapshot.error());
-    }
-    const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot.value());
-    if (!expectation.ok()) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(expectation.error());
-    }
-    const bool full_stop = runtime->status.disable_handoff->scope_resolution ==
-                           DisableHandoffScopeResolutionDTO::kPromotedToFull;
-    const DisableHandoffAdmissionQueryDTO query{
-        runtime->status.accepted_intent.controllable_component_id,
-        full_stop ? DisableHandoffScopeRequestKindDTO::kFullStopRequired
-                  : DisableHandoffScopeRequestKindDTO::kResolvedComponentScope,
-        full_stop ? std::nullopt : std::optional(expectation.value())};
-    const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(query);
-    if (!admission.ok()) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(admission.error());
-    }
-    const auto retained =
-        journal_.LoadRetainedLifecycleStatus(runtime->status.acceptance.lifecycle_transaction_id);
-    if (!retained.ok() || !retained.value().has_value() ||
-        retained.value()->acceptance.lifecycle_transaction_generation !=
-            runtime->status.acceptance.lifecycle_transaction_generation ||
-        retained.value()->status_sequence != runtime->status.status_sequence ||
-        retained.value()->disable_handoff != runtime->status.disable_handoff ||
-        retained.value()->configuration_fence != runtime->status.configuration_fence) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(
-          retained.ok()
-              ? coordinator_error(
-                    "component_lifecycle_disable_release_status_mismatch",
-                    "the in-memory Disable release precondition differs from durable status",
-                    "durable_release_precondition_mismatch")
-              : retained.error());
-    }
-    const auto& durable_precondition = *retained.value();
-    DisableFenceReleaseRequestDTO request{
-        {RequestId(
-             "cclc.disable.release." +
-             std::to_string(runtime->status.acceptance.lifecycle_transaction_generation.value()) +
-             "." + std::to_string(effect_sequence)),
-         admission.value().request_owner_epoch, "CCLC Disable fence release",
-         runtime->status.accepted_intent.request_context.request_id.value()},
-        runtime->status.accepted_intent.request_context.request_id,
-        runtime->status.acceptance.lifecycle_transaction_id,
-        runtime->status.acceptance.lifecycle_transaction_generation,
-        runtime->status.accepted_intent.controllable_component_id,
-        *runtime->status.disable_handoff,
-        durable_precondition.status_sequence,
-        ContentDigest(
-            detail::ComponentLifecycleStatusReleasePreconditionDigest(durable_precondition)),
-        expectation.value(),
-        admission.value()};
-    if (!request.locally_valid()) {
-      return Result<DisableFenceReleaseRequestDTO>::Err(
-          coordinator_error("component_lifecycle_disable_release_request_invalid",
-                            "fresh under-fence facts cannot form an exact release request",
-                            "release_request_construction_failed"));
-    }
-    return Result<DisableFenceReleaseRequestDTO>::Ok(std::move(request));
-  }
-
-  void StartDisableFenceRelease(const std::shared_ptr<RuntimeState>& runtime) {
-    const auto effect_sequence = NextEffectSequence(runtime->effect_sequence);
-    if (!effect_sequence.ok()) {
-      CloseAdmission();
-      return;
-    }
-    Result<DisableFenceReleaseRequestDTO> request =
-        Result<DisableFenceReleaseRequestDTO>::Err(coordinator_error(
-            "component_lifecycle_disable_release_request_failed",
-            "the Disable release request could not be built", "release_request_failed"));
-    try {
-      request = BuildDisableFenceReleaseRequest(runtime, effect_sequence.value());
-    } catch (...) {
-    }
-    if (!request.ok()) {
-      ScheduleDisableReleaseRetry(runtime);
-      return;
-    }
-    auto prepared_status = runtime->status;
-    AdvanceStatus(runtime, prepared_status, ComponentLifecycleTransactionPhaseDTO::kVerifying);
-    ClearResolvedOwnerReplacementMarker(prepared_status);
-    const auto prepared_attempt =
-        PreparedDisableFenceReleaseAttempt(request.value(), effect_sequence.value());
-    const auto persisted =
-        journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
-    if (!persisted.ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->effect_sequence = effect_sequence.value();
-    runtime->status = std::move(prepared_status);
-
-    std::optional<DisableFenceReleasedDTO> receipt;
-    try {
-      const auto released = kernel_disable_handoff_port_.ReleaseDisableFence(request.value());
-      if (released.ok() && released.value().matches(request.value())) {
-        receipt = released.value();
-      }
-    } catch (...) {
-    }
-    if (receipt.has_value()) {
-      CompleteDisableFenceRelease(runtime, request.value(), *receipt);
-      return;
-    }
-    ReconcilePreparedDisableFenceRelease(runtime, request.value());
-  }
-
-  void ScheduleDisableReleaseRetry(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->release_retry_scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->release_retry_scheduled = true;
-    const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns), [this, weak] {
-              if (shutting_down_.load(std::memory_order_acquire)) {
-                return;
-              }
-              if (const auto state = weak.lock(); state) {
-                state->release_retry_scheduled = false;
-                ScheduleDisableRelease(state);
-              }
-            })) {
-      runtime->release_retry_scheduled = false;
-    }
-  }
-
-  void ReconcilePreparedDisableFenceRelease(const std::shared_ptr<RuntimeState>& runtime,
-                                            const DisableFenceReleaseRequestDTO& request) {
-    AcquireUnresolvedEffectAdmissionGate(runtime);
-    try {
-      const auto reconciliation =
-          kernel_disable_handoff_port_.ReconcileDisableFenceReleaseAttempt(request);
-      if (!reconciliation.ok()) {
-        AcquireUnresolvedEffectAdmissionGate(runtime);
-        ScheduleDisableFenceReleaseReconciliation(runtime, request);
-        return;
-      }
-      if (!reconciliation.value().locally_valid() || reconciliation.value().request != request) {
-        CloseAdmission();
-        return;
-      }
-      if (reconciliation.value().disposition ==
-          DisableFenceReleaseAttemptDispositionDTO::kReleasedExact) {
-        CompleteDisableFenceRelease(runtime, request, *reconciliation.value().release_receipt);
-        return;
-      }
-      if (reconciliation.value().disposition ==
-          DisableFenceReleaseAttemptDispositionDTO::kNotReleasedHeld) {
-        auto completed_status = runtime->status;
-        AdvanceStatus(runtime, completed_status, ComponentLifecycleTransactionPhaseDTO::kVerifying);
-        ClearResolvedOwnerReplacementMarker(completed_status);
-        auto completed_attempt =
-            PreparedDisableFenceReleaseAttempt(request, runtime->effect_sequence);
-        completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
-        completed_attempt.disable_fence_release_result = DisableFenceReleaseEffectResultDTO{
-            request, DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld, std::nullopt};
-        if (!journal_
-                 .RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status)
-                 .ok()) {
-          CloseAdmission();
-          return;
-        }
-        runtime->status = std::move(completed_status);
-        ScheduleDisableRelease(runtime);
-        return;
-      }
-    } catch (...) {
-    }
-    AcquireUnresolvedEffectAdmissionGate(runtime);
-    ScheduleDisableFenceReleaseReconciliation(runtime, request);
-  }
-
-  void ScheduleDisableFenceReleaseReconciliation(const std::shared_ptr<RuntimeState>& runtime,
-                                                 DisableFenceReleaseRequestDTO request) {
-    if (runtime->scheduled || shutting_down_.load(std::memory_order_acquire)) {
-      return;
-    }
-    runtime->scheduled = true;
-    const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns),
-            [this, weak, request = std::move(request)] {
-              if (shutting_down_.load(std::memory_order_acquire)) {
-                return;
-              }
-              if (const auto state = weak.lock(); state) {
-                state->scheduled = false;
-                if (!kernel_worker_pool_.Submit(
-                        [this, state, request](std::stop_token cancellation) {
-                          if (!cancellation.stop_requested()) {
-                            ReconcilePreparedDisableFenceRelease(state, request);
-                          }
-                        })) {
-                  CloseAdmission();
-                }
-              }
-            })) {
-      runtime->scheduled = false;
-    }
-  }
-
-  void CompleteDisableFenceRelease(const std::shared_ptr<RuntimeState>& runtime,
-                                   const DisableFenceReleaseRequestDTO& request,
-                                   const DisableFenceReleasedDTO& receipt) {
-    if (!receipt.matches(request)) {
-      CloseAdmission();
-      return;
-    }
-    auto terminal_status = runtime->status;
-    const bool all_succeeded = std::all_of(
-        terminal_status.domains.begin(), terminal_status.domains.end(), [](const auto& domain) {
-          return domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded;
-        });
-    const bool any_observed = std::any_of(
-        terminal_status.domains.begin(), terminal_status.domains.end(), [](const auto& domain) {
-          return domain.effect == ComponentLifecycleDomainEffectDTO::kEffectObserved ||
-                 domain.effect == ComponentLifecycleDomainEffectDTO::kPartialEffectObserved;
-        });
-    AdvanceStatus(runtime, terminal_status,
-                  all_succeeded ? ComponentLifecycleTransactionPhaseDTO::kSucceeded
-                                : ComponentLifecycleTransactionPhaseDTO::kFailed);
-    terminal_status.configuration_fence->state = ConfigurationFenceState::kReleased;
-    terminal_status.disable_fence_released = receipt;
-    terminal_status.reconciliation_required = false;
-    terminal_status.remaining_duration_ns = 0;
-    if (all_succeeded) {
-      terminal_status.current_state = terminal_status.requested_state.state;
-      terminal_status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
-      terminal_status.error.reset();
-    } else {
-      terminal_status.terminal_result =
-          any_observed ? ComponentLifecycleTerminalResultDTO::kFailedPartialEffect
-                       : ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
-      if (!terminal_status.error.has_value()) {
-        terminal_status.error = coordinator_error(
-            "component_lifecycle_disable_mutation_failed",
-            "Disable containment completed without every requested lifecycle postcondition",
-            "one_or_more_domains_failed");
-      }
-    }
-    if (!terminal_status.locally_valid() ||
-        !PublishTerminalComponentReadiness(runtime, terminal_status).ok()) {
-      CloseAdmission();
-      return;
-    }
-    auto completed_attempt = PreparedDisableFenceReleaseAttempt(request, runtime->effect_sequence);
-    completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
-    completed_attempt.disable_fence_release_result = DisableFenceReleaseEffectResultDTO{
-        request, DisableFenceReleaseEffectDispositionDTO::kReleased, receipt};
-    if (!runtime->cell_claim.has_value()) {
-      CloseAdmission();
-      return;
-    }
-    const auto& claim = *runtime->cell_claim;
-    const CellAdmissionClaimReleaseDTO claim_release{
-        claim.intent.owner_role,
-        claim.intent.owner_epoch,
-        claim.intent.owner_transaction_id,
-        claim.intent.request_id,
-        claim.intent.request_payload_digest,
-        claim.acquired_admission_generation,
-        claim.claim_generation,
-        {CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-         ContentDigest(
-             detail::ComponentLifecycleStatusReleasePreconditionDigest(terminal_status))}};
-    if (!terminal_status.locally_valid() ||
-        !journal_
-             .RecordEffectCompletedAndLifecycleClaimRelease(CurrentOwnerEpoch(), completed_attempt,
-                                                            terminal_status, claim_release)
-             .ok()) {
-      CloseAdmission();
-      return;
-    }
-    runtime->status = std::move(terminal_status);
-    runtime->cell_claim_release = claim_release;
-    if (!ReleaseDurableClaim(runtime, claim_release)) {
-      return;
-    }
-    Complete(runtime);
   }
 
   [[nodiscard]] bool Initialize(const std::shared_ptr<RuntimeState>& runtime) {
@@ -5339,10 +4113,6 @@ class ComponentLifecycleCoordinator::Impl final {
                                           CCLCEffectKindDTO::kBrandLifecyclePrimitive,
                                           CCLCEffectAttemptStateDTO::kPrepared,
                                           primitive,
-                                          std::nullopt,
-                                          std::nullopt,
-                                          std::nullopt,
-                                          std::nullopt,
                                           std::nullopt};
     const auto prepared =
         journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
@@ -5818,7 +4588,7 @@ class ComponentLifecycleCoordinator::Impl final {
     try {
       // The exact retained receipt below is authoritative even if this reply
       // is lost after the Kernel has durably released the claim.
-      static_cast<void>(kernel_cell_admission_port_->ReleaseCellAdmissionClaim(release));
+      static_cast<void>(kernel_cell_admission_port_.ReleaseCellAdmissionClaim(release));
     } catch (...) {
     }
     const CellAdmissionRecoveryReceiptQueryDTO query{claim.intent, claim, release};
@@ -5827,7 +4597,7 @@ class ComponentLifecycleCoordinator::Impl final {
             "component_lifecycle_claim_release_unknown",
             "Kernel lifecycle release receipt raised an exception", "claim_receipt_exception"));
     try {
-      receipt = kernel_cell_admission_port_->GetCellAdmissionRecoveryReceipt(query);
+      receipt = kernel_cell_admission_port_.GetCellAdmissionRecoveryReceipt(query);
     } catch (...) {
     }
     if (!receipt.ok() ||
@@ -5868,15 +4638,6 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
 
-    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-        runtime->status.disable_handoff.has_value() &&
-        runtime->status.disable_handoff->state == DisableHandoffStateDTO::kReady &&
-        runtime->status.configuration_fence.has_value() &&
-        runtime->status.configuration_fence->state == ConfigurationFenceState::kHeld) {
-      ResolveDisableWithoutVendorMutation(runtime, error);
-      return;
-    }
-
     auto status = runtime->status;
     AdvanceStatus(runtime, status, ComponentLifecycleTransactionPhaseDTO::kFailed);
     bool any_effect = false;
@@ -5912,11 +4673,6 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   void Succeed(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-        runtime->status.disable_handoff.has_value()) {
-      ScheduleDisableRelease(runtime);
-      return;
-    }
     auto status = runtime->status;
     AdvanceStatus(runtime, status, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
     status.current_state = status.requested_state.state;
@@ -6031,7 +4787,6 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     }
     worker_pool_.Stop();
-    kernel_worker_pool_.Stop();
   }
 
   void CloseAdmissionLocked() noexcept {
@@ -6177,14 +4932,12 @@ class ComponentLifecycleCoordinator::Impl final {
   const ICCLCCurrentComponentSnapshotSource& current_snapshot_source_;
   const ICCLCLifecyclePlanCatalogSource& lifecycle_plan_catalog_source_;
   const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver_;
-  ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port_;
+  IKernelCellAdmissionPort& kernel_cell_admission_port_;
   IClock& clock_;
   IScheduler& scheduler_;
-  IKernelCellAdmissionPort* kernel_cell_admission_port_;
   ICCLCComponentCommandReadinessPort* component_command_readiness_port_;
   std::optional<ComponentLifecycleCoordinatorRouteServices> route_services_;
   FixedWorkerPool worker_pool_;
-  FixedWorkerPool kernel_worker_pool_;
 
   mutable std::mutex state_mutex_;
   std::condition_variable state_changed_;
@@ -6222,14 +4975,13 @@ ComponentLifecycleCoordinator::ComponentLifecycleCoordinator(
     const ICCLCCurrentComponentSnapshotSource& current_snapshot_source,
     const ICCLCLifecyclePlanCatalogSource& lifecycle_plan_catalog_source,
     const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
-    ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
-    IScheduler& scheduler, IKernelCellAdmissionPort* kernel_cell_admission_port,
+    IKernelCellAdmissionPort& kernel_cell_admission_port, IClock& clock, IScheduler& scheduler,
     std::optional<ComponentLifecycleCoordinatorRouteServices> route_services,
     ICCLCComponentCommandReadinessPort* component_command_readiness_port)
     : impl_(std::make_unique<Impl>(
           std::move(config), journal, domain_reservations, current_snapshot_source,
-          lifecycle_plan_catalog_source, lifecycle_port_resolver, kernel_disable_handoff_port,
-          clock, scheduler, kernel_cell_admission_port, std::move(route_services),
+          lifecycle_plan_catalog_source, lifecycle_port_resolver, kernel_cell_admission_port,
+          clock, scheduler, std::move(route_services),
           component_command_readiness_port)) {}
 
 ComponentLifecycleCoordinator::~ComponentLifecycleCoordinator() = default;

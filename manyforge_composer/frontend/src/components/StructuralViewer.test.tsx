@@ -430,16 +430,10 @@ describe('viewer failure isolation', () => {
       new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
       'utf8',
     );
-    const authoring = readFileSync(
-      new URL('../state/sceneAuthoring.ts', import.meta.url),
-      'utf8',
-    );
 
-    expect(viewer).toContain('Detach Attached object');
-    expect(workspace).toContain('Attached-object placement');
+    expect(workspace).toContain('This object is Attached in the live cell');
     expect(workspace).toContain('objects.length} objects · {attachments.length} Attached');
     expect(workspace).toContain('`Attached to ${attachment.controllable_component_id}');
-    expect(authoring).toContain('Set the Attached object to Detached');
     expect(viewer).not.toContain('Detach carried object');
     expect(workspace).not.toContain('carried-object placement');
   });

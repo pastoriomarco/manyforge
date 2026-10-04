@@ -1923,3 +1923,46 @@ def test_program_apply_refuses_a_no_op_before_any_effect(
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "program_apply_nothing_to_apply"
     assert response.json()["detail"]["message"].startswith("Nothing to apply")
+
+
+def test_program_revert_refuses_saved_equal_to_applied_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _copy_program(tmp_path)
+    program = Program(source, build_node_environment().catalog)
+    state = _enable_authoring(
+        ComposerState(program=program, program_source_path=str(source))
+    )
+
+    class Admission(_AuthoringPassThrough):
+        def execute_external_submission(self, *_args, **_kwargs):
+            pytest.fail("a no-op Revert must not reach admission")
+
+    state.authoring_admission = Admission()  # type: ignore[assignment]
+
+    def submit(*_args, **_kwargs):
+        pytest.fail("a no-op Revert must not submit a Manager activation")
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", submit)
+    monkeypatch.setattr(routes_draft, "_active_catalog", lambda s: s.node_catalog)
+    # Saved is the loaded file and the Applied Program already is exactly it.
+    monkeypatch.setattr(routes_draft, "_applied_context", lambda _s: (
+        SimpleNamespace(program_revision=program.program_revision), None,
+    ))
+    client = TestClient(create_app(state, security=SecurityConfig(
+        allowed_fs_roots=[str(tmp_path)], cors_origins=["http://localhost:3000"],
+    )))
+    state.headless_client = SimpleNamespace(  # type: ignore[assignment]
+        manager_status=lambda: pytest.fail("a no-op Revert must not read the Manager")
+    )
+    before = state.draft_session.retained_state()
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    response = client.post("/api/program/revert", json=body)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "program_revert_nothing_to_revert"
+    assert response.json()["detail"]["message"].startswith("Nothing to revert")
+    assert state.draft_session.retained_state() == before

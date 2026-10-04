@@ -78,8 +78,7 @@ private:
 };
 
 class UnusedKernelPorts final
-    : public core::ICCLCKernelDisableHandoffPort,
-      public core::ICCLCKernelRouteConfigurationFencePort,
+    : public core::ICCLCKernelRouteConfigurationFencePort,
       public core::IKernelCellAdmissionPort {
 public:
   [[nodiscard]] core::AuthoringAdmissionDTO GetAuthoringAdmission()
@@ -120,43 +119,6 @@ public:
          std::nullopt,
          {},
          {}});
-  }
-  [[nodiscard]] core::Result<core::DisableHandoffAdmissionSnapshotDTO>
-  ObserveDisableHandoffAdmission(
-      const core::DisableHandoffAdmissionQueryDTO &) const override {
-    return core::Result<core::DisableHandoffAdmissionSnapshotDTO>::Err(
-        unsupported());
-  }
-
-  [[nodiscard]] core::Result<core::DisableHandoffAcceptedDTO>
-  BeginDisableHandoff(const core::DisableHandoffRequestDTO &) override {
-    return core::Result<core::DisableHandoffAcceptedDTO>::Err(unsupported());
-  }
-
-  [[nodiscard]] core::Result<core::DisableHandoffStatusDTO>
-  DisableHandoffStatus(const core::LifecycleTransactionId &,
-                       core::LifecycleTransactionGeneration) override {
-    return core::Result<core::DisableHandoffStatusDTO>::Err(unsupported());
-  }
-
-  [[nodiscard]] core::Result<core::DisableHandoffAttemptReconciliationDTO>
-  ReconcileDisableHandoffAttempt(
-      const core::DisableHandoffRequestDTO &) override {
-    return core::Result<core::DisableHandoffAttemptReconciliationDTO>::Err(
-        unsupported());
-  }
-
-  [[nodiscard]] core::Result<core::DisableFenceReleasedDTO>
-  ReleaseDisableFence(const core::DisableFenceReleaseRequestDTO &) override {
-    return core::Result<core::DisableFenceReleasedDTO>::Err(unsupported());
-  }
-
-  [[nodiscard]]
-  core::Result<core::DisableFenceReleaseAttemptReconciliationDTO>
-  ReconcileDisableFenceReleaseAttempt(
-      const core::DisableFenceReleaseRequestDTO &) override {
-    return core::Result<core::DisableFenceReleaseAttemptReconciliationDTO>::Err(
-        unsupported());
   }
 
   [[nodiscard]]
@@ -253,7 +215,7 @@ configuration(const std::filesystem::path &root, const core::CellId &cell_id,
   return {state_root,
           run_root,
           cell_id,
-          {core::RequestOwnerEpoch("cclc-owner." + owner_suffix), 128U, 1U, 1U,
+          {core::RequestOwnerEpoch("cclc-owner." + owner_suffix), 128U, 1U,
            1'000'000LL, 30'000'000'000LL}};
 }
 
@@ -321,7 +283,7 @@ TEST(CCLCRuntimeComposition,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   EXPECT_FALSE(composition.value()->coordinator().accepting_new_requests());
@@ -386,7 +348,7 @@ TEST(CCLCRuntimeComposition,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
   ASSERT_TRUE(reused.ok());
   ASSERT_TRUE(reused.value()->Start().ok());
@@ -398,7 +360,7 @@ TEST(CCLCRuntimeComposition,
                     "2"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
-      kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
+      kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
   ASSERT_TRUE(replacement.ok()) << replacement.error().message;
   EXPECT_FALSE(replacement.value()->coordinator().accepting_new_requests());
@@ -427,7 +389,7 @@ TEST(CCLCRuntimeComposition, RejectsMissingTrustedRootsWithoutCreatingThem) {
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, publication_owner, clock, scheduler);
   EXPECT_FALSE(composition.ok());
   EXPECT_FALSE(std::filesystem::exists(missing_run_root));
 }
@@ -453,7 +415,7 @@ TEST(CCLCRuntimeComposition, RejectsAliasedStateAndRunCapabilities) {
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, publication_owner, clock, scheduler);
   EXPECT_FALSE(composition.ok());
 }
 
@@ -479,7 +441,7 @@ TEST(CCLCRuntimeComposition, RejectsNestedStateAndRunCapabilities) {
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, publication_owner, clock, scheduler);
   EXPECT_FALSE(composition.ok());
 }
 
@@ -519,7 +481,7 @@ TEST(CCLCRuntimeComposition,
         std::move(config), retained.bundle, publication_reader, receipt,
         artifact_source, catalogs.value(), {},
         controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
-        kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+        kernel_ports, publication_owner, clock, scheduler);
     EXPECT_FALSE(composition.ok());
     EXPECT_TRUE(std::filesystem::is_empty(state_root));
     EXPECT_TRUE(std::filesystem::is_empty(real_run_root));

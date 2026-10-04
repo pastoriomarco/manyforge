@@ -19,9 +19,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Final
 
-import yaml
 from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
     canonical_json_bytes,
+    load_strict_json_yaml_bytes,
     raw_sha256_digest,
 )
 from manyforge_behavior.model_source_capture import (
@@ -456,13 +457,12 @@ def read_json(path: Path, label: str) -> dict[str, Any]:
 def read_yaml(path: Path, label: str) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise GenerationError(f"{label} is not one plain file: {path}")
+    # JSON-model scalars only: YAML 1.1 typing reads JSON numbers such as
+    # -4e-05 as strings and would copy them into generated Programs.
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        return load_strict_json_yaml_bytes(path.read_bytes(), source=str(path))
+    except (OSError, StrictArtifactError) as error:
         raise GenerationError(f"cannot read {label}: {error}") from error
-    if type(value) is not dict:
-        raise GenerationError(f"{label} root must be an object")
-    return value
 
 
 def replace_file(path: Path, payload: bytes) -> None:

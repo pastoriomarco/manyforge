@@ -39,8 +39,8 @@ struct ComponentLifecycleGenerationWatermarkDTO final {
 ///
 /// A missing watermark and state means the component has never entered the
 /// CCLC journal.  A present watermark with no state means a generation was
-/// durably minted while no coherent current state was available (for example,
-/// a containment-only Full-Stop Disable).  A present state belongs exactly to
+/// durably minted while no coherent current state was available.  A present
+/// state belongs exactly to
 /// the returned watermark; older state is never exposed as current.
 struct ComponentLifecycleCurrentFactReadbackDTO final {
   ControllableComponentId controllable_component_id;
@@ -116,8 +116,6 @@ struct CCLCCurrentFactsReadbackDTO final {
 
 enum class CCLCEffectKindDTO : std::uint8_t {
   kBrandLifecyclePrimitive = 0,
-  kKernelDisableHandoff,
-  kKernelDisableFenceRelease,
 };
 
 enum class CCLCEffectAttemptStateDTO : std::uint8_t {
@@ -135,10 +133,6 @@ struct CCLCEffectAttemptDTO final {
   CCLCEffectAttemptStateDTO state;
   std::optional<BrandLifecyclePrimitiveIntentDTO> lifecycle_primitive_intent;
   std::optional<BrandLifecyclePrimitiveResultDTO> lifecycle_primitive_result;
-  std::optional<DisableHandoffRequestDTO> disable_handoff_request;
-  std::optional<DisableHandoffEffectResultDTO> disable_handoff_result;
-  std::optional<DisableFenceReleaseRequestDTO> disable_fence_release_request;
-  std::optional<DisableFenceReleaseEffectResultDTO> disable_fence_release_result;
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
@@ -348,20 +342,6 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   [[nodiscard]] virtual Result<std::uint64_t> RecordEffectCompleted(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
       const ComponentLifecycleStatusDTO& successor_status) = 0;
-  [[nodiscard]] virtual Result<std::uint64_t>
-  RecordEffectCompletedAndLifecycleClaimRelease(
-      const RequestOwnerEpoch& active_owner_epoch,
-      const CCLCEffectAttemptDTO& completed_attempt,
-      const ComponentLifecycleStatusDTO& successor_status,
-      const CellAdmissionClaimReleaseDTO& release) {
-    (void)active_owner_epoch;
-    (void)completed_attempt;
-    (void)successor_status;
-    (void)release;
-    return Result<std::uint64_t>::Err(
-        {"component_lifecycle_claim_journal_unavailable",
-         "CCLC journal has no atomic terminal claim release", {}});
-  }
 
   /// Replaces one transaction status only when its sequence and owner-clock
   /// timestamps advance monotonically. The transaction identity, accepted

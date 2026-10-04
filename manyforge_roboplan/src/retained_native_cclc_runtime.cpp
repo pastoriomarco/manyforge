@@ -1082,7 +1082,6 @@ CreateRetainedNativeCCLCRuntime(
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner
@@ -1122,7 +1121,7 @@ CreateRetainedNativeCCLCRuntime(
       std::move(value.lifecycle_provider_occurrences),
       std::move(value.controller_sources), std::move(value.brand_ports),
       std::move(value.controller_ports), std::move(value.source_projections),
-      kernel_disable_handoff_port, kernel_cell_admission_port,
+      kernel_cell_admission_port,
       kernel_route_fence_port, kernel_publication_owner, clock, scheduler,
       std::move(kernel_current_configuration_source),
       component_command_readiness_port);
@@ -1139,7 +1138,6 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner &route_owner,
@@ -1220,7 +1218,7 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
       std::move(config), std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,
       lifecycle_catalog_source, std::move(brand_ports),
-      std::move(physical_bindings), kernel_disable_handoff_port,
+      std::move(physical_bindings),
       kernel_cell_admission_port, kernel_route_fence_port, route_owner, clock,
       scheduler, std::move(current_configuration), {}, &readiness_owner);
   if (!composition.ok())
@@ -1268,7 +1266,6 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
     RetainedNativeRuntime &runtime,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
@@ -1334,7 +1331,7 @@ CreateRetainedNativeCCLCRuntime(
       std::move(config), std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,
       lifecycle_catalog_source, std::move(brand_ports),
-      std::move(physical_bindings), kernel_disable_handoff_port,
+      std::move(physical_bindings),
       kernel_cell_admission_port, kernel_route_fence_port, runtime,
       *runtime.clock, *runtime.scheduler, std::move(current_configuration),
       std::move(externally_managed_controller_snapshot_source), &runtime);

@@ -58,6 +58,7 @@ import {
   programChangeKindMutation,
   programDeleteMutation,
   programDetachedInsertionMutation,
+  programPaletteDropPosition,
   programInsertionMutation,
   programMoveMutation,
   programSubtreeCopy,
@@ -770,7 +771,10 @@ export function ProgramTreeCanvas({
     const catalogId = readProgramPaletteDrag((format) => event.dataTransfer.getData(format));
     const flow = flowInstance.current;
     if (!catalogId || !flow) return;
-    const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    const point = programPaletteDropPosition(
+      flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }),
+      NODE_SIZE,
+    );
     const entry = catalogEntries.find((candidate) => candidate.id === catalogId);
     if (!entry) {
       showCanvasMessage(`Unknown catalog entry '${catalogId}'.`, 'error');

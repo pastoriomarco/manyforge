@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/retained_native_view_predecessor.hpp>
 #include <manyforge_roboplan/writer_preferring_shared_gate.hpp>
 
 #include <atomic>
@@ -577,4 +578,49 @@ TEST(WriterPreferringSharedGateTest, BlockedReaderProceedsAfterTheWriter) {
   gate.unlock();
   reader.join();
   EXPECT_TRUE(read.load());
+}
+
+namespace {
+
+[[nodiscard]] ProjectionRevisionDTO PublishedProjection(
+    const std::uint64_t scene_revision_id) {
+  return {
+      RetainedBundleId("bundle.active"),
+      GraphRevision("graph.active"),
+      SceneRevision{
+          SceneId("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+          scene_revision_id,
+          ContentDigest("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+      },
+  };
+}
+
+}  // namespace
+
+TEST(RetainedNativeViewPredecessor,
+     SceneRevisionAdvancedByRunAttachDetachStillFollowsPredecessor) {
+  // Published at Scene revision 5; a pick-and-place cycle's attach, detach
+  // and reset advanced the live Scene to revision 8 before Revert.
+  const auto published = PublishedProjection(5U);
+  const auto predecessor = PublishedProjection(8U);
+  const RetainedBundleId bundle("bundle.active");
+
+  EXPECT_TRUE(RetainedNativeViewFollowsPredecessor(
+      bundle, published, bundle, predecessor));
+}
+
+TEST(RetainedNativeViewPredecessor, AnotherDeploymentCrossesThePredecessor) {
+  const auto published = PublishedProjection(5U);
+  const RetainedBundleId bundle("bundle.active");
+  auto other_graph = published;
+  other_graph.graph_revision = GraphRevision("graph.other");
+  auto other_bundle = published;
+  other_bundle.retained_bundle_id = RetainedBundleId("bundle.other");
+
+  EXPECT_FALSE(RetainedNativeViewFollowsPredecessor(
+      bundle, published, bundle, other_graph));
+  EXPECT_FALSE(RetainedNativeViewFollowsPredecessor(
+      bundle, published, bundle, other_bundle));
+  EXPECT_FALSE(RetainedNativeViewFollowsPredecessor(
+      bundle, published, RetainedBundleId("bundle.other"), published));
 }

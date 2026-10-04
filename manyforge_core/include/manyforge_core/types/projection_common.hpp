@@ -64,6 +64,22 @@ struct ProjectionRevisionDTO final {
                          const ProjectionRevisionDTO&) = default;
 };
 
+/// Whether two projection revisions name the same active Deployment.
+///
+/// A planned reconfiguration's predecessor is the active Deployment (retained
+/// bundle and graph). The Scene revision in an active publication or runtime
+/// composition is the one at publication time; the Scene owner advances it
+/// afterwards (authoring transactions, run attach/detach and reset) without
+/// any Deployment change. The exact Scene predecessor is proved only by the
+/// Scene owner against its live revision when the candidate Scene is
+/// initialized, so every other predecessor check compares this identity.
+[[nodiscard]] inline bool SameActiveDeployment(
+    const ProjectionRevisionDTO& left,
+    const ProjectionRevisionDTO& right) noexcept {
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision;
+}
+
 struct ProjectionLeaseBindingDTO final {
   ProjectionRevisionDTO projection_revision;
   ProjectionLeaseId projection_lease_id{std::string{}};

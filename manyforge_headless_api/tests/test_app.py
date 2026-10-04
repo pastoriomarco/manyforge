@@ -4286,3 +4286,74 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
         "set",
     ]
     assert runner.calls[1][1]["value"] == 2
+
+
+def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot() -> None:
+    client, core, _manager = _client()
+    calls: list[dict[str, Any]] = []
+
+    def prepared(sequence: int, run: str, component: str, admitted: float) -> dict[str, Any]:
+        return {
+            "sequence": sequence,
+            "event": {
+                "event_type": "operation_prepared",
+                "occurred_at_wall": f"2026-10-04T10:00:{sequence:02d}Z",
+                "payload": {
+                    "schema_version": "manyforge.operation_history_event.v1",
+                    "journal_payload": {
+                        "record_kind": "operation_prepared",
+                        "intent": {
+                            "transition_reason": "subordinate_motion_prepared",
+                            "prepared_motion_diagnostics": [{
+                                "participant_id": "p-1",
+                                "requested_tcp_linear_speed_mps": 0.15,
+                                "deployment_maximum_tcp_linear_speed_mps": 0.1,
+                                "admitted_tcp_linear_speed_mps": admitted,
+                            }],
+                        },
+                        "operation_state": {
+                            "operation_id": f"op-{sequence}",
+                            "program_run_id": run,
+                            "participants": [{
+                                "participant_id": "p-1",
+                                "controllable_component_id": component,
+                                "command_target_id": "arm",
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+    def history_export(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": "manyforge.historian_export_page.v1",
+            "events": [
+                prepared(9, "run-1", "lite6_robot", 0.1),
+                prepared(8, "run-1", "lite6_robot", 0.05),  # older: not shown
+                prepared(7, "run-other", "ur5e_robot", 0.2),  # another run
+            ],
+            "truncated": False,
+            "next_before_sequence": None,
+        }
+
+    core.history_export = history_export  # type: ignore[attr-defined]
+    with client:
+        response = client.get("/api/execution/program-runs/run-1/admitted-speeds")
+    assert response.status_code == 200, response.text
+    assert calls[0]["event_types"] == ["operation_prepared"]
+    assert calls[0]["correlations"] == {"program_run_id": "run-1"}
+    assert response.json() == {
+        "schema_version": "manyforge.program_run_admitted_speeds.v1",
+        "program_run_id": "run-1",
+        "targets": [{
+            "controllable_component_id": "lite6_robot",
+            "command_target_id": "arm",
+            "operation_id": "op-9",
+            "occurred_at_wall": "2026-10-04T10:00:09Z",
+            "requested_tcp_linear_speed_mps": 0.15,
+            "deployment_maximum_tcp_linear_speed_mps": 0.1,
+            "admitted_tcp_linear_speed_mps": 0.1,
+        }],
+    }

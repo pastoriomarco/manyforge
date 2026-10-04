@@ -1758,6 +1758,20 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             saved_empty = saved_document.get("forest") == [] and not saved_document.get("scene")
             saved_program = None if saved_empty else Program.from_dict(
                 saved_document, _active_catalog(state), path="<composer-program-revert-saved>")
+            # Revert exists only while Saved differs from Applied: refused
+            # before preparation or admission, so no effect is possible. An
+            # Applied Program that cannot be read now never proves a no-op.
+            applied_context, _unavailable = _applied_context(state)
+            if (
+                saved_program is not None
+                and applied_context is not None
+                and applied_context.program_revision == saved_program.program_revision
+            ):
+                raise DraftSessionError(
+                    "program_revert_nothing_to_revert",
+                    "Nothing to revert: the Saved Program already matches Applied",
+                    status_code=409,
+                )
             intent, prepared = prepare_program_activation(
                 body, saved_program.to_dict() if saved_program is not None else None
             )

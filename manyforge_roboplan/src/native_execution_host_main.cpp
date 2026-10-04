@@ -69,6 +69,7 @@
 #include <manyforge_roboplan/retained_native_component_owner.hpp>
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
+#include <manyforge_roboplan/retained_native_view_predecessor.hpp>
 #include <manyforge_roboplan/retained_native_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -10630,7 +10631,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
       config.execution_state_root,
       config.execution_run_root,
       core::CellId(config.cell_id),
-      {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U, 2U,
+      {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U,
        10'000'000LL, 30'000'000'000LL}};
   auto cclc = [&]() -> core::Result<
       std::unique_ptr<deployment::CCLCRuntimeComposition>> {
@@ -10657,7 +10658,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
           lifecycle_product.value()->catalog_source(),
           lifecycle_product.value()->brand_ports(),
           CellControlBindingRepresentatives(composition), *composition.runtime,
-          fence_owner, *composition.active_addressed_kernel(), fence_owner);
+          *composition.active_addressed_kernel(), fence_owner);
     }
     if (composition.cell_runtime != nullptr) {
       if (composition.cclc_cell_route_publication_owner == nullptr) {
@@ -10677,7 +10678,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
             std::move(active_publication.value()), *artifact_source,
             lifecycle_product.value()->catalog_source(),
             lifecycle_product.value()->brand_ports(),
-            CellControlBindingRepresentatives(composition), fence_owner,
+            CellControlBindingRepresentatives(composition),
             *composition.active_addressed_kernel(), fence_owner,
             *composition.cclc_cell_route_publication_owner,
             *composition.cclc_cell_command_readiness_port,
@@ -10723,7 +10724,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
           std::move(active_publication.value()), *artifact_source,
           lifecycle_product.value()->catalog_source(),
           lifecycle_product.value()->brand_ports(),
-          CellControlBindingRepresentatives(composition), fence_owner,
+          CellControlBindingRepresentatives(composition),
           *composition.active_addressed_kernel(), fence_owner,
           *composition.cclc_cell_route_publication_owner, *owner_clock,
           *owner_scheduler, std::move(current_configuration_source), {},
@@ -10748,7 +10749,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
         lifecycle_product.value()->catalog_source(),
         lifecycle_product.value()->brand_ports(),
         CellControlBindingRepresentatives(composition), *composition.runtime,
-        fence_owner, *composition.active_addressed_kernel(), fence_owner
+        *composition.active_addressed_kernel(), fence_owner
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       ,
       composition.ros2_control_runtime_handle->lifecycle_snapshot_source()
@@ -11667,7 +11668,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   stop_recovery_kernel.store(stable_kernel_owner, std::memory_order_release);
   admission_gate.BindResourceTable(
       stable_kernel_owner->resource_admission_table());
-  fence_owner.BindDisableHandoffKernel(*stable_kernel_owner);
   component_manager::detail::ManagerLivenessCommandAdmission
       manager_liveness_admission;
   component_manager::detail::ChildOwnedManagerLivenessReceiver
@@ -11768,13 +11768,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       return active_managed_composition->active_addressed_kernel();
     }
     return nullptr;
-  };
-
-  const auto bind_disable_handoff_owner = [&] {
-    auto *const owner = stable_addressed_kernel();
-    if (owner != nullptr) {
-      fence_owner.BindDisableHandoffKernel(*owner);
-    }
   };
 
   const auto await_manager_loss_containment = [&] {
@@ -12007,7 +12000,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   active_managed_composition->runtime.get(),
                   std::memory_order_release);
               installed = active_managed_composition.get();
-              fence_owner.BindDisableHandoffKernel(*stable_kernel_owner);
             }
             std::cerr << "native composition phase: stable Kernel bound\n";
             // Initial CCLC recovery is part of composing a usable runtime.  It
@@ -12631,15 +12623,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             Require(IsExactRetainedNativeViewApply(request) &&
                         active_managed_composition != nullptr &&
                         active_managed_composition->bundle != nullptr &&
-                        active_managed_composition->bundle->retained_bundle_id() ==
-                            request.predecessor_projection_revision
-                                .retained_bundle_id &&
-                        active_managed_composition->projection_revision ==
-                            request.predecessor_projection_revision &&
                         retained_view_input->bundle != nullptr &&
-                        retained_view_input->bundle->retained_bundle_id() ==
+                        RetainedNativeViewFollowsPredecessor(
                             active_managed_composition->bundle
                                 ->retained_bundle_id(),
+                            active_managed_composition->projection_revision,
+                            retained_view_input->bundle->retained_bundle_id(),
+                            request.predecessor_projection_revision),
                     "retained native view crossed its verified predecessor");
             auto &candidate = *active_managed_composition;
             Require(candidate.component_runtime_identity() != nullptr &&
@@ -13104,7 +13094,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         failed_prepared_composition = std::move(prepared);
       throw;
     }
-    bind_disable_handoff_owner();
     require_installed_candidate_configuration();
     if (request.phase == component_manager::
                              ManagerSelectedRuntimeCompositionPhase::kPrepare) {
@@ -17341,8 +17330,6 @@ public:
                   .count();
             }},
         admission_gate_);
-    fence_owner_->BindDisableHandoffKernel(
-        *composition_->active_addressed_kernel());
 #if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     const auto fixture_readiness =
         composition_->active_addressed_kernel()

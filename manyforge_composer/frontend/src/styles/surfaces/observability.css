@@ -864,6 +864,73 @@
   overflow-x: auto;
 }
 
+.program-run-setup-robots {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.program-run-setup-robots h5 {
+  margin: 0;
+  color: var(--mf-text-neutral-86);
+  font-weight: 600;
+}
+
+.program-run-setup-robot {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--mf-border-neutral-19);
+  border-radius: var(--mf-radius-md);
+}
+
+.program-run-setup-robot h6 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0 0 0.45rem;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-096);
+  font-weight: 600;
+}
+
+.program-run-setup-component {
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-076);
+  font-weight: 400;
+}
+
+.program-run-setup-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+}
+
+.program-run-setup-stat {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 7rem;
+}
+
+.program-run-setup-stat-label {
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-072);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.program-run-setup-stat-value {
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-096);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.program-run-setup-stat-note {
+  max-width: 16rem;
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-072);
+  overflow-wrap: anywhere;
+}
+
 .program-run-setup-table {
   width: 100%;
   border-collapse: collapse;

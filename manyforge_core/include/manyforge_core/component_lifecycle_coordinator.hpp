@@ -8,7 +8,6 @@
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
-#include <manyforge_core/ports/icclc_kernel_disable_handoff_port.hpp>
 #include <manyforge_core/ports/icclc_kernel_route_configuration_fence_port.hpp>
 #include <manyforge_core/ports/icclc_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/ports/icclc_route_configuration_publication_port.hpp>
@@ -28,7 +27,6 @@ struct ComponentLifecycleCoordinatorConfig final {
   RequestOwnerEpoch request_owner_epoch;
   std::size_t request_membership_capacity;
   std::size_t lifecycle_worker_count;
-  std::size_t kernel_worker_count;
   std::int64_t observation_poll_period_ns;
   std::int64_t route_selection_timeout_duration_ns{30'000'000'000LL};
 
@@ -60,9 +58,8 @@ class ComponentLifecycleCoordinator final {
       const ICCLCCurrentComponentSnapshotSource& current_snapshot_source,
       const ICCLCLifecyclePlanCatalogSource& lifecycle_plan_catalog_source,
       const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
-      ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
+      IKernelCellAdmissionPort& kernel_cell_admission_port, IClock& clock,
       IScheduler& scheduler,
-      IKernelCellAdmissionPort* kernel_cell_admission_port = nullptr,
       std::optional<ComponentLifecycleCoordinatorRouteServices> route_services = std::nullopt,
       ICCLCComponentCommandReadinessPort* component_command_readiness_port = nullptr);
   ~ComponentLifecycleCoordinator();

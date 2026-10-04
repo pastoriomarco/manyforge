@@ -27,30 +27,20 @@ export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
 };
 
 /**
- * Draft geometry is a deliberate preview only when a current owner projection
- * explicitly reports an empty scene. Startup/transport unknown is not an empty
- * owner scene and must never flash the Draft presentation.
+ * The viewer presents the Draft Scene while it is editable and differs from
+ * Applied; with no difference the runtime Scene is shown (and edited through
+ * the identical Draft copy). An explicit choice is a pure view override. An
+ * unknown owner scene never flashes the Draft presentation.
  */
-export function programDraftPreviewActive(
-  ownerSceneKnown: boolean,
-  ownerObjectCount: number,
-  draftObjectCount: number,
-): boolean {
-  return ownerSceneKnown && ownerObjectCount === 0 && draftObjectCount > 0;
-}
-
 export function sceneSourceIsDraft(
   choice: 'auto' | 'draft' | 'applied',
   ownerSceneKnown: boolean,
   draftAvailable: boolean,
+  draftEditable: boolean,
   draftDiffersFromApplied: boolean,
-  emptyOwnerPreview: boolean,
 ): boolean {
-  // An explicit Draft choice applies only while Draft and Applied differ,
-  // which is also the only time its toggle is shown.
-  return ownerSceneKnown && draftAvailable
-    && ((choice === 'draft' && draftDiffersFromApplied) || (choice === 'auto'
-      && (draftDiffersFromApplied || emptyOwnerPreview)));
+  return ownerSceneKnown && draftAvailable && draftEditable
+    && (choice === 'draft' || (choice === 'auto' && draftDiffersFromApplied));
 }
 
 function orderedVisibility(

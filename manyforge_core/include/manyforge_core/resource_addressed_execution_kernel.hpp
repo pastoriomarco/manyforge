@@ -149,30 +149,6 @@ struct ResolvedManualControlAvailability final {
   bool cleanup_required{};
 };
 
-/// One coherent, read-only projection of the current addressed execution
-/// truth needed by the durable Kernel Disable-handoff owner.  Active
-/// publication and configuration-fence generation remain owned by that
-/// durable owner and are deliberately not duplicated here.
-struct KernelDisableHandoffRuntimeSnapshotDTO final {
-  ControllableComponentId controllable_component_id;
-  DisableHandoffScopeRequestKindDTO request_kind{
-      DisableHandoffScopeRequestKindDTO::kFullStopRequired};
-  RequestOwnerEpoch request_owner_epoch;
-  DisableHandoffScopeResolutionDTO scope_resolution{
-      DisableHandoffScopeResolutionDTO::kPromotedToFull};
-  ConfigurationFenceScopeDTO current_scope;
-  RetainedBundleId retained_bundle_id;
-  GraphRevision graph_revision;
-  std::uint64_t operation_resource_generation{};
-  std::vector<CurrentDomainActiveControlConfigurationDTO> current_active_control_configurations;
-  StopGeneration current_cell_stop_generation{0U};
-  std::vector<OperationId> affected_queued_operations;
-  std::uint64_t affected_active_operation_count{};
-
-  friend bool operator==(const KernelDisableHandoffRuntimeSnapshotDTO&,
-                         const KernelDisableHandoffRuntimeSnapshotDTO&) = default;
-};
-
 /// Compact owner projection for the existing full-cell Stop command. Detailed
 /// evidence remains in the Stop certificate/history APIs; this status value
 /// carries only the exact action fence and the latest outcome summary needed
@@ -420,19 +396,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const MalformedStopIngressDTO& ingress);
 
   [[nodiscard]] CellStopActionProjectionDTO cell_stop_action_projection() const;
-
-  /// Atomically derives the current exact component scope or conservative
-  /// Full-Stop promotion from the registered physical truth and slot table.
-  /// This performs no I/O, fence acquisition, Stop, reservation, or replay
-  /// mutation.
-  [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO>
-  capture_disable_handoff_runtime_snapshot(const DisableHandoffAdmissionQueryDTO& query) const;
-
-  /// Re-resolve one already persisted Disable request from its immutable
-  /// semantic expectations.  Unlike the observation overload, this does not
-  /// reconstruct or self-attest the earlier component-snapshot digest.
-  [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO> revalidate_disable_handoff_request(
-      const DisableHandoffRequestDTO& request) const;
 
   [[nodiscard]] Result<StopStatusDTO> get_stop_status(const StopId& stop_id) const;
   [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
@@ -683,7 +646,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct StopTerminalRecord;
   struct StopProjectionJob;
   struct PartialDispatchStopScope;
-  struct DisableRuntimeExpectation;
   struct EngineEventIngress;
   class StopProjectionWorker;
   struct EngineSubscription;
@@ -859,8 +821,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const MalformedStopIngressDTO* malformed_ingress = nullptr);
   void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
   [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
-  [[nodiscard]] Result<KernelDisableHandoffRuntimeSnapshotDTO>
-  capture_disable_handoff_runtime_snapshot_impl(const DisableRuntimeExpectation& expectation) const;
 
   RuntimeParticipantRegistry registry_;
   std::shared_ptr<std::recursive_mutex> admission_mutex_;

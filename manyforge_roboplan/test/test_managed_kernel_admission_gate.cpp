@@ -11,12 +11,7 @@
 #include <iterator>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
-#include <manyforge_core/disable_handoff_record_codec_internal.hpp>
-#include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/route_fence_record_codec_internal.hpp>
-#include <manyforge_core/sqlite_operation_journal.hpp>
-#include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
@@ -161,172 +156,6 @@ struct OwnerFixture final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::int64_t now_ns{1000};
 };
-
-class IdleParticipantEngine final
-    : public core::IResolvedParticipantExecutionEngine {
-public:
-  core::Result<std::uint64_t>
-  execute(const core::ExecuteRequestDTO &) override {
-    return core::Result<std::uint64_t>::Err(Unavailable());
-  }
-  core::PauseResultDTO pause() override { return {false, Unavailable()}; }
-  core::ResumeResultDTO resume(std::optional<std::uint64_t>) override {
-    return {false, Unavailable()};
-  }
-  core::ResetResultDTO reset(std::optional<std::uint64_t>) override {
-    return {false, Unavailable()};
-  }
-  core::ResetResultDTO
-  reset_after_certified_containment(std::uint64_t,
-                                    std::optional<std::uint64_t>) override {
-    return {false, Unavailable()};
-  }
-  core::AcknowledgeCompletedResultDTO
-  acknowledge_completed(std::uint64_t, std::optional<std::uint64_t>) override {
-    return {false, Unavailable()};
-  }
-  core::Result<core::ResolvedRuntimeScaleAcceptedDTO>
-  set_runtime_scale(const core::ResolvedRuntimeScaleCommandDTO &) override {
-    return core::Result<core::ResolvedRuntimeScaleAcceptedDTO>::Err(
-        Unavailable());
-  }
-  core::Result<core::ResolvedRuntimeScaleStatusDTO>
-  runtime_scale_status(const core::OperationId &,
-                       const core::ControlBindingId &) const override {
-    return core::Result<core::ResolvedRuntimeScaleStatusDTO>::Err(
-        Unavailable());
-  }
-  core::GripperCommandResultDTO
-  command_gripper(const core::GripperCommandRequestDTO &) override {
-    return {false, 0U, 0U, Unavailable()};
-  }
-  core::Result<void> validate_gripper_command(
-      const core::GripperCommandRequestDTO &) const override {
-    return core::Result<void>::Err(Unavailable());
-  }
-  core::GripperCommandStatusDTO
-  get_gripper_status(const std::string &) const override {
-    return {};
-  }
-  core::Result<std::uint64_t> stop_gripper(const std::string &, std::uint64_t,
-                                           std::uint64_t) override {
-    return core::Result<std::uint64_t>::Err(Unavailable());
-  }
-  core::Result<void> reset_gripper(const std::string &, std::uint64_t,
-                                   std::uint64_t) override {
-    return core::Result<void>::Err(Unavailable());
-  }
-  core::ExecutionStatus get_status() const override { return {}; }
-  core::SubscriptionHandle
-  subscribe_events(core::EventCallback callback) override {
-    callback_ = std::move(callback);
-    return core::SubscriptionHandle{1U};
-  }
-  void unsubscribe_events(core::SubscriptionHandle) override { callback_ = {}; }
-
-private:
-  [[nodiscard]] static core::ErrorDTO Unavailable() {
-    return {"idle_test_engine_unavailable",
-            "idle test engine must not receive an effect",
-            {}};
-  }
-
-  core::EventCallback callback_;
-};
-
-[[nodiscard]] core::RuntimeParticipantBinding
-FixtureBinding(const OwnerFixture &fixture) {
-  const std::vector<std::string> joints{"joint_1", "joint_2"};
-  std::vector<core::RuntimeResourceBindingDTO> resources;
-  resources.reserve(joints.size());
-  for (std::size_t index = 0; index < joints.size(); ++index) {
-    resources.push_back(
-        {core::ResourceRoleId("arm_joints"),
-         core::ResourceId("resource.joint." + std::to_string(index + 1U)),
-         joints[index], joints[index], core::CoordinateKind::kAngular});
-  }
-
-  core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.disable.test"),
-      core::ProgramRevision("program-revision"),
-      core::ProgramBindingId("program-binding"),
-      fixture.bundle->retained_bundle_id(),
-      fixture.bundle->value().cell_graph.graph_revision,
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId("arm"),
-      core::ControllableComponentId("robot.1"),
-      core::ComponentTypeId("aggregate.robot"),
-      core::ComponentTypeRevision("aggregate-revision"),
-      core::CommandTargetId("arm.target"),
-      core::CapabilityId("execution.trajectory.execute"),
-      core::CapabilityDefinitionRevision("capability-revision"),
-      std::nullopt,
-      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
-                                        core::ModelInstanceId("robot.model"),
-                                        core::ModelRevision("model-revision")}},
-      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
-                                         core::ModelInstanceId("robot.model"),
-                                         "arm", joints}},
-      {core::ProgramFrameRoleBindingDTO{
-           core::FrameRoleId("base"), core::ModelInstanceId("robot.model"),
-           core::ModelRevision("model-revision"), "base"},
-       core::ProgramFrameRoleBindingDTO{
-           core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
-           core::ModelRevision("model-revision"), "tool0"}},
-      std::move(resources),
-      {},
-      core::RuntimeControlPathDTO{
-          core::ControlDomainId("domain.arm"),
-          core::ControlDomainRevision("domain-revision"),
-          core::ControlBindingId("binding.arm"),
-          core::ControlBindingRevision("binding-revision"),
-          core::ControlInterfaceContractId("trajectory.position"),
-          core::ControlInterfaceRevision("interface-revision"),
-          core::ControllerTopologyId("topology.native"),
-          core::TopologyRevision("topology-revision"),
-          core::ControlRouteId("route.native"),
-          core::ActivationSetId("activation.native"),
-          core::ActiveControlConfigurationId("active.native"),
-          core::ActiveControlConfigurationGeneration(1U),
-          core::ProviderInstanceId("provider.native"),
-          core::ProviderManifestId("provider-manifest.native"),
-          core::ProviderManifestRevision("provider-manifest-revision"),
-          core::RuntimeUnitId("runtime.native"),
-          core::RuntimeEpoch("runtime-epoch.1"),
-          core::StateAuthorityId("state.native"),
-          core::StateAuthorityClass::kPredicted,
-          core::StopEvidencePolicyId("stop.native"),
-          core::StopEvidencePolicyRevision("stop-revision"),
-          core::ContainmentGranularity::kResource,
-          core::RuntimeScaleRouteQualificationDTO{
-              core::ControlRouteId("route.native"),
-              core::ScalingDomainId("scale.native"),
-              core::EndpointRoleId("runtime_scale_command"),
-              core::EndpointRoleId("runtime_scale_state"), std::nullopt,
-              core::RuntimeScaleAcknowledgementKind::kAppliedState, 4.0,
-              100'000'000}},
-      std::nullopt,
-      {core::RuntimeCapabilityProviderPathDTO{
-          core::CapabilityId("planning.motion.joint_goal"),
-          core::CapabilityDefinitionRevision("sha256:"
-                                             "0f6cb2fda7e1d05f20a5867203b84c0e0"
-                                             "427440f4b11657941a907c2e2a23dce"),
-          core::CapabilityProviderBindingId("planner-binding"),
-          core::CapabilityProviderBindingRevision("planner-binding-revision"),
-          core::ProviderInstanceId("planner-provider"),
-          core::ProviderManifestId("planner-provider-manifest"),
-          core::ProviderManifestRevision("planner-provider-revision"),
-          core::RuntimeUnitId("runtime.native"),
-          core::RuntimeEpoch("runtime-epoch.1")}},
-      {core::RuntimeUnitEpochBindingDTO{
-          core::RuntimeUnitId("runtime.native"),
-          core::RuntimeEpoch("runtime-epoch.1")}}};
-  auto verified = core::verify_runtime_participant_binding(std::move(value));
-  if (!verified.ok()) {
-    throw std::runtime_error(verified.error().message);
-  }
-  return std::move(verified.value());
-}
 
 [[nodiscard]] core::ConfigurationFenceScopeDTO AffectedScope() {
   return core::ConfigurationFenceScopeDTO{
@@ -729,17 +558,6 @@ TEST(ManagedKernelRouteFenceRecordCodec,
                std::invalid_argument);
 }
 
-TEST(
-    ManagedKernelDisableFenceRecordCodec,
-    ActualResolutionAndCompleteScopeRoundTripWithoutInventingAnAdmissionQuery) {
-  const core::detail::DisableHandoffFenceScopeRecordDTO record{
-      core::DisableHandoffScopeResolutionDTO::kPromotedToFull, AffectedScope()};
-  const auto bytes = core::detail::EncodeDisableHandoffFenceScopeRecord(record);
-  EXPECT_EQ(core::detail::DecodeDisableHandoffFenceScopeRecord(bytes), record);
-  EXPECT_THROW(core::detail::DecodeDisableHandoffRequestRecord(bytes),
-               std::invalid_argument);
-}
-
 TEST(ManagedKernelRouteFenceOwner,
      DurableAcquireReconcileRestartReleaseAndReplayShareOneLedger) {
   OwnerFixture fixture;
@@ -888,97 +706,6 @@ TEST(ManagedKernelRouteFenceOwner,
   }
 }
 
-TEST(ManagedKernelDisableFenceOwner,
-     OrdinaryDisableWithoutAnExactComponentScopeIsRefusedBeforeAnyFence) {
-  OwnerFixture fixture;
-  ManagedKernelAdmissionGate gate;
-  const auto binding = FixtureBinding(fixture);
-  IdleParticipantEngine engine;
-  const auto config = fixture.Config("disable");
-  const auto owner_epoch = config.request_owner_epoch;
-  core::FakeClock clock;
-  clock.set(1000);
-  core::ManualScheduler scheduler;
-  core::SqliteOperationJournal journal(
-      fixture.state_root.path() / "operation-journal.sqlite3",
-      fixture.bundle->value().cell_graph.cell_id, 32U);
-  core::RuntimeParticipantExecutionRegistration registration{
-      .binding = binding,
-      .stop_readiness = std::nullopt,
-      .retained_default_stop_limits = {},
-      .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
-      .engine = &engine,
-      .stop_execution_port = nullptr,
-      .participant_policy = std::nullopt,
-      .prepared_motion_engine = nullptr,
-      .default_operator_stop_profile = std::nullopt,
-      .default_fault_stop_profile = std::nullopt,
-      .deployment_maximum_tcp_linear_speed_mps = std::nullopt};
-  core::ResourceAddressedExecutionKernel kernel(
-      {std::move(registration)}, clock, scheduler, journal,
-      core::ResourceAddressedExecutionKernelConfig{
-          owner_epoch,
-          fixture.bundle->value().cell_graph.cell_id,
-          16U,
-          {},
-          &gate,
-          binding.value().graph_revision});
-  gate.BindResourceTable(kernel.resource_admission_table());
-  ManagedKernelApplyFenceOwner owner(config, gate);
-  owner.BindDisableHandoffKernel(kernel);
-
-  const core::DisableHandoffAdmissionQueryDTO full_query{
-      binding.value().controllable_component_id,
-      core::DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
-  const auto full = owner.ObserveDisableHandoffAdmission(full_query);
-  ASSERT_TRUE(full.ok()) << full.error().message;
-  const core::DisableHandoffComponentScopeExpectationDTO expectation{
-      core::ContentDigest("component-current-snapshot-1"),
-      full.value().active_publication_generation,
-      full.value().active_public_pointer_digest,
-      full.value().retained_bundle_id,
-      full.value().graph_revision,
-      core::ComponentLifecycleGeneration(1U),
-      full.value().current_scope,
-      full.value().current_active_control_configurations};
-  const core::DisableHandoffAdmissionQueryDTO query{
-      binding.value().controllable_component_id,
-      core::DisableHandoffScopeRequestKindDTO::kResolvedComponentScope,
-      expectation};
-  const auto observed = owner.ObserveDisableHandoffAdmission(query);
-  ASSERT_TRUE(observed.ok()) << observed.error().message;
-  // This registration has no Stop readiness, so the Kernel cannot resolve an
-  // exact component scope. Ordinary Disable never promotes to Full Stop: it is
-  // refused before any durable fence exists.
-  EXPECT_NE(observed.value().scope_resolution,
-            core::DisableHandoffScopeResolutionDTO::kExact);
-  const core::DisableHandoffRequestDTO request{
-      {core::RequestId("request.disable.internal.1"), owner_epoch, "cclc",
-       std::nullopt},
-      core::RequestId("request.disable.public.1"),
-      core::LifecycleTransactionId("lifecycle.disable.1"),
-      core::LifecycleTransactionGeneration(1U),
-      binding.value().controllable_component_id,
-      observed.value().scope_resolution,
-      observed.value().current_scope,
-      observed.value().snapshot_digest,
-      observed.value().active_publication_generation,
-      observed.value().active_public_pointer_digest,
-      observed.value().graph_revision,
-      observed.value().retained_bundle_id,
-      core::ComponentLifecycleGeneration(1U),
-      observed.value().operation_resource_generation,
-      observed.value().configuration_fence_generation,
-      observed.value().current_active_control_configurations};
-  const auto refused = owner.BeginDisableHandoff(request);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_NE(refused.error().message.find("cannot escalate to Stop"), std::string::npos);
-  const auto after = owner.ObserveDisableHandoffAdmission(query);
-  ASSERT_TRUE(after.ok()) << after.error().message;
-  EXPECT_EQ(after.value().configuration_fence_generation,
-            observed.value().configuration_fence_generation);
-}
-
 TEST(ManagedKernelAdmissionGate,
      RestoredFenceBlocksAResourceTableAttachedAfterRestart) {
   ManagedKernelAdmissionGate gate;
@@ -1046,53 +773,6 @@ TEST(ManagedKernelAdmissionGate,
                    ActiveConfigurations(), [&] { commit_called = true; }),
                std::runtime_error);
   EXPECT_FALSE(commit_called);
-}
-
-TEST(
-    ManagedKernelAdmissionGate,
-    OrdinaryDisableFenceRefusesResidentWorkAndClosesOnlyAnIdleScope) {
-  ManagedKernelAdmissionGate gate;
-  const auto scope = AffectedScope();
-  auto table = std::make_shared<core::ResourceSlotTable>(
-      scope.resources, ActiveConfigurations(), gate.shared_admission_mutex());
-  gate.BindResourceTable(table);
-  const auto owner = OperationOwner();
-  ASSERT_TRUE(gate.reserve(*table, owner, scope.resources).ok());
-
-  // Resident work: ordinary Disable is refused, never escalated to Stop, and
-  // commits nothing durable.
-  bool committed_with_work = false;
-  EXPECT_THROW(static_cast<void>(gate.AcquireDisableFenceDurably(
-                   core::ConfigurationFenceId("fence.disable.busy"), scope,
-                   [&](const auto &) { committed_with_work = true; })),
-               std::runtime_error);
-  EXPECT_FALSE(committed_with_work);
-  ASSERT_TRUE(table->release(owner, scope.resources).ok());
-
-  // Idle: the fence closes admission and reopens it only after durable release.
-  std::optional<manyforge::roboplan_backend::ManagedKernelAdmissionObservation>
-      acquired_observation;
-  const auto admitted = gate.AcquireDisableFenceDurably(
-      core::ConfigurationFenceId("fence.disable"), scope,
-      [&](const auto &observation) { acquired_observation = observation; });
-  ASSERT_TRUE(acquired_observation.has_value());
-  EXPECT_EQ(*acquired_observation, admitted);
-  EXPECT_EQ(admitted.affected_queued_operation_count, 0U);
-  EXPECT_EQ(admitted.affected_active_operation_count, 0U);
-  const auto blocked = gate.reserve(*table, owner, scope.resources);
-  ASSERT_FALSE(blocked.ok());
-  EXPECT_EQ(blocked.error().details.at("reason"), "configuration_fence_held");
-
-  bool release_committed = false;
-  gate.ReleaseDisableFenceDurably(
-      core::ConfigurationFenceId("fence.disable"), scope,
-      [&](const auto &observation) {
-        EXPECT_EQ(observation.affected_queued_operation_count, 0U);
-        EXPECT_EQ(observation.affected_active_operation_count, 0U);
-        release_committed = true;
-      });
-  EXPECT_TRUE(release_committed);
-  EXPECT_TRUE(gate.reserve(*table, owner, scope.resources).ok());
 }
 
 } // namespace

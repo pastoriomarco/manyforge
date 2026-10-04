@@ -124,7 +124,6 @@ CCLCRuntimeComposition::Create(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::ControllerLifecyclePortRegistrationDTO> controller_ports,
     std::vector<core::KinematicResourceSourceProjectionDTO> source_projections,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
@@ -157,7 +156,7 @@ CCLCRuntimeComposition::Create(
             std::move(controller_sources), std::move(brand_ports),
             std::move(controller_ports), std::move(source_projections),
             std::move(kernel_current_configuration_source),
-            kernel_disable_handoff_port, kernel_cell_admission_port,
+            kernel_cell_admission_port,
             kernel_route_fence_port, kernel_publication_owner, clock,
             scheduler, component_command_readiness_port));
     return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Ok(
@@ -220,7 +219,6 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
         std::optional<core::ActiveControlConfigurationDTO>>(
         const core::ControlDomainId &)>
         kernel_current_configuration_source,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
@@ -249,8 +247,8 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                               [&clock] { return clock.now(); }),
       coordinator_(config_.coordinator, journal_, domain_reservations_,
                    lifecycle_snapshot_source_, lifecycle_catalog_source,
-                   port_registry_, kernel_disable_handoff_port, clock,
-                   scheduler, &kernel_cell_admission_port,
+                   port_registry_, kernel_cell_admission_port, clock,
+                   scheduler,
                    core::ComponentLifecycleCoordinatorRouteServices{
                        &route_snapshot_source_, &port_registry_,
                        &kernel_route_fence_port, &route_publication_port_},

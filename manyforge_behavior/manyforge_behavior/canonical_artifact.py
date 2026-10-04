@@ -56,8 +56,18 @@ class StrictArtifactError(ValueError):
     """A serialized artifact is not a strict bounded JSON-model document."""
 
 
-class _StrictJsonLoader(yaml.BaseLoader):
-    """Reject YAML features that have no unambiguous JSON-model meaning."""
+class StrictJsonYamlLoader(yaml.BaseLoader):
+    """Reject YAML features that have no unambiguous JSON-model meaning.
+
+    Plain scalars resolve by JSON rules, never by YAML 1.1 implicit typing, so
+    a JSON number such as ``-4e-05`` is a number here (PyYAML's SafeLoader
+    reads it as a string). Callers with tighter envelopes subclass this and
+    lower the class bounds; composition still enforces them before allocation.
+    """
+
+    max_document_depth = MAX_DOCUMENT_DEPTH
+    max_document_nodes = MAX_DOCUMENT_NODES
+    max_scalar_bytes = MAX_SCALAR_BYTES
 
     def __init__(self, stream: str) -> None:
         super().__init__(stream)
@@ -67,21 +77,21 @@ class _StrictJsonLoader(yaml.BaseLoader):
     def compose_node(self, parent: yaml.Node | None, index: int | None) -> yaml.Node:
         event = self.peek_event()
         is_collection = isinstance(event, (MappingStartEvent, SequenceStartEvent))
-        if is_collection and self._collection_depth >= MAX_DOCUMENT_DEPTH:
+        if is_collection and self._collection_depth >= self.max_document_depth:
             event = self.peek_event()
             raise ConstructorError(
                 None,
                 None,
-                f"collection nesting exceeds {MAX_DOCUMENT_DEPTH}",
+                f"collection nesting exceeds {self.max_document_depth}",
                 event.start_mark,
             )
         self._composed_nodes += 1
-        if self._composed_nodes > MAX_DOCUMENT_NODES:
+        if self._composed_nodes > self.max_document_nodes:
             event = self.peek_event()
             raise ConstructorError(
                 None,
                 None,
-                f"document contains more than {MAX_DOCUMENT_NODES} nodes",
+                f"document contains more than {self.max_document_nodes} nodes",
                 event.start_mark,
             )
         if isinstance(event, AliasEvent):
@@ -181,11 +191,11 @@ class _StrictJsonLoader(yaml.BaseLoader):
                 "scalar is not valid Unicode",
                 node.start_mark,
             ) from exc
-        if len(encoded) > MAX_SCALAR_BYTES:
+        if len(encoded) > self.max_scalar_bytes:
             raise ConstructorError(
                 None,
                 None,
-                f"scalar exceeds {MAX_SCALAR_BYTES} UTF-8 bytes",
+                f"scalar exceeds {self.max_scalar_bytes} UTF-8 bytes",
                 node.start_mark,
             )
         if node.style is not None:
@@ -411,7 +421,12 @@ def _load_exact_json_mapping(text: str, label: str) -> dict[str, Any] | None:
     return value
 
 
-def load_strict_json_yaml_bytes(raw: bytes, *, source: str) -> dict[str, Any]:
+def load_strict_json_yaml_bytes(
+    raw: bytes,
+    *,
+    source: str,
+    loader: type[StrictJsonYamlLoader] = StrictJsonYamlLoader,
+) -> dict[str, Any]:
     """Parse one already-captured bounded UTF-8 mapping."""
 
     if len(raw) > MAX_DOCUMENT_BYTES:
@@ -428,12 +443,12 @@ def load_strict_json_yaml_bytes(raw: bytes, *, source: str) -> dict[str, Any]:
     try:
         if any(
             isinstance(token, DirectiveToken)
-            for token in yaml.scan(text, Loader=_StrictJsonLoader)
+            for token in yaml.scan(text, Loader=loader)
         ):
             raise StrictArtifactError(
                 f"{source}: YAML directives are forbidden"
             )
-        value = yaml.load(text, Loader=_StrictJsonLoader)
+        value = yaml.load(text, Loader=loader)
     except StrictArtifactError:
         raise
     except yaml.YAMLError as exc:

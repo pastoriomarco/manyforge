@@ -7,7 +7,7 @@ runnable fallback.
 
 Retained here:
 
-* safe YAML loading into scenario/matrix value objects;
+* strict JSON-model YAML loading into scenario/matrix value objects;
 * bounded, workspace-contained matrix expansion;
 * payload-path resolution and owner-neutral expectation matching;
 * deterministic hashes and Git revision evidence; and
@@ -44,9 +44,11 @@ import tarfile
 import tempfile
 from typing import Any, Final, NoReturn
 
-import yaml
-from yaml.constructor import ConstructorError
-from yaml.events import AliasEvent, MappingStartEvent, SequenceStartEvent
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    StrictJsonYamlLoader,
+    load_strict_json_yaml_bytes,
+)
 
 
 UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
@@ -105,130 +107,16 @@ class ScenarioAssertionError(AssertionError):
     """Historical assertion type retained for future thin clients."""
 
 
-class _BoundedScenarioLoader(yaml.SafeLoader):
-    """Safe YAML loader with pre-construction depth, node, and scalar bounds."""
+class _BoundedScenarioLoader(StrictJsonYamlLoader):
+    """Strict JSON-model YAML loader with the tighter scenario envelope.
 
-    def __init__(self, stream: str) -> None:
-        super().__init__(stream)
-        self._collection_depth = 0
-        self._composed_nodes = 0
+    Scalars resolve by JSON rules, so a JSON number such as ``-4e-05`` is a
+    number, never the string YAML 1.1 implicit typing would make of it.
+    """
 
-    def compose_node(
-        self,
-        parent: yaml.Node | None,
-        index: int | None,
-    ) -> yaml.Node:
-        event = self.peek_event()
-        is_collection = isinstance(
-            event,
-            (MappingStartEvent, SequenceStartEvent),
-        )
-        if is_collection and self._collection_depth >= MAX_DOCUMENT_DEPTH:
-            raise ConstructorError(
-                None,
-                None,
-                f"collection nesting exceeds {MAX_DOCUMENT_DEPTH}",
-                event.start_mark,
-            )
-        self._composed_nodes += 1
-        if self._composed_nodes > MAX_DOCUMENT_NODES:
-            raise ConstructorError(
-                None,
-                None,
-                f"document contains more than {MAX_DOCUMENT_NODES} nodes",
-                event.start_mark,
-            )
-        if isinstance(event, AliasEvent):
-            raise ConstructorError(
-                None,
-                None,
-                "YAML aliases are forbidden",
-                event.start_mark,
-            )
-        if getattr(event, "anchor", None) is not None:
-            raise ConstructorError(
-                None,
-                None,
-                "YAML anchors are forbidden",
-                event.start_mark,
-            )
-        if getattr(event, "tag", None) is not None:
-            raise ConstructorError(
-                None,
-                None,
-                "explicit YAML tags are forbidden",
-                event.start_mark,
-            )
-        if is_collection:
-            self._collection_depth += 1
-        try:
-            return super().compose_node(parent, index)
-        finally:
-            if is_collection:
-                self._collection_depth -= 1
-
-    def construct_mapping(
-        self,
-        node: yaml.MappingNode,
-        deep: bool = False,
-    ) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key_node, value_node in node.value:
-            if (
-                key_node.tag == "tag:yaml.org,2002:merge"
-                or (key_node.value == "<<" and key_node.style is None)
-            ):
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    "YAML merge keys are forbidden",
-                    key_node.start_mark,
-                )
-            key = self.construct_object(key_node, deep=deep)
-            if not isinstance(key, str):
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    "mapping keys must be strings",
-                    key_node.start_mark,
-                )
-            if key in result:
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    f"duplicate mapping key {key!r}",
-                    key_node.start_mark,
-                )
-            result[key] = self.construct_object(value_node, deep=deep)
-        return result
-
-    def construct_scalar(self, node: yaml.ScalarNode) -> Any:
-        value = super().construct_scalar(node)
-        if isinstance(value, str):
-            if len(value) > MAX_SCALAR_BYTES:
-                raise ConstructorError(
-                    None,
-                    None,
-                    f"scalar exceeds {MAX_SCALAR_BYTES} UTF-8 bytes",
-                    node.start_mark,
-                )
-            try:
-                encoded = value.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise ConstructorError(
-                    None,
-                    None,
-                    "scalar is not valid Unicode",
-                    node.start_mark,
-                ) from exc
-            if len(encoded) > MAX_SCALAR_BYTES:
-                raise ConstructorError(
-                    None,
-                    None,
-                    f"scalar exceeds {MAX_SCALAR_BYTES} UTF-8 bytes",
-                    node.start_mark,
-                )
-        return value
+    max_document_depth = MAX_DOCUMENT_DEPTH
+    max_document_nodes = MAX_DOCUMENT_NODES
+    max_scalar_bytes = MAX_SCALAR_BYTES
 
 
 @dataclass(slots=True)
@@ -383,17 +271,13 @@ def _bounded_yaml_mapping(path: str | Path) -> tuple[Path, dict[str, Any]]:
             f"{MAX_YAML_DOCUMENT_BYTES}-byte YAML bound"
         )
     try:
-        document = encoded.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"{artifact_path} is not UTF-8") from exc
-
-    loader = _BoundedScenarioLoader(document)
-    try:
-        raw = loader.get_single_data()
-    except yaml.YAMLError as exc:
+        raw = load_strict_json_yaml_bytes(
+            encoded,
+            source=str(artifact_path),
+            loader=_BoundedScenarioLoader,
+        )
+    except StrictArtifactError as exc:
         raise ValueError(f"{artifact_path} has invalid bounded YAML: {exc}") from exc
-    finally:
-        loader.dispose()
     mapping = _mapping_document(raw, artifact_path)
     _validate_json_model(mapping, str(artifact_path))
     return artifact_path, mapping

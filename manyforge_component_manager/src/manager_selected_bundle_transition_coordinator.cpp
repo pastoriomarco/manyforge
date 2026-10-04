@@ -33,8 +33,9 @@ namespace deployment = manyforge::deployment;
              ready.staged_ready.predecessor_publication_generation &&
          receipt.durable_public_pointer_content_digest ==
              ready.staged_ready.predecessor_public_pointer_digest &&
-         receipt.request.candidate_projection_revision ==
-             intent.expected_active_projection_revision;
+         core::SameActiveDeployment(
+             receipt.request.candidate_projection_revision,
+             intent.expected_active_projection_revision);
 }
 
 } // namespace

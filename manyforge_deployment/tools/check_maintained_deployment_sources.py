@@ -12,7 +12,10 @@ import sys
 from pathlib import Path
 from typing import Any, Final
 
-import yaml
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    load_strict_json_yaml_bytes,
+)
 
 API_VERSION: Final = "manyforge.maintained_deployment_sources.v1"
 PROGRAM_API_VERSION: Final = "manyforge.program.v2"
@@ -1497,8 +1500,10 @@ def _validate_model_semantics(
 
 def _program_roles(program_path: Path) -> tuple[set[str], dict[str, str]]:
     try:
-        value = yaml.safe_load(program_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        value = load_strict_json_yaml_bytes(
+            program_path.read_bytes(), source=str(program_path)
+        )
+    except (OSError, StrictArtifactError) as error:
         raise SourceDescriptionError(
             f"cannot read Program source {program_path}: {error}"
         ) from error

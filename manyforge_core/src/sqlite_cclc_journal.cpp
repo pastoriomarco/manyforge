@@ -129,8 +129,7 @@ CREATE TABLE cclc_effect_attempts (
   lifecycle_transaction_id TEXT NOT NULL,
   effect_sequence INTEGER NOT NULL,
   effect_kind TEXT NOT NULL CHECK (
-    effect_kind IN ('brand_lifecycle_primitive', 'kernel_disable_handoff',
-                    'kernel_disable_fence_release')),
+    effect_kind IN ('brand_lifecycle_primitive')),
   effect_identity TEXT NOT NULL UNIQUE,
   prepared_owner_epoch TEXT NOT NULL,
   prepared_status_sequence INTEGER NOT NULL,
@@ -609,9 +608,8 @@ SELECT 'rejection',membership_sequence,membership_sequence,rejection_sequence,le
 FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT NULL
 )sql";
 
-[[nodiscard]] const std::vector<SchemaDefinition>& ExpectedSchemaDefinitions(
-    std::int64_t version = kCCLCJournalSchemaVersion) {
-  const auto build = [](std::int64_t version) {
+[[nodiscard]] const std::vector<SchemaDefinition>& ExpectedSchemaDefinitions() {
+  const auto build = [] {
     sqlite3* expected = nullptr;
     const auto open_result = sqlite3_open_v2(
         ":memory:", &expected, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -626,10 +624,10 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
     }
     try {
       Exec(expected, kSchema);
-      if (version >= 7) Exec(expected, kProgramNodeSchemaUpgrade);
-      if (version >= 10) Exec(expected, kRouteRecoverySchemaUpgrade);
-      if (version >= 11) Exec(expected, kNativeApplySchemaUpgrade);
-      if (version >= 12) Exec(expected, kNativeApplyDeltaSchemaUpgrade);
+      Exec(expected, kProgramNodeSchemaUpgrade);
+      Exec(expected, kRouteRecoverySchemaUpgrade);
+      Exec(expected, kNativeApplySchemaUpgrade);
+      Exec(expected, kNativeApplyDeltaSchemaUpgrade);
       auto result = SchemaDefinitions(expected);
       const auto close_result = sqlite3_close(expected);
       if (close_result != SQLITE_OK) {
@@ -646,14 +644,8 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       throw;
     }
   };
-  static const auto legacy = build(6);
-  static const auto previous = build(9);
-  static const auto previous_current = build(10);
-  static const auto native_apply = build(11);
-  static const auto current = build(12);
-  return version == 6 ? legacy : version < 10 ? previous
-                      : version == 10 ? previous_current
-                      : version == 11 ? native_apply : current;
+  static const auto current = build();
+  return current;
 }
 
 [[nodiscard]] const std::set<std::string>& ExpectedSchemaObjects() {
@@ -727,10 +719,6 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
   switch (kind) {
     case CCLCEffectKindDTO::kBrandLifecyclePrimitive:
       return "brand_lifecycle_primitive";
-    case CCLCEffectKindDTO::kKernelDisableHandoff:
-      return "kernel_disable_handoff";
-    case CCLCEffectKindDTO::kKernelDisableFenceRelease:
-      return "kernel_disable_fence_release";
   }
   return {};
 }
@@ -741,12 +729,6 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
     case CCLCEffectKindDTO::kBrandLifecyclePrimitive:
       return prefix +
              "brand:" + attempt.lifecycle_primitive_intent->lifecycle_primitive_attempt_id.value();
-    case CCLCEffectKindDTO::kKernelDisableHandoff:
-      return prefix +
-             "disable:" + attempt.disable_handoff_request->owner_request_context.request_id.value();
-    case CCLCEffectKindDTO::kKernelDisableFenceRelease:
-      return prefix + "release:" +
-             attempt.disable_fence_release_request->owner_request_context.request_id.value();
   }
   return {};
 }
@@ -762,8 +744,6 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
 [[nodiscard]] CCLCEffectAttemptDTO PreparedForm(CCLCEffectAttemptDTO completed) {
   completed.state = CCLCEffectAttemptStateDTO::kPrepared;
   completed.lifecycle_primitive_result.reset();
-  completed.disable_handoff_result.reset();
-  completed.disable_fence_release_result.reset();
   return completed;
 }
 
@@ -1005,101 +985,6 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
   return true;
 }
 
-[[nodiscard]] bool CurrentDomainIsWithinPromotedFullFence(
-    const ComponentLifecycleDomainStatusDTO& domain,
-    const ConfigurationFenceScopeDTO& fence_scope) {
-  if (!domain.current_scope.has_value()) {
-    return true;
-  }
-  const auto& current = *domain.current_scope;
-  const auto domain_row = std::lower_bound(
-      fence_scope.domains.begin(), fence_scope.domains.end(), current.control_domain_id,
-      [](const auto& candidate, const auto& id) { return candidate.control_domain_id < id; });
-  if (domain_row == fence_scope.domains.end() ||
-      domain_row->control_domain_id != current.control_domain_id ||
-      domain_row->predecessor_control_domain_revision !=
-          std::optional(current.control_domain_revision)) {
-    return false;
-  }
-  for (const auto& binding : current.current_control_bindings) {
-    const auto binding_row = std::lower_bound(
-        fence_scope.bindings.begin(), fence_scope.bindings.end(), binding.control_binding_id,
-        [](const auto& candidate, const auto& id) { return candidate.control_binding_id < id; });
-    if (binding_row == fence_scope.bindings.end() ||
-        binding_row->control_binding_id != binding.control_binding_id ||
-        binding_row->predecessor_control_binding_revision !=
-            std::optional(binding.control_binding_revision)) {
-      return false;
-    }
-  }
-  return std::includes(fence_scope.resources.begin(), fence_scope.resources.end(),
-                       current.current_resources.begin(), current.current_resources.end());
-}
-
-[[nodiscard]] bool IsFirstNoSnapshotPromotedFullAugmentation(
-    const ComponentLifecycleStatusDTO& previous, const ComponentLifecycleStatusDTO& next) {
-  if (previous.accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable ||
-      previous.previous_state.has_value() || previous.current_state.has_value() ||
-      !next.previous_state.has_value() || !next.current_state.has_value() ||
-      next.previous_state != next.current_state ||
-      next.phase != ComponentLifecycleTransactionPhaseDTO::kVerifying ||
-      next.reconciliation_required || !next.disable_handoff.has_value() ||
-      next.disable_handoff->scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull ||
-      next.disable_handoff->state != DisableHandoffStateDTO::kReady ||
-      !next.configuration_fence.has_value() ||
-      next.configuration_fence->state != ConfigurationFenceState::kHeld ||
-      !std::binary_search(next.disable_handoff->scope.controllable_component_ids.begin(),
-                          next.disable_handoff->scope.controllable_component_ids.end(),
-                          next.accepted_intent.controllable_component_id) ||
-      std::any_of(previous.domains.begin(), previous.domains.end(), [](const auto& domain) {
-        return domain.current_scope.has_value() ||
-               domain.resolved_provider_occurrence.has_value() ||
-               domain.previous_state.has_value() || domain.current_state.has_value() ||
-               !domain.primitive_attempts.empty();
-      })) {
-    return false;
-  }
-
-  std::size_t previous_index = 0U;
-  bool acquired_current_scope = false;
-  for (const auto& current : next.domains) {
-    while (previous_index < previous.domains.size() &&
-           previous.domains[previous_index].control_domain_id < current.control_domain_id) {
-      return false;
-    }
-    const bool retained_row =
-        previous_index < previous.domains.size() &&
-        previous.domains[previous_index].control_domain_id == current.control_domain_id;
-    if (retained_row) {
-      const auto& prior = previous.domains[previous_index++];
-      if (prior.expected_domain != current.expected_domain ||
-          prior.requested_state != current.requested_state ||
-          prior.primitive_attempts != current.primitive_attempts ||
-          !DomainEffectMonotonic(prior, current) || !DomainActionMonotonic(prior, current)) {
-        return false;
-      }
-    } else if (current.expected_domain.has_value()) {
-      return false;
-    }
-
-    if (!current.primitive_attempts.empty() ||
-        (current.effect != ComponentLifecycleDomainEffectDTO::kNone &&
-         current.effect != ComponentLifecycleDomainEffectDTO::kKnownNoEffect)) {
-      return false;
-    }
-    if (!current.current_scope.has_value()) {
-      continue;
-    }
-    acquired_current_scope = true;
-    if (current.previous_state != next.previous_state ||
-        current.current_state != next.current_state ||
-        !CurrentDomainIsWithinPromotedFullFence(current, next.disable_handoff->scope)) {
-      return false;
-    }
-  }
-  return acquired_current_scope && previous_index == previous.domains.size();
-}
-
 [[nodiscard]] bool DomainEvidenceMonotonic(const ComponentLifecycleStatusDTO& previous,
                                            const ComponentLifecycleStatusDTO& next) {
   if (previous.domains.size() != next.domains.size()) {
@@ -1117,87 +1002,14 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
   return true;
 }
 
-[[nodiscard]] bool DisableAndFenceEvidenceRetained(const ComponentLifecycleStatusDTO& previous,
-                                                   const ComponentLifecycleStatusDTO& next) {
-  if (previous.disable_handoff.has_value()) {
-    if (!next.disable_handoff.has_value()) {
-      return false;
-    }
-    const auto& prior = *previous.disable_handoff;
-    const auto& current = *next.disable_handoff;
-    const bool state_monotonic =
-        prior.state == current.state || (prior.state == DisableHandoffStateDTO::kStopping &&
-                                         (current.state == DisableHandoffStateDTO::kReady ||
-                                          current.state == DisableHandoffStateDTO::kFailed));
-    if (prior.lifecycle_transaction_id != current.lifecycle_transaction_id ||
-        prior.lifecycle_transaction_generation != current.lifecycle_transaction_generation ||
-        prior.controllable_component_id != current.controllable_component_id ||
-        prior.scope_resolution != current.scope_resolution ||
-        prior.component_scope_digest != current.component_scope_digest ||
-        prior.configuration_fence_id != current.configuration_fence_id ||
-        prior.configuration_fence_generation != current.configuration_fence_generation ||
-        prior.scope != current.scope ||
-        prior.configuration_fence_handle != current.configuration_fence_handle ||
-        !state_monotonic ||
-        (prior.stop_certificate.has_value() &&
-         prior.stop_certificate != current.stop_certificate) ||
-        !std::includes(
-            current.cancelled_queued_operations.begin(), current.cancelled_queued_operations.end(),
-            prior.cancelled_queued_operations.begin(), prior.cancelled_queued_operations.end()) ||
-        (prior.error.has_value() && prior.error != current.error)) {
-      return false;
-    }
-  }
-  if (previous.configuration_fence.has_value()) {
-    if (!next.configuration_fence.has_value()) {
-      return false;
-    }
-    const auto& prior = *previous.configuration_fence;
-    const auto& current = *next.configuration_fence;
-    const bool same_identity_and_scope =
-        prior.configuration_fence_id == current.configuration_fence_id &&
-        prior.configuration_fence_generation == current.configuration_fence_generation &&
-        prior.lifecycle_transaction_id == current.lifecycle_transaction_id &&
-        prior.lifecycle_transaction_generation == current.lifecycle_transaction_generation &&
-        prior.controllable_component_id == current.controllable_component_id &&
-        prior.scope == current.scope && prior.reason == current.reason;
-    const bool state_monotonic = prior.state == current.state ||
-                                 (prior.state == ConfigurationFenceState::kHeld &&
-                                  (current.state == ConfigurationFenceState::kReleasePending ||
-                                   current.state == ConfigurationFenceState::kReleased)) ||
-                                 (prior.state == ConfigurationFenceState::kReleasePending &&
-                                  current.state == ConfigurationFenceState::kReleased);
-    if (!same_identity_and_scope || !state_monotonic) {
-      return false;
-    }
-  }
-  if (previous.disable_fence_released.has_value() &&
-      previous.disable_fence_released != next.disable_fence_released) {
-    return false;
-  }
-  return true;
-}
-
 [[nodiscard]] bool TerminalStatusIsQuiescent(const ComponentLifecycleStatusDTO& status) {
-  if (!Terminal(status) || status.reconciliation_required) {
-    return false;
-  }
-  if (!status.disable_handoff.has_value()) {
-    return !status.configuration_fence.has_value() && !status.disable_fence_released.has_value();
-  }
-  return status.configuration_fence.has_value() &&
-         status.configuration_fence->state == ConfigurationFenceState::kReleased &&
-         status.disable_fence_released.has_value() &&
-         status.disable_fence_released->request.ready_handoff == *status.disable_handoff;
+  return Terminal(status) && !status.reconciliation_required;
 }
 
 [[nodiscard]] bool ReplacementTerminalIsSupportedByRetainedEvidence(
     const ComponentLifecycleStatusDTO& previous, const ComponentLifecycleStatusDTO& next) {
   if (!TerminalStatusIsQuiescent(next) || previous.previous_state != next.previous_state ||
       previous.current_state != next.current_state ||
-      previous.configuration_fence != next.configuration_fence ||
-      previous.disable_handoff != next.disable_handoff ||
-      previous.disable_fence_released != next.disable_fence_released ||
       previous.domains.size() != next.domains.size() || !next.terminal_result.has_value()) {
     return false;
   }
@@ -1259,39 +1071,15 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
          retained_observed_effect;
 }
 
-[[nodiscard]] bool DisableDomainsResolvedForFenceRelease(
-    const ComponentLifecycleStatusDTO& status) {
-  if (status.accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable ||
-      status.reconciliation_required || Terminal(status) ||
-      status.phase != ComponentLifecycleTransactionPhaseDTO::kVerifying ||
-      !status.disable_handoff.has_value() ||
-      status.disable_handoff->state != DisableHandoffStateDTO::kReady ||
-      !status.configuration_fence.has_value() ||
-      status.configuration_fence->state != ConfigurationFenceState::kHeld ||
-      status.disable_fence_released.has_value()) {
-    return false;
-  }
-  return std::all_of(status.domains.begin(), status.domains.end(), [](const auto& domain) {
-    const bool terminal_action =
-        domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded ||
-        domain.action_state == ComponentLifecycleDomainActionStateDTO::kFailed;
-    return terminal_action && domain.effect != ComponentLifecycleDomainEffectDTO::kEffectUncertain;
-  });
-}
-
 [[nodiscard]] bool StatusEvidenceIsMonotonic(const ComponentLifecycleStatusDTO& previous,
                                              const ComponentLifecycleStatusDTO& next) {
   const bool owner_changed = previous.status_owner_epoch != next.status_owner_epoch;
   const bool ordinary_closure_retained = previous.previous_state == next.previous_state &&
                                          AttemptsRetained(previous, next) &&
                                          DomainEvidenceMonotonic(previous, next);
-  const bool first_promoted_full_snapshot =
-      IsFirstNoSnapshotPromotedFullAugmentation(previous, next);
   return !Terminal(previous) && ImmutableAcceptanceEqual(previous, next) &&
          RequestedStateMonotonic(previous, next) &&
-         next.status_sequence > previous.status_sequence &&
-         (ordinary_closure_retained || first_promoted_full_snapshot) &&
-         DisableAndFenceEvidenceRetained(previous, next) &&
+         next.status_sequence > previous.status_sequence && ordinary_closure_retained &&
          (owner_changed || next.latest_updated_at_ns >= previous.latest_updated_at_ns);
 }
 
@@ -1418,8 +1206,7 @@ class SqliteCCLCJournal::Impl final {
 
   std::uint64_t RecordEffectCompleted(const RequestOwnerEpoch& active_owner_epoch,
                                       const CCLCEffectAttemptDTO& completed_attempt,
-                                      const ComponentLifecycleStatusDTO& successor_status,
-                                      const CellAdmissionClaimReleaseDTO* release = nullptr);
+                                      const ComponentLifecycleStatusDTO& successor_status);
 
   std::uint64_t RecordLifecycleStatus(const RequestOwnerEpoch& active_owner_epoch,
                                       const ComponentLifecycleStatusDTO& status,
@@ -1588,76 +1375,19 @@ class SqliteCCLCJournal::Impl final {
       Require(!metadata.Step(), "component_lifecycle_journal_corrupt",
               "lifecycle journal metadata insert returned an unexpected row");
     }
-    if (!objects.empty() &&
+    // Current-only development journal: earlier versions are not migrated.
+    // Version 13 removed the Disable Stop-handoff effect kinds and status
+    // fields, so an older journal is refused unchanged before any write.
+    if (const auto found_version = ScalarInteger(database_, "PRAGMA user_version");
         ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
-        ScalarInteger(database_, "PRAGMA user_version") == 6) {
-      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(6),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor lifecycle journal schema is not exact");
-      Statement predecessor(database_,
-                            "SELECT schema_id,schema_version,cell_id FROM cclc_journal_metadata "
-                            "WHERE singleton=1");
-      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
-                  predecessor.Integer(1) == 6 && predecessor.Text(2) == cell_id_.value() &&
-                  !predecessor.Step(),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor lifecycle journal identity is not exact");
-      Exec(database_, kProgramNodeSchemaUpgrade);
-      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=7 WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=7");
-    }
-    const auto predecessor_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
-        (predecessor_version == 7 || predecessor_version == 8 || predecessor_version == 9)) {
-      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(9),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor CCLC schema is not exact");
-      Statement predecessor(database_,
-                            "SELECT schema_id,schema_version,cell_id "
-                            "FROM cclc_journal_metadata WHERE singleton=1");
-      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
-                  predecessor.Integer(1) == predecessor_version &&
-                  predecessor.Text(2) == cell_id_.value() && !predecessor.Step(),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor CCLC journal identity is not exact");
-      Exec(database_, kRouteRecoverySchemaUpgrade);
-      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=10 WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=10");
-    }
-    if (ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
-        ScalarInteger(database_, "PRAGMA user_version") == 10) {
-      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(10),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor native-Apply CCLC schema is not exact");
-      Statement predecessor(database_,
-                            "SELECT schema_id,schema_version,cell_id "
-                            "FROM cclc_journal_metadata WHERE singleton=1");
-      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
-                  predecessor.Integer(1) == 10 &&
-                  predecessor.Text(2) == cell_id_.value() && !predecessor.Step(),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor native-Apply CCLC journal identity is not exact");
-      Exec(database_, kNativeApplySchemaUpgrade);
-      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=11 WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=11");
-    }
-    if (ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
-        ScalarInteger(database_, "PRAGMA user_version") == 11) {
-      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(11),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor native-Apply-delta CCLC schema is not exact");
-      Statement predecessor(database_,
-                            "SELECT schema_id,schema_version,cell_id "
-                            "FROM cclc_journal_metadata WHERE singleton=1");
-      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
-                  predecessor.Integer(1) == 11 &&
-                  predecessor.Text(2) == cell_id_.value() && !predecessor.Step(),
-              "component_lifecycle_journal_storage_foreign",
-              "predecessor native-Apply-delta CCLC journal identity is not exact");
-      // Existing plans retained nothing and removed nothing explicitly.
-      Exec(database_, kNativeApplyDeltaSchemaUpgrade);
-      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=12 WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=12");
+        found_version != kCCLCJournalSchemaVersion) {
+      Fail("component_lifecycle_journal_storage_unsupported",
+           "CCLC journal schema version " + std::to_string(found_version) +
+               " is unsupported; this owner opens only version " +
+               std::to_string(kCCLCJournalSchemaVersion) +
+               " and does not migrate earlier lifecycle history. The journal was left "
+               "unchanged. Stop the development workbench (./scripts/compose-dev.sh stop) "
+               "and start it again for fresh runtime state.");
     }
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects() &&
                 SchemaDefinitions(database_) == ExpectedSchemaDefinitions(),
@@ -2153,72 +1883,6 @@ void SqliteCCLCJournal::Impl::ValidateRetainedState() {
             "component_lifecycle_journal_corrupt",
             "lifecycle status contains an uncompleted primitive result");
 
-    Statement completed_disable_effects(
-        database_,
-        "SELECT completed_attempt_blob FROM cclc_effect_attempts WHERE "
-        "lifecycle_transaction_id=? AND "
-        "effect_kind='kernel_disable_handoff' AND "
-        "completed_attempt_blob IS NOT NULL ORDER BY effect_sequence");
-    completed_disable_effects.Bind(1, transaction_id);
-    std::size_t accepted_disable_count = 0U;
-    while (completed_disable_effects.Step()) {
-      const auto completed = detail::DecodeCCLCEffectAttempt(completed_disable_effects.Blob(0));
-      Require(completed.disable_handoff_result.has_value(), "component_lifecycle_journal_corrupt",
-              "completed Disable handoff has no typed result");
-      const auto& result = *completed.disable_handoff_result;
-      if (result.disposition == DisableHandoffEffectDispositionDTO::kProvenNotSeen) {
-        continue;
-      }
-      Require(result.acceptance.has_value() && status.disable_handoff.has_value(),
-              "component_lifecycle_journal_corrupt",
-              "accepted Disable handoff is absent from lifecycle status");
-      const auto& acceptance = *result.acceptance;
-      const auto& handoff = *status.disable_handoff;
-      Require(
-          handoff.lifecycle_transaction_id == acceptance.lifecycle_transaction_id &&
-              handoff.lifecycle_transaction_generation ==
-                  acceptance.lifecycle_transaction_generation &&
-              handoff.controllable_component_id == acceptance.controllable_component_id &&
-              handoff.scope_resolution == acceptance.scope_resolution &&
-              handoff.component_scope_digest == acceptance.component_scope_digest &&
-              handoff.configuration_fence_id == acceptance.configuration_fence_id &&
-              handoff.configuration_fence_generation == acceptance.configuration_fence_generation,
-          "component_lifecycle_journal_corrupt",
-          "completed Disable handoff conflicts with lifecycle status");
-      ++accepted_disable_count;
-    }
-    Require(accepted_disable_count <= 1U &&
-                status.disable_handoff.has_value() == (accepted_disable_count == 1U),
-            "component_lifecycle_journal_corrupt",
-            "Disable handoff completion/status cardinality is invalid");
-
-    Statement completed_release_effects(
-        database_,
-        "SELECT completed_attempt_blob FROM cclc_effect_attempts WHERE "
-        "lifecycle_transaction_id=? AND "
-        "effect_kind='kernel_disable_fence_release' AND "
-        "completed_attempt_blob IS NOT NULL ORDER BY effect_sequence");
-    completed_release_effects.Bind(1, transaction_id);
-    std::size_t released_count = 0U;
-    while (completed_release_effects.Step()) {
-      const auto completed = detail::DecodeCCLCEffectAttempt(completed_release_effects.Blob(0));
-      Require(completed.disable_fence_release_result.has_value(),
-              "component_lifecycle_journal_corrupt",
-              "completed Disable fence release has no typed result");
-      const auto& result = *completed.disable_fence_release_result;
-      if (result.disposition == DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld) {
-        continue;
-      }
-      Require(result.release_receipt.has_value() &&
-                  status.disable_fence_released == result.release_receipt,
-              "component_lifecycle_journal_corrupt",
-              "released Disable fence receipt conflicts with lifecycle status");
-      ++released_count;
-    }
-    Require(
-        released_count <= 1U && status.disable_fence_released.has_value() == (released_count == 1U),
-        "component_lifecycle_journal_corrupt",
-        "Disable fence release completion/status cardinality is invalid");
     if (terminal == 1) {
       const auto terminal_sequence =
           Positive(transactions.Integer(8), "lifecycle terminal sequence");
@@ -3737,13 +3401,10 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectPrepared(
   switch (prepared_attempt.effect_kind) {
     case CCLCEffectKindDTO::kBrandLifecyclePrimitive: {
       const auto& intent = *prepared_attempt.lifecycle_primitive_intent;
-      const bool promoted_full_disable =
+      const bool stateless_disable =
           successor_status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-          ((!previous.current_state.has_value() && !successor_status.current_state.has_value()) ||
-           (successor_status.disable_handoff.has_value() &&
-            successor_status.disable_handoff->scope_resolution ==
-                DisableHandoffScopeResolutionDTO::kPromotedToFull));
-      Require(!promoted_full_disable &&
+          !previous.current_state.has_value() && !successor_status.current_state.has_value();
+      Require(!stateless_disable &&
                   successor_status.accepted_intent.controllable_component_id ==
                       intent.controllable_component_id &&
                   std::any_of(successor_status.domains.begin(), successor_status.domains.end(),
@@ -3752,32 +3413,6 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectPrepared(
                               }),
               "component_lifecycle_journal_attempt_invalid",
               "brand lifecycle effect is outside the accepted component scope");
-      break;
-    }
-    case CCLCEffectKindDTO::kKernelDisableHandoff:
-      Require(
-          successor_status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-              successor_status.accepted_intent.controllable_component_id ==
-                  prepared_attempt.disable_handoff_request->controllable_component_id,
-          "component_lifecycle_journal_attempt_invalid",
-          "Kernel Disable handoff does not own this lifecycle transaction");
-      break;
-    case CCLCEffectKindDTO::kKernelDisableFenceRelease: {
-      const auto& release = *prepared_attempt.disable_fence_release_request;
-      Require(
-          successor_status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-              DisableDomainsResolvedForFenceRelease(previous) &&
-              release.release_precondition_status_sequence == previous.status_sequence &&
-              release.release_precondition_status_digest.value() ==
-                  detail::ComponentLifecycleStatusReleasePreconditionDigest(previous) &&
-              successor_status.disable_handoff == release.ready_handoff &&
-              successor_status.configuration_fence.has_value() &&
-              successor_status.configuration_fence->state == ConfigurationFenceState::kHeld &&
-              !successor_status.disable_fence_released.has_value() &&
-              successor_status.phase == ComponentLifecycleTransactionPhaseDTO::kVerifying &&
-              !Terminal(successor_status),
-          "component_lifecycle_journal_attempt_invalid",
-          "Disable fence release was not prepared from an exact held fence");
       break;
     }
   }
@@ -3849,8 +3484,7 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectPrepared(
 
 std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
     const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
-    const ComponentLifecycleStatusDTO& successor_status,
-    const CellAdmissionClaimReleaseDTO* release) {
+    const ComponentLifecycleStatusDTO& successor_status) {
   Require(!active_owner_epoch.empty() && completed_attempt.locally_valid() &&
               completed_attempt.state == CCLCEffectAttemptStateDTO::kCompleted &&
               successor_status.locally_valid() &&
@@ -3931,57 +3565,6 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
               "completed brand effect is absent from its successor status");
       break;
     }
-    case CCLCEffectKindDTO::kKernelDisableHandoff: {
-      const auto& result = *completed_attempt.disable_handoff_result;
-      if (result.disposition == DisableHandoffEffectDispositionDTO::kAccepted) {
-        const auto& acceptance = *result.acceptance;
-        Require(
-            successor_status.disable_handoff.has_value() &&
-                DisableHandoffPreservesOrWidensScope(result.request,
-                                                     *successor_status.disable_handoff) &&
-                successor_status.disable_handoff->lifecycle_transaction_id ==
-                    acceptance.lifecycle_transaction_id &&
-                successor_status.disable_handoff->lifecycle_transaction_generation ==
-                    acceptance.lifecycle_transaction_generation &&
-                successor_status.disable_handoff->controllable_component_id ==
-                    acceptance.controllable_component_id &&
-                successor_status.disable_handoff->scope_resolution == acceptance.scope_resolution &&
-                successor_status.disable_handoff->component_scope_digest ==
-                    acceptance.component_scope_digest &&
-                successor_status.disable_handoff->configuration_fence_id ==
-                    acceptance.configuration_fence_id &&
-                successor_status.disable_handoff->configuration_fence_generation ==
-                    acceptance.configuration_fence_generation,
-            "component_lifecycle_journal_attempt_conflict",
-            "completed Disable handoff is absent from its successor status");
-      } else {
-        Require(!successor_status.disable_handoff.has_value(),
-                "component_lifecycle_journal_attempt_conflict",
-                "proven-not-seen Disable handoff manufactured handoff evidence");
-      }
-      break;
-    }
-    case CCLCEffectKindDTO::kKernelDisableFenceRelease: {
-      const auto& result = *completed_attempt.disable_fence_release_result;
-      if (result.disposition == DisableFenceReleaseEffectDispositionDTO::kReleased) {
-        Require(
-            successor_status.disable_fence_released == result.release_receipt &&
-                successor_status.configuration_fence.has_value() &&
-                successor_status.configuration_fence->state == ConfigurationFenceState::kReleased &&
-                Terminal(successor_status),
-            "component_lifecycle_journal_attempt_conflict",
-            "released Disable fence is absent from terminal successor status");
-      } else {
-        Require(!successor_status.disable_fence_released.has_value() &&
-                    successor_status.disable_handoff == result.request.ready_handoff &&
-                    successor_status.configuration_fence.has_value() &&
-                    successor_status.configuration_fence->state == ConfigurationFenceState::kHeld &&
-                    !Terminal(successor_status),
-                "component_lifecycle_journal_attempt_conflict",
-                "proven-held Disable fence completion manufactured a release");
-      }
-      break;
-    }
   }
 
   Statement history_bytes(database_,
@@ -4019,7 +3602,7 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
   if (Terminal(successor_status)) {
     Require(TerminalStatusIsQuiescent(successor_status),
             "component_lifecycle_journal_attempt_unresolved",
-            "terminal lifecycle status retains a fence or reconciliation obligation");
+            "terminal lifecycle status retains a reconciliation obligation");
     Statement unresolved(database_,
                          "SELECT count(*) FROM cclc_effect_attempts "
                          "WHERE lifecycle_transaction_id=? AND completed_attempt_blob IS NULL");
@@ -4050,13 +3633,6 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
   Require(!update_status.Step() && sqlite3_changes(database_) == 1,
           "component_lifecycle_journal_corrupt",
           "completed CCLC effect status did not replace one transaction");
-  if (release != nullptr) {
-    Require(Terminal(successor_status), "component_lifecycle_claim_release_invalid",
-            "release requires terminal status");
-    RetainCellClaimRelease(
-        *release, successor_status.acceptance.lifecycle_transaction_id.value(),
-        detail::ComponentLifecycleStatusReleasePreconditionDigest(successor_status));
-  }
   RetainCurrentComponentLifecycleFact(successor_status);
   CompactTerminalResults();
   transaction.Commit();
@@ -4120,77 +3696,9 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordLifecycleStatus(
               "lifecycle status contains an unprepared or conflicting attempt");
     }
   }
-  if (status.disable_handoff.has_value()) {
-    Statement disable_attempt(database_,
-                              "SELECT completed_attempt_blob FROM cclc_effect_attempts "
-                              "WHERE lifecycle_transaction_id=? AND "
-                              "effect_kind='kernel_disable_handoff'");
-    disable_attempt.Bind(1, status.acceptance.lifecycle_transaction_id.value());
-    bool matched_handoff = false;
-    while (disable_attempt.Step()) {
-      if (disable_attempt.IsNull(0)) {
-        continue;
-      }
-      const auto completed = detail::DecodeCCLCEffectAttempt(disable_attempt.Blob(0));
-      matched_handoff =
-          matched_handoff ||
-          (completed.disable_handoff_result.has_value() &&
-           completed.disable_handoff_result->disposition ==
-               DisableHandoffEffectDispositionDTO::kAccepted &&
-           completed.disable_handoff_result->acceptance.has_value() &&
-           completed.disable_handoff_result->acceptance->component_scope_digest ==
-               status.disable_handoff->component_scope_digest &&
-           completed.disable_handoff_result->acceptance->configuration_fence_id ==
-               status.disable_handoff->configuration_fence_id &&
-           completed.disable_handoff_result->acceptance->configuration_fence_generation ==
-               status.disable_handoff->configuration_fence_generation);
-    }
-    Require(matched_handoff, "component_lifecycle_journal_attempt_conflict",
-            "Disable status conflicts with its completed Kernel handoff");
-  }
-  if (status.configuration_fence.has_value() &&
-      status.configuration_fence->state == ConfigurationFenceState::kReleasePending) {
-    Statement release_attempt(database_,
-                              "SELECT prepared_attempt_blob FROM cclc_effect_attempts "
-                              "WHERE lifecycle_transaction_id=? AND "
-                              "effect_kind='kernel_disable_fence_release' AND "
-                              "completed_attempt_blob IS NULL");
-    release_attempt.Bind(1, status.acceptance.lifecycle_transaction_id.value());
-    Require(release_attempt.Step(), "component_lifecycle_journal_attempt_conflict",
-            "Disable release-pending status has no prepared release effect");
-    const auto prepared = detail::DecodeCCLCEffectAttempt(release_attempt.Blob(0));
-    Require(prepared.disable_fence_release_request.has_value() &&
-                prepared.disable_fence_release_request->ready_handoff == status.disable_handoff &&
-                prepared.disable_fence_release_request->release_precondition_status_sequence <
-                    status.status_sequence &&
-                !release_attempt.Step(),
-            "component_lifecycle_journal_attempt_conflict",
-            "Disable release-pending status conflicts with its prepared release effect");
-  }
-  if (status.disable_fence_released.has_value()) {
-    Statement release_attempt(database_,
-                              "SELECT completed_attempt_blob FROM cclc_effect_attempts "
-                              "WHERE lifecycle_transaction_id=? AND "
-                              "effect_kind='kernel_disable_fence_release' AND "
-                              "completed_attempt_blob IS NOT NULL ORDER BY effect_sequence DESC");
-    release_attempt.Bind(1, status.acceptance.lifecycle_transaction_id.value());
-    bool matched_release = false;
-    while (release_attempt.Step()) {
-      const auto completed = detail::DecodeCCLCEffectAttempt(release_attempt.Blob(0));
-      if (completed.disable_fence_release_result.has_value() &&
-          completed.disable_fence_release_result->disposition ==
-              DisableFenceReleaseEffectDispositionDTO::kReleased &&
-          completed.disable_fence_release_result->release_receipt ==
-              status.disable_fence_released) {
-        matched_release = true;
-      }
-    }
-    Require(matched_release, "component_lifecycle_journal_attempt_conflict",
-            "Disable release receipt has no completed fence-release effect");
-  }
   if (Terminal(status)) {
     Require(TerminalStatusIsQuiescent(status), "component_lifecycle_journal_attempt_unresolved",
-            "terminal lifecycle status retains a fence or reconciliation obligation");
+            "terminal lifecycle status retains a reconciliation obligation");
     Require(!has_unresolved_prepared_effect, "component_lifecycle_journal_attempt_unresolved",
             "terminal lifecycle status has an unresolved effect attempt");
     Statement history_bytes(database_,
@@ -6162,18 +5670,6 @@ Result<std::uint64_t> SqliteCCLCJournal::RecordEffectCompleted(
     const ComponentLifecycleStatusDTO& successor_status) {
   return AsResult<std::uint64_t>([&]() {
     return impl_->RecordEffectCompleted(active_owner_epoch, completed_attempt, successor_status);
-  });
-}
-
-Result<std::uint64_t>
-SqliteCCLCJournal::RecordEffectCompletedAndLifecycleClaimRelease(
-    const RequestOwnerEpoch& owner,
-    const CCLCEffectAttemptDTO& completed_attempt,
-    const ComponentLifecycleStatusDTO& status,
-    const CellAdmissionClaimReleaseDTO& release) {
-  return AsResult<std::uint64_t>([&]() {
-    return impl_->RecordEffectCompleted(owner, completed_attempt, status,
-                                        &release);
   });
 }
 

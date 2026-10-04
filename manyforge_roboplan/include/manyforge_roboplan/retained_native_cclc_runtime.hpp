@@ -68,7 +68,6 @@ CreateRetainedNativeCCLCRuntime(
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner
@@ -100,7 +99,6 @@ CreateRetainedNativeCCLCRuntime(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
     RetainedNativeRuntime &runtime,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
@@ -122,7 +120,6 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::RuntimeParticipantBinding> physical_bindings,
-    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner &route_owner,

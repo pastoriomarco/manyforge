@@ -476,9 +476,11 @@
   cursor: grabbing;
 }
 
+/* The wrapper fits its node, so React Flow measures the real size (a
+   collapsed node grows with its list) for fit view, layout and edges. */
 .program-tree-react-flow .react-flow__node {
-  width: var(--mf-node-width);
-  height: var(--mf-node-height);
+  width: max-content;
+  height: max-content;
   padding: 0;
   border: 0;
   border-radius: 0;

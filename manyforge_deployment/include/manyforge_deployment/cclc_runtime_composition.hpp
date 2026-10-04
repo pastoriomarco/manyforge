@@ -72,7 +72,6 @@ public:
              controller_ports,
          std::vector<core::KinematicResourceSourceProjectionDTO>
              source_projections,
-         core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
          core::IKernelCellAdmissionPort &kernel_cell_admission_port,
          core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
          IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
@@ -126,7 +125,6 @@ private:
           core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
               const core::ControlDomainId &)>
           kernel_current_configuration_source,
-      core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
       core::IKernelCellAdmissionPort &kernel_cell_admission_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,

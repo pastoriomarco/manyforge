@@ -243,7 +243,8 @@ describe('Program tree canvas presentation actions', () => {
           parameters: {},
           children: [],
         },
-        position: { x: 30, y: 40 },
+        // Centred on the pointer (30, 40), like the drag preview.
+        position: { x: -70, y: 5 },
       }],
       ['tree_draft_move_node', {
         instance_id: 'detached',

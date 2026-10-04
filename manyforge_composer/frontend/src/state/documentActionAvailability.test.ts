@@ -4,15 +4,18 @@ import { deploymentActionUnavailableReason } from './documentStates';
 import type { DeploymentWorkspaceResponse, ProgramWorkspaceResponse } from '../types/api';
 
 describe('document action prerequisites shared by controls and handlers', () => {
-  it('allows Program Revert when Saved equals Applied but differs from Draft', () => {
+  it('disables Program Revert while Saved equals Applied, even with Draft edits', () => {
     const workspace = {
       saved: { available: true, matchesDraft: false, programRevision: 'saved' },
-      applied: { available: true, programRevision: 'saved' },
+      applied: { available: true, matchesDraft: false, programRevision: 'saved' },
     } as ProgramWorkspaceResponse;
-    expect(programActionUnavailableReason(workspace, 'revert', null)).toBe(null);
+    expect(programActionUnavailableReason(workspace, 'revert', null))
+      .toBe('Nothing to revert: the Saved Program matches Applied.');
     workspace.saved.matchesDraft = true;
     expect(programActionUnavailableReason(workspace, 'revert', null)).not.toBe(null);
     workspace.applied.programRevision = 'older';
+    expect(programActionUnavailableReason(workspace, 'revert', null)).toBe(null);
+    workspace.saved.matchesDraft = false;
     expect(programActionUnavailableReason(workspace, 'revert', null)).toBe(null);
   });
 
@@ -26,14 +29,17 @@ describe('document action prerequisites shared by controls and handlers', () => 
     expect(programActionUnavailableReason(workspace, 'discard', 'Manager pending')).toBe('Manager pending');
   });
 
-  it('allows Deployment Revert of Draft-only edits and keeps the admission reason', () => {
+  it('disables Deployment Revert while Saved equals Applied and keeps the admission reason', () => {
     const workspace = {
       savedScenarioCandidates: [{}], saved: { deploymentRevision: 'saved' },
       managerApplied: { deploymentRevision: 'saved' }, draft: { differsFromSaved: true },
     } as DeploymentWorkspaceResponse;
+    expect(deploymentActionUnavailableReason(workspace, 'revert', null))
+      .toBe('Nothing to revert: the Saved Deployment matches Manager Applied.');
+    workspace.managerApplied.deploymentRevision = 'older';
     expect(deploymentActionUnavailableReason(workspace, 'revert', null)).toBe(null);
     workspace.draft.differsFromSaved = false;
-    expect(deploymentActionUnavailableReason(workspace, 'revert', null)).not.toBe(null);
+    expect(deploymentActionUnavailableReason(workspace, 'revert', null)).toBe(null);
     expect(deploymentActionUnavailableReason(workspace, 'revert', 'Backend unavailable')).toBe('Backend unavailable');
   });
 });

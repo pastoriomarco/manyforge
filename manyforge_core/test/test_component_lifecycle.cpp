@@ -245,9 +245,6 @@ ComponentLifecycleStatusDTO prepared_recovery_status() {
           requested,
           ComponentLifecycleTransactionPhaseDTO::kExecuting,
           {std::move(domain)},
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
           false,
           std::nullopt,
           std::nullopt,
@@ -264,10 +261,6 @@ CCLCEffectAttemptDTO prepared_recovery_attempt() {
           CCLCEffectKindDTO::kBrandLifecyclePrimitive,
           CCLCEffectAttemptStateDTO::kPrepared,
           primitive_intent(),
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
           std::nullopt};
 }
 
@@ -287,111 +280,6 @@ ComponentLifecycleDomainStatusDTO successful_domain_status(
           {},
           std::nullopt,
           std::nullopt};
-}
-
-ConfigurationFenceScopeDTO disable_handoff_component_scope() {
-  return {
-      {ControllableComponentId("component-1")},
-      {{ControlDomainId("domain-1"), ControlDomainRevision("domain-revision-1"), std::nullopt}},
-      {{ControlBindingId("binding-1"), ControlBindingRevision("binding-revision-1"), std::nullopt}},
-      {ResourceId("resource-1")}};
-}
-
-ConfigurationFenceScopeDTO disable_handoff_full_scope() {
-  auto scope = disable_handoff_component_scope();
-  scope.controllable_component_ids.push_back(ControllableComponentId("component-2"));
-  scope.domains.push_back(
-      {ControlDomainId("domain-2"), ControlDomainRevision("domain-revision-2"), std::nullopt});
-  scope.bindings.push_back(
-      {ControlBindingId("binding-2"), ControlBindingRevision("binding-revision-2"), std::nullopt});
-  scope.resources.push_back(ResourceId("resource-2"));
-  return scope;
-}
-
-DisableHandoffRequestDTO disable_handoff_request(
-    ConfigurationFenceScopeDTO scope,
-    DisableHandoffScopeResolutionDTO resolution = DisableHandoffScopeResolutionDTO::kExact) {
-  std::vector<CurrentDomainActiveControlConfigurationDTO> configurations;
-  for (const auto& domain : scope.domains) {
-    configurations.push_back({domain.control_domain_id, absent_configuration()});
-  }
-  return {
-      {RequestId("handoff-request-1"), RequestOwnerEpoch("kernel-owner-1"), "test", std::nullopt},
-      RequestId("public-request-1"),
-      LifecycleTransactionId("transaction-1"),
-      LifecycleTransactionGeneration(4U),
-      ControllableComponentId("component-1"),
-      resolution,
-      std::move(scope),
-      ContentDigest("admission-snapshot-1"),
-      ActiveBundlePublicationGeneration(2U),
-      ContentDigest("public-pointer-1"),
-      GraphRevision("graph-revision-1"),
-      RetainedBundleId("retained-bundle-1"),
-      ComponentLifecycleGeneration(4U),
-      3U,
-      ConfigurationFenceGeneration(5U),
-      std::move(configurations)};
-}
-
-DisableHandoffStatusDTO disable_handoff_status(const DisableHandoffRequestDTO& request,
-                                               ConfigurationFenceScopeDTO scope,
-                                               DisableHandoffScopeResolutionDTO resolution) {
-  const ConfigurationFenceHandleDTO handle{ConfigurationFenceId("configuration-fence-1"),
-                                           ConfigurationFenceGeneration(6U),
-                                           request.lifecycle_transaction_id,
-                                           request.lifecycle_transaction_generation,
-                                           request.controllable_component_id,
-                                           scope,
-                                           "Disable containment",
-                                           ConfigurationFenceState::kHeld};
-  return {request.lifecycle_transaction_id,
-          request.lifecycle_transaction_generation,
-          request.controllable_component_id,
-          resolution,
-          ContentDigest("component-scope-1"),
-          handle.configuration_fence_id,
-          handle.configuration_fence_generation,
-          DisableHandoffStateDTO::kReady,
-          std::move(scope),
-          handle,
-          std::nullopt,
-          {},
-          std::nullopt};
-}
-
-DisableHandoffAdmissionSnapshotDTO disable_handoff_admission_snapshot(
-    ConfigurationFenceGeneration fence_generation = ConfigurationFenceGeneration(0U)) {
-  const auto scope = disable_handoff_component_scope();
-  const DisableHandoffComponentScopeExpectationDTO expectation{
-      ContentDigest("component-snapshot-1"),
-      ActiveBundlePublicationGeneration(2U),
-      ContentDigest("public-pointer-1"),
-      RetainedBundleId("retained-bundle-1"),
-      GraphRevision("graph-revision-1"),
-      ComponentLifecycleGeneration(4U),
-      scope,
-      {{ControlDomainId("domain-1"), absent_configuration()}}};
-  DisableHandoffAdmissionSnapshotDTO snapshot{
-      {ControllableComponentId("component-1"),
-       DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation},
-      RequestOwnerEpoch("kernel-owner-1"),
-      DisableHandoffScopeResolutionDTO::kExact,
-      scope,
-      ActiveBundlePublicationGeneration(2U),
-      ContentDigest("public-pointer-1"),
-      RetainedBundleId("retained-bundle-1"),
-      GraphRevision("graph-revision-1"),
-      3U,
-      fence_generation,
-      {{ControlDomainId("domain-1"), absent_configuration()}},
-      ContentDigest(std::string("sha256:") + std::string(64U, '0'))};
-  const auto digest = ComputeDisableHandoffAdmissionSnapshotDigest(snapshot);
-  if (!digest.ok()) {
-    throw std::logic_error("test Disable admission snapshot is invalid");
-  }
-  snapshot.snapshot_digest = digest.value();
-  return snapshot;
 }
 
 TEST(ComponentLifecycleStrongIds, PreserveSemanticSeparation) {
@@ -601,83 +489,6 @@ TEST(ComponentLifecycleResolvedScope, MatchesExactTopologyBindingRouteAndConfigu
   EXPECT_TRUE(ExpectedDomainMatchesResolvedScope(first_expected, first_resolved));
 }
 
-TEST(DisableHandoffScope, PreservesEveryRequestedDimensionAndMayOnlyWidenToFull) {
-  const auto component_scope = disable_handoff_component_scope();
-  const auto full_scope = disable_handoff_full_scope();
-  const auto exact_request = disable_handoff_request(component_scope);
-  const auto widened = disable_handoff_status(exact_request, full_scope,
-                                              DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  ASSERT_TRUE(exact_request.locally_valid());
-  ASSERT_TRUE(widened.locally_valid());
-  EXPECT_TRUE(DisableHandoffPreservesOrWidensScope(exact_request, widened));
-
-  auto revised_scope = component_scope;
-  revised_scope.domains.front().predecessor_control_domain_revision =
-      ControlDomainRevision("domain-revision-2");
-  revised_scope.bindings.front().predecessor_control_binding_revision =
-      ControlBindingRevision("binding-revision-2");
-  const auto stale_but_resolved =
-      disable_handoff_status(exact_request, revised_scope,
-                             DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved);
-  ASSERT_TRUE(stale_but_resolved.locally_valid());
-  EXPECT_TRUE(DisableHandoffPreservesOrWidensScope(exact_request, stale_but_resolved));
-
-  auto omitted_domain = widened;
-  omitted_domain.scope.domains.erase(omitted_domain.scope.domains.begin());
-  omitted_domain.configuration_fence_handle.scope = omitted_domain.scope;
-  ASSERT_TRUE(omitted_domain.locally_valid());
-  EXPECT_FALSE(DisableHandoffPreservesOrWidensScope(exact_request, omitted_domain));
-
-  auto omitted_binding = widened;
-  omitted_binding.scope.bindings.erase(omitted_binding.scope.bindings.begin());
-  omitted_binding.configuration_fence_handle.scope = omitted_binding.scope;
-  ASSERT_TRUE(omitted_binding.locally_valid());
-  EXPECT_FALSE(DisableHandoffPreservesOrWidensScope(exact_request, omitted_binding));
-
-  auto omitted_resource = widened;
-  omitted_resource.scope.resources.erase(omitted_resource.scope.resources.begin());
-  omitted_resource.configuration_fence_handle.scope = omitted_resource.scope;
-  ASSERT_TRUE(omitted_resource.locally_valid());
-  EXPECT_FALSE(DisableHandoffPreservesOrWidensScope(exact_request, omitted_resource));
-
-  const auto full_request =
-      disable_handoff_request(full_scope, DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  const auto narrowed = disable_handoff_status(full_request, component_scope,
-                                               DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  ASSERT_TRUE(full_request.locally_valid());
-  ASSERT_TRUE(narrowed.locally_valid());
-  EXPECT_FALSE(DisableHandoffPreservesOrWidensScope(full_request, narrowed));
-
-  const auto downgraded_resolution =
-      disable_handoff_status(full_request, full_scope, DisableHandoffScopeResolutionDTO::kExact);
-  ASSERT_TRUE(downgraded_resolution.locally_valid());
-  EXPECT_FALSE(DisableHandoffPreservesOrWidensScope(full_request, downgraded_resolution));
-}
-
-TEST(DisableHandoffAdmissionIdentity,
-     AcceptsInitialFencePredecessorAndDetectsEverySemanticMutation) {
-  auto snapshot = disable_handoff_admission_snapshot();
-  ASSERT_TRUE(snapshot.locally_valid());
-  ASSERT_TRUE(VerifyDisableHandoffAdmissionSnapshot(snapshot).ok());
-
-  auto request = disable_handoff_request(disable_handoff_component_scope());
-  request.expected_fence_generation = ConfigurationFenceGeneration(0U);
-  EXPECT_TRUE(request.locally_valid());
-
-  const auto component_scope = ComputeDisableHandoffScopeDigest(snapshot.current_scope);
-  ASSERT_TRUE(component_scope.ok());
-  auto widened_scope = disable_handoff_full_scope();
-  const auto widened_digest = ComputeDisableHandoffScopeDigest(widened_scope);
-  ASSERT_TRUE(widened_digest.ok());
-  EXPECT_NE(component_scope.value(), widened_digest.value());
-
-  snapshot.operation_resource_generation += 1U;
-  EXPECT_FALSE(VerifyDisableHandoffAdmissionSnapshot(snapshot).ok());
-  const auto recomputed = ComputeDisableHandoffAdmissionSnapshotDigest(snapshot);
-  ASSERT_TRUE(recomputed.ok());
-  EXPECT_NE(recomputed.value(), snapshot.snapshot_digest);
-}
-
 TEST(ComponentLifecycleCurrentSnapshot, JoinsOneCanonicalProviderOccurrenceToEveryCompleteDomain) {
   const auto expected = expected_domain();
   const auto scope = current_scope(expected);
@@ -762,9 +573,6 @@ TEST(ComponentLifecycleStatus, AcceptsAlreadySatisfiedSuccessWithoutPrimitiveAtt
       requested,
       ComponentLifecycleTransactionPhaseDTO::kSucceeded,
       {successful_domain_status(lifecycle_intent.expected_control_domains[0], requested)},
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
       false,
       ComponentLifecycleTerminalResultDTO::kSucceeded,
       std::nullopt,
@@ -812,9 +620,6 @@ TEST(ComponentLifecycleStatus, RecoverMayFailUnresolvedOnlyWithKnownNoEffect) {
                                      requested,
                                      ComponentLifecycleTransactionPhaseDTO::kFailed,
                                      {domain},
-                                     std::nullopt,
-                                     std::nullopt,
-                                     std::nullopt,
                                      false,
                                      ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect,
                                      ErrorDTO{"recover_target_ambiguous", "no unique plan", {}},
@@ -873,9 +678,6 @@ TEST(ComponentLifecycleStatus, DisableUsesExpectedAndCurrentDomainUnionWithoutWi
        status_row(expected_b.control_domain_id, expected_b, std::nullopt),
        status_row(current_c_expected.control_domain_id, std::nullopt,
                   current_scope(current_c_expected))},
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
       false,
       std::nullopt,
       std::nullopt,
@@ -894,11 +696,11 @@ TEST(ComponentLifecycleStatus, DisableUsesExpectedAndCurrentDomainUnionWithoutWi
   EXPECT_FALSE(status.locally_valid());
 }
 
-TEST(ComponentLifecycleStatus, DisablePreparedHandoffMayRemainUnknownWithoutInventingAFence) {
+TEST(ComponentLifecycleStatus, UnknownDisableOutcomeRequiresReconciliation) {
   auto disable_intent = intent(ComponentLifecycleIntentKindDTO::kDisable, {expected_domain()});
   const auto requested = resolved_requested(ComponentLifecycleStateDTO::kDisabled);
   const ErrorDTO uncertainty{
-      "disable_handoff_outcome_unknown", "prepared handoff requires reconciliation", {}};
+      "disable_outcome_unknown", "uncertain Disable primitive requires reconciliation", {}};
   const auto scope = current_scope(disable_intent.expected_control_domains.front());
   ComponentLifecycleDomainStatusDTO domain{ControlDomainId("domain-1"),
                                            disable_intent.expected_control_domains.front(),
@@ -921,9 +723,6 @@ TEST(ComponentLifecycleStatus, DisablePreparedHandoffMayRemainUnknownWithoutInve
                                      requested,
                                      ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown,
                                      {domain},
-                                     std::nullopt,
-                                     std::nullopt,
-                                     std::nullopt,
                                      true,
                                      std::nullopt,
                                      uncertainty,
@@ -933,21 +732,6 @@ TEST(ComponentLifecycleStatus, DisablePreparedHandoffMayRemainUnknownWithoutInve
 
   EXPECT_TRUE(status.locally_valid());
   status.reconciliation_required = false;
-  EXPECT_FALSE(status.locally_valid());
-  status.reconciliation_required = true;
-  status.configuration_fence = ConfigurationFenceHandleDTO{
-      ConfigurationFenceId("invented"),
-      ConfigurationFenceGeneration(1U),
-      LifecycleTransactionId("transaction-1"),
-      LifecycleTransactionGeneration(4U),
-      ControllableComponentId("component-1"),
-      {{ControllableComponentId("component-1")},
-       {{ControlDomainId("domain-1"), ControlDomainRevision("domain-revision-1"), std::nullopt}},
-       {{ControlBindingId("binding-1"), ControlBindingRevision("binding-revision-1"),
-         std::nullopt}},
-       {ResourceId("resource-1")}},
-      "invented",
-      ConfigurationFenceState::kHeld};
   EXPECT_FALSE(status.locally_valid());
 }
 
@@ -964,9 +748,6 @@ TEST(ComponentLifecycleStatus, RequiresTheExactAcceptedProviderOccurrenceForCurr
       requested,
       ComponentLifecycleTransactionPhaseDTO::kSucceeded,
       {successful_domain_status(lifecycle_intent.expected_control_domains[0], requested)},
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
       false,
       ComponentLifecycleTerminalResultDTO::kSucceeded,
       std::nullopt,
@@ -1010,9 +791,6 @@ TEST(ComponentLifecycleStatus, UnresolvedScopeDisableDoesNotInventObservedState)
                                      requested,
                                      ComponentLifecycleTransactionPhaseDTO::kAccepted,
                                      {domain},
-                                     std::nullopt,
-                                     std::nullopt,
-                                     std::nullopt,
                                      false,
                                      std::nullopt,
                                      std::nullopt,

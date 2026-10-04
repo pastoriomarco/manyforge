@@ -38,19 +38,6 @@ template <typename Value, typename Less>
                             }) == values.end();
 }
 
-template <typename Value, typename Key>
-[[nodiscard]] bool exact_rows_are_subset(const std::vector<Value>& subset,
-                                         const std::vector<Value>& superset, Key key) noexcept {
-  return std::all_of(subset.begin(), subset.end(), [&](const Value& expected) {
-    const auto expected_key = key(expected);
-    const auto found = std::lower_bound(superset.begin(), superset.end(), expected_key,
-                                        [&](const Value& candidate, const auto& candidate_key) {
-                                          return key(candidate) < candidate_key;
-                                        });
-    return found != superset.end() && key(*found) == expected_key && *found == expected;
-  });
-}
-
 [[nodiscard]] bool known(ComponentLifecycleIntentKindDTO value) noexcept {
   switch (value) {
     case ComponentLifecycleIntentKindDTO::kPrepare:
@@ -169,85 +156,6 @@ template <typename Value, typename Key>
   return false;
 }
 
-[[nodiscard]] bool known(ConfigurationFenceState value) noexcept {
-  switch (value) {
-    case ConfigurationFenceState::kHeld:
-    case ConfigurationFenceState::kReleasePending:
-    case ConfigurationFenceState::kReleased:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableHandoffStateDTO value) noexcept {
-  switch (value) {
-    case DisableHandoffStateDTO::kStopping:
-    case DisableHandoffStateDTO::kReady:
-    case DisableHandoffStateDTO::kFailed:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableHandoffAttemptDispositionDTO value) noexcept {
-  switch (value) {
-    case DisableHandoffAttemptDispositionDTO::kAcceptedExact:
-    case DisableHandoffAttemptDispositionDTO::kNotSeen:
-    case DisableHandoffAttemptDispositionDTO::kConflicting:
-    case DisableHandoffAttemptDispositionDTO::kUncertain:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableHandoffScopeRequestKindDTO value) noexcept {
-  switch (value) {
-    case DisableHandoffScopeRequestKindDTO::kResolvedComponentScope:
-    case DisableHandoffScopeRequestKindDTO::kFullStopRequired:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableHandoffScopeResolutionDTO value) noexcept {
-  switch (value) {
-    case DisableHandoffScopeResolutionDTO::kExact:
-    case DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved:
-    case DisableHandoffScopeResolutionDTO::kPromotedToFull:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableHandoffEffectDispositionDTO value) noexcept {
-  switch (value) {
-    case DisableHandoffEffectDispositionDTO::kAccepted:
-    case DisableHandoffEffectDispositionDTO::kProvenNotSeen:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableFenceReleaseAttemptDispositionDTO value) noexcept {
-  switch (value) {
-    case DisableFenceReleaseAttemptDispositionDTO::kReleasedExact:
-    case DisableFenceReleaseAttemptDispositionDTO::kNotReleasedHeld:
-    case DisableFenceReleaseAttemptDispositionDTO::kConflicting:
-    case DisableFenceReleaseAttemptDispositionDTO::kUncertain:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(DisableFenceReleaseEffectDispositionDTO value) noexcept {
-  switch (value) {
-    case DisableFenceReleaseEffectDispositionDTO::kReleased:
-    case DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld:
-      return true;
-  }
-  return false;
-}
-
 [[nodiscard]] bool context_valid(const PublicRequestContextDTO& context) noexcept {
   return bounded_identity(context.request_id) && bounded_identity(context.request_owner_epoch) &&
          !context.source_label.empty() &&
@@ -332,81 +240,6 @@ template <typename Value, typename Key>
   return true;
 }
 
-[[nodiscard]] bool fence_scope_bounded(const ConfigurationFenceScopeDTO& scope) noexcept {
-  if (scope.controllable_component_ids.size() > kMaxLifecycleDisableDomainUnion ||
-      scope.domains.size() > kMaxLifecycleDisableDomainUnion ||
-      scope.bindings.size() > kMaxLifecycleStatusBindingUnion ||
-      scope.resources.size() > kMaxLifecycleCurrentResources) {
-    return false;
-  }
-  for (const auto& component : scope.controllable_component_ids) {
-    if (!bounded_identity(component)) {
-      return false;
-    }
-  }
-  for (const auto& domain : scope.domains) {
-    if (!bounded_identity(domain.control_domain_id) ||
-        (domain.predecessor_control_domain_revision.has_value() &&
-         !bounded_identity(*domain.predecessor_control_domain_revision)) ||
-        (domain.candidate_control_domain_revision.has_value() &&
-         !bounded_identity(*domain.candidate_control_domain_revision))) {
-      return false;
-    }
-  }
-  for (const auto& binding : scope.bindings) {
-    if (!bounded_identity(binding.control_binding_id) ||
-        (binding.predecessor_control_binding_revision.has_value() &&
-         !bounded_identity(*binding.predecessor_control_binding_revision)) ||
-        (binding.candidate_control_binding_revision.has_value() &&
-         !bounded_identity(*binding.candidate_control_binding_revision))) {
-      return false;
-    }
-  }
-  return std::all_of(scope.resources.begin(), scope.resources.end(),
-                     [](const ResourceId& resource) { return bounded_identity(resource); });
-}
-
-[[nodiscard]] bool fence_scope_contains_component(
-    const ConfigurationFenceScopeDTO& scope, const ControllableComponentId& component_id) noexcept {
-  return std::binary_search(scope.controllable_component_ids.begin(),
-                            scope.controllable_component_ids.end(), component_id);
-}
-
-[[nodiscard]] bool fence_scope_is_exact_subset(
-    const ConfigurationFenceScopeDTO& subset, const ConfigurationFenceScopeDTO& superset) noexcept {
-  return std::includes(
-             superset.controllable_component_ids.begin(), superset.controllable_component_ids.end(),
-             subset.controllable_component_ids.begin(), subset.controllable_component_ids.end()) &&
-         exact_rows_are_subset(subset.domains, superset.domains,
-                               [](const auto& row) { return row.control_domain_id; }) &&
-         exact_rows_are_subset(subset.bindings, superset.bindings,
-                               [](const auto& row) { return row.control_binding_id; }) &&
-         std::includes(superset.resources.begin(), superset.resources.end(),
-                       subset.resources.begin(), subset.resources.end());
-}
-
-[[nodiscard]] bool fence_scope_membership_is_subset(
-    const ConfigurationFenceScopeDTO& subset, const ConfigurationFenceScopeDTO& superset) noexcept {
-  const auto row_ids_are_subset = [](const auto& left, const auto& right, const auto& key) {
-    return std::all_of(left.begin(), left.end(), [&](const auto& item) {
-      const auto found = std::lower_bound(right.begin(), right.end(), key(item),
-                                          [&](const auto& candidate, const auto& requested_key) {
-                                            return key(candidate) < requested_key;
-                                          });
-      return found != right.end() && key(*found) == key(item);
-    });
-  };
-  return std::includes(
-             superset.controllable_component_ids.begin(), superset.controllable_component_ids.end(),
-             subset.controllable_component_ids.begin(), subset.controllable_component_ids.end()) &&
-         row_ids_are_subset(subset.domains, superset.domains,
-                            [](const auto& row) { return row.control_domain_id; }) &&
-         row_ids_are_subset(subset.bindings, superset.bindings,
-                            [](const auto& row) { return row.control_binding_id; }) &&
-         std::includes(superset.resources.begin(), superset.resources.end(),
-                       subset.resources.begin(), subset.resources.end());
-}
-
 [[nodiscard]] bool domain_requested_postcondition_satisfied(
     const ComponentLifecycleDomainStatusDTO& domain) noexcept {
   if (domain.requested_state.presence != ComponentLifecycleRequestedStatePresenceDTO::kResolved ||
@@ -418,16 +251,6 @@ template <typename Value, typename Key>
          (domain.reconciliation_evidence->observed_state == *domain.current_state &&
           domain.reconciliation_evidence->postcondition_result ==
               LifecyclePostconditionResultDTO::kSatisfied);
-}
-
-[[nodiscard]] bool same_fence_identity_and_scope(
-    const ConfigurationFenceHandleDTO& left, const ConfigurationFenceHandleDTO& right) noexcept {
-  return left.configuration_fence_id == right.configuration_fence_id &&
-         left.configuration_fence_generation == right.configuration_fence_generation &&
-         left.lifecycle_transaction_id == right.lifecycle_transaction_id &&
-         left.lifecycle_transaction_generation == right.lifecycle_transaction_generation &&
-         left.controllable_component_id == right.controllable_component_id &&
-         left.scope == right.scope && left.reason == right.reason;
 }
 
 }  // namespace
@@ -449,33 +272,7 @@ bool CCLCEffectAttemptDTO::locally_valid() const noexcept {
              lifecycle_primitive_intent->lifecycle_transaction_generation ==
                  lifecycle_transaction_generation &&
              lifecycle_primitive_result.has_value() == completed &&
-             (!completed || lifecycle_primitive_result->matches(*lifecycle_primitive_intent)) &&
-             !disable_handoff_request.has_value() && !disable_handoff_result.has_value() &&
-             !disable_fence_release_request.has_value() &&
-             !disable_fence_release_result.has_value();
-    case CCLCEffectKindDTO::kKernelDisableHandoff:
-      return disable_handoff_request.has_value() && disable_handoff_request->locally_valid() &&
-             disable_handoff_request->lifecycle_transaction_id == lifecycle_transaction_id &&
-             disable_handoff_request->lifecycle_transaction_generation ==
-                 lifecycle_transaction_generation &&
-             disable_handoff_result.has_value() == completed &&
-             (!completed || (disable_handoff_result->locally_valid() &&
-                             disable_handoff_result->request == *disable_handoff_request)) &&
-             !lifecycle_primitive_intent.has_value() && !lifecycle_primitive_result.has_value() &&
-             !disable_fence_release_request.has_value() &&
-             !disable_fence_release_result.has_value();
-    case CCLCEffectKindDTO::kKernelDisableFenceRelease:
-      return disable_fence_release_request.has_value() &&
-             disable_fence_release_request->locally_valid() &&
-             disable_fence_release_request->lifecycle_transaction_id == lifecycle_transaction_id &&
-             disable_fence_release_request->lifecycle_transaction_generation ==
-                 lifecycle_transaction_generation &&
-             disable_fence_release_result.has_value() == completed &&
-             (!completed ||
-              (disable_fence_release_result->locally_valid() &&
-               disable_fence_release_result->request == *disable_fence_release_request)) &&
-             !lifecycle_primitive_intent.has_value() && !lifecycle_primitive_result.has_value() &&
-             !disable_handoff_request.has_value() && !disable_handoff_result.has_value();
+             (!completed || lifecycle_primitive_result->matches(*lifecycle_primitive_intent));
   }
   return false;
 }
@@ -620,45 +417,25 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
                               watermark.highest_effect_sequence == attempt.effect_sequence;
                      }) ||
         status->accepted_intent.controllable_component_id !=
-            (attempt.effect_kind == CCLCEffectKindDTO::kBrandLifecyclePrimitive
-                 ? attempt.lifecycle_primitive_intent->controllable_component_id
-             : attempt.effect_kind == CCLCEffectKindDTO::kKernelDisableHandoff
-                 ? attempt.disable_handoff_request->controllable_component_id
-                 : attempt.disable_fence_release_request->controllable_component_id)) {
+            attempt.lifecycle_primitive_intent->controllable_component_id) {
       return false;
     }
-    if (attempt.effect_kind == CCLCEffectKindDTO::kBrandLifecyclePrimitive) {
-      const auto& primitive = *attempt.lifecycle_primitive_intent;
-      if (std::none_of(status->domains.begin(), status->domains.end(), [&](const auto& domain) {
-            return domain.control_domain_id == primitive.control_domain_id &&
-                   domain.resolved_provider_occurrence.has_value() &&
-                   domain.resolved_provider_occurrence->provider_instance_id ==
-                       primitive.provider_instance_id &&
-                   domain.resolved_provider_occurrence->provider_manifest_id ==
-                       primitive.provider_manifest_id &&
-                   domain.resolved_provider_occurrence->provider_manifest_revision ==
-                       primitive.provider_manifest_revision &&
-                   domain.resolved_provider_occurrence->provider_runtime_unit_id ==
-                       primitive.provider_runtime_unit_id &&
-                   domain.resolved_provider_occurrence->provider_runtime_epoch ==
-                       primitive.provider_runtime_epoch;
-          })) {
-        return false;
-      }
-    } else if (status->accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
+    const auto& primitive = *attempt.lifecycle_primitive_intent;
+    if (std::none_of(status->domains.begin(), status->domains.end(), [&](const auto& domain) {
+          return domain.control_domain_id == primitive.control_domain_id &&
+                 domain.resolved_provider_occurrence.has_value() &&
+                 domain.resolved_provider_occurrence->provider_instance_id ==
+                     primitive.provider_instance_id &&
+                 domain.resolved_provider_occurrence->provider_manifest_id ==
+                     primitive.provider_manifest_id &&
+                 domain.resolved_provider_occurrence->provider_manifest_revision ==
+                     primitive.provider_manifest_revision &&
+                 domain.resolved_provider_occurrence->provider_runtime_unit_id ==
+                     primitive.provider_runtime_unit_id &&
+                 domain.resolved_provider_occurrence->provider_runtime_epoch ==
+                     primitive.provider_runtime_epoch;
+        })) {
       return false;
-    } else if (attempt.effect_kind == CCLCEffectKindDTO::kKernelDisableHandoff) {
-      if (status->disable_handoff.has_value() || status->configuration_fence.has_value()) {
-        return false;
-      }
-    } else {
-      const auto& release = *attempt.disable_fence_release_request;
-      if (status->disable_handoff != std::optional(release.ready_handoff) ||
-          !status->configuration_fence.has_value() ||
-          status->configuration_fence->state != ConfigurationFenceState::kHeld ||
-          status->disable_fence_released.has_value()) {
-        return false;
-      }
     }
   }
 
@@ -1122,368 +899,6 @@ bool ExpectedDomainMatchesResolvedScope(
              current.active_control_configuration->active_control_configuration_generation;
 }
 
-bool DisableHandoffPreservesOrWidensScope(const DisableHandoffRequestDTO& request,
-                                          const DisableHandoffStatusDTO& status) noexcept {
-  return request.locally_valid() && status.locally_valid() &&
-         status.lifecycle_transaction_id == request.lifecycle_transaction_id &&
-         status.lifecycle_transaction_generation == request.lifecycle_transaction_generation &&
-         status.controllable_component_id == request.controllable_component_id &&
-         fence_scope_membership_is_subset(request.affected_scope, status.scope) &&
-         (request.scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull ||
-          status.scope_resolution == DisableHandoffScopeResolutionDTO::kPromotedToFull);
-}
-
-bool ConfigurationFenceHandleDTO::locally_valid() const noexcept {
-  if (!bounded_identity(configuration_fence_id) || !configuration_fence_generation.nonzero() ||
-      !bounded_identity(lifecycle_transaction_id) || !lifecycle_transaction_generation.nonzero() ||
-      !bounded_identity(controllable_component_id) || !scope.valid() ||
-      !fence_scope_bounded(scope) || reason.empty() || reason.size() > kMaxLifecycleReasonBytes ||
-      !known(state) || !fence_scope_contains_component(scope, controllable_component_id)) {
-    return false;
-  }
-  return std::all_of(scope.domains.begin(), scope.domains.end(),
-                     [](const ConfigurationFenceDomainScopeDTO& domain) {
-                       return domain.predecessor_control_domain_revision.has_value() &&
-                              !domain.candidate_control_domain_revision.has_value();
-                     }) &&
-         std::all_of(scope.bindings.begin(), scope.bindings.end(),
-                     [](const ConfigurationFenceBindingScopeDTO& binding) {
-                       return binding.predecessor_control_binding_revision.has_value() &&
-                              !binding.candidate_control_binding_revision.has_value();
-                     });
-}
-
-bool CurrentDomainActiveControlConfigurationDTO::locally_valid() const noexcept {
-  return bounded_identity(control_domain_id) && active_control_configuration.locally_valid();
-}
-
-bool DisableHandoffComponentScopeExpectationDTO::locally_valid() const noexcept {
-  if (!bounded_identity(component_snapshot_digest) || !active_publication_generation.nonzero() ||
-      !bounded_identity(active_public_pointer_digest) || !bounded_identity(retained_bundle_id) ||
-      !bounded_identity(graph_revision) || !component_lifecycle_generation.nonzero() ||
-      !component_scope.valid() || !fence_scope_bounded(component_scope) ||
-      component_scope.controllable_component_ids.size() != 1U ||
-      current_active_control_configurations.size() != component_scope.domains.size()) {
-    return false;
-  }
-  const auto less = [](const CurrentDomainActiveControlConfigurationDTO& left,
-                       const CurrentDomainActiveControlConfigurationDTO& right) {
-    return left.control_domain_id < right.control_domain_id;
-  };
-  if (!sorted_unique(current_active_control_configurations, less)) {
-    return false;
-  }
-  for (std::size_t index = 0U; index < current_active_control_configurations.size(); ++index) {
-    if (!current_active_control_configurations[index].locally_valid() ||
-        current_active_control_configurations[index].control_domain_id !=
-            component_scope.domains[index].control_domain_id) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool DisableHandoffAdmissionQueryDTO::locally_valid() const noexcept {
-  if (!bounded_identity(controllable_component_id) || !known(request_kind) ||
-      (component_expectation.has_value() &&
-       (!component_expectation->locally_valid() ||
-        component_expectation->component_scope.controllable_component_ids.front() !=
-            controllable_component_id))) {
-    return false;
-  }
-  switch (request_kind) {
-    case DisableHandoffScopeRequestKindDTO::kResolvedComponentScope:
-      return component_expectation.has_value();
-    case DisableHandoffScopeRequestKindDTO::kFullStopRequired:
-      return !component_expectation.has_value();
-  }
-  return false;
-}
-
-bool DisableHandoffAdmissionSnapshotDTO::locally_valid() const noexcept {
-  if (!query.locally_valid() || !bounded_identity(request_owner_epoch) ||
-      !known(scope_resolution) || !current_scope.valid() || !fence_scope_bounded(current_scope) ||
-      !active_publication_generation.nonzero() || !bounded_identity(active_public_pointer_digest) ||
-      !bounded_identity(retained_bundle_id) || !bounded_identity(graph_revision) ||
-      current_active_control_configurations.size() != current_scope.domains.size() ||
-      !bounded_identity(snapshot_digest)) {
-    return false;
-  }
-  if (query.request_kind == DisableHandoffScopeRequestKindDTO::kFullStopRequired &&
-      scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull) {
-    return false;
-  }
-  if (scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull &&
-      (query.request_kind != DisableHandoffScopeRequestKindDTO::kResolvedComponentScope ||
-       current_scope.controllable_component_ids.size() != 1U ||
-       current_scope.controllable_component_ids.front() != query.controllable_component_id)) {
-    return false;
-  }
-  const auto less = [](const CurrentDomainActiveControlConfigurationDTO& left,
-                       const CurrentDomainActiveControlConfigurationDTO& right) {
-    return left.control_domain_id < right.control_domain_id;
-  };
-  if (!sorted_unique(current_active_control_configurations, less)) {
-    return false;
-  }
-  for (std::size_t index = 0U; index < current_active_control_configurations.size(); ++index) {
-    if (!current_active_control_configurations[index].locally_valid() ||
-        current_active_control_configurations[index].control_domain_id !=
-            current_scope.domains[index].control_domain_id) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool DisableHandoffRequestDTO::locally_valid() const noexcept {
-  if (!context_valid(owner_request_context) || !bounded_identity(initiating_public_request_id) ||
-      !bounded_identity(lifecycle_transaction_id) || !lifecycle_transaction_generation.nonzero() ||
-      !bounded_identity(controllable_component_id) || !known(scope_resolution) ||
-      !affected_scope.valid() || !fence_scope_bounded(affected_scope) ||
-      !bounded_identity(disable_admission_snapshot_digest) ||
-      !expected_active_publication_generation.nonzero() ||
-      !bounded_identity(expected_active_public_pointer_digest) ||
-      !bounded_identity(expected_graph_revision) ||
-      !bounded_identity(expected_retained_bundle_id) ||
-      !expected_component_lifecycle_generation.nonzero() ||
-      expected_active_control_configurations.size() != affected_scope.domains.size()) {
-    return false;
-  }
-  if (scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull &&
-      (affected_scope.controllable_component_ids.size() != 1U ||
-       affected_scope.controllable_component_ids.front() != controllable_component_id)) {
-    return false;
-  }
-  if (!std::all_of(affected_scope.domains.begin(), affected_scope.domains.end(),
-                   [](const ConfigurationFenceDomainScopeDTO& domain) {
-                     return domain.predecessor_control_domain_revision.has_value() &&
-                            !domain.candidate_control_domain_revision.has_value();
-                   }) ||
-      !std::all_of(affected_scope.bindings.begin(), affected_scope.bindings.end(),
-                   [](const ConfigurationFenceBindingScopeDTO& binding) {
-                     return binding.predecessor_control_binding_revision.has_value() &&
-                            !binding.candidate_control_binding_revision.has_value();
-                   })) {
-    return false;
-  }
-  const auto less = [](const CurrentDomainActiveControlConfigurationDTO& left,
-                       const CurrentDomainActiveControlConfigurationDTO& right) {
-    return left.control_domain_id < right.control_domain_id;
-  };
-  if (!sorted_unique(expected_active_control_configurations, less)) {
-    return false;
-  }
-  for (std::size_t index = 0U; index < expected_active_control_configurations.size(); ++index) {
-    const auto& configuration = expected_active_control_configurations[index];
-    if (!configuration.locally_valid() ||
-        configuration.control_domain_id != affected_scope.domains[index].control_domain_id) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool DisableHandoffAcceptedDTO::locally_valid() const noexcept {
-  return bounded_identity(request_id) && IsAcceptedRequestReplayStatus(replay_status) &&
-         bounded_identity(lifecycle_transaction_id) && lifecycle_transaction_generation.nonzero() &&
-         bounded_identity(controllable_component_id) && known(scope_resolution) &&
-         bounded_identity(component_scope_digest) && bounded_identity(configuration_fence_id) &&
-         configuration_fence_generation.nonzero() &&
-         stop_id.has_value() == stop_generation.has_value() &&
-         (!stop_id.has_value() || (bounded_identity(*stop_id) && stop_generation->nonzero()));
-}
-
-bool DisableHandoffAcceptedDTO::matches(const DisableHandoffRequestDTO& request) const noexcept {
-  return locally_valid() && request.locally_valid() &&
-         request_id == request.owner_request_context.request_id &&
-         lifecycle_transaction_id == request.lifecycle_transaction_id &&
-         lifecycle_transaction_generation == request.lifecycle_transaction_generation &&
-         controllable_component_id == request.controllable_component_id &&
-         (request.scope_resolution != DisableHandoffScopeResolutionDTO::kPromotedToFull ||
-          scope_resolution == DisableHandoffScopeResolutionDTO::kPromotedToFull);
-}
-
-bool DisableHandoffStatusDTO::locally_valid() const noexcept {
-  if (!bounded_identity(lifecycle_transaction_id) || !lifecycle_transaction_generation.nonzero() ||
-      !bounded_identity(controllable_component_id) || !known(scope_resolution) ||
-      !bounded_identity(component_scope_digest) || !bounded_identity(configuration_fence_id) ||
-      !configuration_fence_generation.nonzero() || !known(state) || !scope.valid() ||
-      !configuration_fence_handle.locally_valid() ||
-      configuration_fence_handle.configuration_fence_id != configuration_fence_id ||
-      configuration_fence_handle.configuration_fence_generation != configuration_fence_generation ||
-      configuration_fence_handle.lifecycle_transaction_id != lifecycle_transaction_id ||
-      configuration_fence_handle.lifecycle_transaction_generation !=
-          lifecycle_transaction_generation ||
-      configuration_fence_handle.controllable_component_id != controllable_component_id ||
-      configuration_fence_handle.scope != scope ||
-      configuration_fence_handle.state != ConfigurationFenceState::kHeld ||
-      (stop_certificate.has_value() && (!stop_certificate->locally_valid() ||
-                                        !bounded_identity(stop_certificate->stop_certificate_id) ||
-                                        !bounded_identity(stop_certificate->stop_id))) ||
-      cancelled_queued_operations.size() > kMaxLifecycleCancelledOperations ||
-      !std::is_sorted(cancelled_queued_operations.begin(), cancelled_queued_operations.end()) ||
-      std::adjacent_find(cancelled_queued_operations.begin(), cancelled_queued_operations.end()) !=
-          cancelled_queued_operations.end() ||
-      std::any_of(
-          cancelled_queued_operations.begin(), cancelled_queued_operations.end(),
-          [](const OperationId& operation_id) { return !bounded_identity(operation_id); }) ||
-      !error_valid(error)) {
-    return false;
-  }
-  switch (state) {
-    case DisableHandoffStateDTO::kStopping:
-      return !stop_certificate.has_value() && !error.has_value();
-    case DisableHandoffStateDTO::kReady:
-      return !error.has_value();
-    case DisableHandoffStateDTO::kFailed:
-      return !stop_certificate.has_value() && error.has_value();
-  }
-  return false;
-}
-
-bool DisableHandoffAttemptReconciliationDTO::locally_valid() const noexcept {
-  if (!request.locally_valid() || !known(disposition) || !error_valid(error) ||
-      (acceptance.has_value() && !acceptance->matches(request)) ||
-      (status.has_value() &&
-       (!status->locally_valid() || !DisableHandoffPreservesOrWidensScope(request, *status)))) {
-    return false;
-  }
-  const bool exact_pair =
-      acceptance.has_value() && status.has_value() &&
-      status->lifecycle_transaction_id == request.lifecycle_transaction_id &&
-      status->lifecycle_transaction_generation == request.lifecycle_transaction_generation &&
-      status->controllable_component_id == request.controllable_component_id &&
-      status->scope_resolution == acceptance->scope_resolution &&
-      status->component_scope_digest == acceptance->component_scope_digest &&
-      status->configuration_fence_id == acceptance->configuration_fence_id &&
-      status->configuration_fence_generation == acceptance->configuration_fence_generation;
-  switch (disposition) {
-    case DisableHandoffAttemptDispositionDTO::kAcceptedExact:
-      return exact_pair && !error.has_value();
-    case DisableHandoffAttemptDispositionDTO::kNotSeen:
-      return !acceptance.has_value() && !status.has_value() && !error.has_value();
-    case DisableHandoffAttemptDispositionDTO::kConflicting:
-    case DisableHandoffAttemptDispositionDTO::kUncertain:
-      return !exact_pair && error.has_value();
-  }
-  return false;
-}
-
-bool DisableHandoffEffectResultDTO::locally_valid() const noexcept {
-  if (!request.locally_valid() || !known(disposition) ||
-      (acceptance.has_value() && !acceptance->matches(request))) {
-    return false;
-  }
-  switch (disposition) {
-    case DisableHandoffEffectDispositionDTO::kAccepted:
-      return acceptance.has_value();
-    case DisableHandoffEffectDispositionDTO::kProvenNotSeen:
-      return !acceptance.has_value();
-  }
-  return false;
-}
-
-bool DisableFenceReleaseRequestDTO::locally_valid() const noexcept {
-  if (!context_valid(owner_request_context) || !bounded_identity(initiating_public_request_id) ||
-      !bounded_identity(lifecycle_transaction_id) || !lifecycle_transaction_generation.nonzero() ||
-      !bounded_identity(controllable_component_id) || !ready_handoff.locally_valid() ||
-      ready_handoff.state != DisableHandoffStateDTO::kReady ||
-      ready_handoff.lifecycle_transaction_id != lifecycle_transaction_id ||
-      ready_handoff.lifecycle_transaction_generation != lifecycle_transaction_generation ||
-      ready_handoff.controllable_component_id != controllable_component_id ||
-      ready_handoff.configuration_fence_handle.state != ConfigurationFenceState::kHeld ||
-      release_precondition_status_sequence == 0U ||
-      !bounded_identity(release_precondition_status_digest) ||
-      !current_component_expectation.locally_valid() ||
-      current_component_expectation.component_scope.controllable_component_ids.front() !=
-          controllable_component_id ||
-      !current_admission_snapshot.locally_valid() ||
-      current_admission_snapshot.query.controllable_component_id != controllable_component_id ||
-      current_admission_snapshot.request_owner_epoch != owner_request_context.request_owner_epoch ||
-      current_admission_snapshot.current_scope != ready_handoff.scope ||
-      current_admission_snapshot.configuration_fence_generation !=
-          ready_handoff.configuration_fence_generation ||
-      current_admission_snapshot.active_publication_generation !=
-          current_component_expectation.active_publication_generation ||
-      current_admission_snapshot.active_public_pointer_digest !=
-          current_component_expectation.active_public_pointer_digest ||
-      current_admission_snapshot.retained_bundle_id !=
-          current_component_expectation.retained_bundle_id ||
-      current_admission_snapshot.graph_revision != current_component_expectation.graph_revision) {
-    return false;
-  }
-  if (ready_handoff.scope_resolution == DisableHandoffScopeResolutionDTO::kPromotedToFull) {
-    return current_admission_snapshot.query.request_kind ==
-               DisableHandoffScopeRequestKindDTO::kFullStopRequired &&
-           current_admission_snapshot.scope_resolution ==
-               DisableHandoffScopeResolutionDTO::kPromotedToFull &&
-           fence_scope_is_exact_subset(current_component_expectation.component_scope,
-                                       current_admission_snapshot.current_scope) &&
-           exact_rows_are_subset(
-               current_component_expectation.current_active_control_configurations,
-               current_admission_snapshot.current_active_control_configurations,
-               [](const auto& row) { return row.control_domain_id; });
-  }
-  return current_admission_snapshot.query.request_kind ==
-             DisableHandoffScopeRequestKindDTO::kResolvedComponentScope &&
-         current_admission_snapshot.query.component_expectation == current_component_expectation &&
-         current_admission_snapshot.scope_resolution !=
-             DisableHandoffScopeResolutionDTO::kPromotedToFull &&
-         current_component_expectation.component_scope == ready_handoff.scope &&
-         current_admission_snapshot.current_active_control_configurations ==
-             current_component_expectation.current_active_control_configurations;
-}
-
-bool DisableFenceReleasedDTO::locally_valid() const noexcept {
-  return request.locally_valid() && IsAcceptedRequestReplayStatus(replay_status) &&
-         released_at_ns >= 0 && bounded_identity(configuration_fence_id) &&
-         configuration_fence_generation.nonzero() &&
-         configuration_fence_id == request.ready_handoff.configuration_fence_id &&
-         configuration_fence_generation == request.ready_handoff.configuration_fence_generation &&
-         bounded_identity(scope_digest) &&
-         scope_digest == request.ready_handoff.component_scope_digest &&
-         bounded_identity(receipt_digest);
-}
-
-bool DisableFenceReleasedDTO::matches(
-    const DisableFenceReleaseRequestDTO& candidate) const noexcept {
-  return locally_valid() && candidate.locally_valid() && request == candidate;
-}
-
-bool DisableFenceReleaseAttemptReconciliationDTO::locally_valid() const noexcept {
-  if (!request.locally_valid() || !known(disposition) || !error_valid(error) ||
-      (release_receipt.has_value() && !release_receipt->matches(request)) ||
-      (current_handoff_status.has_value() && !current_handoff_status->locally_valid())) {
-    return false;
-  }
-  switch (disposition) {
-    case DisableFenceReleaseAttemptDispositionDTO::kReleasedExact:
-      return release_receipt.has_value() && !error.has_value();
-    case DisableFenceReleaseAttemptDispositionDTO::kNotReleasedHeld:
-      return !release_receipt.has_value() && !error.has_value() &&
-             current_handoff_status == request.ready_handoff;
-    case DisableFenceReleaseAttemptDispositionDTO::kConflicting:
-    case DisableFenceReleaseAttemptDispositionDTO::kUncertain:
-      return !release_receipt.has_value() && error.has_value();
-  }
-  return false;
-}
-
-bool DisableFenceReleaseEffectResultDTO::locally_valid() const noexcept {
-  if (!request.locally_valid() || !known(disposition) ||
-      (release_receipt.has_value() && !release_receipt->matches(request))) {
-    return false;
-  }
-  switch (disposition) {
-    case DisableFenceReleaseEffectDispositionDTO::kReleased:
-      return release_receipt.has_value();
-    case DisableFenceReleaseEffectDispositionDTO::kProvenNotReleasedHeld:
-      return !release_receipt.has_value();
-  }
-  return false;
-}
-
 bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
   if (!bounded_identity(control_domain_id) ||
       (!expected_domain.has_value() && !current_scope.has_value()) ||
@@ -1592,7 +1007,6 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       domains.size() > (accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable
                             ? kMaxLifecycleDisableDomainUnion
                             : kMaxLifecycleResolvedDomains) ||
-      (disable_fence_released.has_value() && !disable_fence_released->locally_valid()) ||
       !error_valid(error) || accepted_at_ns != acceptance.accepted_at_ns || accepted_at_ns < 0 ||
       latest_updated_at_ns < 0 ||
       (status_owner_epoch == accepted_intent.request_context.request_owner_epoch &&
@@ -1739,56 +1153,11 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
     return false;
   }
 
-  if (accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
-    return !configuration_fence.has_value() && !disable_handoff.has_value() &&
-           !disable_fence_released.has_value();
-  }
-
-  // Fresh ordinary Disable is an idle-claim lifecycle mutation. Only durable
-  // pre-cutover transactions carry the Stop-handoff/fence fields below.
-  if (!disable_handoff.has_value()) {
-    return (phase != ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
-            reconciliation_required) &&
-           !configuration_fence.has_value() &&
-           !disable_fence_released.has_value();
-  }
-
-  if (phase == ComponentLifecycleTransactionPhaseDTO::kAccepted ||
-      phase == ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains) {
-    return false;
-  }
-  if (!disable_handoff->locally_valid() ||
-      disable_handoff->lifecycle_transaction_id != acceptance.lifecycle_transaction_id ||
-      disable_handoff->lifecycle_transaction_generation !=
-          acceptance.lifecycle_transaction_generation ||
-      disable_handoff->controllable_component_id != accepted_intent.controllable_component_id) {
-    return false;
-  }
-  if (disable_handoff->state == DisableHandoffStateDTO::kReady) {
-    if (!configuration_fence.has_value() || !configuration_fence->locally_valid() ||
-        !same_fence_identity_and_scope(*configuration_fence,
-                                       disable_handoff->configuration_fence_handle)) {
-      return false;
-    }
-    if (!disable_fence_released.has_value()) {
-      return !terminal_phase &&
-             (configuration_fence->state == ConfigurationFenceState::kHeld ||
-              configuration_fence->state == ConfigurationFenceState::kReleasePending);
-    }
-    const auto& receipt = *disable_fence_released;
-    return terminal_phase && !reconciliation_required &&
-           configuration_fence->state == ConfigurationFenceState::kReleased &&
-           receipt.request.ready_handoff == *disable_handoff &&
-           receipt.request.lifecycle_transaction_id == acceptance.lifecycle_transaction_id &&
-           receipt.request.lifecycle_transaction_generation ==
-               acceptance.lifecycle_transaction_generation &&
-           receipt.request.controllable_component_id == accepted_intent.controllable_component_id &&
-           receipt.request.release_precondition_status_sequence < status_sequence &&
-           receipt.configuration_fence_id == configuration_fence->configuration_fence_id &&
-           receipt.configuration_fence_generation ==
-               configuration_fence->configuration_fence_generation;
-  }
-  return !terminal_phase && !configuration_fence.has_value() && !disable_fence_released.has_value();
+  // Disable is idle-only: it runs under the same cell claim as Prepare and
+  // Enable and never carries a Kernel Stop or configuration-fence record.
+  return accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable ||
+         phase != ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
+         reconciliation_required;
 }
 
 }  // namespace manyforge::core

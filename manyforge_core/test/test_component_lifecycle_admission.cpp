@@ -145,38 +145,16 @@ constexpr std::int64_t kAcceptedAtNs = 100;
           {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt}};
 }
 
-[[nodiscard]] DisableHandoffAdmissionSnapshotDTO ScopedDisableAdmission(
-    const ComponentLifecycleCurrentSnapshotDTO& snapshot,
-    DisableHandoffScopeResolutionDTO resolution = DisableHandoffScopeResolutionDTO::kExact) {
-  const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot);
-  EXPECT_TRUE(expectation.ok());
-  return {{snapshot.controllable_component_id,
-           DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation.value()},
-          RequestOwnerEpoch("kernel-owner.1"),
-          resolution,
-          expectation.value().component_scope,
-          expectation.value().active_publication_generation,
-          expectation.value().active_public_pointer_digest,
-          expectation.value().retained_bundle_id,
-          expectation.value().graph_revision,
-          9U,
-          ConfigurationFenceGeneration(11U),
-          expectation.value().current_active_control_configurations,
-          ContentDigest("disable-admission.1")};
-}
-
 [[nodiscard]] ComponentLifecycleAdmissionCandidate Candidate(
     std::optional<ComponentLifecycleCurrentSnapshotDTO> snapshot,
     std::vector<BrandLifecyclePlanCatalogDTO> catalogs,
-    std::optional<DisableHandoffAdmissionSnapshotDTO> disable_admission = std::nullopt,
     ComponentLifecycleGeneration durable_predecessor = ComponentLifecycleGeneration(3U)) {
   return {LifecycleTransactionId("lifecycle-transaction.1"),
           LifecycleTransactionGeneration(8U),
           durable_predecessor,
           kAcceptedAtNs,
           std::move(snapshot),
-          std::move(catalogs),
-          std::move(disable_admission)};
+          std::move(catalogs)};
 }
 
 TEST(ComponentLifecycleAdmission, PreparesExactFixedTargetFromCurrentProviderCatalogClosure) {
@@ -199,7 +177,6 @@ TEST(ComponentLifecycleAdmission, PreparesExactFixedTargetFromCurrentProviderCat
   ASSERT_TRUE(prepared.value().qualified_lifecycle_plan_catalogs.has_value());
   EXPECT_EQ(*prepared.value().qualified_lifecycle_plan_catalogs,
             std::vector<BrandLifecyclePlanCatalogDTO>{catalog});
-  EXPECT_TRUE(prepared.value().lifecycle_mutation_eligible);
   ASSERT_EQ(prepared.value().initial_status.domains.size(), 1U);
   EXPECT_EQ(prepared.value().initial_status.requested_state.state,
             ComponentLifecycleStateDTO::kPrepared);
@@ -279,16 +256,14 @@ TEST(ComponentLifecycleAdmission, DisableRejectsChangedDomainSetBeforeReservatio
 
   const auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected_a, expected_b}),
-      Candidate(snapshot, {catalog_a, catalog_c},
-                ScopedDisableAdmission(
-                    snapshot, DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved)));
+      Candidate(snapshot, {catalog_a, catalog_c}));
 
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.error().code, "component_lifecycle_configuration_stale");
 }
 
 TEST(ComponentLifecycleAdmission,
-     OrdinaryDisableUsesTheCurrentSnapshotWithoutAStopHandoff) {
+     OrdinaryDisableUsesTheCurrentSnapshotUnderTheIdleClaim) {
   const auto expected = ExpectedDomain("a");
   auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   const auto catalog = Catalog(
@@ -300,8 +275,6 @@ TEST(ComponentLifecycleAdmission,
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
       Candidate(snapshot, {catalog}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_TRUE(prepared.value().lifecycle_mutation_eligible);
-  EXPECT_FALSE(prepared.value().initial_status.disable_handoff.has_value());
   EXPECT_EQ(prepared.value().initial_status.requested_state.state,
             ComponentLifecycleStateDTO::kDisabled);
   EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, 6'000);
@@ -317,7 +290,7 @@ TEST(ComponentLifecycleAdmission, DisableRejectsUnqualifiedCatalogBeforeReservat
 
   const auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
-      Candidate(snapshot, {catalog}, ScopedDisableAdmission(snapshot)));
+      Candidate(snapshot, {catalog}));
 
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.error().code, "component_lifecycle_catalog_mismatch");
@@ -334,8 +307,6 @@ TEST(ComponentLifecycleAdmission, StaleResolvedDisableDoesNotMintSuccessor) {
   const auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
       Candidate(snapshot, {catalog},
-                ScopedDisableAdmission(
-                    snapshot, DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved),
                 ComponentLifecycleGeneration(5U)));
 
   ASSERT_FALSE(prepared.ok());
@@ -352,7 +323,7 @@ TEST(ComponentLifecycleAdmission, NonDisableAndFutureDisableCannotBypassDurableP
 
   auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kEnable, {expected}),
-      Candidate(snapshot, {enable_catalog}, std::nullopt, ComponentLifecycleGeneration(5U)));
+      Candidate(snapshot, {enable_catalog}, ComponentLifecycleGeneration(5U)));
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.error().code, "component_lifecycle_current_snapshot_mismatch");
 
@@ -362,42 +333,19 @@ TEST(ComponentLifecycleAdmission, NonDisableAndFutureDisableCannotBypassDurableP
   prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected},
              ComponentLifecycleGeneration(6U)),
-      Candidate(snapshot, {disable_catalog}, ScopedDisableAdmission(snapshot),
+      Candidate(snapshot, {disable_catalog},
                 ComponentLifecycleGeneration(5U)));
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.error().code, "component_lifecycle_current_snapshot_mismatch");
 }
 
-TEST(ComponentLifecycleAdmission, NoSnapshotDisableDoesNotPromoteToContainment) {
+TEST(ComponentLifecycleAdmission, NoSnapshotDisableIsRefused) {
   const auto expected = ExpectedDomain("a");
-  const auto illustrative_snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   const auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
-      Candidate(std::nullopt, {}, ScopedDisableAdmission(illustrative_snapshot)));
+      Candidate(std::nullopt, {}));
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.error().code, "component_lifecycle_scope_unresolved");
-}
-
-TEST(ComponentLifecycleAdmission,
-     OrdinaryDisableRejectsALegacyStopHandoffSnapshot) {
-  const auto expected = ExpectedDomain("a");
-  auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
-  const auto catalog = Catalog(snapshot.provider_occurrences.front(),
-                               {FixedPlan(ComponentLifecycleIntentKindDTO::kDisable,
-                                          ComponentLifecycleStateDTO::kDisabled, 6'000)});
-  auto admission = ScopedDisableAdmission(snapshot);
-  admission.query.component_expectation->component_snapshot_digest =
-      ContentDigest("different-snapshot");
-  ASSERT_TRUE(admission.locally_valid());
-
-  const auto prepared = PrepareComponentLifecycleAdmission(
-      Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
-      Candidate(snapshot, {catalog}, admission));
-
-  ASSERT_FALSE(prepared.ok());
-  EXPECT_EQ(prepared.error().code, "component_lifecycle_admission_invalid");
-  EXPECT_EQ(prepared.error().details.at("reason"),
-            "unexpected_disable_handoff_admission");
 }
 
 }  // namespace

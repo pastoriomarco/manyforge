@@ -66,15 +66,17 @@ describe('Program workspace lifecycle controls', () => {
     const header = viewer.slice(viewer.indexOf('className="viewer-header-controls"'));
     expect(header.indexOf('className="viewer-tool-strip"'))
       .toBeLessThan(header.indexOf('{sceneSourceControl}'));
-    expect(scene).toContain('sceneSourceControl={draftSceneDifferent ? (');
+    expect(scene).toContain('sceneSourceControl={draftSceneEditable && draftDiffersFromApplied ? (');
+    expect(scene).toContain("programController.state.workspace?.hasUnappliedChanges === true");
     expect(scene).toContain('className="viewer-scene-source-toggle"');
     expect(scene).toContain("setSceneSourceChoice(programDraftPreview ? 'applied' : 'draft')");
     expect(scene).toContain("programDraftPreview ? 'Draft Scene' : 'Applied Scene'");
     expect(scene).toContain('robot models and observation status remain from Applied Deployment');
+    expect(scene).toContain('Applied Scene: the live cell, read-only while unapplied Draft changes exist.');
     expect(scene).not.toContain('Draft objects · Applied robots');
     // While execution is not Idle the live Scene is shown and the Draft is
-    // neither previewed nor compared.
-    expect(scene).toContain('const draftSceneDifferent = !executionActive && ');
+    // not previewed.
+    expect(scene).toContain('const draftSceneEditable = !executionActive && sceneSourceIsDraft(');
     expect(scene).toContain('const programDraftPreview = !executionActive && sceneSourceIsDraft(');
     expect(scene).toContain('ownerSceneKnown && !executionActive');
   });

@@ -607,3 +607,23 @@ export interface RuntimeScaleControlAccepted {
   activeOperationRevision: number | null;
   activeOperationScaleGeneration: number | null;
 }
+
+/**
+ * One robot's latest owner-admitted TCP speed in a Program run: copied from
+ * the Kernel's prepared-motion diagnostics in operation history. The browser
+ * never derives it.
+ */
+export interface AdmittedTcpSpeed {
+  controllableComponentId: string;
+  commandTargetId: string;
+  operationId: string;
+  occurredAtWall: string;
+  requestedTcpLinearSpeedMps: number | null;
+  deploymentMaximumTcpLinearSpeedMps: number;
+  admittedTcpLinearSpeedMps: number;
+}
+
+export interface ProgramRunAdmittedSpeeds {
+  programRunId: string;
+  targets: AdmittedTcpSpeed[];
+}

@@ -13,7 +13,6 @@ import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 import { api } from '../api/client';
-import { useOperationalErrorMirror } from '../state/operationalErrors';
 import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
 import {
   useExecutionObservationTransport,
@@ -39,22 +38,8 @@ import type { ViewerInspectorPanel } from './StructuralViewer';
 import {
   candidateTcpPoseFromCell,
   candidateTcpPoseInCell,
-  componentAttachmentFenceFromSnapshot,
-  editableProgramShapeFromObject,
-  livePoseFromProgramResource,
-  logicalSceneShapeFromProgramShape,
   sceneOwnerFacts,
-  sceneAttachTransaction,
-  sceneMutationFenceFromSnapshot,
-  sceneObjectMutationAvailability,
   sceneOwnerPresentation,
-  sceneObjectTransformTransaction,
-  sceneObjectUpdateTransaction,
-  sceneDetachTransaction,
-  sceneDuplicateTransaction,
-  scenePoseTransaction,
-  sceneRemoveTransaction,
-  type ComponentAttachmentFenceResult,
   type SceneObjectMutationAvailability,
   type SceneOwnerFacts,
   type RetainedSceneOwnerPresentation,
@@ -77,7 +62,6 @@ import {
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
-  programDraftPreviewActive,
   sceneSourceIsDraft,
   programViewerMetadata,
   viewerPresentationDraftFromProgram,
@@ -95,7 +79,6 @@ import type {
   ProgramSceneResource,
   ProgramViewerMetadata,
   SceneUrdfManifest,
-  SceneTransactionRequest,
   SceneRuntimePoseSource,
   SceneRuntimeProjection,
   SourceModelProjection,
@@ -166,11 +149,6 @@ function sceneSelectionKey(selection: SceneSelection): string | null {
   return selection === null ? null : `${selection.kind}:${selection.id}`;
 }
 
-function requestId(): string {
-  return globalThis.crypto?.randomUUID?.()
-    ?? `composer-scene-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
 function programRoleIds(
   program: ProgramDocument | ProgramAuthoringDocument | null,
   field: 'required_frame_roles' | 'required_resource_roles',
@@ -223,16 +201,6 @@ function programComponentFrameOptions(
     }
   }
   return options.sort((left, right) => left.id.localeCompare(right.id));
-}
-
-function objectEditReason(object: LogicalSceneObject): string | null {
-  if (object.placement.kind === 'carried') {
-    return 'Attached-object placement is attachment-owned and cannot be edited here.';
-  }
-  if (object.provider_evidence !== null) {
-    return 'This pose is provider-owned; Composer cannot replace provider evidence.';
-  }
-  return null;
 }
 
 function defaultResource(existingIds: Set<string>): ProgramSceneResource {
@@ -596,93 +564,6 @@ function SceneHierarchy({
   );
 }
 
-function AttachObjectControls({
-  object,
-  sourceModel,
-  disabled,
-  attachmentFence,
-  onAttach,
-}: {
-  object: LogicalSceneObject;
-  sourceModel: SourceModelProjection | null;
-  disabled: boolean;
-  attachmentFence: ComponentAttachmentFenceResult;
-  onAttach: (
-    target: {
-      componentId: string;
-      targetId: string;
-      frameRoleId: string;
-      touchBodyRoles: string[];
-    },
-    attachmentRevisions: string[],
-  ) => Promise<boolean>;
-}) {
-  const candidates = useMemo(() => (sourceModel?.targets ?? []).flatMap((target) => (
-    target.frames
-      .filter((frame) => frame.frame_kind === 'component_model_frame')
-      .map((frame) => ({
-        id: `${target.component_id}\u0000${target.target_id}\u0000${frame.frame_role_id}`,
-        componentId: target.component_id,
-        targetId: target.target_id,
-        frameRoleId: frame.frame_role_id,
-        touchBodyRoles: target.collision_bodies.map(
-          (body) => body.collision_body_role_id,
-        ).sort(),
-      }))
-  )), [sourceModel]);
-  const [candidateId, setCandidateId] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    if (!candidates.some((candidate) => candidate.id === candidateId)) {
-      setCandidateId(candidates[0]?.id ?? '');
-    }
-  }, [candidateId, candidates]);
-  const selected = candidates.find((candidate) => candidate.id === candidateId) ?? null;
-  return (
-    <div className="scene-attach-controls">
-      <label>
-        <span>Carrier target / frame</span>
-        <select
-          value={candidateId}
-          disabled={disabled || candidates.length === 0 || busy}
-          onChange={(event) => setCandidateId(event.target.value)}
-        >
-          {candidates.length === 0 && <option value="">No compatible carrier target</option>}
-          {candidates.map((candidate) => (
-            <option value={candidate.id} key={candidate.id}>
-              {candidate.componentId} · {candidate.targetId} · {candidate.frameRoleId}
-            </option>
-          ))}
-        </select>
-      </label>
-      {selected !== null && (
-        <span className="muted">
-          Touch bodies: {selected.touchBodyRoles.join(', ') || 'none advertised'}
-        </span>
-      )}
-      <button
-        type="button"
-        disabled={disabled || !attachmentFence.available || selected === null || busy}
-        title={attachmentFence.available
-          ? 'Attach this object to the selected robot frame in the live Scene; it then moves with the robot.'
-          : attachmentFence.reason}
-        onClick={() => {
-          if (selected === null || !attachmentFence.available) return;
-          setBusy(true);
-          setError(null);
-          void onAttach(selected, attachmentFence.revisions).catch((reason: unknown) => {
-            setError(reason instanceof Error ? reason.message : 'Attach failed.');
-          }).finally(() => setBusy(false));
-        }}
-      >
-        Attach {object.scene_resource_id}
-      </button>
-      {error !== null && <span className="scene-commit-error inline-message severity-error" role="alert">{error}</span>}
-    </div>
-  );
-}
-
 function MeshResourceBrowser({
   onSelect,
 }: {
@@ -888,7 +769,7 @@ function SceneShapeFields({
             className="quiet-button"
             aria-expanded={meshBrowserOpen}
             disabled={disabled}
-            title={disabled ? disabledTitle : undefined}
+            title={disabled ? disabledTitle : 'Pick the mesh for this object from the approved mesh files.'}
             onPointerDown={(event) => event.preventDefault()}
             onClick={() => setMeshBrowserOpen((current) => !current)}
           >
@@ -930,12 +811,54 @@ function SceneShapeFields({
   );
 }
 
-function ProgramSceneEditor({
+/** Why the live object cannot be copied into the Draft, or null when it can. */
+function observedCopyUnavailableReason(object: LogicalSceneObject | undefined): string | null {
+  if (object === undefined) return 'This object is not in the live cell.';
+  if (object.placement.kind !== 'cell_fixed') {
+    return 'This object is Attached in the live cell; copy it once it is Detached.';
+  }
+  if (object.collision_shapes.length !== 1) {
+    return 'Only a live object with exactly one collision shape can be copied.';
+  }
+  return null;
+}
+
+/** The single capture action: the object as observed now in the live cell, into the Draft. */
+function CopyObservedToDraftButton({
+  object,
+  blockedReason,
+  mutate,
+}: {
+  object: LogicalSceneObject | undefined;
+  /** The shared Draft edit gate reason; null while the Draft is editable. */
+  blockedReason: string | null;
+  mutate: ProgramWorkspaceController['mutate'];
+}) {
+  const reason = blockedReason ?? observedCopyUnavailableReason(object);
+  return (
+    <button
+      type="button"
+      disabled={reason !== null}
+      title={reason ?? 'Copy this object as observed now in the live cell into the Program Draft, replacing the Draft copy. Apply or Save to keep it.'}
+      onPointerDown={(event) => event.preventDefault()}
+      onClick={() => {
+        if (reason === null && object !== undefined) {
+          void mutate('program_draft_store_observed_scene_resource', {
+            scene_resource_id: object.scene_resource_id,
+          });
+        }
+      }}
+    >Copy current position to Draft</button>
+  );
+}
+
+export function ProgramSceneEditor({
   program,
   draftRevision,
   busy,
   busyReason,
   mutate,
+  liveObjects,
   selectedResourceId,
   onSelectResource,
 }: {
@@ -944,6 +867,8 @@ function ProgramSceneEditor({
   busy: boolean;
   busyReason: string | null;
   mutate: ProgramWorkspaceController['mutate'];
+  /** The live cell objects, for copying an observed position into the Draft. */
+  liveObjects: LogicalSceneObject[];
   selectedResourceId: string | null;
   onSelectResource: (sceneResourceId: string | null) => void;
 }) {
@@ -1062,19 +987,18 @@ function ProgramSceneEditor({
         <button
           type="button"
           disabled={busy}
-          title={blockedTitle}
           onPointerDown={(event) => event.preventDefault()}
           onClick={() => addResource(defaultResource(
             new Set(resources.map((resource) => resource.scene_resource_id)),
           ))}
+          title={blockedTitle ?? 'Add a new 10 cm box to the Program Draft.'}
         >
           Add box
         </button>
       </header>
       <p>
-        These resources belong to the editable Program. They are not the current runtime scene.
-        Save persists this Draft. Runtime Apply, Revert-to-Saved, and
-        Discard-to-Applied remain unavailable at their named scene-workflow gate.
+        These objects belong to the Program Draft, not the live cell. Each committed field
+        change is one Draft edit; Apply, Revert, or Discard in the top bar.
       </p>
       <label>
       <span>Resource</span>
@@ -1153,6 +1077,7 @@ function ProgramSceneEditor({
                 <span>{axis} (m)</span>
                 <input
                   type="number"
+                  aria-label={`Draft ${axis} position (m)`}
                   step={0.001}
                   value={staged.pose.position_m[index]}
                   disabled={busy}
@@ -1226,17 +1151,24 @@ function ProgramSceneEditor({
             <button
               type="button"
               disabled={busy}
-              title={blockedTitle}
+              title={blockedTitle ?? 'Add a copy of this object to the Program Draft, offset by 5 cm.'}
               onPointerDown={(event) => event.preventDefault()}
               onClick={duplicateSelected}
             >
               Duplicate
             </button>
+            <CopyObservedToDraftButton
+              object={liveObjects.find(
+                (object) => object.scene_resource_id === staged.scene_resource_id,
+              )}
+              blockedReason={busy ? busyReason ?? 'The Program Draft cannot be edited now.' : null}
+              mutate={mutate}
+            />
             <button
               className="danger-button"
               type="button"
               disabled={busy}
-              title={blockedTitle}
+              title={blockedTitle ?? 'Remove this object from the Program Draft.'}
               onPointerDown={(event) => event.preventDefault()}
               onClick={() => mutate('scene_draft_remove_objects', {
                 scene_resource_ids: [staged.scene_resource_id],
@@ -1531,8 +1463,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   draftIdentity,
   viewer,
   selection,
-  livePose,
-  liveShape,
   selectionLocked,
   onSelect,
   ghost,
@@ -1540,15 +1470,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   candidatePresentationAllowed,
   candidatePoseEditable,
   gizmo,
-  onCommitTransform,
-  onDuplicate,
-  onRemove,
-  onDetach,
   onDuplicateProgramResource,
   onRemoveProgramResource,
   onCommitProgramTransform,
   onEditSelection,
-  mutationAvailability,
   hiddenSelectionKeys,
   objectAxesSelectionKeys,
   onObjectAxesVisibleIdsChange,
@@ -1582,8 +1507,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   draftIdentity: { draftId: string; draftRevision: number } | null;
   viewer: ProgramViewerMetadata | undefined;
   selection: SceneSelection;
-  livePose: LogicalScenePose | null;
-  liveShape: ProgramSceneResource['shape'] | null;
   selectionLocked: boolean;
   onSelect: (selection: SceneSelection) => void;
   ghost: Pose3Value | null;
@@ -1591,15 +1514,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   candidatePresentationAllowed: boolean;
   candidatePoseEditable: boolean;
   gizmo: GizmoController;
-  onCommitTransform: (
-    sceneResourceId: string,
-    pose: LogicalScenePose,
-    scale: [number, number, number],
-    expectedOwnerIdentity: { ownerEpoch: string; generation: number },
-  ) => Promise<boolean>;
-  onDuplicate: (sceneResourceId: string) => Promise<boolean>;
-  onRemove: (sceneResourceId: string) => Promise<boolean>;
-  onDetach: (sceneResourceId: string) => Promise<boolean>;
   onDuplicateProgramResource: (sceneResourceId: string) => Promise<boolean>;
   onRemoveProgramResource: (sceneResourceId: string) => Promise<boolean>;
   onCommitProgramTransform: (
@@ -1609,7 +1523,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     expectedDraftIdentity: { ownerEpoch: string; generation: number },
   ) => Promise<boolean>;
   onEditSelection: (kind: 'owner_object' | 'program_resource', id: string) => void;
-  mutationAvailability: Record<string, SceneObjectMutationAvailability>;
   hiddenSelectionKeys: ReadonlySet<string>;
   objectAxesSelectionKeys: ReadonlySet<string>;
   onObjectAxesVisibleIdsChange: (ids: string[], draftPreview: boolean) => void;
@@ -1620,7 +1533,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   robotControl: RobotControlController;
   correctionGhost: CorrectionGhost | null;
   runtimeEnabled: boolean;
-  objectControlSurface?: ReactNode;
+  /** The object panel: the Draft editor while objects are editable, else the read-only live view. */
+  objectControlSurface: (editable: boolean) => ReactNode;
   inspectorTarget?: HTMLElement | null;
   inspectorMinimized?: boolean;
   onInspectorMinimizedChange?: (minimized: boolean) => void;
@@ -1697,10 +1611,19 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   const objects = presentationFacts?.logicalScene.snapshot?.objects
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
   const ownerSceneKnown = presentationFacts !== null;
+  // Every object edit goes into the Program Draft. The viewer presents the
+  // Draft Scene only while it has unapplied changes (the same comparison the
+  // top bar uses for Discard); otherwise the runtime Scene, which then equals
+  // the Draft and is edited through it. While execution is not Idle the Draft
+  // cannot be edited, and runtime Scene changes (carried or moved objects) are
+  // real: only the live Scene is shown.
+  const draftDiffersFromApplied = programController.state.workspace?.hasUnappliedChanges === true;
   const [sceneSourceChoice, setSceneSourceChoice] = useState<'auto' | 'draft' | 'applied'>('auto');
-  // While execution is not Idle the Draft cannot be edited, and runtime Scene
-  // changes (carried or moved objects) are real, not authored differences. Show
-  // only the live Scene and skip the Draft comparison entirely.
+  // The manual toggle is a pure view override that never sticks: it resets
+  // whenever the Draft-vs-Applied difference appears or disappears.
+  useEffect(() => {
+    setSceneSourceChoice('auto');
+  }, [draftDiffersFromApplied]);
   const draftPreviewObjects = useMemo(() => (
     ownerSceneKnown && !executionActive
       ? (program?.scene ?? []).map(programScenePreviewObject).filter(
@@ -1708,42 +1631,24 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         )
       : EMPTY_LOGICAL_SCENE_OBJECTS
   ), [executionActive, ownerSceneKnown, program?.scene]);
-  const draftSceneDifferent = !executionActive && ownerSceneKnown && draftIdentity !== null && (
-    draftPreviewObjects.length !== (program?.scene?.length ?? 0)
-    || draftPreviewObjects.length !== objects.length
-    || draftPreviewObjects.some((draftObject) => {
-      const appliedObject = objects.find(
-        (object) => object.scene_resource_id === draftObject.scene_resource_id,
-      );
-      return appliedObject === undefined
-        || appliedObject.provider_evidence !== null
-        || appliedObject.support_contacts.length > 0
-        || JSON.stringify(draftObject.collision_shapes)
-          !== JSON.stringify(appliedObject.collision_shapes)
-        || JSON.stringify(draftObject.placement.kind === 'cell_fixed'
-          ? draftObject.placement.pose_in_cell : null)
-          !== JSON.stringify(appliedObject.placement.kind === 'cell_fixed'
-            ? appliedObject.placement.pose_in_cell : null);
-    })
+  const draftSceneEditable = !executionActive && sceneSourceIsDraft(
+    'draft', ownerSceneKnown, draftIdentity !== null, programController.mutationAvailable,
+    draftDiffersFromApplied,
   );
-  // A Draft/Applied choice only means something while the two differ and its
-  // toggle is visible. Once they match (a Load, Apply or Discard settled),
-  // return to automatic so a stale choice cannot keep a hidden Draft view.
-  useEffect(() => {
-    if (!draftSceneDifferent) setSceneSourceChoice('auto');
-  }, [draftSceneDifferent]);
   const programDraftPreview = !executionActive && sceneSourceIsDraft(
     sceneSourceChoice, ownerSceneKnown, draftIdentity !== null,
-    draftSceneDifferent,
-    programDraftPreviewActive(ownerSceneKnown, objects.length,
-      draftPreviewObjects.length),
+    programController.mutationAvailable, draftDiffersFromApplied,
   );
+  // The runtime view is editable through the Draft copy only while it equals
+  // the Draft; a runtime view chosen over unapplied changes is read-only.
+  const objectsEditable = draftSceneEditable
+    && (programDraftPreview || !draftDiffersFromApplied);
   const unresolvedDraftObjects = (program?.scene?.length ?? 0) - draftPreviewObjects.length;
-  const selectedSceneResourceId = selection?.kind === 'owner_object'
-    ? (programDraftPreview ? null : selection.id)
-    : selection?.kind === 'program_resource'
-      ? (programDraftPreview ? selection.id : null)
-      : null;
+  // One identity names the object in both views, so a selection survives the
+  // automatic switch when the first edit creates a Draft difference.
+  const selectedSceneResourceId = selection === null || selection.kind === 'structure'
+    ? null
+    : selection.id;
   const selectedStructureName = selection?.kind === 'structure'
     ? selection.linkName
     : null;
@@ -1766,22 +1671,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     programDraftPreview,
     viewer?.resource_role_visibility,
   ]);
-  const viewportObjects = useMemo(() => visibleObjects.map((object) => {
-    if (
-      object.scene_resource_id !== selectedSceneResourceId
-      || selection?.kind !== 'owner_object'
-      || object.placement.kind !== 'cell_fixed'
-      || livePose === null
-    ) return object;
-    const stagedShape = liveShape === null
-      ? null
-      : logicalSceneShapeFromProgramShape(liveShape);
-    return {
-      ...object,
-      collision_shapes: stagedShape === null ? object.collision_shapes : [stagedShape],
-      placement: { ...object.placement, pose_in_cell: livePose },
-    };
-  }), [livePose, liveShape, selectedSceneResourceId, selection?.kind, visibleObjects]);
   const motionDescriptor = robotControl.selectedStatus?.directControl?.targetDescriptor ?? null;
   const sceneRuntimePresentation = useMemo(() => runtimeScenePresentation(
     presentationFacts?.sceneRuntime ?? null,
@@ -2064,22 +1953,26 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       identity,
     );
   }, [onEditSelection, programDraftPreview]);
-  const presentedMutationAvailability = useMemo(() => (
-    programDraftPreview
-      ? Object.fromEntries(viewportObjects.map((object) => [object.scene_resource_id, {
+  // Objects are edited only through their Draft copy.
+  const presentedMutationAvailability = useMemo<
+    Record<string, SceneObjectMutationAvailability>
+  >(() => (
+    objectsEditable
+      ? Object.fromEntries(visibleObjects.filter((object) => (program?.scene ?? []).some(
+          (resource) => resource.scene_resource_id === object.scene_resource_id
+            && resource.pose.frame_ref.kind === 'cell_frame',
+        )).map((object) => [object.scene_resource_id, {
           duplicate: true,
           remove: true,
-          detach: false,
           transform: true,
           shape: true,
           duplicateReason: null,
           removeReason: null,
           transformReason: null,
           shapeReason: null,
-          detachReason: 'Program Draft resources are not runtime Attached objects.',
         }]))
-      : mutationAvailability
-  ), [mutationAvailability, programDraftPreview, viewportObjects]);
+      : {}
+  ), [objectsEditable, program?.scene, visibleObjects]);
   const sceneOwnerEpoch = facts?.sourceOwnerEpoch;
   const sceneOwnerGeneration = facts?.sourceGeneration;
   const sceneOwnerIdentity = useMemo(() => (
@@ -2106,12 +1999,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     viewerFrameOwnerEpoch,
     viewerRuntime?.complete,
   ]);
-  const objectAxesVisibleIds = useMemo(() => viewportObjects.flatMap((object) => {
+  const objectAxesVisibleIds = useMemo(() => visibleObjects.flatMap((object) => {
     const kind = programDraftPreview ? 'program_resource' : 'owner_object';
     return objectAxesSelectionKeys.has(`${kind}:${object.scene_resource_id}`)
       ? [object.scene_resource_id]
       : [];
-  }), [objectAxesSelectionKeys, programDraftPreview, viewportObjects]);
+  }), [objectAxesSelectionKeys, programDraftPreview, visibleObjects]);
   const objectAxesRows = useMemo(
     () => (objects.length === 0 ? draftPreviewObjects : objects).map((object) => {
       const persistent = (program?.scene ?? []).some(
@@ -2202,24 +2095,24 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       manifest={viewerManifest}
       modelPresentation={modelPresentation}
       onRetry={retryViewerModel}
-      sceneObjects={viewportObjects}
+      sceneObjects={visibleObjects}
       staleScenePreview={!programDraftPreview && presentationFacts !== null && (
         facts === null
         || headlessState.transportStatus !== 'connected'
         || headlessState.semanticStatus !== 'current'
       )}
       programDraftPreview={programDraftPreview}
-      sceneSourceControl={draftSceneDifferent ? (
+      sceneSourceControl={draftSceneEditable && draftDiffersFromApplied ? (
         <button type="button" className="viewer-scene-source-toggle"
           aria-label={programDraftPreview
-            ? 'Showing Draft Scene object preview only. Robot models and observation status come from Applied Deployment. Switch to Applied Scene.'
-            : 'Showing Applied Scene. Robot models and observation status come from Applied Deployment. Switch to Draft Scene preview.'}
+            ? 'Showing the editable Draft Scene. Robot models and observation status come from Applied Deployment. Switch to the read-only Applied Scene.'
+            : 'Showing the Applied Scene, read-only while unapplied Draft changes exist. Robot models and observation status come from Applied Deployment. Switch to the editable Draft Scene.'}
           onClick={() => setSceneSourceChoice(programDraftPreview ? 'applied' : 'draft')}
           title={programDraftPreview && unresolvedDraftObjects > 0
-            ? `${unresolvedDraftObjects} Program Draft objects need frame or asset resolution. This preview changes Scene objects only; robot models and observation status remain from Applied Deployment.`
+            ? `${unresolvedDraftObjects} Program Draft objects need frame or asset resolution. Object edits go into the Draft; robot models and observation status remain from Applied Deployment.`
             : programDraftPreview
-              ? 'Program Draft Scene object preview only; robot models and observation status remain from Applied Deployment.'
-              : 'Applied Scene objects; robot models and observation status come from Applied Deployment.'}>
+              ? 'Program Draft Scene: object edits go into the Draft; robot models and observation status remain from Applied Deployment. Switch to view the live cell.'
+              : 'Applied Scene: the live cell, read-only while unapplied Draft changes exist. Switch to the Draft Scene to edit objects.'}>
           {programDraftPreview ? 'Draft Scene' : 'Applied Scene'} <span aria-hidden="true">⇄</span>
         </button>
       ) : null}
@@ -2230,15 +2123,14 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onSelectSceneResource={selectSceneResource}
       selectedStructureName={selectedStructureName}
       onSelectStructure={selectStructure}
-      onCommitSceneTransform={onCommitTransform}
-      onCommitProgramDraftTransform={onCommitProgramTransform}
-      onDuplicateSceneResource={programDraftPreview
+      onCommitProgramDraftTransform={objectsEditable ? onCommitProgramTransform : undefined}
+      programDraftEditIdentity={objectsEditable ? draftIdentity ?? undefined : undefined}
+      onDuplicateSceneResource={objectsEditable
         ? onDuplicateProgramResource
-        : onDuplicate}
-      onRemoveSceneResource={programDraftPreview
+        : undefined}
+      onRemoveSceneResource={objectsEditable
         ? onRemoveProgramResource
-        : onRemove}
-      onDetachSceneResource={onDetach}
+        : undefined}
       onEditSceneResource={editSceneResource}
       selectionLocked={selectionLocked}
       sceneMutationAvailability={presentedMutationAvailability}
@@ -2289,7 +2181,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
       robotMotionActive={robotControlHasActiveOperation(robotControl.state)}
-      objectControlSurface={objectControlSurface}
+      objectControlSurface={objectControlSurface(objectsEditable)}
       inspectorTarget={inspectorTarget}
       inspectorMinimized={inspectorMinimized}
       onInspectorMinimizedChange={onInspectorMinimizedChange}
@@ -2369,14 +2261,6 @@ export function SceneAuthoringWorkspace({
     () => draftId === null ? null : { draftId, draftRevision },
     [draftId, draftRevision],
   );
-  const sceneMutationFenceResult = useMemo(() => sceneMutationFenceFromSnapshot(
-    headlessState.snapshot,
-    draftId,
-    draftRevision,
-  ), [draftId, draftRevision, headlessState.snapshot]);
-  const sceneMutationFence = sceneMutationFenceResult.available
-    ? sceneMutationFenceResult.fence
-    : null;
   const environmentValue = environment.status === 'ready' ? environment.data : null;
   const sourceValue = sourceModel.status === 'ready' ? sourceModel.data : null;
   const factsResult = useMemo(
@@ -2407,8 +2291,6 @@ export function SceneAuthoringWorkspace({
   const [selection, setSelection] = useState<SceneSelection>(null);
   const ownerObjectPanel = useCardPanelLayout();
   const sceneTabs = useCardPanelLayout();
-  const [livePose, setLivePose] = useState<LogicalScenePose | null>(null);
-  const [liveShape, setLiveShape] = useState<ProgramSceneResource['shape'] | null>(null);
   const [selectionLocked, setSelectionLocked] = useState(false);
   const [hiddenSelectionKeys, setHiddenSelectionKeys] = useState<Set<string>>(
     () => new Set(),
@@ -2429,17 +2311,6 @@ export function SceneAuthoringWorkspace({
     [stableProgramSceneIds, viewer?.scene_resource_axes_visibility],
   );
   const gizmo = useGizmoSettings();
-  const [commitState, setCommitState] = useState<
-    { kind: 'idle' | 'busy' | 'success' | 'error'; message: string | null }
-  >({ kind: 'idle', message: null });
-  const [commitOperationalError, setCommitOperationalError] = useState<string | null>(null);
-  useOperationalErrorMirror({
-    source: 'composer.scene_transaction',
-    title: 'Scene owner command or response failed',
-    message: commitOperationalError,
-    onDismiss: () => setCommitOperationalError(null),
-  });
-
   useEffect(() => {
     const occurrences = sourceValue?.occurrences ?? [];
     if (!occurrences.some((item) => item.model_instance_id === selectedOccurrenceId)) {
@@ -2488,32 +2359,9 @@ export function SceneAuthoringWorkspace({
     }
   }, [objects, program?.scene, selection, selectionLocked]);
   const selectedOwnerObjectId = selection?.kind === 'owner_object' ? selection.id : null;
-  const selectedProgramResourceId = selection?.kind === 'program_resource'
-    ? selection.id
-    : selectedOwnerObjectId;
   const selectedObject = objects.find(
     (object) => object.scene_resource_id === selectedOwnerObjectId,
   ) ?? null;
-  const selectedObjectPoseKey = selectedObject?.placement.kind === 'cell_fixed'
-    ? JSON.stringify(selectedObject.placement.pose_in_cell)
-    : null;
-  const selectedObjectShapeKey = selectedObject === null
-    ? null
-    : JSON.stringify(editableProgramShapeFromObject(selectedObject));
-  useEffect(() => {
-    setLivePose(selectedObjectPoseKey === null
-      ? null
-      : JSON.parse(selectedObjectPoseKey) as LogicalScenePose);
-    setLiveShape(selectedObjectShapeKey === null
-      ? null
-      : JSON.parse(selectedObjectShapeKey) as ProgramSceneResource['shape'] | null);
-    setCommitState({ kind: 'idle', message: null });
-  }, [
-    selectedOwnerObjectId,
-    selectedObjectPoseKey,
-    selectedObjectShapeKey,
-  ]);
-
   const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
@@ -2612,171 +2460,6 @@ export function SceneAuthoringWorkspace({
   const draftEditBlockReason = busyDraft
     ? 'Another Program operation is in progress.'
     : programController.mutationUnavailableReason;
-  const selectedProgramResource = program?.scene?.find(
-    (resource) => resource.scene_resource_id === selectedProgramResourceId,
-  ) ?? null;
-  const draftPoseForLive = selectedProgramResource === null
-    ? null
-    : livePoseFromProgramResource(selectedProgramResource);
-  const editReason = selectedObject === null
-    ? 'Select an owner-issued scene object.'
-    : objectEditReason(selectedObject);
-
-  const editLivePose = (
-    field: 'x' | 'y' | 'z' | 0 | 1 | 2 | 3,
-    value: number,
-  ) => {
-    if (livePose === null || !Number.isFinite(value)) return;
-    if (typeof field === 'string') {
-      setLivePose({
-        ...livePose,
-        position_m: { ...livePose.position_m, [field]: value },
-      });
-      return;
-    }
-    const orientation = [...livePose.orientation_xyzw] as [number, number, number, number];
-    orientation[field] = value;
-    setLivePose({ ...livePose, orientation_xyzw: orientation });
-  };
-
-  const submitSceneTransaction = useCallback(async (
-    transaction: SceneTransactionRequest | null,
-    id: string,
-  ): Promise<boolean> => {
-    if (transaction === null) {
-      setCommitState({ kind: 'error', message: 'The current owner does not permit this scene edit.' });
-      return false;
-    }
-    setCommitState({ kind: 'busy', message: null });
-    setCommitOperationalError(null);
-    try {
-      const response = await api.scene.commit(transaction);
-      if (
-        response.request_id !== id
-        || response.request_owner_epoch !== transaction.request_context.request_owner_epoch
-      ) throw new Error('The scene owner returned a mismatched transaction receipt.');
-      setCommitState({
-        kind: 'success',
-        message: `Committed scene revision ${response.committed_projection_revision.scene_revision.revision_id}.`,
-      });
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Scene commit failed.';
-      setCommitState({
-        kind: 'error',
-        message,
-      });
-      setCommitOperationalError(message);
-      return false;
-    }
-  }, []);
-
-  const mutationAvailability = useMemo<Record<string, SceneObjectMutationAvailability>>(
-    () => facts === null
-      ? {}
-      : Object.fromEntries(objects.map((object) => [
-          object.scene_resource_id,
-          sceneObjectMutationAvailability(facts, sceneMutationFence, object),
-        ])),
-    [facts, objects, sceneMutationFence],
-  );
-  const componentAttachmentFence = useMemo(
-    () => componentAttachmentFenceFromSnapshot(
-      headlessState.snapshot?.runtime ?? null,
-      facts?.logicalScene.access.active_projection ?? null,
-    ),
-    [facts?.logicalScene.access.active_projection, headlessState.snapshot?.runtime],
-  );
-  const selectedMutationAvailability = selectedOwnerObjectId === null
-    ? null
-    : mutationAvailability[selectedOwnerObjectId] ?? null;
-
-  const commitTransform = useCallback(async (
-    sceneResourceId: string,
-    pose: LogicalScenePose,
-    scale: [number, number, number],
-    expectedOwnerIdentity: { ownerEpoch: string; generation: number },
-  ) => {
-    const object = objects.find(
-      (candidate) => candidate.scene_resource_id === sceneResourceId,
-    );
-    if (
-      facts === null
-      || sceneMutationFence === null
-      || object === undefined
-      || facts.sourceOwnerEpoch !== expectedOwnerIdentity.ownerEpoch
-      || facts.sourceGeneration !== expectedOwnerIdentity.generation
-    ) {
-      setCommitState({
-        kind: 'error',
-        message: 'The scene changed while the transform was being edited; the preview was reset.',
-      });
-      return false;
-    }
-    const id = requestId();
-    const accepted = await submitSceneTransaction(sceneObjectTransformTransaction(
-      facts, sceneMutationFence, object, pose, scale, id,
-      sceneResourceId === selectedOwnerObjectId ? liveShape : null,
-    ), id);
-    if (accepted) setLivePose(pose);
-    return accepted;
-  }, [facts, liveShape, objects, sceneMutationFence, selectedOwnerObjectId, submitSceneTransaction]);
-
-  const duplicateObject = useCallback(async (sceneResourceId: string) => {
-    const object = objects.find((candidate) => candidate.scene_resource_id === sceneResourceId);
-    if (facts === null || sceneMutationFence === null || object === undefined) return false;
-    const existing = new Set(objects.map((candidate) => candidate.scene_resource_id));
-    let duplicateId = `${sceneResourceId}_copy`;
-    let suffix = 2;
-    while (existing.has(duplicateId)) duplicateId = `${sceneResourceId}_copy_${suffix++}`;
-    const id = requestId();
-    return submitSceneTransaction(sceneDuplicateTransaction(
-      facts, sceneMutationFence, object, duplicateId, id,
-    ), id);
-  }, [facts, objects, sceneMutationFence, submitSceneTransaction]);
-
-  const removeObject = useCallback(async (sceneResourceId: string) => {
-    const object = objects.find((candidate) => candidate.scene_resource_id === sceneResourceId);
-    if (facts === null || sceneMutationFence === null || object === undefined) return false;
-    const id = requestId();
-    const accepted = await submitSceneTransaction(sceneRemoveTransaction(
-      facts, sceneMutationFence, object, id,
-    ), id);
-    if (accepted && selectedOwnerObjectId === sceneResourceId) setSelection(null);
-    return accepted;
-  }, [facts, objects, sceneMutationFence, selectedOwnerObjectId, submitSceneTransaction]);
-
-  const detachObject = useCallback(async (sceneResourceId: string) => {
-    const attachment = facts?.logicalScene.snapshot?.carried_object_attachments.find(
-      (candidate) => candidate.scene_resource_id === sceneResourceId,
-    );
-    if (facts === null || attachment === undefined) return false;
-    const id = requestId();
-    return submitSceneTransaction(sceneDetachTransaction(
-      facts, attachment, id,
-    ), id);
-  }, [facts, submitSceneTransaction]);
-
-  const attachObject = useCallback(async (
-    target: {
-      componentId: string;
-      targetId: string;
-      frameRoleId: string;
-      touchBodyRoles: string[];
-    },
-    attachmentRevisions: string[],
-  ) => {
-    if (facts === null || selectedObject === null) return false;
-    const id = requestId();
-    return submitSceneTransaction(sceneAttachTransaction(
-      facts,
-      selectedObject,
-      target,
-      attachmentRevisions,
-      id,
-    ), id);
-  }, [facts, selectedObject, submitSceneTransaction]);
-
   const duplicateProgramResource = useCallback(async (sceneResourceId: string) => {
     const resource = program?.scene?.find(
       (candidate) => candidate.scene_resource_id === sceneResourceId,
@@ -2838,47 +2521,26 @@ export function SceneAuthoringWorkspace({
     }) !== null;
   }, [busyDraft, draftId, draftRevision, program?.scene, programController]);
 
-  const commitLiveObject = async () => {
-    if (
-      facts === null
-      || sceneMutationFence === null
-      || selectedObject === null
-      || livePose === null
-    ) return;
-    const id = requestId();
-    const originalShape = editableProgramShapeFromObject(selectedObject);
-    const shapeChanged = liveShape !== null
-      && JSON.stringify(liveShape) !== JSON.stringify(originalShape);
-    const transaction = shapeChanged
-      ? sceneObjectUpdateTransaction(
-          facts,
-          sceneMutationFence,
-          selectedObject,
-          livePose,
-          liveShape,
-          id,
-        )
-      : scenePoseTransaction(
-          facts,
-          sceneMutationFence,
-          selectedObject,
-          livePose,
-          id,
-        );
-    if (transaction === null) {
-      setCommitState({
-        kind: 'error',
-        message: facts.writeUnavailableReason
-          ?? editReason
-          ?? (!sceneMutationFenceResult.available ? sceneMutationFenceResult.reason : null)
-          ?? 'The local object edit is invalid.',
-      });
-      return;
-    }
-    await submitSceneTransaction(transaction, id);
-  };
+  // The viewer edits objects only through the Program Draft editor; the live
+  // (Applied) Scene is shown read-only.
+  const programSceneEditor = program === null ? null : (
+    <ProgramSceneEditor
+      program={program}
+      draftRevision={draftRevision}
+      busy={draftEditBlocked}
+      busyReason={draftEditBlockReason}
+      mutate={programController.mutate}
+      liveObjects={objects}
+      selectedResourceId={selection === null || selection.kind === 'structure'
+        ? null
+        : selection.id}
+      onSelectResource={(identity) => setSelection(identity === null
+        ? null
+        : { kind: 'program_resource', id: identity })}
+    />
+  );
 
-  const ownerObjectControlSurface = objects.length === 0 ? undefined : (
+  const liveObjectPanel = objects.length === 0 ? undefined : (
     <div ref={ownerObjectPanel} className="viewer-object-owner-editor dpanel">
       {!factsResult.available && (
         <div className="panel-state error-state" role="alert">
@@ -2890,6 +2552,11 @@ export function SceneAuthoringWorkspace({
         <>
           <section className="dcard">
           <h4>Object</h4>
+          <p className="scene-contract-note hint" role="status">
+            {programController.mutationAvailable
+              ? 'Applied Scene: the live cell, read-only while unapplied Draft changes exist. Switch the viewer to the Draft Scene to edit objects.'
+              : `Read-only: ${programController.mutationUnavailableReason ?? 'The Program Draft cannot be edited now.'}`}
+          </p>
           <label>
           <span>Scene object</span>
           <select
@@ -2913,71 +2580,7 @@ export function SceneAuthoringWorkspace({
               Measured overlay: {warning}
             </p>
           ))}
-          {(editReason ?? selectedMutationAvailability?.transformReason ?? null) !== null && (
-            <p className="scene-contract-note inline-message severity-warning">
-              {editReason ?? selectedMutationAvailability?.transformReason}
-            </p>
-          )}
           </section>
-          {selectedObject !== null && livePose !== null && (
-            <section className="dcard">
-              <h4>Pose and shape</h4>
-              <div className="scene-pose-grid dgrid">
-                {(['x', 'y', 'z'] as const).map((field) => (
-                  <label key={field}>
-                    <span>{field.toUpperCase()} (m)</span>
-                    <input
-                      type="number"
-                      step={gizmo.settings.linearStepM}
-                      value={livePose.position_m[field]}
-                      disabled={editReason !== null || commitState.kind === 'busy'}
-                      title={commitState.kind === 'busy'
-                        ? 'A Scene commit is in progress.'
-                        : editReason ?? undefined}
-                      onChange={(event) => editLivePose(field, event.currentTarget.valueAsNumber)}
-                    />
-                  </label>
-                ))}
-              </div>
-              <div className="scene-pose-grid scene-quaternion-grid dgrid">
-                {['Qx', 'Qy', 'Qz', 'Qw'].map((label, index) => (
-                  <label key={label}>
-                    <span>{label}</span>
-                    <input
-                      type="number"
-                      step={0.001}
-                      value={livePose.orientation_xyzw[index]}
-                      disabled={editReason !== null || commitState.kind === 'busy'}
-                      title={commitState.kind === 'busy'
-                        ? 'A Scene commit is in progress.'
-                        : editReason ?? undefined}
-                      onChange={(event) => editLivePose(
-                        index as 0 | 1 | 2 | 3,
-                        event.currentTarget.valueAsNumber,
-                      )}
-                    />
-                  </label>
-                ))}
-              </div>
-              {liveShape !== null && (
-                <SceneShapeFields
-                  shape={liveShape}
-                  disabled={selectedMutationAvailability?.shape !== true
-                    || commitState.kind === 'busy'}
-                  disabledTitle={commitState.kind === 'busy'
-                    ? 'A Scene commit is in progress.'
-                    : selectedMutationAvailability?.shapeReason ?? undefined}
-                  onChange={setLiveShape}
-                />
-              )}
-              {liveShape === null && (
-                <p className="scene-contract-note hint">
-                  Shape editing is available only for an object with exactly one canonical shape;
-                  pose editing remains independent.
-                </p>
-              )}
-            </section>
-          )}
           {selectedObject !== null && (
             <details className="dcard">
               <summary>Ownership, contacts, and collision metadata</summary>
@@ -3008,119 +2611,18 @@ export function SceneAuthoringWorkspace({
               2,
             )}</pre>
           </details>
-          {selectedObject?.placement.kind === 'cell_fixed' && (
+          {selectedObject !== null && (
             <section className="dcard">
-            <h4>Attach</h4>
-            <AttachObjectControls
-              object={selectedObject}
-              sourceModel={sourceValue}
-              attachmentFence={componentAttachmentFence}
-              disabled={!facts.runtimeWriteAvailable
-                || selectedObject.provider_evidence !== null
-                || commitState.kind === 'busy'}
-              onAttach={attachObject}
-            />
+            <h4>Draft</h4>
+            <div className="dactions">
+              <CopyObservedToDraftButton
+                object={selectedObject}
+                blockedReason={draftEditBlocked ? draftEditBlockReason : null}
+                mutate={programController.mutate}
+              />
+            </div>
             </section>
           )}
-          <section className="dcard">
-          <h4>Edit</h4>
-          <div className="dactions">
-            <button
-              type="button"
-              disabled={selectedObject === null || livePose === null || editReason !== null
-                || selectedMutationAvailability?.transform !== true
-                || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.transformReason
-                ?? 'Send the pose and shape in these fields to the live Scene now. The Program is not changed.'}
-              onClick={() => void commitLiveObject()}
-            >Commit object edit</button>
-            <button
-              type="button"
-              disabled={selectedObject?.placement.kind !== 'cell_fixed' || commitState.kind === 'busy'}
-              title="Throw away the uncommitted changes in these fields and show the live Scene values again."
-              onClick={() => {
-                setLivePose(selectedObject?.placement.kind === 'cell_fixed'
-                  ? selectedObject.placement.pose_in_cell
-                  : null);
-                setLiveShape(selectedObject === null
-                  ? null
-                  : editableProgramShapeFromObject(selectedObject));
-              }}
-            >Discard local edit</button>
-          </div>
-          <div className="dactions">
-            <button
-              type="button"
-              disabled={draftPoseForLive === null || editReason !== null || commitState.kind === 'busy'}
-              title={editReason
-                ?? (draftPoseForLive === null
-                  ? 'This object is not in the Program Draft.'
-                  : 'Fill these fields with the pose the Program Draft stores for this object. Uncommitted field changes are replaced; nothing is sent until Commit.')}
-              onClick={() => {
-                if (draftPoseForLive !== null) setLivePose(draftPoseForLive);
-              }}
-            >Stage Draft pose</button>
-            <button
-              type="button"
-              disabled={
-                selectedObject?.placement.kind !== 'cell_fixed'
-                || selectedProgramResource === null
-                || busyDraft
-                || !programController.mutationAvailable
-              }
-              title={programController.mutationAvailable
-                ? 'Copy this object as it is now in the live Scene into the Program Draft, replacing the Draft copy. Apply or Save to keep it.'
-                : programController.mutationUnavailableReason ?? undefined}
-              onClick={() => {
-                if (selectedObject?.placement.kind === 'cell_fixed') void programController.mutate('program_draft_store_observed_scene_resource', {
-                  scene_resource_id: selectedObject.scene_resource_id,
-                });
-              }}
-            >Save observed object to Program</button>
-          </div>
-          <div className="dactions">
-            <button
-              type="button"
-              disabled={selectedOwnerObjectId === null
-                || mutationAvailability[selectedOwnerObjectId]?.duplicate !== true
-                || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.duplicateReason
-                ?? 'Create a copy of this object in the live Scene.'}
-              onClick={() => {
-                if (selectedOwnerObjectId !== null) void duplicateObject(selectedOwnerObjectId);
-              }}
-            >Duplicate</button>
-            <button
-              type="button"
-              disabled={selectedOwnerObjectId === null
-                || mutationAvailability[selectedOwnerObjectId]?.detach !== true
-                || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.detachReason
-                ?? 'Release this object from the robot and leave it where it is now.'}
-              onClick={() => {
-                if (selectedOwnerObjectId !== null) void detachObject(selectedOwnerObjectId);
-              }}
-            >Detach at current pose</button>
-            <button
-              type="button"
-              className="danger-button"
-              disabled={selectedOwnerObjectId === null
-                || mutationAvailability[selectedOwnerObjectId]?.remove !== true
-                || commitState.kind === 'busy'}
-              title={selectedMutationAvailability?.removeReason
-                ?? 'Delete this object from the live Scene.'}
-              onClick={() => {
-                if (selectedOwnerObjectId !== null) void removeObject(selectedOwnerObjectId);
-              }}
-            >Remove</button>
-          </div>
-          {commitState.message !== null && (
-            <p
-              className={commitState.kind === 'error' ? 'scene-commit-error inline-message severity-error' : 'scene-commit-success'}
-              role={commitState.kind === 'error' ? 'alert' : 'status'}
-            >{commitState.message}</p>
-          )}
-          </section>
         </>
       )}
     </div>
@@ -3142,8 +2644,6 @@ export function SceneAuthoringWorkspace({
       draftIdentity={draftIdentity}
       viewer={viewer}
       selection={selection}
-      livePose={livePose}
-      liveShape={liveShape}
       selectionLocked={selectionLocked}
       onSelect={setSelection}
       ghost={ghost}
@@ -3151,10 +2651,6 @@ export function SceneAuthoringWorkspace({
       candidatePresentationAllowed={candidatePresentationAllowed}
       candidatePoseEditable={candidatePoseEditable}
       gizmo={gizmo}
-      onCommitTransform={commitTransform}
-      onDuplicate={duplicateObject}
-      onRemove={removeObject}
-      onDetach={detachObject}
       onDuplicateProgramResource={duplicateProgramResource}
       onRemoveProgramResource={removeProgramResource}
       onCommitProgramTransform={commitProgramTransform}
@@ -3162,7 +2658,6 @@ export function SceneAuthoringWorkspace({
         setSelection({ kind, id: identity });
         setActiveSceneTool(kind === 'program_resource' ? 'program' : 'current');
       }}
-      mutationAvailability={mutationAvailability}
       hiddenSelectionKeys={hiddenSelectionKeys}
       objectAxesSelectionKeys={objectAxesSelectionKeys}
       onObjectAxesVisibleIdsChange={(ids, draftPreview) => {
@@ -3215,7 +2710,7 @@ export function SceneAuthoringWorkspace({
       robotControl={robotControl}
       correctionGhost={correctionGhost}
       runtimeEnabled={runtimeEnabled}
-      objectControlSurface={ownerObjectControlSurface}
+      objectControlSurface={(editable) => (editable ? programSceneEditor : liveObjectPanel)}
       inspectorTarget={viewerInspectorTarget}
       inspectorMinimized={viewerInspectorMinimized}
       onInspectorMinimizedChange={onViewerInspectorMinimizedChange}
@@ -3331,21 +2826,7 @@ export function SceneAuthoringWorkspace({
             <span>Open a Program before authoring its initial scene or viewer metadata.</span>
           </div>
         )}
-        {activeSceneTool === 'program' && program !== null && (
-            <ProgramSceneEditor
-              program={program}
-              draftRevision={draftRevision}
-              busy={draftEditBlocked}
-              busyReason={draftEditBlockReason}
-              mutate={programController.mutate}
-              selectedResourceId={selection?.kind === 'program_resource'
-                ? selection.id
-                : null}
-              onSelectResource={(identity) => setSelection(identity === null
-                ? null
-                : { kind: 'program_resource', id: identity })}
-            />
-        )}
+        {activeSceneTool === 'program' && programSceneEditor}
         {activeSceneTool === 'contacts' && program !== null && (
           <ProgramContactPolicyEditor
             program={program}
@@ -3374,7 +2855,7 @@ export function SceneAuthoringWorkspace({
 
         {activeSceneTool === 'current' && (
           <div data-testid="current-scene-editor">
-            {ownerObjectControlSurface ?? (
+            {liveObjectPanel ?? (
               <div className="panel-state">
                 <strong>No current scene objects</strong>
                 <span>The logical-scene owner reports an empty object inventory.</span>

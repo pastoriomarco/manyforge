@@ -1924,6 +1924,14 @@ def create_app(
             },
         )
 
+    @app.get("/api/execution/program-runs/{program_run_id}/admitted-speeds")
+    def program_run_admitted_speeds(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=1024)],
+    ) -> JSONResponse:
+        return JSONResponse(
+            content=service.program_run_admitted_speeds(program_run_id)
+        )
+
     @app.get("/api/execution/history/health")
     def historian_health() -> dict[str, Any]:
         return service.core.historian_health()

@@ -130,12 +130,11 @@ interface StructuralViewerProps {
   onSelectSceneResource?: (sceneResourceId: string | null) => void;
   selectedStructureName?: string | null;
   onSelectStructure?: (structureName: string | null) => void;
-  onCommitSceneTransform?: (
-    sceneResourceId: string,
-    pose: LogicalScenePose,
-    scale: [number, number, number],
-    expectedOwnerIdentity: { ownerEpoch: string; generation: number },
-  ) => Promise<boolean>;
+  /** Object edits commit only into the Program Draft, fenced by its identity. */
+  programDraftEditIdentity?: {
+    draftId: string;
+    draftRevision: number;
+  };
   onCommitProgramDraftTransform?: (
     sceneResourceId: string,
     pose: LogicalScenePose,
@@ -144,7 +143,6 @@ interface StructuralViewerProps {
   ) => Promise<boolean>;
   onDuplicateSceneResource?: (sceneResourceId: string) => Promise<boolean>;
   onRemoveSceneResource?: (sceneResourceId: string) => Promise<boolean>;
-  onDetachSceneResource?: (sceneResourceId: string) => Promise<boolean>;
   onEditSceneResource?: (sceneResourceId: string) => void;
   selectionLocked?: boolean;
   sceneMutationAvailability?: Record<string, SceneObjectMutationAvailability>;
@@ -222,6 +220,8 @@ interface StructuralViewerProps {
 }
 
 export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | null;
+
+const READ_ONLY_SCENE_REASON = 'Read-only: the Program Draft cannot be edited now, or this Applied view hides unapplied Draft changes (switch to the Draft Scene).';
 
 const ignoreViewerRaycast: THREE.Object3D['raycast'] = () => undefined;
 
@@ -2964,11 +2964,10 @@ function StructuralViewerContent({
   onSelectSceneResource = () => undefined,
   selectedStructureName = null,
   onSelectStructure = () => undefined,
-  onCommitSceneTransform,
+  programDraftEditIdentity,
   onCommitProgramDraftTransform,
   onDuplicateSceneResource,
   onRemoveSceneResource,
-  onDetachSceneResource,
   onEditSceneResource,
   selectionLocked = false,
   sceneMutationAvailability,
@@ -3085,17 +3084,15 @@ function StructuralViewerContent({
   const selectedObjectAvailability = selectedObject === null
     ? null
     : sceneMutationAvailability?.[selectedObject.scene_resource_id] ?? null;
-  const transformCommit = programDraftPreview
-    ? onCommitProgramDraftTransform
-    : onCommitSceneTransform;
+  const transformCommit = onCommitProgramDraftTransform;
   const transformIdentity = useMemo(() => (
-    programDraftPreview
-      ? programDraftIdentity === undefined ? undefined : {
-          ownerEpoch: programDraftIdentity.draftId,
-          generation: programDraftIdentity.draftRevision,
+    programDraftEditIdentity === undefined
+      ? undefined
+      : {
+          ownerEpoch: programDraftEditIdentity.draftId,
+          generation: programDraftEditIdentity.draftRevision,
         }
-      : sceneOwnerIdentity
-  ), [programDraftIdentity, programDraftPreview, sceneOwnerIdentity]);
+  ), [programDraftEditIdentity]);
   const transformBaseEnabled = transformCommit !== undefined
     && transformIdentity !== undefined
     && (selectedSceneResourceId === null || !editLockedObjectIds.has(selectedSceneResourceId))
@@ -3650,7 +3647,9 @@ function StructuralViewerContent({
                 onDuplicateSceneResource === undefined
                 || contextAvailability?.duplicate !== true
               }
-              title={contextAvailability?.duplicateReason ?? undefined}
+              title={onDuplicateSceneResource === undefined
+                ? READ_ONLY_SCENE_REASON
+                : contextAvailability?.duplicateReason ?? 'Add a copy of this object to the Program Draft.'}
               onClick={() => {
                 void onDuplicateSceneResource?.(contextMenu.sceneResourceId);
                 setContextMenu(null);
@@ -3659,26 +3658,14 @@ function StructuralViewerContent({
             <button
               type="button"
               role="menuitem"
-              disabled={
-                onDetachSceneResource === undefined
-                || programDraftPreview
-                || contextAvailability?.detach !== true
-              }
-              title={contextAvailability?.detachReason ?? undefined}
-              onClick={() => {
-                void onDetachSceneResource?.(contextMenu.sceneResourceId);
-                setContextMenu(null);
-              }}
-            >Detach Attached object</button>
-            <button
-              type="button"
-              role="menuitem"
               className="danger-button"
               disabled={
                 onRemoveSceneResource === undefined
                 || contextAvailability?.remove !== true
               }
-              title={contextAvailability?.removeReason ?? undefined}
+              title={onRemoveSceneResource === undefined
+                ? READ_ONLY_SCENE_REASON
+                : contextAvailability?.removeReason ?? 'Remove this object from the Program Draft.'}
               onClick={() => {
                 void onRemoveSceneResource?.(contextMenu.sceneResourceId);
                 setContextMenu(null);
@@ -4145,17 +4132,11 @@ function StructuralViewerContent({
                 type="button"
                 disabled={onDuplicateSceneResource === undefined
                   || selectedObjectAvailability?.duplicate !== true}
-                title={selectedObjectAvailability?.duplicateReason ?? undefined}
+                title={onDuplicateSceneResource === undefined
+                  ? READ_ONLY_SCENE_REASON
+                  : selectedObjectAvailability?.duplicateReason ?? 'Add a copy of this object to the Program Draft.'}
                 onClick={() => { void onDuplicateSceneResource?.(selectedObject.scene_resource_id); }}
               >Duplicate</button>
-              <button
-                type="button"
-                disabled={onDetachSceneResource === undefined
-                  || programDraftPreview
-                  || selectedObjectAvailability?.detach !== true}
-                title={selectedObjectAvailability?.detachReason ?? undefined}
-                onClick={() => { void onDetachSceneResource?.(selectedObject.scene_resource_id); }}
-              >Detach</button>
               <button
                 type="button"
                 onClick={() => setEditLockedObjectIds((current) => {
@@ -4177,7 +4158,9 @@ function StructuralViewerContent({
                 className="danger-button"
                 disabled={onRemoveSceneResource === undefined
                   || selectedObjectAvailability?.remove !== true}
-                title={selectedObjectAvailability?.removeReason ?? undefined}
+                title={onRemoveSceneResource === undefined
+                  ? READ_ONLY_SCENE_REASON
+                  : selectedObjectAvailability?.removeReason ?? 'Remove this object from the Program Draft.'}
                 onClick={() => { void onRemoveSceneResource?.(selectedObject.scene_resource_id); }}
               >Remove</button>
             </div>

@@ -3,18 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   candidateTcpPoseFromCell,
   candidateTcpPoseInCell,
-  componentAttachmentFenceFromSnapshot,
-  editableLogicalSceneObject,
-  editableProgramShapeFromObject,
-  livePoseFromProgramResource,
   programResourceWithLivePose,
-  sceneMutationFenceFromSnapshot,
-  sceneObjectMutationAvailability,
-  sceneObjectUpdateTransaction,
   sceneOwnerPresentation,
-  scenePoseTransaction,
-  sceneDuplicateTransaction,
-  sceneDetachTransaction,
   type SceneOwnerFacts,
 } from './sceneAuthoring';
 import type {
@@ -23,7 +13,6 @@ import type {
   SceneRuntimeProjection,
   SourceModelProjection,
 } from '../types/api';
-import type { ComposerHeadlessState, HeadlessRuntimeSnapshot } from '../types/headless';
 
 const object: LogicalSceneObject = {
   scene_resource_id: 'part',
@@ -38,12 +27,6 @@ const object: LogicalSceneObject = {
   },
   provider_evidence: null,
   support_contacts: [],
-};
-
-const fence = {
-  admissionGeneration: 7,
-  draftId: 'draft-1',
-  draftRevision: 4,
 };
 
 function facts(): SceneOwnerFacts {
@@ -95,10 +78,6 @@ function facts(): SceneOwnerFacts {
     sourceOwnerEpoch: 'scene-owner-1',
     runtimeSourceGeneration: 1,
     runtimeSourceOwnerEpoch: 'runtime-owner-1',
-    writeAvailable: true,
-    writeUnavailableReason: null,
-    runtimeWriteAvailable: true,
-    runtimeWriteUnavailableReason: null,
   };
 }
 
@@ -120,190 +99,6 @@ describe('scene authoring intents', () => {
       .toBeNull();
   });
 
-  it('forms an authored fence only from one current admitted Draft snapshot', () => {
-    const snapshot = {
-      authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
-      authoringWorkspace: {
-        workspaceEpoch: 'workspace.epoch.1',
-        workspaceRevision: 9,
-        programDraftId: 'draft-1',
-        programDraftRevision: 4,
-        deploymentDraftId: 'deployment-draft-1',
-        deploymentDraftRevision: 1,
-      },
-    } as ComposerHeadlessState;
-    expect(sceneMutationFenceFromSnapshot(snapshot, 'draft-1', 4)).toEqual({
-      available: true,
-      fence,
-    });
-    expect(sceneMutationFenceFromSnapshot(snapshot, 'draft-1', 5)).toMatchObject({
-      available: false,
-    });
-    expect(sceneMutationFenceFromSnapshot({
-      ...snapshot,
-      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
-    }, 'draft-1', 4)).toMatchObject({ available: false });
-  });
-
-  it('uses the exact current Manager snapshot as the attachment fence', () => {
-    const runtime = {
-      complete: true,
-      sections: {
-        manager: {
-          available: true,
-          freshness: 'fresh',
-          knownGaps: [],
-          sourceGeneration: 3,
-          sourceOwnerEpoch: 'manager-owner-1',
-          payload: {
-            active: {
-              retained_bundle_id: 'bundle-1',
-              graph_revision: 'graph-1',
-              cell_graph: {
-                component_attachments: [
-                  { component_attachment_revision: 'revision-b' },
-                  { component_attachment_revision: 'revision-a' },
-                ],
-              },
-            },
-          },
-        },
-      },
-    } as unknown as HeadlessRuntimeSnapshot;
-    expect(componentAttachmentFenceFromSnapshot(
-      runtime,
-      facts().logicalScene.access.active_projection,
-    )).toEqual({
-      available: true,
-      revisions: ['revision-a', 'revision-b'],
-    });
-    expect(componentAttachmentFenceFromSnapshot(runtime, {
-      ...facts().logicalScene.access.active_projection!,
-      graph_revision: 'other-graph',
-    })).toMatchObject({ available: false });
-  });
-
-  it('commits exactly one current-revision, cell-framed pose update', () => {
-    expect(scenePoseTransaction(facts(), fence, object, object.placement.kind === 'cell_fixed'
-      ? object.placement.pose_in_cell
-      : neverPose(), 'request-1')).toEqual({
-      request_context: {
-        request_id: 'request-1',
-        request_owner_epoch: 'scene-owner-1',
-        source_label: 'composer_ui',
-        correlation_id: null,
-      },
-      expected_projection_revision: facts().logicalScene.access.active_projection,
-      expected_admission_generation: 7,
-      expected_draft_id: 'draft-1',
-      expected_draft_revision: 4,
-      operation: {
-        kind: 'update_object_pose',
-        scene_resource_id: 'part',
-        pose: {
-          position_m: { x_m: 0.4, y_m: 0.1, z_m: 0.2 },
-          orientation: { x: 0, y: 0, z: 0, w: 1 },
-        },
-        frame_ref: { kind: 'cell_frame', cell_id: 'cell-a' },
-        provider_evidence: null,
-        expected_attached: false,
-      },
-    });
-  });
-
-  it('rejects provider-owned, carried, and write-fenced edits while allowing owner meshes', () => {
-    expect(editableLogicalSceneObject({
-      ...object,
-      provider_evidence: { provider_instance_id: 'camera' },
-    })).toBeNull();
-    expect(editableLogicalSceneObject({
-      ...object,
-      collision_shapes: [{ type: 'mesh', resource_uri: 'package://part', scale: { x: 1, y: 1, z: 1 } }],
-    })).not.toBeNull();
-    const fenced = { ...facts(), writeAvailable: false };
-    expect(scenePoseTransaction(
-      fenced,
-      fence,
-      object,
-      object.placement.kind === 'cell_fixed' ? object.placement.pose_in_cell : neverPose(),
-      'request-2',
-    )).toBeNull();
-  });
-
-  it('keeps pose editing independent from single-shape actions', () => {
-    const shapeless = { ...object, collision_shapes: [] };
-    expect(editableLogicalSceneObject(shapeless)).not.toBeNull();
-    expect(sceneObjectMutationAvailability(facts(), fence, shapeless)).toMatchObject({
-      transform: true,
-      shape: false,
-      duplicate: false,
-      remove: true,
-    });
-  });
-
-  it('commits one exact owner update for staged mesh, scale, and pose', () => {
-    const shape = editableProgramShapeFromObject({
-      ...object,
-      collision_shapes: [{
-        type: 'mesh',
-        resource_uri: 'package://part.glb',
-        scale: { x: 1, y: 2, z: 3 },
-      }],
-    });
-    expect(shape).not.toBeNull();
-    expect(sceneObjectUpdateTransaction(
-      facts(),
-      fence,
-      { ...object, collision_shapes: [{
-        type: 'mesh',
-        resource_uri: 'package://part.glb',
-        scale: { x: 1, y: 2, z: 3 },
-      }] },
-      object.placement.kind === 'cell_fixed'
-        ? object.placement.pose_in_cell
-        : neverPose(),
-      shape!,
-      'request-shape',
-    )?.operation).toMatchObject({
-      kind: 'upsert_object',
-      shape: {
-        type: 'mesh',
-        mesh_resource_uri: 'package://part.glb',
-        mesh_scale: { x_m: 1, y_m: 2, z_m: 3 },
-      },
-    });
-  });
-
-  it('builds owner-fenced duplicate and detach transactions without browser effects', () => {
-    expect(sceneDuplicateTransaction(
-      facts(), fence, object, 'part_copy', 'request-copy',
-    )?.operation).toMatchObject({ kind: 'add_object', scene_resource_id: 'part_copy' });
-    const detached = sceneDetachTransaction(facts(), {
-      carried_object_attachment_id: 'attachment.1',
-      carried_object_attachment_revision: 'sha256:' + 'a'.repeat(64),
-      scene_resource_id: 'part',
-      controllable_component_id: 'robot',
-      command_target_id: 'arm',
-      carrier_frame_ref: {
-        kind: 'component',
-        controllable_component_id: 'robot',
-        model_instance_id: 'robot.model',
-        frame_role_id: 'tcp',
-      },
-      pose_in_carrier_frame: {
-        position_m: { x: 0, y: 0, z: 0 },
-        orientation_xyzw: [0, 0, 0, 1],
-      },
-      touch_body_roles: [],
-    }, 'request-detach');
-    expect(detached).not.toHaveProperty('expected_admission_generation');
-    expect(detached).not.toHaveProperty('expected_draft_id');
-    expect(detached?.operation).toMatchObject({
-      kind: 'detach_carried_object_at_current_pose',
-      expected_scene_resource_id: 'part',
-    });
-  });
-
   it('copies a live cell pose into Program Draft without changing its shape', () => {
     expect(programResourceWithLivePose({
       scene_resource_id: 'part',
@@ -317,37 +112,6 @@ describe('scene authoring intents', () => {
       shape: { type: 'box', box_dimensions_m: [0.1, 0.2, 0.3] },
       pose: { position_m: [0.4, 0.1, 0.2] },
     });
-  });
-
-  it('stages an exact cell-frame Program pose without mutating the live owner', () => {
-    const staged = livePoseFromProgramResource({
-      scene_resource_id: 'part',
-      shape: { type: 'sphere', sphere_radius_m: 0.02 },
-      pose: {
-        frame_ref: { kind: 'cell_frame' },
-        position_m: [0.2, 0.3, 0.4],
-        orientation: { rpy_deg: [0, 0, 90] },
-      },
-    });
-    expect(staged?.position_m).toEqual({ x: 0.2, y: 0.3, z: 0.4 });
-    expect(staged?.orientation_xyzw[0]).toBeCloseTo(0);
-    expect(staged?.orientation_xyzw[1]).toBeCloseTo(0);
-    expect(staged?.orientation_xyzw[2]).toBeCloseTo(Math.SQRT1_2);
-    expect(staged?.orientation_xyzw[3]).toBeCloseTo(Math.SQRT1_2);
-    expect(livePoseFromProgramResource({
-      scene_resource_id: 'part',
-      shape: { type: 'sphere', sphere_radius_m: 0.02 },
-      pose: {
-        frame_ref: {
-          kind: 'component_frame',
-          component_role: 'robot',
-          model_role: 'arm',
-          frame_role: 'base',
-        },
-        position_m: [0.2, 0.3, 0.4],
-        orientation: { xyzw: [0, 0, 0, 1] },
-      },
-    })).toBeNull();
   });
 
   it('places a cell-framed preview directly and requires an exact base mapping otherwise', () => {
@@ -435,7 +199,3 @@ describe('scene authoring intents', () => {
     expect(roundTrip.pose.orientation.w).toBeCloseTo(pose.orientation.w);
   });
 });
-
-function neverPose(): never {
-  throw new Error('fixture is not cell-fixed');
-}

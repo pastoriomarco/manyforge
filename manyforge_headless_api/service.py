@@ -8,6 +8,7 @@ from functools import lru_cache
 import hashlib
 import json
 import logging
+import math
 from threading import Lock
 import time
 from typing import Any, Callable, Sequence
@@ -156,6 +157,69 @@ def _history_page(page: dict[str, Any], schema: str) -> dict[str, Any]:
             "historian_response_invalid", "historian page cursor does not advance"
         )
     return page
+
+
+_ADMITTED_SPEED_HISTORY_PAGES = 4
+
+
+def _prepared_motion_admitted_speeds(
+    stored: Any, program_run_id: str
+) -> list[dict[str, Any]]:
+    """Copy one ``operation_prepared`` record's Kernel speed diagnostics.
+
+    Rows are matched to their exact participant target. Anything malformed or
+    from another run yields no row rather than a guessed value.
+    """
+
+    event = stored.get("event") if isinstance(stored, dict) else None
+    payload = event.get("payload") if isinstance(event, dict) else None
+    journal = payload.get("journal_payload") if isinstance(payload, dict) else None
+    if not isinstance(journal, dict) or journal.get("record_kind") != "operation_prepared":
+        return []
+    state = journal.get("operation_state")
+    intent = journal.get("intent")
+    if (
+        not isinstance(state, dict)
+        or state.get("program_run_id") != program_run_id
+        or not isinstance(intent, dict)
+    ):
+        return []
+    participants = {
+        participant.get("participant_id"): participant
+        for participant in state.get("participants") or ()
+        if isinstance(participant, dict)
+    }
+    rows: list[dict[str, Any]] = []
+    for diagnostic in intent.get("prepared_motion_diagnostics") or ():
+        if not isinstance(diagnostic, dict):
+            continue
+        participant = participants.get(diagnostic.get("participant_id"))
+        admitted = diagnostic.get("admitted_tcp_linear_speed_mps")
+        if (
+            participant is None
+            or not _bounded_text(participant.get("controllable_component_id"), maximum_bytes=1024)
+            or not _bounded_text(participant.get("command_target_id"), maximum_bytes=1024)
+            or type(admitted) not in (int, float)
+            or not math.isfinite(admitted)
+            or admitted <= 0
+        ):
+            continue
+        rows.append(
+            {
+                "controllable_component_id": participant["controllable_component_id"],
+                "command_target_id": participant["command_target_id"],
+                "operation_id": state.get("operation_id"),
+                "occurred_at_wall": event.get("occurred_at_wall"),
+                "requested_tcp_linear_speed_mps": diagnostic.get(
+                    "requested_tcp_linear_speed_mps"
+                ),
+                "deployment_maximum_tcp_linear_speed_mps": diagnostic.get(
+                    "deployment_maximum_tcp_linear_speed_mps"
+                ),
+                "admitted_tcp_linear_speed_mps": admitted,
+            }
+        )
+    return rows
 
 
 def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
@@ -2281,6 +2345,40 @@ class HeadlessService:
                 key: None if arguments[key] is None else str(arguments[key])
                 for key in ("start_utc_ns", "end_utc_ns")
             },
+        }
+
+    def program_run_admitted_speeds(self, program_run_id: str) -> dict[str, Any]:
+        """Return the owner-admitted TCP speed of each robot's latest prepared motion.
+
+        Execution evidence only: each row copies, unchanged, the Kernel's
+        ``prepared_motion_diagnostics`` row journaled when the motion was
+        prepared (requested, Deployment maximum and admitted speed). Nothing
+        is computed here. The scan reads at most
+        ``_ADMITTED_SPEED_HISTORY_PAGES`` newest history pages of this run, so
+        a robot whose last prepared motion is older (or pruned) has no row.
+        """
+
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        before_sequence: int | None = None
+        for _ in range(_ADMITTED_SPEED_HISTORY_PAGES):
+            page = self.history_export(
+                HistorianQueryRequest(
+                    program_run_id=program_run_id,
+                    event_types=["operation_prepared"],
+                    before_sequence=before_sequence,
+                )
+            )
+            for stored in page["events"]:  # newest first: the first row wins
+                for row in _prepared_motion_admitted_speeds(stored, program_run_id):
+                    key = (row["controllable_component_id"], row["command_target_id"])
+                    rows.setdefault(key, row)
+            if not page["truncated"]:
+                break
+            before_sequence = page["next_before_sequence"]
+        return {
+            "schema_version": "manyforge.program_run_admitted_speeds.v1",
+            "program_run_id": program_run_id,
+            "targets": [rows[key] for key in sorted(rows)],
         }
 
     def debug_export(self, query: HistorianQueryRequest) -> dict[str, Any]:

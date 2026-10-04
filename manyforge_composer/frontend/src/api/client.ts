@@ -44,6 +44,7 @@ import {
   parseSceneUrdfManifest,
   parseSourceModelProjection,
   parseProgramNodeCorrectionPreview,
+  parseProgramRunAdmittedSpeeds,
 } from './parsers';
 import {
   parseComposerSettingsSnapshot,
@@ -123,6 +124,7 @@ import type {
   StopFaultRecoveryOffer,
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
+  ProgramRunAdmittedSpeeds,
 } from '../types/robotControl';
 import type { DeploymentActivationScope } from '../state/activationScope';
 import type {
@@ -1311,6 +1313,13 @@ export const api = {
     ),
   },
   execution: {
+    /** Each robot's latest owner-admitted TCP speed in one Program run (history evidence). */
+    admittedSpeeds: (programRunId: string, signal?: AbortSignal): Promise<ProgramRunAdmittedSpeeds> =>
+      requestJson(
+        `/api/execution/program-runs/${encodeURIComponent(programRunId)}/admitted-speeds`,
+        parseProgramRunAdmittedSpeeds,
+        signal,
+      ),
     identity: (signal?: AbortSignal): Promise<ExecutionIdentity> =>
       requestJson(
         '/api/execution/identity',

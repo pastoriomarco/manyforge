@@ -177,6 +177,27 @@ def test_payload_path_limits_are_checked_before_fact_traversal() -> None:
         resolve_scenario_payload_path({}, "missing[")
 
 
+def test_json_exponent_numbers_load_as_numbers_not_yaml11_strings(
+    tmp_path: Path,
+) -> None:
+    # PyYAML's YAML 1.1 SafeLoader reads `-4e-05` (no dot) as a string; the
+    # Isaac UR10e example Scenes carry exactly this JSON spelling.
+    exponent = _write_yaml(
+        tmp_path / "exponent.scenario.yaml",
+        "scenario_id: exponent\ntimeouts: {rpy_deg: [-2.1e-05, -4e-05]}",
+    )
+    yaml11_only = _write_yaml(
+        tmp_path / "yaml11.scenario.yaml",
+        "scenario_id: yaml11\ntimeouts: {enabled: on}",
+    )
+
+    definition = scenario_runner.load_scenario_definition(exponent)
+    assert definition.timeouts == {"rpy_deg": [-2.1e-05, -4e-05]}
+    assert all(type(value) is float for value in definition.timeouts["rpy_deg"])
+    with pytest.raises(ValueError, match="YAML-only implicit scalar"):
+        scenario_runner.load_scenario_definition(yaml11_only)
+
+
 def test_yaml_byte_and_scalar_bounds_apply_before_scenario_allocation(
     tmp_path: Path,
 ) -> None:

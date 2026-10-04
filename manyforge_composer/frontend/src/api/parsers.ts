@@ -344,6 +344,7 @@ import type {
   SceneRevisionValue,
   ManualControlAvailability,
   ManualProgramHandoverContext,
+  ProgramRunAdmittedSpeeds,
 } from '../types/robotControl';
 import {
   parseProgramBindingTransport,
@@ -10922,4 +10923,39 @@ export function parseRuntimeScaleControlAccepted(
       'runtimeScaleControlAcceptance.accepted.active_operation_scale_generation',
     ),
   };
+}
+
+export function parseProgramRunAdmittedSpeeds(value: unknown): ProgramRunAdmittedSpeeds {
+  const path = 'programRunAdmittedSpeeds';
+  const root = objectAt(value, path);
+  exactKeysAt(root, ['schema_version', 'program_run_id', 'targets'], path);
+  if (root.schema_version !== 'manyforge.program_run_admitted_speeds.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_admitted_speeds.v1');
+  }
+  const targets = arrayAt(root.targets, `${path}.targets`).map((item, index) => {
+    const at = `${path}.targets[${index}]`;
+    const row = objectAt(item, at);
+    exactKeysAt(row, [
+      'controllable_component_id', 'command_target_id', 'operation_id', 'occurred_at_wall',
+      'requested_tcp_linear_speed_mps', 'deployment_maximum_tcp_linear_speed_mps',
+      'admitted_tcp_linear_speed_mps',
+    ], at);
+    const admitted = numberAt(row.admitted_tcp_linear_speed_mps, `${at}.admitted_tcp_linear_speed_mps`);
+    if (admitted <= 0) return fail(`${at}.admitted_tcp_linear_speed_mps`, 'positive');
+    return {
+      controllableComponentId: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
+      commandTargetId: stringAt(row.command_target_id, `${at}.command_target_id`),
+      operationId: stringAt(row.operation_id, `${at}.operation_id`),
+      occurredAtWall: stringAt(row.occurred_at_wall, `${at}.occurred_at_wall`),
+      requestedTcpLinearSpeedMps: row.requested_tcp_linear_speed_mps === null
+        ? null
+        : numberAt(row.requested_tcp_linear_speed_mps, `${at}.requested_tcp_linear_speed_mps`),
+      deploymentMaximumTcpLinearSpeedMps: numberAt(
+        row.deployment_maximum_tcp_linear_speed_mps,
+        `${at}.deployment_maximum_tcp_linear_speed_mps`,
+      ),
+      admittedTcpLinearSpeedMps: admitted,
+    };
+  });
+  return { programRunId: stringAt(root.program_run_id, `${path}.program_run_id`), targets };
 }

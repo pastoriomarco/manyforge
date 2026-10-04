@@ -20,8 +20,6 @@
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/disable_handoff_record_codec_internal.hpp>
-#include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/route_fence_record_codec_internal.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
@@ -46,8 +44,8 @@ namespace deployment = manyforge::deployment;
 namespace persistence = manyforge::persistence;
 
 constexpr std::string_view kSchemaId =
-    "manyforge.internal.kernel-configuration-fence-ledger.v4";
-constexpr int kSchemaVersion = 4;
+    "manyforge.internal.kernel-configuration-fence-ledger.v5";
+constexpr int kSchemaVersion = 5;
 constexpr int kSqliteApplicationId = 1296451142;
 constexpr std::uint64_t kMaximumFenceRecords = 256U;
 constexpr std::uint64_t kMaximumDatabasePageImageBytes = 64U * 1024U * 1024U;
@@ -84,22 +82,6 @@ InvokeRouteFencePort(Operation &&operation) noexcept {
     return core::Result<Value>::Err(
         core::ErrorDTO{"route_configuration_fence_rejected",
                        "route-configuration fence operation failed",
-                       {}});
-  }
-}
-
-template <typename Value, typename Operation>
-[[nodiscard]] core::Result<Value>
-InvokeDisableHandoffPort(Operation &&operation) noexcept {
-  try {
-    return core::Result<Value>::Ok(operation());
-  } catch (const std::exception &error) {
-    return core::Result<Value>::Err(
-        core::ErrorDTO{"kernel_disable_handoff_rejected", error.what(), {}});
-  } catch (...) {
-    return core::Result<Value>::Err(
-        core::ErrorDTO{"kernel_disable_handoff_rejected",
-                       "Kernel Disable-handoff operation failed",
                        {}});
   }
 }
@@ -525,36 +507,6 @@ SelectExpectedConfiguration(
           found->active_control_configuration_generation};
 }
 
-[[nodiscard]] std::vector<core::CurrentDomainActiveControlConfigurationDTO>
-SelectCurrentConfigurations(
-    const std::vector<core::DomainActiveControlConfigurationDTO> &available,
-    const core::ConfigurationFenceScopeDTO &scope) {
-  ValidateConfigurations(available);
-  std::vector<core::CurrentDomainActiveControlConfigurationDTO> result;
-  result.reserve(scope.domains.size());
-  for (const auto &domain : scope.domains) {
-    const auto found = std::lower_bound(
-        available.begin(), available.end(), domain.control_domain_id,
-        [](const auto &configuration, const auto &domain_id) {
-          return configuration.control_domain_id < domain_id;
-        });
-    if (found == available.end() ||
-        found->control_domain_id != domain.control_domain_id) {
-      result.push_back(
-          {domain.control_domain_id,
-           {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-            std::nullopt, std::nullopt}});
-    } else {
-      result.push_back(
-          {domain.control_domain_id,
-           {core::ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-            found->active_control_configuration_id,
-            found->active_control_configuration_generation}});
-    }
-  }
-  return result;
-}
-
 [[nodiscard]] std::string
 FenceIdFor(const core::ApplyConfigurationFenceIntentDTO &intent,
            const std::uint64_t generation) {
@@ -572,16 +524,7 @@ FenceIdFor(const core::RouteConfigurationFenceIntentDTO &intent,
          digest.substr(digest.size() - 16U);
 }
 
-[[nodiscard]] std::string
-FenceIdFor(const core::DisableHandoffRequestDTO &request,
-           const std::uint64_t generation) {
-  const auto digest = content_identity::sha256_digest(
-      core::detail::EncodeDisableHandoffRequestRecord(request));
-  return "configuration-fence-" + std::to_string(generation) + "-" +
-         digest.substr(digest.size() - 16U);
-}
-
-enum class DurableFenceOwnerKind { kApply, kRoute, kDisable };
+enum class DurableFenceOwnerKind { kApply, kRoute };
 
 [[nodiscard]] constexpr std::string_view
 ToString(const DurableFenceOwnerKind kind) noexcept {
@@ -590,8 +533,6 @@ ToString(const DurableFenceOwnerKind kind) noexcept {
     return "apply";
   case DurableFenceOwnerKind::kRoute:
     return "route";
-  case DurableFenceOwnerKind::kDisable:
-    return "disable";
   }
   return {};
 }
@@ -600,7 +541,6 @@ struct DurableFenceRow final {
   DurableFenceOwnerKind owner_kind;
   std::string intent_bytes;
   std::string accepted_bytes;
-  std::optional<std::string> disable_fence_scope_bytes;
   int state;
   std::optional<std::string> release_request_bytes;
   std::optional<std::string> release_receipt_bytes;
@@ -619,60 +559,6 @@ ScopesOverlap(const core::ConfigurationFenceScopeDTO &left,
         return std::binary_search(right.resources.begin(),
                                   right.resources.end(), resource);
       });
-}
-
-[[nodiscard]] bool
-ScopeIsSubset(const core::ConfigurationFenceScopeDTO &subset,
-              const core::ConfigurationFenceScopeDTO &superset) noexcept {
-  const auto ids_subset = [](const auto &left, const auto &right,
-                             const auto &key) {
-    return std::all_of(left.begin(), left.end(), [&](const auto &item) {
-      const auto found = std::lower_bound(
-          right.begin(), right.end(), key(item),
-          [&](const auto &candidate, const auto &requested_key) {
-            return key(candidate) < requested_key;
-          });
-      return found != right.end() && *found == item;
-    });
-  };
-  return std::includes(superset.controllable_component_ids.begin(),
-                       superset.controllable_component_ids.end(),
-                       subset.controllable_component_ids.begin(),
-                       subset.controllable_component_ids.end()) &&
-         ids_subset(subset.domains, superset.domains,
-                    [](const auto &row) { return row.control_domain_id; }) &&
-         ids_subset(subset.bindings, superset.bindings,
-                    [](const auto &row) { return row.control_binding_id; }) &&
-         std::includes(superset.resources.begin(), superset.resources.end(),
-                       subset.resources.begin(), subset.resources.end());
-}
-
-[[nodiscard]] bool ScopeMembershipIsSubset(
-    const core::ConfigurationFenceScopeDTO &subset,
-    const core::ConfigurationFenceScopeDTO &superset) noexcept {
-  const auto row_ids_are_subset = [](const auto &left, const auto &right,
-                                     const auto &key) {
-    return std::all_of(left.begin(), left.end(), [&](const auto &item) {
-      const auto found = std::lower_bound(
-          right.begin(), right.end(), key(item),
-          [&](const auto &candidate, const auto &requested_key) {
-            return key(candidate) < requested_key;
-          });
-      return found != right.end() && key(*found) == key(item);
-    });
-  };
-  return std::includes(superset.controllable_component_ids.begin(),
-                       superset.controllable_component_ids.end(),
-                       subset.controllable_component_ids.begin(),
-                       subset.controllable_component_ids.end()) &&
-         row_ids_are_subset(
-             subset.domains, superset.domains,
-             [](const auto &row) { return row.control_domain_id; }) &&
-         row_ids_are_subset(
-             subset.bindings, superset.bindings,
-             [](const auto &row) { return row.control_binding_id; }) &&
-         std::includes(superset.resources.begin(), superset.resources.end(),
-                       subset.resources.begin(), subset.resources.end());
 }
 
 } // namespace
@@ -914,117 +800,6 @@ void ManagedKernelAdmissionGate::AcquireRouteFenceDurably(
       "an overlapping configuration fence already closes operation admission");
   held_fences_.push_back({fence_id, scope});
   commit_durable_fence();
-}
-
-ManagedKernelAdmissionObservation
-ManagedKernelAdmissionGate::AcquireDisableFenceDurably(
-    const core::ConfigurationFenceId &fence_id,
-    const core::ConfigurationFenceScopeDTO &scope,
-    const std::function<void(const ManagedKernelAdmissionObservation &)>
-        &commit_durable_fence) {
-  Require(!fence_id.empty() && scope.valid() &&
-              static_cast<bool>(commit_durable_fence),
-          "Disable-fence acquisition is invalid");
-  std::lock_guard lock(*admission_mutex_);
-  const auto table = resource_table_.lock();
-  Require(table != nullptr || !resource_table_was_bound_,
-          "the bound Kernel resource table is no longer available");
-  Require(std::none_of(held_fences_.begin(), held_fences_.end(),
-                       [&](const auto &held) {
-                         return ScopesOverlap(held.scope, scope);
-                       }),
-          "an overlapping configuration fence already closes Disable scope");
-  const auto snapshot = table != nullptr
-                            ? table->admission_snapshot(scope.resources)
-                            : core::ResourceSlotAdmissionSnapshotDTO{};
-  Require(snapshot.affected_queued_operation_count == 0U &&
-              snapshot.affected_active_operation_count == 0U,
-          "ordinary Disable refuses outstanding work; Stop is a separate operation");
-  ManagedKernelAdmissionObservation observation{
-      snapshot.operation_resource_generation,
-      snapshot.active_control_configurations,
-      snapshot.route_published_active_control_configurations,
-      snapshot.affected_queued_operation_count,
-      snapshot.affected_active_operation_count};
-  held_fences_.push_back({fence_id, scope});
-  // Stop containment is deliberately allowed to begin with affected work.
-  // The same mutex closes new reservations before the prepared durable row.
-  commit_durable_fence(observation);
-  return observation;
-}
-
-void ManagedKernelAdmissionGate::WidenDisableFenceDurably(
-    const core::ConfigurationFenceId &fence_id,
-    const core::ConfigurationFenceScopeDTO &prior_scope,
-    const core::ConfigurationFenceScopeDTO &widened_scope,
-    const std::function<void(const ManagedKernelAdmissionObservation &)>
-        &commit_durable_widening) {
-  Require(!fence_id.empty() && prior_scope.valid() && widened_scope.valid() &&
-              ScopeIsSubset(prior_scope, widened_scope) &&
-              static_cast<bool>(commit_durable_widening),
-          "Disable-fence widening is invalid");
-  std::lock_guard lock(*admission_mutex_);
-  const auto found = std::find_if(
-      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
-        return held.fence_id == fence_id && held.scope == prior_scope;
-      });
-  Require(found != held_fences_.end(),
-          "Disable-fence widening does not name the exact held fence");
-  Require(found->active_effect_count == 0U,
-          "Disable-fence widening conflicts with an active guarded effect");
-  Require(std::none_of(held_fences_.begin(), held_fences_.end(),
-                       [&](const auto &held) {
-                         return &held != &*found &&
-                                ScopesOverlap(held.scope, widened_scope);
-                       }),
-          "Disable-fence widening overlaps another held fence");
-  const auto table = resource_table_.lock();
-  Require(table != nullptr || !resource_table_was_bound_,
-          "the bound Kernel resource table is no longer available");
-  const auto snapshot = table != nullptr
-                            ? table->admission_snapshot(widened_scope.resources)
-                            : core::ResourceSlotAdmissionSnapshotDTO{};
-  ManagedKernelAdmissionObservation observation{
-      snapshot.operation_resource_generation,
-      snapshot.active_control_configurations,
-      snapshot.route_published_active_control_configurations,
-      snapshot.affected_queued_operation_count,
-      snapshot.affected_active_operation_count};
-  found->scope = widened_scope;
-  commit_durable_widening(observation);
-}
-
-void ManagedKernelAdmissionGate::ReleaseDisableFenceDurably(
-    const core::ConfigurationFenceId &fence_id,
-    const core::ConfigurationFenceScopeDTO &scope,
-    const std::function<void(const ManagedKernelAdmissionObservation &)>
-        &commit_durable_release) {
-  Require(!fence_id.empty() && scope.valid() &&
-              static_cast<bool>(commit_durable_release),
-          "Disable-fence release is invalid");
-  std::lock_guard lock(*admission_mutex_);
-  const auto found = std::find_if(
-      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
-        return held.fence_id == fence_id && held.scope == scope;
-      });
-  Require(found != held_fences_.end(),
-          "Disable-fence release does not name the exact held fence");
-  Require(found->active_effect_count == 0U,
-          "Disable-fence release conflicts with an active guarded effect");
-  const auto table = resource_table_.lock();
-  Require(table != nullptr || !resource_table_was_bound_,
-          "the bound Kernel resource table is no longer available");
-  const auto snapshot = table != nullptr
-                            ? table->admission_snapshot(scope.resources)
-                            : core::ResourceSlotAdmissionSnapshotDTO{};
-  ManagedKernelAdmissionObservation observation{
-      snapshot.operation_resource_generation,
-      snapshot.active_control_configurations,
-      snapshot.route_published_active_control_configurations,
-      snapshot.affected_queued_operation_count,
-      snapshot.affected_active_operation_count};
-  commit_durable_release(observation);
-  held_fences_.erase(found);
 }
 
 void ManagedKernelAdmissionGate::RestoreFence(
@@ -1856,583 +1631,6 @@ public:
     return result;
   }
 
-  void
-  BindDisableHandoffKernel(core::ResourceAddressedExecutionKernel &kernel) {
-    std::lock_guard lock(mutex_);
-    Require(kernel.request_owner_epoch() == config_.request_owner_epoch,
-            "Disable-handoff Kernel owner epoch differs from the durable "
-            "fence owner");
-    Require(disable_handoff_kernel_ == nullptr ||
-                disable_handoff_kernel_ == &kernel,
-            "Disable-handoff Kernel cannot be rebound to another owner");
-    disable_handoff_kernel_ = &kernel;
-  }
-
-  [[nodiscard]] core::DisableHandoffAdmissionSnapshotDTO
-  ObserveDisableHandoffAdmission(
-      const core::DisableHandoffAdmissionQueryDTO &query) const {
-    std::lock_guard lock(mutex_);
-    return ObserveDisableHandoffAdmissionLocked(query);
-  }
-
-  [[nodiscard]] core::DisableHandoffAcceptedDTO
-  BeginDisableHandoff(const core::DisableHandoffRequestDTO &request) {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid(), "Disable-handoff request is invalid");
-    Require(request.owner_request_context.request_owner_epoch ==
-                config_.request_owner_epoch,
-            "Disable-handoff request names a stale Kernel owner epoch");
-    const auto request_bytes =
-        core::detail::EncodeDisableHandoffRequestRecord(request);
-    if (const auto existing =
-            ReadByRequest(request.owner_request_context.request_owner_epoch,
-                          request.owner_request_context.request_id)) {
-      Require(existing->owner_kind == DurableFenceOwnerKind::kDisable &&
-                  existing->intent_bytes == request_bytes,
-              "request ID is bound to another configuration-fence outcome");
-      Require(!existing->accepted_bytes.empty(),
-              "prepared Disable handoff has an unresolved possible effect; "
-              "attempt reconciliation is required");
-      auto accepted = core::detail::DecodeDisableHandoffAcceptedRecord(
-          existing->accepted_bytes);
-      accepted.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
-      Require(accepted.matches(request),
-              "durable Disable-handoff replay contradicts its request");
-      return accepted;
-    }
-    Require(
-        ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
-                          "durable fence record count") < kMaximumFenceRecords,
-        "durable fence ledger has reached its fixed record bound");
-
-    auto capture = RevalidateDisableHandoffRequestLocked(request);
-    Require(request.scope_resolution ==
-                    core::DisableHandoffScopeResolutionDTO::kExact &&
-                capture.runtime.scope_resolution ==
-                    core::DisableHandoffScopeResolutionDTO::kExact &&
-                request.affected_scope == capture.runtime.current_scope &&
-                capture.runtime.affected_queued_operations.empty() &&
-                capture.runtime.affected_active_operation_count == 0U,
-            "ordinary Disable requires the exact idle component scope; "
-            "it cannot escalate to Stop");
-
-    const auto predecessor_generation = ReadFenceGeneration();
-    Require(predecessor_generation < std::numeric_limits<std::uint64_t>::max(),
-            "configuration-fence generation overflowed");
-    const auto next_generation = predecessor_generation + 1U;
-    const core::ConfigurationFenceId fence_id(
-        FenceIdFor(request, next_generation));
-    const core::detail::DisableHandoffFenceScopeRecordDTO scope_record{
-        capture.runtime.scope_resolution, capture.runtime.current_scope};
-    const auto scope_record_bytes =
-        core::detail::EncodeDisableHandoffFenceScopeRecord(scope_record);
-
-    const auto admitted = admission_gate_.AcquireDisableFenceDurably(
-        fence_id, scope_record.scope,
-        [&](const ManagedKernelAdmissionObservation &observation) {
-          const auto selected_configurations = SelectCurrentConfigurations(
-              observation.active_control_configurations, scope_record.scope);
-          Require(
-              capture.active.receipt.request.candidate_retained_bundle_id ==
-                      capture.runtime.retained_bundle_id &&
-                  capture.active.receipt.request.candidate_graph_revision ==
-                      capture.runtime.graph_revision,
-              "active publication changed before Disable-fence acquisition");
-          Transaction transaction(database_);
-          Statement insert(
-              database_,
-              "INSERT INTO kernel_apply_fences (owner_kind,owner_id,"
-              "owner_generation,request_id,request_owner_epoch,intent_blob,"
-              "accepted_blob,disable_fence_scope_blob,fence_id,"
-              "fence_generation,state,release_request_blob,"
-              "release_receipt_blob) VALUES "
-              "(?,?,?,?,?,?,NULL,?,?,?,0,NULL,NULL)");
-          insert.Text(1, ToString(DurableFenceOwnerKind::kDisable));
-          insert.Text(2, request.lifecycle_transaction_id.value());
-          insert.Integer(3, request.lifecycle_transaction_generation.value());
-          insert.Text(4, request.owner_request_context.request_id.value());
-          insert.Text(
-              5, request.owner_request_context.request_owner_epoch.value());
-          insert.Blob(6, request_bytes);
-          insert.Blob(7, scope_record_bytes);
-          insert.Text(8, fence_id.value());
-          insert.Integer(9, next_generation);
-          Require(insert.Step() == SQLITE_DONE,
-                  "durable prepared Disable fence insertion returned a row");
-          Statement update(
-              database_,
-              "UPDATE kernel_apply_fence_meta SET fence_generation=? WHERE "
-              "id=1 AND fence_generation=?");
-          update.Integer(1, next_generation);
-          update.Integer(2, predecessor_generation);
-          Require(update.Step() == SQLITE_DONE &&
-                      sqlite3_changes(database_) == 1,
-                  "durable Disable-fence generation compare-and-swap failed");
-          transaction.Commit();
-          capture.runtime.operation_resource_generation =
-              observation.operation_resource_generation;
-          capture.runtime.current_active_control_configurations =
-              selected_configurations;
-        });
-
-    // Ordinary Disable is idle-only: work found under the durable fence is a
-    // refusal, never a reason to escalate to Stop.
-    Require(admitted.affected_queued_operation_count == 0U &&
-                admitted.affected_active_operation_count == 0U,
-            "ordinary Disable found work under its fence; it cannot escalate to Stop");
-    const auto scope_digest =
-        core::ComputeDisableHandoffScopeDigest(scope_record.scope);
-    Require(scope_digest.ok(),
-            "Disable-handoff actual scope has no canonical identity");
-    core::DisableHandoffAcceptedDTO accepted{
-        request.owner_request_context.request_id,
-        core::RequestReplayStatusDTO::kAcceptedNew,
-        request.lifecycle_transaction_id,
-        request.lifecycle_transaction_generation,
-        request.controllable_component_id,
-        scope_record.scope_resolution,
-        scope_digest.value(),
-        fence_id,
-        core::ConfigurationFenceGeneration(next_generation),
-        std::nullopt,
-        std::nullopt};
-    Require(accepted.matches(request),
-            "constructed Disable-handoff acceptance is invalid");
-    const auto accepted_bytes =
-        core::detail::EncodeDisableHandoffAcceptedRecord(accepted);
-    Transaction transaction(database_);
-    Statement update(
-        database_,
-        "UPDATE kernel_apply_fences SET accepted_blob=? WHERE owner_kind="
-        "'disable' AND request_owner_epoch=? AND request_id=? AND state=0 "
-        "AND accepted_blob IS NULL");
-    update.Blob(1, accepted_bytes);
-    update.Text(2, request.owner_request_context.request_owner_epoch.value());
-    update.Text(3, request.owner_request_context.request_id.value());
-    Require(update.Step() == SQLITE_DONE && sqlite3_changes(database_) == 1,
-            "durable Disable acceptance compare-and-swap failed");
-    transaction.Commit();
-    return accepted;
-  }
-
-  [[nodiscard]] core::DisableHandoffStatusDTO DisableHandoffStatus(
-      const core::LifecycleTransactionId &lifecycle_transaction_id,
-      const core::LifecycleTransactionGeneration
-          lifecycle_transaction_generation) const {
-    std::lock_guard lock(mutex_);
-    return DisableHandoffStatusLocked(lifecycle_transaction_id,
-                                      lifecycle_transaction_generation);
-  }
-
-  [[nodiscard]] core::DisableHandoffAttemptReconciliationDTO
-  ReconcileDisableHandoffAttempt(
-      const core::DisableHandoffRequestDTO &request) const {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid(),
-            "Disable-handoff reconciliation request is invalid");
-    const auto encoded =
-        core::detail::EncodeDisableHandoffRequestRecord(request);
-    const auto row =
-        ReadByRequest(request.owner_request_context.request_owner_epoch,
-                      request.owner_request_context.request_id);
-    if (!row.has_value()) {
-      if (request.owner_request_context.request_owner_epoch ==
-          config_.request_owner_epoch) {
-        return {request, core::DisableHandoffAttemptDispositionDTO::kNotSeen,
-                std::nullopt, std::nullopt, std::nullopt};
-      }
-      return {request, core::DisableHandoffAttemptDispositionDTO::kUncertain,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{
-                  "kernel_disable_handoff_owner_replaced",
-                  "replacement owner cannot prove the stale request was not "
-                  "seen",
-                  {}}};
-    }
-    if (row->owner_kind != DurableFenceOwnerKind::kDisable ||
-        row->intent_bytes != encoded) {
-      return {request, core::DisableHandoffAttemptDispositionDTO::kConflicting,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{
-                  "kernel_disable_handoff_request_conflict",
-                  "the durable request identity names another fence outcome",
-                  {}}};
-    }
-    if (row->accepted_bytes.empty()) {
-      return {
-          request, core::DisableHandoffAttemptDispositionDTO::kUncertain,
-          std::nullopt, std::nullopt,
-          core::ErrorDTO{"kernel_disable_handoff_possible_effect",
-                         "the durable prepared fence has no authoritative Stop "
-                         "acceptance result",
-                         {}}};
-    }
-    if (row->state != 0) {
-      return {request, core::DisableHandoffAttemptDispositionDTO::kConflicting,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{
-                  "kernel_disable_handoff_already_released",
-                  "the exact handoff was accepted and its fence is released",
-                  {}}};
-    }
-    const auto accepted =
-        core::detail::DecodeDisableHandoffAcceptedRecord(row->accepted_bytes);
-    const auto status =
-        DisableHandoffStatusLocked(request.lifecycle_transaction_id,
-                                   request.lifecycle_transaction_generation);
-    core::DisableHandoffAttemptReconciliationDTO result{
-        request, core::DisableHandoffAttemptDispositionDTO::kAcceptedExact,
-        accepted, status, std::nullopt};
-    Require(result.locally_valid(),
-            "constructed Disable-handoff reconciliation is invalid");
-    return result;
-  }
-
-  [[nodiscard]] core::DisableFenceReleasedDTO
-  ReleaseDisableFence(const core::DisableFenceReleaseRequestDTO &request) {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid() &&
-                core::VerifyDisableHandoffAdmissionSnapshot(
-                    request.current_admission_snapshot)
-                    .ok(),
-            "Disable-fence release request is invalid");
-    Require(request.owner_request_context.request_owner_epoch ==
-                config_.request_owner_epoch,
-            "Disable-fence release names a stale Kernel owner epoch");
-    const auto request_bytes =
-        core::detail::EncodeDisableFenceReleaseRequestRecord(request);
-    const auto row =
-        ReadByFence(request.ready_handoff.configuration_fence_id,
-                    request.ready_handoff.configuration_fence_generation);
-    Require(row.has_value() &&
-                row->owner_kind == DurableFenceOwnerKind::kDisable,
-            "Disable-fence release identity is absent or foreign");
-    if (row->state == 1) {
-      Require(row->release_request_bytes == request_bytes &&
-                  row->release_receipt_bytes.has_value(),
-              "exact Disable-fence release replay conflicts with its receipt");
-      auto released = core::detail::DecodeDisableFenceReleasedRecord(
-          *row->release_receipt_bytes);
-      released.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
-      return released;
-    }
-    Require(!row->accepted_bytes.empty() &&
-                row->disable_fence_scope_bytes.has_value(),
-            "Disable-fence release names an unresolved prepared handoff");
-    const auto accepted =
-        core::detail::DecodeDisableHandoffAcceptedRecord(row->accepted_bytes);
-    const auto scope_record =
-        core::detail::DecodeDisableHandoffFenceScopeRecord(
-            *row->disable_fence_scope_bytes);
-    const auto current =
-        DisableHandoffStatusLocked(request.lifecycle_transaction_id,
-                                   request.lifecycle_transaction_generation);
-    Require(current == request.ready_handoff &&
-                accepted.configuration_fence_id ==
-                    current.configuration_fence_id &&
-                accepted.configuration_fence_generation ==
-                    current.configuration_fence_generation &&
-                scope_record.scope == current.scope,
-            "Disable-fence release conflicts with its ready handoff");
-    const auto fresh = ObserveDisableHandoffAdmissionLocked(
-        request.current_admission_snapshot.query);
-    Require(fresh == request.current_admission_snapshot,
-            "Disable-fence release admission facts changed before release");
-
-    core::DisableFenceReleasedDTO released{
-        request,
-        core::RequestReplayStatusDTO::kAcceptedNew,
-        config_.now_ns(),
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation,
-        accepted.component_scope_digest,
-        Digest("manyforge.kernel-disable-fence-release-receipt.seed.v1")};
-    released.receipt_digest =
-        core::ContentDigest(content_identity::sha256_digest(
-            core::detail::EncodeDisableFenceReleasedRecord(released)));
-    Require(released.locally_valid(),
-            "constructed Disable-fence release receipt is invalid");
-    const auto receipt_bytes =
-        core::detail::EncodeDisableFenceReleasedRecord(released);
-    admission_gate_.ReleaseDisableFenceDurably(
-        accepted.configuration_fence_id, scope_record.scope,
-        [&](const ManagedKernelAdmissionObservation &observation) {
-          Require(observation.operation_resource_generation ==
-                          fresh.operation_resource_generation &&
-                      observation.affected_queued_operation_count == 0U &&
-                      observation.affected_active_operation_count == 0U &&
-                      SelectCurrentConfigurations(
-                          observation.active_control_configurations,
-                          scope_record.scope) ==
-                          fresh.current_active_control_configurations,
-                  "Disable-fence release facts changed under the held fence");
-          Transaction transaction(database_);
-          Statement update(
-              database_,
-              "UPDATE kernel_apply_fences SET state=1,"
-              "release_request_blob=?,release_receipt_blob=? WHERE "
-              "owner_kind='disable' AND fence_id=? AND fence_generation=? "
-              "AND state=0");
-          update.Blob(1, request_bytes);
-          update.Blob(2, receipt_bytes);
-          update.Text(3, accepted.configuration_fence_id.value());
-          update.Integer(4, accepted.configuration_fence_generation.value());
-          Require(update.Step() == SQLITE_DONE &&
-                      sqlite3_changes(database_) == 1,
-                  "durable Disable-fence release compare-and-swap failed");
-          transaction.Commit();
-        });
-    return released;
-  }
-
-  [[nodiscard]] core::DisableFenceReleaseAttemptReconciliationDTO
-  ReconcileDisableFenceReleaseAttempt(
-      const core::DisableFenceReleaseRequestDTO &request) const {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid(),
-            "Disable-fence release reconciliation request is invalid");
-    const auto row =
-        ReadByFence(request.ready_handoff.configuration_fence_id,
-                    request.ready_handoff.configuration_fence_generation);
-    if (!row.has_value()) {
-      const auto disposition =
-          request.owner_request_context.request_owner_epoch ==
-                  config_.request_owner_epoch
-              ? core::DisableFenceReleaseAttemptDispositionDTO::kConflicting
-              : core::DisableFenceReleaseAttemptDispositionDTO::kUncertain;
-      return {request, disposition, std::nullopt, std::nullopt,
-              core::ErrorDTO{
-                  "kernel_disable_fence_release_missing",
-                  "the release fence is absent from the current durable owner",
-                  {}}};
-    }
-    if (row->owner_kind != DurableFenceOwnerKind::kDisable) {
-      return {request,
-              core::DisableFenceReleaseAttemptDispositionDTO::kConflicting,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{"kernel_disable_fence_release_conflict",
-                             "the release identity names a foreign fence",
-                             {}}};
-    }
-    const auto encoded =
-        core::detail::EncodeDisableFenceReleaseRequestRecord(request);
-    if (row->state == 1 && row->release_request_bytes == encoded &&
-        row->release_receipt_bytes.has_value()) {
-      const auto receipt = core::detail::DecodeDisableFenceReleasedRecord(
-          *row->release_receipt_bytes);
-      core::DisableFenceReleaseAttemptReconciliationDTO result{
-          request,
-          core::DisableFenceReleaseAttemptDispositionDTO::kReleasedExact,
-          receipt, std::nullopt, std::nullopt};
-      Require(result.locally_valid(),
-              "constructed exact Disable release reconciliation is invalid");
-      return result;
-    }
-    if (row->state == 0 && !row->accepted_bytes.empty()) {
-      const auto status =
-          DisableHandoffStatusLocked(request.lifecycle_transaction_id,
-                                     request.lifecycle_transaction_generation);
-      if (status == request.ready_handoff) {
-        core::DisableFenceReleaseAttemptReconciliationDTO result{
-            request,
-            core::DisableFenceReleaseAttemptDispositionDTO::kNotReleasedHeld,
-            std::nullopt, status, std::nullopt};
-        Require(result.locally_valid(),
-                "constructed held Disable release reconciliation is invalid");
-        return result;
-      }
-    }
-    return {request,
-            core::DisableFenceReleaseAttemptDispositionDTO::kConflicting,
-            std::nullopt, std::nullopt,
-            core::ErrorDTO{
-                "kernel_disable_fence_release_conflict",
-                "the durable release outcome conflicts with the exact request",
-                {}}};
-  }
-
-private:
-  struct DisableRuntimeCapture final {
-    core::KernelDisableHandoffRuntimeSnapshotDTO runtime;
-    ActivePublication active;
-  };
-
-  [[nodiscard]] DisableRuntimeCapture CaptureDisableRuntimeLocked(
-      const core::DisableHandoffAdmissionQueryDTO &query) const {
-    Require(disable_handoff_kernel_ != nullptr,
-            "Disable-handoff Kernel is not bound");
-    auto runtime =
-        disable_handoff_kernel_->capture_disable_handoff_runtime_snapshot(
-            query);
-    if (!runtime.ok()) {
-      Fail("Kernel Disable admission snapshot failed: " +
-           runtime.error().message);
-    }
-    auto active = ReadActivePublication();
-    Require(runtime.value().request_owner_epoch ==
-                    config_.request_owner_epoch &&
-                runtime.value().retained_bundle_id ==
-                    active.receipt.request.candidate_retained_bundle_id &&
-                runtime.value().graph_revision ==
-                    active.receipt.request.candidate_graph_revision,
-            "Kernel Disable runtime and active publication are not coherent");
-    if (query.component_expectation.has_value() &&
-        runtime.value().scope_resolution ==
-            core::DisableHandoffScopeResolutionDTO::kExact &&
-        (query.component_expectation->active_publication_generation !=
-             active.receipt.publication_generation ||
-         query.component_expectation->active_public_pointer_digest !=
-             active.receipt.durable_public_pointer_content_digest)) {
-      runtime.value().scope_resolution = core::
-          DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved;
-    }
-    return {std::move(runtime.value()), std::move(active)};
-  }
-
-  [[nodiscard]] DisableRuntimeCapture RevalidateDisableHandoffRequestLocked(
-      const core::DisableHandoffRequestDTO &request) const {
-    Require(disable_handoff_kernel_ != nullptr,
-            "Disable-handoff Kernel is not bound");
-    auto runtime =
-        disable_handoff_kernel_->revalidate_disable_handoff_request(request);
-    if (!runtime.ok()) {
-      Fail("Kernel Disable request revalidation failed: " +
-           runtime.error().message);
-    }
-    auto active = ReadActivePublication();
-    Require(runtime.value().request_owner_epoch ==
-                    config_.request_owner_epoch &&
-                runtime.value().retained_bundle_id ==
-                    active.receipt.request.candidate_retained_bundle_id &&
-                runtime.value().graph_revision ==
-                    active.receipt.request.candidate_graph_revision,
-            "Kernel Disable runtime and active publication are not coherent");
-    if (runtime.value().scope_resolution ==
-            core::DisableHandoffScopeResolutionDTO::kExact &&
-        (request.expected_active_publication_generation !=
-             active.receipt.publication_generation ||
-         request.expected_active_public_pointer_digest !=
-             active.receipt.durable_public_pointer_content_digest)) {
-      runtime.value().scope_resolution = core::
-          DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved;
-    }
-    return {std::move(runtime.value()), std::move(active)};
-  }
-
-  [[nodiscard]] core::DisableHandoffAdmissionSnapshotDTO
-  ObserveDisableHandoffAdmissionLocked(
-      const core::DisableHandoffAdmissionQueryDTO &query) const {
-    Require(query.locally_valid(),
-            "Disable-handoff admission query is invalid");
-    auto capture = CaptureDisableRuntimeLocked(query);
-    core::DisableHandoffAdmissionSnapshotDTO snapshot{
-        query,
-        config_.request_owner_epoch,
-        capture.runtime.scope_resolution,
-        capture.runtime.current_scope,
-        capture.active.receipt.publication_generation,
-        capture.active.receipt.durable_public_pointer_content_digest,
-        capture.runtime.retained_bundle_id,
-        capture.runtime.graph_revision,
-        capture.runtime.operation_resource_generation,
-        core::ConfigurationFenceGeneration(ReadFenceGeneration()),
-        capture.runtime.current_active_control_configurations,
-        Digest("manyforge.kernel-disable-admission-snapshot.seed.v1")};
-    const auto digest =
-        core::ComputeDisableHandoffAdmissionSnapshotDigest(snapshot);
-    Require(digest.ok(),
-            "constructed Disable admission snapshot is not canonical");
-    snapshot.snapshot_digest = digest.value();
-    Require(core::VerifyDisableHandoffAdmissionSnapshot(snapshot).ok(),
-            "constructed Disable admission snapshot is invalid");
-    return snapshot;
-  }
-
-  [[nodiscard]] core::DisableHandoffStatusDTO DisableHandoffStatusLocked(
-      const core::LifecycleTransactionId &lifecycle_transaction_id,
-      const core::LifecycleTransactionGeneration
-          lifecycle_transaction_generation) const {
-    const auto row = ReadByDisableOwner(lifecycle_transaction_id,
-                                        lifecycle_transaction_generation);
-    Require(row.has_value() &&
-                row->owner_kind == DurableFenceOwnerKind::kDisable &&
-                row->state == 0 && !row->accepted_bytes.empty() &&
-                row->disable_fence_scope_bytes.has_value(),
-            "Disable-handoff status is absent, unresolved, or released");
-    const auto request =
-        core::detail::DecodeDisableHandoffRequestRecord(row->intent_bytes);
-    const auto accepted =
-        core::detail::DecodeDisableHandoffAcceptedRecord(row->accepted_bytes);
-    const auto scope_record =
-        core::detail::DecodeDisableHandoffFenceScopeRecord(
-            *row->disable_fence_scope_bytes);
-    Require(accepted.matches(request) &&
-                accepted.scope_resolution == scope_record.scope_resolution,
-            "durable Disable-handoff status conflicts with its request");
-
-    auto state = core::DisableHandoffStateDTO::kReady;
-    std::optional<core::StopCertificateRefDTO> certificate;
-    std::optional<core::ErrorDTO> status_error;
-    if (accepted.stop_id.has_value()) {
-      Require(disable_handoff_kernel_ != nullptr,
-              "Disable-handoff Kernel is not bound for status observation");
-      const auto stop =
-          disable_handoff_kernel_->get_stop_status(*accepted.stop_id);
-      if (!stop.ok()) {
-        Fail("Disable-handoff Stop status is unavailable: " +
-             stop.error().message);
-      }
-      switch (stop.value().state) {
-      case core::StopStatusStateDTO::kAccepted:
-      case core::StopStatusStateDTO::kStopping:
-      case core::StopStatusStateDTO::kCertifying:
-        state = core::DisableHandoffStateDTO::kStopping;
-        break;
-      case core::StopStatusStateDTO::kSucceeded:
-        Require(stop.value().stop_certificate.has_value(),
-                "successful Disable Stop lacks its certificate reference");
-        state = core::DisableHandoffStateDTO::kReady;
-        certificate = stop.value().stop_certificate;
-        break;
-      case core::StopStatusStateDTO::kPartial:
-      case core::StopStatusStateDTO::kFailed:
-        state = core::DisableHandoffStateDTO::kFailed;
-        status_error = core::ErrorDTO{
-            "kernel_disable_stop_not_certified",
-            "Disable containment did not produce a successful Stop "
-            "certificate",
-            {}};
-        break;
-      }
-    }
-    const core::ConfigurationFenceHandleDTO handle{
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation,
-        accepted.lifecycle_transaction_id,
-        accepted.lifecycle_transaction_generation,
-        accepted.controllable_component_id,
-        scope_record.scope,
-        "component_lifecycle_disable_handoff",
-        core::ConfigurationFenceState::kHeld};
-    core::DisableHandoffStatusDTO status{
-        accepted.lifecycle_transaction_id,
-        accepted.lifecycle_transaction_generation,
-        accepted.controllable_component_id,
-        accepted.scope_resolution,
-        accepted.component_scope_digest,
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation,
-        state,
-        scope_record.scope,
-        handle,
-        certificate,
-        {},
-        status_error};
-    Require(status.locally_valid(),
-            "constructed Disable-handoff status is invalid");
-    return status;
-  }
-
   [[nodiscard]] core::RouteConfigurationFenceAdmissionSnapshotDTO
   ObserveRouteConfigurationFenceAdmissionLocked(
       const core::RouteConfigurationFenceAdmissionQueryDTO &query) const {
@@ -2647,21 +1845,16 @@ private:
           database_,
           "CREATE TABLE kernel_apply_fences ("
           "owner_kind TEXT NOT NULL CHECK(owner_kind IN "
-          "('apply','route','disable')),owner_id TEXT NOT NULL,"
+          "('apply','route')),owner_id TEXT NOT NULL,"
           "owner_generation INTEGER NOT NULL CHECK("
           "owner_generation>0),request_id TEXT NOT NULL,request_owner_epoch "
-          "TEXT NOT NULL,intent_blob BLOB NOT NULL,accepted_blob BLOB,"
-          "disable_fence_scope_blob BLOB,"
+          "TEXT NOT NULL,intent_blob BLOB NOT NULL,accepted_blob BLOB NOT NULL,"
           "fence_id TEXT NOT NULL,fence_generation INTEGER NOT NULL CHECK("
           "fence_generation>0),state INTEGER NOT NULL CHECK(state IN (0,1)),"
           "release_request_blob BLOB,release_receipt_blob BLOB,"
           "PRIMARY KEY(request_owner_epoch,request_id),"
           "UNIQUE(owner_kind,owner_id,owner_generation),UNIQUE(fence_id),"
           "UNIQUE(fence_generation),"
-          "CHECK((owner_kind IN ('apply','route') AND accepted_blob IS NOT "
-          "NULL AND disable_fence_scope_blob IS NULL) OR (owner_kind='disable' "
-          "AND disable_fence_scope_blob IS NOT NULL)),"
-          "CHECK(state=0 OR accepted_blob IS NOT NULL),"
           "CHECK((state=0 AND release_request_blob IS "
           "NULL AND release_receipt_blob IS NULL) OR (state=1 AND "
           "release_request_blob IS NOT NULL AND release_receipt_blob IS NOT "
@@ -2718,7 +1911,7 @@ private:
   void RestoreHeldFence() {
     Statement statement(database_,
                         "SELECT owner_kind,intent_blob,accepted_blob,"
-                        "disable_fence_scope_blob,fence_id FROM "
+                        "fence_id FROM "
                         "kernel_apply_fences WHERE state=0 ORDER "
                         "BY fence_generation");
     while (statement.Step() == SQLITE_ROW) {
@@ -2735,37 +1928,7 @@ private:
         admission_gate_.RestoreFence(accepted.configuration_fence_id,
                                      accepted.captured_scope);
       } else {
-        Require(owner_kind == ToString(DurableFenceOwnerKind::kDisable),
-                "durable fence has an unknown owner kind");
-        const auto request = core::detail::DecodeDisableHandoffRequestRecord(
-            statement.ColumnBlob(1));
-        const auto scope_record =
-            core::detail::DecodeDisableHandoffFenceScopeRecord(
-                statement.ColumnBlob(3));
-        Require(
-            ScopeMembershipIsSubset(request.affected_scope,
-                                    scope_record.scope) &&
-                (request.scope_resolution !=
-                     core::DisableHandoffScopeResolutionDTO::kPromotedToFull ||
-                 scope_record.scope_resolution ==
-                     core::DisableHandoffScopeResolutionDTO::kPromotedToFull),
-            "prepared Disable fence narrows its durable request");
-        const auto fence_id =
-            core::ConfigurationFenceId(statement.ColumnText(4));
-        const auto accepted_bytes = statement.OptionalColumnBlob(2);
-        if (accepted_bytes.has_value()) {
-          const auto accepted =
-              core::detail::DecodeDisableHandoffAcceptedRecord(*accepted_bytes);
-          const auto scope_digest =
-              core::ComputeDisableHandoffScopeDigest(scope_record.scope);
-          Require(scope_digest.ok() && accepted.matches(request) &&
-                      accepted.scope_resolution ==
-                          scope_record.scope_resolution &&
-                      accepted.component_scope_digest == scope_digest.value() &&
-                      accepted.configuration_fence_id == fence_id,
-                  "durable Disable acceptance conflicts with its fence scope");
-        }
-        admission_gate_.RestoreFence(fence_id, scope_record.scope);
+        Fail("durable fence has an unknown owner kind");
       }
     }
   }
@@ -2787,8 +1950,8 @@ private:
                 const core::RequestId &request_id) const {
     Statement statement(database_,
                         "SELECT "
-                        "owner_kind,intent_blob,accepted_blob,disable_fence_"
-                        "scope_blob,state,release_request_blob,"
+                        "owner_kind,intent_blob,accepted_blob,"
+                        "state,release_request_blob,"
                         "release_receipt_blob FROM kernel_apply_fences WHERE "
                         "request_owner_epoch=? AND request_id=?");
     statement.Text(1, owner_epoch.value());
@@ -2802,26 +1965,12 @@ private:
     Statement statement(
         database_,
         "SELECT "
-        "owner_kind,intent_blob,accepted_blob,disable_fence_scope_blob,state,"
+        "owner_kind,intent_blob,accepted_blob,state,"
         "release_request_blob,"
         "release_receipt_blob FROM kernel_apply_fences WHERE fence_id=? AND "
         "fence_generation=?");
     statement.Text(1, fence_id.value());
     statement.Integer(2, generation.value());
-    return ReadOptionalRow(statement);
-  }
-
-  [[nodiscard]] std::optional<DurableFenceRow> ReadByDisableOwner(
-      const core::LifecycleTransactionId &transaction_id,
-      const core::LifecycleTransactionGeneration transaction_generation) const {
-    Statement statement(
-        database_,
-        "SELECT owner_kind,intent_blob,accepted_blob,disable_fence_scope_blob,"
-        "state,release_request_blob,release_receipt_blob FROM "
-        "kernel_apply_fences WHERE owner_kind='disable' AND owner_id=? AND "
-        "owner_generation=?");
-    statement.Text(1, transaction_id.value());
-    statement.Integer(2, transaction_generation.value());
     return ReadOptionalRow(statement);
   }
 
@@ -2832,21 +1981,17 @@ private:
     }
     const auto owner_kind = statement.ColumnText(0);
     Require(owner_kind == ToString(DurableFenceOwnerKind::kApply) ||
-                owner_kind == ToString(DurableFenceOwnerKind::kRoute) ||
-                owner_kind == ToString(DurableFenceOwnerKind::kDisable),
+                owner_kind == ToString(DurableFenceOwnerKind::kRoute),
             "durable fence owner kind is invalid");
     const auto kind = owner_kind == ToString(DurableFenceOwnerKind::kApply)
                           ? DurableFenceOwnerKind::kApply
-                      : owner_kind == ToString(DurableFenceOwnerKind::kRoute)
-                          ? DurableFenceOwnerKind::kRoute
-                          : DurableFenceOwnerKind::kDisable;
+                          : DurableFenceOwnerKind::kRoute;
     DurableFenceRow row{kind,
                         statement.ColumnBlob(1),
-                        statement.OptionalColumnBlob(2).value_or(""),
-                        statement.OptionalColumnBlob(3),
-                        static_cast<int>(statement.ColumnInteger(4)),
-                        statement.OptionalColumnBlob(5),
-                        statement.OptionalColumnBlob(6)};
+                        statement.ColumnBlob(2),
+                        static_cast<int>(statement.ColumnInteger(3)),
+                        statement.OptionalColumnBlob(4),
+                        statement.OptionalColumnBlob(5)};
     Require(statement.Step() == SQLITE_DONE,
             "durable fence identity is not unique");
     return row;
@@ -2859,18 +2004,17 @@ private:
     AppendField(bytes, std::to_string(ReadFenceGeneration()));
     Statement statement(
         database_, "SELECT "
-                   "owner_kind,intent_blob,accepted_blob,disable_fence_scope_"
-                   "blob,state,release_request_blob,"
+                   "owner_kind,intent_blob,accepted_blob,"
+                   "state,release_request_blob,"
                    "release_receipt_blob FROM kernel_apply_fences ORDER BY "
                    "fence_generation");
     while (statement.Step() == SQLITE_ROW) {
       AppendField(bytes, statement.ColumnText(0));
       AppendField(bytes, statement.ColumnBlob(1));
-      AppendField(bytes, statement.OptionalColumnBlob(2).value_or(""));
-      AppendField(bytes, statement.OptionalColumnBlob(3).value_or(""));
-      AppendField(bytes, std::to_string(statement.ColumnInteger(4)));
+      AppendField(bytes, statement.ColumnBlob(2));
+      AppendField(bytes, std::to_string(statement.ColumnInteger(3)));
+      AppendField(bytes, statement.OptionalColumnBlob(4).value_or(""));
       AppendField(bytes, statement.OptionalColumnBlob(5).value_or(""));
-      AppendField(bytes, statement.OptionalColumnBlob(6).value_or(""));
     }
     return core::ContentDigest(content_identity::sha256_digest(bytes));
   }
@@ -2996,7 +2140,6 @@ private:
   sqlite3 *database_{};
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   component_manager::SqliteActiveBundlePublicationStore publication_store_;
-  core::ResourceAddressedExecutionKernel *disable_handoff_kernel_{};
   mutable std::mutex mutex_;
 };
 
@@ -3102,58 +2245,6 @@ ManagedKernelApplyFenceOwner::ReconcileRouteConfigurationFenceReleaseAttempt(
       core::RouteConfigurationFenceReleaseAttemptReconciliationDTO>([&] {
     return impl_->ReconcileRouteConfigurationFenceReleaseAttempt(request);
   });
-}
-
-void ManagedKernelApplyFenceOwner::BindDisableHandoffKernel(
-    core::ResourceAddressedExecutionKernel &kernel) {
-  impl_->BindDisableHandoffKernel(kernel);
-}
-
-core::Result<core::DisableHandoffAdmissionSnapshotDTO>
-ManagedKernelApplyFenceOwner::ObserveDisableHandoffAdmission(
-    const core::DisableHandoffAdmissionQueryDTO &query) const {
-  return InvokeDisableHandoffPort<core::DisableHandoffAdmissionSnapshotDTO>(
-      [&] { return impl_->ObserveDisableHandoffAdmission(query); });
-}
-
-core::Result<core::DisableHandoffAcceptedDTO>
-ManagedKernelApplyFenceOwner::BeginDisableHandoff(
-    const core::DisableHandoffRequestDTO &request) {
-  return InvokeDisableHandoffPort<core::DisableHandoffAcceptedDTO>(
-      [&] { return impl_->BeginDisableHandoff(request); });
-}
-
-core::Result<core::DisableHandoffStatusDTO>
-ManagedKernelApplyFenceOwner::DisableHandoffStatus(
-    const core::LifecycleTransactionId &lifecycle_transaction_id,
-    const core::LifecycleTransactionGeneration
-        lifecycle_transaction_generation) {
-  return InvokeDisableHandoffPort<core::DisableHandoffStatusDTO>([&] {
-    return impl_->DisableHandoffStatus(lifecycle_transaction_id,
-                                       lifecycle_transaction_generation);
-  });
-}
-
-core::Result<core::DisableHandoffAttemptReconciliationDTO>
-ManagedKernelApplyFenceOwner::ReconcileDisableHandoffAttempt(
-    const core::DisableHandoffRequestDTO &request) {
-  return InvokeDisableHandoffPort<core::DisableHandoffAttemptReconciliationDTO>(
-      [&] { return impl_->ReconcileDisableHandoffAttempt(request); });
-}
-
-core::Result<core::DisableFenceReleasedDTO>
-ManagedKernelApplyFenceOwner::ReleaseDisableFence(
-    const core::DisableFenceReleaseRequestDTO &request) {
-  return InvokeDisableHandoffPort<core::DisableFenceReleasedDTO>(
-      [&] { return impl_->ReleaseDisableFence(request); });
-}
-
-core::Result<core::DisableFenceReleaseAttemptReconciliationDTO>
-ManagedKernelApplyFenceOwner::ReconcileDisableFenceReleaseAttempt(
-    const core::DisableFenceReleaseRequestDTO &request) {
-  return InvokeDisableHandoffPort<
-      core::DisableFenceReleaseAttemptReconciliationDTO>(
-      [&] { return impl_->ReconcileDisableFenceReleaseAttempt(request); });
 }
 
 } // namespace manyforge::roboplan_backend

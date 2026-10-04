@@ -15,14 +15,6 @@ namespace {
       ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}});
 }
 
-[[nodiscard]] Result<DisableHandoffComponentScopeExpectationDTO> reject_expectation(
-    std::string reason) {
-  return Result<DisableHandoffComponentScopeExpectationDTO>::Err(
-      ErrorDTO{"component_lifecycle_scope_invalid",
-               "the current component snapshot cannot form one exact Disable scope",
-               {{"reason", std::move(reason)}}});
-}
-
 [[nodiscard]] ComponentLifecycleRequestedStateDTO requested_state_for(
     ComponentLifecycleIntentKindDTO intent) {
   switch (intent) {
@@ -149,70 +141,6 @@ namespace {
 
 }  // namespace
 
-Result<DisableHandoffComponentScopeExpectationDTO> BuildDisableHandoffComponentScopeExpectation(
-    const ComponentLifecycleCurrentSnapshotDTO& snapshot) {
-  if (!snapshot.locally_valid()) {
-    return reject_expectation("current_snapshot_invalid");
-  }
-
-  ConfigurationFenceScopeDTO scope;
-  scope.controllable_component_ids = {snapshot.controllable_component_id};
-  std::vector<CurrentDomainActiveControlConfigurationDTO> configurations;
-  configurations.reserve(snapshot.domains.size());
-  for (const auto& domain : snapshot.domains) {
-    scope.domains.push_back(
-        {domain.control_domain_id, domain.control_domain_revision, std::nullopt});
-    for (const auto& binding : domain.current_control_bindings) {
-      scope.bindings.push_back(
-          {binding.control_binding_id, binding.control_binding_revision, std::nullopt});
-    }
-    scope.resources.insert(scope.resources.end(), domain.current_resources.begin(),
-                           domain.current_resources.end());
-    if (domain.active_control_configuration.has_value()) {
-      configurations.push_back(
-          {domain.control_domain_id,
-           {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-            domain.active_control_configuration->active_control_configuration_id,
-            domain.active_control_configuration->active_control_configuration_generation}});
-    } else {
-      configurations.push_back(
-          {domain.control_domain_id,
-           {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt}});
-    }
-  }
-  const auto binding_less = [](const ConfigurationFenceBindingScopeDTO& left,
-                               const ConfigurationFenceBindingScopeDTO& right) {
-    return left.control_binding_id < right.control_binding_id;
-  };
-  std::sort(scope.bindings.begin(), scope.bindings.end(), binding_less);
-  if (std::adjacent_find(scope.bindings.begin(), scope.bindings.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.control_binding_id == right.control_binding_id;
-                         }) != scope.bindings.end()) {
-    return reject_expectation("control_binding_occurs_in_several_domains");
-  }
-  std::sort(scope.resources.begin(), scope.resources.end());
-  scope.resources.erase(std::unique(scope.resources.begin(), scope.resources.end()),
-                        scope.resources.end());
-  if (!scope.valid()) {
-    return reject_expectation("derived_component_scope_invalid");
-  }
-
-  DisableHandoffComponentScopeExpectationDTO result{
-      snapshot.snapshot_digest,
-      snapshot.active_publication_receipt.publication_generation,
-      snapshot.active_publication_receipt.durable_public_pointer_content_digest,
-      snapshot.active_publication_receipt.request.candidate_retained_bundle_id,
-      snapshot.active_publication_receipt.request.candidate_graph_revision,
-      snapshot.component_lifecycle_generation,
-      std::move(scope),
-      std::move(configurations)};
-  if (!result.locally_valid()) {
-    return reject_expectation("derived_component_expectation_invalid");
-  }
-  return Result<DisableHandoffComponentScopeExpectationDTO>::Ok(std::move(result));
-}
-
 Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
     const ComponentLifecycleIntentDTO& intent,
     const ComponentLifecycleAdmissionCandidate& candidate) {
@@ -234,7 +162,6 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
   std::vector<ControlDomainId> reserved_domains;
   std::optional<ComponentLifecycleStateDTO> component_state;
   std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> qualified_catalogs;
-  bool lifecycle_mutation_eligible = false;
 
   if (!candidate.current_snapshot.has_value()) {
     return reject("component_lifecycle_scope_unresolved",
@@ -297,14 +224,6 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
     for (const auto& domain : snapshot.domains) {
       reserved_domains.push_back(domain.control_domain_id);
     }
-
-    if (candidate.disable_handoff_admission.has_value()) {
-      return reject("component_lifecycle_admission_invalid",
-                    "ordinary lifecycle admission cannot carry a Kernel Stop handoff snapshot",
-                    "unexpected_disable_handoff_admission");
-    } else {
-      lifecycle_mutation_eligible = true;
-    }
   }
 
   ComponentLifecycleAcceptedDTO acceptance{
@@ -324,9 +243,6 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
                                              requested_state,
                                              ComponentLifecycleTransactionPhaseDTO::kAccepted,
                                              std::move(domains),
-                                             std::nullopt,
-                                             std::nullopt,
-                                             std::nullopt,
                                              false,
                                              std::nullopt,
                                              std::nullopt,
@@ -345,7 +261,7 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
 
   return Result<PreparedComponentLifecycleAdmission>::Ok(
       {std::move(acceptance), std::move(initial_status), std::move(reserved_domains),
-       std::move(qualified_catalogs), lifecycle_mutation_eligible});
+       std::move(qualified_catalogs)});
 }
 
 }  // namespace manyforge::core

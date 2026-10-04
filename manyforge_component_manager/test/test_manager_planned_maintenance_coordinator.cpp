@@ -459,6 +459,23 @@ TEST(ManagerPlannedMaintenanceCoordinator,
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
+     SceneRevisionAdvancedSincePublicationIsNotAStalePredecessor) {
+  // The Scene owner advances the live Scene revision after the active
+  // Deployment was published; the accepted intent captures that newer
+  // revision. The active Deployment is unchanged, so this is not stale.
+  MaintenanceFixture fixture;
+  auto intent = Intent();
+  intent.expected_active_projection_revision.scene_revision = SceneRevision{
+      SceneId(std::string(kDigestThree)), 7U,
+      ContentDigest(std::string(kDigestOne))};
+
+  const auto result = fixture.Enter(nullptr, &intent);
+
+  EXPECT_TRUE(result.entered_idle_maintenance()) << result.failure_code;
+  EXPECT_EQ(fixture.gate_.close_calls, 1);
+}
+
+TEST(ManagerPlannedMaintenanceCoordinator,
      MismatchedIntentPredecessorIsRejectedWithoutAnyEffect) {
   MaintenanceFixture fixture;
   const auto intent = Intent();

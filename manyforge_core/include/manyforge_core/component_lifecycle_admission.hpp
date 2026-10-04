@@ -23,7 +23,6 @@ struct ComponentLifecycleAdmissionCandidate final {
   std::int64_t accepted_at_ns;
   std::optional<ComponentLifecycleCurrentSnapshotDTO> current_snapshot;
   std::vector<BrandLifecyclePlanCatalogDTO> lifecycle_plan_catalogs;
-  std::optional<DisableHandoffAdmissionSnapshotDTO> disable_handoff_admission;
 };
 
 /// Fully closed values ready for atomic reservation plus journal admission.
@@ -34,14 +33,7 @@ struct PreparedComponentLifecycleAdmission final {
   /// Present when the complete exact provider-catalog closure was qualified
   /// for this accepted ordinary lifecycle intent.
   std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> qualified_lifecycle_plan_catalogs;
-  /// True when the current component snapshot and exact provider/catalog
-  /// closure permit mutation under the ordinary idle lifecycle claim.
-  bool lifecycle_mutation_eligible;
 };
-
-/// Derive the historical Stop-handoff expectation for durable-effect recovery.
-[[nodiscard]] Result<DisableHandoffComponentScopeExpectationDTO>
-BuildDisableHandoffComponentScopeExpectation(const ComponentLifecycleCurrentSnapshotDTO& snapshot);
 
 /// Pure closed admission construction after replay classification and source
 /// reads, but before reservation or durable journal CAS.

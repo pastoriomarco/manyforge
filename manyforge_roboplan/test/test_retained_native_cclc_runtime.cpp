@@ -559,8 +559,7 @@ private:
       core::ComponentLifecycleStateDTO::kDeclared};
 };
 
-class KernelPorts final : public core::ICCLCKernelDisableHandoffPort,
-                          public core::ICCLCKernelRouteConfigurationFencePort,
+class KernelPorts final : public core::ICCLCKernelRouteConfigurationFencePort,
                           public core::IKernelCellAdmissionPort {
 public:
   [[nodiscard]] core::AuthoringAdmissionDTO
@@ -613,35 +612,6 @@ public:
          claim_.has_value() ? std::vector{*claim_}
                             : std::vector<core::CellAdmissionClaimDTO>{},
          {}});
-  }
-  [[nodiscard]] core::Result<core::DisableHandoffAdmissionSnapshotDTO>
-  ObserveDisableHandoffAdmission(
-      const core::DisableHandoffAdmissionQueryDTO &) const override {
-    return unused<core::DisableHandoffAdmissionSnapshotDTO>();
-  }
-  [[nodiscard]] core::Result<core::DisableHandoffAcceptedDTO>
-  BeginDisableHandoff(const core::DisableHandoffRequestDTO &) override {
-    return unused<core::DisableHandoffAcceptedDTO>();
-  }
-  [[nodiscard]] core::Result<core::DisableHandoffStatusDTO>
-  DisableHandoffStatus(const core::LifecycleTransactionId &,
-                       core::LifecycleTransactionGeneration) override {
-    return unused<core::DisableHandoffStatusDTO>();
-  }
-  [[nodiscard]] core::Result<core::DisableHandoffAttemptReconciliationDTO>
-  ReconcileDisableHandoffAttempt(
-      const core::DisableHandoffRequestDTO &) override {
-    return unused<core::DisableHandoffAttemptReconciliationDTO>();
-  }
-  [[nodiscard]] core::Result<core::DisableFenceReleasedDTO>
-  ReleaseDisableFence(const core::DisableFenceReleaseRequestDTO &) override {
-    return unused<core::DisableFenceReleasedDTO>();
-  }
-  [[nodiscard]]
-  core::Result<core::DisableFenceReleaseAttemptReconciliationDTO>
-  ReconcileDisableFenceReleaseAttempt(
-      const core::DisableFenceReleaseRequestDTO &) override {
-    return unused<core::DisableFenceReleaseAttemptReconciliationDTO>();
   }
 
   [[nodiscard]]
@@ -1667,7 +1637,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
       {state_root,
        plan_root,
        bundle->value().cell_graph.cell_id,
-       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL}},
+       {owner, 128U, 2U, 1'000'000LL, 1'000'000'000LL}},
       1'000'000'000LL};
 
   const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
@@ -1694,7 +1664,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   auto composition = CreateRetainedNativeCCLCRuntime(
       config, bundle, publication_store, publication.value(), artifacts,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-      kernel_ports, kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, publication_owner, clock, scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   ASSERT_TRUE(composition.value()->Start().ok());
   const auto current_request_owner =
@@ -1834,7 +1804,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
     auto recovered = CreateRecoveredRetainedNativeCellCCLCRuntime(
         config, bundle, publication_store, publication.value(), artifacts,
         catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-        kernel_ports, kernel_ports, publication_owner, readiness,
+        kernel_ports, publication_owner, readiness,
         publication_owner.kernel(), clock, scheduler,
         [](const core::ActiveControlConfigurationDTO &) {
           ADD_FAILURE() << "Exact installed route must not be republished";
@@ -1956,7 +1926,7 @@ TEST(RetainedNativeCCLCRuntime,
       {state_root,
        run_root,
        bundle->value().cell_graph.cell_id,
-       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL}},
+       {owner, 128U, 2U, 1'000'000LL, 1'000'000'000LL}},
       1'000'000'000LL};
   const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
       fixture_root / "retained-package");
@@ -2014,7 +1984,7 @@ TEST(RetainedNativeCCLCRuntime,
         std::move(config), bundle, publication_reader,
         expected_publication, artifacts, catalogs, {},
         {std::move(stale_binding.value())}, kernel_ports, kernel_ports,
-        kernel_ports, route_owner, readiness_owner, cell.addressed_kernel(),
+        route_owner, readiness_owner, cell.addressed_kernel(),
         clock, scheduler,
         [&predecessor_adoption_calls](
             const core::ActiveControlConfigurationDTO &) {

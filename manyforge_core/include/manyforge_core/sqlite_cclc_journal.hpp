@@ -13,7 +13,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 12;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 13;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -148,11 +148,6 @@ class SqliteCCLCJournal final : public ICCLCJournal {
   [[nodiscard]] Result<std::uint64_t> RecordEffectCompleted(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& completed_attempt,
       const ComponentLifecycleStatusDTO& successor_status) override;
-  [[nodiscard]] Result<std::uint64_t>
-  RecordEffectCompletedAndLifecycleClaimRelease(
-      const RequestOwnerEpoch&, const CCLCEffectAttemptDTO&,
-      const ComponentLifecycleStatusDTO&,
-      const CellAdmissionClaimReleaseDTO&) override;
 
   [[nodiscard]] Result<std::uint64_t> RecordLifecycleStatus(
       const RequestOwnerEpoch& active_owner_epoch,

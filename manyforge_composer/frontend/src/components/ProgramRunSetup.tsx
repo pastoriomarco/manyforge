@@ -3,7 +3,21 @@ import type {
   JsonValue,
   ProgramTreeNode,
 } from '../types/api';
-import type { DirectControlMotionStatus } from '../types/robotControl';
+import type { DirectControlMotionStatus, ProgramRunAdmittedSpeeds } from '../types/robotControl';
+
+/**
+ * The owner-admitted speeds for Run details, as read from the backend. The
+ * browser only displays them; it never derives an admitted speed.
+ */
+export type AdmittedSpeedsView =
+  | { kind: 'no_run' }
+  | { kind: 'loading' }
+  | { kind: 'unavailable'; reason: string }
+  | { kind: 'ready'; speeds: ProgramRunAdmittedSpeeds };
+
+const ADMITTED_HEADER_HINT = 'TCP speed the execution owner admitted for this robot\'s most recent '
+  + 'prepared motion in this run (the request capped by the applied Deployment maximum), read from '
+  + 'operation history. Motions not yet prepared have no admitted value; nothing is estimated here.';
 
 /** One motion node's TCP-speed request, as authored. */
 interface SpeedRequest {
@@ -51,16 +65,57 @@ function speedRequests(applied: AppliedProgramSelection): SpeedRequest[] {
   return requests;
 }
 
-function requestSummary(requests: SpeedRequest[]): string {
-  if (requests.length === 0) return 'none (Deployment maximum)';
+function requestSummary(requests: SpeedRequest[]): { value: string; note: string | null } {
+  if (requests.length === 0) return { value: '—', note: 'no request: Deployment maximum' };
   // A Program parameter's value is always its Program default: there is no
   // Scenario or launch-time override.
-  const labels = [...new Set(requests.map((request) => (
-    request.parameterId !== null
-      ? `${request.value ?? '?'} m/s (default of ${request.parameterId})`
-      : `${request.value} m/s`
-  )))];
-  return labels.join(', ');
+  const values = [...new Set(requests.map((request) => `${request.value ?? '?'} m/s`))];
+  const sources = [...new Set(requests
+    .filter((request) => request.parameterId !== null)
+    .map((request) => `default of ${request.parameterId}`))];
+  return { value: values.join(', '), note: sources.length === 0 ? null : sources.join(', ') };
+}
+
+function AdmittedSpeedCell({
+  admitted,
+  target,
+}: {
+  admitted: AdmittedSpeedsView;
+  target: DirectControlMotionStatus;
+}) {
+  const row = admitted.kind === 'ready'
+    ? admitted.speeds.targets.find((candidate) => (
+      candidate.controllableComponentId === target.controllableComponentId
+      && candidate.commandTargetId === target.commandTargetId
+    ))
+    : undefined;
+  if (row !== undefined) {
+    const requested = row.requestedTcpLinearSpeedMps === null
+      ? 'no per-motion request'
+      : `requested ${row.requestedTcpLinearSpeedMps} m/s`;
+    return (
+      <div className="program-run-setup-stat" title={`Admitted by the owner for operation ${row.operationId} (prepared ${row.occurredAtWall}): ${requested}, Deployment maximum ${row.deploymentMaximumTcpLinearSpeedMps} m/s.`}>
+        <span className="program-run-setup-stat-label" title={ADMITTED_HEADER_HINT}>Last admitted</span>
+        <span className="program-run-setup-stat-value">{row.admittedTcpLinearSpeedMps} m/s</span>
+        <span className="program-run-setup-stat-note">by the Kernel</span>
+      </div>
+    );
+  }
+  const reason = admitted.kind === 'no_run'
+    ? 'No Program run, so no motion has been admitted.'
+    : admitted.kind === 'loading'
+      ? 'Reading operation history.'
+      : admitted.kind === 'unavailable'
+        ? `Operation history could not be read: ${admitted.reason}`
+        : 'No motion of this robot has been prepared in this run yet, or it is older than the recent '
+          + 'history read. The owner admits a speed only when it prepares a motion.';
+  return (
+    <div className="program-run-setup-stat" title={reason}>
+      <span className="program-run-setup-stat-label" title={ADMITTED_HEADER_HINT}>Last admitted</span>
+      <span className="program-run-setup-stat-value">—</span>
+      <span className="program-run-setup-stat-note">no motion yet</span>
+    </div>
+  );
 }
 
 /**
@@ -72,10 +127,12 @@ export function ProgramRunSetup({
   applied,
   targets,
   groups,
+  admitted,
 }: {
   applied: AppliedProgramSelection | null;
   targets: DirectControlMotionStatus[];
   groups: Array<{ groupId: string; nodeCount: number; state: string; velocity: string }>;
+  admitted: AdmittedSpeedsView;
 }) {
   if (applied === null) {
     return <p className="hint">No Program is applied.</p>;
@@ -92,41 +149,47 @@ export function ProgramRunSetup({
         <strong>{applied.scenarioId}</strong>
         <span className="hint"> · revision {applied.programRevision.slice(0, 15)}…</span>
       </p>
-      <div className="program-run-setup-table-wrap">
-        <table className="program-run-setup-table">
-          <caption>Robots</caption>
-          <thead>
-            <tr>
-              <th scope="col">Robot role</th>
-              <th scope="col">Component</th>
-              <th scope="col">Deployment TCP max</th>
-              <th scope="col">Program requests</th>
-            </tr>
-          </thead>
-          <tbody>
-            {targets.map((target) => {
-              const key = targetKey(target.controllableComponentId, target.commandTargetId);
-              return (
-                <tr key={key}>
-                  <td>{rolesFor(key).join(', ') || '—'}</td>
-                  <td>{target.controllableComponentId}</td>
-                  <td>
+      <section className="program-run-setup-robots" aria-label="Robots">
+        <h5>Robots</h5>
+        {targets.map((target) => {
+          const key = targetKey(target.controllableComponentId, target.commandTargetId);
+          return (
+            <div key={key} className="program-run-setup-robot">
+              <h6>
+                {rolesFor(key).join(', ') || '—'}
+                <span className="program-run-setup-component">{target.controllableComponentId}</span>
+              </h6>
+              <div className="program-run-setup-stats">
+                <div className="program-run-setup-stat">
+                  <span className="program-run-setup-stat-label">Deployment max</span>
+                  <span className="program-run-setup-stat-value">
                     {target.targetDescriptor.operationalLimit === null
                       ? '—'
                       : `${target.targetDescriptor.operationalLimit.maximumTcpLinearSpeedMps} m/s`}
-                  </td>
-                  <td>
-                    {requestSummary(requests.filter(
-                      (request) => request.targetRoleId !== null
-                        && targetByRole.get(request.targetRoleId) === key,
-                    ))}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+                  </span>
+                  <span className="program-run-setup-stat-note">TCP speed limit</span>
+                </div>
+                {(() => {
+                  const request = requestSummary(requests.filter(
+                    (candidate) => candidate.targetRoleId !== null
+                      && targetByRole.get(candidate.targetRoleId) === key,
+                  ));
+                  return (
+                    <div className="program-run-setup-stat">
+                      <span className="program-run-setup-stat-label">Program request</span>
+                      <span className="program-run-setup-stat-value">{request.value}</span>
+                      {request.note !== null && (
+                        <span className="program-run-setup-stat-note">{request.note}</span>
+                      )}
+                    </div>
+                  );
+                })()}
+                <AdmittedSpeedCell admitted={admitted} target={target} />
+              </div>
+            </div>
+          );
+        })}
+      </section>
       {groups.length > 0 && (
         <div className="program-run-setup-table-wrap">
           <table className="program-run-setup-table">

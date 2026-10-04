@@ -19,6 +19,7 @@ import {
   programMoveMutation,
   programPaletteClickIntent,
   programPaletteDragData,
+  programPaletteDropPosition,
   programWrapMutation,
   readProgramPaletteDrag,
 } from './programCanvasInteraction';
@@ -88,6 +89,11 @@ describe('Program canvas interaction intents', () => {
       0,
       { x: 12, y: 34 },
     ).args.position).toEqual({ x: 12, y: 34 });
+  });
+
+  it('centres a palette drop on the pointer, where the drag preview was', () => {
+    expect(programPaletteDropPosition({ x: 300, y: 200 }, { width: 200, height: 70 }))
+      .toEqual({ x: 200, y: 165 });
   });
 
   it('maps explicit child, sibling, wrapper, and compatible-kind choices atomically', () => {
