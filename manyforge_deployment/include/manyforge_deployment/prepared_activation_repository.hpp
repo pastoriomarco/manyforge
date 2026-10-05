@@ -12,8 +12,8 @@
 
 namespace manyforge::deployment {
 
-/// Upper bound of one stored prepared activation, matching the preparer's
-/// bounded output (its payload carries raw and catalog artifacts).
+/// Upper bound of one stored prepared activation (its payload carries raw and
+/// catalog artifacts). The preparer returns only the compact receipt naming it.
 inline constexpr std::uint64_t kMaxPreparedActivationBytes =
     128ULL * 1024ULL * 1024ULL;
 

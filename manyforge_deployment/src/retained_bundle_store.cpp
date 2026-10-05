@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -296,65 +297,50 @@ class DurableFileCollection final {
     }
   }
 
+  struct Entry final {
+    std::string_view hex;
+    std::string_view bytes;
+  };
+
   [[nodiscard]] bool put_if_absent(std::string_view hex,
                                    std::string_view bytes) {
+    const Entry entry{hex, bytes};
+    return put_all_if_absent(std::span<const Entry>(&entry, 1U)).front();
+  }
+
+  /// Publishes entries in order under one cross-process lock. The complete
+  /// verified index refresh happens once per lock acquisition, not once per
+  /// entry: the lock excludes every other writer, and each publication below
+  /// updates the index it checks the bounds against.
+  [[nodiscard]] std::vector<bool> put_all_if_absent(
+      std::span<const Entry> entries) {
     require_owner_process();
-    if (bytes.size() > max_single_stored_entry_bytes_) {
-      fail("durable retention encoded value exceeds its single-entry "
-           "bound");
-    }
-    (void)detail::retained_digest_from_hex(hex);
-    const std::uint64_t logical_byte_size =
-        verify_entry_bytes(kind_, hex, bytes);
-    if (logical_byte_size > max_single_entry_bytes_) {
-      fail("durable retention value exceeds its single-entry bound");
+    std::vector<std::uint64_t> logical_byte_sizes;
+    logical_byte_sizes.reserve(entries.size());
+    for (const auto& entry : entries) {
+      if (entry.bytes.size() > max_single_stored_entry_bytes_) {
+        fail("durable retention encoded value exceeds its single-entry "
+             "bound");
+      }
+      (void)detail::retained_digest_from_hex(entry.hex);
+      logical_byte_sizes.push_back(
+          verify_entry_bytes(kind_, entry.hex, entry.bytes));
+      if (logical_byte_sizes.back() > max_single_entry_bytes_) {
+        fail("durable retention value exceeds its single-entry bound");
+      }
     }
 
     std::lock_guard process_lock(mutex_);
     const auto file_lock = lock_->acquire(LOCK_EX);
     refresh_index_locked(true);
-    const std::filesystem::path final_path =
-        data_directory_ / committed_filename(hex);
-    if (const auto existing =
-            posix::read_exact_regular_file(
-                final_path, max_single_stored_entry_bytes_, true,
-                kPosixErrors,
-                kReadMessages);
-        existing.has_value()) {
-      (void)verify_entry_bytes(kind_, hex, *existing);
-      if (*existing != bytes) {
-        throw std::runtime_error(
-            "durable retention identity collision");
-      }
-      return false;
+    std::vector<bool> inserted;
+    inserted.reserve(entries.size());
+    for (std::size_t index = 0U; index < entries.size(); ++index) {
+      inserted.push_back(publish_locked(entries[index].hex,
+                                        entries[index].bytes,
+                                        logical_byte_sizes[index]));
     }
-
-    const std::uint64_t stored_byte_size =
-        static_cast<std::uint64_t>(bytes.size());
-    if (entry_count_ >= max_entry_count_ ||
-        logical_byte_size > max_total_bytes_ - retained_bytes_ ||
-        stored_byte_size >
-            max_total_stored_bytes_ - stored_bytes_) {
-      fail("durable retention repository bound is exhausted");
-    }
-
-    const bool inserted = posix::publish_immutable_file_no_replace(
-        final_path, bytes, max_single_stored_entry_bytes_, kPosixErrors,
-        kReadMessages, kDirectorySyncMessages, kPublicationMessages,
-        [this, hex, bytes](std::string_view existing) {
-          if (existing != bytes) {
-            throw std::runtime_error(
-                "durable retention identity collision");
-          }
-          (void)verify_entry_bytes(kind_, hex, existing);
-        });
-    if (!inserted) {
-      return false;
-    }
-    ++entry_count_;
-    retained_bytes_ += logical_byte_size;
-    stored_bytes_ += stored_byte_size;
-    return true;
+    return inserted;
   }
 
   [[nodiscard]] std::optional<std::string> get_verified(
@@ -402,6 +388,53 @@ class DurableFileCollection final {
   }
 
  private:
+  [[nodiscard]] bool publish_locked(std::string_view hex,
+                                    std::string_view bytes,
+                                    std::uint64_t logical_byte_size) {
+    const std::filesystem::path final_path =
+        data_directory_ / committed_filename(hex);
+    if (const auto existing =
+            posix::read_exact_regular_file(
+                final_path, max_single_stored_entry_bytes_, true,
+                kPosixErrors,
+                kReadMessages);
+        existing.has_value()) {
+      (void)verify_entry_bytes(kind_, hex, *existing);
+      if (*existing != bytes) {
+        throw std::runtime_error(
+            "durable retention identity collision");
+      }
+      return false;
+    }
+
+    const std::uint64_t stored_byte_size =
+        static_cast<std::uint64_t>(bytes.size());
+    if (entry_count_ >= max_entry_count_ ||
+        logical_byte_size > max_total_bytes_ - retained_bytes_ ||
+        stored_byte_size >
+            max_total_stored_bytes_ - stored_bytes_) {
+      fail("durable retention repository bound is exhausted");
+    }
+
+    const bool inserted = posix::publish_immutable_file_no_replace(
+        final_path, bytes, max_single_stored_entry_bytes_, kPosixErrors,
+        kReadMessages, kDirectorySyncMessages, kPublicationMessages,
+        [this, hex, bytes](std::string_view existing) {
+          if (existing != bytes) {
+            throw std::runtime_error(
+                "durable retention identity collision");
+          }
+          (void)verify_entry_bytes(kind_, hex, existing);
+        });
+    if (!inserted) {
+      return false;
+    }
+    ++entry_count_;
+    retained_bytes_ += logical_byte_size;
+    stored_bytes_ += stored_byte_size;
+    return true;
+  }
+
   [[nodiscard]] std::string committed_filename(
       std::string_view hex) const {
     return std::string(hex) + std::string(layout_.file_suffix);
@@ -551,20 +584,43 @@ FilesystemRawArtifactStore::~FilesystemRawArtifactStore() = default;
 
 StoredRawArtifact FilesystemRawArtifactStore::put_if_absent(
     std::string_view bytes) {
-  storage_->files.require_insert_size(bytes.size());
-  const std::string digest = sha256_digest(bytes);
-  const auto hex = detail::retained_digest_hex(digest);
-  if (!hex.has_value()) {
-    throw std::logic_error("SHA-256 helper returned an invalid digest");
+  return put_all_if_absent(std::span<const std::string_view>(&bytes, 1U))
+      .front();
+}
+
+std::vector<StoredRawArtifact> FilesystemRawArtifactStore::put_all_if_absent(
+    std::span<const std::string_view> values) {
+  std::vector<std::string> digests;
+  std::vector<std::string> hexes;
+  digests.reserve(values.size());
+  hexes.reserve(values.size());
+  for (const auto bytes : values) {
+    storage_->files.require_insert_size(bytes.size());
+    digests.push_back(sha256_digest(bytes));
+    const auto hex = detail::retained_digest_hex(digests.back());
+    if (!hex.has_value()) {
+      throw std::logic_error("SHA-256 helper returned an invalid digest");
+    }
+    hexes.emplace_back(*hex);
   }
-  const bool inserted = storage_->files.put_if_absent(*hex, bytes);
-  return {
-      core::ContentDigest(digest),
-      core::ContentAddressedStoreKey(
-          detail::retained_store_key_for_digest(digest)),
-      static_cast<std::uint64_t>(bytes.size()),
-      inserted,
-  };
+  std::vector<DurableFileCollection::Entry> entries;
+  entries.reserve(values.size());
+  for (std::size_t index = 0U; index < values.size(); ++index) {
+    entries.push_back({hexes[index], values[index]});
+  }
+  const auto inserted = storage_->files.put_all_if_absent(entries);
+  std::vector<StoredRawArtifact> stored;
+  stored.reserve(values.size());
+  for (std::size_t index = 0U; index < values.size(); ++index) {
+    stored.push_back({
+        core::ContentDigest(digests[index]),
+        core::ContentAddressedStoreKey(
+            detail::retained_store_key_for_digest(digests[index])),
+        static_cast<std::uint64_t>(values[index].size()),
+        inserted[index],
+    });
+  }
+  return stored;
 }
 
 std::optional<std::string> FilesystemRawArtifactStore::get_verified(
@@ -622,24 +678,49 @@ StoredCatalogArtifact FilesystemCatalogArtifactStore::put_if_absent(
     const core::ContentAddressedStoreKey& exact_key,
     const core::ContentDigest& expected_digest,
     std::string_view bytes) {
-  storage_->files.require_insert_size(bytes.size());
-  const auto storage_hex =
-      detail::catalog_artifact_storage_hex(exact_key.value());
-  if (!storage_hex.has_value()) {
-    fail("catalog artifact key must be non-empty and within its fixed "
-         "bound");
+  const CatalogArtifactPublication artifact{exact_key, expected_digest, bytes};
+  return put_all_if_absent(
+             std::span<const CatalogArtifactPublication>(&artifact, 1U))
+      .front();
+}
+
+std::vector<StoredCatalogArtifact>
+FilesystemCatalogArtifactStore::put_all_if_absent(
+    std::span<const CatalogArtifactPublication> artifacts) {
+  std::vector<std::string> storage_hexes;
+  std::vector<std::string> envelopes;
+  storage_hexes.reserve(artifacts.size());
+  envelopes.reserve(artifacts.size());
+  for (const auto& artifact : artifacts) {
+    storage_->files.require_insert_size(artifact.bytes.size());
+    auto storage_hex = detail::catalog_artifact_storage_hex(
+        artifact.content_addressed_store_key.value());
+    if (!storage_hex.has_value()) {
+      fail("catalog artifact key must be non-empty and within its fixed "
+           "bound");
+    }
+    storage_hexes.push_back(std::move(*storage_hex));
+    envelopes.push_back(detail::encode_catalog_artifact_envelope(
+        artifact.content_addressed_store_key.value(),
+        artifact.content_digest.value(), artifact.bytes));
   }
-  const std::string envelope =
-      detail::encode_catalog_artifact_envelope(
-          exact_key.value(), expected_digest.value(), bytes);
-  const bool inserted =
-      storage_->files.put_if_absent(*storage_hex, envelope);
-  return {
-      exact_key,
-      expected_digest,
-      static_cast<std::uint64_t>(bytes.size()),
-      inserted,
-  };
+  std::vector<DurableFileCollection::Entry> entries;
+  entries.reserve(artifacts.size());
+  for (std::size_t index = 0U; index < artifacts.size(); ++index) {
+    entries.push_back({storage_hexes[index], envelopes[index]});
+  }
+  const auto inserted = storage_->files.put_all_if_absent(entries);
+  std::vector<StoredCatalogArtifact> stored;
+  stored.reserve(artifacts.size());
+  for (std::size_t index = 0U; index < artifacts.size(); ++index) {
+    stored.push_back({
+        artifacts[index].content_addressed_store_key,
+        artifacts[index].content_digest,
+        static_cast<std::uint64_t>(artifacts[index].bytes.size()),
+        inserted[index],
+    });
+  }
+  return stored;
 }
 
 std::optional<std::string>

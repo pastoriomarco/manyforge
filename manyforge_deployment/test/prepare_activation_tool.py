@@ -13,7 +13,8 @@ import tempfile
 
 
 MAX_ACTIVATION_PREPARATION_REQUEST_BYTES = 34 * 1024 * 1024
-MAX_ACTIVATION_PREPARATION_OUTPUT_BYTES = 128 * 1024 * 1024
+# The compact receipt bound of Headless's ActivationPreparer.
+MAX_ACTIVATION_PREPARATION_OUTPUT_BYTES = 1024 * 1024
 
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
@@ -277,10 +278,11 @@ def _run(
     expect_error: str | None = None,
     expected_program_outcome_kind: str = "bound",
     publish_canonical_empty: bool = False,
+    reuse_root: bool = False,
 ) -> dict[str, object] | None:
-    root.mkdir()
+    root.mkdir(exist_ok=reuse_root)
     activation_root = root / "activation"
-    activation_root.mkdir()
+    activation_root.mkdir(exist_ok=reuse_root)
     request_path = root / "request.json"
     request_path.write_bytes(canonical_json_bytes(request))
     command = [
@@ -302,14 +304,15 @@ def _run(
     if result.returncode != 0:
         raise AssertionError(result.stderr)
     if len(result.stdout.encode("utf-8")) > MAX_ACTIVATION_PREPARATION_OUTPUT_BYTES:
-        raise AssertionError("preparer exceeded the direct-transfer output bound")
-    value = json.loads(result.stdout)
+        raise AssertionError("preparer exceeded the compact receipt bound")
+    receipt = json.loads(result.stdout)
+    value = _stored_product(activation_root, receipt)
     if value["source_document_digest"] != request["source_document_digest"]:
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
     if value.get("schema_version") != "manyforge.prepared_activation_input.v5":
-        raise AssertionError("preparer did not return the direct v4 handoff")
+        raise AssertionError("preparer did not return the v5 prepared activation")
     program_outcome = value.get("program_outcome")
     if (
         not isinstance(program_outcome, dict)
@@ -340,7 +343,7 @@ def _run(
         "raw_artifacts",
         "retained_bundle",
     }:
-        raise AssertionError("preparer returned an incomplete direct payload")
+        raise AssertionError("preparer stored an incomplete payload")
     if not payload["raw_artifacts"] or not payload["catalog_artifacts"]:
         raise AssertionError("preparer omitted its exact artifact closure")
     bundle = payload["retained_bundle"]
@@ -361,6 +364,35 @@ def _run(
         raise AssertionError("preparer omitted the activation closure")
     if publish_canonical_empty:
         _require_native_canonical_empty_configuration(activation_root, bundle)
+    return value
+
+
+def _stored_product(
+    activation_root: Path, receipt: dict[str, object]
+) -> dict[str, object]:
+    """Read the stored product the compact receipt names and bind the two."""
+
+    if not isinstance(receipt, dict) or "activation_payload" in receipt:
+        raise AssertionError("preparer did not return a compact receipt")
+    prepared_activation_id = receipt.get("prepared_activation_id")
+    if not isinstance(prepared_activation_id, str) or not prepared_activation_id.startswith(
+        "sha256:"
+    ):
+        raise AssertionError("compact receipt names no prepared identity")
+    stored_path = (
+        activation_root
+        / "prepared-activations"
+        / f"{prepared_activation_id.removeprefix('sha256:')}.json"
+    )
+    stored = stored_path.read_bytes()
+    value = json.loads(stored)
+    if stored != canonical_json_bytes(value):
+        raise AssertionError("stored prepared activation is not RFC 8785 canonical")
+    identity = {key: item for key, item in value.items() if key != "prepared_activation_id"}
+    if raw_sha256_digest(canonical_json_bytes(identity)) != prepared_activation_id:
+        raise AssertionError("stored prepared activation has a false content identity")
+    if {key: item for key, item in value.items() if key != "activation_payload"} != receipt:
+        raise AssertionError("compact receipt differs from the stored product")
     return value
 
 
@@ -761,6 +793,10 @@ def main() -> int:
             replay = _run(args, request, temporary / "exact-replay",
                           publish_canonical_empty=True)
             assert replay == prepared
+            # A repeated Load adopts the exact stored closure in place.
+            same_root = _run(args, request, temporary / "valid",
+                             publish_canonical_empty=True, reuse_root=True)
+            assert same_root == prepared
             other_runtime = copy.deepcopy(request)
             other_runtime["runtime_cell_id"] = "another_runtime"
             other = _run(args, other_runtime, temporary / "other-runtime")

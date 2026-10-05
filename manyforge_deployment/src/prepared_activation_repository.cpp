@@ -336,8 +336,22 @@ bool FilesystemPreparedActivationRepository::put_if_absent(
   if (bytes.size() > kMaxPreparedActivationBytes) {
     fail("prepared activation exceeds its stored byte bound");
   }
+  const auto path = prepared_path(root_, prepared.prepared_activation_id());
+  // An exact earlier preparation is adopted without rewriting and syncing
+  // another complete temporary copy; the directory barrier makes a final
+  // left by an interrupted writer durable before it is reported present.
+  if (const auto existing = posix::read_exact_regular_file(
+          path, kMaxPreparedActivationBytes, true, kPosixErrors,
+          kReadMessages);
+      existing.has_value()) {
+    if (*existing != bytes) {
+      fail("prepared activation identity collision");
+    }
+    posix::sync_directory(root_, kDirectorySyncMessages);
+    return false;
+  }
   return posix::publish_immutable_file_no_replace(
-      prepared_path(root_, prepared.prepared_activation_id()), bytes,
+      path, bytes,
       kMaxPreparedActivationBytes, kPosixErrors, kReadMessages,
       kDirectorySyncMessages, kPublicationMessages,
       [&bytes](const std::string_view existing) {

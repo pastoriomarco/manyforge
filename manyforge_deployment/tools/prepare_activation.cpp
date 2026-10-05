@@ -113,28 +113,39 @@ void materialize_activation(
     const std::filesystem::path &activation_root) {
   const auto &closure = prepared.closure();
   {
-    deployment::FilesystemRawArtifactStore store(activation_root);
+    std::vector<std::string_view> values;
+    values.reserve(closure.raw_artifacts.size());
     for (const auto &artifact : closure.raw_artifacts) {
-      const auto stored = store.put_if_absent(artifact.bytes);
-      if (stored.content_addressed_store_key !=
+      values.emplace_back(artifact.bytes);
+    }
+    deployment::FilesystemRawArtifactStore store(activation_root);
+    const auto stored = store.put_all_if_absent(values);
+    for (std::size_t index = 0U; index < stored.size(); ++index) {
+      const auto &artifact = closure.raw_artifacts[index];
+      if (stored[index].content_addressed_store_key !=
               artifact.content_addressed_store_key ||
-          stored.content_digest != artifact.content_digest ||
-          stored.byte_size != artifact.bytes.size()) {
+          stored[index].content_digest != artifact.content_digest ||
+          stored[index].byte_size != artifact.bytes.size()) {
         throw std::runtime_error(
             "prepared raw artifact materialized with another identity");
       }
     }
   }
   {
-    deployment::FilesystemCatalogArtifactStore store(activation_root);
+    std::vector<deployment::CatalogArtifactPublication> artifacts;
+    artifacts.reserve(closure.catalog_artifacts.size());
     for (const auto &artifact : closure.catalog_artifacts) {
-      const auto stored = store.put_if_absent(
-          artifact.content_addressed_store_key, artifact.content_digest,
-          artifact.bytes);
-      if (stored.content_addressed_store_key !=
+      artifacts.push_back({artifact.content_addressed_store_key,
+                           artifact.content_digest, artifact.bytes});
+    }
+    deployment::FilesystemCatalogArtifactStore store(activation_root);
+    const auto stored = store.put_all_if_absent(artifacts);
+    for (std::size_t index = 0U; index < stored.size(); ++index) {
+      const auto &artifact = closure.catalog_artifacts[index];
+      if (stored[index].content_addressed_store_key !=
               artifact.content_addressed_store_key ||
-          stored.content_digest != artifact.content_digest ||
-          stored.byte_size != artifact.bytes.size()) {
+          stored[index].content_digest != artifact.content_digest ||
+          stored[index].byte_size != artifact.bytes.size()) {
         throw std::runtime_error(
             "prepared catalog artifact materialized with another identity");
       }
@@ -520,7 +531,16 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
           "prepared canonical empty predecessor did not reload exactly");
     }
   }
-  return prepared.normalized_root();
+  // The compact receipt: every prepared field except the payload. Its
+  // prepared_activation_id names the stored product published above, which
+  // consumers read instead of a second full copy on stdout.
+  deployment::CanonicalValue::Object receipt;
+  for (const auto &[name, value] : prepared.normalized_root().as_object()) {
+    if (name != "activation_payload") {
+      receipt.emplace_back(name, value);
+    }
+  }
+  return deployment::CanonicalValue(std::move(receipt));
 }
 
 } // namespace

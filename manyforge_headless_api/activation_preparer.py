@@ -7,8 +7,10 @@ from functools import lru_cache
 import json
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import threading
@@ -32,8 +34,14 @@ from .native import (
 )
 
 
-_MAXIMUM_COMPILER_OUTPUT_BYTES = 128 * 1024 * 1024
+# The preparer prints only the compact receipt; the complete prepared value is
+# read from the stored product it names.
+_MAXIMUM_COMPILER_OUTPUT_BYTES = 1024 * 1024
 _MAXIMUM_COMPILER_ERROR_BYTES = 64 * 1024
+# Must match kMaxPreparedActivationBytes in
+# manyforge_deployment/prepared_activation_repository.hpp.
+_MAXIMUM_STORED_PREPARED_ACTIVATION_BYTES = 128 * 1024 * 1024
+_PREPARED_ACTIVATION_ID = re.compile(r"sha256:([0-9a-f]{64})")
 _RECEIPT_FIELDS = {
     "assistant_mode",
     "captured_input_digest",
@@ -190,6 +198,115 @@ def _require_admitted_program(value: Mapping[str, Any]) -> None:
             "Activation preparation refused a Program that is not in its "
             "validated canonical form",
         )
+
+
+def _read_stored_prepared_activation(
+    activation_root: Path, prepared_activation_id: str
+) -> bytes:
+    """Read the exact immutable product the native preparer published.
+
+    The repository layout is ``prepared-activations/<hex>.json`` below the
+    trusted activation root (``FilesystemPreparedActivationRepository``).
+    """
+
+    match = _PREPARED_ACTIVATION_ID.fullmatch(prepared_activation_id)
+    if match is None:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Activation preparer returned an invalid prepared identity",
+        )
+    path = activation_root / "prepared-activations" / f"{match.group(1)}.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Activation preparer named no stored prepared activation",
+        ) from error
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            status = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_size > _MAXIMUM_STORED_PREPARED_ACTIVATION_BYTES
+            ):
+                raise HeadlessApiError(
+                    "activation_preparer_response_invalid",
+                    "Stored prepared activation violates its file bound",
+                )
+            stored = stream.read(_MAXIMUM_STORED_PREPARED_ACTIVATION_BYTES + 1)
+    except OSError as error:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation could not be read",
+        ) from error
+    if len(stored) != status.st_size:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation changed during its exact read",
+        )
+    return stored
+
+
+def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("duplicate JSON member")
+    return value
+
+
+def _require_stored_product(
+    receipt: Mapping[str, Any], stored: bytes
+) -> dict[str, Any]:
+    """Bind the compact receipt to the stored product and verify its identity.
+
+    The stored bytes must be exactly the RFC 8785 form of their value, as the
+    Manager's repository reader requires; the value must carry exactly the
+    receipt plus its payload, and its RFC 8785 content identity must be the
+    receipt's prepared_activation_id.
+    """
+
+    try:
+        value = json.loads(
+            stored.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_members,
+        )
+        canonical = rfc8785.dumps(value)
+    except (UnicodeError, ValueError, rfc8785.CanonicalizationError) as error:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation is not valid canonical JSON",
+        ) from error
+    if canonical != stored:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation is not in its canonical form",
+        )
+    if (
+        not isinstance(value, dict)
+        or set(value) != _EXPECTED_RESULT_FIELDS
+        or any(value[field] != receipt[field] for field in _RECEIPT_FIELDS)
+    ):
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation differs from the preparer receipt",
+        )
+    identity = dict(value)
+    prepared_activation_id = identity.pop("prepared_activation_id")
+    expected_identity = "sha256:" + hashlib.sha256(
+        rfc8785.dumps(identity)
+    ).hexdigest()
+    if prepared_activation_id != expected_identity:
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Activation preparer returned a false content identity",
+        )
+    if not isinstance(value.get("activation_payload"), dict):
+        raise HeadlessApiError(
+            "activation_preparer_response_invalid",
+            "Stored prepared activation has an invalid payload",
+        )
+    return value
 
 
 def _prepare_model_closure(
@@ -422,42 +539,33 @@ class ActivationPreparer:
                     details={"preparer_detail": detail[:4096]},
                 )
             try:
-                value = json.loads(output.decode("utf-8", errors="strict"))
+                receipt = json.loads(output.decode("utf-8", errors="strict"))
             except (UnicodeError, json.JSONDecodeError) as error:
                 raise HeadlessApiError(
                     "activation_preparer_response_invalid",
                     "Activation preparer returned invalid JSON",
                 ) from error
             if (
-                not isinstance(value, dict)
-                or set(value) != _EXPECTED_RESULT_FIELDS
-                or value.get("schema_version")
+                not isinstance(receipt, dict)
+                or set(receipt) != _RECEIPT_FIELDS
+                or receipt.get("schema_version")
                 != "manyforge.prepared_activation_input.v5"
-                or value.get("source_document_digest") != source_document_digest
-                or value.get("captured_input_digest") != captured_input_digest
+                or receipt.get("source_document_digest") != source_document_digest
+                or receipt.get("captured_input_digest") != captured_input_digest
+                or not isinstance(receipt.get("prepared_activation_id"), str)
             ):
                 raise HeadlessApiError(
                     "activation_preparer_response_invalid",
                     "Activation preparer returned a divergent result",
                 )
-            identity = dict(value)
-            prepared_activation_id = identity.pop("prepared_activation_id")
-            expected_identity = "sha256:" + hashlib.sha256(
-                rfc8785.dumps(identity)
-            ).hexdigest()
-            if prepared_activation_id != expected_identity:
-                raise HeadlessApiError(
-                    "activation_preparer_response_invalid",
-                    "Activation preparer returned a false content identity",
-                )
-            if not isinstance(value.get("activation_payload"), dict):
-                raise HeadlessApiError(
-                    "activation_preparer_response_invalid",
-                    "Activation preparer returned an invalid direct payload",
-                )
+            value = _require_stored_product(
+                receipt,
+                _read_stored_prepared_activation(
+                    self._activation_root, receipt["prepared_activation_id"]
+                ),
+            )
             _require_admitted_program(value)
-            receipt = {field: value[field] for field in _RECEIPT_FIELDS}
-            self._prepared = {prepared_activation_id: receipt}
+            self._prepared = {receipt["prepared_activation_id"]: receipt}
             return deepcopy(receipt)
         finally:
             if input_path is not None:

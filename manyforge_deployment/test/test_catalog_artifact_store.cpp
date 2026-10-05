@@ -182,6 +182,52 @@ template <typename Put>
 }
 
 TEST(FilesystemCatalogArtifactStoreTest,
+     BatchPublicationMatchesConsecutivePuts) {
+  ScopedTrustedRoot root;
+  const std::string first = "first catalog payload";
+  const std::string second = "second catalog payload";
+  const std::vector<CatalogArtifactPublication> artifacts{
+      {core::ContentAddressedStoreKey("catalog://one"),
+       core::ContentDigest(sha256_digest(first)), first},
+      {core::ContentAddressedStoreKey("catalog://two"),
+       core::ContentDigest(sha256_digest(second)), second},
+      {core::ContentAddressedStoreKey("catalog://one"),
+       core::ContentDigest(sha256_digest(first)), first},
+  };
+  {
+    FilesystemCatalogArtifactStore store(root.path());
+    const auto stored = store.put_all_if_absent(artifacts);
+    ASSERT_EQ(stored.size(), artifacts.size());
+    EXPECT_TRUE(stored[0].inserted);
+    EXPECT_TRUE(stored[1].inserted);
+    EXPECT_FALSE(stored[2].inserted);
+    for (std::size_t index = 0U; index < artifacts.size(); ++index) {
+      EXPECT_EQ(stored[index].content_addressed_store_key,
+                artifacts[index].content_addressed_store_key);
+      EXPECT_EQ(stored[index].content_digest, artifacts[index].content_digest);
+      EXPECT_EQ(stored[index].byte_size, artifacts[index].bytes.size());
+    }
+  }
+  FilesystemCatalogArtifactStore reopened(root.path());
+  EXPECT_EQ(reopened.size(), 2U);
+  EXPECT_EQ(reopened.retained_bytes(), first.size() + second.size());
+  EXPECT_EQ(reopened.get_verified(artifacts[1].content_addressed_store_key,
+                                  artifacts[1].content_digest),
+            second);
+  // A payload that differs from its declared digest is refused before any
+  // entry of its batch is published.
+  const std::string third = "third catalog payload";
+  const std::vector<CatalogArtifactPublication> mismatched{
+      {core::ContentAddressedStoreKey("catalog://three"),
+       core::ContentDigest(sha256_digest(third)), third},
+      {core::ContentAddressedStoreKey("catalog://four"),
+       core::ContentDigest(sha256_digest(first)), second},
+  };
+  EXPECT_ANY_THROW(static_cast<void>(reopened.put_all_if_absent(mismatched)));
+  EXPECT_EQ(reopened.size(), 2U);
+}
+
+TEST(FilesystemCatalogArtifactStoreTest,
      OpaqueNonDigestUnsafeKeyRoundTripsExactBytesAcrossRestart) {
   ScopedTrustedRoot root;
   const std::string key{

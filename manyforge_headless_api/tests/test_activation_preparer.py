@@ -4,6 +4,7 @@ import copy
 from functools import lru_cache
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import rfc8785
 from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
+from manyforge_headless_api import activation_preparer
 from manyforge_headless_api.activation_preparer import ActivationPreparer
 from manyforge_headless_api.native import (
     HeadlessApiConfig,
@@ -84,6 +86,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
     capabilities = tmp_path / "capabilities"
     executable = tmp_path / "preparer"
     capabilities.mkdir()
+    (tmp_path / "artifacts").mkdir()
     executable.write_text("fixture", encoding="utf-8")
     return ActivationPreparer(
         executable=executable,
@@ -137,6 +140,24 @@ def _result(program: object = ...) -> dict[str, object]:
     }
 
 
+def _receipt(result: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in result.items() if key != "activation_payload"}
+
+
+def _stored_path(activation_root: Path, result: dict[str, object]) -> Path:
+    identity = str(result["prepared_activation_id"]).removeprefix("sha256:")
+    return activation_root / "prepared-activations" / f"{identity}.json"
+
+
+def _publish(activation_root: Path, result: dict[str, object]) -> bytes:
+    """Store ``result`` as the native preparer does and return its stdout."""
+
+    path = _stored_path(activation_root, result)
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(rfc8785.dumps(result))
+    return rfc8785.dumps(_receipt(result)) + b"\n"
+
+
 def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,7 +169,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         observed["kwargs"] = kwargs
         input_path = Path(command[command.index("--input") + 1])
         observed["input"] = json.loads(input_path.read_text())
-        kwargs["stdout"].write(json.dumps(_result()).encode("utf-8"))
+        kwargs["stdout"].write(_publish(tmp_path / "artifacts", _result()))
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -310,13 +331,13 @@ def test_preparer_rejects_timeout_and_invalid_output(
     assert raised.value.code == "activation_preparer_response_invalid"
 
 
-def _prepare_with_result(
+def _prepare_with_output(
     preparer: ActivationPreparer,
     monkeypatch: pytest.MonkeyPatch,
-    result: dict[str, object],
+    output: bytes,
 ) -> dict[str, object]:
     def run(_command, **kwargs):
-        kwargs["stdout"].write(json.dumps(result).encode("utf-8"))
+        kwargs["stdout"].write(output)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -329,6 +350,180 @@ def _prepare_with_result(
         program=None,
         program_role_assignment={"component_roles": [], "target_roles": []},
     )
+
+
+def _prepare_with_result(
+    preparer: ActivationPreparer,
+    monkeypatch: pytest.MonkeyPatch,
+    result: dict[str, object],
+) -> dict[str, object]:
+    return _prepare_with_output(
+        preparer, monkeypatch, _publish(preparer._activation_root, result)
+    )
+
+
+def _reidentified(identity: dict[str, object]) -> dict[str, object]:
+    identity = {key: value for key, value in identity.items()
+                if key != "prepared_activation_id"}
+    return {
+        **identity,
+        "prepared_activation_id": "sha256:"
+        + hashlib.sha256(rfc8785.dumps(identity)).hexdigest(),
+    }
+
+
+def test_preparer_returns_only_the_receipt_of_the_stored_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    output = _publish(tmp_path / "artifacts", result)
+    # The compact response is the receipt alone: no second payload copy.
+    assert json.loads(output) == _receipt(result)
+    assert b"activation_payload" not in output
+
+    receipt = _prepare_with_output(preparer, monkeypatch, output)
+
+    assert receipt == _receipt(result)
+    assert preparer.prepared_value(result["prepared_activation_id"]) == receipt
+
+
+def test_preparer_refuses_the_full_value_as_its_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    _publish(tmp_path / "artifacts", result)
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, rfc8785.dumps(result))
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_bounds_its_compact_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, b" " * (1024 * 1024 + 1))
+
+    assert raised.value.code == "activation_preparer_output_oversized"
+
+
+def test_preparer_refuses_a_receipt_without_its_stored_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    output = _publish(tmp_path / "artifacts", result)
+    _stored_path(tmp_path / "artifacts", result).unlink()
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, output)
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_refuses_a_stored_product_reached_through_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    output = _publish(tmp_path / "artifacts", result)
+    stored = _stored_path(tmp_path / "artifacts", result)
+    elsewhere = tmp_path / "elsewhere.json"
+    stored.rename(elsewhere)
+    stored.symlink_to(elsewhere)
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, output)
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        # Same value, but not its RFC 8785 bytes: the Manager would refuse it.
+        lambda stored: stored + b"\n",
+        # A duplicate member that a plain JSON parser would silently drop.
+        lambda stored: b'{"schema_version":"duplicate",' + stored[1:],
+    ],
+    ids=["non_canonical_bytes", "duplicate_member"],
+)
+def test_preparer_refuses_a_stored_product_the_manager_would_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rewrite
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    output = _publish(tmp_path / "artifacts", result)
+    stored = _stored_path(tmp_path / "artifacts", result)
+    stored.write_bytes(rewrite(stored.read_bytes()))
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, output)
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_reports_a_stored_product_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    output = _publish(tmp_path / "artifacts", result)
+
+    def failing_fstat(_descriptor: int) -> os.stat_result:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(activation_preparer.os, "fstat", failing_fstat)
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, output)
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert "could not be read" in str(raised.value)
+
+
+def test_preparer_refuses_a_receipt_that_differs_from_the_stored_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    _publish(tmp_path / "artifacts", result)
+    # Same stored identity, but the receipt names another candidate bundle.
+    receipt = {**_receipt(result), "retained_bundle_id": "sha256:" + "2" * 64}
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_output(preparer, monkeypatch, rfc8785.dumps(receipt))
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_refuses_a_stored_product_with_a_false_content_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparer = _preparer(tmp_path)
+    result = _result()
+    # The receipt and stored value agree, but the payload is not the content
+    # the RFC 8785 identity names.
+    result["activation_payload"] = {
+        **result["activation_payload"],
+        "raw_artifacts": [{"bytes": "Yg=="}],
+    }
+
+    with pytest.raises(HeadlessApiError) as raised:
+        _prepare_with_result(preparer, monkeypatch, result)
+
+    assert raised.value.code == "activation_preparer_response_invalid"
+    assert "false content identity" in str(raised.value)
+    assert preparer.prepared_value(result["prepared_activation_id"]) is None
 
 
 def test_preparer_admits_no_program_without_program_validation(
@@ -384,16 +579,9 @@ def test_preparer_refuses_a_program_the_program_validator_refuses(
     result = _result(program)
     if code == "activation_preparer_response_invalid":
         # The receipt names the admitted Program; the payload diverges from it.
-        identity = {
-            key: value for key, value in result.items()
-            if key != "prepared_activation_id"
-        }
-        identity["program_id"] = _admitted_program()["program_id"]
-        result = {
-            **identity,
-            "prepared_activation_id": "sha256:"
-            + hashlib.sha256(rfc8785.dumps(identity)).hexdigest(),
-        }
+        result = _reidentified(
+            {**result, "program_id": _admitted_program()["program_id"]}
+        )
 
     with pytest.raises(HeadlessApiError) as raised:
         _prepare_with_result(preparer, monkeypatch, result)
@@ -407,19 +595,15 @@ def test_preparer_refuses_a_program_payload_for_no_program(
 ) -> None:
     preparer = _preparer(tmp_path)
     result = _result(None)
-    identity = {
-        key: value for key, value in result.items()
-        if key != "prepared_activation_id"
-    }
-    identity["activation_payload"] = {
-        **identity["activation_payload"],
-        "program": copy.deepcopy(_admitted_program()),
-    }
-    result = {
-        **identity,
-        "prepared_activation_id": "sha256:"
-        + hashlib.sha256(rfc8785.dumps(identity)).hexdigest(),
-    }
+    result = _reidentified(
+        {
+            **result,
+            "activation_payload": {
+                **result["activation_payload"],
+                "program": copy.deepcopy(_admitted_program()),
+            },
+        }
+    )
 
     with pytest.raises(HeadlessApiError) as raised:
         _prepare_with_result(preparer, monkeypatch, result)

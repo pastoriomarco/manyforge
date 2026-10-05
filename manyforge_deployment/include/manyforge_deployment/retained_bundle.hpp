@@ -219,6 +219,10 @@ public:
 
   [[nodiscard]] StoredRawArtifact
   put_if_absent(std::string_view bytes) override;
+  /// Publish several blobs in order, as consecutive `put_if_absent` calls
+  /// would, under one cross-process lock and one verified store refresh.
+  [[nodiscard]] std::vector<StoredRawArtifact>
+  put_all_if_absent(std::span<const std::string_view> values);
   [[nodiscard]] std::optional<std::string>
   get_verified(const core::ContentAddressedStoreKey &key,
                const core::ContentDigest &expected_digest,
@@ -241,6 +245,13 @@ struct StoredCatalogArtifact final {
 
   friend bool operator==(const StoredCatalogArtifact&,
                          const StoredCatalogArtifact&) = default;
+};
+
+/// One exact-key catalog artifact to publish; `bytes` is borrowed.
+struct CatalogArtifactPublication final {
+  core::ContentAddressedStoreKey content_addressed_store_key;
+  core::ContentDigest content_digest;
+  std::string_view bytes;
 };
 
 /// Exact-key immutable catalog-artifact read port.
@@ -330,6 +341,10 @@ class FilesystemCatalogArtifactStore final : public ICatalogArtifactStore {
       const core::ContentAddressedStoreKey& exact_key,
       const core::ContentDigest& expected_digest,
       std::string_view bytes) override;
+  /// Publish several artifacts in order, as consecutive `put_if_absent`
+  /// calls would, under one cross-process lock and one verified refresh.
+  [[nodiscard]] std::vector<StoredCatalogArtifact> put_all_if_absent(
+      std::span<const CatalogArtifactPublication> artifacts);
   [[nodiscard]] std::optional<std::string> get_verified(
       const core::ContentAddressedStoreKey& exact_key,
       const core::ContentDigest& expected_digest,

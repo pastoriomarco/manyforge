@@ -661,6 +661,45 @@ TEST(FilesystemRawArtifactStoreTest,
 }
 
 TEST(FilesystemRawArtifactStoreTest,
+     BatchPublicationMatchesConsecutivePutsUnderItsBounds) {
+  ScopedTrustedRoot root;
+  {
+    FilesystemRawArtifactStore store(root.path(), 3U, 1024U, 1024U);
+    ASSERT_TRUE(store.put_if_absent("existing"sv).inserted);
+    const std::array<std::string_view, 4U> values{
+        "first"sv, "existing"sv, "second"sv, "first"sv};
+    const auto stored = store.put_all_if_absent(values);
+    ASSERT_EQ(stored.size(), values.size());
+    EXPECT_TRUE(stored[0].inserted);
+    EXPECT_FALSE(stored[1].inserted);
+    EXPECT_TRUE(stored[2].inserted);
+    EXPECT_FALSE(stored[3].inserted);
+    for (std::size_t index = 0U; index < values.size(); ++index) {
+      EXPECT_EQ(stored[index].content_digest.value(),
+                sha256_digest(values[index]));
+      EXPECT_EQ(stored[index].byte_size, values[index].size());
+      EXPECT_EQ(store.get_verified(stored[index].content_addressed_store_key,
+                                   stored[index].content_digest,
+                                   stored[index].byte_size),
+                values[index]);
+    }
+    EXPECT_EQ(store.size(), 3U);
+    EXPECT_TRUE(store.put_all_if_absent({}).empty());
+
+    // The count bound is enforced per entry inside one batch: earlier
+    // entries remain published exactly as consecutive puts would leave them.
+    const std::array<std::string_view, 2U> over{"existing"sv, "third"sv};
+    EXPECT_THROW(static_cast<void>(store.put_all_if_absent(over)),
+                 std::invalid_argument);
+    EXPECT_EQ(store.size(), 3U);
+  }
+  FilesystemRawArtifactStore reopened(root.path(), 3U, 1024U, 1024U);
+  EXPECT_EQ(reopened.size(), 3U);
+  EXPECT_EQ(reopened.retained_bytes(),
+            ("existing"sv).size() + ("first"sv).size() + ("second"sv).size());
+}
+
+TEST(FilesystemRawArtifactStoreTest,
      CrossProcessSameContentHasOneInsertionAndExactAccounting) {
   ScopedTrustedRoot root;
   {
