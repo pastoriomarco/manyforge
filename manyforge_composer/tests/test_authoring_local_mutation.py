@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import json
+import logging
 from typing import Any
 from types import SimpleNamespace
 
@@ -21,6 +23,8 @@ from manyforge_headless_api.client import HeadlessClientError
 from manyforge_composer.backend.authoring_admission import (
     AuthoringAdmissionCoordinator,
     AuthoringMutationEnvelope,
+    OperationEffects,
+    owner_transaction_id,
 )
 from manyforge_composer.backend.authoring_workspace import (
     AuthoringWorkspace,
@@ -28,6 +32,7 @@ from manyforge_composer.backend.authoring_workspace import (
     AuthoringWorkspaceIdentity,
     scenario_project_facts,
 )
+from manyforge_composer.backend.headless_ws import HeadlessStateSource
 from manyforge_composer.backend.routes_authoring_workspace import create_authoring_workspace_router
 
 
@@ -549,6 +554,108 @@ def test_unexpected_install_scope_violation_contains_the_workspace(
     assert headless.settlements == []
 
 
+def test_install_failure_after_a_save_write_is_logged_once_and_published(
+    tmp_path, caplog
+) -> None:
+    """A Save wrote its file, then the in-memory install failed: the workspace
+    is contained once, logged once, and published without an attempted edit."""
+
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    source = HeadlessStateSource(
+        headless,  # type: ignore[arg-type]
+        admission=coordinator,
+        workspace=workspace,
+    )
+    # The shell publication reads the owner; this observer records its wake.
+    workspace.set_observer(lambda: headless.events.append("wake"))
+    saved = tmp_path / "saved.program.yaml"
+    effects = OperationEffects()
+
+    def write_under_claim() -> None:
+        saved.write_text("program: saved\n", encoding="utf-8")
+        effects.destination_published(str(saved))
+
+    def failing_install() -> bool:
+        raise RuntimeError("install exploded")
+
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(AuthoringWorkspaceError) as raised:
+        coordinator.execute_local_mutation(
+            _envelope(),
+            operation_kind="save_program",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={"path": str(saved)},
+            workspace=workspace,
+            install=failing_install,
+            validate_under_claim=write_under_claim,
+            effects=effects,
+        )
+
+    cause = "program in-memory install failed: RuntimeError: install exploded"
+    assert raised.value.code == "composer_workspace_install_failed"
+    assert raised.value.detail == {"cause": cause}
+    # Containment is unchanged: the claim stays held and authoring blocked.
+    assert workspace.failed_closed == cause
+    assert coordinator.local_claim_pending is True
+    assert coordinator.mutation_ready is False
+    # One wake publishes the containment; nothing committed.
+    assert headless.events == ["acquire", "wake"]
+
+    template = json.dumps({
+        "schema_version": "manyforge.execution_control.v2",
+        "message_kind": "delta",
+        "control_session_id": "control-session.1",
+        "server_sequence": "2",
+        "shell": {"complete": False},
+    })
+    shell = json.loads(source.local_delta(template))["shell"]
+    assert shell["authoring_workspace_containment"] == {
+        "cause": cause,
+        "saved_path": str(saved),
+    }
+    assert shell["authoring_workspace"]["workspace_revision"] == 1
+
+    # Every later edit is still refused before any effect, and logs nothing.
+    with pytest.raises(HTTPException) as refused:
+        _run_local(coordinator, workspace, program, headless)
+    assert refused.value.status_code == 503
+    assert refused.value.detail["code"] == "composer_workspace_failed_closed"
+    assert refused.value.detail["effect"] == "none"
+    with pytest.raises(HTTPException) as edit_refused:
+        coordinator.execute_draft_edit(
+            _envelope(),
+            operation_kind="mutate_draft",
+            workspace=workspace,
+            draft_id=program.draft_id,
+            expected_identity=workspace.publication()[0],
+            install=lambda: program.install("rev-2"),
+            session="program",
+        )
+    assert edit_refused.value.detail["code"] == "composer_workspace_failed_closed"
+    assert workspace.failed_closed == cause
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "composer_authoring_workspace_contained"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.ERROR
+    assert record.name == "manyforge_composer.backend.authoring_workspace"
+    assert record.operation == "save_program"
+    assert record.install_label == "program"
+    assert record.cause == cause
+    assert record.written_path == str(saved)
+    assert record.request_owner_epoch == "browser.1"
+    assert record.request_id == "request.1"
+    assert record.owner_transaction_id == owner_transaction_id(
+        "browser.1", "request.1"
+    )
+    assert record.workspace_epoch == workspace.epoch
+
+
 def test_admission_refusal_takes_no_claim(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(
         tmp_path, allowed=False
@@ -873,7 +980,7 @@ def test_external_submission_rejects_composite_workspace_race(tmp_path) -> None:
 
 
 def _held_cycle(
-    *, run_state: str = "intervention_required", all_group: str = "held",
+    *, run_state: str = "intervention_required", motion_held: bool = True,
     active_operation_count: int | None = None, containment_pending: bool = False,
 ) -> dict[str, Any]:
     return {
@@ -891,24 +998,25 @@ def _held_cycle(
                 "failure_pause_containment_unconfirmed" if containment_pending else None
             ),
         }]},
-        "runtime_controls": {"execution_selections": {"groups": [{
-            "group_id": "all", "state": all_group, "node_count": 3, "held_node_count": 3,
-        }]}},
+        "runtime_controls": {"execution_selections": {
+            "motion_held": motion_held,
+            "groups": [{"group_id": "all", "state": "held", "node_count": 3,
+                        "held_node_count": 3}],
+        }},
     }
 
 
-def _executed_cycle(*group_states: str) -> dict[str, Any]:
-    """Executed, no Run yet: the owner publishes every group ``ready``."""
-
-    return {
-        **_held_cycle(run_state="running"),
-        "recovery_offer": None,
-        "runtime_controls": {"execution_selections": {"groups": [
-            {"group_id": "all" if index == 0 else f"group.{index}", "state": state,
-             "node_count": 2, "held_node_count": 2 if state == "ready" else 0}
-            for index, state in enumerate(group_states)
-        ]}},
-    }
+# The live case after an operator Stop: `all` is `ready` with four of seven
+# nodes held (control flow keeps running, two motion nodes never started).
+_LIVE_STOPPED_RUN = {
+    **_held_cycle(run_state="running"),
+    "recovery_offer": None,
+    "runtime_controls": {"execution_selections": {
+        "motion_held": True,
+        "groups": [{"group_id": "all", "state": "ready", "node_count": 7,
+                    "held_node_count": 4}],
+    }},
+}
 
 
 class _HeldHeadless(_Headless):
@@ -965,22 +1073,17 @@ def test_idle_draft_edit_commits_without_a_cell_claim(tmp_path) -> None:
     "cycle",
     [
         _held_cycle(),  # failure pause, Stop of other motion confirmed
-        _held_cycle(run_state="running"),  # operator Stop holds everything
-        _held_cycle(run_state="running", all_group="mixed"),
-        _held_cycle(run_state="full_stopped", all_group="unavailable",
+        _held_cycle(run_state="running"),  # operator Stop holds all motion
+        _LIVE_STOPPED_RUN,
+        _held_cycle(run_state="full_stopped", motion_held=False,
                     active_operation_count=0),  # settled Halt
-        _executed_cycle("ready"),  # Executed, never Run
-        _executed_cycle("ready", "ready", "ready"),
     ],
 )
 @pytest.mark.parametrize(
     "manual",
     [
         [],
-        # Released terminal results and the owner's never-dispatched proof.
         [{"resident": False, "operation": {"state": "completed"}}],
-        [{"resident": False, "operation": {"state": "stopped"}}],
-        [{"resident": False, "operation": {"state": "failed"}}],
         [{"resident": True, "operation": {"state": "cancelled_pre_dispatch"}}],
     ],
 )
@@ -1001,35 +1104,13 @@ def test_held_run_with_all_motion_stopped_admits_a_draft_edit(
 @pytest.mark.parametrize(
     "cycle, manual",
     [
-        (_held_cycle(all_group="stopping"), []),
-        (_held_cycle(all_group="running"), []),
-        (_held_cycle(all_group="ready"), []),  # failure pause, nothing held
-        # Executed, but a group has started (or a fact is not proven).
-        (_executed_cycle("ready", "running", "ready"), []),
-        (_executed_cycle("running"), []),
-        (_executed_cycle("ready", "mixed"), []),
-        (_executed_cycle("ready", "unavailable"), []),
-        (_executed_cycle(), []),
-        ({**_executed_cycle("ready"), "recovery_offer": {"actions": []}}, []),
-        ({**_executed_cycle("ready"), "runtime_controls": None}, []),
-        (_executed_cycle("ready"), [{"resident": True, "operation": {"state": "executing"}}]),
+        # The full matrix is the shared rule's (Headless held_run_authoring).
+        (_held_cycle(motion_held=False), []),
+        (_held_cycle(run_state="running", motion_held=False), []),
         (_held_cycle(containment_pending=True), []),
-        (_held_cycle(run_state="full_stopping", active_operation_count=1), []),
         (_held_cycle(run_state="full_stopped", active_operation_count=None), []),
-        ({**_held_cycle(), "state": "stopping"}, []),
-        (_held_cycle(), [{"resident": True, "operation": {"state": "executing"}}]),
-        # Not affirmatively settled: effect unproven, authority retained,
-        # or a state the owner did not (recognizably) publish.
-        (_held_cycle(), [{"resident": True, "operation": {"state": "intervention_required"}}]),
-        (_held_cycle(), [{"resident": True, "operation": {"state": "interrupted"}}]),
-        (_held_cycle(), [{"resident": False, "operation": {"state": "interrupted"}}]),
-        (_held_cycle(), [{"resident": False, "operation": {"state": "intervention_required"}}]),
-        (_held_cycle(), [{"resident": True, "operation": {"state": "completed"}}]),
-        (_held_cycle(), [{"resident": False, "operation": {"state": "mystery"}}]),
-        (_held_cycle(), [{"resident": False, "operation": {}}]),
-        (_held_cycle(), [{"operation": {"state": "completed"}}]),
-        (_held_cycle(), [{"resident": False}]),
         ({**_held_cycle(), "recovery_offer": None}, []),  # failure pause unproven
+        (_held_cycle(), [{"resident": True, "operation": {"state": "executing"}}]),
         (HeadlessClientError("headless_http_timeout", "timed out"), []),
     ],
 )
@@ -1045,6 +1126,8 @@ def test_moving_settling_or_unknown_run_refuses_a_draft_edit(
 
     assert refused.value.status_code == 409
     assert refused.value.detail["code"] == "authoring_not_ready"
+    # Refused before any effect: the client releases its submission guard.
+    assert refused.value.detail["effect"] == "none"
     assert headless.events == []
     assert workspace.revision == 1
 
@@ -1056,4 +1139,5 @@ def test_draft_edit_requires_the_displayed_admission_generation(tmp_path) -> Non
         _draft_edit(coordinator, workspace, program, headless, envelope=_envelope(6))
 
     assert refused.value.detail["code"] == "stale_generation"
+    assert refused.value.detail["effect"] == "none"
     assert headless.events == []

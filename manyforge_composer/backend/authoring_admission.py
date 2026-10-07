@@ -7,15 +7,19 @@ from collections import OrderedDict
 from copy import deepcopy
 import hashlib
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping, NoReturn
 import uuid
 
 from fastapi import HTTPException
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.held_run_authoring import held_run_draft_edit_allowed
 import rfc8785
 
 from .authoring_identity import canonical_digest
-from .held_run_authoring import held_run_draft_editable
+from .draft_session import DraftSessionError
+from .scenario_artifacts import ScenarioArtifactError
+
+from .authoring_workspace import AuthoringOperationContext
 
 if TYPE_CHECKING:
     from .authoring_workspace import (
@@ -51,14 +55,177 @@ class AuthoringOperationError(RuntimeError):
         self.code = code
 
 
-def headless_client_http_exception(error: HeadlessClientError) -> HTTPException:
+@dataclass(slots=True)
+class OperationEffects:
+    """The durable or externally visible effects of one operation, as they happen.
+
+    One operation boundary owns one record and hands it to its writers and to
+    the admission coordinator. A writer records a destination when it first
+    changes it and again when the destination is proven to hold the intended
+    document; the coordinator records workspace commits and Manager
+    submissions. The same record decides both the HTTP outcome (the
+    ``"effect": "none"`` marker only while nothing is recorded) and the local
+    claim settlement (``proven_no_effect`` only while nothing is recorded).
+    Acquiring and releasing an otherwise effect-free claim records nothing.
+    """
+
+    destination: str | None = None
+    published: bool = False
+    workspace: bool = False
+    submission: bool = False
+
+    def destination_changed(self, path: str) -> None:
+        """A destination changed; its content is not yet proven."""
+
+        self.destination = path
+
+    def destination_published(self, path: str) -> None:
+        """The destination holds exactly the intended document."""
+
+        self.destination = path
+        self.published = True
+
+    def workspace_committed(self) -> None:
+        """A Draft/workspace change committed, or its outcome is unknown."""
+
+        self.workspace = True
+
+    def submitted(self) -> None:
+        """A Manager/Kernel submission was made beyond the local claim."""
+
+        self.submission = True
+
+    @property
+    def none(self) -> bool:
+        return self.destination is None and not self.workspace and not self.submission
+
+    @property
+    def published_path(self) -> str | None:
+        return self.destination if self.published else None
+
+    @property
+    def settlement_kind(self) -> str:
+        return "proven_no_effect" if self.none else "owner_commit"
+
+
+def refused_before_effect(status_code: int, detail: Mapping[str, Any]) -> HTTPException:
+    """One structured refusal of a request that left no effect.
+
+    ``"effect": "none"`` tells the client that this request left no durable or
+    externally visible effect: no committed Draft/workspace change, no file
+    written or published, no Manager or Kernel submission (an effect-free local
+    claim acquired and released is not an effect), so the client may release
+    its submission guard. A raise site that proves this passes it explicitly;
+    an operation boundary adds it from its :class:`OperationEffects`. Any other
+    failure leaves the field out and its outcome stays unconfirmed.
+    """
+
+    return HTTPException(status_code=status_code, detail={**detail, "effect": "none"})
+
+
+def raise_operation_failure(
+    error: Exception,
+    effects: OperationEffects,
+    translate: Callable[[Exception], NoReturn],
+) -> NoReturn:
+    """Raise one failure of an effect-tracked operation as its HTTP outcome.
+
+    ``translate`` is the route's error mapping. With no recorded effect the
+    translated refusal carries the marker; after a destination changed it
+    names that destination and never carries the marker. An ``HTTPException``
+    raised by an owner (for example an unsettled claim) is kept unchanged.
+    """
+
+    if isinstance(error, HTTPException):
+        raise error
+    try:
+        translate(error)
+    except HTTPException as translated:
+        detail = translated.detail
+        if not isinstance(detail, Mapping):
+            raise
+        if effects.none:
+            raise refused_before_effect(translated.status_code, detail) from error
+        if effects.destination is not None and "path" not in detail:
+            raise HTTPException(
+                status_code=translated.status_code,
+                detail={**detail, "path": effects.destination},
+            ) from error
+        raise
+    raise error
+
+
+def raise_save_failure(
+    error: Exception,
+    effects: OperationEffects,
+    translate: Callable[[Exception], NoReturn],
+    *,
+    code: str,
+    document: str,
+) -> NoReturn:
+    """Raise one Save-like failure as Not saved, Saved-not-adopted or unverified.
+
+    Once the destination is proven to hold the intended document, a later
+    readback or workspace failure is the definite ``code`` outcome: it names
+    the written path, says the document was not adopted as the Saved
+    baseline, and never carries the marker.
+    """
+
+    path = effects.published_path
+    if path is None or isinstance(error, HTTPException):
+        raise_operation_failure(error, effects, translate)
+    cause_detail = getattr(error, "detail", None)
+    current = (
+        cause_detail.get("workspace") if isinstance(cause_detail, Mapping) else None
+    )
+    cause_code = getattr(error, "code", None)
+    detail: dict[str, Any] = {
+        "code": code,
+        "message": (
+            f"The {document} was written to {path}, but a newer workspace "
+            "revision was not adopted as Saved"
+            if cause_code == "composer_workspace_stale"
+            else f"The {document} was written to {path}, but it was not "
+            f"adopted as the Saved baseline: {error}"
+        ),
+        "path": path,
+        "causeCode": cause_code if isinstance(cause_code, str) else type(error).__name__,
+    }
+    if current is not None:
+        detail["currentWorkspace"] = current
+    raise HTTPException(status_code=409, detail=detail) from error
+
+
+def draft_session_http_exception(error: DraftSessionError) -> HTTPException:
+    """Every Draft-session refusal precedes the Draft's atomic state change."""
+
+    detail: dict[str, Any] = {"code": error.code, "message": str(error)}
+    if error.detail != str(error):
+        detail["context"] = error.detail
+    return refused_before_effect(error.status_code, detail)
+
+
+def scenario_artifact_http_exception(error: ScenarioArtifactError) -> HTTPException:
+    """A code cannot tell whether a write already happened: never marked here."""
+
+    return HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": str(error)},
+    )
+
+
+def headless_client_http_exception(
+    error: HeadlessClientError, *, before_effect: bool = False
+) -> HTTPException:
+    """``before_effect``: the caller proves this request had no effect yet."""
+
     detail: dict[str, Any] = {"code": error.code, "message": str(error)}
     if error.details:
         detail["details"] = error.details
-    return HTTPException(
-        status_code=error.status_code or 503,
-        detail=detail,
-    )
+    status_code = error.status_code or 503
+    if before_effect:
+        return refused_before_effect(status_code, detail)
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 def owner_transaction_id(request_owner_epoch: str, request_id: str) -> str:
@@ -165,10 +332,51 @@ class AuthoringAdmissionCoordinator:
 
     def _require_mutation_ready(self) -> None:
         if not self._ready:
-            raise self._unavailable(
-                "composer_authoring_recovery_blocked",
-                self._blocked_reason or "authoring is contained",
+            raise refused_before_effect(
+                503,
+                {
+                    "code": "composer_authoring_recovery_blocked",
+                    "message": self._blocked_reason or "authoring is contained",
+                },
             )
+
+    @staticmethod
+    def _require_workspace_open(workspace: "AuthoringWorkspace") -> None:
+        if workspace.failed_closed is not None:
+            raise refused_before_effect(
+                503,
+                {
+                    "code": "composer_workspace_failed_closed",
+                    "message": (
+                        "the authoring workspace is contained: "
+                        f"{workspace.failed_closed}"
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _require_admission_generation(
+        admission: Mapping[str, Any], envelope: AuthoringMutationEnvelope
+    ) -> None:
+        if admission.get("admission_generation") != envelope.expected_admission_generation:
+            raise refused_before_effect(
+                409, {"code": "stale_generation", "message": "admission changed"}
+            )
+
+    def _held_run_draft_edit_allowed(self) -> bool:
+        """Apply the published held-run rule to the owners' current facts.
+
+        The same function computes the control-state fact the browser reads;
+        any read failure is "not editable".
+        """
+
+        try:
+            return held_run_draft_edit_allowed(
+                self._client.program_cycle_status(),
+                self._client.execution_control_state(),
+            )
+        except Exception:
+            return False
 
     def recover(self) -> None:
         """Settle this process' claim, then replace an obsolete owner epoch."""
@@ -309,7 +517,16 @@ class AuthoringAdmissionCoordinator:
         expected_identity: "AuthoringWorkspaceIdentity | None" = None,
         project: Mapping[str, Any] | None = None,
         prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None = None,
+        effects: OperationEffects | None = None,
     ) -> LocalAuthoringCommit:
+        """Commit one local change under a short-lived Kernel authoring claim.
+
+        ``effects`` is the operation's effect record. Its writers record a
+        destination they change under the claim; a failure then settles the
+        claim as ``owner_commit``, and only an operation that recorded nothing
+        settles as ``proven_no_effect``.
+        """
+
         if session not in _LOCAL_MUTATION_SESSIONS:
             raise ValueError("local mutation session is not supported")
         if session == "project":
@@ -341,6 +558,7 @@ class AuthoringAdmissionCoordinator:
                 expected_identity=expected_identity,
                 project=project,
                 prepare_project_under_claim=prepare_project_under_claim,
+                effects=OperationEffects() if effects is None else effects,
             )
             self._record_outcome(envelope, operation_kind)
             return result
@@ -361,10 +579,11 @@ class AuthoringAdmissionCoordinator:
 
         A Draft edit has no external effect, so it needs no Kernel authoring
         claim. It is admitted when authoring is Idle or when a held Program run
-        has all its motion confirmed stopped (``held_run_authoring``), at the
-        client's displayed admission generation. The commit is serialized
-        with execution starts and external submissions by the same lock, so
-        Execute, Run, Resume and Retry observe either the old or the new Draft.
+        has all its motion confirmed stopped (Headless ``held_run_authoring``),
+        at the client's displayed admission generation. The commit is
+        serialized with execution starts and external submissions by the same
+        lock, so Execute, Run, Resume and Retry observe either the old or the
+        new Draft.
         """
 
         if session not in {"program", "deployment"}:
@@ -372,25 +591,17 @@ class AuthoringAdmissionCoordinator:
         if not callable(install):
             raise TypeError("Draft edit install must be callable")
         with self._local_mutation_lock:
-            if workspace.failed_closed is not None:
-                raise self._unavailable(
-                    "composer_workspace_failed_closed",
-                    f"the authoring workspace is contained: {workspace.failed_closed}",
-                )
+            self._require_workspace_open(workspace)
             self._settle_pending_local_claim()
             self._require_mutation_ready()
             admission = self._client.authoring_admission()
-            if admission.get("admission_generation") != envelope.expected_admission_generation:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "stale_generation", "message": "admission changed"},
-                )
+            self._require_admission_generation(admission, envelope)
             if admission.get("authoring_allowed") is not True and not (
-                held_run_draft_editable(self._client)
+                self._held_run_draft_edit_allowed()
             ):
-                raise HTTPException(
-                    status_code=409,
-                    detail={
+                raise refused_before_effect(
+                    409,
+                    {
                         "code": "authoring_not_ready",
                         "message": (
                             "editing the Draft requires Idle or a Program run "
@@ -409,6 +620,11 @@ class AuthoringAdmissionCoordinator:
                 draft_id=draft_id,
                 expected_identity=expected_identity,
                 install=install,
+                context=AuthoringOperationContext(
+                    operation=operation_kind,
+                    request_owner_epoch=envelope.request_owner_epoch,
+                    request_id=envelope.request_id,
+                ),
             )
             self._record_outcome(envelope, operation_kind)
             return LocalAuthoringCommit(
@@ -440,9 +656,18 @@ class AuthoringAdmissionCoordinator:
         submit: Callable[[dict[str, Any]], Any],
         commit_before_submit: Callable[[], None] | None = None,
         after_release: Callable[[], None] | None = None,
+        effects: OperationEffects | None = None,
     ) -> Any:
-        """Fence one immutable submission; Manager owns it after acceptance."""
+        """Fence one immutable submission; Manager owns it after acceptance.
 
+        ``effects`` is the operation's effect record (see
+        :meth:`execute_local_mutation`); a committed ``commit_before_submit``
+        is recorded in it, so a later definite Manager rejection settles the
+        claim as ``owner_commit``, not ``proven_no_effect``.
+        """
+
+        if effects is None:
+            effects = OperationEffects()
         with self._local_mutation_lock:
             self._settle_pending_local_claim()
             self._require_mutation_ready()
@@ -466,15 +691,17 @@ class AuthoringAdmissionCoordinator:
                 validate_under_claim(claim)
                 if commit_before_submit is not None:
                     commit_before_submit()
+                    effects.workspace_committed()
             except Exception:
-                self._settle_pending_local_claim("proven_no_effect")
+                self._settle_failed_operation(envelope, operation_kind, effects)
                 raise
             try:
                 result = submit(claim)
             except Exception as error:
                 if getattr(error, "code", None) == "manager_apply_rejected":
-                    self._settle_pending_local_claim("proven_no_effect")
+                    self._settle_failed_operation(envelope, operation_kind, effects)
                 else:
+                    effects.submitted()
                     self._block("Manager submission outcome requires observation")
                 raise
             # An accepted Manager operation adopts this exact claim as its
@@ -540,12 +767,9 @@ class AuthoringAdmissionCoordinator:
         expected_identity: "AuthoringWorkspaceIdentity | None",
         project: Mapping[str, Any] | None,
         prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None,
+        effects: OperationEffects,
     ) -> LocalAuthoringCommit:
-        if workspace.failed_closed is not None:
-            raise self._unavailable(
-                "composer_workspace_failed_closed",
-                f"the authoring workspace is contained: {workspace.failed_closed}",
-            )
+        self._require_workspace_open(workspace)
         payload_digest = canonical_digest(
             {
                 "operation_kind": operation_kind,
@@ -558,20 +782,16 @@ class AuthoringAdmissionCoordinator:
         self._require_mutation_ready()
         admission = self._client.authoring_admission()
         if admission.get("authoring_allowed") is not True:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "authoring_not_ready", "message": "editing requires Idle"},
+            raise refused_before_effect(
+                409, {"code": "authoring_not_ready", "message": "editing requires Idle"}
             )
-        if admission.get("admission_generation") != envelope.expected_admission_generation:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "stale_generation", "message": "admission changed"},
-            )
+        self._require_admission_generation(admission, envelope)
         revision_before = workspace.revision
+        transaction_id = owner_transaction_id(
+            envelope.request_owner_epoch, envelope.request_id
+        )
         self._acquire_local_claim(
-            transaction_id=owner_transaction_id(
-                envelope.request_owner_epoch, envelope.request_id
-            ),
+            transaction_id=transaction_id,
             payload_digest=payload_digest,
             expected_admission_generation=envelope.expected_admission_generation,
             operation_kind=operation_kind,
@@ -587,7 +807,8 @@ class AuthoringAdmissionCoordinator:
                         "under-claim project preparation returned invalid facts"
                     )
         except Exception:
-            self._settle_pending_local_claim("proven_no_effect")
+            # A destination written under the claim is a known effect.
+            self._settle_failed_operation(envelope, operation_kind, effects)
             raise
         installed: list[bool] = []
 
@@ -608,11 +829,26 @@ class AuthoringAdmissionCoordinator:
                 expected_identity=expected_identity,
                 install=(tracked_install if install is not None else None),
                 project=project,
+                # Every destination this operation writes is recorded before
+                # the commit, so a containment reports the written file.
+                context=AuthoringOperationContext(
+                    operation=operation_kind,
+                    request_owner_epoch=envelope.request_owner_epoch,
+                    request_id=envelope.request_id,
+                    owner_transaction_id=transaction_id,
+                    written_path=effects.destination,
+                ),
             )
         except Exception as error:
             if not installed and workspace.failed_closed is None:
-                self._settle_pending_local_claim("proven_no_effect")
+                # The workspace refused the commit before any install: settle
+                # from what the operation recorded (for example a Save whose
+                # destination is already written).
+                self._settle_failed_operation(envelope, operation_kind, effects)
                 raise
+            # An in-memory install whose outcome is unknown contains the
+            # workspace; the claim stays held for diagnosis.
+            effects.workspace_committed()
             self._block(f"local install outcome is unknown: {error}")
             raise
         if workspace.revision != revision_before:
@@ -634,6 +870,7 @@ class AuthoringAdmissionCoordinator:
         expected_identity: "AuthoringWorkspaceIdentity | None",
         install: Callable[[], bool] | None,
         project: Mapping[str, Any] | None,
+        context: AuthoringOperationContext,
     ) -> "AuthoringWorkspaceSnapshot":
         if session == "whole-workspace":
             assert install is not None
@@ -642,6 +879,7 @@ class AuthoringAdmissionCoordinator:
                 install=install,
                 project=project,
                 notify=False,
+                context=context,
             )
         if session == "project":
             assert project is not None
@@ -655,6 +893,7 @@ class AuthoringAdmissionCoordinator:
                 expected_identity=expected_identity,
                 install=install,
                 notify=False,
+                context=context,
             )
         assert install is not None
         return workspace.commit_program(
@@ -662,6 +901,7 @@ class AuthoringAdmissionCoordinator:
             expected_identity=expected_identity,
             install=install,
             notify=False,
+            context=context,
         )
 
     def _acquire_local_claim(
@@ -707,6 +947,20 @@ class AuthoringAdmissionCoordinator:
             assert self._pending_local_claim is not None
             self._pending_local_claim.claim = claim
         return claim
+
+    def _settle_failed_operation(
+        self,
+        envelope: AuthoringMutationEnvelope,
+        operation_kind: str,
+        effects: OperationEffects,
+    ) -> None:
+        """Settle the claim of a failed operation from its recorded effects."""
+
+        self._settle_pending_local_claim(effects.settlement_kind)
+        if not effects.none:
+            # A definite post-effect outcome: a client rechecking this exact
+            # request reads its claim as settled, not as unknown.
+            self._record_outcome(envelope, operation_kind)
 
     @staticmethod
     def _release_evidence(pending: _PendingLocalClaim) -> str:
@@ -788,6 +1042,12 @@ __all__ = [
     "AuthoringOperationError",
     "AuthoringMutationEnvelope",
     "LocalAuthoringCommit",
+    "OperationEffects",
     "PARTIAL_EFFECT_OBSERVATION_CODES",
+    "draft_session_http_exception",
     "headless_client_http_exception",
+    "raise_operation_failure",
+    "raise_save_failure",
+    "refused_before_effect",
+    "scenario_artifact_http_exception",
 ]

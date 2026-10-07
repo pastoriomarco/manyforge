@@ -7,7 +7,7 @@ import {
   useState,
 } from 'react';
 
-import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
+import { api, authoringRefusalMessage, isStaleWorkspaceError, savedNotAdoptedMessage } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
@@ -258,7 +258,10 @@ export function useProgramWorkspace(
       return result;
     } catch (error: unknown) {
       if (action !== 'refresh') authoring.finishMutation(null, error);
-      const refusal = action === 'refresh' ? null : authoringRefusalMessage(error);
+      // A stale fence is also refused before any effect, but it needs the
+      // refresh below, so it is never handled as a plain refusal.
+      const refusal = action === 'refresh' || isStaleWorkspaceError(error)
+        ? null : authoringRefusalMessage(error);
       if (refusal !== null) {
         if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
         return null;
@@ -271,8 +274,11 @@ export function useProgramWorkspace(
         });
       }
       // Another client's accepted edit moved the workspace ahead of this
-      // request. Refresh both owners' truth once and never repeat the edit.
+      // request, or a Save wrote its document without adopting it as Saved.
+      // Refresh both owners' truth once and never repeat the request; the
+      // written-but-not-adopted outcome stays visible with its path.
       if (isStaleWorkspaceError(error)) {
+        const notAdopted = savedNotAdoptedMessage(error);
         void readWorkspace(current).then(
           (workspace) => {
             if (mounted.current) {
@@ -280,7 +286,7 @@ export function useProgramWorkspace(
                 type: 'request_succeeded',
                 generation: current,
                 workspace,
-                message: null,
+                message: notAdopted,
                 transitionStatus: null,
               });
             }

@@ -926,6 +926,104 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     return TestClient(app), state
 
 
+@pytest.mark.parametrize("route", ["save", "save-as"])
+def test_refused_deployment_save_writes_no_artifact(
+    tmp_path: Path, route: str
+) -> None:
+    """Admission precedes the artifact write, so its refusal has no effect."""
+
+    class Refusing:
+        def authoring_admission(self) -> dict[str, Any]:
+            return {"authoring_allowed": False, "admission_generation": 1}
+
+        def acquire_authoring_transaction(self, _request):
+            raise AssertionError("a refused Save takes no claim")
+
+    client, state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    workspace = client.get("/api/deployment/workspace").json()
+    workspace = client.post(
+        "/api/deployment/open-draft",
+        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+    workspace = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(workspace, path=["name"], value="Edited cell"),
+    ).json()
+    source_bytes = source.read_bytes()
+    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing())  # type: ignore[arg-type]
+
+    refused = client.post(
+        f"/api/deployment/{route}",
+        json=(
+            _request(workspace, kind="save")
+            if route == "save"
+            else _request(
+                workspace,
+                path=str(tmp_path / "saved"),
+                confirmOverwrite=False,
+                kind="save",
+            )
+        ),
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "authoring_not_ready"
+    assert refused.json()["detail"]["effect"] == "none"
+    assert source.read_bytes() == source_bytes
+    assert not (tmp_path / "saved.deployment.yaml").exists()
+    assert client.get("/api/deployment/workspace").json() == workspace
+
+
+@pytest.mark.parametrize("stale_at", ["before_write", "after_write"])
+def test_deployment_save_draft_refusal_is_marked_only_before_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_at: str
+) -> None:
+    client, state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    workspace = client.get("/api/deployment/workspace").json()
+    workspace = client.post(
+        "/api/deployment/open-draft",
+        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+
+    def stale(*_args, **_kwargs):
+        raise DeploymentDraftError(
+            "deployment_draft_stale", "Deployment Draft changed", status_code=409
+        )
+
+    monkeypatch.setattr(
+        state.deployment_draft_session,
+        "require_current" if stale_at == "before_write" else "install_prepared_save",
+        stale,
+    )
+    target = tmp_path / "saved.deployment.yaml"
+    refused = client.post(
+        "/api/deployment/save-as",
+        json=_request(
+            workspace, path=str(tmp_path / "saved"), confirmOverwrite=False, kind="save"
+        ),
+    )
+
+    detail = refused.json()["detail"]
+    if stale_at == "before_write":
+        # Nothing was written: the operation recorded no effect.
+        assert refused.status_code == 409, refused.text
+        assert detail["code"] == "deployment_draft_stale"
+        assert detail["effect"] == "none"
+        assert not target.exists()
+    else:
+        # Written, then the workspace owner contained the failed adoption.
+        assert refused.status_code == 409, refused.text
+        assert detail["code"] == "deployment_saved_baseline_not_adopted"
+        assert detail["causeCode"] == "composer_workspace_install_failed"
+        assert detail["path"] == str(target)
+        assert "effect" not in detail
+        assert target.exists()
+
+
 def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     tmp_path: Path,
 ):
@@ -1573,6 +1671,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         assert refused.json()["detail"] == {
             "code": "activation_input_changed_after_confirmation",
             "message": "Draft changed after confirmation; review again",
+            "effect": "none",
         }
     assert len(effects) == effects_before_scope
     assert capture_calls == capture_calls_after_preparation

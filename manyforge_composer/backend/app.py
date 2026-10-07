@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -52,6 +53,25 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 _MAXIMUM_REQUEST_BODY_BYTES = 1024 * 1024
+# A structured error code is one short identifier; nothing else of an error
+# body (messages may carry user data) reaches the request log.
+_LOGGED_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+
+
+def _structured_error_code(body: bytes) -> str | None:
+    """Return only ``detail.code`` of one JSON error body, when it has one."""
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return (
+        code
+        if isinstance(code, str) and _LOGGED_ERROR_CODE.fullmatch(code)
+        else None
+    )
 
 _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
@@ -346,11 +366,30 @@ def create_app(
                 },
             )
         duration_ms = (time.monotonic() - started_at) * 1000.0
+        error_code = None
+        if response.status_code >= 400 and response.headers.get(
+            "content-type", ""
+        ).startswith("application/json"):
+            body = getattr(response, "body", None)
+            if body is None:
+                # A routed response streams; error bodies are small and are
+                # replayed unchanged after their code is read, with the raw
+                # header list (repeated headers such as Set-Cookie included).
+                body = b"".join([chunk async for chunk in response.body_iterator])
+                streamed = response
+                response = Response(
+                    content=body,
+                    status_code=streamed.status_code,
+                    background=streamed.background,
+                )
+                response.raw_headers = list(streamed.raw_headers)
+            error_code = _structured_error_code(body)
         response.headers["X-Request-ID"] = request_id
         fields = {
             "method": request.method,
             "path": str(request.url.path),
             "status_code": response.status_code,
+            "error_code": error_code,
             "duration_ms": round(duration_ms, 1),
             "client": request.client.host if request.client else None,
             "request_id": request_id,

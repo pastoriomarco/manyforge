@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-10-02 19:28:14 UTC
+  Last regenerated: 2026-10-06 18:51:43 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -85,6 +85,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/operations/{operation_id}/resume` | headless-runtime-client | Execution Resume |
 | `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
+| `GET` | `/api/execution/program-runs/{program_run_id}/admitted-speeds` | headless-runtime-client | Program Run Admitted Speeds |
 | `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
 | `GET` | `/api/execution/stop-fault` | headless-runtime-client | Execution Stop Fault |

@@ -1,4 +1,5 @@
 import type { ProgramViewerMetadata } from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
 
 export interface ViewerPresentationDraft {
   frameRoleVisibility: Record<string, boolean>;
@@ -41,6 +42,19 @@ export function sceneSourceIsDraft(
 ): boolean {
   return ownerSceneKnown && draftAvailable && draftEditable
     && (choice === 'draft' || (choice === 'auto' && draftDiffersFromApplied));
+}
+
+/**
+ * Whether Program execution locks the viewer's object editing: any run,
+ * except one whose Program motion the owners confirm stopped (the published
+ * `heldRunDraftEditAllowed`, the rule every other Draft edit follows).
+ */
+export function executionLocksObjectEditing(
+  snapshot: ComposerHeadlessState | null,
+): boolean {
+  return snapshot !== null
+    && snapshot.programCycle.state !== 'idle_after_reset'
+    && snapshot.heldRunDraftEditAllowed !== true;
 }
 
 function orderedVisibility(

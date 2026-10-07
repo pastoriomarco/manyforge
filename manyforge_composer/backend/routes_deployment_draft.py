@@ -24,8 +24,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .authoring_admission import (
     AuthoringOperationError,
     AuthoringMutationEnvelope,
+    OperationEffects,
     PARTIAL_EFFECT_OBSERVATION_CODES,
+    draft_session_http_exception,
     headless_client_http_exception,
+    raise_save_failure,
+    refused_before_effect,
+    scenario_artifact_http_exception,
 )
 from .deployment_artifacts import (
     load_deployment_artifact,
@@ -256,10 +261,12 @@ def _require_activation_scope(state: ComposerState, scope: ActivationScope) -> N
         or state.scenario_source_document_digest != scope.source_document_digest
         or state.scenario_program_role_assignment != scope.program_role_assignment
     ):
-        raise DeploymentDraftError(
-            "activation_input_changed_after_confirmation",
-            "Draft changed after confirmation; review again",
-            status_code=409,
+        raise refused_before_effect(
+            409,
+            {
+                "code": "activation_input_changed_after_confirmation",
+                "message": "Draft changed after confirmation; review again",
+            },
         )
 
 
@@ -317,6 +324,9 @@ class ApplyDeploymentCandidateRequest(_Fence):
         return self
 
 
+# Deployment Apply refusals raised before admission or any Manager submission
+# (or under the claim before it, which then settles as proven no-effect): a
+# no-op Apply, and a confirmed activation input that changed meanwhile.
 def _raise(error: Exception) -> NoReturn:
     if isinstance(error, AuthoringWorkspaceError):
         raise HTTPException(
@@ -339,18 +349,17 @@ def _raise(error: Exception) -> NoReturn:
             status_code=503,
             detail={"code": error.code, "message": str(error)},
         ) from error
-    if isinstance(error, (DeploymentDraftError, ScenarioArtifactError)):
+    if isinstance(error, DeploymentDraftError):
         raise HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
         ) from error
+    if isinstance(error, ScenarioArtifactError):
+        raise scenario_artifact_http_exception(error) from error
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
     if isinstance(error, DraftSessionError):
-        raise HTTPException(
-            status_code=error.status_code,
-            detail={"code": error.code, "message": str(error)},
-        ) from error
+        raise draft_session_http_exception(error) from error
     raise error
 
 
@@ -685,103 +694,132 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         """Persist one exact Deployment Draft and adopt it as the Saved baseline.
 
         The capture, the write and the baseline adoption are three separate
-        steps: the write happens outside every owner lock and the adoption is one
-        composite commit fenced by the captured workspace identity.
+        steps: the write happens only after admission, under the local
+        authoring claim, so an admission refusal writes nothing; the adoption
+        is one composite commit fenced by the captured workspace identity.
+        One effect record decides both the HTTP outcome and the claim
+        settlement: Not saved, Saved but not adopted (naming the written
+        path), or unverified.
         """
 
-        target = body.path if isinstance(body, SaveDeploymentAsRequest) else None
+        effects = OperationEffects()
         try:
-            prepared = state.deployment_draft_session.prepare_save(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                target_path=(
-                    normalize_deployment_save_path(target)
-                    if target is not None
-                    else None
-                ),
-                confirm_overwrite=(
-                    body.confirm_overwrite
-                    if isinstance(body, SaveDeploymentAsRequest)
-                    else True
-                ),
+            save_under_claim(body, effects)
+        except Exception as error:
+            raise_save_failure(
+                error,
+                effects,
+                _raise,
+                code="deployment_saved_baseline_not_adopted",
+                document="Deployment Draft",
             )
-            project_path = state.authoring_workspace.snapshot().project["document_path"]
-            scenario_member = (
-                target is None and project_path is not None
-                and prepared.resolved_target == str(
-                    Path(project_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]
-                )
+        # The Deployment workspace carries its own Draft-matched identity;
+        # the composite snapshot must not replace it (it breaks that contract).
+        try:
+            return _workspace(state)
+        except Exception as error:
+            _raise(error)
+
+    def save_under_claim(
+        body: SaveDeploymentRequest | SaveDeploymentAsRequest,
+        effects: OperationEffects,
+    ) -> None:
+        target = body.path if isinstance(body, SaveDeploymentAsRequest) else None
+        prepared = state.deployment_draft_session.prepare_save(
+            draft_id=body.draft_id,
+            expected_revision=body.expected_draft_revision,
+            target_path=(
+                normalize_deployment_save_path(target)
+                if target is not None
+                else None
+            ),
+            confirm_overwrite=(
+                body.confirm_overwrite
+                if isinstance(body, SaveDeploymentAsRequest)
+                else True
+            ),
+        )
+        project_path = state.authoring_workspace.snapshot().project["document_path"]
+        scenario_member = (
+            target is None and project_path is not None
+            and prepared.resolved_target == str(
+                Path(project_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]
             )
-            saved_path = prepared.resolved_target
-            artifact_written = not scenario_member
-            source_root = state.deployment_draft_session.source_project_root
+        )
+        saved_path = prepared.resolved_target
+        source_root = state.deployment_draft_session.source_project_root
 
-            def prepare_saved_project() -> dict[str, Any]:
-                nonlocal artifact_written
-                deployment = json.loads(prepared.canonical_json)
-                if source_root is not None and source_root != project_path:
-                    try:
-                        deployment = rebase_deployment_intent_sources(
-                            deployment,
-                            source_project_root=Path(source_root),
-                            destination_project_root=Path(project_path),
-                        )
-                    except DeploymentIntentError as error:
-                        raise DeploymentDraftError(
-                            "scenario_deployment_intent_invalid", str(error),
-                            status_code=400,
-                        ) from error
-                document, path, digest = save_scenario_member(
-                    project_path, "deployment_draft", deployment,
-                    allowed_roots=state.allowed_fs_roots,
-                )
-                artifact_written = True
-                return scenario_project_facts(
-                    document, document_path=path, source_document_digest=digest
-                )
-
-            if not scenario_member and _published_deployment_canonical(
-                state, prepared.target_path
-            ) != prepared.canonical_json:
+        def write_artifact_under_claim() -> None:
+            nonlocal saved_path
+            # The adoption's fences, checked before the write: a stale
+            # Save is refused before any effect.
+            body.require_workspace_fence(state.authoring_workspace.identity())
+            state.deployment_draft_session.require_current(
+                prepared.draft_id, prepared.base_revision
+            )
+            # A prior completed write of this exact document is resolved
+            # without repeating it.
+            intended = prepared.canonical_json
+            if _published_deployment_canonical(state, prepared.target_path) == intended:
+                return
+            try:
                 saved_path = save_deployment_artifact(
-                    prepared.canonical_json,
+                    intended,
                     prepared.target_path,
                     allowed_roots=_write_roots(state),
                     overwrite=prepared.overwrite,
                 )
-            try:
-                commit = commit_local_authoring(
-                    state,
-                    body,
-                    operation_kind=prepared.tool_id,
-                    session="whole-workspace" if scenario_member else "deployment",
-                    prepare_project_under_claim=(
-                        prepare_saved_project if scenario_member else None
-                    ),
-                    install=lambda: state.deployment_draft_session.install_prepared_save(
-                        prepared, saved_path=saved_path
-                    ),
-                )
-            except AuthoringWorkspaceError as error:
-                if error.code != "composer_workspace_stale" or not artifact_written:
-                    raise
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "deployment_saved_baseline_not_adopted",
-                        "message": (
-                            "the Deployment artifact was written but a newer "
-                            "workspace revision was not adopted as Saved"
-                        ),
-                        "path": saved_path,
-                        "currentWorkspace": error.detail.get("workspace"),
-                    },
-                ) from error
-            # The Deployment workspace carries its own Draft-matched identity;
-            # the composite snapshot must not replace it (it breaks that contract).
-            return _workspace(state)
-        except Exception as error:
-            _raise(error)
+            except Exception:
+                # One atomic replacement: the target holds either its
+                # previous content (Not saved) or exactly this document.
+                if _published_deployment_canonical(
+                    state, prepared.target_path
+                ) == intended:
+                    effects.destination_published(saved_path)
+                raise
+            effects.destination_published(saved_path)
+
+        def prepare_saved_project() -> dict[str, Any]:
+            deployment = json.loads(prepared.canonical_json)
+            if source_root is not None and source_root != project_path:
+                try:
+                    deployment = rebase_deployment_intent_sources(
+                        deployment,
+                        source_project_root=Path(source_root),
+                        destination_project_root=Path(project_path),
+                    )
+                except DeploymentIntentError as error:
+                    raise DeploymentDraftError(
+                        "scenario_deployment_intent_invalid", str(error),
+                        status_code=400,
+                    ) from error
+            document, path, digest = save_scenario_member(
+                project_path, "deployment_draft", deployment,
+                allowed_roots=state.allowed_fs_roots, effects=effects,
+            )
+            return scenario_project_facts(
+                document, document_path=path, source_document_digest=digest
+            )
+
+        # Both forms are written under the claim, after admission: a
+        # Scenario member with its manifest, a standalone artifact as the
+        # under-claim step before the commit.
+        commit_local_authoring(
+            state,
+            body,
+            operation_kind=prepared.tool_id,
+            session="whole-workspace" if scenario_member else "deployment",
+            validate_under_claim=(
+                None if scenario_member else write_artifact_under_claim
+            ),
+            prepare_project_under_claim=(
+                prepare_saved_project if scenario_member else None
+            ),
+            install=lambda: state.deployment_draft_session.install_prepared_save(
+                prepared, saved_path=saved_path
+            ),
+            effects=effects,
+        )
 
     @router.post("/api/deployment/save")
     def save_draft(body: SaveDeploymentRequest) -> dict[str, Any]:
@@ -1100,10 +1138,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             else None
         )
         if scope is not None:
-            try:
-                _require_activation_scope(state, scope)
-            except DeploymentDraftError as error:
-                _raise(error)
+            _require_activation_scope(state, scope)
         source_closure = _capture_model_sources(state, deployment)
         if apply:
             # Nothing to apply: every input already is the Manager's Applied
@@ -1131,13 +1166,15 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 and isinstance(program_revision, str)
                 and _applied_program_revision(state) == program_revision
             ):
-                _raise(
-                    DeploymentDraftError(
-                        "deployment_apply_nothing_to_apply",
-                        "Nothing to apply: the Deployment and Program Drafts "
-                        "already match Applied",
-                        status_code=409,
-                    )
+                raise refused_before_effect(
+                    409,
+                    {
+                        "code": "deployment_apply_nothing_to_apply",
+                        "message": (
+                            "Nothing to apply: the Deployment and Program "
+                            "Drafts already match Applied"
+                        ),
+                    },
                 )
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(

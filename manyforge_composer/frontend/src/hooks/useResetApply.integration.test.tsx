@@ -48,6 +48,8 @@ vi.mock('../api/client', async (importOriginal) => ({
   api: apiMock,
 }));
 
+import { ApiError } from '../api/client';
+
 import {
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
@@ -94,6 +96,9 @@ interface Environment {
   /** The native execution owner (Robot Control) epoch. */
   executionOwnerEpoch?: string;
 }
+
+/** The holds in which nothing moves and nothing can start. */
+const STOPPED_HOLDS: readonly Hold[] = ['failure_pause', 'operator_stop', 'halt', 'never_run'];
 
 /** Held on a failed node, the other motion stopped; one unapplied Program edit. */
 const HELD: Environment = {
@@ -287,6 +292,10 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
       authoringAllowed: environment.admissionOpen ?? cycle.state === 'idle_after_reset',
       admissionGeneration: environment.admissionGeneration,
     },
+    // The backend's published held-run verdict for each hold (the rule itself
+    // is tested in Headless test_held_run_authoring.py).
+    heldRunDraftEditAllowed: cycle.state === 'running'
+      && STOPPED_HOLDS.includes(environment.hold),
     programCycle: cycle,
     authoringWorkspace: identity(environment),
   } as unknown as ComposerHeadlessState;
@@ -420,8 +429,41 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
+describe('A refused stale Deployment fence', () => {
+  // Refused before any effect, and the workspace moved: the hook refreshes it
+  // instead of only reporting the refusal.
+  const stale = () => new ApiError('Deployment Draft changed', 409, {
+    detail: { code: 'composer_draft_revision_stale', message: 'Deployment Draft changed', effect: 'none' },
+  });
+
+  it('refreshes the workspace after a stale Draft edit', async () => {
+    await mount({ ...HELD, hold: 'operator_stop' });
+    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
+    apiMock.deploymentWorkspace.mutate.mockRejectedValueOnce(stale());
+    await act(async () => { await hooks!.deployment.mutate(['tick'], 'set', 1); });
+    expect(apiMock.deploymentWorkspace.mutate).toHaveBeenCalledOnce();
+    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads + 1);
+    expect(hooks!.deployment.feedback).toBeNull();
+    expect(hooks!.deployment.error).toBe('Deployment Draft changed');
+    expect(hooks!.deployment.mutationAvailable).toBe(true);
+  });
+
+  it('refreshes the workspace after a stale Apply', async () => {
+    await mount({
+      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2, deploymentContent: digest('e'),
+    });
+    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
+    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(stale());
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenCalledOnce();
+    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads + 1);
+    expect(hooks!.deployment.feedback).toBeNull();
+    expect(hooks!.deployment.error).toBe('Deployment Draft changed');
+  });
+});
+
 describe('Draft editing while a Program run exists', () => {
-  it.each<Hold>(['failure_pause', 'operator_stop', 'halt', 'never_run'])(
+  it.each<Hold>(STOPPED_HOLDS)(
     'is editable when all motion is confirmed stopped (%s)',
     async (hold) => {
       await mount({ ...HELD, hold });

@@ -990,7 +990,7 @@ export interface ProgramGroupRuntimeScaleState {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v8';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v9';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;

@@ -24,7 +24,12 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from fastapi import HTTPException
 
-from .authoring_admission import LocalAuthoringCommit
+from .authoring_admission import (
+    AuthoringAdmissionCoordinator,
+    LocalAuthoringCommit,
+    OperationEffects,
+    refused_before_effect,
+)
 
 if TYPE_CHECKING:
     from .authoring_workspace import AuthoringWorkspaceIdentity
@@ -60,6 +65,19 @@ def require_captured_workspace_identity(
         )
 
 
+def _require_coordinator(state: "ComposerState") -> AuthoringAdmissionCoordinator:
+    coordinator = state.authoring_admission
+    if coordinator is None:
+        raise refused_before_effect(
+            503,
+            {
+                "code": "authoring_not_ready",
+                "message": "authoritative authoring admission is unavailable",
+            },
+        )
+    return coordinator
+
+
 def commit_local_authoring(
     state: "ComposerState",
     body: Any,
@@ -71,6 +89,7 @@ def commit_local_authoring(
     session: str = "program",
     project: Mapping[str, Any] | None = None,
     prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None = None,
+    effects: OperationEffects | None = None,
 ) -> LocalAuthoringCommit:
     """Commit one already-prepared value through the local admission path.
 
@@ -81,15 +100,7 @@ def commit_local_authoring(
     it atomically together with the domain fence.
     """
 
-    coordinator = state.authoring_admission
-    if coordinator is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "authoring_not_ready",
-                "message": "authoritative authoring admission is unavailable",
-            },
-        )
+    coordinator = _require_coordinator(state)
     identity: "AuthoringWorkspaceIdentity" = (
         state.authoring_workspace.identity()
         if captured_identity is None
@@ -109,6 +120,7 @@ def commit_local_authoring(
         expected_identity=identity,
         project=project,
         prepare_project_under_claim=prepare_project_under_claim,
+        effects=effects,
     )
 
 
@@ -128,15 +140,7 @@ def commit_draft_edit(
     confirmed stopped.
     """
 
-    coordinator = state.authoring_admission
-    if coordinator is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "authoring_not_ready",
-                "message": "authoritative authoring admission is unavailable",
-            },
-        )
+    coordinator = _require_coordinator(state)
     identity: "AuthoringWorkspaceIdentity" = state.authoring_workspace.identity()
     body.require_workspace_fence(identity)
     return coordinator.execute_draft_edit(

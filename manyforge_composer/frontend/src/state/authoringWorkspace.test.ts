@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  authoringContainmentNotices,
   authoringUnavailableCause,
   authoringUnavailableReason,
+  draftEditUnavailableReason,
   programApplyScenarioReason,
   requiredComponentFaultNotices,
   authoringWorkspaceIdentity,
@@ -90,6 +92,7 @@ function headlessState(
     componentOverview: {} as never,
     alarms: {} as never,
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
+    heldRunDraftEditAllowed: false,
     programCycle: { state: 'idle_after_reset' } as never,
     authoringWorkspace: {
       workspaceEpoch: 'workspace.epoch.1',
@@ -100,6 +103,7 @@ function headlessState(
       deploymentDraftRevision: 4,
       ...overrides,
     },
+    authoringWorkspaceContainment: null,
     receiverEpoch: 'receiver.epoch.1',
     snapshotSequence: workspaceRevision,
     ...state,
@@ -197,6 +201,24 @@ describe('authoringWorkspace', () => {
     );
   });
 
+  it('admits a Draft edit during a run only by the published held-run rule', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    const running = { programCycle: { state: 'running' } as never };
+    expect(draftEditUnavailableReason(
+      installed,
+      headlessState(5, {}, { ...running, heldRunDraftEditAllowed: true }),
+    )).toBeNull();
+    expect(draftEditUnavailableReason(
+      installed,
+      headlessState(5, {}, { ...running, heldRunDraftEditAllowed: false }),
+    )).toBe('Program execution is running; editing requires Idle or all Program motion stopped (Stop, Halt, a failure pause, or Executed but not yet Run).');
+    // The published rule never bypasses the other gates.
+    expect(draftEditUnavailableReason(
+      installed,
+      headlessState(6, {}, { ...running, heldRunDraftEditAllowed: true }),
+    )).toBe('The displayed workspace is still synchronizing with the backend.');
+  });
+
   it('explains only live manual operations and keeps owner faults visible', () => {
     const installed = published(workspaceSnapshot(5, 3, 4));
     const state = headlessState(5, {}, {
@@ -222,6 +244,41 @@ describe('authoringWorkspace', () => {
     state.authoringAdmission.authoringAllowed = true;
     expect(authoringUnavailableCause(installed, state)).toBeNull();
     expect(requiredComponentFaultNotices(state)).toHaveLength(1);
+  });
+
+  it('shows a published containment as one persistent error, with and without a saved file', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    expect(authoringContainmentNotices(headlessState(5))).toEqual([]);
+    expect(authoringContainmentNotices(null)).toEqual([]);
+
+    const cause = 'program in-memory install failed: RuntimeError: install exploded';
+    const saved = headlessState(5, {}, {
+      authoringWorkspaceContainment: { cause, savedPath: '/projects/saved.program.yaml' },
+    });
+    const savedMessage = `Authoring contained: ${cause}. Saved file: `
+      + '/projects/saved.program.yaml. Restart Composer to recover.';
+    expect(authoringContainmentNotices(saved)).toEqual([{
+      id: 'authoring.contained',
+      severity: 'error',
+      domain: 'program_authoring',
+      title: 'Authoring contained',
+      message: savedMessage,
+    }]);
+    // It is not a transition gap and outranks every other authoring cause,
+    // without the operator attempting an edit.
+    expect(authoringContainmentNotices(saved)[0].expectedDuringTransition).toBeUndefined();
+    expect(authoringUnavailableCause(installed, saved)).toBe('contained');
+    expect(authoringUnavailableReason(installed, saved)).toBe(savedMessage);
+    expect(draftEditUnavailableReason(installed, saved)).toBe(savedMessage);
+    expect(authoringUnavailableCause(null, saved)).toBe('contained');
+
+    const unsaved = headlessState(6, {}, {
+      authoringWorkspaceContainment: { cause: `${cause}.`, savedPath: null },
+    });
+    expect(authoringContainmentNotices(unsaved)).toEqual([expect.objectContaining({
+      severity: 'error',
+      message: `Authoring contained: ${cause}. Restart Composer to recover.`,
+    })]);
   });
 
   it('does not report an available alarm owner with active alarms as unavailable', () => {

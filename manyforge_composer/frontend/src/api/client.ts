@@ -332,18 +332,21 @@ export class ApiError extends Error {
 }
 
 /**
- * The named causes for which "Use current robot pose/joints" refuses before any
- * Draft change: one code per thing the operator has to correct.
+ * Whether the backend refused this request before any of its effects.
+ *
+ * The backend marks every such refusal in its structured error body
+ * (`detail.effect === "none"`): the request left no durable or externally
+ * visible effect (no committed Draft/workspace change, no file written or
+ * published, no Manager or Kernel submission), so the browser's submission
+ * guard is released. A failure after a write names the written path instead.
+ * Only that marker proves it, never a code or a bare status: a transport or
+ * gateway failure, a malformed body, or a failure after an effect may hide a
+ * request that took effect, so it stays unconfirmed.
  */
-const OBSERVED_MOVE_REFUSAL_CODES = new Set([
-  'observed_move_node_unsupported',
-  'observed_move_role_missing',
-  'observed_move_configuration_changed',
-  'observed_move_target_unbound',
-  'observed_move_target_unavailable',
-  'observed_move_frame_mismatch',
-  'observed_move_unavailable',
-]);
+export function refusedBeforeEffect(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.structuredError === null) return false;
+  return (error.payload as { detail: Record<string, unknown> }).detail.effect === 'none';
+}
 
 /** Remedies the owner's message does not already name (it lies outside the Draft). */
 const OBSERVED_MOVE_REFUSAL_GUIDANCE: Readonly<Record<string, string>> = {
@@ -352,100 +355,40 @@ const OBSERVED_MOVE_REFUSAL_GUIDANCE: Readonly<Record<string, string>> = {
 };
 
 /**
- * Only for authoring requests; never retry an edit after a refused fence.
- *
- * A refusal is recognised only by an explicit, named code in the backend's
- * structured error body, never by a bare status: a 502/503 without such a code
- * (a proxy or gateway failure, a malformed body) may hide a request that
- * succeeded before its reply was lost, so it stays unconfirmed.
+ * The operator text for a refusal the backend raised before any effect, or
+ * null for every other failure. Only for authoring requests; never retry an
+ * edit after a refused fence.
  */
 export function authoringRefusalMessage(error: unknown): string | null {
-  if (!(error instanceof ApiError)) return null;
-  const code = apiErrorCode(error);
-  // The observed-move resolver refuses these before preparing or installing a
-  // Draft mutation; no submission outcome remains to reconcile. The code alone
-  // proves it, whatever the status (an unreachable owner is reported as 503).
-  if (code !== null && OBSERVED_MOVE_REFUSAL_CODES.has(code)) {
+  if (!refusedBeforeEffect(error)) return null;
+  const refusal = error as ApiError;
+  const code = apiErrorCode(refusal);
+  const message = refusal.message.replace(/[.\s]*$/, '');
+  // The observed-pose and observed-object resolvers name what the operator
+  // has to correct before a Draft edit can capture the current state.
+  if (code !== null && code.startsWith('observed_')) {
     const guidance = OBSERVED_MOVE_REFUSAL_GUIDANCE[code];
-    if (!guidance) return `Edit not applied: ${error.message}`;
-    return `Edit not applied: ${error.message.replace(/[.\s]*$/, '')}. ${guidance}`;
+    if (!guidance) return `Edit not applied: ${refusal.message}`;
+    return `Edit not applied: ${message}. ${guidance}`;
   }
-  if (error.status !== 409) return null;
   if (code === 'authoring_not_ready') return 'Edit not applied: authoring is currently unavailable.';
   if (code === 'stale_generation') return 'Edit not applied: backend state changed. Review the current state before trying again.';
-  // Preparation runs before any claim or runtime effect, so it is a definite
-  // refusal of this input, never an unconfirmed submission.
   if (code === 'activation_preparation_failed') {
-    const details = error.structuredError?.details?.preparer_detail;
+    const details = refusal.structuredError?.details?.preparer_detail;
     const cause = typeof details === 'string'
       ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim() : '';
     return `Not applied: the candidate could not be prepared${cause ? ` (${cause})` : ''}. Correct it and try again.`;
   }
-  if (code !== null && (SCENARIO_PRE_EFFECT_REFUSAL_CODES.has(code) || APPLY_PRE_EFFECT_REFUSAL_CODES.has(code))) {
-    return `Not applied: ${error.message.replace(/[.\s]*$/, '')}. Nothing was changed.`;
-  }
-  return null;
+  return `Not applied: ${message}. Nothing was changed.`;
 }
 
-/**
- * Apply refusals (409) raised before preparation, admission or any Manager
- * submission: a no-op Apply (every input already is Applied) and a
- * confirmed activation scope that changed before the Apply was sent.
- */
-const APPLY_PRE_EFFECT_REFUSAL_CODES = new Set([
-  'program_apply_nothing_to_apply',
-  'deployment_apply_nothing_to_apply',
-  'activation_input_changed_after_confirmation',
-]);
-
-/**
- * Scenario-document refusals (409) that every raising site on the Scenario
- * Save/Load/New/Export and Scenario-member Save routes reaches before any
- * workspace commit, Manager submission or project file write. The code itself
- * proves that nothing happened, so the browser's submission guard is released.
- *
- * - `scenario_artifact_version_unsupported`: a removed form (leftover
- *   `overrides.yaml`, a v1 manifest, typed overrides) found while capturing or
- *   before Save writes anything.
- * - `scenario_project_save_interrupted`, `scenario_project_incomplete`: project
- *   capture (Load, or the read before a member Save writes).
- * - `scenario_source_invalid`, `scenario_model_source_unavailable`: model-source
- *   capture during project capture or Save/New preparation, before writing.
- * - `scenario_artifact_overwrite_confirmation_required`,
- *   `scenario_destination_exists`: the target exists; nothing is created.
- * - `scenario_discard_confirmation_required`, `scenario_activation_incomplete`,
- *   `scenario_activation_preview_changed`, `scenario_applied_source_unavailable`,
- *   `scenario_applied_source_changed`, `scenario_new_impact_changed`: Load/New
- *   checks before the claim, or under it before the workspace commit (the
- *   claim is then settled as proven no-effect).
- * - `scenario_export_source_unavailable`: Export without a saved project.
- * - `scenario_artifact_changed`: the project or its directory moved before
- *   Save created or wrote anything.
- *
- * Save reports every failure after it created or started writing the project
- * as `scenario_artifact_save_incomplete` (500), never with a pre-write code, so
- * that outcome and the post-write outcomes (`scenario_created_not_activated`,
- * `scenario_load_activation_not_confirmed`, `scenario_saved_baseline_not_adopted`)
- * stay unconfirmed. Pre-write `scenario_artifact_target_invalid` and
- * `scenario_artifact_write_failed` are 400 refusals. A re-capture after Save
- * writes is not a workspace commit: the coordinator settles it as no-effect.
- */
-const SCENARIO_PRE_EFFECT_REFUSAL_CODES = new Set([
-  'scenario_artifact_version_unsupported',
-  'scenario_project_save_interrupted',
-  'scenario_project_incomplete',
-  'scenario_source_invalid',
-  'scenario_model_source_unavailable',
-  'scenario_artifact_overwrite_confirmation_required',
-  'scenario_destination_exists',
-  'scenario_discard_confirmation_required',
-  'scenario_activation_incomplete',
-  'scenario_activation_preview_changed',
-  'scenario_applied_source_unavailable',
-  'scenario_applied_source_changed',
-  'scenario_new_impact_changed',
-  'scenario_export_source_unavailable',
-  'scenario_artifact_changed',
+// The document was written to the named path but not read back or adopted as
+// Saved (for example a newer workspace revision): a definite outcome, so the
+// client shows it, refreshes and adopts the current identity, never retries.
+const SAVED_NOT_ADOPTED_CODES = new Set([
+  'program_saved_baseline_not_adopted',
+  'deployment_saved_baseline_not_adopted',
+  'scenario_saved_baseline_not_adopted',
 ]);
 
 const STALE_WORKSPACE_CODES = new Set([
@@ -454,10 +397,7 @@ const STALE_WORKSPACE_CODES = new Set([
   'composer_draft_id_stale',
   'composer_draft_revision_stale',
   'scenario_workspace_stale',
-  // The artifact was written, but a newer workspace revision refused to be
-  // labelled Saved; the client must adopt the newer identity, not retry.
-  'program_saved_baseline_not_adopted',
-  'deployment_saved_baseline_not_adopted',
+  ...SAVED_NOT_ADOPTED_CODES,
 ]);
 
 /**
@@ -471,6 +411,13 @@ export function isStaleWorkspaceError(error: unknown): boolean {
   if (!(error instanceof ApiError) || error.status !== 409) return false;
   const code = apiErrorCode(error);
   return code !== null && STALE_WORKSPACE_CODES.has(code);
+}
+
+/** The backend's text for a definite "written but not adopted as Saved" outcome, or null. */
+export function savedNotAdoptedMessage(error: unknown): string | null {
+  if (!isStaleWorkspaceError(error)) return null;
+  const code = apiErrorCode(error);
+  return code !== null && SAVED_NOT_ADOPTED_CODES.has(code) ? (error as ApiError).message : null;
 }
 
 export type AuthoringRequestIdentity = {

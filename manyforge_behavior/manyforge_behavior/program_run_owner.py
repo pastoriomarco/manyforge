@@ -1549,8 +1549,20 @@ class ProgramRunOwner:
                         ),
                     }
                 )
+            # Every effectful node is held by the Kernel in a settled phase:
+            # never released (Ready) or stopped with its Stop certified
+            # (Held). The Kernel admits a Program operation only for a
+            # released node, so no Program motion is active and none can start
+            # until a Run/Resume release. Non-effectful nodes never move. An
+            # unknown or empty effectful set proves nothing.
+            motion_held = (
+                unavailable is None
+                and bool(initially_effectful)
+                and initially_effectful <= held - stopping - faulted
+            )
             return live, {
                 "selection_revision": snapshot.selection_revision,
+                "motion_held": motion_held,
                 "groups": groups,
             }
 

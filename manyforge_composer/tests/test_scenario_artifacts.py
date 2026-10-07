@@ -16,7 +16,11 @@ from manyforge_composer.backend.routes_scenario_documents import (
     _document_content_digest,
     create_scenario_document_router,
 )
-from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
+from manyforge_composer.backend.authoring_admission import (
+    AuthoringAdmissionCoordinator,
+    AuthoringMutationEnvelope,
+    LocalAuthoringCommit,
+)
 from manyforge_composer.backend.authoring_forest import from_program, derive_candidate
 from manyforge_composer.backend.routes_draft import create_draft_router
 from manyforge_composer.backend.routes_deployment_draft import create_deployment_draft_router
@@ -239,11 +243,14 @@ class _PassThroughAdmission:
         install=None,
         expected_identity=None,
         project=None,
+        validate_under_claim=None,
         prepare_project_under_claim=None,
         **_kwargs,
     ):
         """Commit through the real composite owner; only the Kernel is stubbed."""
 
+        if validate_under_claim is not None:
+            validate_under_claim()
         if prepare_project_under_claim is not None:
             project = prepare_project_under_claim()
         if session == "whole-workspace":
@@ -740,6 +747,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             "code": "activation_preparation_failed",
             "message": "Activation preparation failed",
             "details": {"preparer_detail": "invalid candidate geometry"},
+            "effect": "none",
         }
         assert admission.events == []
         assert state.authoring_workspace.snapshot() == before
@@ -992,9 +1000,8 @@ def test_removed_parameter_override_forms_are_refused_not_read(tmp_path: Path) -
 def test_routes_refuse_leftover_overrides_before_any_effect(tmp_path: Path) -> None:
     """Load and Save refuse a leftover overrides.yaml with no file or workspace effect.
 
-    The browser releases its submission guard for this code (frontend
-    ``SCENARIO_PRE_EFFECT_REFUSAL_CODES``), which is only correct because both
-    routes refuse before touching the project or the authoring workspace.
+    Both routes refuse before touching the project or the authoring
+    workspace, so their operation boundary marks the refusal as no-effect.
     """
 
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
@@ -1026,6 +1033,7 @@ def test_routes_refuse_leftover_overrides_before_any_effect(tmp_path: Path) -> N
             "scenario_artifact_version_unsupported"
         )
         assert "overrides.yaml) were removed" in response.json()["detail"]["message"]
+        assert response.json()["detail"]["effect"] == "none"
     assert {
         path.name: path.read_bytes() for path in sorted(target.iterdir())
     } == before_files
@@ -1394,3 +1402,423 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     assert confirmed["manager_apply"]["accepted_impact_digest"] == (
         "sha256:" + "4" * 64 if destructive else None
     )
+
+
+@pytest.mark.parametrize("code", ["stale_generation", "authoring_not_ready"])
+@pytest.mark.parametrize("claimed", [False, True])
+def test_preparation_admission_refusal_is_marked_only_before_the_claim(
+    tmp_path: Path, code: str, claimed: bool
+) -> None:
+    """Apply/Load/New preparation runs before every claim and effect, so the
+    preparer's admission refusal there changed nothing. Under a claim the same
+    code proves no such thing and stays unmarked."""
+
+    from fastapi import HTTPException
+
+    class Headless:
+        manager_calls = 0
+
+        def prepare_activation(self, _request):
+            raise HeadlessClientError(code, "admission changed", status_code=409)
+
+        def manager_status(self):
+            Headless.manager_calls += 1
+            raise AssertionError("no Manager read after a refused preparation")
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.headless_client = Headless()  # type: ignore[assignment]
+    intent = {
+        "scenario_id": "cell",
+        "source_document_digest": "sha256:" + "1" * 64,
+        "captured_input_digest": "sha256:" + "2" * 64,
+        "deployment": {},
+        "model_source_closure": {},
+        "program": None,
+        "program_role_assignment": {},
+        "expected_manager_current": {},
+        "expected_admission_generation": 1,
+    }
+    claim = {"claim": "test"} if claimed else None
+
+    if claimed:
+        with pytest.raises(HeadlessClientError) as unmarked:
+            state.execute_authored_deployment_candidate(intent, claim, apply=True)
+        assert unmarked.value.code == code
+    else:
+        with pytest.raises(HTTPException) as refused:
+            state.execute_authored_deployment_candidate(
+                intent, None, apply=True, prepare_only=True
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == {
+            "code": code,
+            "message": "admission changed",
+            "effect": "none",
+        }
+    assert Headless.manager_calls == 0
+
+
+def test_other_unclaimed_preparation_failures_stay_unmarked(tmp_path: Path) -> None:
+    class Headless:
+        def prepare_activation(self, _request):
+            raise HeadlessClientError("headless_unavailable", "timed out")
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.headless_client = Headless()  # type: ignore[assignment]
+    with pytest.raises(HeadlessClientError):
+        state.execute_authored_deployment_candidate(
+            {
+                "scenario_id": "cell",
+                "source_document_digest": "sha256:" + "1" * 64,
+                "captured_input_digest": "sha256:" + "2" * 64,
+                "deployment": {},
+                "model_source_closure": {},
+                "program": None,
+                "program_role_assignment": {},
+                "expected_admission_generation": 1,
+            },
+            None,
+            apply=True,
+            prepare_only=True,
+        )
+
+
+class _SettlingHeadless:
+    """Kernel authoring-claim double that records every settlement kind."""
+
+    def __init__(self) -> None:
+        self.settlements: list[str] = []
+
+    def authoring_admission(self) -> dict:
+        return {"authoring_allowed": True, "admission_generation": 1}
+
+    def acquire_authoring_transaction(self, _body: dict) -> dict:
+        return {"claim": {"claim_generation": 1, "acquired_admission_generation": 1}}
+
+    def settle_authoring_transaction(self, body: dict) -> dict:
+        self.settlements.append(body["settlement_kind"])
+        return {"admission": {"admission_generation": 1}}
+
+
+def _claimed_scenario_state(
+    tmp_path: Path,
+) -> tuple[ComposerState, TestClient, _SettlingHeadless]:
+    """A complete authored workspace whose Saves take a real local claim."""
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    headless = _SettlingHeadless()
+    state.authoring_admission = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
+    authoring = deepcopy(_PROGRAM_FIXTURE)
+    program, diagnostics = derive_candidate(authoring, state.node_catalog)
+    post = routes_scenario_documents._workspace_post_state(
+        state, authoring, program, diagnostics, _deployment_intent()
+    )
+    state.draft_session.install_prepared_replacement(
+        state.draft_session.prepare_load_replacement(post["program"], state.node_catalog)
+    )
+    state.deployment_draft_session.install_prepared_replacement(
+        state.deployment_draft_session.prepare_load_replacement(post["deployment"])
+    )
+    app = FastAPI()
+    app.include_router(create_scenario_document_router(state))
+    app.include_router(create_draft_router(state))
+    app.include_router(create_deployment_draft_router(state))
+    return state, TestClient(app), headless
+
+
+def _save_scenario(client: TestClient, state: ComposerState, target: Path, **extra):
+    return client.post("/api/scenario-documents/save", json={
+        **_fence(state), "path": str(target), "scenarioId": "saved_cell",
+        "name": "Saved cell", "description": "written by this request",
+        "confirmOverwrite": False, **extra,
+    })
+
+
+@pytest.mark.parametrize("failure", ["readback", "workspace_stale", "workspace_install"])
+def test_scenario_save_after_its_write_is_saved_not_adopted_and_never_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """(a) readback and (b) workspace failures after the project was written."""
+
+    state, client, headless = _claimed_scenario_state(tmp_path)
+    coordinator = state.authoring_admission
+    target = tmp_path / "saved"
+    before = state.authoring_workspace.snapshot().as_dict()
+    original_save = routes_scenario_documents.save_scenario_artifact
+
+    if failure == "readback":
+        def unreadable(*_args, **_kwargs):
+            raise ScenarioArtifactError(
+                "scenario_source_invalid", "model source vanished", status_code=409
+            )
+
+        monkeypatch.setattr(
+            routes_scenario_documents, "capture_scenario_artifact", unreadable
+        )
+    elif failure == "workspace_stale":
+        def write_then_edit(*args, **kwargs) -> str:
+            saved = original_save(*args, **kwargs)
+            snapshot = state.authoring_workspace.snapshot()
+            project = snapshot.as_dict()["project"]
+            project["document_description"] = "concurrent edit"
+            state.authoring_workspace.commit_project(
+                expected_identity=snapshot.identity, facts=project
+            )
+            return saved
+
+        monkeypatch.setattr(
+            routes_scenario_documents, "save_scenario_artifact", write_then_edit
+        )
+    else:
+        def broken_install(*_args, **_kwargs):
+            raise RuntimeError("in-memory install failed")
+
+        monkeypatch.setattr(
+            state.draft_session, "install_prepared_save", broken_install
+        )
+
+    response = _save_scenario(client, state, target)
+
+    # The destination holds exactly the intended project.
+    monkeypatch.undo()
+    written, _source = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert written["description"] == "written by this request"
+    assert not (target / scenario_artifacts.SCENARIO_SAVE_MARKER).exists()
+    # A definite outcome naming the written path, never "no effect".
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "scenario_saved_baseline_not_adopted"
+    assert detail["path"] == str(target.resolve())
+    assert str(target.resolve()) in detail["message"]
+    assert "effect" not in detail
+    assert detail["causeCode"] == {
+        "readback": "scenario_source_invalid",
+        "workspace_stale": "composer_workspace_stale",
+        "workspace_install": "composer_workspace_install_failed",
+    }[failure]
+    if failure == "workspace_install":
+        # An in-memory install with an unknown outcome contains the workspace;
+        # the claim stays held for diagnosis and is never "proven no effect".
+        assert headless.settlements == []
+        assert coordinator.local_claim_pending is True
+        assert coordinator.mutation_ready is False
+        return
+    # The claim settles from the recorded write: effect committed, not
+    # proven no-effect, and authoring stays usable.
+    assert headless.settlements == ["owner_commit"]
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is True
+    current = state.authoring_workspace.snapshot().as_dict()
+    assert current["project"]["document_path"] is None
+    assert current["program"]["saved"]["available"] is False
+    if failure == "readback":
+        assert current["workspaceRevision"] == before["workspaceRevision"]
+    else:
+        assert detail["currentWorkspace"]["workspaceRevision"] == (
+            before["workspaceRevision"] + 1
+        )
+    # The exact request reads back as settled, so the browser is not locked.
+    outcome = coordinator.submission_outcome(AuthoringMutationEnvelope(
+        expected_admission_generation=1,
+        request_owner_epoch="browser-test-epoch",
+        request_id="scenario-test-request",
+    ))
+    assert outcome["outcome"]["kind"] == "settled"
+
+
+@pytest.mark.parametrize("cause", ["confirmation", "marker_write"])
+def test_scenario_save_failure_before_its_write_is_not_saved_and_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str,
+) -> None:
+    """(c) a failure before the destination changed: Not saved."""
+
+    state, client, headless = _claimed_scenario_state(tmp_path)
+    target = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "existing"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    before_files = _project_bytes(target)
+    before = state.authoring_workspace.snapshot().as_dict()
+    replace = scenario_artifacts._replace_regular_at
+
+    def full_disk(directory_fd, name, raw):
+        if name == scenario_artifacts.SCENARIO_SAVE_MARKER:
+            raise OSError("No space left on device")
+        replace(directory_fd, name, raw)
+
+    if cause == "marker_write":
+        monkeypatch.setattr(scenario_artifacts, "_replace_regular_at", full_disk)
+    response = _save_scenario(
+        client, state, target, confirmOverwrite=cause == "marker_write"
+    )
+
+    assert _project_bytes(target) == before_files
+    assert list(target.glob(".*.tmp-*")) == []
+    detail = response.json()["detail"]
+    assert detail["code"] == {
+        "confirmation": "scenario_artifact_overwrite_confirmation_required",
+        "marker_write": "scenario_artifact_write_failed",
+    }[cause]
+    assert detail["effect"] == "none"
+    assert "path" not in detail
+    assert headless.settlements == ["proven_no_effect"]
+    assert state.authoring_admission.mutation_ready is True
+    assert state.authoring_workspace.snapshot().as_dict() == before
+
+
+def test_scenario_save_partial_write_is_unverified_with_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure that leaves the project neither unchanged nor as intended."""
+
+    state, client, headless = _claimed_scenario_state(tmp_path)
+    target = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "existing"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    replace = scenario_artifacts._replace_regular_at
+
+    def fail_after_marker(directory_fd, name, raw):
+        if name == "deployment.yaml":
+            raise OSError("No space left on device")
+        replace(directory_fd, name, raw)
+
+    monkeypatch.setattr(scenario_artifacts, "_replace_regular_at", fail_after_marker)
+    response = _save_scenario(client, state, target, confirmOverwrite=True)
+
+    assert (target / scenario_artifacts.SCENARIO_SAVE_MARKER).is_file()
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "scenario_artifact_save_incomplete"
+    assert detail["path"] == str(target)
+    assert "effect" not in detail
+    assert headless.settlements == ["owner_commit"]
+    assert state.authoring_admission.mutation_ready is True
+
+
+def _member_save(
+    tmp_path: Path, member: str
+) -> tuple[ComposerState, TestClient, _SettlingHeadless, Path, dict]:
+    """Save one project, then edit one member Draft; return its member Save."""
+
+    state, client, headless = _claimed_scenario_state(tmp_path)
+    target = tmp_path / "project"
+    assert _save_scenario(client, state, target).status_code == 200
+    headless.settlements.clear()
+    if member == "program":
+        program_state = state.draft_session.retained_state()
+        program_state["authoring"]["name"] = "Edited Program"
+        edited, diagnostics = derive_candidate(
+            program_state["authoring"], state.node_catalog
+        )
+        program_state["program"] = edited.to_dict()
+        program_state["diagnostics"] = diagnostics
+        program_state["draft_revision"] += 1
+        state.draft_session.install_prepared_replacement(
+            state.draft_session.prepare_load_replacement(
+                program_state, state.node_catalog
+            )
+        )
+    else:
+        deployment_state = state.deployment_draft_session.retained_state()
+        deployment_state["document"]["name"] = "Edited Deployment"
+        deployment_state["draft_revision"] += 1
+        state.deployment_draft_session.install_prepared_replacement(
+            state.deployment_draft_session.prepare_load_replacement(
+                deployment_state,
+                source_project_root=state.deployment_draft_session.source_project_root,
+            )
+        )
+    fence = _fence(state)
+    if member == "deployment":
+        fence["draftId"] = fence["deploymentDraftId"]
+        fence["expectedDraftRevision"] = fence["expectedDeploymentDraftRevision"]
+    del fence["deploymentDraftId"], fence["expectedDeploymentDraftRevision"]
+    return state, client, headless, target.resolve(), fence
+
+
+def _member_name(project: Path, member: str) -> str:
+    disk, _ = load_scenario_artifact(str(project), allowed_roots=[str(project.parent)])
+    return disk[f"{member}_draft"]["name"]
+
+
+@pytest.mark.parametrize("member", ["program", "deployment"])
+@pytest.mark.parametrize(
+    "failure", ["readback", "workspace_stale", "workspace_install", "before_write"]
+)
+def test_scenario_member_save_reports_the_effect_it_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: str, failure: str,
+) -> None:
+    """(a) readback, (b) workspace commit and (c) pre-write member failures."""
+
+    state, client, headless, project, fence = _member_save(tmp_path, member)
+    original_save = scenario_artifacts.save_scenario_artifact
+    original_capture = scenario_artifacts.capture_scenario_artifact
+    written: list[str] = []
+
+    def save_then(*args, **kwargs) -> str:
+        saved = original_save(*args, **kwargs)
+        written.append(saved)
+        if failure == "workspace_stale":
+            snapshot = state.authoring_workspace.snapshot()
+            facts = snapshot.as_dict()["project"]
+            facts["document_description"] = "concurrent edit"
+            state.authoring_workspace.commit_project(
+                expected_identity=snapshot.identity, facts=facts
+            )
+        return saved
+
+    def capture(*args, **kwargs):
+        if failure == "readback" and written:
+            raise ScenarioArtifactError(
+                "scenario_source_invalid", "model source vanished", status_code=409
+            )
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(scenario_artifacts, "save_scenario_artifact", save_then)
+    monkeypatch.setattr(scenario_artifacts, "capture_scenario_artifact", capture)
+    if failure == "before_write":
+        # An interrupted earlier save is refused when the project is captured.
+        (project / scenario_artifacts.SCENARIO_SAVE_MARKER).write_text("{}\n")
+    if failure == "workspace_install":
+        def broken_install(*_args, **_kwargs):
+            raise RuntimeError("in-memory install failed")
+
+        session = (
+            state.draft_session if member == "program"
+            else state.deployment_draft_session
+        )
+        monkeypatch.setattr(session, "install_prepared_save", broken_install)
+    before_files = _project_bytes(project)
+
+    response = client.post(f"/api/{member}/save", json=fence)
+
+    detail = response.json()["detail"]
+    if failure == "before_write":
+        assert written == []
+        assert _project_bytes(project) == before_files
+        assert detail["code"] == "scenario_project_save_interrupted"
+        assert detail["effect"] == "none"
+        assert headless.settlements == ["proven_no_effect"]
+        return
+    monkeypatch.undo()
+    expected_name = "Edited Program" if member == "program" else "Edited Deployment"
+    assert _member_name(project, member) == expected_name
+    assert response.status_code == 409, response.text
+    assert detail["code"] == f"{member}_saved_baseline_not_adopted"
+    assert detail["path"] == str(project)
+    assert str(project) in detail["message"]
+    assert "effect" not in detail
+    if failure == "workspace_install":
+        # Contained in-memory install: the claim stays held, never no-effect.
+        assert detail["causeCode"] == "composer_workspace_install_failed"
+        assert headless.settlements == []
+        assert state.authoring_admission.mutation_ready is False
+        return
+    assert headless.settlements == ["owner_commit"]
+    assert state.authoring_admission.mutation_ready is True
+    current = state.authoring_workspace.snapshot().as_dict()
+    if member == "program":
+        assert current["program"]["saved"]["matchesDraft"] is False
+    else:
+        assert current["deployment"]["differsFromSaved"] is True

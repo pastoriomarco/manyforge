@@ -3,40 +3,50 @@ import {
   ApiError,
   authoringRefusalMessage,
   failedAuthoringRequest,
+  refusedBeforeEffect,
   HISTORIAN_PAGE_LIMIT,
   api,
   historianListPath,
   resolveStructuralAssetUrl,
 } from './client';
 
-it('classifies only exact authoring pre-effect refusals', () => {
+it('classifies a refusal only by the backend before-effect marker', () => {
+  const refused = (code: string, status = 409, extra: Record<string, unknown> = {}) => new ApiError(
+    'refused', status, { detail: { code, message: 'refused', effect: 'none', ...extra } },
+  );
   for (const code of [
     'authoring_not_ready',
     'stale_generation',
     'observed_move_node_unsupported',
-    'observed_move_role_missing',
-    'observed_move_configuration_changed',
-    'observed_move_target_unbound',
-    'observed_move_target_unavailable',
-    'observed_move_frame_mismatch',
     'observed_move_unavailable',
+    'observed_scene_object_ineligible',
   ]) {
-    expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code } })))
-      .toContain('Edit not applied');
+    expect(refusedBeforeEffect(refused(code))).toBe(true);
+    expect(authoringRefusalMessage(refused(code))).toContain('Edit not applied');
   }
-  // The retired catch-all code is no longer a recognised pre-effect refusal.
-  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code: 'observed_move_target_mismatch' } })))
-    .toBeNull();
-  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code: 'activation_preparation_failed' } })))
+  // The marker, not the status or an allowlisted code, proves it.
+  expect(authoringRefusalMessage(refused('authoring_not_ready', 503)))
+    .toBe('Edit not applied: authoring is currently unavailable.');
+  expect(authoringRefusalMessage(refused('scenario_destination_exists')))
+    .toBe('Not applied: refused. Nothing was changed.');
+  expect(authoringRefusalMessage(refused('activation_preparation_failed')))
     .toBe('Not applied: the candidate could not be prepared. Correct it and try again.');
-  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: {
-    code: 'activation_preparation_failed',
+  expect(authoringRefusalMessage(refused('activation_preparation_failed', 409, {
     details: { preparer_detail: 'manyforge_prepare_activation: Program is missing compatibility' },
-  } }))).toBe('Not applied: the candidate could not be prepared (Program is missing compatibility). Correct it and try again.');
-  expect(authoringRefusalMessage(new ApiError('fault', 409, { detail: { code: 'component_fault' } }))).toBeNull();
-  expect(authoringRefusalMessage(new ApiError('failure', 500, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
-  expect(authoringRefusalMessage(new ApiError('failure', 503, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
-  expect(authoringRefusalMessage(new Error('authoring_not_ready'))).toBeNull();
+  }))).toBe('Not applied: the candidate could not be prepared (Program is missing compatibility). Correct it and try again.');
+  // Without the marker nothing is a definite refusal, whatever its code.
+  for (const error of [
+    new ApiError('refused', 409, { detail: { code: 'authoring_not_ready' } }),
+    new ApiError('refused', 409, { detail: { code: 'scenario_destination_exists' } }),
+    new ApiError('refused', 409, { detail: { code: 'observed_move_unavailable', effect: 'unknown' } }),
+    new ApiError('fault', 409, { detail: { code: 'component_fault' } }),
+    new ApiError('failure', 500, { detail: { code: 'authoring_not_ready' } }),
+    new ApiError('failure', 409, { effect: 'none' }),
+    new Error('authoring_not_ready'),
+  ]) {
+    expect(refusedBeforeEffect(error)).toBe(false);
+    expect(authoringRefusalMessage(error)).toBeNull();
+  }
 });
 
 it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
@@ -55,11 +65,11 @@ it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
   expect(new ApiError('failure', 503, { detail: 'upstream unavailable' }).structuredError).toBeNull();
 });
 
-it('classifies a named observed-move refusal by its code, whatever its status', () => {
+it('classifies a marked observed-move refusal whatever its status', () => {
   const message = 'current pose/joints could not be read: execution owner disconnected';
   for (const status of [502, 503]) {
     expect(authoringRefusalMessage(new ApiError(message, status, {
-      detail: { code: 'observed_move_unavailable', message },
+      detail: { code: 'observed_move_unavailable', message, effect: 'none' },
     }))).toBe('Edit not applied: current pose/joints could not be read: execution owner disconnected. '
       + 'Wait for the robot to report its current state, then try again.');
   }
@@ -79,7 +89,7 @@ it('never classifies a bare gateway or unavailable status as a refusal', () => {
 
 it('names each observed-move refusal cause with the owner message', () => {
   const refusal = (code: string, message: string) => authoringRefusalMessage(
-    new ApiError(message, 409, { detail: { code, message } }),
+    new ApiError(message, 409, { detail: { code, message, effect: 'none' } }),
   );
   expect(refusal(
     'observed_move_configuration_changed',
@@ -93,6 +103,9 @@ it('names each observed-move refusal cause with the owner message', () => {
     .toBe('Edit not applied: the bound robot target is unavailable in the current execution owner. Check that the robot is running in the current configuration.');
   expect(refusal('observed_move_unavailable', 'execution owner has no complete current observed target.'))
     .toBe('Edit not applied: execution owner has no complete current observed target. Wait for the robot to report its current state, then try again.');
+  // The live Copy current position to Draft refusal.
+  expect(refusal('observed_scene_object_ineligible', 'only one current cell-fixed object with one portable shape can be saved'))
+    .toBe('Edit not applied: only one current cell-fixed object with one portable shape can be saved');
 });
 import type {
   DraftFenceRequest,

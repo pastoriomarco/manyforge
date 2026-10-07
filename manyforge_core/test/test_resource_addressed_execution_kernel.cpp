@@ -566,8 +566,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                     : StopEvidenceItemStateDTO::kFailed,
           requirement.resolved_source,
           requirement.resolved_source.runtime_target.provider_runtime_epoch, 1U, 0,
-          next_stop_result.accepted ? std::optional<JsonValueDTO>(JsonValueDTO{true})
-                                    : std::nullopt,
+          next_stop_result.accepted
+              ? std::optional<JsonValueDTO>(next_stop_evidence.value_or(JsonValueDTO{true}))
+              : std::nullopt,
           next_stop_result.accepted ? std::nullopt
                                     : std::optional(next_stop_result.error.value_or(
                                           ErrorDTO{"controller_stop_rejected",
@@ -1013,6 +1014,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
   Result<void> next_command_validation = Result<void>::Ok();
   StopResultDTO next_stop_result{true, std::nullopt};
+  std::optional<JsonValueDTO> next_stop_evidence;
   PauseResultDTO next_pause_result{true, std::nullopt};
   ResumeResultDTO next_resume_result{true, std::nullopt};
   ResetResultDTO next_reset_result{true, std::nullopt};
@@ -6834,6 +6836,104 @@ TEST(ResourceAddressedExecutionKernelTest,
                                       planning.value().operation_id};
   std::sort(operations.begin(), operations.end());
   EXPECT_EQ(latch->captured_operation_ids, operations);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopRacingNaturalCompletionSettlesNominalWithoutLatchButFailuresEscalate) {
+  // Live 2026-10-06: an ordinary Stop was accepted while the goal executed;
+  // the goal reached its endpoint before its controlled stage ran. The barrier
+  // places that natural completion (or an abort) between acceptance and the
+  // stage result. Only the exact natural-completion settlement avoids
+  // escalation; a still-active goal whose Stop fails, or an aborted goal,
+  // escalates and latches as before.
+  enum class Race { kNaturalCompletion, kStillActiveStopFailed, kAbortedBeforeStage };
+  for (const auto race :
+       {Race::kNaturalCompletion, Race::kStillActiveStopFailed, Race::kAbortedBeforeStage}) {
+    SCOPED_TRACE(static_cast<int>(race));
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    const auto binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    ResourceAddressedExecutionKernel kernel(
+        {registration(binding, engine)}, clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    const auto accepted = kernel.execute(motion_operation("request.race.natural"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    const auto executing = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(executing.ok()) << executing.error().message;
+    ASSERT_EQ(executing.value().state, OperationStateKind::kExecuting);
+
+    if (race == Race::kNaturalCompletion) {
+      engine.next_stop_evidence = JsonValueDTO{JsonObjectDTO{
+          {"completed_by_natural_completion", JsonValueDTO{true}},
+          {"provider_diagnostics",
+           JsonValueDTO{JsonObjectDTO{{"natural_completion_basis",
+                                       JsonValueDTO{"goal_completed_before_stop_stage"}}}}}}};
+    } else {
+      engine.next_stop_result =
+          StopResultDTO{false, ErrorDTO{"motion_interrupt_backend_stop_failed",
+                                        "native prepared goal no longer owns the active execution",
+                                        {{"reason", "prepared_goal_not_active"}}}};
+    }
+    HeldSettlementCall nominal_stage;
+    engine.translate_stop_stage_hook = [&, gate = nominal_stage.Blocker(),
+                                        calls = std::make_shared<unsigned>(0U)] {
+      if ((*calls)++ == 0U) {
+        gate();
+      } else {
+        engine.next_stop_result = StopResultDTO{true, std::nullopt};
+      }
+    };
+    const auto stopped = kernel.stop(stop_request("request.race.stop", accepted.value(),
+                                                  executing.value().operation_revision.value()));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(nominal_stage.Entered());
+    if (race == Race::kNaturalCompletion) {
+      engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
+    } else if (race == Race::kAbortedBeforeStage) {
+      engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kFailed,
+                             ErrorDTO{"execution_aborted", "goal aborted", {}});
+    }
+    nominal_stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    EXPECT_EQ(status.value().state, StopStatusStateDTO::kSucceeded);
+    const auto certificate =
+        kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    if (race == Race::kNaturalCompletion) {
+      EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+      EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+      EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+      ASSERT_EQ(certificate.value().attempted_stage_results.size(), 1U);
+      const auto& attempt = certificate.value().attempted_stage_results.front().result;
+      EXPECT_EQ(attempt.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+      ASSERT_FALSE(attempt.evidence_items.empty());
+      ASSERT_TRUE(attempt.evidence_items.front().evidence.has_value());
+      const auto& evidence =
+          std::get<JsonObjectDTO>(attempt.evidence_items.front().evidence->value);
+      EXPECT_TRUE(std::get<bool>(evidence.at("completed_by_natural_completion").value));
+      // The accepted Stop owns the terminal boundary; the natural completion
+      // is retained as its evidence rather than replacing it.
+      const auto terminal = kernel.get_operation_state(accepted.value().operation_id);
+      ASSERT_TRUE(terminal.ok()) << terminal.error().message;
+      EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+      EXPECT_FALSE(terminal.value().participants.front().terminal_error.has_value());
+    } else {
+      EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+      EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
+      const auto latch = kernel.get_stop_fault_latch();
+      ASSERT_TRUE(latch.has_value());
+      EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+    }
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

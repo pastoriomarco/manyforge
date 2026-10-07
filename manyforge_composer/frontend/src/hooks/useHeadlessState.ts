@@ -5,6 +5,7 @@ import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
   parseApiErrorDto,
+  parseAuthoringWorkspaceContainment,
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
   parseComponentOverviewProjection,
@@ -1430,7 +1431,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           throw new Error('Partial control delta claimed to be complete.');
         }
         const localIdentityFields = [
-          'schema_version', 'authoring_workspace', 'receiver_epoch',
+          'schema_version', 'authoring_workspace',
+          'authoring_workspace_containment', 'receiver_epoch',
           'snapshot_sequence',
         ];
         const localIdentityCount = localIdentityFields.filter(
@@ -1442,6 +1444,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         const hasLocalIdentity = localIdentityCount === localIdentityFields.length;
         let authoringWorkspace = this.latest.authoringWorkspace;
+        let authoringWorkspaceContainment = this.latest.authoringWorkspaceContainment;
         let receiverEpoch = this.latest.receiverEpoch;
         let snapshotSequence = this.latest.snapshotSequence;
         if (hasLocalIdentity) {
@@ -1456,14 +1459,19 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             throw new Error('Control delta shell identity is invalid.');
           }
           authoringWorkspace = workspace;
+          authoringWorkspaceContainment = parseAuthoringWorkspaceContainment(
+            shellRecord.authoring_workspace_containment,
+            'controlDelta.authoring_workspace_containment',
+          );
           receiverEpoch = shellRecord.receiver_epoch;
           snapshotSequence = shellRecord.snapshot_sequence as number;
         }
         const permitted = new Set([
           'schema_version', 'complete', 'runtime', 'alarms',
-          'component_overview', 'authoring_admission', 'execution_targets',
+          'component_overview', 'authoring_admission', 'held_run_draft_edit_allowed',
+          'execution_targets',
           'execution_control_state', 'program_cycle', 'authoring_workspace',
-          'receiver_epoch', 'snapshot_sequence',
+          'authoring_workspace_containment', 'receiver_epoch', 'snapshot_sequence',
         ]);
         if (Object.keys(shellRecord).some((name) => !permitted.has(name))) {
           throw new Error('Control delta shell shape is invalid.');
@@ -1492,6 +1500,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             authoringAllowed: admission.authoring_allowed,
             admissionGeneration: admission.admission_generation as number,
           };
+        }
+        let heldRunDraftEditAllowed = this.latest.heldRunDraftEditAllowed;
+        if ('held_run_draft_edit_allowed' in shellRecord) {
+          if (typeof shellRecord.held_run_draft_edit_allowed !== 'boolean') {
+            throw new Error('Control delta held-run Draft edit rule is invalid.');
+          }
+          heldRunDraftEditAllowed = shellRecord.held_run_draft_edit_allowed;
         }
         let executionControlStatus = this.latest.executionControlStatus;
         if (executionStatePresent) {
@@ -1527,8 +1542,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             ? { programCycle: parseProgramCycleStatus(shellRecord.program_cycle) }
             : {}),
           authoringAdmission,
+          heldRunDraftEditAllowed,
           executionControlStatus,
           authoringWorkspace,
+          authoringWorkspaceContainment,
           receiverEpoch,
           snapshotSequence,
         };

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, apiErrorCode, authoringRefusalMessage, failedAuthoringRequest, isStaleWorkspaceError, type AuthoringRequestIdentity } from '../api/client';
+import { api, ApiError, apiErrorCode, failedAuthoringRequest, isStaleWorkspaceError, refusedBeforeEffect, type AuthoringRequestIdentity } from '../api/client';
 import { parseManagerApplyAvailability } from '../api/parsers';
 import { sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
 import { errorMessage } from '../state/structuralResource';
@@ -214,10 +214,12 @@ export function useAuthoringWorkspace(
     return true;
   }, [editOwnerReason, ownerReason]);
   const finishMutation = useCallback((accepted: ManagerApplyIdentity | null = null, failure?: unknown) => {
-    // Only a definite client refusal proves that the effect was not accepted.
-    // A transport/parse/server failure is not permission to replay a mutation.
+    // Only a definite refusal proves that the effect was not accepted: the
+    // backend's before-effect marker, a typed stale fence, a Manager
+    // rejection or a client-error status. A transport/parse/server failure is
+    // not permission to replay a mutation.
     submission.current = failure === undefined ? accepted
-      : authoringRefusalMessage(failure) !== null || isStaleWorkspaceError(failure)
+      : refusedBeforeEffect(failure) || isStaleWorkspaceError(failure)
         || apiErrorCode(failure) === 'manager_apply_rejected'
         || (failure instanceof ApiError && [400, 403, 404, 422].includes(failure.status))
         ? null : 'unknown';

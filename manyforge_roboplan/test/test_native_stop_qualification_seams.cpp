@@ -357,6 +357,23 @@ software_hard_stage_fixture() {
   return stage;
 }
 
+// Controlled arm stage requiring both fresh motion rest and the exact native
+// goal-terminal observation, with an explicit natural-completion policy.
+[[nodiscard]] core::ResolvedParticipantStopStageDTO
+controlled_stage_with_goal_terminal(bool allow_natural_completion) {
+  auto stage = controlled_stage_fixture();
+  auto &prepared = stage.participant_stop_plan.stage_commands.front();
+  auto &parameters = *prepared.validated_contract_parameters;
+  parameters["allow_natural_completion_on_short_path"] =
+      core::JsonValueDTO{allow_natural_completion};
+  prepared.resolved_stage.default_contract_parameters = parameters;
+  prepared.resolved_stage.evidence_requirements.push_back(
+      direct_stage_fixture()
+          .participant_stop_plan.stage_commands.front()
+          .resolved_stage.evidence_requirements.front());
+  return stage;
+}
+
 TEST(NativeStopQualificationSeamTest,
      TerminalGoalStillAcceptsExactHardStopButRequiresFreshRestDwell) {
   // Fresh rest, one sample, actual motion, Reset, newer execution.
@@ -511,6 +528,184 @@ TEST(NativeStopQualificationSeamTest,
             completed.timestamp_ns);
   EXPECT_EQ(backend->get_execution_snapshot().sequence_number,
             completed.sequence_number);
+}
+
+TEST(NativeStopQualificationSeamTest,
+     ControlledStageAfterRacingNaturalCompletionSettlesAtRestWithoutStop) {
+  // Live 2026-10-06 (Historian 249-254): an ordinary Stop was accepted while
+  // this exact goal executed near its endpoint. The goal completed before the
+  // controlled stage arrived; the stage failed "prepared_goal_not_active" and
+  // forced a software-hard escalation and Stop-fault latch. Injected time
+  // places the natural completion between acceptance and stage invocation.
+  core::FakeClock clock;
+  const auto binding = fixture::make_binding();
+  auto channel = std::make_shared<fixture::StateChannel>(binding);
+  RecordingProbe probe;
+  auto backend = detail::NativeStopQualificationAccess::construct(
+      binding, channel, clock, {}, probe);
+  const auto stage = controlled_stage_with_goal_terminal(true);
+  auto execution =
+      backend->execute_trajectory(fixture::trajectory(binding, 0.02));
+  ASSERT_TRUE(probe.wait_for(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+  // Admitted and still executing at Stop acceptance (injected time frozen).
+  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+      *backend, stage, core::ContentDigest("prepared.raced-natural"),
+      execution);
+  ASSERT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kExecuting);
+  // The goal reaches its accepted endpoint before the stage is invoked.
+  clock.advance(30'000'000);
+  ASSERT_TRUE(execution.wait_for_completion(2'000'000'000));
+  const auto completed = backend->get_execution_snapshot();
+  ASSERT_EQ(completed.state, core::ExecutionState::kCompleted);
+  const auto hard_requests =
+      detail::NativeStopQualificationAccess::hard_stop_requests(*backend);
+  // Every evidence read observes one fresh at-rest sample 5 ms later.
+  channel->set_read_hook([&clock, raw = channel.get(),
+                          positions = completed.joint_positions_rad] {
+    clock.advance(5'000'000);
+    const auto now = clock.now();
+    (void)raw->publish_state(positions,
+                             std::vector<double>(positions.size(), 0.0), now,
+                             now);
+  });
+
+  const auto result =
+      backend->TranslateStopStage(stage, remaining_budget(stage), {});
+  channel->set_read_hook({});
+
+  EXPECT_EQ(result.attempt_disposition,
+            core::StopStageAttemptDispositionDTO::kDispatched);
+  ASSERT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->message : "no diagnostic");
+  EXPECT_FALSE(result.error.has_value());
+  EXPECT_EQ(result.actual_provider_contract_mode,
+            core::MotionControlledStopMode::kSoftOnPath);
+  ASSERT_EQ(result.evidence_items.size(), 2U);
+  for (const auto &item : result.evidence_items) {
+    EXPECT_EQ(item.state, core::StopEvidenceItemStateDTO::kSatisfied);
+    ASSERT_TRUE(item.evidence);
+    const auto &evidence = std::get<core::JsonObjectDTO>(item.evidence->value);
+    EXPECT_TRUE(
+        std::get<bool>(evidence.at("completed_by_natural_completion").value));
+    const auto &diagnostics = std::get<core::JsonObjectDTO>(
+        evidence.at("provider_diagnostics").value);
+    EXPECT_EQ(std::get<std::string>(
+                  diagnostics.at("natural_completion_basis").value),
+              "goal_completed_before_stop_stage");
+  }
+  const auto &rest = std::get<core::JsonObjectDTO>(
+      std::get<core::JsonObjectDTO>(result.evidence_items.front().evidence->value)
+          .at("post_command_rest")
+          .value);
+  EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
+  // Goal terminality names the exact Completed transition of this goal.
+  EXPECT_EQ(result.evidence_items.back().source_sequence,
+            completed.sequence_number);
+  EXPECT_EQ(result.controller_acknowledgement_sequence,
+            completed.sequence_number);
+  // No Stop effect was issued and the natural terminal is not rewritten.
+  EXPECT_EQ(detail::NativeStopQualificationAccess::hard_stop_requests(*backend),
+            hard_requests);
+  EXPECT_EQ(
+      probe.count(detail::NativeStopQualificationEvent::kNominalProviderEntry),
+      0U);
+  EXPECT_EQ(
+      probe.count(detail::NativeStopQualificationEvent::kPhysicalDispatch), 0U);
+  EXPECT_EQ(backend->get_execution_snapshot().state,
+            core::ExecutionState::kCompleted);
+  EXPECT_EQ(backend->get_execution_snapshot().sequence_number,
+            completed.sequence_number);
+}
+
+TEST(NativeStopQualificationSeamTest,
+     ControlledStageStillFailsForEveryOtherEndOfThePreparedGoal) {
+  // Only this goal's own profile-authorized natural completion settles. A
+  // disallowing profile, a Stopped or Failed (aborted) terminal, and a newer
+  // generation all remain a failed, undispatched stage so the Kernel escalates.
+  enum class End { kCompletedWithoutPolicy, kStopped, kFailed, kNewerGoal };
+  for (const auto end : {End::kCompletedWithoutPolicy, End::kStopped,
+                         End::kFailed, End::kNewerGoal}) {
+    SCOPED_TRACE(static_cast<int>(end));
+    core::FakeClock clock;
+    clock.set(1'000'000'000);
+    const auto binding = fixture::make_binding();
+    auto channel = std::make_shared<fixture::StateChannel>(binding);
+    RecordingProbe probe(
+        end == End::kFailed
+            ? std::optional(
+                  detail::NativeStopQualificationEvent::kExecutionLoopArmed)
+            : std::nullopt);
+    auto backend = detail::NativeStopQualificationAccess::construct(
+        binding, channel, clock, {}, probe);
+    auto release =
+        std::shared_ptr<void>(nullptr, [&](void *) { probe.release(); });
+    const auto stage =
+        controlled_stage_with_goal_terminal(end != End::kCompletedWithoutPolicy);
+    auto execution = backend->execute_trajectory(
+        fixture::trajectory(binding, end == End::kStopped ? 5.0 : 0.02));
+    ASSERT_TRUE(probe.wait_for(
+        detail::NativeStopQualificationEvent::kExecutionLoopArmed));
+    detail::NativeStopQualificationAccess::install_prepared_goal_membership(
+        *backend, stage, core::ContentDigest("prepared.other-end"), execution);
+    std::string expected_state = "Completed";
+    switch (end) {
+    case End::kCompletedWithoutPolicy:
+    case End::kNewerGoal:
+      clock.advance(30'000'000);
+      break;
+    case End::kStopped:
+      ASSERT_TRUE(backend->stop().accepted);
+      expected_state = "Stopped";
+      break;
+    case End::kFailed:
+      clock.set(999'999'999); // The goal aborts on an invalid time law.
+      release.reset();
+      expected_state = "Failed";
+      break;
+    }
+    ASSERT_TRUE(execution.wait_for_completion(2'000'000'000));
+    if (end == End::kNewerGoal) {
+      ASSERT_EQ(backend->get_execution_snapshot().state,
+                core::ExecutionState::kCompleted);
+      auto tiny = fixture::trajectory(binding, 1e-10);
+      tiny.waypoints.back().positions_rad = tiny.waypoints.front().positions_rad;
+      auto newer = backend->execute_trajectory(tiny);
+      ASSERT_TRUE(newer.wait_for_completion(2'000'000'000));
+    }
+    ASSERT_EQ(backend->get_execution_snapshot().state,
+              end == End::kStopped  ? core::ExecutionState::kStopped
+              : end == End::kFailed ? core::ExecutionState::kFailed
+                                    : core::ExecutionState::kCompleted);
+    const auto hard_requests =
+        detail::NativeStopQualificationAccess::hard_stop_requests(*backend);
+
+    const auto result =
+        backend->TranslateStopStage(stage, remaining_budget(stage), {});
+
+    EXPECT_EQ(result.attempt_disposition,
+              core::StopStageAttemptDispositionDTO::kNotDispatched);
+    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->details.at("reason"), "prepared_goal_not_active");
+    EXPECT_EQ(result.error->details.at("current_execution_state"),
+              expected_state);
+    EXPECT_EQ(result.error->details.at("current_execution_activity"),
+              "terminal_or_inactive");
+    EXPECT_EQ(result.error->details.at("prepared_execution_generation") !=
+                  result.error->details.at("current_execution_generation"),
+              end == End::kNewerGoal);
+    for (const auto &item : result.evidence_items) {
+      EXPECT_EQ(item.state, core::StopEvidenceItemStateDTO::kMissing);
+    }
+    EXPECT_EQ(
+        detail::NativeStopQualificationAccess::hard_stop_requests(*backend),
+        hard_requests);
+    EXPECT_EQ(probe.count(
+                  detail::NativeStopQualificationEvent::kNominalProviderEntry),
+              0U);
+  }
 }
 
 TEST(NativeStopQualificationSeamTest,

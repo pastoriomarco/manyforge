@@ -213,6 +213,21 @@ def _fail(
 
 
 @dataclass(frozen=True, slots=True)
+class AuthoringOperationContext:
+    """Caller identity reported once if this commit contains the workspace.
+
+    It changes no commit decision: the owner only logs it at containment and
+    publishes ``written_path`` beside the containment cause.
+    """
+
+    operation: str
+    request_owner_epoch: str | None = None
+    request_id: str | None = None
+    owner_transaction_id: str | None = None
+    written_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AuthoringWorkspaceIdentity:
     """One composite identity: the workspace fence plus both domain fences."""
 
@@ -323,6 +338,8 @@ class AuthoringWorkspace:
         self._epoch = workspace_epoch or f"workspace-{uuid.uuid4().hex}"
         self._revision = 1
         self._failed_closed: str | None = None
+        self._contained_written_path: str | None = None
+        self._containment_report: dict[str, Any] | None = None
         self._observer: Callable[[], None] | None = None
         self._document_path: str | None = None
         self._document_id: str | None = None
@@ -352,6 +369,28 @@ class AuthoringWorkspace:
 
         with self._lock:
             return self._failed_closed
+
+    def publication(
+        self,
+    ) -> tuple[AuthoringWorkspaceIdentity, dict[str, Any] | None]:
+        """Return the published identity and the containment record, or ``None``.
+
+        A diagnostic read for the control-stream shell. It stays available
+        while the workspace is contained, so every client sees the containment
+        without attempting an edit. A contained identity is only the last
+        observed one and fences nothing: every commit and fenced read refuses.
+        """
+
+        with self._lock:
+            containment = (
+                None
+                if self._failed_closed is None
+                else {
+                    "cause": self._failed_closed,
+                    "saved_path": self._contained_written_path,
+                }
+            )
+            return self._identity_locked(), containment
 
     @property
     def revision(self) -> int:
@@ -498,6 +537,7 @@ class AuthoringWorkspace:
         expected_identity: AuthoringWorkspaceIdentity | None = None,
         install: Callable[[], bool],
         notify: bool = True,
+        context: AuthoringOperationContext | None = None,
     ) -> AuthoringWorkspaceSnapshot:
         """Commit one already-prepared Program Draft change.
 
@@ -507,7 +547,8 @@ class AuthoringWorkspace:
         verifies that the install did not rotate the Program Draft identity.
         ``notify=False`` defers the single wake to
         :meth:`publish_commit_wake`, so the local admission path can publish it
-        after the Kernel authoring claim is settled.
+        after the Kernel authoring claim is settled. ``context`` identifies the
+        caller's operation if this commit contains the workspace.
         """
 
         return self._commit(
@@ -516,6 +557,7 @@ class AuthoringWorkspace:
             expected_identity=expected_identity,
             install=install,
             notify=notify,
+            context=context,
         )
 
     def commit_deployment(
@@ -525,6 +567,7 @@ class AuthoringWorkspace:
         expected_identity: AuthoringWorkspaceIdentity | None = None,
         install: Callable[[], bool],
         notify: bool = True,
+        context: AuthoringOperationContext | None = None,
     ) -> AuthoringWorkspaceSnapshot:
         """Commit one already-prepared Deployment Draft change.
 
@@ -538,6 +581,7 @@ class AuthoringWorkspace:
             expected_identity=expected_identity,
             install=install,
             notify=notify,
+            context=context,
         )
 
     def replace(
@@ -547,6 +591,7 @@ class AuthoringWorkspace:
         install: Callable[[], bool],
         project: Mapping[str, Any] | None = None,
         notify: bool = True,
+        context: AuthoringOperationContext | None = None,
     ) -> AuthoringWorkspaceSnapshot:
         """Replace the whole workspace, allowing both Draft identities to rotate.
 
@@ -560,38 +605,45 @@ class AuthoringWorkspace:
         if project is not None:
             # Reject malformed prepared input before any session can change.
             _require_project_shape(project)
-        with self._lock:
-            self._require_usable_locked()
-            self._require_capacity_locked()
-            if expected_identity is not None:
-                self._require_identity_locked(expected_identity)
-            identity_before = self._identity_locked()
-            changed = self._run_install_locked("whole-workspace", install)
-            identity_after = self._identity_locked()
-            if not changed and identity_after != identity_before:
-                self._failed_closed = (
-                    "whole-workspace install changed a Draft identity while "
-                    "reporting no change"
+        try:
+            with self._lock:
+                self._require_usable_locked()
+                self._require_capacity_locked()
+                if expected_identity is not None:
+                    self._require_identity_locked(expected_identity)
+                identity_before = self._identity_locked()
+                changed = self._run_install_locked(
+                    "whole-workspace", install, context
                 )
-                _fail(
-                    "composer_workspace_install_scope_invalid",
-                    "Composer authoring workspace was contained after an "
-                    "in-memory install changed state outside its result",
-                    status_code=503,
-                    detail={"cause": self._failed_closed},
-                )
-            project_before = self._project_facts_locked()
-            if project is not None:
-                self._remember_project_locked(
-                    document=None,
-                    document_path=None,
-                    source_document_digest=None,
-                    source_diagnostics=None,
-                    explicit=project,
-                )
-            changed = changed or self._project_facts_locked() != project_before
-            advanced = self._finish_commit_locked(changed)
-            captured = self._snapshot_locked()
+                identity_after = self._identity_locked()
+                if not changed and identity_after != identity_before:
+                    self._contain_locked(
+                        "whole-workspace",
+                        "whole-workspace install changed a Draft identity "
+                        "while reporting no change",
+                        context,
+                    )
+                    _fail(
+                        "composer_workspace_install_scope_invalid",
+                        "Composer authoring workspace was contained after an "
+                        "in-memory install changed state outside its result",
+                        status_code=503,
+                        detail={"cause": self._failed_closed},
+                    )
+                project_before = self._project_facts_locked()
+                if project is not None:
+                    self._remember_project_locked(
+                        document=None,
+                        document_path=None,
+                        source_document_digest=None,
+                        source_diagnostics=None,
+                        explicit=project,
+                    )
+                changed = changed or self._project_facts_locked() != project_before
+                advanced = self._finish_commit_locked(changed)
+                captured = self._snapshot_locked()
+        finally:
+            self._publish_containment()
         if advanced and notify:
             self._notify_once()
         return captured
@@ -606,22 +658,30 @@ class AuthoringWorkspace:
         expected_identity: AuthoringWorkspaceIdentity | None,
         install: Callable[[], bool],
         notify: bool = True,
+        context: AuthoringOperationContext | None = None,
     ) -> AuthoringWorkspaceSnapshot:
         if not callable(install):
             raise TypeError("authoring workspace install must be callable")
-        with self._lock:
-            self._require_usable_locked()
-            self._require_capacity_locked()
-            if expected_identity is not None:
-                self._require_identity_locked(expected_identity)
-            self._require_domain_identity_locked(session, draft_id)
-            before = self._identity_locked()
-            changed = self._run_install_locked(session, install)
-            self._require_domain_identity_locked(session, draft_id, after=True)
-            after = self._identity_locked()
-            self._require_commit_scope_locked(session, before, after, changed)
-            advanced = self._finish_commit_locked(changed)
-            captured = self._snapshot_locked()
+        try:
+            with self._lock:
+                self._require_usable_locked()
+                self._require_capacity_locked()
+                if expected_identity is not None:
+                    self._require_identity_locked(expected_identity)
+                self._require_domain_identity_locked(session, draft_id)
+                before = self._identity_locked()
+                changed = self._run_install_locked(session, install, context)
+                self._require_domain_identity_locked(
+                    session, draft_id, after=True, context=context
+                )
+                after = self._identity_locked()
+                self._require_commit_scope_locked(
+                    session, before, after, changed, context
+                )
+                advanced = self._finish_commit_locked(changed)
+                captured = self._snapshot_locked()
+        finally:
+            self._publish_containment()
         if advanced and notify:
             self._notify_once()
         return captured
@@ -642,8 +702,57 @@ class AuthoringWorkspace:
         self._revision += 1
         return True
 
+    def _contain_locked(
+        self,
+        label: str,
+        cause: str,
+        context: AuthoringOperationContext | None,
+    ) -> None:
+        """Contain the workspace: the one writer of the containment state.
+
+        Containment is never cleared in-process; a Composer restart is the
+        recovery. The report is logged and published once by
+        :meth:`_publish_containment` after the lock is released.
+        """
+
+        if self._failed_closed is not None:
+            return
+        self._failed_closed = cause
+        self._contained_written_path = (
+            None if context is None else context.written_path
+        )
+        self._containment_report = {
+            "workspace_epoch": self._epoch,
+            "workspace_revision": self._revision,
+            "install_label": label,
+            "operation": None if context is None else context.operation,
+            "cause": cause,
+            "written_path": self._contained_written_path,
+            "request_owner_epoch": (
+                None if context is None else context.request_owner_epoch
+            ),
+            "request_id": None if context is None else context.request_id,
+            "owner_transaction_id": (
+                None if context is None else context.owner_transaction_id
+            ),
+        }
+
+    def _publish_containment(self) -> None:
+        """Log and wake once for a containment this call caused, unlocked."""
+
+        with self._lock:
+            report = self._containment_report
+            self._containment_report = None
+        if report is None:
+            return
+        _LOGGER.error("composer_authoring_workspace_contained", extra=report)
+        self._notify_once()
+
     def _run_install_locked(
-        self, label: str, install: Callable[[], bool]
+        self,
+        label: str,
+        install: Callable[[], bool],
+        context: AuthoringOperationContext | None = None,
     ) -> bool:
         """Run one prevalidated no-I/O install and contain contract failures."""
 
@@ -652,9 +761,11 @@ class AuthoringWorkspace:
         try:
             changed = install()
         except Exception as error:
-            self._failed_closed = (
+            self._contain_locked(
+                label,
                 f"{label} in-memory install failed: "
-                f"{type(error).__name__}: {error}"
+                f"{type(error).__name__}: {error}",
+                context,
             )
             _fail(
                 "composer_workspace_install_failed",
@@ -664,8 +775,10 @@ class AuthoringWorkspace:
                 detail={"cause": self._failed_closed},
             )
         if type(changed) is not bool:
-            self._failed_closed = (
-                f"{label} in-memory install did not return a change result"
+            self._contain_locked(
+                label,
+                f"{label} in-memory install did not return a change result",
+                context,
             )
             _fail(
                 "composer_workspace_install_contract_invalid",
@@ -682,6 +795,7 @@ class AuthoringWorkspace:
         before: AuthoringWorkspaceIdentity,
         after: AuthoringWorkspaceIdentity,
         changed: bool,
+        context: AuthoringOperationContext | None = None,
     ) -> None:
         other_changed = (
             (
@@ -703,8 +817,10 @@ class AuthoringWorkspace:
             )
         )
         if other_changed or (not changed and before != after):
-            self._failed_closed = (
-                f"{session} in-memory install changed state outside its result"
+            self._contain_locked(
+                session,
+                f"{session} in-memory install changed state outside its result",
+                context,
             )
             _fail(
                 "composer_workspace_install_scope_invalid",
@@ -765,7 +881,12 @@ class AuthoringWorkspace:
             )
 
     def _require_domain_identity_locked(
-        self, session: str, draft_id: str, *, after: bool = False
+        self,
+        session: str,
+        draft_id: str,
+        *,
+        after: bool = False,
+        context: AuthoringOperationContext | None = None,
     ) -> None:
         current = (
             self._program.draft_id
@@ -778,9 +899,11 @@ class AuthoringWorkspace:
             # An ordinary install must never rotate a Draft identity. The
             # in-memory state now contradicts the composite fence, so contain
             # the workspace instead of committing or retrying.
-            self._failed_closed = (
+            self._contain_locked(
+                session,
                 f"{session} Draft identity rotated inside an ordinary "
-                f"workspace commit ({draft_id} -> {current})"
+                f"workspace commit ({draft_id} -> {current})",
+                context,
             )
         _fail(
             "composer_workspace_domain_identity_changed",
@@ -900,7 +1023,8 @@ class AuthoringWorkspace:
         )
 
     def _notify_once(self) -> None:
-        """Wake at most once per real commit, after every lock is released."""
+        """Wake at most once per real commit or containment, after every lock
+        is released."""
 
         with self._lock:
             observer = self._observer
@@ -917,6 +1041,7 @@ class AuthoringWorkspace:
 __all__ = [
     "AUTHORING_WORKSPACE_MAXIMUM_REVISION",
     "SNAPSHOT_API_VERSION",
+    "AuthoringOperationContext",
     "AuthoringWorkspace",
     "AuthoringWorkspaceError",
     "AuthoringWorkspaceIdentity",

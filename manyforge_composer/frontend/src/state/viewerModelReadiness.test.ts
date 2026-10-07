@@ -22,6 +22,7 @@ function snapshot(overrides: {
   applyRecords?: Array<{ incomplete: boolean }>;
 } = {}): ComposerHeadlessState {
   return {
+    authoringWorkspaceContainment: null,
     receiverEpoch: 'receiver.1',
     runtime: {
       complete: true,
@@ -82,6 +83,7 @@ function snapshot(overrides: {
     alarms: {} as ComposerHeadlessState['alarms'],
     componentOverview: {} as ComposerHeadlessState['componentOverview'],
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
+    heldRunDraftEditAllowed: false,
     executionControlStatus: null,
     programCycle: {} as ComposerHeadlessState['programCycle'],
     authoringWorkspace: {} as ComposerHeadlessState['authoringWorkspace'],

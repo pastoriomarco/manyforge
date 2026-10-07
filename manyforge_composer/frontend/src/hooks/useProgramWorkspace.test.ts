@@ -28,10 +28,6 @@ vi.mock('../api/client', async (importOriginal) => ({
   // The hook reads the shared publication through the controller, not through an
   // independent identity read, so the only client surface it needs is the
   // Program workspace projection that still owns Applied truth.
-  isStaleWorkspaceError: (error: unknown) =>
-    error !== null
-    && typeof error === 'object'
-    && (error as { status?: number }).status === 409,
 }));
 
 import {
@@ -360,6 +356,7 @@ function authoringSnapshot(
       },
     },
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
+    heldRunDraftEditAllowed: false,
     programCycle: {
       programRunnerOwnerEpoch: 'program-runner.epoch.1',
       cycleGeneration: 3,
@@ -390,6 +387,7 @@ function authoringSnapshot(
       deploymentDraftId: 'deployment-draft-1',
       deploymentDraftRevision: 4,
     },
+    authoringWorkspaceContainment: null,
     receiverEpoch: 'headless-receiver.epoch.1',
     snapshotSequence: 11,
     runtime: {
@@ -513,7 +511,9 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
-    apiMock.programWorkspace.mutate.mockRejectedValueOnce(new ApiError('refused', 409, { detail: { code } }));
+    apiMock.programWorkspace.mutate.mockRejectedValueOnce(new ApiError('refused', 409, {
+      detail: { code, effect: 'none' },
+    }));
     await act(async () => {
       await latest?.mutate('program_draft_update_node_policies', {});
     });
@@ -522,6 +522,28 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).toContain('Edit not applied');
     expect(latest?.state.workspace?.draft.draftRevision).toBe(1);
   });
+
+  it.each(['composer_draft_revision_stale', 'composer_workspace_stale'])(
+    'refreshes the workspace after a refused-before-effect stale fence (%s)',
+    async (code) => {
+      const initial = deferred<ProgramWorkspaceResponse>();
+      await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+      await act(async () => initial.resolve(workspace(1)));
+      apiMock.programWorkspace.mutate.mockRejectedValueOnce(new ApiError('stale', 409, {
+        detail: { code, effect: 'none' },
+      }));
+      apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(2));
+      await act(async () => {
+        await latest?.mutate('program_draft_update_node_policies', {});
+      });
+      // The stale fence is handled before the refusal message: the newer
+      // workspace is read once and the edit is never repeated.
+      expect(apiMock.programWorkspace.mutate).toHaveBeenCalledTimes(1);
+      expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(2);
+      expect(latest?.state.message ?? '').not.toContain('not applied');
+      expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    },
+  );
 
   it('uses the ordinary Draft mutation path for node policies', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
@@ -624,6 +646,46 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.acceptedApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
     expect(latest?.state.message).toContain('No Program or motion starts automatically');
     expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
+  });
+
+  it('shows a written-but-not-adopted Scenario Save with its path and refreshes once', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(
+      initial,
+      authoringSnapshot(workspace(1)),
+      testPublication(workspace(1)),
+    );
+    await act(async () => initial.resolve(workspace(1)));
+    const message = 'The Scenario project was written to /workspace/cell, but it was not '
+      + 'adopted as the Saved baseline: model source vanished';
+    apiMock.scenarioDocuments.save.mockRejectedValueOnce(new ApiError(message, 409, {
+      detail: {
+        code: 'scenario_saved_baseline_not_adopted',
+        message,
+        path: '/workspace/cell',
+        causeCode: 'scenario_source_invalid',
+      },
+    }));
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(2));
+
+    await act(async () => {
+      latest?.saveScenarioDocument({
+        path: '/workspace/cell',
+        scenarioId: 'cell',
+        name: 'Cell',
+        description: '',
+        confirmOverwrite: false,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Never retried; the current truth is read once and the outcome stays visible.
+    expect(apiMock.scenarioDocuments.save).toHaveBeenCalledTimes(1);
+    expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(2);
+    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    expect(latest?.state.message).toBe(message);
+    expect(latest?.state.message).toContain('/workspace/cell');
   });
 
   it('fences Scenario Save and Load with both current authored documents', async () => {

@@ -62,6 +62,7 @@ function state(
     executionControlStatus: null,
     componentOverview: componentOverview(),
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
+    heldRunDraftEditAllowed: false,
     programCycle: {
       programRunnerOwnerEpoch: 'runner.epoch.1',
       cycleGeneration: 1,
@@ -92,6 +93,7 @@ function state(
       deploymentDraftId: 'deployment-draft-1',
       deploymentDraftRevision: 1,
     },
+    authoringWorkspaceContainment: null,
     receiverEpoch: runtimeEpoch,
     snapshotSequence: Math.max(1, runtimeGeneration),
     runtime: {
@@ -321,6 +323,7 @@ function wireState(generation: number): Record<string, unknown> {
       },
     },
     authoring_admission: { admission_generation: 1, authoring_allowed: true },
+    held_run_draft_edit_allowed: false,
     execution_targets: null,
     execution_control_state: null,
     program_cycle: {
@@ -353,6 +356,7 @@ function wireState(generation: number): Record<string, unknown> {
       deployment_draft_id: 'deployment-draft-1',
       deployment_draft_revision: 1,
     },
+    authoring_workspace_containment: null,
     receiver_epoch: 'receiver.epoch.1',
     snapshot_sequence: Math.max(1, generation + 1),
     complete: true,
@@ -968,6 +972,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
         admission_generation: 2,
         authoring_allowed: false,
       },
+      held_run_draft_edit_allowed: true,
     };
     receiveControl(FakeWebSocket.shell, {
       schema_version: 'manyforge.execution_control.v2',
@@ -994,6 +999,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(merged.authoringAdmission).toEqual({
       admissionGeneration: 2, authoringAllowed: false,
     });
+    // The backend's held-run Draft rule travels beside the admission.
+    expect(merged.heldRunDraftEditAllowed).toBe(true);
     expect(merged.authoringWorkspace).toEqual({
       workspaceEpoch: 'workspace.epoch.1',
       workspaceRevision: 1,
@@ -1905,6 +1912,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
         shell: {
           schema_version: 'manyforge.composer_headless_state.v2',
           complete: false,
+          authoring_workspace_containment: null,
           receiver_epoch: 'receiver.epoch.1',
           snapshot_sequence: draftRevision + 1,
           authoring_workspace: {

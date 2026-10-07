@@ -429,6 +429,33 @@ superseded_stop_stage(const core::ResolvedParticipantStopStageDTO &stage) {
   return result;
 }
 
+// The exact prepared goal already reached its accepted endpoint after Stop
+// acceptance and before this controlled stage. No Stop command is issued; the
+// result is the profile-authorized natural completion, and the caller still
+// requires fresh post-observation rest and exact goal-terminal evidence.
+core::ControlledStopResultDTO
+natural_completion_before_stage(const core::MotionInterruptStopProfileDTO &profile,
+                                std::int64_t observed_after_stage_start_ns) {
+  core::ControlledStopResultDTO result;
+  result.accepted = true;
+  result.backend_stop_confirmed = true;
+  result.completed_by_natural_completion = true;
+  result.executed_stop_mode = profile.stop_mode;
+  result.stop_command_source =
+      core::MotionInterruptStopCommandSource::kDiagnosticOther;
+  result.confirmation_latency_ns =
+      std::max<std::int64_t>(0, observed_after_stage_start_ns);
+  result.diagnostics["command_source"] =
+      core::interrupt_structured_string("native_simulated_natural_completion");
+  result.diagnostics["natural_completion_basis"] =
+      core::interrupt_structured_string("goal_completed_before_stop_stage");
+  result.diagnostics["requested_stop_mode"] = core::interrupt_structured_string(
+      profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath
+          ? "soft_on_path"
+          : "spring_back_hold");
+  return result;
+}
+
 std::optional<std::int64_t>
 remaining_phase(const core::RemainingStopBudgetDTO &budget,
                 const core::StopBudgetPhaseId &phase_id) {
@@ -1875,8 +1902,19 @@ RoboPlanExecutionBackend::TranslateStopStage(
   const auto current_generation =
       last_execution_generation_.load(std::memory_order_acquire);
   const bool execution_running = state_.running.load(std::memory_order_acquire);
+  // Stop acceptance is not atomic with the execution worker: this exact goal
+  // may reach its accepted endpoint before the controlled stage arrives. When
+  // the prepared profile allows natural completion, that is the same outcome
+  // as the in-window natural-completion handoff below; fresh rest is still
+  // proven after this observation. Any other terminal, a replaced/reset
+  // generation, or a profile without that policy remains a failed stage.
+  const bool completed_before_stage =
+      motion_controlled_stop && !execution_running &&
+      dispatch_generation != 0U && dispatch_generation == current_generation &&
+      controlled_profile->allow_natural_completion_on_short_path &&
+      execution_completed_naturally(dispatch_generation);
   if (dispatch_generation == 0U || dispatch_generation != current_generation ||
-      (!execution_running && !software_hard)) {
+      (!execution_running && !software_hard && !completed_before_stage)) {
     auto failure = terminal_stop_stage_failure(
         stage, "prepared_goal_not_active",
         "native prepared goal no longer owns the active execution",
@@ -1888,6 +1926,8 @@ RoboPlanExecutionBackend::TranslateStopStage(
           std::to_string(current_generation);
       failure.error->details["current_execution_activity"] =
           execution_running ? "running" : "terminal_or_inactive";
+      failure.error->details["current_execution_state"] =
+          std::string(core::to_string(get_execution_snapshot().state));
     }
     return failure;
   }
@@ -1943,10 +1983,13 @@ RoboPlanExecutionBackend::TranslateStopStage(
         std::max<std::int64_t>(0, clock_.now() - started_at);
     const auto remaining_ns =
         std::max<std::int64_t>(0, *command_remaining - elapsed_ns);
-    controlled_outcome = execute_controlled_stop_until(
-        *controlled_profile, cancellation,
-        std::chrono::steady_clock::now() +
-            std::chrono::nanoseconds(remaining_ns));
+    controlled_outcome =
+        completed_before_stage
+            ? natural_completion_before_stage(*controlled_profile, elapsed_ns)
+            : execute_controlled_stop_until(
+                  *controlled_profile, cancellation,
+                  std::chrono::steady_clock::now() +
+                      std::chrono::nanoseconds(remaining_ns));
     if (const auto invalid = core::controlled_stop_result_field_error(
             *controlled_profile, *controlled_outcome);
         invalid.has_value()) {
@@ -3326,6 +3369,17 @@ core::ExecutionSnapshot
 RoboPlanExecutionBackend::get_execution_snapshot() const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   return state_.snapshot;
+}
+
+bool RoboPlanExecutionBackend::execution_completed_naturally(
+    const std::uint64_t execution_generation) const {
+  // Only the worker's endpoint branch publishes Completed; replacement replay,
+  // cancellation and faults publish Stopped/Failed. Dispatch and Reset change
+  // the retained generation under this same lock.
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return execution_generation != 0U &&
+         state_.active_trajectory_generation == execution_generation &&
+         state_.snapshot.state == core::ExecutionState::kCompleted;
 }
 
 std::optional<double> RoboPlanExecutionBackend::stopped_trajectory_time_s(

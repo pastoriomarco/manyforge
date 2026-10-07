@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -207,6 +208,9 @@ public:
 
   core::Result<core::ObservedStateSnapshotDTO>
   current_state(std::int64_t) const override {
+    if (read_hook_) {
+      read_hook_();
+    }
     std::lock_guard lock(mutex_);
     ++state_read_count_;
     auto observed_velocities = state_.velocities;
@@ -313,6 +317,10 @@ public:
     forced_observed_velocities_ = std::move(velocities);
   }
 
+  // Deterministic injected-time observation: runs before every state read on
+  // the reading thread. Install it only while no concurrent reader exists.
+  void set_read_hook(std::function<void()> hook) { read_hook_ = std::move(hook); }
+
   std::uint64_t state_read_count() const {
     std::lock_guard lock(mutex_);
     return state_read_count_;
@@ -351,6 +359,7 @@ private:
   mutable core::RuntimeEpoch source_epoch_{context_.runtime_epoch};
   bool refresh_source_on_wait_{};
   std::optional<std::vector<double>> forced_observed_velocities_;
+  std::function<void()> read_hook_;
 };
 
 [[nodiscard]] inline core::TrajectoryDTO

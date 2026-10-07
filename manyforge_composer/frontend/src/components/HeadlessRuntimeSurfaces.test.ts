@@ -266,6 +266,7 @@ describe('headless Composer presentation adapters', () => {
         },
       },
       authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
+      heldRunDraftEditAllowed: false,
       programCycle: {
         programRunnerOwnerEpoch: 'runner.epoch.1',
         cycleGeneration: 1,
@@ -296,6 +297,7 @@ describe('headless Composer presentation adapters', () => {
         deploymentDraftId: 'deployment-draft-1',
         deploymentDraftRevision: 1,
       },
+      authoringWorkspaceContainment: null,
       receiverEpoch: 'receiver.epoch.1',
       snapshotSequence: 1,
       runtime: {

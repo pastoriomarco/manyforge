@@ -227,6 +227,11 @@ private:
       std::optional<std::uint64_t> expected_execution = std::nullopt) noexcept;
   void request_execution_worker_stop_locked() noexcept;
   void publish_execution_inactive() noexcept;
+  /// Exact goal-status fact: `execution_generation` is still the retained
+  /// occurrence and its worker reached the accepted trajectory endpoint
+  /// (Completed). Stopped, Failed, Reset, or a newer dispatch are not.
+  [[nodiscard]] bool
+  execution_completed_naturally(std::uint64_t execution_generation) const;
   core::ControlledStopResultDTO execute_controlled_stop_impl(
       const core::MotionInterruptStopProfileDTO &profile,
       std::stop_token stop_token, std::uint64_t hard_stop_request_generation,

@@ -47,7 +47,11 @@ from .program_artifacts import (
 from .state import ComposerState
 from .authoring_admission import (
     AuthoringMutationEnvelope,
+    OperationEffects,
+    draft_session_http_exception,
     headless_client_http_exception,
+    raise_save_failure,
+    scenario_artifact_http_exception,
 )
 from .authoring_workspace import (
     AuthoringWorkspaceError,
@@ -224,14 +228,15 @@ class _AppliedContext:
 
 
 def _raise_workspace_error(error: Exception) -> NoReturn:
-    if isinstance(error, (DraftSessionError, ProgramArtifactError, ScenarioArtifactError)):
-        detail: dict[str, Any] = {
-            "code": error.code,
-            "message": str(error),
-        }
-        if isinstance(error, DraftSessionError) and error.detail != str(error):
-            detail["context"] = error.detail
-        raise HTTPException(status_code=error.status_code, detail=detail) from error
+    if isinstance(error, DraftSessionError):
+        raise draft_session_http_exception(error) from error
+    if isinstance(error, ScenarioArtifactError):
+        raise scenario_artifact_http_exception(error) from error
+    if isinstance(error, ProgramArtifactError):
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
     if isinstance(error, AuthoringWorkspaceError):
         detail = {"code": error.code, "message": str(error)}
         if error.detail != str(error):
@@ -840,7 +845,14 @@ def _observed_scene_arguments(
     try:
         projection = state.headless_client.scene()
     except HeadlessClientError as error:
-        raise headless_client_http_exception(error) from error
+        # Nothing has been prepared yet, so a failed read is a named no-effect
+        # refusal, like every other refusal of this resolver.
+        raise DraftSessionError(
+            "observed_scene_unavailable",
+            f"the current logical scene could not be read: {error}",
+            status_code=503,
+            detail={"headless_code": error.code},
+        ) from error
     logical = projection.get("logical_scene")
     access = logical.get("access") if isinstance(logical, dict) else None
     snapshot = logical.get("snapshot") if isinstance(logical, dict) else None
@@ -1461,12 +1473,42 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         """Persist one exact Program Draft and adopt it as the Saved baseline.
 
         The capture, the write and the baseline adoption are three separate
-        steps: the write happens outside every owner lock and the adoption is one
-        composite commit fenced by the captured workspace identity. A stale
-        adoption keeps the correctly written file and never labels newer
-        in-memory content Saved.
+        steps: the write happens only after admission, under the local
+        authoring claim, so an admission refusal writes nothing; the adoption
+        is one composite commit fenced by the captured workspace identity. A
+        stale adoption keeps the correctly written file and never labels newer
+        in-memory content Saved. One effect record decides both the HTTP
+        outcome and the claim settlement: Not saved, Saved but not adopted
+        (naming the written path), or unverified.
         """
 
+        effects = OperationEffects()
+        try:
+            _program_save(
+                body,
+                target_path=target_path,
+                confirm_overwrite=confirm_overwrite,
+                effects=effects,
+            )
+        except Exception as error:
+            raise_save_failure(
+                error,
+                effects,
+                _raise_workspace_error,
+                code="program_saved_baseline_not_adopted",
+                document="Program Draft",
+            )
+        # The Program workspace carries its own Draft-matched identity; the
+        # composite snapshot must not replace it (it breaks that contract).
+        return _workspace(state)
+
+    def _program_save(
+        body: SaveDraftRequest | SaveDraftAsRequest,
+        *,
+        target_path: str | None,
+        confirm_overwrite: bool,
+        effects: OperationEffects,
+    ) -> None:
         prepared = state.draft_session.prepare_save(
             draft_id=body.draft_id,
             expected_revision=body.expected_draft_revision,
@@ -1482,63 +1524,65 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             )
         )
         saved_path = prepared.resolved_target
-        artifact_written = not scenario_member
+
+        def write_artifact_under_claim() -> None:
+            nonlocal saved_path
+            # The adoption's fences, checked before the write: a stale Save is
+            # refused before any effect.
+            body.require_workspace_fence(state.authoring_workspace.identity())
+            state.draft_session.require_current(
+                draft_id=prepared.draft_id, expected_revision=prepared.base_revision
+            )
+            # A prior completed write of this exact revision is resolved
+            # without repeating it.
+            revision = prepared.program.program_revision
+            if _published_program_revision(state, prepared.target_path) == revision:
+                return
+            try:
+                saved_path = save_program_artifact(
+                    prepared.program,
+                    prepared.target_path,
+                    allowed_roots=_program_write_roots(state),
+                    overwrite=prepared.overwrite,
+                )
+            except Exception:
+                # The write is one atomic replacement: the target holds either
+                # its previous content (Not saved) or exactly this revision.
+                if _published_program_revision(
+                    state, prepared.target_path
+                ) == revision:
+                    effects.destination_published(saved_path)
+                raise
+            effects.destination_published(saved_path)
 
         def prepare_saved_project() -> dict[str, Any]:
-            nonlocal artifact_written
             document, path, digest = save_scenario_member(
                 project_path, "program_draft", captured_workspace["program"]["authoring"],
-                allowed_roots=state.allowed_fs_roots,
+                allowed_roots=state.allowed_fs_roots, effects=effects,
             )
-            artifact_written = True
             return scenario_project_facts(
                 document, document_path=path, source_document_digest=digest
             )
 
-        # Scenario members are written with their manifest under the claim below.
-        if not scenario_member and _published_program_revision(
-            state, prepared.target_path
-        ) != prepared.program.program_revision:
-            saved_path = save_program_artifact(
-                prepared.program,
-                prepared.target_path,
-                allowed_roots=_program_write_roots(state),
-                overwrite=prepared.overwrite,
-            )
-        try:
-            commit = commit_local_authoring(
-                state,
-                body,
-                operation_kind=prepared.tool_id,
-                session="whole-workspace" if scenario_member else "program",
-                prepare_project_under_claim=(
-                    prepare_saved_project if scenario_member else None
-                ),
-                install=lambda: state.draft_session.install_prepared_save(
-                    prepared, saved_path=saved_path
-                ),
-            )
-        except AuthoringWorkspaceError as error:
-            if error.code != "composer_workspace_stale" or not artifact_written:
-                raise
-            # The Program artifact is correctly written; only the Saved
-            # baseline is refused, so newer in-memory content is never labelled
-            # Saved and the client refreshes instead of retrying blindly.
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "program_saved_baseline_not_adopted",
-                    "message": (
-                        "the Program artifact was written but a newer "
-                        "workspace revision was not adopted as Saved"
-                    ),
-                    "path": saved_path,
-                    "currentWorkspace": error.detail.get("workspace"),
-                },
-            ) from error
-        # The Program workspace carries its own Draft-matched identity; the
-        # composite snapshot must not replace it (it breaks that contract).
-        return _workspace(state)
+        # Both forms are written under the claim, after admission: a Scenario
+        # member with its manifest, a standalone artifact as the under-claim
+        # step before the commit.
+        commit_local_authoring(
+            state,
+            body,
+            operation_kind=prepared.tool_id,
+            session="whole-workspace" if scenario_member else "program",
+            validate_under_claim=(
+                None if scenario_member else write_artifact_under_claim
+            ),
+            prepare_project_under_claim=(
+                prepare_saved_project if scenario_member else None
+            ),
+            install=lambda: state.draft_session.install_prepared_save(
+                prepared, saved_path=saved_path
+            ),
+            effects=effects,
+        )
 
     @router.post("/api/program/save")
     def save_draft(body: SaveDraftRequest) -> dict[str, Any]:

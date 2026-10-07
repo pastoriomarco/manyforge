@@ -518,6 +518,33 @@ def test_control_shell_never_publishes_a_partial_or_crossed_execution_pair(
     assert facts.execution_control_response is control
 
 
+@pytest.mark.parametrize("paired", [True, False])
+def test_control_shell_publishes_the_held_run_draft_edit_rule(paired) -> None:
+    held = {
+        **_cycle(),
+        "state": "running",
+        "program_run_id": "run.1",
+        "run": {"state": "running", "capture": {"program_run_id": "run.1"}},
+        "recovery_offer": None,
+        "runtime_controls": {"execution_selections": {"motion_held": True}},
+    }
+    identity = {"owner_epoch": "kernel.1"}
+    facts = replace(
+        _facts_for_cycle(held),
+        execution_targets_response={"ok": True, "identity": identity},
+        execution_control_response={
+            "ok": True,
+            "identity": identity if paired else {"owner_epoch": "kernel.2"},
+            "control_state": {"manual_operations": []},
+        },
+    )
+    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    # Manual-operation settlement is only proven by a coherent control capture.
+    assert shell["held_run_draft_edit_allowed"] is paired
+    idle = HeadlessControlStateSource._shell_from_facts(_facts_for_cycle(_cycle()))
+    assert idle["held_run_draft_edit_allowed"] is False
+
+
 @pytest.mark.parametrize(
     "targets_ok,control_ok", [(False, False), (False, True), (True, False)]
 )

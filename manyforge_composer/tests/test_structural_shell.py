@@ -289,6 +289,44 @@ def test_structural_routes_preserve_http_errors_and_request_correlation() -> Non
     assert missing.json()["detail"]
 
 
+def test_request_log_replays_error_responses_with_repeated_headers() -> None:
+    """Reading an error's code must not collapse repeated response headers."""
+
+    from fastapi.responses import JSONResponse
+
+    app = create_app(
+        ComposerState(),
+        security=SecurityConfig(
+            allowed_fs_roots=["/workspace"],
+            cors_origins=["http://localhost:3000"],
+        ),
+    )
+
+    def refuse() -> JSONResponse:
+        response = JSONResponse(
+            status_code=409, content={"detail": {"code": "test_refused"}}
+        )
+        response.set_cookie("first", "1")
+        response.set_cookie("second", "2")
+        return response
+
+    app.add_api_route("/api/test/refused", refuse, methods=["GET"])
+    # Ahead of the unavailable catch-all.
+    app.router.routes.insert(0, app.router.routes.pop())
+
+    refused = TestClient(app).get(
+        "/api/test/refused", headers={"X-Request-ID": "ticket-7"}
+    )
+
+    assert refused.status_code == 409
+    assert refused.json() == {"detail": {"code": "test_refused"}}
+    assert [cookie.split(";")[0] for cookie in refused.headers.get_list("set-cookie")] == [
+        "first=1",
+        "second=2",
+    ]
+    assert refused.headers["X-Request-ID"] == "ticket-7"
+
+
 def test_composer_ingress_remains_open_when_legacy_token_env_is_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

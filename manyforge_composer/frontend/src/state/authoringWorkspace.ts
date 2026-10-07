@@ -9,10 +9,11 @@ import type {
   ScenarioDocumentFenceRequest,
 } from '../types/api';
 import type {
+  AuthoringWorkspaceContainment,
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
-import { heldRunMotionStopped, manualOperationSettled } from './heldRunAuthoring';
+import { manualOperationSettled } from './heldRunAuthoring';
 import type { WorkbenchNotice } from './workbenchNotices';
 
 /** Component reason the alarm owner issues for active alarms it can report. */
@@ -127,6 +128,8 @@ export function authoringUnavailableReason(
 ): string | null {
   switch (authoringUnavailableCause(published, snapshot)) {
     case 'disconnected': return ADMISSION_REASON_DISCONNECTED;
+    case 'contained':
+      return authoringContainmentMessage(snapshot!.authoringWorkspaceContainment!);
     case 'not_read': return 'The shared authoring workspace has not been read yet.';
     case 'synchronizing': return 'The displayed workspace is still synchronizing with the backend.';
     case 'execution_active':
@@ -145,8 +148,9 @@ export function authoringUnavailableReason(
  * Why editing the Draft (Program, Scene or Deployment, including Discard) is
  * unavailable, or ``null``. Unlike the other authoring actions, an edit only
  * changes the Draft, so it is also available while a Program run exists with
- * all its motion confirmed stopped (`heldRunMotionStopped`); the edits then
- * reach the robot only through Apply, which Resets the run first.
+ * all its motion confirmed stopped (the backend's published
+ * `heldRunDraftEditAllowed`); the edits then reach the robot only through
+ * Apply, which Resets the run first.
  */
 export function draftEditUnavailableReason(
   published: PublishedAuthoringWorkspace | null,
@@ -155,7 +159,7 @@ export function draftEditUnavailableReason(
   if (authoringUnavailableCause(published, snapshot) !== 'execution_active') {
     return authoringUnavailableReason(published, snapshot);
   }
-  return heldRunMotionStopped(snapshot)
+  return snapshot!.heldRunDraftEditAllowed
     ? null
     : `Program execution is ${snapshot!.programCycle.state.replaceAll('_', ' ')}; editing requires Idle or all Program motion stopped (Stop, Halt, a failure pause, or Executed but not yet Run).`;
 }
@@ -167,6 +171,7 @@ export function draftEditUnavailableReason(
  */
 export type AuthoringUnavailableCause =
   | 'disconnected'
+  | 'contained'
   | 'not_read'
   | 'synchronizing'
   | 'execution_active'
@@ -177,6 +182,9 @@ export function authoringUnavailableCause(
   snapshot: ComposerHeadlessState | null,
 ): AuthoringUnavailableCause | null {
   if (snapshot === null) return 'disconnected';
+  // A contained workspace refuses every edit until Composer restarts; that
+  // outranks synchronization, which can no longer converge.
+  if (snapshot.authoringWorkspaceContainment !== null) return 'contained';
   if (published === null) return 'not_read';
   if (!publicationIsCurrent(published, snapshot)) return 'synchronizing';
   if (snapshot.programCycle.state !== 'idle_after_reset') return 'execution_active';
@@ -208,6 +216,36 @@ export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | 
       message: component.detail,
       expectedDuringTransition: true,
     }));
+}
+
+/** The operator-facing text of one published workspace containment. */
+export function authoringContainmentMessage(
+  containment: AuthoringWorkspaceContainment,
+): string {
+  const saved = containment.savedPath === null
+    ? ''
+    : ` Saved file: ${containment.savedPath}.`;
+  const cause = containment.cause.replace(/\.+$/, '');
+  return `Authoring contained: ${cause}.${saved} Restart Composer to recover.`;
+}
+
+/**
+ * The published workspace containment as one persistent error. It is shown
+ * without an attempted edit and stays until a Composer restart (a normal cold
+ * start) publishes a new, uncontained workspace.
+ */
+export function authoringContainmentNotices(
+  snapshot: ComposerHeadlessState | null,
+): WorkbenchNotice[] {
+  const containment = snapshot?.authoringWorkspaceContainment ?? null;
+  if (containment === null) return [];
+  return [{
+    id: 'authoring.contained',
+    severity: 'error',
+    domain: 'program_authoring',
+    title: 'Authoring contained',
+    message: authoringContainmentMessage(containment),
+  }];
 }
 
 export function programLocalFence(

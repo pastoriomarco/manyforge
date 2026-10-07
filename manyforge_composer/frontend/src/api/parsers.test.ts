@@ -883,7 +883,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v8',
+      schema_version: 'manyforge.program_runtime_control_projection.v9',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
@@ -904,6 +904,7 @@ describe('Program product projections', () => {
       recovery_offer: null,
       execution_selections: {
         selection_revision: 0,
+        motion_held: false,
         groups: [{ group_id: 'all', node_count: 1, held_node_count: 0,
           state: 'running', stop_allowed: true,
           start_allowed: false, start_unavailable_reason: 'selection_not_ready',
@@ -1223,6 +1224,19 @@ describe('Program product projections', () => {
 
     expect(projection.recoveryOffer).toBeNull();
     expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('requires the owner\'s boolean motion-held fact', () => {
+    const input = runtimeControlsProjection();
+    (input.execution_selections as Record<string, unknown>).motion_held = true;
+    expect(() => parseProgramRuntimeControlProjection(input)).not.toThrow();
+    for (const value of [undefined, null, 'true']) {
+      const invalid = runtimeControlsProjection();
+      const selections = invalid.execution_selections as Record<string, unknown>;
+      if (value === undefined) delete selections.motion_held;
+      else selections.motion_held = value;
+      expect(() => parseProgramRuntimeControlProjection(invalid)).toThrow();
+    }
   });
 
   it('carries each selection\'s exact reserved resources, sorted and unique', () => {

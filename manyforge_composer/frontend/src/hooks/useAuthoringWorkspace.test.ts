@@ -169,6 +169,7 @@ function headlessSnapshot(
     },
     alarms: { records: [], generation: 1 } as unknown as ComposerHeadlessState['alarms'],
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 4 },
+    heldRunDraftEditAllowed: false,
     programCycle: { state: 'idle_after_reset' } as unknown as ComposerHeadlessState['programCycle'],
     authoringWorkspace: {
       workspaceEpoch: 'workspace.epoch.1',
@@ -178,6 +179,7 @@ function headlessSnapshot(
       deploymentDraftId: 'deployment-draft.1',
       deploymentDraftRevision,
     },
+    authoringWorkspaceContainment: null,
     receiverEpoch: 'receiver.epoch.1',
     snapshotSequence: workspaceRevision,
   };
@@ -364,19 +366,21 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.unavailableReason).toBe(null);
   });
 
-  it('keeps a lost response unknown, but releases a named pre-effect refusal', async () => {
+  it('keeps a lost response unknown, but releases a marked pre-effect refusal', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
       expect(latest!.beginMutation()).toBe(true);
-      latest!.finishMutation(null, new ApiError('not ready', 409, { detail: { code: 'authoring_not_ready' } }));
+      latest!.finishMutation(null, new ApiError('not ready', 409, {
+        detail: { code: 'authoring_not_ready', effect: 'none' },
+      }));
     });
     expect(latest!.unavailableReason).toBe(null);
     await act(async () => {
       expect(latest!.beginMutation()).toBe(true);
       latest!.finishMutation(null, new ApiError('Applied configuration changed', 409, {
-        detail: { code: 'observed_move_configuration_changed' },
+        detail: { code: 'observed_move_configuration_changed', effect: 'none' },
       }));
     });
     expect(latest!.unavailableReason).toBe(null);
@@ -389,12 +393,14 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.beginMutation()).toBe(false);
   });
 
-  it('releases the guard for a named observed-move refusal reported as 503', async () => {
+  it('releases the guard for a marked observed-move refusal reported as 503', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
     const message = 'current pose/joints could not be read: execution owner disconnected';
-    const refusal = new ApiError(message, 503, { detail: { code: 'observed_move_unavailable', message } });
+    const refusal = new ApiError(message, 503, {
+      detail: { code: 'observed_move_unavailable', message, effect: 'none' },
+    });
     expect(authoringRefusalMessage(refusal)).toBe(
       `Edit not applied: ${message}. Wait for the robot to report its current state, then try again.`,
     );
@@ -407,13 +413,59 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => { expect(latest!.beginMutation()).toBe(true); });
   });
 
+  it('leaves the editor usable after the live Copy current position refusal', async () => {
+    // The exact backend body: the observed-object resolver refuses a carried
+    // object before any Draft change, so it carries the before-effect marker.
+    const message = 'only one current cell-fixed object with one portable shape can be saved';
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ detail: { code: 'observed_scene_object_ineligible', message, effect: 'none' } }),
+      { status: 409, statusText: 'Conflict', headers: { 'Content-Type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api: realApi } = await vi.importActual<typeof import('../api/client')>('../api/client');
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
+    const fence = {
+      draftId: 'draft.1', expectedDraftRevision: 3,
+      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'copy.1',
+      expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
+    } as Parameters<typeof realApi.programWorkspace.mutate>[0];
+    const failure = await realApi.programWorkspace.mutate(
+      fence,
+      'program_draft_store_observed_scene_resource',
+      { scene_resource_id: 'part' },
+    ).then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(ApiError);
+    expect(authoringRefusalMessage(failure)).toBe(`Edit not applied: ${message}`);
+    await act(async () => latest!.finishMutation(null, failure));
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.editUnavailableReason).toBe(null);
+    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
+  });
+
+  it('keeps the guard locked for the same conflict without the before-effect marker', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation('edit')).toBe(true);
+      latest!.finishMutation(null, new ApiError('refused', 409, {
+        detail: { code: 'observed_scene_object_ineligible' },
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.beginMutation('edit')).toBe(false);
+  });
+
   it('releases the guard when Load or Save refuses a project with a leftover overrides.yaml', async () => {
     // The exact backend refusal body (routes_scenario_documents._raise), read
     // through the real client so the classification sees what production sees.
     const message = '/workspace/cell: Scenario parameter overrides (overrides.yaml) were removed; '
       + 'Program parameters always take their Program defaults.';
     const fetchMock = vi.fn(async () => new Response(
-      JSON.stringify({ detail: { code: 'scenario_artifact_version_unsupported', message } }),
+      JSON.stringify({ detail: { code: 'scenario_artifact_version_unsupported', message, effect: 'none' } }),
       { status: 409, statusText: 'Conflict', headers: { 'Content-Type': 'application/json' } },
     ));
     vi.stubGlobal('fetch', fetchMock);
@@ -445,6 +497,42 @@ describe('useAuthoringWorkspace', () => {
     }
     expect(fetchMock).toHaveBeenCalledTimes(2);
     // Authoring stays usable: the next change is admitted.
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it('releases a refused-before-effect stale fence without locking', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError('stale', 409, {
+        detail: { code: 'composer_draft_revision_stale', message: 'stale', effect: 'none' },
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it.each([
+    'program_saved_baseline_not_adopted',
+    'deployment_saved_baseline_not_adopted',
+    'scenario_saved_baseline_not_adopted',
+  ])('releases the guard for the definite written-but-not-adopted outcome %s', async (code) => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    // Written, then not read back or adopted: no before-effect marker, but a
+    // definite outcome naming the written path, so the editor never locks.
+    const message = 'The document was written to /workspace/cell, but it was not adopted as the Saved baseline';
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError(message, 409, {
+        detail: { code, message, path: '/workspace/cell', causeCode: 'scenario_source_invalid' },
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.unavailableReason).toBe(null);
     await act(async () => { expect(latest!.beginMutation()).toBe(true); });
   });
 

@@ -18,7 +18,8 @@
         "program_draft_revision": 2,
         "deployment_draft_id": "deployment-draft-1",
         "deployment_draft_revision": 4
-      }
+      },
+      "authoring_workspace_containment": null
     }
   },
   "invalid_overlays": [

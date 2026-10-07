@@ -303,6 +303,7 @@ import type {
   AlarmMotionAttentionMember,
   AlarmPriority,
   AlarmSubject,
+  AuthoringWorkspaceContainment,
   AuthoringWorkspaceIdentity,
   ComponentOverviewProjection,
   ComposerHeadlessState,
@@ -4792,9 +4793,12 @@ function parseCycleRecoveryOffer(
 
 function parseExecutionSelectionControls(value: unknown, path: string): ProgramExecutionSelectionControls {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['selection_revision', 'groups'], path);
+  exactKeysAt(record, ['selection_revision', 'motion_held', 'groups'], path);
   const selectionRevision = integerAt(record.selection_revision, `${path}.selection_revision`);
   if (selectionRevision < 0) return fail(path, 'a nonnegative selection revision');
+  // The backend derives the held-run Draft rule from it; Composer reads only
+  // that published rule (`held_run_draft_edit_allowed`).
+  booleanAt(record.motion_held, `${path}.motion_held`);
   let previous = '';
   const groups = boundedArrayAt(record.groups, `${path}.groups`, 4097).map((raw, index) => {
     const key = `${path}.groups[${index}]`;
@@ -4881,10 +4885,10 @@ export function parseProgramRuntimeControlProjection(
     'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v8') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v9') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v8',
+      'manyforge.program_runtime_control_projection.v9',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -7528,14 +7532,29 @@ export function parseAuthoringWorkspaceIdentity(
   };
 }
 
+/** The published containment of the authoring workspace, or ``null``. */
+export function parseAuthoringWorkspaceContainment(
+  value: unknown,
+  path = 'authoringWorkspaceContainment',
+): AuthoringWorkspaceContainment | null {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['cause', 'saved_path'], path);
+  return {
+    cause: stringAt(record.cause, `${path}.cause`),
+    savedPath: nullableStringAt(record.saved_path, `${path}.saved_path`),
+  };
+}
+
 export function parseComposerHeadlessState(
   value: unknown,
 ): ComposerHeadlessState {
   const record = objectAt(value, 'headlessState');
   exactKeysAt(record, [
     'schema_version', 'runtime', 'alarms', 'component_overview', 'authoring_admission',
+    'held_run_draft_edit_allowed',
     'execution_targets', 'execution_control_state', 'program_cycle',
-    'authoring_workspace', 'receiver_epoch',
+    'authoring_workspace', 'authoring_workspace_containment', 'receiver_epoch',
     'snapshot_sequence', 'complete',
   ], 'headlessState');
   const schemaVersion = stringAt(
@@ -7565,6 +7584,10 @@ export function parseComposerHeadlessState(
       authoringAllowed: booleanAt(admission.authoring_allowed, 'headlessState.authoring_admission.authoring_allowed'),
       admissionGeneration: positiveIntegerAt(admission.admission_generation, 'headlessState.authoring_admission.admission_generation'),
     },
+    heldRunDraftEditAllowed: booleanAt(
+      record.held_run_draft_edit_allowed,
+      'headlessState.held_run_draft_edit_allowed',
+    ),
     executionControlStatus: record.execution_targets === null
       && record.execution_control_state === null
       ? null
@@ -7576,6 +7599,10 @@ export function parseComposerHeadlessState(
     authoringWorkspace: parseAuthoringWorkspaceIdentity(
       record.authoring_workspace,
       'headlessState.authoring_workspace',
+    ),
+    authoringWorkspaceContainment: parseAuthoringWorkspaceContainment(
+      record.authoring_workspace_containment,
+      'headlessState.authoring_workspace_containment',
     ),
     receiverEpoch: stringAt(record.receiver_epoch, 'headlessState.receiver_epoch'),
     snapshotSequence: positiveIntegerAt(record.snapshot_sequence, 'headlessState.snapshot_sequence'),

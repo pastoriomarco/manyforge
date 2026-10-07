@@ -285,6 +285,7 @@ def test_local_draft_wake_emits_one_resequenced_latest_shell(
                 "deployment_draft_id": identity.deployment_draft_id,
                 "deployment_draft_revision": identity.deployment_draft_revision,
             },
+            "authoring_workspace_containment": None,
             "receiver_epoch": "composer.epoch.1",
             "schema_version": "manyforge.composer_headless_state.v2",
             "snapshot_sequence": 2,

@@ -3,8 +3,10 @@ import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import { sceneSourceIsDraft } from '../state/viewerPresentationDraft';
-import { DraftScenePreviewNotice } from './SceneAuthoringWorkspace';
+import { executionLocksObjectEditing, sceneSourceIsDraft } from '../state/viewerPresentationDraft';
+import type { LogicalSceneObject } from '../types/api';
+import type { ComposerHeadlessState } from '../types/headless';
+import { CopyObservedToDraftButton, DraftScenePreviewNotice } from './SceneAuthoringWorkspace';
 
 const NOTICE = 'Showing Draft Scene preview, not the collision scene used for motion.';
 
@@ -77,5 +79,122 @@ describe('Draft Scene preview notice', () => {
     expect(workspace).toMatch(
       /<DraftScenePreviewNotice\s+shown=\{programDraftPreview\}\s+onShowRuntimeScene=\{\(\) => setSceneSourceChoice\('applied'\)\}/,
     );
+  });
+});
+
+describe('Copy current position to Draft', () => {
+  const box: LogicalSceneObject['collision_shapes'][number] = {
+    type: 'box', dimensions_m: { x: 0.1, y: 0.1, z: 0.1 },
+  };
+  const resting: LogicalSceneObject = {
+    scene_resource_id: 'part',
+    collision_shapes: [box],
+    placement: {
+      kind: 'cell_fixed',
+      cell_id: 'cell',
+      pose_in_cell: { position_m: { x: 0.4, y: 0.1, z: 0.2 }, orientation_xyzw: [0, 0, 0, 1] },
+    },
+    provider_evidence: null,
+    support_contacts: [],
+  };
+  const carried: LogicalSceneObject = {
+    ...resting,
+    placement: {
+      kind: 'carried',
+      carried_object_attachment_id: 'attachment.1',
+      carried_object_attachment_revision: '1',
+    },
+  };
+  const button = (object: LogicalSceneObject | undefined, blockedReason: string | null = null) => {
+    const mutate = vi.fn(async () => null);
+    const element = CopyObservedToDraftButton({ object, blockedReason, mutate }) as ReactElement<{
+      disabled: boolean;
+      title: string;
+      onClick: () => void;
+    }>;
+    return { ...element.props, mutate };
+  };
+
+  it('is enabled only for a copyable object while Draft editing is allowed', () => {
+    const copy = button(resting);
+    expect(copy.disabled).toBe(false);
+    expect(copy.title).toContain('Copy this object as observed now in the live cell');
+    copy.onClick();
+    expect(copy.mutate).toHaveBeenCalledWith('program_draft_store_observed_scene_resource', {
+      scene_resource_id: 'part',
+    });
+  });
+
+  it('names why it is unavailable in its tooltip and sends nothing', () => {
+    const editing = 'Program execution is running; editing requires Idle or all Program motion stopped.';
+    const cases: Array<[LogicalSceneObject | undefined, string | null, string]> = [
+      // The shared Draft-edit admission wins over every object condition.
+      [resting, editing, editing],
+      [carried, editing, editing],
+      [carried, null, 'This object is Attached in the live cell; copy it once it is Detached.'],
+      [{ ...resting, collision_shapes: [box, box] }, null,
+        'Only a live object with exactly one collision shape can be copied.'],
+      [undefined, null, 'This object is not in the live cell.'],
+    ];
+    for (const [object, blockedReason, reason] of cases) {
+      const copy = button(object, blockedReason);
+      expect(copy.disabled).toBe(true);
+      expect(copy.title).toBe(reason);
+      copy.onClick();
+      expect(copy.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it('follows the same Draft-edit admission in the editor and the read-only live panel', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(workspace).toContain('const draftEditBlocked = busyDraft || !programController.mutationAvailable;');
+    expect(workspace).toContain("blockedReason={busy ? busyReason ?? 'The Program Draft cannot be edited now.' : null}");
+    expect(workspace).toContain('blockedReason={draftEditBlocked ? draftEditBlockReason : null}');
+  });
+});
+
+describe('viewer object panel during a Program run', () => {
+  const cycle = (state: string, heldRunDraftEditAllowed: boolean) => ({
+    programCycle: { state }, heldRunDraftEditAllowed,
+  }) as unknown as ComposerHeadlessState;
+  /**
+   * The object panel's editability as the workspace derives it (wiring pinned
+   * below), with the Draft itself editable: the Program workspace admits a
+   * held-run edit through the same published fact.
+   */
+  const panelEditable = (snapshot: ComposerHeadlessState, draftDiffersFromApplied: boolean) => {
+    const executionActive = executionLocksObjectEditing(snapshot);
+    const draftSceneEditable = !executionActive
+      && sceneSourceIsDraft('draft', true, true, true, draftDiffersFromApplied);
+    const draftPreview = !executionActive
+      && sceneSourceIsDraft('auto', true, true, true, draftDiffersFromApplied);
+    return draftSceneEditable && (draftPreview || !draftDiffersFromApplied);
+  };
+
+  it('edits objects in a run whose Program motion is confirmed stopped', () => {
+    for (const differs of [false, true]) {
+      expect(panelEditable(cycle('running', true), differs)).toBe(true);
+      expect(panelEditable(cycle('idle_after_reset', false), differs)).toBe(true);
+    }
+  });
+
+  it('is read-only in a run whose motion is not confirmed stopped', () => {
+    for (const differs of [false, true]) {
+      expect(panelEditable(cycle('running', false), differs)).toBe(false);
+    }
+  });
+
+  it('derives the object panel from the published held-run fact', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(workspace).toContain('const executionActive = executionLocksObjectEditing(headlessState.snapshot);');
+    expect(workspace).toContain('const draftSceneEditable = !executionActive && sceneSourceIsDraft(');
+    expect(workspace).toMatch(/const objectsEditable = draftSceneEditable\s+&& \(programDraftPreview \|\| !draftDiffersFromApplied\);/);
+    expect(workspace).toContain('objectControlSurface={objectControlSurface(objectsEditable)}');
   });
 });

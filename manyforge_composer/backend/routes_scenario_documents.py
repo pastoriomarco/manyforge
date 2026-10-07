@@ -19,7 +19,15 @@ from manyforge_behavior.model_source_capture import (
 from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field
 
-from .authoring_admission import AuthoringMutationEnvelope, headless_client_http_exception
+from .authoring_admission import (
+    AuthoringMutationEnvelope,
+    OperationEffects,
+    draft_session_http_exception,
+    headless_client_http_exception,
+    raise_operation_failure,
+    raise_save_failure,
+    scenario_artifact_http_exception,
+)
 from .authoring_forest import (
     AuthoringForestError,
     derive_candidate,
@@ -136,26 +144,20 @@ class ExportScenarioDocumentRequest(_ScenarioFence):
 
 def _raise(error: Exception) -> NoReturn:
     if isinstance(error, ModelSourceCaptureError):
-        raise HTTPException(status_code=409, detail={
-            "code": "scenario_model_source_unavailable", "message": str(error),
-        }) from error
+        raise scenario_artifact_http_exception(ScenarioArtifactError(
+            "scenario_model_source_unavailable", str(error), status_code=409,
+        )) from error
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
     if isinstance(error, ScenarioArtifactError):
-        raise HTTPException(
-            status_code=error.status_code,
-            detail={"code": error.code, "message": str(error)},
-        ) from error
+        raise scenario_artifact_http_exception(error) from error
     if isinstance(error, DeploymentDraftError):
         raise HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
         ) from error
     if isinstance(error, DraftSessionError):
-        raise HTTPException(
-            status_code=error.status_code,
-            detail={"code": error.code, "message": str(error)},
-        ) from error
+        raise draft_session_http_exception(error) from error
     if isinstance(error, AuthoringForestError):
         raise HTTPException(
             status_code=400,
@@ -166,6 +168,11 @@ def _raise(error: Exception) -> NoReturn:
             status_code=409,
             detail={"code": error.code, "message": str(error)},
         ) from error
+    if isinstance(error, AuthoringWorkspaceError):
+        detail: dict[str, Any] = {"code": error.code, "message": str(error)}
+        if isinstance(error.detail, dict) and "workspace" in error.detail:
+            detail["workspace"] = error.detail["workspace"]
+        raise HTTPException(status_code=error.status_code, detail=detail) from error
     raise error
 
 
@@ -332,6 +339,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     @router.post("/api/scenario-documents/save")
     def save_document(body: SaveScenarioDocumentRequest) -> dict[str, Any]:
         saved_path: str | None = None
+        # The one effect record of this Save: the HTTP outcome and the claim
+        # settlement both come from it, never from an error code.
+        effects = OperationEffects()
         try:
             _require_fence(state, body)
             # One immutable composite capture: the project written and the saved
@@ -433,7 +443,10 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         allowed_roots=state.allowed_fs_roots,
                         overwrite=overwrite,
                         source_project_path=source_project_root,
+                        effects=effects,
                     )
+                # Readback of the published project; its failure is a
+                # definite "written but not adopted" outcome.
                 captured, _, source_digest = capture_scenario_artifact(
                     saved_path, allowed_roots=state.allowed_fs_roots
                 )
@@ -455,7 +468,21 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 session="whole-workspace",
                 install=install_saved_baselines,
                 prepare_project_under_claim=prepare_saved_project,
+                effects=effects,
             )
+        except Exception as error:
+            # Not saved: the marker. Saved but not read back or adopted: the
+            # definite outcome naming the written project, so newer in-memory
+            # content is never labelled Saved. Otherwise unverified.
+            raise_save_failure(
+                error,
+                effects,
+                _raise,
+                code="scenario_saved_baseline_not_adopted",
+                document="Scenario project",
+            )
+        # The project is written and adopted as Saved from here on.
+        try:
             if saved_path is None:
                 raise ScenarioArtifactError(
                     "scenario_saved_path_unavailable",
@@ -463,32 +490,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     status_code=503,
                 )
             workspace = program_workspace(state)
-            return {
-                "status": "saved",
-                "path": saved_path,
-                "scenario_id": body.scenario_id,
-                "last_known_status": document["saved_status"]["last_known_status"],
-                "workspace": workspace,
-            }
-        except AuthoringWorkspaceError as error:
-            if error.code != "composer_workspace_stale":
-                _raise(error)
-            # The project is correctly written; only the Saved baseline is
-            # refused, so newer in-memory content is never labelled Saved.
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "scenario_saved_baseline_not_adopted",
-                    "message": (
-                        "the Scenario project was written but a newer "
-                        "workspace revision was not adopted as Saved"
-                    ),
-                    "path": saved_path,
-                    "currentWorkspace": error.detail.get("workspace"),
-                },
-            ) from error
         except Exception as error:
             _raise(error)
+        return {
+            "status": "saved",
+            "path": saved_path,
+            "scenario_id": body.scenario_id,
+            "last_known_status": document["saved_status"]["last_known_status"],
+            "workspace": workspace,
+        }
 
     @router.post("/api/scenario-documents/load")
     def load_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
@@ -504,6 +514,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         committed_snapshot = None
         activation: dict[str, Any] | None = None
         creating = isinstance(body, NewScenarioDocumentRequest)
+        effects = OperationEffects()
         try:
             _require_fence(state, body)
             captured_workspace = state.authoring_workspace.snapshot()
@@ -771,6 +782,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     created_path = save_scenario_artifact(
                         scenario_document, source_path, allowed_roots=state.allowed_fs_roots,
                         overwrite=False, expected_source_digest=source_digest,
+                        effects=effects,
                     )
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
@@ -818,6 +830,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 submit=submit_load,
                 commit_before_submit=commit_load,
                 after_release=state.authoring_workspace.publish_commit_wake,
+                effects=effects,
             )
             workspace = program_workspace(state)
             return {
@@ -834,6 +847,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "authoringWorkspace": committed_snapshot.as_dict(),
             }
         except Exception as error:
+            if created_path is None and effects.published_path is not None:
+                created_path = effects.published_path
             if created_path is not None:
                 raise HTTPException(status_code=503, detail={
                     "code": "scenario_created_not_activated",
@@ -868,10 +883,11 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "workspace": committed_snapshot.identity.as_dict(),
                     },
                 ) from error
-            _raise(error)
+            raise_operation_failure(error, effects, _raise)
 
     @router.post("/api/scenario-documents/export")
     def export_document(body: ExportScenarioDocumentRequest) -> dict[str, Any]:
+        effects = OperationEffects()
         try:
             _require_fence(state, body)
             # Export reads one immutable composite capture and never changes the
@@ -923,10 +939,11 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     state.deployment_draft_session.source_project_root or source_path
                 ),
                 allowed_roots=state.allowed_fs_roots,
+                effects=effects,
             )
             return {"status": "exported", "path": exported_path}
         except Exception as error:
-            _raise(error)
+            raise_operation_failure(error, effects, _raise)
 
     return router
 

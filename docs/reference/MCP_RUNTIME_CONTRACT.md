@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-02 12:41:47 UTC
+  Last regenerated: 2026-10-06 18:51:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1676,19 +1676,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "additionalProperties": true,
             "title": "Arguments",
             "type": "object"
-          },
-          "correlationId": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlationid"
           },
           "draftId": {
             "maxLength": 256,
@@ -4716,6 +4703,96 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
   "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
   "inputSchema": {
     "$defs": {
+      "ActivationScope": {
+        "additionalProperties": false,
+        "description": "The complete activation input an operator confirmed.\n\nDeployment activation compiles the Deployment Draft together with the\ncurrent Program Draft, the Scenario's Program role assignment and its\nsource document. A confirmation names all of them; any change before the\nApply is sent refuses it so the operator reviews the new input.",
+        "properties": {
+          "deploymentDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Deploymentdraftid",
+            "type": "string"
+          },
+          "deploymentDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Deploymentdraftrevision",
+            "type": "integer"
+          },
+          "deploymentRevision": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deploymentrevision"
+          },
+          "programDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Programdraftid",
+            "type": "string"
+          },
+          "programDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Programdraftrevision",
+            "type": "integer"
+          },
+          "programRevision": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Programrevision"
+          },
+          "programRoleAssignment": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Programroleassignment"
+          },
+          "sourceDocumentDigest": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcedocumentdigest"
+          }
+        },
+        "required": [
+          "deploymentDraftId",
+          "deploymentDraftRevision",
+          "deploymentRevision",
+          "programDraftId",
+          "programDraftRevision",
+          "programRevision",
+          "sourceDocumentDigest",
+          "programRoleAssignment"
+        ],
+        "title": "ActivationScope",
+        "type": "object"
+      },
       "ApplyDeploymentCandidateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -4733,11 +4810,34 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Confirmationtoken"
           },
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
             "title": "Draftid",
             "type": "string"
+          },
+          "expectedActivationScope": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ActivationScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "expectedAdmissionGeneration": {
             "maximum": 9007199254740991.0,

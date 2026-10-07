@@ -2317,6 +2317,65 @@ def test_initial_motion_run_releases_ready_scope_without_recovery():
     assert running["stop_allowed"]
 
 
+def test_motion_held_counts_only_effectful_nodes_and_settled_holds():
+    """The owner fact a held-run Draft edit relies on: every effectful node is
+    held by the Kernel (never released, or stopped and certified), whatever
+    the non-effectful control-flow nodes are doing."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    phases: dict[str, list[int]] = {}
+    read = scope.execution_scope
+
+    def execution_scope(program_run_id: str) -> dict[str, Any]:
+        return {
+            **read(program_run_id),
+            **{
+                f"{phase}_node_indices": phases.get(phase, [])
+                for phase in ("ready", "held", "stopping", "faulted")
+            },
+        }
+
+    def stop_selection(request: Mapping[str, Any]) -> dict[str, Any]:
+        scope.selection_revision += 1
+        return {
+            "state": execution_scope(request["program_run_id"]),
+            "selection_error": None,
+        }
+
+    scope.execution_scope = execution_scope
+    scope.stop_selection = stop_selection
+    # Executed, never Run: the Kernel holds the effectful nodes Ready; the
+    # control-flow node is not held (the live case: `all` is `ready` with
+    # fewer held than captured nodes).
+    phases.update(ready=[0, 1])
+    run_id = owner.start(admission).capture.program_run_id
+    controls = owner.execution_selection_controls(run_id)
+    group = controls["groups"][0]
+    assert scope.node_count == 3
+    assert (group["group_id"], group["state"]) == ("all", "ready")
+    assert (group["node_count"], group["held_node_count"]) == (3, 2)
+    assert controls["motion_held"] is True
+
+    def published(current: dict[str, list[int]]) -> dict[str, Any]:
+        phases.clear()
+        phases.update(current)
+        owner.stop_motion(run_id)
+        return owner.execution_selection_controls(run_id)
+
+    # Run, then a whole-Program Stop that settled: every effectful node is
+    # Held while control flow keeps running, so `all` is only `mixed`.
+    stopped = published({"held": [0, 1]})
+    assert stopped["groups"][0]["state"] == "mixed"
+    assert stopped["motion_held"] is True
+    # Never-started and stopped work alike stay held.
+    assert published({"ready": [0], "held": [1]})["motion_held"] is True
+    # Still stopping, faulted, or one effectful node released: not held.
+    assert published({"held": [0], "stopping": [1]})["motion_held"] is False
+    assert published({"held": [0], "faulted": [1]})["motion_held"] is False
+    assert published({"held": [0]})["motion_held"] is False
+
+
 def test_operator_alarm_refusal_keeps_the_kernel_code_and_releases_nothing():
     owner, admission, task, scope, events = _fixture(
         initial_task_state=OwnerTaskState.ACTIVE

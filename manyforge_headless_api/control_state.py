@@ -33,6 +33,7 @@ from .control_protocol import (
 )
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
+from .held_run_authoring import held_run_draft_edit_allowed
 from .native import HeadlessApiError, strict_json_object
 from .program_cycle import (
     PROGRAM_CONTROL_STATE_SCHEMA,
@@ -267,6 +268,7 @@ def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
         control_shell_fact_key(shell, "runtime"),
         control_shell_fact_key(shell, "alarms"),
         control_shell_fact_key(shell, "authoring_admission"),
+        control_shell_fact_key(shell, "held_run_draft_edit_allowed"),
         control_shell_fact_key(shell, "execution_targets"),
         control_shell_fact_key(shell, "execution_control_state"),
         control_shell_fact_key(shell, "component_overview"),
@@ -1124,6 +1126,12 @@ class HeadlessControlStateSource:
             "alarms": dict(facts.alarms),
             "component_overview": facts.reduce(),
             "authoring_admission": dict(facts.authoring_admission),
+            # Beside the Kernel's Idle admission: whether the existing
+            # Program run leaves the Draft editable (one rule, also applied
+            # by Composer to every Draft edit).
+            "held_run_draft_edit_allowed": held_run_draft_edit_allowed(
+                facts.program_cycle, control
+            ),
             "execution_targets": targets,
             "execution_control_state": control,
             "program_cycle": dict(facts.program_cycle),

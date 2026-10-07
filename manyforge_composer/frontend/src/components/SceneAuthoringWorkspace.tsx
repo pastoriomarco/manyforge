@@ -62,6 +62,7 @@ import {
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
+  executionLocksObjectEditing,
   sceneSourceIsDraft,
   programViewerMetadata,
   viewerPresentationDraftFromProgram,
@@ -811,8 +812,15 @@ function SceneShapeFields({
   );
 }
 
-/** Why the live object cannot be copied into the Draft, or null when it can. */
-function observedCopyUnavailableReason(object: LogicalSceneObject | undefined): string | null {
+/**
+ * Why the live object cannot be copied into the Draft, or null when it can.
+ * Mirrors the backend resolver's conditions for display only; the backend
+ * stays the authority. A parsed cell-fixed object always has a complete pose
+ * (finite position, non-zero quaternion), so that condition needs no check.
+ */
+function observedCopyUnavailableReason(
+  object: LogicalSceneObject | undefined,
+): string | null {
   if (object === undefined) return 'This object is not in the live cell.';
   if (object.placement.kind !== 'cell_fixed') {
     return 'This object is Attached in the live cell; copy it once it is Detached.';
@@ -823,8 +831,12 @@ function observedCopyUnavailableReason(object: LogicalSceneObject | undefined): 
   return null;
 }
 
-/** The single capture action: the object as observed now in the live cell, into the Draft. */
-function CopyObservedToDraftButton({
+/**
+ * The single capture action: the object as observed now in the live cell, into
+ * the Draft. Enabled only while Draft editing is allowed (the same admission
+ * as every other Draft edit) and the object is copyable.
+ */
+export function CopyObservedToDraftButton({
   object,
   blockedReason,
   mutate,
@@ -1613,10 +1625,14 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   const ownerSceneKnown = presentationFacts !== null;
   // Every object edit goes into the Program Draft. The viewer presents the
   // Draft Scene only while it has unapplied changes (the same comparison the
-  // top bar uses for Discard); otherwise the runtime Scene, which then equals
-  // the Draft and is edited through it. While execution is not Idle the Draft
-  // cannot be edited, and runtime Scene changes (carried or moved objects) are
-  // real: only the live Scene is shown.
+  // top bar uses for Discard); otherwise the runtime Scene, which is edited
+  // through the Draft. Objects are editable while Idle and in a run whose
+  // Program motion is confirmed stopped (`heldRunDraftEditAllowed`). In such a
+  // run with no unapplied changes the live view shows the objects' current
+  // positions (the run may have moved them), and an edit writes that object's
+  // current pose plus the change into the Draft: a Draft declaration of where
+  // the object is from now on. In any other run the Draft cannot be edited
+  // and only the live Scene is shown.
   const draftDiffersFromApplied = programController.state.workspace?.hasUnappliedChanges === true;
   const [sceneSourceChoice, setSceneSourceChoice] = useState<'auto' | 'draft' | 'applied'>('auto');
   // The manual toggle is a pure view override that never sticks: it resets
@@ -2250,8 +2266,9 @@ export function SceneAuthoringWorkspace({
   runtimeOverlay,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
-  const executionActive = headlessState.snapshot !== null
-    && headlessState.snapshot.programCycle.state !== 'idle_after_reset';
+  // Object editing follows the one owner-published rule: a run whose Program
+  // motion is confirmed stopped admits Draft edits like Idle does.
+  const executionActive = executionLocksObjectEditing(headlessState.snapshot);
   const programWorkspace = programController.state.workspace;
   const program = programWorkspace?.draft.authoring ?? null;
   const viewer = program?.viewer;

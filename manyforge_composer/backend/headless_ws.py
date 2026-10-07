@@ -112,7 +112,9 @@ class HeadlessStateSource:
             subscription.loop.call_soon_threadsafe(subscription.wake.set)
 
     def _local_shell(self, *, complete: bool) -> dict[str, Any]:
-        identity = self._workspace.identity()
+        # A contained workspace still publishes its last identity beside the
+        # containment, so every client shows it without attempting an edit.
+        identity, containment = self._workspace.publication()
         self._local_revision += 1
         return {
             "complete": complete,
@@ -124,6 +126,7 @@ class HeadlessStateSource:
                 "deployment_draft_id": identity.deployment_draft_id,
                 "deployment_draft_revision": identity.deployment_draft_revision,
             },
+            "authoring_workspace_containment": containment,
             "receiver_epoch": self._admission.receiver_epoch,
             "schema_version": "manyforge.composer_headless_state.v2",
             "snapshot_sequence": self._local_revision,

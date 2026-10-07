@@ -10,7 +10,7 @@ from pathlib import PurePosixPath
 import re
 import shutil
 import stat
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 import uuid
 
 from fastapi import HTTPException
@@ -40,6 +40,9 @@ from .deployment_intent import (
     rebase_deployment_intent_sources,
     validate_deployment_intent,
 )
+
+if TYPE_CHECKING:
+    from .authoring_admission import OperationEffects
 
 
 SCENARIO_API_VERSION = "manyforge.scenario.authoring.v3"
@@ -74,7 +77,7 @@ def _refuse_removed_overrides_member(directory_fd: int, *, source: str) -> None:
         status_code=409,
     )
 SCENARIO_SAVE_MARKER = ".manyforge-save-pending.json"
-# Save failed after it created or started writing the project.
+# Save failed after it created the project or published a file in it.
 SCENARIO_SAVE_INCOMPLETE = "scenario_artifact_save_incomplete"
 SCENARIO_SOURCE_SNAPSHOT_VERSION = "manyforge.scenario.source_snapshot.v1"
 _SCENARIO_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
@@ -866,21 +869,36 @@ def save_scenario_artifact(
     overwrite: bool,
     source_project_path: str | None = None,
     expected_source_digest: str | None = None,
+    effects: OperationEffects | None = None,
 ) -> str:
+    """Publish one project; record each destination effect in ``effects``.
+
+    The destination first changes when the project directory is created or the
+    save marker is published (each an atomic step). Until then a failure left
+    the destination unchanged and keeps its own code. After it, a failure is
+    ``scenario_artifact_save_incomplete``: the destination is captured and
+    compared with the intended file identity, and recorded as published only
+    when it holds exactly the intended document; otherwise the left save
+    marker is the durable interruption evidence.
+    """
+
     roots = _roots(allowed_roots)
     _prepared_document, target, member_bytes, manifest_raw = prepare_scenario_artifact(
         document, raw_path, allowed_roots=roots, source_project_path=source_project_path
     )
-    if expected_source_digest is not None and prepared_scenario_source_digest(member_bytes, manifest_raw) != expected_source_digest:
+    intended_digest = prepared_scenario_source_digest(member_bytes, manifest_raw)
+    if expected_source_digest is not None and intended_digest != expected_source_digest:
         _fail("scenario_artifact_changed", "Scenario sources changed before creation", status_code=409)
     parent = target.parent
     parent_fd = -1
     project_fd = -1
-    # Set once the target can differ from before this call (a created project
-    # directory or a started member write). A failure from then on has one
-    # distinct code, so a pre-write refusal code never also means "partially
-    # written"; the left save marker is the durable interruption evidence.
     effect_started = False
+
+    def destination_changed() -> None:
+        nonlocal effect_started
+        effect_started = True
+        if effects is not None:
+            effects.destination_changed(str(target))
     try:
         parent_fd = os.open(
             parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -901,7 +919,7 @@ def save_scenario_artifact(
                     "Scenario project appeared and requires confirmation",
                     status_code=409,
                 )
-            effect_started = True
+            destination_changed()
             os.fsync(parent_fd)
         else:
             if not stat.S_ISDIR(existing.st_mode):
@@ -945,8 +963,10 @@ def save_scenario_artifact(
             },
             label=SCENARIO_SAVE_MARKER,
         )
-        effect_started = True
+        # An atomic replacement: it either published the marker or left the
+        # destination unchanged.
         _replace_regular_at(project_fd, SCENARIO_SAVE_MARKER, marker)
+        destination_changed()
         os.fsync(project_fd)
         for filename, raw in sorted(member_bytes.items()):
             _replace_regular_at(project_fd, filename, raw)
@@ -954,9 +974,20 @@ def save_scenario_artifact(
         os.fsync(project_fd)
         os.unlink(SCENARIO_SAVE_MARKER, dir_fd=project_fd)
         os.fsync(project_fd)
+        if effects is not None:
+            effects.destination_published(str(target))
         return str(target)
     except (ScenarioArtifactError, OSError) as error:
         if effect_started:
+            if effects is not None:
+                try:
+                    _captured, _source, published_digest = capture_scenario_artifact(
+                        str(target), allowed_roots=roots
+                    )
+                except (ScenarioArtifactError, OSError):
+                    published_digest = None
+                if published_digest == intended_digest:
+                    effects.destination_published(str(target))
             raise ScenarioArtifactError(
                 SCENARIO_SAVE_INCOMPLETE,
                 f"Scenario project {target} may be partially written: {error}",
@@ -978,11 +1009,14 @@ def save_scenario_member(
     value: dict[str, Any],
     *,
     allowed_roots: list[str],
+    effects: OperationEffects | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     """Save one authored member through the project's manifest-owning writer.
 
     Other members come from disk, never from unrelated unsaved Drafts. Capture
-    rejects an interrupted project rather than overwriting its evidence.
+    rejects an interrupted project rather than overwriting its evidence. The
+    write records its destination effects in ``effects``; a failure of the
+    final readback follows a recorded publication.
     """
     if field not in {"program_draft", "deployment_draft"}:
         raise ValueError("unsupported Scenario member")
@@ -1002,7 +1036,7 @@ def save_scenario_member(
     }
     save_scenario_artifact(
         document, path, allowed_roots=allowed_roots, overwrite=True,
-        source_project_path=path,
+        source_project_path=path, effects=effects,
     )
     return capture_scenario_artifact(path, allowed_roots=allowed_roots)
 
@@ -1119,8 +1153,13 @@ def export_scenario_artifact(
     *,
     source_project_path: str,
     allowed_roots: list[str],
+    effects: OperationEffects | None = None,
 ) -> str:
-    """Create one self-contained project without changing the source project."""
+    """Create one self-contained project without changing the source project.
+
+    Only a private staging copy is written before the one atomic rename that
+    publishes the destination; that rename is recorded in ``effects``.
+    """
 
     roots = _roots(allowed_roots)
     source_project = _existing_project(source_project_path, roots)
@@ -1235,6 +1274,8 @@ def export_scenario_artifact(
                 "Exported project did not reopen from its local dependencies",
             )
         os.replace(temporary, target)
+        if effects is not None:
+            effects.destination_published(str(target))
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent_fd)

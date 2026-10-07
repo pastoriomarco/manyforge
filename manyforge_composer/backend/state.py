@@ -34,6 +34,7 @@ from .authoring_admission import (
     AuthoringAdmissionCoordinator,
     AuthoringOperationError,
     AuthoringMutationEnvelope,
+    headless_client_http_exception,
 )
 from .authoring_forest import from_program
 from .authoring_identity import canonical_digest
@@ -1238,22 +1239,41 @@ class ComposerState:
         assert self.headless_client is not None
         phases: dict[str, float] = {}
         started = time.monotonic()
-        response = self.headless_client.prepare_activation(
-            {
-                "source_document_digest": intent["source_document_digest"],
-                "scenario_id": intent["scenario_id"],
-                "captured_input_digest": intent["captured_input_digest"],
-                "deployment": deepcopy(intent["deployment"]),
-                "model_source_closure": deepcopy(intent["model_source_closure"]),
-                "program": deepcopy(intent["program"]),
-                "program_role_assignment": deepcopy(
-                    intent["program_role_assignment"]
-                ),
-                "expected_admission_generation": intent[
-                    "expected_admission_generation"
-                ],
-            }
-        )
+        try:
+            response = self.headless_client.prepare_activation(
+                {
+                    "source_document_digest": intent["source_document_digest"],
+                    "scenario_id": intent["scenario_id"],
+                    "captured_input_digest": intent["captured_input_digest"],
+                    "deployment": deepcopy(intent["deployment"]),
+                    "model_source_closure": deepcopy(
+                        intent["model_source_closure"]
+                    ),
+                    "program": deepcopy(intent["program"]),
+                    "program_role_assignment": deepcopy(
+                        intent["program_role_assignment"]
+                    ),
+                    "expected_admission_generation": intent[
+                        "expected_admission_generation"
+                    ],
+                }
+            )
+        except HeadlessClientError as error:
+            if (
+                claim is None
+                and error.status_code is not None
+                and 400 <= error.status_code < 500
+            ):
+                # Unclaimed preparation is effect-free and precedes every
+                # claim, workspace commit and Manager submission of its
+                # request, and the preparer answered with a definite refusal:
+                # nothing changed. A lost or failed answer, or any failure
+                # under a claim, proves no such thing, so only this call site
+                # marks it, from where it is, never from its code.
+                raise headless_client_http_exception(
+                    error, before_effect=True
+                ) from error
+            raise
         prepared_activation = response.get("prepared_activation")
         if not isinstance(prepared_activation, dict) or any(
             field not in prepared_activation for field in _PREPARED_ACTIVATION_FIELDS

@@ -48,7 +48,11 @@ import {
   useOperationalErrorMirror,
   useOperationalErrors,
 } from './state/operationalErrors';
-import { authoringUnavailableCause, requiredComponentFaultNotices } from './state/authoringWorkspace';
+import {
+  authoringContainmentNotices,
+  authoringUnavailableCause,
+  requiredComponentFaultNotices,
+} from './state/authoringWorkspace';
 import {
   managerApplySettlementKey,
   sameManagerApply,
@@ -598,7 +602,10 @@ export default function App() {
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
     : null;
   const operationNotices = useMemo<WorkbenchNotice[]>(() => {
-    const notices: WorkbenchNotice[] = requiredComponentFaultNotices(headlessSnapshot);
+    const notices: WorkbenchNotice[] = [
+      ...requiredComponentFaultNotices(headlessSnapshot),
+      ...authoringContainmentNotices(headlessSnapshot),
+    ];
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];

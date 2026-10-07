@@ -226,7 +226,9 @@ export function useDeploymentWorkspace(
     } catch (reason: unknown) {
       authoring.finishMutation(null, reason);
       const message = errorMessage(reason, 'Deployment authoring request failed.');
-      const refusal = authoringRefusalMessage(reason);
+      // A stale fence is also refused before any effect, but it needs the
+      // refresh below, so it is never handled as a plain refusal.
+      const refusal = isStaleWorkspaceError(reason) ? null : authoringRefusalMessage(reason);
       if (refusal !== null) {
         if (mounted.current) setFeedback(refusal);
         return null;
@@ -316,7 +318,9 @@ export function useDeploymentWorkspace(
       // action instead of leaving a disabled confirmation overlay behind.
       if (mounted.current) setPendingApplyConfirmation(null);
       pendingConfirmationContext.current = null;
-      const refusal = authoringRefusalMessage(reason);
+      // A stale fence is also refused before any effect, but it needs the
+      // refresh below, so it is never handled as a plain refusal.
+      const refusal = isStaleWorkspaceError(reason) ? null : authoringRefusalMessage(reason);
       if (refusal !== null) {
         if (mounted.current) setFeedback(refusal);
         return null;

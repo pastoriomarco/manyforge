@@ -175,6 +175,16 @@ export interface AuthoringWorkspaceIdentity {
   deploymentDraftRevision: number;
 }
 
+/**
+ * The authoring workspace was contained after an in-memory install violated
+ * its contract. It persists until Composer restarts (a normal cold start).
+ */
+export interface AuthoringWorkspaceContainment {
+  cause: string;
+  /** The file the containing operation wrote first, or ``null``. */
+  savedPath: string | null;
+}
+
 export interface ComposerHeadlessState {
   schemaVersion: 'manyforge.composer_headless_state.v2';
   complete: true;
@@ -185,6 +195,12 @@ export interface ComposerHeadlessState {
     authoringAllowed: boolean;
     admissionGeneration: number;
   };
+  /**
+   * The backend's one held-run rule: a Program run exists, nothing of it is
+   * moving and nothing can start, so a Draft edit is admitted (the backend
+   * applies the same rule to each edit).
+   */
+  heldRunDraftEditAllowed: boolean;
   executionControlStatus: ExecutionOwnerStatus | null;
   programCycle: ProgramCycleStatus;
   /**
@@ -194,6 +210,8 @@ export interface ComposerHeadlessState {
    * Deployment edit all advance the same workspace revision.
    */
   authoringWorkspace: AuthoringWorkspaceIdentity;
+  /** Published with the identity; non-null while authoring is contained. */
+  authoringWorkspaceContainment: AuthoringWorkspaceContainment | null;
   receiverEpoch: string;
   snapshotSequence: number;
 }

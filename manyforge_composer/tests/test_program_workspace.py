@@ -71,6 +71,7 @@ class _AuthoringPassThrough:
         install=None,
         expected_identity=None,
         project=None,
+        validate_under_claim=None,
         prepare_project_under_claim=None,
         **_kwargs,
     ):
@@ -82,6 +83,8 @@ class _AuthoringPassThrough:
         ``test_authoring_admission.py`` and ``test_authoring_local_mutation.py``.
         """
 
+        if validate_under_claim is not None:
+            validate_under_claim()
         if prepare_project_under_claim is not None:
             project = prepare_project_under_claim()
         if session == "whole-workspace":
@@ -543,6 +546,7 @@ def test_observed_move_names_each_refusal_cause_before_any_draft_change(
     detail = response.json()["detail"]
     assert detail["code"] == code
     assert message in detail["message"]
+    assert detail["effect"] == "none"
     monkeypatch.undo()
     after = state.draft_session.workspace_snapshot()
     assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
@@ -636,6 +640,7 @@ def test_observed_move_names_a_failed_robot_pose_read_before_any_draft_change(
     assert detail["code"] == "observed_move_unavailable"
     assert "could not be read: execution owner disconnected" in detail["message"]
     assert detail["context"] == {"headless_code": "headless_unavailable"}
+    assert detail["effect"] == "none"
     monkeypatch.undo()
     after = state.draft_session.workspace_snapshot()
     assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
@@ -832,6 +837,100 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
     }
     assert resource["pose"]["position_m"] == [1.0, 2.0, 3.0]
     assert identity["transaction_sequence"] == 7
+
+
+def _carried_scene() -> dict:
+    return {"logical_scene": {
+        "access": {"active_projection": {"retained_bundle_id": "bundle"}},
+        "snapshot": {"transaction_sequence": 7, "objects": [{
+            "scene_resource_id": "part",
+            "placement": {
+                "kind": "carried",
+                "carried_object_attachment_id": "attachment.1",
+                "carried_object_attachment_revision": "1",
+            },
+            "collision_shapes": [{"type": "box", "dimensions_m": {"x": 0.1, "y": 0.1, "z": 0.1}}],
+            "provider_evidence": None,
+            "support_contacts": [],
+        }]},
+    }}
+
+
+@pytest.mark.parametrize(
+    ("scene", "status", "code"),
+    [
+        # The live case: a carried object is not eligible.
+        pytest.param(_carried_scene, 409, "observed_scene_object_ineligible", id="carried"),
+        pytest.param(None, 503, "observed_scene_unavailable", id="scene-read-failed"),
+    ],
+)
+def test_observed_scene_refusal_is_marked_no_effect_and_logged_by_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scene,
+    status: int,
+    code: str,
+) -> None:
+    class Headless:
+        def scene(self) -> dict:
+            if scene is None:
+                raise HeadlessClientError(
+                    "headless_unavailable", "scene owner disconnected", 503,
+                )
+            return scene()
+
+        def node_environment(self) -> dict:
+            return _node_environment_projection()
+
+    program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
+    state = _enable_authoring(ComposerState(program=program))
+    state.headless_client = Headless()  # type: ignore[assignment]
+    state.execution_observation_source = ExecutionObservationSource(
+        state.headless_client  # type: ignore[arg-type]
+    )
+    workspace = state.draft_session.workspace_snapshot()
+
+    def prepare_mutation(**_kwargs):
+        raise AssertionError("a refused copy must not prepare a Draft change")
+
+    monkeypatch.setattr(state.draft_session, "prepare_mutation", prepare_mutation)
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+
+    with caplog.at_level("INFO", logger="manyforge_composer.backend.app"):
+        response = client.post(
+            "/api/program/draft/mutations",
+            json={
+                **_fence(workspace),
+                "mutation": "program_draft_store_observed_scene_resource",
+                "arguments": {"scene_resource_id": "part"},
+            },
+        )
+
+    assert response.status_code == status, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == code
+    # Refused before any Draft change: the client must not lock the editor.
+    assert detail["effect"] == "none"
+    logged = [
+        record for record in caplog.records
+        if getattr(record, "path", None) == "/api/program/draft/mutations"
+    ]
+    assert [record.status_code for record in logged] == [status]
+    # Only the code reaches the request log, never the message.
+    assert logged[0].error_code == code
+    assert detail["message"] not in logged[0].getMessage()
+    monkeypatch.undo()
+    after = state.draft_session.workspace_snapshot()
+    assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
 
 
 def test_assistant_scene_proposal_honours_reviewed_filters_and_overrides(
@@ -1219,6 +1318,137 @@ def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(
     assert saved.json()["saved"]["path"] == str(
         (workspace_root / "saved.program.yaml").resolve()
     )
+
+
+@pytest.mark.parametrize("route", ["save", "save-as"])
+@pytest.mark.parametrize(
+    ("admission", "code"),
+    [
+        ({"authoring_allowed": False, "admission_generation": 1}, "authoring_not_ready"),
+        ({"authoring_allowed": True, "admission_generation": 2}, "stale_generation"),
+    ],
+)
+def test_refused_program_save_writes_no_artifact(
+    tmp_path: Path, route: str, admission: dict, code: str
+) -> None:
+    """Admission precedes the artifact write, so its refusal has no effect."""
+
+    from manyforge_composer.backend.authoring_admission import (
+        AuthoringAdmissionCoordinator,
+    )
+
+    class Refusing:
+        def authoring_admission(self) -> dict:
+            return dict(admission)
+
+        def acquire_authoring_transaction(self, _request):
+            raise AssertionError("a refused Save takes no claim")
+
+    source = _copy_program(tmp_path)
+    state = _enable_authoring(ComposerState(allowed_fs_roots=[str(tmp_path)]))
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft", json={**_fence(empty), "path": str(source)}
+    ).json()
+    edited = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "tree_draft_update_node_params",
+            "arguments": {
+                "instance_id": "move_to_pick",
+                "expected_node_id": "motion.move_to_joint_target",
+                "parameters": {"planning_timeout_s": 3.0},
+            },
+        },
+    ).json()["workspace"]
+    before = client.get("/api/program/workspace").json()
+    source_bytes = source.read_bytes()
+    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing())  # type: ignore[arg-type]
+
+    target = tmp_path / "saved"
+    refused = client.post(
+        f"/api/program/{route}",
+        json=(
+            _fence(edited)
+            if route == "save"
+            else {**_fence(edited), "path": str(target), "confirmOverwrite": False}
+        ),
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == code
+    assert refused.json()["detail"]["effect"] == "none"
+    assert source.read_bytes() == source_bytes
+    assert not (tmp_path / "saved.program.yaml").exists()
+    assert client.get("/api/program/workspace").json() == before
+
+
+@pytest.mark.parametrize("stale_at", ["before_write", "after_write"])
+def test_save_draft_refusal_is_marked_only_before_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_at: str
+) -> None:
+    """A Draft refusal before the write has no effect; a failed adoption after
+    the write (the race) is never marked as no-effect."""
+
+    source = _copy_program(tmp_path)
+    state = _enable_authoring(ComposerState(allowed_fs_roots=[str(tmp_path)]))
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+                cors_origins=["http://localhost:3000"],
+            ),
+        )
+    )
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft", json={**_fence(empty), "path": str(source)}
+    ).json()
+
+    def stale(*_args, **_kwargs):
+        raise DraftSessionError(
+            "composer_draft_revision_stale", "Draft changed", status_code=409
+        )
+
+    monkeypatch.setattr(
+        state.draft_session,
+        "require_current" if stale_at == "before_write" else "install_prepared_save",
+        stale,
+    )
+    target = tmp_path / "saved.program.yaml"
+    refused = client.post(
+        "/api/program/save-as",
+        json={**_fence(opened), "path": str(tmp_path / "saved"), "confirmOverwrite": False},
+    )
+
+    detail = refused.json()["detail"]
+    if stale_at == "before_write":
+        assert refused.status_code == 409, refused.text
+        assert detail["code"] == "composer_draft_revision_stale"
+        assert detail["effect"] == "none"
+        assert not target.exists()
+    else:
+        # Written, then the workspace owner contained the failed adoption: the
+        # definite "written but not adopted" outcome names the written file and
+        # never carries the no-effect marker.
+        assert refused.status_code == 409, refused.text
+        assert detail["code"] == "program_saved_baseline_not_adopted"
+        assert detail["causeCode"] == "composer_workspace_install_failed"
+        assert detail["path"] == str(target)
+        assert str(target) in detail["message"]
+        assert "effect" not in detail
+        assert target.exists()
 
 
 def test_explicit_invalid_program_write_roots_fail_closed_without_draft_change(
