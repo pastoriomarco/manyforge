@@ -127,6 +127,8 @@ function robotController(): RobotControlController {
     fullStopError: null,
     stopFaultRecoveryPending: false,
     stopFaultRecoveryError: null,
+    componentIncidents: [],
+    componentIncidentsUnavailableReason: null,
     resume: vi.fn(),
     recoverStopFault: vi.fn(),
     setRuntimeScale: vi.fn(),
@@ -1249,6 +1251,37 @@ describe('Program runtime projection', () => {
     expect(cell.actions?.[0]).toMatchObject({ label: 'Retry recovery', disabled: false });
     robot.state.status.cellStopAction.fault = { ...fault, state: 'cleared' };
     expect(guidance()).toEqual([]);
+  });
+
+  it('shows open component incidents before Recover cell and keeps it available', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    robot.state.status.cellStopAction.fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
+      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_configuration' as const,
+      reasonCode: 'physical_rest_unproven', certificate: null,
+    };
+    robot.componentIncidents = [{
+      componentId: 'component.arm',
+      incident: {
+        incidentId: 'incident.1',
+        causeClass: 'external_control',
+        vendorCodes: ['state=5', 'mode=2'],
+        detectedAtNs: 1_000,
+        summary: 'Robot moved from its own interface',
+        acknowledged: false,
+      },
+    }];
+    const [cell] = deriveTransportGuidance({
+      enabled: true, program: controller(), robot, motionActive: false,
+      onReviewProgramRecovery: vi.fn(),
+    });
+    expect(cell.message).toContain(
+      'Incident on component.arm: Robot moved from its own interface · cause: robot moved '
+      + 'or changed mode from its own interface · vendor codes: state=5, mode=2.',
+    );
+    expect(cell.actions?.[0]).toMatchObject({ label: 'Recover cell', disabled: false });
   });
 
   it('classifies live-view observation by what the operator can rely on', () => {

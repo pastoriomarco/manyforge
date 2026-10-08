@@ -413,15 +413,13 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
 @pytest.mark.parametrize(
     "kind,case",
     [
-        ("operation_pause", "current"),
-        ("operation_resume", "current"),
         ("operation_reset", "current"),
         ("operation_acknowledge_completed", "current"),
-        ("operation_resume", "other_operation"),
-        ("operation_resume", "old_revision"),
-        ("operation_resume", "old_owner"),
-        ("operation_resume", "retired"),
-        ("operation_resume", "not_allowed"),
+        ("operation_reset", "other_operation"),
+        ("operation_reset", "old_revision"),
+        ("operation_reset", "old_owner"),
+        ("operation_reset", "retired"),
+        ("operation_reset", "not_allowed"),
         ("operation_reset", "recovery"),
     ],
 )
@@ -480,9 +478,7 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
             assert request.request_context.request_owner_epoch == "kernel.1"
             return {"ok": True, "accepted": {}}
 
-        execution_pause = execution_resume = execution_reset = (
-            execution_acknowledge_completed
-        ) = execute_control
+        execution_reset = execution_acknowledge_completed = execute_control
 
     ingress, _ = _ingress(_Clock())
     try:

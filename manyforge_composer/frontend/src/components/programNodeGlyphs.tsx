@@ -85,8 +85,8 @@ const CATEGORY_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
 // Dedicated icons for the control-flow and recovery nodes, keyed by catalog
 // id; they take precedence over the category icon and use the same fitting
 // rule. Sequence (→) and Parallel (⇉) are the standard behavior-tree symbols;
-// a cross means failure (Fallback, Retry). Stop, pause and resume share a
-// circle; Full Stop uses an octagon because it stops the whole cell.
+// a cross means failure (Fallback, Retry). Stop uses a circle; Full Stop
+// uses an octagon because it stops the whole cell.
 const NODE_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
   sequence: {
     transform: 'translate(-0.087 -0.348) scale(1.0435)',
@@ -140,18 +140,6 @@ const NODE_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
     transform: 'translate(0.000 0.000) scale(1.0000)',
     shapes: (
       <><path d="M5.5 2h5L14 5.5v5L10.5 14h-5L2 10.5v-5z" /><rect className="solid" x="5.6" y="5.6" width="4.8" height="4.8" rx="0.6" /></>
-    ),
-  },
-  'kernel.pause_operation': {
-    transform: 'translate(0.000 0.000) scale(1.0000)',
-    shapes: (
-      <><circle cx="8" cy="8" r="6" /><path d="M6.5 5.6v4.8M9.5 5.6v4.8" /></>
-    ),
-  },
-  'kernel.resume_operation': {
-    transform: 'translate(0.000 0.000) scale(1.0000)',
-    shapes: (
-      <><circle cx="8" cy="8" r="6" /><path d="M6.7 5.4v5.2L10.6 8z" /></>
     ),
   },
   'kernel.reset_operation': {

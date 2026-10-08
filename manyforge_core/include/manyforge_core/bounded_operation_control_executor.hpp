@@ -33,31 +33,20 @@ struct OperationControlEffectRequest final {
   OperationId operation_id;
   OperationParticipantId participant_id;
   OperationRevision operation_revision{0U};
-  OperationControlKind control{OperationControlKind::kPause};
+  OperationControlKind control{OperationControlKind::kReset};
   std::uint64_t subordinate_id{};
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   std::string command_target;
   std::uint64_t subordinate_generation{};
-  IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
-  std::shared_ptr<const ResolvedPreparedMotionResumeRequestDTO> prepared_resume;
-  std::shared_ptr<std::atomic_bool> cancellation_requested;
-  // Internal disposal of an already-created Resume product, not another
-  // public control or another original participant effect.
-  bool prepared_resume_cleanup_only{};
 };
 
 struct OperationControlEffectResult final {
   OperationId operation_id;
   OperationParticipantId participant_id;
   OperationRevision operation_revision{0U};
-  OperationControlKind control{OperationControlKind::kPause};
+  OperationControlKind control{OperationControlKind::kReset};
   bool accepted{};
   std::optional<ErrorDTO> error;
-  // Resume-only lifetime facts. Finished means no product was created or its
-  // one disposal attempt returned; accepted/error retain success or failure.
-  bool prepared_resume_created{};
-  bool prepared_resume_cleanup_finished{};
-  bool prepared_resume_cleanup_only{};
 };
 
 enum class OperationControlEffectStartStatus : std::uint8_t {
@@ -109,7 +98,7 @@ class IOperationControlEffectCompletionReceiver {
                                                OperationControlEffectHandle handle) noexcept = 0;
 };
 
-/// Fixed process-local isolation for participant Pause/Resume and completed-
+/// Fixed process-local isolation for participant Reset and completed-
 /// execution retirement. Construction creates exactly one worker lane per
 /// distinct registered subordinate engine. This preserves per-engine command
 /// ordering while allowing disjoint participants to progress independently.

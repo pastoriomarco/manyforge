@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 
@@ -75,6 +76,14 @@ private:
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};
     std::string source_signature;
+    // Last intervention-requiring cause established from fresh status. It
+    // survives stale/missing status and is cleared only by fresh status.
+    core::LifecycleBlockingCauseClassDTO last_intervention_cause{
+        core::LifecycleBlockingCauseClassDTO::kNone};
+    // The exact controller configuration was active at least once for this
+    // handle. ManyForge never deactivates controllers in this observe-only
+    // lane, so a later fresh inactive controller was not requested by it.
+    bool exact_configuration_seen{false};
   };
 
   mutable std::mutex mutex_;

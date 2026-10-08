@@ -80,12 +80,6 @@ class FakeTransport:
         self.controls.append((kind, operation_id, body))
         return {"ok": True, "accepted": {"operation_id": operation_id}}
 
-    def pause(self, operation_id, body):
-        return self._control("pause", operation_id, body)
-
-    def resume(self, operation_id, body):
-        return self._control("resume", operation_id, body)
-
     def reset(self, operation_id, body):
         return self._control("reset", operation_id, body)
 
@@ -106,7 +100,6 @@ def test_execution_state_vocabulary_is_the_native_owner_vocabulary() -> None:
         "prepared",
         "dispatching",
         "executing",
-        "paused",
         "stopping",
         "completed",
         "stopped",

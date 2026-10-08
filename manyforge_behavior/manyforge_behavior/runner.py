@@ -357,50 +357,12 @@ class OrchestratorRunner:
             "reason": reason,
         }
         callback = {
-            "pause": self._kernel.pause,
-            "resume": self._kernel.resume,
             "reset": self._kernel.reset,
             "acknowledge_completed": self._kernel.acknowledge_completed,
         }.get(control)
         if callback is None:
             raise ValueError("operation control is unsupported")
         return callback(operation_id, request)
-
-    def pause_operation(
-        self,
-        *,
-        request_id: str,
-        operation_id: str,
-        expected_operation_revision: int,
-        reason: str | None = None,
-        correlation_id: str | None = None,
-    ) -> dict[str, Any]:
-        return self._control_operation(
-            "pause",
-            request_id=request_id,
-            operation_id=operation_id,
-            expected_operation_revision=expected_operation_revision,
-            reason=reason,
-            correlation_id=correlation_id,
-        )
-
-    def resume_operation(
-        self,
-        *,
-        request_id: str,
-        operation_id: str,
-        expected_operation_revision: int,
-        reason: str | None = None,
-        correlation_id: str | None = None,
-    ) -> dict[str, Any]:
-        return self._control_operation(
-            "resume",
-            request_id=request_id,
-            operation_id=operation_id,
-            expected_operation_revision=expected_operation_revision,
-            reason=reason,
-            correlation_id=correlation_id,
-        )
 
     def reset_operation(
         self,

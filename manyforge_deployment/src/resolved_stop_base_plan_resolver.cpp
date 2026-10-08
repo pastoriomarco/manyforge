@@ -1381,12 +1381,18 @@ resolve_store_and_verify_route_readiness_batch(
             core::CanonicalRouteSelectionComponentExpectationLess) ||
         !std::all_of(component_expectations.begin(),
                      component_expectations.end(), [](const auto &row) {
-                       // Ordinary route requests permit Prepared/Active only.
+                       // Ordinary route requests permit Prepared/Active only
+                       // (their acceptance rejects any other state first).
                        // Restart also restores a retained Disabled route with
-                       // complete Stop readiness but a closed command gate.
+                       // complete Stop readiness but a closed command gate,
+                       // and a parent Apply (or its restart) installs the
+                       // route of a Declared component of an externally
+                       // managed controller, equally command-closed.
                        return !row.controllable_component_id.empty() &&
                               row.expected_component_lifecycle_generation.nonzero() &&
                               (row.expected_component_lifecycle_state ==
+                                   core::ComponentLifecycleStateDTO::kDeclared ||
+                               row.expected_component_lifecycle_state ==
                                    core::ComponentLifecycleStateDTO::kPrepared ||
                                row.expected_component_lifecycle_state ==
                                    core::ComponentLifecycleStateDTO::kActive ||

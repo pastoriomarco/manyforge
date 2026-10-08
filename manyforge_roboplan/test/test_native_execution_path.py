@@ -101,12 +101,6 @@ class RecordingTransport:
     def read(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation(operation_id)
 
-    def pause(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.client.pause_operation(operation_id, body)
-
-    def resume(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.client.resume_operation(operation_id, body)
-
     def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.reset_operation(operation_id, body)
 
@@ -3357,7 +3351,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         controlled_intent = _direct_control_motion_operation(
             headless.execution_diagnostics()["status"],
             request_id="n4-controlled-operation",
-            # Keep enough path after Pause/Resume for this test to exercise the
+            # Keep enough remaining path for this test to exercise the
             # one-second replacement Stop trajectory rather than the separately
             # qualified short-path natural-completion policy.
             motion={
@@ -3415,53 +3409,15 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             == 1
         )
 
-        paused = composer.pause_operation(
-            controlled_id,
-            {
-                "request_context": {
-                    "request_id": "pause-controlled-operation",
-                    "request_owner_epoch": identity["owner_epoch"],
-                    "source_label": "composer_ui",
-                    "correlation_id": "n4-public-control-test",
-                },
-                "operation_id": controlled_id,
-                "expected_operation_revision": executing["operation_revision"],
-                "reason": "exercise public Pause",
-            },
-        )
-        paused_state = _wait_state(runner, controlled_id, {"paused"})["operation"]
-        assert (
-            paused_state["operation_revision"]
-            == paused["accepted"]["operation_revision_after_acceptance"]
-        )
-
-        resumed = headless.resume_operation(
-            controlled_id,
-            {
-                "request_context": {
-                    "request_id": "resume-controlled-operation",
-                    "request_owner_epoch": identity["owner_epoch"],
-                    "source_label": "headless_process_test",
-                    "correlation_id": "n4-public-control-test",
-                },
-                "operation_id": controlled_id,
-                "expected_operation_revision": paused_state["operation_revision"],
-                "reason": "exercise public Resume",
-            },
-        )
-        resumed_state = _wait_state(runner, controlled_id, {"executing"})["operation"]
-        assert (
-            resumed_state["operation_revision"]
-            == resumed["accepted"]["operation_revision_after_acceptance"]
-        )
+        executing_state = _wait_state(runner, controlled_id, {"executing"})["operation"]
         before_controlled_stop = {
-            "operation": resumed_state,
+            "operation": executing_state,
         }
 
         stop_arguments = {
             "request_id": "stop-controlled-operation",
             "operation_id": controlled_id,
-            "expected_operation_revision": resumed_state["operation_revision"],
+            "expected_operation_revision": executing_state["operation_revision"],
             "expected_stop_generation": 0,
             "reason": "exercise historical operator Stop",
             "correlation_id": "n4-public-control-test",

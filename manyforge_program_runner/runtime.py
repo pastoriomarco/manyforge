@@ -1462,8 +1462,6 @@ class ProgramRuntime:
             # identity/context; the Kernel retains final admission authority.
             "operation_start": cycle.state in {"idle_after_reset", "running"},
             "operation_stop": cycle.state != "resetting",
-            "operation_pause": cycle.state in {"idle_after_reset", "running"},
-            "operation_resume": cycle.state in {"idle_after_reset", "running"},
             "operation_reset": cycle.state != "starting",
             "operation_acknowledge_completed": cycle.state != "starting",
             "cell_full_stop": True,

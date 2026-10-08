@@ -63,10 +63,6 @@ class ExecutionTransport(Protocol):
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def pause(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def resume(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
     def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def acknowledge_completed(
@@ -128,7 +124,6 @@ class ExecutionState(Enum):
     PREPARED = "prepared"
     DISPATCHING = "dispatching"
     EXECUTING = "executing"
-    PAUSED = "paused"
     STOPPING = "stopping"
     COMPLETED = "completed"
     STOPPED = "stopped"
@@ -188,8 +183,6 @@ class KernelClient:
             "identity",
             "submit",
             "read",
-            "pause",
-            "resume",
             "reset",
             "acknowledge_completed",
             "stop",
@@ -355,12 +348,6 @@ class KernelClient:
             )
         return result
 
-    def pause(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.pause(operation_id, request),
-            label="Pause",
-        )
-
     def query_operation(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
             self._transport.query_operation(request), label="Program operation context"
@@ -373,12 +360,6 @@ class KernelClient:
         return self._successful(
             self._transport.set_operation_runtime_scale(request),
             label="operation runtime scale",
-        )
-
-    def resume(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.resume(operation_id, request),
-            label="Resume",
         )
 
     def reset(self, operation_id: str, request: Mapping[str, Any]) -> dict[str, Any]:

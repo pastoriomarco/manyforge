@@ -102,8 +102,6 @@ class _KernelTransport:
     def __getattr__(self, name: str):
         if name in {
             "read",
-            "pause",
-            "resume",
             "reset",
             "acknowledge_completed",
             "stop",

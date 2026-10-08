@@ -43,6 +43,7 @@ from .models import (
     StopIntentRequest,
     TargetObservationQuery,
 )
+from .cclc import MAX_INCIDENT_EVENT_PAGE
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
 from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
 from .private_transport import (
@@ -109,7 +110,6 @@ MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS = 4096
 # Operation states in which the target no longer moves under this operation.
 _OPERATION_REST_STATES = frozenset(
     {
-        "paused",
         "completed",
         "stopped",
         "failed",
@@ -249,20 +249,6 @@ class ExecutionPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def pause(
-        self,
-        request: OperationControlRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]: ...
-
-    def resume(
-        self,
-        request: OperationControlRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]: ...
-
     def reset(
         self,
         request: OperationControlRequest,
@@ -356,6 +342,63 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
         raise HeadlessApiError(
             "execution_command_invalid",
             f"execution command is not canonically encodable: {exc}",
+        ) from exc
+
+
+def _component_condition_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The CCLC snapshot members the lifecycle-cause alarm adapter reads.
+
+    Wait timing (`waiting_since_ns`, `delayed`) is presentation only and is
+    not forwarded, so it neither changes a condition nor crosses the native
+    boundary as an unsafe integer. An open incident crosses with its
+    identity, cause, vendor codes and summary; its detection time stays in
+    the incident record.
+    """
+
+    try:
+        progress = snapshot.get("lifecycle_progress")
+        incident = None if progress is None else progress.get("incident")
+        return {
+            "component_lifecycle_state": snapshot["component_lifecycle_state"],
+            "controllable_component_id": snapshot["controllable_component_id"],
+            "domains": [
+                {
+                    "control_domain_id": domain["control_domain_id"],
+                    "current_resources": list(domain["current_resources"]),
+                }
+                for domain in snapshot["domains"]
+            ],
+            "graph_revision": snapshot["graph_revision"],
+            "lifecycle_progress": (
+                None
+                if progress is None
+                else {
+                    **{
+                        key: progress[key]
+                        for key in ("blocking_cause_class", "blocking_reason", "phase")
+                    },
+                    "incident": (
+                        None
+                        if incident is None
+                        else {
+                            key: incident[key]
+                            for key in (
+                                "cause_class",
+                                "incident_id",
+                                "summary",
+                                "vendor_codes",
+                            )
+                        }
+                    ),
+                }
+            ),
+            "lifecycle_target": snapshot.get("lifecycle_target"),
+            "retained_bundle_id": snapshot["retained_bundle_id"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise HeadlessApiError(
+            "cclc_open_response_invalid",
+            f"CCLC component snapshot lacks a condition field: {exc}",
         ) from exc
 
 
@@ -1831,26 +1874,6 @@ class ExecutionCommandClient:
             )
         return response
 
-    def pause(
-        self,
-        request: OperationControlRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]:
-        return self._control(
-            "pause", request, trusted_principal_id=trusted_principal_id
-        )
-
-    def resume(
-        self,
-        request: OperationControlRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]:
-        return self._control(
-            "resume", request, trusted_principal_id=trusted_principal_id
-        )
-
     def reset(
         self,
         request: OperationControlRequest,
@@ -2241,11 +2264,15 @@ class ExecutionEventPump:
         poll_seconds: float = 0.1,
         condition_poll_seconds: float = 0.5,
         page_limit: int = 16,
+        cclc: Any | None = None,
+        component_condition_poll_seconds: float = 1.0,
     ) -> None:
         if not 0.01 <= poll_seconds <= 5.0:
             raise ValueError("operation event polling period is outside [0.01, 5]")
         if not 0.05 <= condition_poll_seconds <= 5.0:
             raise ValueError("operation condition polling period is outside [0.05, 5]")
+        if not 0.1 <= component_condition_poll_seconds <= 5.0:
+            raise ValueError("component condition polling period is outside [0.1, 5]")
         if not 1 <= page_limit <= 16:
             raise ValueError("operation event page limit is outside [1, 16]")
         self._core = core
@@ -2264,6 +2291,16 @@ class ExecutionEventPump:
         self._progress_dirty = False
         self._progress_sent_at = float("-inf")
         self._alarm_refresh_failing = False
+        self._cclc = cclc
+        self._component_condition_poll_seconds = component_condition_poll_seconds
+        self._next_component_condition_poll_at = float("-inf")
+        self._component_conditions_failing = False
+        # CCLC incident history (addendum 2 contract item 5): cursor per CCLC
+        # owner epoch; the core deduplicates by (incident id, event kind).
+        self._incident_event_owner_epoch: str | None = None
+        self._incident_event_after_sequence = 0
+        self._next_incident_event_poll_at = float("-inf")
+        self._incident_events_failing = False
 
     def set_progress_observer(
         self, observer: Callable[[list[dict[str, Any]]], None] | None,
@@ -2334,6 +2371,163 @@ class ExecutionEventPump:
         if self._alarm_refresh_failing:
             self._alarm_refresh_failing = False
             logging.getLogger(__name__).info("alarm source refresh recovered")
+
+    def _observe_component_lifecycle_conditions(self) -> None:
+        """Hand CCLC component snapshots to the lifecycle-cause alarm adapter.
+
+        Spec 530 §3.3 (2026-10-08): the C++ adapter derives the safety-stop
+        condition and submits only changed ones. This
+        bounded read runs at most once per period and only while the active
+        configuration names components. CCLC being unreachable keeps every
+        raised condition at unknown quality; a component whose snapshot is
+        unavailable keeps its conditions unchanged.
+
+        Unknown quality leaves the whole Alarm Lifecycle Owner unreconciled,
+        which blocks motion admission. An Apply that replaces the CCLC owner
+        makes it briefly unreachable, so until an observation of the current
+        scope is accepted the read repeats at the pump cadence (bounded below
+        by 0.1 s) instead of waiting a whole period after the owner returns.
+        """
+
+        if self._cclc is None:
+            return
+        now = time.monotonic()
+        if now < self._next_component_condition_poll_at:
+            return
+        self._next_component_condition_poll_at = now + min(
+            self._component_condition_poll_seconds, max(self._poll_seconds, 0.1)
+        )
+        try:
+            scope = self._core.component_lifecycle_condition_scope()
+            component_ids = scope.get("component_ids")
+            if not isinstance(component_ids, list) or not all(
+                isinstance(value, str) and value for value in component_ids
+            ):
+                raise HeadlessApiError(
+                    "headless_component_lifecycle_invalid",
+                    "component lifecycle condition scope is invalid",
+                )
+            if not component_ids:
+                self._next_component_condition_poll_at = (
+                    now + self._component_condition_poll_seconds
+                )
+                return
+            try:
+                identity = self._cclc.owner_identity()
+                snapshots: list[dict[str, Any]] = []
+                unavailable: list[str] = []
+                for component_id in component_ids:
+                    try:
+                        snapshots.append(
+                            _component_condition_facts(
+                                self._cclc.component_snapshot(component_id)
+                            )
+                        )
+                    except HeadlessApiError as error:
+                        if error.code == "cclc_owner_unavailable":
+                            raise
+                        unavailable.append(component_id)
+                # A replaced owner between reads would mix two epochs.
+                if self._cclc.owner_identity() != identity:
+                    return
+            except HeadlessApiError as error:
+                if error.code != "cclc_owner_unavailable":
+                    raise
+                self._core.mark_component_lifecycle_source_unknown()
+                return
+            result = self._core.observe_component_lifecycle_conditions(
+                cclc_owner_epoch=identity["request_owner_epoch"],
+                snapshots_json=_canonical_json(snapshots).decode("utf-8"),
+                unavailable_component_ids=unavailable,
+            )
+            # `scope_changed` (an Apply between the scope read and the
+            # observation) completed nothing; only an accepted observation
+            # waits the full period.
+            if result.get("status") in {"observed", "empty"}:
+                self._next_component_condition_poll_at = (
+                    now + self._component_condition_poll_seconds
+                )
+        except Exception:
+            if not self._component_conditions_failing:
+                self._component_conditions_failing = True
+                logging.getLogger(__name__).warning(
+                    "component lifecycle condition observation failed",
+                    exc_info=True,
+                )
+            return
+        if self._component_conditions_failing:
+            self._component_conditions_failing = False
+            logging.getLogger(__name__).info(
+                "component lifecycle condition observation recovered"
+            )
+
+    def _record_cclc_incident_events(self) -> None:
+        """Copy CCLC incident history events into the historian.
+
+        Same cadence and bounded client as the component-condition read. One
+        page per period; a full page is followed immediately by the next one.
+        Only new events are recorded: the cursor follows the CCLC owner epoch
+        and restarts from zero when it changes, and the core answers an event
+        it already holds as a duplicate, so a lost cursor never records one
+        twice. A rejected (full-queue) event is retried from the same cursor.
+        """
+
+        if self._cclc is None:
+            return
+        now = time.monotonic()
+        if now < self._next_incident_event_poll_at:
+            return
+        self._next_incident_event_poll_at = now + self._component_condition_poll_seconds
+        logger = logging.getLogger(__name__)
+        try:
+            try:
+                identity = self._cclc.owner_identity()["request_owner_epoch"]
+                if identity != self._incident_event_owner_epoch:
+                    self._incident_event_owner_epoch = identity
+                    self._incident_event_after_sequence = 0
+                page = self._cclc.incident_events(
+                    self._incident_event_after_sequence, MAX_INCIDENT_EVENT_PAGE
+                )
+                # A replaced owner between reads would mix two journals.
+                if self._cclc.owner_identity()["request_owner_epoch"] != identity:
+                    return
+            except HeadlessApiError as error:
+                if error.code == "cclc_owner_unavailable":
+                    return
+                raise
+            for event in page["events"]:
+                try:
+                    result = self._core.record_cclc_incident_event(
+                        cclc_owner_epoch=identity,
+                        event_json=_canonical_json(event).decode("utf-8"),
+                    )
+                except HeadlessApiError as error:
+                    if error.code not in {
+                        "headless_cclc_incident_event_invalid",
+                        "headless_source_invalid",
+                        "historian_event_invalid",
+                    }:
+                        raise
+                    # Never block later incidents behind one unrecordable row.
+                    logger.error(
+                        "CCLC incident event %s was not recordable: %s",
+                        event["event_sequence"],
+                        error,
+                    )
+                    result = {"status": "invalid"}
+                if result.get("status") == "rejected":
+                    return
+                self._incident_event_after_sequence = event["event_sequence"]
+            if len(page["events"]) == MAX_INCIDENT_EVENT_PAGE:
+                self._next_incident_event_poll_at = now
+        except Exception:
+            if not self._incident_events_failing:
+                self._incident_events_failing = True
+                logger.warning("CCLC incident event recording failed", exc_info=True)
+            return
+        if self._incident_events_failing:
+            self._incident_events_failing = False
+            logger.info("CCLC incident event recording recovered")
 
     def _notify_change(self) -> None:
         observer = self._change_observer
@@ -2573,6 +2767,8 @@ class ExecutionEventPump:
 
         while not self._stop.is_set():
             self._refresh_alarm_sources()
+            self._observe_component_lifecycle_conditions()
+            self._record_cclc_incident_events()
             try:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()

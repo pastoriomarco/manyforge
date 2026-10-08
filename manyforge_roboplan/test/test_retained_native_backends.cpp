@@ -1913,31 +1913,13 @@ TEST(RoboPlanExecutionBackendTest,
 }
 
 TEST(RoboPlanExecutionBackendTest,
-     PauseResumeResetRemainBoundedThroughTheAddressedStateChannel) {
+     ResetRemainsBoundedThroughTheAddressedStateChannel) {
   auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0, 0.0});
   FakeClock clock;
   RoboPlanExecutionBackend backend(binding, channel, clock);
   auto active = backend.execute_trajectory(trajectory(binding, 1.0));
-  ASSERT_TRUE(backend.pause().accepted);
-
-  const auto pause_deadline = std::chrono::steady_clock::now() + 1s;
-  while (backend.get_execution_snapshot().state != ExecutionState::kPaused &&
-         std::chrono::steady_clock::now() < pause_deadline) {
-    std::this_thread::yield();
-  }
-  EXPECT_EQ(backend.get_execution_snapshot().state, ExecutionState::kPaused);
-
-  auto resumed = backend.resume(trajectory(binding, 0.05));
-  const auto completion_deadline = std::chrono::steady_clock::now() + 2s;
-  while (resumed.get_snapshot().state != ExecutionState::kCompleted &&
-         std::chrono::steady_clock::now() < completion_deadline) {
-    clock.advance(10'000'000);
-    std::this_thread::yield();
-  }
-  ASSERT_TRUE(resumed.wait_for_completion(2'000'000'000));
-  EXPECT_EQ(resumed.get_snapshot().state, ExecutionState::kCompleted);
   EXPECT_TRUE(backend.reset().accepted);
   EXPECT_EQ(backend.get_execution_snapshot().state, ExecutionState::kIdle);
   (void)active;

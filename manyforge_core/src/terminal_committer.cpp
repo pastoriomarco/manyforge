@@ -71,11 +71,11 @@ TerminalCommitter::CommitOutcome TerminalCommitter::commit(const CommitRequest& 
   outcome.previous = current;
 
   // A Stop authority may arrive only after another owner has already proved
-  // physical containment. Serialize its Executing/Paused -> Stopping ->
+  // physical containment. Serialize its Executing -> Stopping ->
   // Stopped local settlement here so a concurrent natural terminal cannot
   // enter between those two transitions. No backend effect is issued here.
   if (request.origin == Origin::kStopAuthority && request.proposed == ExecutionState::kStopped &&
-      (current == ExecutionState::kExecuting || current == ExecutionState::kPaused)) {
+      current == ExecutionState::kExecuting) {
     auto stopping = sm_.try_transition(ExecutionState::kStopping);
     if (!stopping.ok()) {
       outcome.committed = sm_.status().state;

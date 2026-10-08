@@ -753,7 +753,6 @@ struct ExecutionKernel::PreparedMotionSession final {
   std::atomic<PreparedMotionDispatchGate> dispatch_gate{PreparedMotionDispatchGate::kOpen};
   bool dispatch_requested{};
   bool cancel_requested{};
-  bool resume_cycle{};
 };
 
 namespace {
@@ -826,8 +825,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
           clock_, scheduler_, RuntimeCollisionMonitor::Config{config_.collision_monitor_period_ns},
           [this]() { return collision_check_tick(); },
           [this]() {
-            return sm_.status().state == ExecutionState::kExecuting ||
-                   sm_.status().state == ExecutionState::kPaused || motion_trip_stop_.active() ||
+            return sm_.status().state == ExecutionState::kExecuting || motion_trip_stop_.active() ||
                    operator_stop_worker_.active() || fault_preempt_stop_active();
           }) {
   // Detach authored aliases once; control/Stop readers share immutable values.
@@ -958,26 +956,13 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
         execution_backend_.get_execution_snapshot().state == ExecutionState::kStopped;
     if (error.code == kErrorInvalidRequest &&
         (state == ExecutionState::kPlanning || state == ExecutionState::kValidating ||
-         state == ExecutionState::kPaused || state == ExecutionState::kStopped ||
+         state == ExecutionState::kStopped ||
          state == ExecutionState::kIdle ||
          (state == ExecutionState::kStopping &&
           (operator_stop_worker_.active() || backend_already_stopped)))) {
       return Result<void>::Ok();
     }
     return Result<void>::Err(error);
-  });
-  // Spec/230 §6.1 pause chain: the Stopping → Paused transition fires
-  // inside the scheduled lambda of stop_policy_.request_pause(). This
-  // callback emits the terminal state_transition event so external
-  // observers see the full pause boundary.
-  stop_policy_.set_pause_completed_callback([this]() {
-    emit_event({KernelEventType::kStateTransition,
-                sm_.status().execution_id,
-                clock_.now(),
-                ExecutionState::kStopping,
-                ExecutionState::kPaused,
-                std::nullopt,
-                {}});
   });
   install_builtin_interrupt_sources();
   // Seed a complete first-read DTO without emitting a lifecycle event before
@@ -1766,9 +1751,6 @@ TerminalCommitter::CommitOutcome ExecutionKernel::commit_terminal(
   if (outcome.ok()) {
     switch (outcome.committed) {
       using enum ExecutionState;
-      case kPaused:
-        invalidate_gripper_authority(GripperInvalidationReason::kPause);
-        break;
       case kStopping:
       case kStopped:
       case kInterrupted:
@@ -4235,7 +4217,7 @@ void ExecutionKernel::arm_runtime_collision_lookahead(
     const auto state = sm_.status().state;
     if (!runtime_collision_protection_.active ||
         runtime_collision_protection_.execution_id != execution_id ||
-        (state != ExecutionState::kExecuting && state != ExecutionState::kPaused)) {
+        state != ExecutionState::kExecuting) {
       return;
     }
     invalid_authority = execution_generation == 0 || !collision_trajectory ||
@@ -4310,7 +4292,7 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
     if (!runtime_collision_protection_.active ||
         runtime_collision_protection_.execution_id != result.execution_id ||
         addressed_stop_fence_execution_id_.load(std::memory_order_acquire) == result.execution_id ||
-        (state != ExecutionState::kExecuting && state != ExecutionState::kPaused) ||
+        state != ExecutionState::kExecuting ||
         motion_trip_stop_.active() || operator_stop_worker_.active() ||
         fault_preempt_stop_active()) {
       return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
@@ -6682,7 +6664,6 @@ void ExecutionKernel::async_execute_worker(
     RetainedSceneSnapshotLease retained_scene,
     std::optional<SceneSnapshotLease> scene_snapshot_lease,
     std::shared_ptr<PreparedMotionSession> prepared_session) {
-  const double requested_execution_timeout_s = request.timeouts.execution_timeout_s;
   // Worker-local motion-execution state. Lives on this
   // stack frame so two overlapping workers (should never happen under
   // the lifecycle mutex, but defense in depth) cannot share state.
@@ -6924,7 +6905,6 @@ void ExecutionKernel::async_execute_worker(
     core::ExecutionSnapshot latest_backend_snapshot =
         std::move(dispatch_phase.latest_backend_snapshot);
 
-    bool pause_in_progress = false;
     int64_t last_runtime_scale_sample_ns = exec_start_ns;
     double runtime_scaled_execution_ns = 0.0;
     const auto finalize_worker_stop_token_requested = [&]() {
@@ -6943,9 +6923,7 @@ void ExecutionKernel::async_execute_worker(
                                     state_before_stop == ExecutionState::kInterventionRequired;
       const bool stop_confirmed =
           containment_already_certified || backend_stop.accepted || already_terminal;
-      if ((state_before_stop == ExecutionState::kExecuting ||
-           state_before_stop == ExecutionState::kPaused) &&
-          stop_confirmed) {
+      if (state_before_stop == ExecutionState::kExecuting && stop_confirmed) {
         (void)sm_.try_transition(ExecutionState::kStopping);
       }
       const ExecutionState target_state =
@@ -7025,18 +7003,8 @@ void ExecutionKernel::async_execute_worker(
                                          /*apply_preemption_inline=*/true);
         }
       }
-      const bool paused = latest_backend_snapshot.state == ExecutionState::kPaused ||
-                          sm_.status().state == ExecutionState::kPaused;
-      if (paused) {
-        if (!pause_in_progress) {
-          pause_in_progress = true;
-        }
-      } else if (pause_in_progress) {
-        pause_in_progress = false;
-      }
-
       std::optional<ErrorDTO> execution_timing_error;
-      if (!paused && !completed) {
+      if (!completed) {
         const int64_t dt_ns = std::max<int64_t>(0, now_ns - last_runtime_scale_sample_ns);
         try {
           const auto mechanism = execution_backend_.runtime_velocity_scale_status();
@@ -7365,558 +7333,6 @@ void ExecutionKernel::async_execute_worker(
                                    st);
           return;
         }
-      }
-
-      if (latest_backend_snapshot.state == ExecutionState::kPaused ||
-          loop_state == ExecutionState::kPaused) {
-        if (worker_signals_.consume_resume_request()) {
-          bool prepared_resume = false;
-          ExecuteRequestDTO resume_request = request;
-          if (prepared_session) {
-            std::lock_guard session_lock(prepared_session->mutex);
-            prepared_resume = prepared_session->resume_cycle;
-            if (prepared_resume) {
-              resume_request = prepared_session->authority.execution_request;
-            }
-          }
-          // The worker retains the last resolved intent even when the private
-          // prepared session has advanced its goal and cleared the old product.
-          resume_request.motion = request.motion;
-          if (prepared_resume) {
-            // Resume is a new controller-goal occurrence of the same semantic
-            // motion. Advance the existing correlation and scale identities
-            // together before planning; no new execution owner is introduced.
-            set_active_request_correlation(resume_request);
-          }
-          auto finish_resume_interrupted = [&](ExecutionState terminal_state, ErrorDTO error,
-                                               const char* reap_reason) {
-            sm_.set_last_error(error_code_from_dto(error));
-            if (terminal_state != sm_.status().state) {
-              (void)commit_terminal(terminal_state, "trip_reap_terminal");
-            }
-            auto terminal_snapshot = latest_backend_snapshot;
-            terminal_snapshot.timestamp_ns = clock_.now();
-            terminal_snapshot.execution_id = terminal_state == ExecutionState::kIdle ? 0 : exec_id;
-            terminal_snapshot.move_id =
-                terminal_state == ExecutionState::kIdle ? std::string{} : request.move_id;
-            terminal_snapshot.state = terminal_state;
-            terminal_snapshot.error = error;
-            publish_execution_snapshot(std::move(terminal_snapshot));
-            emit_event({KernelEventType::kStateTransition,
-                        exec_id,
-                        clock_.now(),
-                        ExecutionState::kValidating,
-                        terminal_state,
-                        std::nullopt,
-                        {{"reason", reap_reason}}});
-            finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kStopped,
-                                              std::nullopt, std::nullopt, reap_reason);
-          };
-
-          auto fail_resume_closed = [&](ErrorDTO error, const char* failure_reason,
-                                        const char* outcome_reap_reason, bool count_plan_failure,
-                                        bool count_validation_failure) {
-            if (count_validation_failure) {
-              emit_contact_policy_violation_event(exec_id, error.details);
-              emit_event({KernelEventType::kValidationFailed,
-                          exec_id,
-                          clock_.now(),
-                          {},
-                          {},
-                          std::nullopt,
-                          {{"reason", failure_reason},
-                           {"resume_phase", "validation"},
-                           {"resume_replan", "true"}}});
-            }
-            emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, error, {}});
-            {
-              std::lock_guard<std::mutex> lock(metrics_mutex_);
-              if (count_plan_failure) {
-                metrics_.plans_failed++;
-              }
-              if (count_validation_failure) {
-                metrics_.validations_failed++;
-              }
-            }
-            sm_.set_last_error(error_code_from_dto(error));
-            if (prepared_resume) {
-              if (prepared_session) {
-                {
-                  std::lock_guard session_lock(prepared_session->mutex);
-                  prepared_session->error = error;
-                  prepared_session->state =
-                      ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
-                  prepared_session->resume_cycle = false;
-                }
-                prepared_session->changed.notify_all();
-              }
-              auto prev_state = sm_.status().state;
-              auto terminal_commit =
-                  commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
-              auto failed_snapshot = latest_backend_snapshot;
-              failed_snapshot.timestamp_ns = clock_.now();
-              failed_snapshot.execution_id = exec_id;
-              failed_snapshot.move_id = request.move_id;
-              failed_snapshot.state = terminal_commit.committed;
-              failed_snapshot.error = error;
-              publish_execution_snapshot(std::move(failed_snapshot));
-              emit_event({KernelEventType::kStateTransition,
-                          exec_id,
-                          clock_.now(),
-                          prev_state,
-                          terminal_commit.committed,
-                          error,
-                          {{"reason", outcome_reap_reason}}});
-              finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
-                                                error, std::nullopt, outcome_reap_reason);
-              return;
-            }
-            (void)execution_backend_.stop();
-            const bool stop_completed = drain_execution_handle_bounded(execution_handle);
-            auto prev_state = sm_.status().state;
-            auto terminal_state =
-                stop_completed ? ExecutionState::kFailed : ExecutionState::kInterventionRequired;
-            if (!stop_completed) {
-              sm_.set_last_error(ErrorCode::kStopFailed);
-            }
-            auto terminal_commit = commit_terminal(terminal_state, "trip_stop_terminal");
-            if (terminal_commit.committed != terminal_state) {
-              if (finalize_overridden_terminal_authority(
-                      terminal_commit.committed,
-                      "resume_failure_stop_overridden_by_terminal_authority", error)) {
-                return;
-              }
-            }
-            terminal_state = terminal_commit.committed;
-            auto failed_snapshot = latest_backend_snapshot;
-            failed_snapshot.timestamp_ns = clock_.now();
-            failed_snapshot.execution_id = exec_id;
-            failed_snapshot.move_id = request.move_id;
-            failed_snapshot.state = terminal_state;
-            failed_snapshot.error =
-                stop_completed ? error
-                               : operator_intervention_error(ErrorCode::kStopFailed,
-                                                             "Resume failed and software stop "
-                                                             "completion was not observed",
-                                                             "resume_failure_stop_drain",
-                                                             prev_state, exec_id, request.move_id);
-            publish_execution_snapshot(std::move(failed_snapshot));
-            emit_event({KernelEventType::kStateTransition,
-                        exec_id,
-                        clock_.now(),
-                        prev_state,
-                        terminal_state,
-                        std::nullopt,
-                        {}});
-            finalize_motion_execution_outcome(
-                motion_state, MotionExecutionTerminalCause::kFailed,
-                stop_completed ? error
-                               : ErrorDTO{kErrorStopFailed,
-                                          "Resume failed and stop drain did not complete",
-                                          {{"reason", "resume_failure_stop_drain"}}},
-                std::nullopt, outcome_reap_reason);
-          };
-
-          emit_event({KernelEventType::kPlanStarted,
-                      exec_id,
-                      clock_.now(),
-                      {},
-                      {},
-                      std::nullopt,
-                      {{"reason", "resume_replan"}, {"resume_phase", "planning"}}});
-          auto synchronized_scene = synchronize_scene_before_planning();
-          if (!synchronized_scene.ok()) {
-            fail_resume_closed(synchronized_scene.error(), "resume scene synchronization failed",
-                               "resume_scene_synchronization_failed", true, false);
-            return;
-          }
-          auto resume_scene_result = retain_current_scene_snapshot_lease_inventory(
-              exec_id, request.move_id + "_resume_" + std::to_string(clock_.now()));
-          if (!resume_scene_result.ok()) {
-            fail_resume_closed(resume_scene_result.error(), "resume scene retention failed",
-                               "resume_scene_retention_failed", true, false);
-            return;
-          }
-          auto resume_scene = std::move(resume_scene_result.value());
-          if (synchronized_scene.value().has_value() &&
-              resume_scene.binding().projection_revision != *synchronized_scene.value()) {
-            fail_resume_closed(ErrorDTO{kErrorExecutionRejected,
-                                        "Retained Resume projection differs from the "
-                                        "synchronized scene",
-                                        {{"reason", "planning_scene_synchronization_raced"}}},
-                               "resume scene synchronization raced",
-                               "resume_scene_synchronization_raced", true, false);
-            return;
-          }
-          auto resume_scene_snapshot_lease =
-              build_scene_snapshot_lease(resume_scene.inventory(), resume_request, exec_id);
-          auto resume_plan = plan_resume_trajectory_with_evidence(
-              resume_request, resume_scene.inventory(), trajectory,
-              execution_backend_.stopped_trajectory_time_s(execution_handle.execution_generation));
-          if (!resume_plan.ok()) {
-            fail_resume_closed(resume_plan.error(), "resume planning failed",
-                               "resume_planning_failed", true, false);
-            return;
-          }
-
-          auto resumed_trajectory = *resume_plan.value().result.trajectory;
-          if (prepared_resume) {
-            auto timing = apply_coordinated_candidate_timing(resumed_trajectory,
-                                                             prepared_session->authority, st);
-            if (!timing.ok()) {
-              fail_resume_closed(timing.error(), "resume common timing failed",
-                                 "resume_common_timing_failed", true, false);
-              return;
-            }
-            resume_plan.value().result.trajectory = resumed_trajectory;
-          }
-          emit_event({KernelEventType::kPlanCompleted,
-                      exec_id,
-                      clock_.now(),
-                      {},
-                      {},
-                      std::nullopt,
-                      {{"reason", "resume_replan"}, {"resume_phase", "planning"}}});
-          {
-            std::lock_guard<std::mutex> lock(metrics_mutex_);
-            metrics_.plans_succeeded++;
-          }
-
-          if (stop_policy_.stop_requested() || sm_.status().state == ExecutionState::kStopped) {
-            finish_resume_interrupted(ExecutionState::kStopped,
-                                      ErrorDTO{kErrorInternalError,
-                                               "Resume planning interrupted by stop",
-                                               {{"reason", "resume_planning_stop"}}},
-                                      "resume_planning_stop");
-            return;
-          }
-          if (sm_.status().state == ExecutionState::kIdle) {
-            finish_resume_interrupted(ExecutionState::kIdle,
-                                      ErrorDTO{kErrorInternalError,
-                                               "Resume planning interrupted by reset",
-                                               {{"reason", "resume_planning_reset"}}},
-                                      "resume_planning_reset");
-            return;
-          }
-
-          emit_event({KernelEventType::kValidationStarted,
-                      exec_id,
-                      clock_.now(),
-                      {},
-                      {},
-                      std::nullopt,
-                      {{"reason", "resume_replan"}, {"resume_phase", "validation"}}});
-
-          Result<CollisionValidationSuccess> resume_validation =
-              validate_trajectory(resumed_trajectory, resume_request,
-                                  resume_scene.mutable_inventory(), resume_scene_snapshot_lease);
-          if (!resume_validation.ok()) {
-            if (validation_cancelled_by_interrupt(resume_validation.error()) &&
-                sm_.status().state == ExecutionState::kInterrupted) {
-              emit_event({KernelEventType::kValidationFailed,
-                          exec_id,
-                          clock_.now(),
-                          {},
-                          {},
-                          std::nullopt,
-                          {{"reason", "resume validation cancelled by interrupt"},
-                           {"resume_phase", "validation"},
-                           {"resume_replan", "true"}}});
-              emit_event({KernelEventType::kErrorRaised,
-                          exec_id,
-                          clock_.now(),
-                          {},
-                          {},
-                          resume_validation.error(),
-                          {}});
-              mark_active_interrupt_preemption_result(InterruptPreemptionResult::kSucceeded);
-              auto interrupted_snapshot = latest_backend_snapshot;
-              interrupted_snapshot.timestamp_ns = clock_.now();
-              interrupted_snapshot.execution_id = exec_id;
-              interrupted_snapshot.move_id = request.move_id;
-              interrupted_snapshot.state = ExecutionState::kInterrupted;
-              interrupted_snapshot.error = resume_validation.error();
-              publish_execution_snapshot(std::move(interrupted_snapshot));
-              finalize_motion_execution_outcome(
-                  motion_state, MotionExecutionTerminalCause::kInterruptedFault, std::nullopt,
-                  std::nullopt, "resume_validation_cancelled_by_interrupt");
-              return;
-            }
-            fail_resume_closed(resume_validation.error(), "resume validation failed",
-                               "resume_validation_failed", false, true);
-            return;
-          }
-          auto resume_projection = build_runtime_collision_state_projection(
-              resumed_trajectory, resume_validation.value().collision_trajectory);
-          if (!resume_projection.ok()) {
-            fail_resume_closed(resume_projection.error(),
-                               "resume runtime collision projection failed",
-                               "resume_runtime_collision_projection_failed", false, true);
-            return;
-          }
-          set_runtime_collision_state_projection(std::move(resume_projection.value()));
-          auto resume_collision_trajectory = std::make_shared<const TrajectoryDTO>(
-              std::move(resume_validation.value().collision_trajectory));
-
-          const auto& resume_validation_telemetry = resume_validation.value().telemetry;
-          emit_event(
-              {KernelEventType::kValidationPassed,
-               exec_id,
-               clock_.now(),
-               {},
-               {},
-               std::nullopt,
-               {{"reason", "resume_replan"},
-                {"resume_phase", "validation"},
-                {"collision_workers_requested",
-                 std::to_string(resume_validation_telemetry.workers_requested)},
-                {"collision_workers_effective",
-                 std::to_string(resume_validation_telemetry.workers_effective)},
-                {"collision_workers_used",
-                 std::to_string(resume_validation_telemetry.workers_actually_used)},
-                {"collision_parallel_fallback_reason", resume_validation_telemetry.fallback_reason},
-                {"collision_ordered_contact_summary_used",
-                 resume_validation_telemetry.ordered_contact_summary_used ? "true" : "false"},
-                {"collision_validation_wall_ns",
-                 std::to_string(resume_validation_telemetry.total_wall_ns)},
-                {"dynamically_discovered_start_contact_count",
-                 std::to_string(
-                     resume_validation.value().dynamically_discovered_start_contact_count)}}});
-          {
-            std::lock_guard<std::mutex> lock(metrics_mutex_);
-            metrics_.validations_passed++;
-          }
-
-          if (stop_policy_.stop_requested() || sm_.status().state == ExecutionState::kStopped) {
-            finish_resume_interrupted(ExecutionState::kStopped,
-                                      ErrorDTO{kErrorInternalError,
-                                               "Resume validation interrupted by stop",
-                                               {{"reason", "resume_validation_stop"}}},
-                                      "resume_validation_stop");
-            return;
-          }
-          if (sm_.status().state == ExecutionState::kIdle) {
-            finish_resume_interrupted(ExecutionState::kIdle,
-                                      ErrorDTO{kErrorInternalError,
-                                               "Resume validation interrupted by reset",
-                                               {{"reason", "resume_validation_reset"}}},
-                                      "resume_validation_reset");
-            return;
-          }
-
-          std::shared_ptr<const PreparedOperationParticipantDTO> resume_participant;
-          if (resume_request.trajectory_relative_timeout) {
-            resume_request.timeouts.execution_timeout_s = requested_execution_timeout_s;
-            resolve_motion_execution_timeout(resume_request, resumed_trajectory);
-          }
-          if (prepared_resume) {
-            ExecuteWorkerPlanPhaseResult resume_plan_phase;
-            resume_plan_phase.trajectory = resumed_trajectory;
-            resume_plan_phase.plan_request = resume_plan.value().request;
-            resume_plan_phase.planning_result = resume_plan.value().result;
-            ExecuteWorkerValidationPhaseResult resume_validation_phase;
-            resume_validation_phase.collision_world_revision =
-                resume_validation.value().collision_world_revision;
-            resume_validation_phase.validation_evidence = PreparedMotionValidationEvidenceDTO{
-                config_.validation_revision, resume_validation.value().noncollision_result,
-                resume_validation.value().collision_world_revision,
-                resume_validation.value().collision_policy_revision,
-                resume_validation.value().collision_decision};
-            auto prepared = make_and_prepare_motion_participant(
-                resume_request, resumed_trajectory, resume_plan_phase, resume_validation_phase,
-                prepared_session);
-            if (!prepared.ok()) {
-              fail_resume_closed(prepared.error(), "resume backend preparation failed",
-                                 "resume_backend_preparation_failed", false, false);
-              return;
-            }
-            bool cancelled = false;
-            {
-              std::lock_guard session_lock(prepared_session->mutex);
-              cancelled = prepared_session->cancel_requested;
-              if (!cancelled) {
-                prepared_session->participant = prepared.value();
-                prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kPrepared;
-                resume_participant = std::move(prepared.value());
-              }
-            }
-            prepared_session->changed.notify_all();
-            if (cancelled) {
-              finish_resume_interrupted(
-                  ExecutionState::kStopped,
-                  ErrorDTO{kErrorInvalidRequest,
-                           "Prepared Resume was cancelled before dispatch",
-                           {{"reason", "prepared_resume_cancelled_pre_dispatch"}}},
-                  "prepared_resume_cancelled_pre_dispatch");
-              return;
-            }
-            emit_event({KernelEventType::kParticipantPrepared,
-                        exec_id,
-                        clock_.now(),
-                        {},
-                        {},
-                        std::nullopt,
-                        {{"prepared_contract_digest",
-                          resume_participant->prepared_contract_digest.value()},
-                         {"reason", "resume_reprepare"}}});
-            {
-              std::unique_lock session_lock(prepared_session->mutex);
-              while (!prepared_session->dispatch_requested && !prepared_session->cancel_requested &&
-                     !st.stop_requested() && !stop_policy_.stop_requested()) {
-                prepared_session->changed.wait_for(session_lock, std::chrono::milliseconds(10));
-              }
-              cancelled = prepared_session->cancel_requested || st.stop_requested() ||
-                          stop_policy_.stop_requested();
-              if (!cancelled) {
-                auto expected = PreparedMotionDispatchGate::kOpen;
-                if (!prepared_session->dispatch_gate.compare_exchange_strong(
-                        expected, PreparedMotionDispatchGate::kCommitted, std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
-                  cancelled = expected == PreparedMotionDispatchGate::kFencedBeforeDispatch;
-                }
-              }
-              if (cancelled) {
-                prepared_session->cancel_requested = true;
-                prepared_session->state =
-                    ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
-              }
-            }
-            if (cancelled) {
-              finish_resume_interrupted(
-                  ExecutionState::kStopped,
-                  ErrorDTO{kErrorInvalidRequest,
-                           "Prepared Resume was cancelled at the dispatch barrier",
-                           {{"reason", "prepared_resume_cancelled_at_dispatch_barrier"}}},
-                  "prepared_resume_cancelled_at_dispatch_barrier");
-              return;
-            }
-          }
-
-          motion_state.runtime_collision_protection_generation = start_collision_monitoring(
-              "resume_dispatch", RuntimeCollisionProtectionPurpose::kMotion,
-              &resume_scene.inventory());
-          // A freshly validated manual remainder gets its own duration-based
-          // budget. Authored Program deadlines remain cumulative, unchanged.
-          if (resume_request.trajectory_relative_timeout) {
-            exec_timeout_ns =
-                static_cast<int64_t>(resume_request.timeouts.execution_timeout_s * 1e9);
-            runtime_scaled_execution_ns = 0.0;
-            last_runtime_scale_sample_ns = clock_.now();
-          }
-          execution_handle =
-              prepared_resume ? execution_backend_.DispatchResume(
-                                    *resume_participant, resume_request.binding.controller_goal_id,
-                                    resume_request.binding.controller_goal_generation)
-                              : execution_backend_.resume(resumed_trajectory);
-          if (prepared_resume) {
-            if (const auto invalid = prepared_execution_handle_field_error(
-                    execution_handle, *resume_participant,
-                    resume_request.binding.controller_goal_id,
-                    resume_request.binding.controller_goal_generation)) {
-              fail_resume_closed(
-                  ErrorDTO{kErrorInvariantViolation,
-                           "Resume backend returned a handle outside the prepared goal",
-                           {{"reason", std::string(*invalid)}}},
-                  "prepared Resume dispatch membership failed",
-                  "prepared_resume_dispatch_membership_failed", false, false);
-              return;
-            }
-            {
-              std::lock_guard session_lock(prepared_session->mutex);
-              prepared_session->backend_execution_generation =
-                  execution_handle.execution_generation;
-              prepared_session->last_dispatched_participant = prepared_session->participant;
-              prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
-              prepared_session->resume_cycle = false;
-            }
-            prepared_session->changed.notify_all();
-          }
-
-          auto prev_state = sm_.status().state;
-          auto resume_transition = sm_.try_transition(ExecutionState::kExecuting);
-          if (!resume_transition.ok()) {
-            sm_.set_last_error(ErrorCode::kResumeFailed);
-            ErrorDTO resume_error{kErrorResumeFailed, "Resume transition to Executing failed", {}};
-            emit_event(
-                {KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, resume_error, {}});
-            auto terminal_commit = commit_terminal(ExecutionState::kFailed, "terminal_commit");
-            if (terminal_commit.committed != ExecutionState::kFailed) {
-              if (finalize_overridden_terminal_authority(
-                      terminal_commit.committed,
-                      "resume_transition_overridden_by_terminal_authority", resume_error)) {
-                return;
-              }
-            }
-            auto failed_snapshot = latest_backend_snapshot;
-            failed_snapshot.timestamp_ns = clock_.now();
-            failed_snapshot.execution_id = exec_id;
-            failed_snapshot.move_id = request.move_id;
-            failed_snapshot.state = terminal_commit.committed;
-            failed_snapshot.error = resume_error;
-            publish_execution_snapshot(std::move(failed_snapshot));
-            emit_event({KernelEventType::kStateTransition,
-                        exec_id,
-                        clock_.now(),
-                        prev_state,
-                        terminal_commit.committed,
-                        std::nullopt,
-                        {}});
-            finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed,
-                                              resume_error, std::nullopt,
-                                              "resume_transition_failed");
-            return;
-          }
-
-          emit_event({KernelEventType::kStateTransition,
-                      exec_id,
-                      clock_.now(),
-                      prev_state,
-                      ExecutionState::kExecuting,
-                      std::nullopt,
-                      {}});
-          emit_event(
-              {KernelEventType::kExecuteStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
-
-          auto resumed_snapshot = latest_backend_snapshot;
-          resumed_snapshot.timestamp_ns = clock_.now();
-          resumed_snapshot.execution_id = exec_id;
-          resumed_snapshot.move_id = request.move_id;
-          resumed_snapshot.state = ExecutionState::kExecuting;
-          resumed_snapshot.error.reset();
-          publish_execution_snapshot(std::move(resumed_snapshot));
-
-          motion_state.execution_progress_generation = execution_handle.execution_generation;
-          arm_runtime_collision_lookahead(exec_id, execution_handle.execution_generation,
-                                          std::move(resume_collision_trajectory),
-                                          resume_request.contact_policy_id,
-                                          resume_scene.inventory());
-          // A second Pause/Resume must use this new curve's timeline and
-          // remaining destinations, not the initial execution's milestones.
-          request.motion = std::move(resume_request.motion);
-          trajectory = std::move(resumed_trajectory);
-        }
-
-        if (completed) {
-          // Some real backends implement pause by cancelling the active
-          // controller goal. Their execution handle is then terminal even
-          // though the kernel state is intentionally kPaused. Keep the kernel
-          // worker alive so a later resume() can replan, validate, and
-          // fresh-dispatch the original motion intent; otherwise the state
-          // machine can advance to kValidating with no worker left to consume
-          // resume intent.
-          //
-          // Audit 6D (finding 2.19): condvar wait instead of a bare sleep —
-          // resume()/stop()/reset() notify `worker_signals_`, so the worker
-          // wakes immediately on intent instead of up to one poll period
-          // later. The poll period remains only as the deadline fallback.
-          (void)worker_signals_.wait_for_resume_or(
-              std::chrono::nanoseconds(kExecutionPollNs), [this, &st]() {
-                return lifecycle_stop_requested_while_busy_.load(std::memory_order_seq_cst) ||
-                       lifecycle_reset_requested_while_busy_.load(std::memory_order_acquire) ||
-                       st.stop_requested();
-              });
-        }
-        continue;
       }
 
       if (completed) {
@@ -8446,195 +7862,6 @@ Result<void> ExecutionKernel::DispatchPreparedMotion(
     session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
   }
   session->changed.notify_all();
-  return Result<void>::Ok();
-}
-
-Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_id,
-                                                  ResolvedPreparedMotionResumeRequestDTO request) {
-  std::shared_ptr<PreparedMotionSession> session;
-  {
-    std::lock_guard lock(prepared_motion_session_mutex_);
-    session = active_prepared_motion_session_;
-  }
-  if (!session) {
-    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                      "Prepared motion session is not resident",
-                                      {{"reason", "prepared_motion_session_missing"}}});
-  }
-  if (!request.operation_revision.nonzero() || request.operation_id.empty() ||
-      request.participant_id.empty() || request.controller_goal_id.empty() ||
-      !request.controller_goal_generation.nonzero() || !request.ordinary_stop_plan) {
-    return Result<void>::Err(ErrorDTO{kErrorInvalidRequest,
-                                      "Prepared Resume authority is incomplete",
-                                      {{"reason", "prepared_resume_authority_invalid"}}});
-  }
-
-  std::lock_guard lifecycle_lock(lifecycle_mutex_);
-  std::lock_guard session_lock(session->mutex);
-  if (session->execution_id != execution_id) {
-    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                      "Prepared Resume execution identity is stale",
-                                      {{"reason", "prepared_resume_execution_id_mismatch"}}});
-  }
-  const auto& prior = session->authority;
-  const auto& prior_binding = prior.execution_request.binding;
-  if (session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
-      session->resume_cycle || request.operation_id != prior_binding.operation_id ||
-      request.participant_id != prior_binding.participant_id ||
-      request.operation_revision.value() <= prior.operation_revision.value() ||
-      request.controller_goal_generation.value() <=
-          prior_binding.controller_goal_generation.value() ||
-      request.controller_goal_id == prior_binding.controller_goal_id ||
-      request.ordinary_stop_plan->operation_id != request.operation_id ||
-      request.ordinary_stop_plan->operation_revision != request.operation_revision ||
-      request.ordinary_stop_plan->participant_id != request.participant_id ||
-      request.ordinary_stop_plan->program_run_id != prior_binding.program_run_id ||
-      static_cast<bool>(request.fault_stop_plan) != static_cast<bool>(prior.fault_stop_plan) ||
-      (request.fault_stop_plan &&
-       (request.fault_stop_plan->operation_id != request.operation_id ||
-        request.fault_stop_plan->operation_revision != request.operation_revision ||
-        request.fault_stop_plan->participant_id != request.participant_id ||
-        request.fault_stop_plan->program_run_id != prior_binding.program_run_id ||
-        request.fault_stop_plan->participant_stop_profile_purpose !=
-            ParticipantStopProfilePurposeDTO::kFault ||
-        request.fault_stop_plan->motion_interrupt_scope_id.has_value()))) {
-    return Result<void>::Err(
-        ErrorDTO{kErrorInvalidRequest,
-                 "Prepared Resume does not advance the resident participant authority",
-                 {{"reason", "prepared_resume_authority_mismatch"}}});
-  }
-  const auto verified_stop = VerifyPreparedParticipantStopPlan(
-      prior.stop_readiness.value(), *request.ordinary_stop_plan, prior.binding.value().resources,
-      prior.retained_default_stop_limits, prior.stop_node_category);
-  if (!verified_stop.ok()) {
-    return Result<void>::Err(verified_stop.error());
-  }
-  if (request.fault_stop_plan) {
-    const auto verified_fault = VerifyPreparedParticipantStopPlan(
-        prior.stop_readiness.value(), *request.fault_stop_plan, prior.binding.value().resources,
-        prior.retained_default_stop_limits, prior.stop_node_category);
-    if (!verified_fault.ok()) {
-      return Result<void>::Err(verified_fault.error());
-    }
-  }
-
-  ResolvedPreparedMotionExecutionRequestDTO updated = prior;
-  updated.operation_revision = request.operation_revision;
-  updated.execution_request.binding.controller_goal_id = std::move(request.controller_goal_id);
-  updated.execution_request.binding.controller_goal_generation = request.controller_goal_generation;
-  updated.ordinary_stop_plan = std::move(request.ordinary_stop_plan);
-  updated.fault_stop_plan = std::move(request.fault_stop_plan);
-  updated.common_timing = std::move(request.common_timing);
-  if (prior.execution_request.initial_runtime_scale.has_value()) {
-    std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
-    if (!accepted_resolved_runtime_scale_command_.has_value() ||
-        !accepted_resolved_runtime_scale_result_.has_value() ||
-        !resolved_scale_target_matches(*accepted_resolved_runtime_scale_command_, prior_binding)) {
-      return Result<void>::Err(
-          ErrorDTO{kErrorInvariantViolation,
-                   "Prepared Resume lost its retained runtime-scale authority",
-                   {{"reason", "prepared_resume_runtime_scale_authority_missing"}}});
-    }
-    auto scale = *accepted_resolved_runtime_scale_command_;
-    scale.operation_revision = updated.operation_revision;
-    scale.controller_goal_id = updated.execution_request.binding.controller_goal_id;
-    scale.controller_goal_generation = updated.execution_request.binding.controller_goal_generation;
-    auto acceptance = *accepted_resolved_runtime_scale_result_;
-    acceptance.operation_revision = scale.operation_revision;
-    acceptance.controller_goal_id = scale.controller_goal_id;
-    acceptance.controller_goal_generation = scale.controller_goal_generation;
-    accepted_resolved_runtime_scale_command_ = scale;
-    accepted_resolved_runtime_scale_result_ = acceptance;
-    updated.execution_request.initial_runtime_scale = std::move(scale);
-  }
-  auto transition = stop_policy_.request_resume();
-  if (!transition.ok()) {
-    return Result<void>::Err(transition.error());
-  }
-  addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
-  session->authority = std::move(updated);
-  session->participant.reset();
-  session->backend_prepare_result.reset();
-  session->error.reset();
-  session->dispatch_gate.store(PreparedMotionDispatchGate::kOpen, std::memory_order_release);
-  session->dispatch_requested = false;
-  session->cancel_requested = false;
-  session->resume_cycle = true;
-  session->state = ResolvedPreparedMotionExecutionStateDTO::kPreparing;
-  worker_signals_.request_resume();
-  return Result<void>::Ok();
-}
-
-Result<void> ExecutionKernel::DispatchPreparedResumeMotion(
-    const std::uint64_t execution_id, const ContentDigest& prepared_contract_digest) {
-  std::shared_ptr<PreparedMotionSession> session;
-  {
-    std::lock_guard lock(prepared_motion_session_mutex_);
-    session = active_prepared_motion_session_;
-  }
-  if (!session) {
-    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                      "Prepared motion session is not resident",
-                                      {{"reason", "prepared_motion_session_missing"}}});
-  }
-  {
-    std::lock_guard lock(session->mutex);
-    if (session->execution_id != execution_id) {
-      return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                        "Prepared Resume execution identity is stale",
-                                        {{"reason", "prepared_resume_execution_id_mismatch"}}});
-    }
-    if (!session->resume_cycle ||
-        session->state != ResolvedPreparedMotionExecutionStateDTO::kPrepared ||
-        !session->participant ||
-        session->participant->prepared_contract_digest != prepared_contract_digest) {
-      return Result<void>::Err(
-          ErrorDTO{kErrorInvalidRequest,
-                   "Prepared Resume dispatch does not name the exact ready contract",
-                   {{"reason", "prepared_resume_dispatch_mismatch"}}});
-    }
-    session->dispatch_requested = true;
-    session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
-  }
-  session->changed.notify_all();
-  return Result<void>::Ok();
-}
-
-Result<void> ExecutionKernel::CancelPreparedResumeMotion(const std::uint64_t execution_id) {
-  std::shared_ptr<PreparedMotionSession> session;
-  {
-    std::lock_guard lock(prepared_motion_session_mutex_);
-    session = active_prepared_motion_session_;
-  }
-  if (!session) {
-    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                      "Prepared motion session is not resident",
-                                      {{"reason", "prepared_motion_session_missing"}}});
-  }
-  {
-    std::lock_guard lock(session->mutex);
-    if (session->execution_id != execution_id) {
-      return Result<void>::Err(ErrorDTO{kErrorMissingReference,
-                                        "Prepared Resume execution identity is stale",
-                                        {{"reason", "prepared_resume_execution_id_mismatch"}}});
-    }
-    if (!session->resume_cycle ||
-        session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
-      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                                        "No cancellable prepared Resume is resident",
-                                        {{"reason", "prepared_resume_not_cancellable"}}});
-    }
-    if (session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed ||
-        session->state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch) {
-      return Result<void>::Ok();
-    }
-    session->cancel_requested = true;
-    session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
-    if (session->authority.common_timing) session->authority.common_timing->cancel();
-  }
-  session->changed.notify_all();
-  request_active_planning_cancel();
-  request_active_validation_cancel("prepared_resume_cancelled_pre_dispatch");
   return Result<void>::Ok();
 }
 
@@ -9539,7 +8766,7 @@ Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_
                  {{"reason", "addressed_participant_stop_settlement_not_ready"},
                   {"state", to_string(before.state)}}});
   }
-  if (before.state != ExecutionState::kExecuting && before.state != ExecutionState::kPaused &&
+  if (before.state != ExecutionState::kExecuting &&
       before.state != ExecutionState::kStopping && before.state != ExecutionState::kCompleted) {
     std::map<std::string, std::string> details{{"reason", "addressed_motion_stop_state_invalid"},
                                                {"state", to_string(before.state)}};
@@ -9582,8 +8809,7 @@ Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_
                   {"state", to_string(committed.committed)}}});
   }
 
-  if (committed.previous == ExecutionState::kExecuting ||
-      committed.previous == ExecutionState::kPaused) {
+  if (committed.previous == ExecutionState::kExecuting) {
     emit_event({KernelEventType::kStateTransition,
                 request.execution_id,
                 clock_.now(),
@@ -9704,11 +8930,11 @@ StopResultDTO ExecutionKernel::stop() {
 
   // Pre-transition to kStopping when the source state has a
   // deceleration window. The state machine allows kStopping from
-  // Executing/Paused; Planning/Validating cancel direct to Stopped
+  // Executing; Planning/Validating cancel direct to Stopped
   // (no intermediate to observe). stop_policy_.request_hard_stop()
   // handles the final Stopping → Stopped step.
   const bool transitioned_to_stopping =
-      (prev_state == ExecutionState::kExecuting || prev_state == ExecutionState::kPaused) &&
+      prev_state == ExecutionState::kExecuting &&
       sm_.try_transition(ExecutionState::kStopping).ok();
   if (transitioned_to_stopping) {
     emit_event({KernelEventType::kStateTransition,
@@ -9837,7 +9063,7 @@ StopResultDTO ExecutionKernel::stop() {
               std::nullopt,
               {}});
   // Emit terminal state transition. `pre_completion_state` is kStopping
-  // when the source state had a deceleration window (Executing/Paused),
+  // when the source state had a deceleration window (Executing),
   // matching the spec/230 §6.1 stop chain; for Planning/Validating
   // cancellations it is the original prev_state and the transition goes
   // direct to kStopped.
@@ -9855,133 +9081,6 @@ StopResultDTO ExecutionKernel::stop() {
   }
   lifecycle_stop_requested_while_busy_.store(false, std::memory_order_seq_cst);
   return accepted_stop();
-}
-
-PauseResultDTO ExecutionKernel::pause() {
-  EventDeferralScope event_scope(*this);
-  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
-  if (!lifecycle_lock.owns_lock()) {
-    if (execute_admission_interruptible_.load(std::memory_order_seq_cst)) {
-      return PauseResultDTO{false, ErrorDTO{kErrorInvalidRequest,
-                                            "Pause is only valid during Executing",
-                                            {{"reason_code", "pause_not_executing"},
-                                             {"state", to_string(sm_.status().state)}}}};
-    }
-    lifecycle_lock.lock();
-  }
-
-  // Per spec/230 §6.1 Pause chain:
-  //   pause_requested → state_transition(Stopping) → state_transition(Paused)
-  // The Executing → Stopping transition is synchronous inside
-  // stop_policy_.request_pause(); the Stopping → Paused transition fires
-  // asynchronously via the scheduled lambda there. The
-  // pause_completed_callback (wired in the constructor) emits the
-  // terminal kStateTransition(Paused) event when that lambda runs.
-  const auto prev_state = sm_.status().state;
-  auto result = stop_policy_.request_pause();
-  if (result.ok()) {
-    auto backend_pause = execution_backend_.pause();
-    if (!backend_pause.accepted) {
-      auto error = backend_pause.error.value_or(ErrorDTO{kErrorStopFailed,
-                                                         "Execution backend refused pause",
-                                                         {{"reason", "backend_pause_refused"}}});
-      if (!error.details.contains("reason")) {
-        error.details["reason"] = "backend_pause_refused";
-      }
-      sm_.set_last_error(error_code_from_dto(error));
-      auto transition = commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
-      auto snapshot = get_execution_snapshot();
-      snapshot.timestamp_ns = clock_.now();
-      snapshot.state = sm_.status().state;
-      snapshot.error = error;
-      publish_execution_snapshot(std::move(snapshot));
-      emit_event({KernelEventType::kErrorRaised,
-                  sm_.status().execution_id,
-                  clock_.now(),
-                  {},
-                  {},
-                  error,
-                  error.details});
-      if (transition.ok()) {
-        emit_event({KernelEventType::kStateTransition,
-                    sm_.status().execution_id,
-                    clock_.now(),
-                    ExecutionState::kStopping,
-                    ExecutionState::kInterventionRequired,
-                    std::nullopt,
-                    {{"reason", "backend_pause_refused"}}});
-      }
-      return PauseResultDTO{false, error};
-    }
-    invalidate_gripper_authority(GripperInvalidationReason::kPause);
-    auto snapshot = get_execution_snapshot();
-    snapshot.timestamp_ns = clock_.now();
-    snapshot.state = sm_.status().state;
-    publish_execution_snapshot(std::move(snapshot));
-    emit_event({KernelEventType::kPauseRequested,
-                sm_.status().execution_id,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {}});
-    emit_event({KernelEventType::kStateTransition,
-                sm_.status().execution_id,
-                clock_.now(),
-                prev_state,
-                ExecutionState::kStopping,
-                std::nullopt,
-                {}});
-    return PauseResultDTO{true, std::nullopt};
-  }
-  auto error = result.error();
-  if (error.code == to_string(ErrorCode::kInvalidStateTransition)) {
-    error = ErrorDTO{kErrorInvalidRequest,
-                     "Pause is only valid during Executing",
-                     {{"reason_code", "pause_not_executing"}, {"state", to_string(prev_state)}}};
-  }
-  return PauseResultDTO{false, error};
-}
-
-ResumeResultDTO ExecutionKernel::resume(std::optional<std::uint64_t> expected_epoch) {
-  EventDeferralScope event_scope(*this);
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-
-  if (!control_command_epoch_matches(expected_epoch)) {
-    return ResumeResultDTO{false, stale_control_command_error()};
-  }
-  auto prev_state = sm_.status().state;
-  auto result = stop_policy_.request_resume();
-  if (result.ok()) {
-    authorize_gripper_authority();
-    // Audit 6D: wake the paused worker immediately (it waits on
-    // worker_signals_ keyed on resume intent instead of sleep-polling).
-    worker_signals_.request_resume();
-    auto snapshot = get_execution_snapshot();
-    snapshot.timestamp_ns = clock_.now();
-    snapshot.state = ExecutionState::kValidating;
-    snapshot.error.reset();
-    snapshot.state = sm_.status().state;
-    publish_execution_snapshot(std::move(snapshot));
-    // Emit kResumeRequested event
-    emit_event({KernelEventType::kResumeRequested,
-                sm_.status().execution_id,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {}});
-    emit_event({KernelEventType::kStateTransition,
-                sm_.status().execution_id,
-                clock_.now(),
-                prev_state,
-                sm_.status().state,
-                std::nullopt,
-                {}});
-    (void)refresh_recovery_assessment_locked("resume_accepted");
-    return ResumeResultDTO{true, std::nullopt};
-  }
-  return ResumeResultDTO{false, result.error()};
 }
 
 MotionInterruptStopCapabilityDTO ExecutionKernel::get_motion_interrupt_stop_capability() const {
@@ -10037,7 +9136,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
   // This reset intent is now admitted. Fence gripper callbacks and dispatch
   // before any cancellation, worker retirement, controlled-stop wait, or
   // backend reset can block. Later reset failure deliberately leaves admission
-  // closed; only a successful reset/resume/new execute reauthorizes commands.
+  // closed; only a successful reset/new execute reauthorizes commands.
   invalidate_gripper_authority(GripperInvalidationReason::kReset);
   ExecutionState prev_state;
   {
@@ -10222,8 +9321,6 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     return publish_idle_after_reset(prev_state, /*emit_transition=*/false);
   }
 
-  worker_signals_.clear_resume_request();
-
   const auto operator_stop_timeout = [&]() {
     if (config_.operator_stop_profile) {
       return effective_controlled_stop_deadline_duration(
@@ -10303,7 +9400,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     return std::nullopt;
   };
 
-  if ((prev_state == ExecutionState::kExecuting || prev_state == ExecutionState::kPaused) &&
+  if (prev_state == ExecutionState::kExecuting &&
       config_.operator_stop_profile && operator_controlled_stop_allowed(prev_state)) {
     emit_event({KernelEventType::kStopRequested,
                 sm_.status().execution_id,
@@ -10360,7 +9457,7 @@ ResetResultDTO ExecutionKernel::reset(std::optional<std::uint64_t> expected_epoc
     if (auto error = wait_for_selected_stop(ExecutionState::kStopping)) {
       return enter_reset_intervention(*error, prev_state);
     }
-  } else if (prev_state == ExecutionState::kExecuting || prev_state == ExecutionState::kPaused ||
+  } else if (prev_state == ExecutionState::kExecuting ||
              prev_state == ExecutionState::kStopping) {
     emit_event({KernelEventType::kStopRequested,
                 sm_.status().execution_id,
@@ -11562,11 +10659,10 @@ Result<void> ExecutionKernel::collision_check_tick() {
   }
   const auto stop_coverage_generation =
       stop_path_active ? runtime_collision_stop_coverage_.active_generation() : 0;
-  // The monitor runs over the robot during normal execution, while paused,
+  // The monitor runs over the robot during normal execution,
   // and over decelerating stop paths owned by motion-trip/operator/fault
   // preempt stop.
-  if (!stop_path_active && prev_state != ExecutionState::kExecuting &&
-      prev_state != ExecutionState::kPaused) {
+  if (!stop_path_active && prev_state != ExecutionState::kExecuting) {
     return Result<void>::Ok();
   }
 
@@ -12261,15 +11357,6 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     return Result<TrajectoryDTO>::Err(planned.error());
   }
   return Result<TrajectoryDTO>::Ok(std::move(*planned.value().result.trajectory));
-}
-
-Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_resume_trajectory_with_evidence(
-    ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-    const TrajectoryDTO& interrupted_trajectory, std::optional<double> original_cursor_s) {
-  auto retained = detail::capture_motion_resume_intent(request.motion, interrupted_trajectory,
-                                                       original_cursor_s);
-  if (!retained.ok()) return Result<PlanningSuccess>::Err(retained.error());
-  return plan_motion_continuation(request, projection_inventory, retained.value());
 }
 
 Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_motion_continuation(

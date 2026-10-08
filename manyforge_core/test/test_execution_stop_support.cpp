@@ -42,18 +42,11 @@ class SnapshotExecutionBackend final : public IExecutionBackend {
     return {};
   }
 
-  ExecutionHandle DispatchResume(const PreparedOperationParticipantDTO&, const ControllerGoalId&,
-                                 ControllerGoalGeneration) override {
-    return {};
-  }
-
   ExecutionHandle execute_trajectory(const TrajectoryDTO&) override { return {}; }
 
   Result<void> sync_observed_state_before_planning() override { return Result<void>::Ok(); }
 
   StopResultDTO stop() override { return {true, std::nullopt}; }
-  PauseResultDTO pause() override { return {true, std::nullopt}; }
-  ExecutionHandle resume(const TrajectoryDTO&) override { return {}; }
   ResetResultDTO reset() override { return {true, std::nullopt}; }
 
   ExecutionSnapshot get_execution_snapshot() const override {

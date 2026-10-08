@@ -1354,7 +1354,7 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_FALSE(retarget(0.75));
   detail::NativeStopQualificationAccess::release_runtime_scale(*first);
   // Finishing one Stop must not re-open the stopped occurrence's common law.
-  // A fresh prepared Resume uses a different clock.
+  // A fresh prepared dispatch uses a different clock.
   EXPECT_FALSE(retarget(0.75));
   const auto frozen = common->sample_now();
   ASSERT_TRUE(frozen);
@@ -1515,68 +1515,6 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000));
   EXPECT_EQ(backend->get_execution_snapshot().state,
             core::ExecutionState::kStopped);
-}
-
-TEST(NativeStopQualificationSeamTest,
-     PausedScaleChangesDoNotAdvanceMotionOrDependOnMotionFrameFreshness) {
-  core::FakeClock clock;
-  clock.advance(1);
-  auto binding = fixture::make_binding();
-  auto channel = std::make_shared<fixture::StateChannel>(binding);
-  RecordingProbe probe;
-  auto backend = detail::NativeStopQualificationAccess::construct(
-      binding, channel, clock, {}, probe);
-  auto execution =
-      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
-  ASSERT_TRUE(wait_until_executing(*backend));
-  ASSERT_TRUE(backend->pause().accepted);
-  const auto until = [](auto predicate) {
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (predicate())
-        return true;
-      std::this_thread::yield();
-    }
-    return false;
-  };
-  ASSERT_TRUE(until([&] {
-    return backend->get_execution_snapshot().state ==
-           core::ExecutionState::kPaused;
-  }));
-  const auto before = backend->get_execution_snapshot();
-  const auto cursor =
-      backend->stopped_trajectory_time_s(execution.execution_generation);
-  ASSERT_TRUE(cursor);
-  backend->set_runtime_velocity_scale(0.4);
-  ASSERT_TRUE(until([&] {
-    return backend->runtime_velocity_scale_status().applied_scale == 0.4;
-  }));
-  ASSERT_TRUE(until([&] {
-    return backend->get_execution_snapshot().sequence_number >
-           before.sequence_number;
-  }));
-  const auto paused = backend->get_execution_snapshot();
-  const auto first = backend->runtime_velocity_scale_status();
-  // Virtual years, not a wall-clock soak. A genuine local register read is
-  // fresh without publishing another joint frame or advancing the robot.
-  clock.advance(31LL * 365 * 24 * 60 * 60 * 1'000'000'000);
-  const auto later = backend->runtime_velocity_scale_status();
-  EXPECT_FALSE(later.error.has_value());
-  EXPECT_GT(later.acknowledgement_sequence, first.acknowledgement_sequence);
-  EXPECT_EQ(later.acknowledgement_timestamp_ns, clock.now());
-  EXPECT_EQ(later.virtual_trajectory_time_s, first.virtual_trajectory_time_s);
-  EXPECT_EQ(backend->get_execution_snapshot().sequence_number,
-            paused.sequence_number);
-  EXPECT_EQ(backend->get_execution_snapshot().joint_positions_rad,
-            before.joint_positions_rad);
-  EXPECT_EQ(backend->get_execution_snapshot().state,
-            core::ExecutionState::kPaused);
-  EXPECT_EQ(backend->stopped_trajectory_time_s(execution.execution_generation),
-            cursor);
-  EXPECT_TRUE(backend->reset().accepted);
-  EXPECT_FALSE(
-      backend->stopped_trajectory_time_s(execution.execution_generation));
-  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
 TEST(NativeStopQualificationSeamTest,

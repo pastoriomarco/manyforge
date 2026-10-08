@@ -28,7 +28,6 @@ GripperCommandResultDTO ExecutionKernel::command_gripper(const GripperCommandReq
   const auto state = sm_.status().state;
   switch (state) {
     using enum ExecutionState;
-    case kPaused:
     case kStopping:
     case kStopped:
     case kInterrupted:
@@ -49,7 +48,6 @@ Result<void> ExecutionKernel::validate_gripper_command(
   const auto state = sm_.status().state;
   switch (state) {
     using enum ExecutionState;
-    case kPaused:
     case kStopping:
     case kStopped:
     case kInterrupted:

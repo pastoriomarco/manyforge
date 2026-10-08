@@ -290,10 +290,10 @@ def test_control_origin_is_forwarded_privately_and_forbidden_publicly(
         "request_context": _stop_body()["request_context"],
         "operation_id": "operation.1",
         "expected_operation_revision": 2,
-        "reason": "Program Resume",
+        "reason": "Program Reset",
         "execution_scope": {
-            "node_instance_id": "resume",
-            "node_attempt_id": "resume.1",
+            "node_instance_id": "reset",
+            "node_attempt_id": "reset.1",
         },
     }
     commands = []
@@ -302,18 +302,18 @@ def test_control_origin_is_forwarded_privately_and_forbidden_publicly(
         commands.append(command)
         return {
             "ok": True,
-            "command": "resume",
+            "command": "reset",
             "accepted": {
                 "request_id": request["request_context"]["request_id"],
                 "operation_id": "operation.1",
-                "control": "resume",
+                "control": "reset",
                 "accepted_against_revision": 2,
             },
         }
 
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
-    assert transport.resume("operation.1", request)["ok"] is True
+    assert transport.reset("operation.1", request)["ok"] is True
     assert commands[0]["request"]["execution_scope"] == request["execution_scope"]
     with pytest.raises(ValidationError, match="execution_scope"):
         OperationControlRequest.model_validate(request)

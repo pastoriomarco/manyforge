@@ -200,7 +200,6 @@ class CollisionResourceManager {
   [[nodiscard]] static bool runtime_monitor_may_own_resource(
       ExecutionState state) {
     return state == ExecutionState::kExecuting ||
-           state == ExecutionState::kPaused ||
            state == ExecutionState::kStopping;
   }
 

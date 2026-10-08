@@ -210,13 +210,8 @@ class BoundedOperationControlExecutor::Impl final {
     std::shared_lock slots_lock(slots_mutex_);
     if (request.engine == nullptr || request.operation_id.empty() ||
         request.participant_id.empty() || !request.operation_revision.nonzero() ||
-        (request.control != OperationControlKind::kPause &&
-         request.control != OperationControlKind::kResume &&
-         request.control != OperationControlKind::kReset &&
+        (request.control != OperationControlKind::kReset &&
          request.control != OperationControlKind::kAcknowledgeCompleted) ||
-        (request.control == OperationControlKind::kResume &&
-         (request.prepared_engine == nullptr || !request.prepared_resume ||
-          !request.cancellation_requested)) ||
         ((request.control == OperationControlKind::kReset ||
           request.control == OperationControlKind::kAcknowledgeCompleted) &&
          request.subordinate_id == 0U) ||
@@ -404,62 +399,9 @@ class BoundedOperationControlExecutor::Impl final {
                                           request->control,
                                           false,
                                           std::nullopt};
-      result.prepared_resume_cleanup_only = request->prepared_resume_cleanup_only;
       bool infrastructure_failure = false;
       try {
         switch (request->control) {
-          case OperationControlKind::kPause: {
-            auto value = request->engine->pause();
-            result.accepted = value.accepted;
-            result.error = std::move(value.error);
-            break;
-          }
-          case OperationControlKind::kResume: {
-            if (request->prepared_resume_cleanup_only) {
-              result.prepared_resume_cleanup_finished = true;
-              const auto cancelled =
-                  request->prepared_engine->CancelPreparedResumeMotion(request->subordinate_id);
-              result.accepted = cancelled.ok();
-              if (!cancelled.ok()) result.error = cancelled.error();
-              break;
-            }
-            if (request->cancellation_requested->load(std::memory_order_acquire)) {
-              result.error =
-                  ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                           "Prepared Resume was superseded before subordinate preparation",
-                           {{"reason", "prepared_resume_superseded_before_prepare"}}};
-              result.prepared_resume_cleanup_finished = true;
-              break;
-            }
-            auto value = request->prepared_engine->PrepareResumeMotion(request->subordinate_id,
-                                                                       *request->prepared_resume);
-            result.prepared_resume_created = value.ok();
-            if (!value.ok()) {
-              // The exact preparation API must not retain a dispatchable
-              // product when it reports failure.
-              result.prepared_resume_cleanup_finished = true;
-            }
-            if (value.ok() && request->cancellation_requested->load(std::memory_order_acquire)) {
-              // A failed or throwing disposal remains one completed attempt,
-              // not permission for an automatic second cancellation.
-              result.prepared_resume_cleanup_finished = true;
-              auto cancelled =
-                  request->prepared_engine->CancelPreparedResumeMotion(request->subordinate_id);
-              if (!cancelled.ok()) {
-                value = Result<void>::Err(cancelled.error());
-              } else {
-                value = Result<void>::Err(
-                    ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                             "Prepared Resume was superseded during subordinate preparation",
-                             {{"reason", "prepared_resume_superseded_during_prepare"}}});
-              }
-            }
-            result.accepted = value.ok();
-            if (!value.ok()) {
-              result.error = value.error();
-            }
-            break;
-          }
           case OperationControlKind::kAcknowledgeCompleted: {
             auto value =
                 request->engine->acknowledge_completed(request->subordinate_id, std::nullopt);

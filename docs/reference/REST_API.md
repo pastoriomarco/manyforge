@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-10-06 18:51:43 UTC
+  Last regenerated: 2026-10-08 14:53:37 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -80,9 +80,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/operations` | headless-runtime-client | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` | headless-runtime-client | Execution Read |
 | `POST` | `/api/execution/operations/{operation_id}/acknowledge-completed` | headless-runtime-client | Execution Acknowledge Completed |
-| `POST` | `/api/execution/operations/{operation_id}/pause` | headless-runtime-client | Execution Pause |
 | `POST` | `/api/execution/operations/{operation_id}/reset` | headless-runtime-client | Execution Reset |
-| `POST` | `/api/execution/operations/{operation_id}/resume` | headless-runtime-client | Execution Resume |
 | `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
 | `GET` | `/api/execution/program-runs/{program_run_id}/admitted-speeds` | headless-runtime-client | Program Run Admitted Speeds |

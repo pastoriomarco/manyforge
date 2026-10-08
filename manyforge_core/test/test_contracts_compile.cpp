@@ -152,10 +152,6 @@ TEST(ContractsCompile, DefaultDTOs) {
   EXPECT_FALSE(stop_result.accepted);
   EXPECT_FALSE(stop_result.error.has_value());
 
-  manyforge::core::PauseResultDTO pause_result;
-  EXPECT_FALSE(pause_result.accepted);
-  EXPECT_FALSE(pause_result.error.has_value());
-
   manyforge::core::ResetResultDTO reset_result;
   EXPECT_FALSE(reset_result.accepted);
   EXPECT_FALSE(reset_result.error.has_value());
@@ -302,7 +298,6 @@ TEST(ContractsCompile, AllExecutionStates) {
   EXPECT_STREQ(to_string(ExecutionState::kValidating), "Validating");
   EXPECT_STREQ(to_string(ExecutionState::kExecuting), "Executing");
   EXPECT_STREQ(to_string(ExecutionState::kInterrupted), "Interrupted");
-  EXPECT_STREQ(to_string(ExecutionState::kPaused), "Paused");
   EXPECT_STREQ(to_string(ExecutionState::kStopping), "Stopping");
   EXPECT_STREQ(to_string(ExecutionState::kStopped), "Stopped");
   EXPECT_STREQ(to_string(ExecutionState::kCompleted), "Completed");

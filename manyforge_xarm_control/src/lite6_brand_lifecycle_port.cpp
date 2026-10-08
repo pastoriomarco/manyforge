@@ -91,6 +91,11 @@ constexpr int kModeChangedFeedbackState = 5;
           std::move(value)};
 }
 
+[[nodiscard]] LifecycleFactValueDTO integer_value(std::int64_t value) {
+  return {LifecycleFactValueKindDTO::kInteger, std::nullopt, value,
+          std::nullopt};
+}
+
 [[nodiscard]] FactState known_boolean(bool value) {
   return value ? FactState::kTrue : FactState::kFalse;
 }
@@ -154,6 +159,9 @@ observed_state(const XArmObservedState &observed) {
   const auto joint_servo = joint_servo_mode_selected(observed);
   const auto warning = warning_present(observed);
 
+  // A drive-disabled stopped arm keeps lifecycle state Disabled even with a
+  // vendor fault (the Recover plan requires it); the fault takes precedence in
+  // the `manyforge.blocking_cause_class` fact instead (spec 210).
   if (is_false(observed.motion_enabled) && is_true(stopped)) {
     return ComponentLifecycleStateDTO::kDisabled;
   }
@@ -177,8 +185,69 @@ observed_state(const XArmObservedState &observed) {
   return ComponentLifecycleStateDTO::kDegraded;
 }
 
+[[nodiscard]] bool report_unavailable(const XArmObservedState &observed) {
+  return std::find(observed.blocking_reason_codes.begin(),
+                   observed.blocking_reason_codes.end(),
+                   "xarm_report_unavailable") !=
+         observed.blocking_reason_codes.end();
+}
+
+// UFactory controller error codes (addendum 2 §9; R7 hardware verification
+// pending): C1 emergency-stop button, C2 control-box emergency IO, C3 enabling
+// switch; C10-C17 servo faults that need a power cycle; C31 collision.
+[[nodiscard]] bool emergency_stop_error(const int error_code) {
+  return error_code >= 1 && error_code <= 3;
+}
+
+[[nodiscard]] bool power_cycle_error(const int error_code) {
+  return error_code >= 10 && error_code <= 17;
+}
+
+constexpr int kCollisionErrorCode = 31;
+
+// Conservative vendor-state classification of one fresh, connected report.
+//
+// A positive controller error code is classified by its documented meaning;
+// every other positive code is `fault`. The protective stop has no documented
+// code and is never inferred: anything not established from the report is
+// `unknown`. An unrequested mode/state change (see `track_vendor_control`) is
+// `external_control`.
+[[nodiscard]] core::LifecycleBlockingCauseClassDTO
+vendor_cause(const XArmObservedState &observed,
+             const bool external_control_detected) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  if (observed.error_code > 0) {
+    if (emergency_stop_error(observed.error_code)) {
+      return Cause::kEmergencyStop;
+    }
+    if (observed.error_code == kCollisionErrorCode) {
+      return Cause::kCollision;
+    }
+    return Cause::kFault;
+  }
+  if (is_true(observed.fault_present) || is_true(observed.recovery_required)) {
+    return Cause::kFault;
+  }
+  if (report_unavailable(observed)) {
+    return Cause::kAvailability;
+  }
+  if (external_control_detected) {
+    return Cause::kExternalControl;
+  }
+  if (!is_false(observed.fault_present) ||
+      !is_false(observed.recovery_required) ||
+      observed.motion_enabled == FactState::kUnknown ||
+      !is_true(observed.position_valid) ||
+      !is_false(warning_present(observed)) || observed.mode < 0 ||
+      observed.state < 0) {
+    return Cause::kUnknown;
+  }
+  return Cause::kNone;
+}
+
 [[nodiscard]] std::vector<LifecycleFactDTO>
-normalized_facts(const XArmObservedState &observed) {
+normalized_facts(const XArmObservedState &observed,
+                 const core::LifecycleBlockingCauseClassDTO cause) {
   std::vector<LifecycleFactDTO> facts{
       {LifecycleFactId(std::string(kXArmMotionEnabledFactId)),
        fact_value(observed.motion_enabled)},
@@ -200,7 +269,32 @@ normalized_facts(const XArmObservedState &observed) {
        fact_value(ready_state_request_eligible(observed))},
       {LifecycleFactId(std::string(kXArmVendorFeedbackClassFactId)),
        feedback_class(observed)},
+      {LifecycleFactId(std::string(core::kLifecycleBlockingCauseFactId)),
+       token_value(std::string(core::to_string(cause)))},
   };
+  if (!report_unavailable(observed)) {
+    if (observed.error_code > 0) {
+      facts.push_back({LifecycleFactId(std::string(kVendorCodeErrorFactId)),
+                       token_value("C" + std::to_string(observed.error_code))});
+    }
+    if (power_cycle_error(observed.error_code)) {
+      facts.push_back(
+          {LifecycleFactId(std::string(kVendorCodePowerCycleFactId)),
+           token_value(std::string(kPowerCycleRequiredToken))});
+    }
+    if (observed.warning_code > 0) {
+      facts.push_back({LifecycleFactId(std::string(kVendorCodeWarningFactId)),
+                       integer_value(observed.warning_code)});
+    }
+    if (observed.mode >= 0) {
+      facts.push_back({LifecycleFactId(std::string(kVendorCodeModeFactId)),
+                       integer_value(observed.mode)});
+    }
+    if (observed.state >= 0) {
+      facts.push_back({LifecycleFactId(std::string(kVendorCodeStateFactId)),
+                       integer_value(observed.state)});
+    }
+  }
   std::sort(facts.begin(), facts.end(),
             [](const auto &left, const auto &right) {
               return left.lifecycle_fact_id < right.lifecycle_fact_id;
@@ -281,25 +375,92 @@ dispatched_uncertain(const BrandLifecyclePrimitiveIntentDTO &intent,
 }
 
 [[nodiscard]] BrandLifecyclePrimitiveResultDTO
-dispatched_failed(const BrandLifecyclePrimitiveIntentDTO &intent,
-                  std::string reason) {
-  auto result = result_base(intent);
-  result.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown;
-  result.effect = LifecyclePrimitiveEffectDTO::kPossible;
-  result.known_result = LifecyclePrimitiveKnownResultDTO::kFailed;
-  result.error = error("xarm_lifecycle_primitive_failed",
-                       "the restricted xArm owner reported primitive failure",
-                       std::move(reason));
-  return result;
-}
-
-[[nodiscard]] BrandLifecyclePrimitiveResultDTO
 dispatched_succeeded(const BrandLifecyclePrimitiveIntentDTO &intent) {
   auto result = result_base(intent);
   result.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown;
   result.effect = LifecyclePrimitiveEffectDTO::kPossible;
   result.known_result = LifecyclePrimitiveKnownResultDTO::kSucceeded;
   return result;
+}
+
+// An own primitive explains vendor mode/state changes for this long after it
+// returned, unless a report showed its final expected pair earlier.
+constexpr std::int64_t kOwnPrimitiveSettleNs = 5'000'000'000LL;
+constexpr int kPositionMode = 0;
+constexpr int kMovingFeedbackState = 1;
+constexpr int kDeceleratingFeedbackState = 6;
+
+// Mode/state pairs equivalent for unrequested-change detection: in joint-servo
+// mode the vendor alternates between moving and ready while ManyForge's own
+// ros2_control stream executes.
+[[nodiscard]] bool equivalent_pair(const int left_mode, const int left_state,
+                                   const int right_mode,
+                                   const int right_state) {
+  if (left_mode != right_mode) {
+    return false;
+  }
+  if (left_state == right_state) {
+    return true;
+  }
+  const auto servo_running = [](const int state) {
+    return state == kMovingFeedbackState || state == kReadyFeedbackState;
+  };
+  return left_mode == kJointServoMode && servo_running(left_state) &&
+         servo_running(right_state);
+}
+
+// True when `command`, dispatched from (base_mode, base_state), may by
+// itself have produced the reported (mode, state), including the vendor's
+// intermediate states. Deliberately permissive: an own effect is never an
+// incident, while modes ManyForge never selects are never explained.
+[[nodiscard]] bool own_effect_explains(const XArmLifecycleCommand command,
+                                       const int base_mode,
+                                       const int base_state, const int mode,
+                                       const int state) {
+  const bool base_or_position_mode =
+      mode == base_mode || mode == kPositionMode;
+  switch (command) {
+  case XArmLifecycleCommand::kEnableMotion:
+    return mode == base_mode &&
+           (state == base_state || state == kStoppedFeedbackState);
+  case XArmLifecycleCommand::kSelectJointServoMode:
+    return (mode == kJointServoMode &&
+            (state == base_state || state == kStoppedFeedbackState ||
+             state == kModeChangedFeedbackState)) ||
+           (mode == base_mode && state == kModeChangedFeedbackState);
+  case XArmLifecycleCommand::kSetReadyState:
+    return mode == base_mode && state == kReadyFeedbackState;
+  case XArmLifecycleCommand::kSetStoppedState:
+    return base_or_position_mode && (state == kStoppedFeedbackState ||
+                                      state == kDeceleratingFeedbackState);
+  case XArmLifecycleCommand::kDisableMotion:
+  case XArmLifecycleCommand::kClearError:
+  case XArmLifecycleCommand::kClearWarning:
+    return base_or_position_mode &&
+           (state == base_state || state == kStoppedFeedbackState);
+  default:
+    return false;
+  }
+}
+
+// True when the reported pair is the command's final expected postcondition.
+[[nodiscard]] bool own_effect_completed(const XArmLifecycleCommand command,
+                                        const int mode, const int state) {
+  switch (command) {
+  case XArmLifecycleCommand::kSelectJointServoMode:
+    return mode == kJointServoMode && state == kModeChangedFeedbackState;
+  case XArmLifecycleCommand::kSetReadyState:
+    return state == kReadyFeedbackState;
+  default:
+    return state == kStoppedFeedbackState;
+  }
+}
+
+// Stop-direction primitives CCLC may run while an intervention cause is open
+// (a requested Disable). They do not authorize a fresh baseline.
+[[nodiscard]] bool stop_direction(const XArmLifecycleCommand command) {
+  return command == XArmLifecycleCommand::kSetStoppedState ||
+         command == XArmLifecycleCommand::kDisableMotion;
 }
 
 } // namespace
@@ -408,6 +569,72 @@ bool Lite6BrandLifecyclePort::matches_occurrence(
          intent.provider_runtime_epoch == config_.provider_runtime_epoch;
 }
 
+// Unrequested mode/state change detection (addendum 2 §7). ManyForge knows
+// the changes it causes: each own primitive carries an expected vendor
+// effect. With a fresh error-free report, a mode/state change that neither
+// the last explained pair nor the in-flight or just-completed own primitive
+// explains is `external_control` (for example a UFactory Studio jog leaving
+// mode 0 / state 5, teach mode 2, or a stop that ManyForge did not request).
+// It stays reported, also across report loss, until CCLC dispatches the next
+// non-stop primitive, which it does only after the operator's acknowledgement;
+// that dispatch re-baselines from the latest fresh report. Detection of real
+// Studio jogs and of these vendor sequences is verified on hardware in R7.
+void Lite6BrandLifecyclePort::track_vendor_control(
+    const XArmObservedState &observed, const std::int64_t now_ns) {
+  if (report_unavailable(observed)) {
+    return;
+  }
+  last_reported_error_code_ = observed.error_code;
+  if (observed.mode < 0 || observed.state < 0) {
+    return;
+  }
+  const VendorControlPair reported{observed.mode, observed.state};
+  last_reported_pair_ = reported;
+  if (own_expectation_.has_value()) {
+    if (own_expectation_->completed_at_ns.has_value() &&
+        now_ns - *own_expectation_->completed_at_ns > kOwnPrimitiveSettleNs) {
+      own_expectation_.reset();
+    } else if (own_expectation_->base.mode < 0 ||
+               own_expectation_->base.state < 0) {
+      own_expectation_->base = explained_pair_.value_or(reported);
+    }
+  }
+  // A vendor error explains the pair it reports; its code classifies it.
+  if (observed.error_code != 0 || !is_false(observed.fault_present) ||
+      !is_false(observed.recovery_required)) {
+    explained_pair_ = reported;
+    return;
+  }
+  // ManyForge only ever selects position or joint-servo mode.
+  if (reported.mode != kPositionMode && reported.mode != kJointServoMode) {
+    external_control_detected_ = true;
+    return;
+  }
+  if (!explained_pair_.has_value()) {
+    explained_pair_ = reported;
+    return;
+  }
+  if (!equivalent_pair(explained_pair_->mode, explained_pair_->state,
+                       reported.mode, reported.state)) {
+    if (!own_expectation_.has_value() ||
+        !own_effect_explains(own_expectation_->command,
+                             own_expectation_->base.mode,
+                             own_expectation_->base.state, reported.mode,
+                             reported.state)) {
+      // The explained pair stays frozen at the last explained status.
+      external_control_detected_ = true;
+      return;
+    }
+    explained_pair_ = reported;
+  }
+  if (own_expectation_.has_value() &&
+      own_expectation_->completed_at_ns.has_value() &&
+      own_effect_completed(own_expectation_->command, reported.mode,
+                           reported.state)) {
+    own_expectation_.reset();
+  }
+}
+
 core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
     const core::BrandLifecycleObservationQueryDTO &query) {
   if (!query.locally_valid() || !matches_occurrence(query)) {
@@ -460,6 +687,27 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
             : observed.transport_owner_progress_reason));
   }
 
+  // A connected observation without a vendor report is an availability loss
+  // only while no intervention-requiring cause was previously reported; any
+  // classification from a report replaces the retained cause.
+  auto cause = core::LifecycleBlockingCauseClassDTO::kUnknown;
+  {
+    std::lock_guard lock(cause_mutex_);
+    track_vendor_control(observed, now_ns);
+    cause = vendor_cause(observed, external_control_detected_);
+    if (cause == core::LifecycleBlockingCauseClassDTO::kAvailability) {
+      if (last_intervention_cause_ !=
+          core::LifecycleBlockingCauseClassDTO::kNone) {
+        cause = last_intervention_cause_;
+      }
+    } else {
+      last_intervention_cause_ =
+          core::lifecycle_cause_requires_intervention(cause)
+              ? cause
+              : core::LifecycleBlockingCauseClassDTO::kNone;
+    }
+  }
+
   BrandLifecycleObservationDTO result{
       query.lifecycle_transaction_id,
       query.lifecycle_transaction_generation,
@@ -477,7 +725,7 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
       observed.transport_owner_received_timestamp_ns,
       observed.fresh_until_ns,
       observed_state(observed),
-      normalized_facts(observed)};
+      normalized_facts(observed, cause)};
   if (!result.locally_valid() || !result.matches(query)) {
     return core::Result<BrandLifecycleObservationDTO>::Err(
         error("xarm_lifecycle_observation_invalid",
@@ -503,6 +751,38 @@ BrandLifecyclePrimitiveResultDTO Lite6BrandLifecyclePort::Dispatch(
     return not_dispatched(intent, "xarm_lifecycle_primitive_cancelled",
                           "cancelled_before_transport_call");
   }
+  {
+    std::lock_guard lock(cause_mutex_);
+    // Servo faults C10-C17 need a power cycle; a clearing command must not
+    // precede it (R7 verification list).
+    if (*command == XArmLifecycleCommand::kClearError &&
+        power_cycle_error(last_reported_error_code_)) {
+      return not_dispatched(intent, "xarm_lifecycle_primitive_not_permitted",
+                            "power_cycle_required");
+    }
+    // CCLC dispatches a non-stop primitive only after the operator
+    // acknowledged an intervention; recovery starts from the fresh report.
+    if (!stop_direction(*command) && external_control_detected_) {
+      external_control_detected_ = false;
+      explained_pair_ = last_reported_pair_;
+    }
+    own_expectation_ = OwnPrimitiveExpectation{
+        *command, last_reported_pair_.value_or(VendorControlPair{}),
+        std::nullopt};
+  }
+  const auto settle_own_expectation = [&](const bool effect_possible) {
+    std::lock_guard lock(cause_mutex_);
+    if (!own_expectation_.has_value() ||
+        own_expectation_->command != *command ||
+        own_expectation_->completed_at_ns.has_value()) {
+      return;
+    }
+    if (effect_possible) {
+      own_expectation_->completed_at_ns = clock_.now();
+    } else {
+      own_expectation_.reset();
+    }
+  };
 
   XArmLifecycleCommandResult transport_result;
   try {
@@ -511,27 +791,41 @@ BrandLifecyclePrimitiveResultDTO Lite6BrandLifecyclePort::Dispatch(
         intent.expected_observation_generation, intent.remaining_duration_ns,
         cancellation);
   } catch (const std::exception &exception) {
+    settle_own_expectation(true);
     return dispatched_uncertain(intent, exception.what());
   } catch (...) {
+    settle_own_expectation(true);
     return dispatched_uncertain(intent, "unknown_transport_exception");
   }
 
   switch (transport_result.state) {
   case XArmLifecycleResultState::kNotDispatched:
+    settle_own_expectation(false);
     return not_dispatched(intent, "xarm_lifecycle_primitive_not_dispatched",
                           transport_result.reason);
   case XArmLifecycleResultState::kOutcomeUnknownAfterDispatch:
+    settle_own_expectation(true);
     return dispatched_uncertain(intent, transport_result.reason);
   case XArmLifecycleResultState::kResponseReceived:
     if (!transport_result.attempted) {
+      settle_own_expectation(false);
       return not_dispatched(intent, "xarm_lifecycle_primitive_not_permitted",
                             transport_result.reason);
     }
+    settle_own_expectation(true);
     if (transport_result.permitted && transport_result.return_code == 0) {
       return dispatched_succeeded(intent);
     }
-    return dispatched_failed(intent, transport_result.reason);
+    // A non-zero vendor return is an unknown outcome (old-main semantics):
+    // CCLC re-observes and reconciles; it never retries blindly.
+    return dispatched_uncertain(
+        intent, "vendor_return_code_" +
+                    std::to_string(transport_result.return_code) +
+                    (transport_result.reason.empty()
+                         ? std::string()
+                         : ":" + transport_result.reason));
   }
+  settle_own_expectation(true);
   return dispatched_uncertain(intent, "unknown_transport_result_state");
 }
 

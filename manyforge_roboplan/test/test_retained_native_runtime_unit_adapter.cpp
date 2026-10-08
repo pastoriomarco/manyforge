@@ -1301,8 +1301,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       << content_identity::canonical_json(recognized);
   const auto late = ExecutionPacket(
       ordinary,
-      packet("resume",
-             "{\"request_context\":" + context("late.resume") +
+      packet("reset",
+             "{\"request_context\":" + context("late.reset") +
                  ",\"operation_id\":\"operation.before-reconstruction\","
                  "\"expected_operation_revision\":1,\"reason\":null}"));
   ASSERT_NE(late.find_object_member("error"), nullptr);

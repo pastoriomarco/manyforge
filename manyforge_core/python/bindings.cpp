@@ -54,7 +54,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kValidating", manyforge::core::ExecutionState::kValidating)
       .value("kExecuting", manyforge::core::ExecutionState::kExecuting)
       .value("kInterrupted", manyforge::core::ExecutionState::kInterrupted)
-      .value("kPaused", manyforge::core::ExecutionState::kPaused)
       .value("kStopping", manyforge::core::ExecutionState::kStopping)
       .value("kStopped", manyforge::core::ExecutionState::kStopped)
       .value("kCompleted", manyforge::core::ExecutionState::kCompleted)
@@ -97,8 +96,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kExecutionAborted", manyforge::core::ErrorCode::kExecutionAborted)
       .value("kExecutionTimeout", manyforge::core::ErrorCode::kExecutionTimeout)
       .value("kStopFailed", manyforge::core::ErrorCode::kStopFailed)
-      .value("kPauseFailed", manyforge::core::ErrorCode::kPauseFailed)
-      .value("kResumeFailed", manyforge::core::ErrorCode::kResumeFailed)
       .value("kResetFailed", manyforge::core::ErrorCode::kResetFailed)
       .value("kInternalError", manyforge::core::ErrorCode::kInternalError)
       .value("kInvariantViolation", manyforge::core::ErrorCode::kInvariantViolation)
@@ -521,22 +518,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("error", &manyforge::core::StopResultDTO::error)
       .def("__repr__", [](const manyforge::core::StopResultDTO& s) {
         return py::str("StopResultDTO(accepted={})").format(s.accepted);
-      });
-
-  py::class_<manyforge::core::PauseResultDTO>(m, "PauseResultDTO")
-      .def(py::init<>())
-      .def_readwrite("accepted", &manyforge::core::PauseResultDTO::accepted)
-      .def_readwrite("error", &manyforge::core::PauseResultDTO::error)
-      .def("__repr__", [](const manyforge::core::PauseResultDTO& p) {
-        return py::str("PauseResultDTO(accepted={})").format(p.accepted);
-      });
-
-  py::class_<manyforge::core::ResumeResultDTO>(m, "ResumeResultDTO")
-      .def(py::init<>())
-      .def_readwrite("accepted", &manyforge::core::ResumeResultDTO::accepted)
-      .def_readwrite("error", &manyforge::core::ResumeResultDTO::error)
-      .def("__repr__", [](const manyforge::core::ResumeResultDTO& r) {
-        return py::str("ResumeResultDTO(accepted={})").format(r.accepted);
       });
 
   py::class_<manyforge::core::ResetResultDTO>(m, "ResetResultDTO")

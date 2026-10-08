@@ -529,15 +529,6 @@ TEST(RecoveryAdmissionTest, WaitingAssessmentRejectsAction) {
   EXPECT_EQ(decision.rejection_reason, reason_codes::kRecoveryStopNotCertified);
 }
 
-TEST(RecoveryAssessmentTest, PausedPublishesNoRecoveryOffer) {
-  RecoveryAuthorityCapture capture;
-  capture.execution_state = ExecutionState::kPaused;
-  const auto assessment = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
-  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kNone);
-  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kUnavailable);
-  EXPECT_TRUE(assessment.allowed_actions.empty());
-}
-
 TEST(RecoveryAssessmentTest, StoppedWithCertificateOffersReplan) {
   RecoveryAuthorityCapture capture;
   capture.control_command_epoch = 2;

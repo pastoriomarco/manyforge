@@ -46,8 +46,6 @@ adapters:
       - execution.feedback.phase_events
       - execution.feedback.state_snapshots
       - execution.stop.soft
-      - execution.pause
-      - execution.resume
       - execution.reset
     config: {}
 orchestrator:

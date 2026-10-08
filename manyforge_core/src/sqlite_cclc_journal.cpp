@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <map>
@@ -551,6 +552,56 @@ CREATE TABLE cclc_native_apply_plan_removals (
 ) STRICT;
 )sql";
 
+// v14/v15: session-scoped requested lifecycle targets (with whether the
+// component reached its target since startup or the last acknowledged
+// incident), the last intervention-required cause per component domain, and
+// component incidents with their bounded durable history events. A cancelled
+// target keeps its row (present=0) so a re-added component never reuses a
+// generation. At most one incident per component is open (acknowledged=0).
+constexpr std::string_view kLifecycleTargetSchemaUpgrade = R"sql(
+CREATE TABLE cclc_component_lifecycle_targets (
+  controllable_component_id TEXT PRIMARY KEY,
+  requested_state INTEGER NOT NULL CHECK (requested_state BETWEEN 0 AND 2),
+  origin INTEGER NOT NULL CHECK (origin BETWEEN 0 AND 2),
+  target_generation INTEGER NOT NULL CHECK (target_generation > 0),
+  present INTEGER NOT NULL CHECK (present IN (0, 1)),
+  reached INTEGER NOT NULL CHECK (reached IN (0, 1)),
+  recovered_cause INTEGER CHECK (recovered_cause IS NULL OR recovered_cause BETWEEN 2 AND 10)
+) STRICT;
+CREATE TABLE cclc_component_intervention_causes (
+  controllable_component_id TEXT NOT NULL,
+  control_domain_id TEXT NOT NULL,
+  cause_class INTEGER NOT NULL CHECK (cause_class BETWEEN 2 AND 10),
+  observed_at_ns INTEGER NOT NULL CHECK (observed_at_ns >= 0),
+  PRIMARY KEY(controllable_component_id, control_domain_id)
+) STRICT;
+CREATE TABLE cclc_component_incidents (
+  incident_id TEXT PRIMARY KEY,
+  incident_sequence INTEGER NOT NULL UNIQUE CHECK (incident_sequence > 0),
+  controllable_component_id TEXT NOT NULL,
+  cause_class INTEGER NOT NULL CHECK (cause_class BETWEEN 2 AND 10),
+  vendor_codes_json TEXT NOT NULL,
+  detected_at_ns INTEGER NOT NULL CHECK (detected_at_ns >= 0),
+  summary TEXT NOT NULL,
+  containment_state INTEGER NOT NULL CHECK (containment_state BETWEEN 0 AND 2),
+  record_json TEXT NOT NULL,
+  acknowledged INTEGER NOT NULL CHECK (acknowledged IN (0, 1)),
+  acknowledged_by TEXT,
+  acknowledged_at_ns INTEGER CHECK (acknowledged_at_ns IS NULL OR acknowledged_at_ns >= 0),
+  acknowledgement_request_id TEXT
+) STRICT;
+CREATE UNIQUE INDEX one_open_cclc_component_incident
+  ON cclc_component_incidents(controllable_component_id) WHERE acknowledged=0;
+CREATE TABLE cclc_component_incident_events (
+  event_sequence INTEGER PRIMARY KEY CHECK (event_sequence > 0),
+  incident_id TEXT NOT NULL,
+  event_kind TEXT NOT NULL CHECK (event_kind IN
+    ('component_incident', 'component_incident_acknowledged')),
+  occurred_at_ns INTEGER NOT NULL CHECK (occurred_at_ns >= 0),
+  payload_json TEXT NOT NULL
+) STRICT;
+)sql";
+
 [[nodiscard]] bool ValidCCLCClaimIntent(const CellAdmissionClaimIntentDTO& intent) {
   return ValidateCellAdmissionClaimIntent(intent).ok() &&
          intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
@@ -628,6 +679,7 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       Exec(expected, kRouteRecoverySchemaUpgrade);
       Exec(expected, kNativeApplySchemaUpgrade);
       Exec(expected, kNativeApplyDeltaSchemaUpgrade);
+      Exec(expected, kLifecycleTargetSchemaUpgrade);
       auto result = SchemaDefinitions(expected);
       const auto close_result = sqlite3_close(expected);
       if (close_result != SQLITE_OK) {
@@ -673,6 +725,11 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       "table:cclc_native_apply_plan_routes",
       "table:cclc_native_apply_plans",
       "table:cclc_native_apply_reservations",
+      "table:cclc_component_lifecycle_targets",
+      "table:cclc_component_intervention_causes",
+      "table:cclc_component_incidents",
+      "table:cclc_component_incident_events",
+      "index:one_open_cclc_component_incident",
       "table:lifecycle_transactions",
       "table:route_selection_transactions",
   };
@@ -1264,7 +1321,59 @@ class SqliteCCLCJournal::Impl final {
   void AdoptNativeApplyFacts(const NativeApplyFactAdoptionDTO& adoption);
   bool HasNativeApplyFacts(const ActiveBundlePublicationReceiptDTO& publication);
 
+  ComponentLifecycleTargetDTO SetLifecycleTarget(const ControllableComponentId& component,
+                                                 LifecycleTargetStateDTO requested_state,
+                                                 LifecycleTargetOriginDTO origin);
+  std::vector<ComponentLifecycleTargetDTO> LoadLifecycleTargets();
+  std::optional<ComponentLifecycleTargetDTO> LoadLifecycleTarget(
+      const ControllableComponentId& component);
+  bool RecordInterventionCause(const ControllableComponentId& component,
+                               const ControlDomainId& domain,
+                               std::optional<LifecycleBlockingCauseClassDTO> cause_class,
+                               std::int64_t observed_at_ns);
+  std::vector<ComponentLifecycleInterventionCauseDTO> LoadInterventionCauses(
+      const ControllableComponentId& component);
+  bool RecordLifecycleTargetReached(const ControllableComponentId& component, bool reached);
+  bool ComponentInUnadoptedApplyPlan(const ControllableComponentId& component);
+  ComponentIncidentRecordDTO OpenComponentIncident(const ComponentIncidentRecordDTO& record);
+  std::optional<ComponentIncidentRecordDTO> LoadOpenComponentIncident(
+      const ControllableComponentId& component);
+  bool RecordComponentIncidentContainment(const std::string& incident_id,
+                                          ComponentIncidentContainmentStateDTO state,
+                                          const std::string& record_json,
+                                          std::int64_t occurred_at_ns);
+  bool AcknowledgeComponentIncident(const ComponentLifecycleIncidentDTO& acknowledged,
+                                    const std::string& payload_json);
+  std::optional<ComponentIncidentRecoveryDTO> LoadComponentIncidentRecovery(
+      const ControllableComponentId& component, const RequestId& request_id);
+  bool UpdateOpenComponentIncident(const std::string& incident_id,
+                                   LifecycleBlockingCauseClassDTO cause_class,
+                                   const std::vector<std::string>& vendor_codes,
+                                   const std::string& record_json);
+  std::vector<ComponentIncidentEventDTO> LoadComponentIncidentEvents(std::uint64_t after_sequence,
+                                                                     std::size_t limit);
+
  private:
+  std::optional<ComponentIncidentRecordDTO> ReadOpenComponentIncidentLocked(
+      const ControllableComponentId& component);
+  void AppendComponentIncidentEventLocked(std::string_view event_kind,
+                                          const std::string& incident_id,
+                                          std::int64_t occurred_at_ns,
+                                          const std::string& payload_json);
+  /// The stored row, cancelled or not; caller holds the mutex.
+  std::optional<std::pair<ComponentLifecycleTargetDTO, bool>> ReadLifecycleTargetLocked(
+      const ControllableComponentId& component);
+  /// Mint the next target generation for one component; caller holds the
+  /// mutex inside a write transaction.
+  /// `reset_reached` starts the component over (startup or changed by an
+  /// Apply); an operator target keeps whether it reached its target.
+  ComponentLifecycleTargetDTO WriteLifecycleTargetLocked(const ControllableComponentId& component,
+                                                         LifecycleTargetStateDTO requested_state,
+                                                         LifecycleTargetOriginDTO origin,
+                                                         bool reset_reached);
+  /// Cancel the target and drop the intervention causes of a component that
+  /// left the adopted set; its generation watermark stays.
+  void CancelLifecycleTargetLocked(const ControllableComponentId& component);
   void InsertRejection(const RequestOwnerEpoch& owner, const RequestId& request_id,
                        std::string_view kind, std::string_view digest, const ErrorDTO& error);
   void RecordRejectionLocked(const PublicRequestContextDTO& context, std::string_view kind,
@@ -1357,6 +1466,7 @@ class SqliteCCLCJournal::Impl final {
       Exec(database_, kRouteRecoverySchemaUpgrade);
       Exec(database_, kNativeApplySchemaUpgrade);
       Exec(database_, kNativeApplyDeltaSchemaUpgrade);
+      Exec(database_, kLifecycleTargetSchemaUpgrade);
       Exec(database_, "PRAGMA application_id=" + std::to_string(kCCLCJournalSqliteApplicationId));
       Exec(database_, "PRAGMA user_version=" + std::to_string(kCCLCJournalSchemaVersion));
       Statement metadata(database_,
@@ -1376,6 +1486,9 @@ class SqliteCCLCJournal::Impl final {
               "lifecycle journal metadata insert returned an unexpected row");
     }
     // Current-only development journal: earlier versions are not migrated.
+    // Version 15 added component incidents, their history events and the
+    // reached-target marker; version 14 added requested lifecycle targets and
+    // intervention causes.
     // Version 13 removed the Disable Stop-handoff effect kinds and status
     // fields, so an older journal is refused unchanged before any write.
     if (const auto found_version = ScalarInteger(database_, "PRAGMA user_version");
@@ -4872,10 +4985,12 @@ std::optional<NativeApplyPlanDTO> SqliteCCLCJournal::Impl::ReadNativeApplyPlanLo
   while (components.Step()) {
     const auto state = static_cast<ComponentLifecycleStateDTO>(components.Integer(1));
     const bool retained = components.Integer(3) == 1;
-    // A changed component starts Active or keeps an explicit Disable; a
-    // retained one keeps whatever exact state it already had.
+    // A changed component starts Active (native) or Declared (externally
+    // managed controller), or keeps an explicit Disable; a retained one keeps
+    // whatever exact state it already had.
     Require(retained ? !to_string(state).empty()
                      : (state == ComponentLifecycleStateDTO::kActive ||
+                        state == ComponentLifecycleStateDTO::kDeclared ||
                         state == ComponentLifecycleStateDTO::kDisabled),
             "component_lifecycle_journal_corrupt", "native Apply plan state is invalid");
     plan.components.push_back(
@@ -4914,9 +5029,11 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
               request.components.size() <= kMaximumCCLCComponentWatermarks &&
               request.removed_components.size() <= kMaximumCCLCComponentWatermarks &&
               request.compiled_routes.size() <= kMaximumCCLCActiveConfigurationWatermarks &&
-              request.removed_domains.size() <= kMaximumCCLCActiveConfigurationWatermarks,
+              request.removed_domains.size() <= kMaximumCCLCActiveConfigurationWatermarks &&
+              (request.changed_component_state == ComponentLifecycleStateDTO::kActive ||
+               request.changed_component_state == ComponentLifecycleStateDTO::kDeclared),
           "component_lifecycle_native_apply_invalid",
-          "native Apply plan has an invalid Apply, candidate or scope");
+          "native Apply plan has an invalid Apply, candidate, scope or changed state");
   const auto valid_identity = [](const auto& id) {
     return !id.empty() && id.value().size() <= kMaxLifecycleIdentityBytes;
   };
@@ -5045,7 +5162,7 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
       }
       const bool retained =
           std::binary_search(retained_components.begin(), retained_components.end(), component);
-      auto state = ComponentLifecycleStateDTO::kActive;
+      auto state = request.changed_component_state;
       std::uint64_t generation = 0U;
       if (retained) {
         // The retained runtime keeps its exact lifecycle fact. A component
@@ -5058,7 +5175,8 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
         generation = current_fact->second;
       } else {
         // Only an explicit, completed Disable is preserved; every other
-        // changed native component is enabled by the Apply.
+        // changed component takes the requested state (enabled by a native
+        // Apply, only declared for an externally managed controller).
         if (current_fact.has_value() &&
             current_fact->first == ComponentLifecycleStateDTO::kDisabled) {
           state = ComponentLifecycleStateDTO::kDisabled;
@@ -5147,9 +5265,18 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
               plan->retained_components == retained_components &&
               plan->retained_domains == retained_domains &&
               plan->removed_components == removed_components &&
-              plan->removed_domains == removed_domains,
+              plan->removed_domains == removed_domains &&
+              std::all_of(plan->components.begin(), plan->components.end(),
+                          [&](const auto& component) {
+                            return std::binary_search(retained_components.begin(),
+                                                      retained_components.end(),
+                                                      component.component_id) ||
+                                   component.state == ComponentLifecycleStateDTO::kDisabled ||
+                                   component.state == request.changed_component_state;
+                          }),
           "component_lifecycle_native_apply_conflict",
-          "native Apply replay names another component, route, retained or removed scope");
+          "native Apply replay names another component, route, retained or removed scope, "
+          "or another changed component state");
   transaction.Commit();
   return *plan;
 }
@@ -5448,6 +5575,42 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
     Require(!current.Step(), "component_lifecycle_journal_corrupt",
             "native Apply route fact write returned a row");
   }
+  // Requested targets follow the adopted set in this same transaction
+  // (ADR-0026 §7 lifecycle-target amendment): a changed component gets the
+  // next generation of the startup target `active`, or `disabled` when the
+  // plan preserves an explicit Disable; a retained component keeps its
+  // target; every other target is cancelled with its intervention causes.
+  {
+    std::vector<ControllableComponentId> stale;
+    Statement present(database_,
+                      "SELECT controllable_component_id FROM cclc_component_lifecycle_targets "
+                      "WHERE present=1");
+    while (present.Step()) {
+      const ControllableComponentId id(present.Text(0));
+      if (std::none_of(components.begin(), components.end(),
+                       [&](const auto& row) { return row.component_id == id; })) {
+        stale.push_back(id);
+      }
+    }
+    for (const auto& id : stale) CancelLifecycleTargetLocked(id);
+  }
+  for (const auto& component : components) {
+    const auto existing = ReadLifecycleTargetLocked(component.component_id);
+    const bool has_target = existing.has_value() && existing->second;
+    if (retained_component(component.component_id) && has_target) continue;
+    if (component.state == ComponentLifecycleStateDTO::kDisabled) {
+      if (has_target && existing->first.requested_state == LifecycleTargetStateDTO::kDisabled) {
+        continue;
+      }
+      static_cast<void>(WriteLifecycleTargetLocked(
+          component.component_id, LifecycleTargetStateDTO::kDisabled,
+          LifecycleTargetOriginDTO::kOperator, true));
+    } else {
+      static_cast<void>(WriteLifecycleTargetLocked(component.component_id,
+                                                   LifecycleTargetStateDTO::kActive,
+                                                   LifecycleTargetOriginDTO::kStartup, true));
+    }
+  }
   Statement retain(database_,
       "INSERT INTO cclc_native_apply_adoptions("
       "apply_id,apply_generation,publication_generation,public_pointer_digest,"
@@ -5495,6 +5658,528 @@ bool SqliteCCLCJournal::Impl::HasNativeApplyFacts(
           "component_lifecycle_native_apply_conflict",
           "native Apply adoption conflicts with the active publication");
   return true;
+}
+
+std::optional<std::pair<ComponentLifecycleTargetDTO, bool>>
+SqliteCCLCJournal::Impl::ReadLifecycleTargetLocked(const ControllableComponentId& component) {
+  Statement row(database_,
+                "SELECT requested_state,origin,target_generation,present,reached,recovered_cause "
+                "FROM cclc_component_lifecycle_targets WHERE controllable_component_id=?");
+  row.Bind(1, component.value());
+  if (!row.Step()) return std::nullopt;
+  const ComponentLifecycleTargetDTO target{
+      component,
+      static_cast<LifecycleTargetStateDTO>(row.Integer(0)),
+      static_cast<LifecycleTargetOriginDTO>(row.Integer(1)),
+      Positive(row.Integer(2), "lifecycle target generation"),
+      row.Integer(4) == 1,
+      row.IsNull(5) ? std::nullopt
+                    : std::optional(static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(5)))};
+  const bool present = row.Integer(3) == 1;
+  Require(target.locally_valid() && !row.Step(), "component_lifecycle_journal_corrupt",
+          "lifecycle target row is invalid or duplicated");
+  return std::pair{target, present};
+}
+
+ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
+    const ControllableComponentId& component, const LifecycleTargetStateDTO requested_state,
+    const LifecycleTargetOriginDTO origin, const bool reset_reached) {
+  const auto previous = ReadLifecycleTargetLocked(component);
+  const std::uint64_t previous_generation = previous ? previous->first.target_generation : 0U;
+  Require(FitsSqliteInteger(previous_generation + 1U), "component_lifecycle_journal_capacity",
+          "lifecycle target generation is exhausted");
+  const bool keep = !reset_reached && previous.has_value() && previous->second;
+  const ComponentLifecycleTargetDTO target{
+      component,
+      requested_state,
+      origin,
+      previous_generation + 1U,
+      keep && previous->first.reached,
+      keep ? previous->first.recovered_cause : std::nullopt};
+  Require(target.locally_valid(), "component_lifecycle_target_invalid",
+          "lifecycle target is invalid");
+  Statement write(database_,
+                  "INSERT INTO cclc_component_lifecycle_targets("
+                  "controllable_component_id,requested_state,origin,target_generation,present,"
+                  "reached,recovered_cause) VALUES(?,?,?,?,1,?,?) "
+                  "ON CONFLICT(controllable_component_id) DO UPDATE "
+                  "SET requested_state=excluded.requested_state,origin=excluded.origin,"
+                  "target_generation=excluded.target_generation,present=1,"
+                  "reached=excluded.reached,recovered_cause=excluded.recovered_cause");
+  write.Bind(1, component.value());
+  write.Bind(2, static_cast<std::int64_t>(requested_state));
+  write.Bind(3, static_cast<std::int64_t>(origin));
+  write.Bind(4, static_cast<std::int64_t>(target.target_generation));
+  write.Bind(5, static_cast<std::int64_t>(target.reached ? 1 : 0));
+  if (target.recovered_cause) {
+    write.Bind(6, static_cast<std::int64_t>(*target.recovered_cause));
+  } else {
+    write.BindNull(6);
+  }
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "lifecycle target write returned a row");
+  return target;
+}
+
+void SqliteCCLCJournal::Impl::CancelLifecycleTargetLocked(
+    const ControllableComponentId& component) {
+  Statement cancel(database_,
+                   "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,"
+                   "recovered_cause=NULL WHERE controllable_component_id=?");
+  cancel.Bind(1, component.value());
+  Require(!cancel.Step(), "component_lifecycle_journal_corrupt",
+          "lifecycle target cancellation returned a row");
+  Statement causes(database_,
+                   "DELETE FROM cclc_component_intervention_causes "
+                   "WHERE controllable_component_id=?");
+  causes.Bind(1, component.value());
+  Require(!causes.Step(), "component_lifecycle_journal_corrupt",
+          "intervention cause removal returned a row");
+}
+
+ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::SetLifecycleTarget(
+    const ControllableComponentId& component, const LifecycleTargetStateDTO requested_state,
+    const LifecycleTargetOriginDTO origin) {
+  Require(!component.empty() && component.value().size() <= kMaxLifecycleIdentityBytes &&
+              !to_string(requested_state).empty() && !to_string(origin).empty(),
+          "component_lifecycle_target_invalid", "lifecycle target request is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  // Only a component whose facts an Apply adopted can carry a target.
+  Statement current(database_,
+                    "SELECT 1 FROM lifecycle_component_current_facts "
+                    "WHERE controllable_component_id=?");
+  current.Bind(1, component.value());
+  Require(current.Step(), "component_lifecycle_target_unknown_component",
+          "component " + component.value() + " has no adopted lifecycle fact");
+  auto target = WriteLifecycleTargetLocked(component, requested_state, origin, false);
+  transaction.Commit();
+  return target;
+}
+
+std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::LoadLifecycleTargets() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement rows(database_,
+                 "SELECT controllable_component_id,requested_state,origin,target_generation,"
+                 "reached,recovered_cause FROM cclc_component_lifecycle_targets WHERE present=1 "
+                 "ORDER BY controllable_component_id");
+  std::vector<ComponentLifecycleTargetDTO> result;
+  while (rows.Step()) {
+    ComponentLifecycleTargetDTO target{
+        ControllableComponentId(rows.Text(0)),
+        static_cast<LifecycleTargetStateDTO>(rows.Integer(1)),
+        static_cast<LifecycleTargetOriginDTO>(rows.Integer(2)),
+        Positive(rows.Integer(3), "lifecycle target generation"),
+        rows.Integer(4) == 1,
+        rows.IsNull(5)
+            ? std::nullopt
+            : std::optional(static_cast<LifecycleBlockingCauseClassDTO>(rows.Integer(5)))};
+    Require(target.locally_valid() && result.size() < kMaximumCCLCComponentWatermarks,
+            "component_lifecycle_journal_corrupt", "lifecycle target rows are invalid");
+    result.push_back(std::move(target));
+  }
+  return result;
+}
+
+std::optional<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::LoadLifecycleTarget(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto row = ReadLifecycleTargetLocked(component);
+  if (!row || !row->second) return std::nullopt;
+  return row->first;
+}
+
+bool SqliteCCLCJournal::Impl::RecordInterventionCause(
+    const ControllableComponentId& component, const ControlDomainId& domain,
+    const std::optional<LifecycleBlockingCauseClassDTO> cause_class,
+    const std::int64_t observed_at_ns) {
+  Require(!component.empty() && component.value().size() <= kMaxLifecycleIdentityBytes &&
+              !domain.empty() && domain.value().size() <= kMaxLifecycleIdentityBytes &&
+              observed_at_ns >= 0 &&
+              (!cause_class || lifecycle_cause_requires_intervention(*cause_class)),
+          "component_lifecycle_target_invalid", "intervention cause is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  std::optional<LifecycleBlockingCauseClassDTO> stored;
+  {
+    Statement current(database_,
+                      "SELECT cause_class FROM cclc_component_intervention_causes "
+                      "WHERE controllable_component_id=? AND control_domain_id=?");
+    current.Bind(1, component.value());
+    current.Bind(2, domain.value());
+    if (current.Step()) stored = static_cast<LifecycleBlockingCauseClassDTO>(current.Integer(0));
+  }
+  // An unchanged cause opens no write transaction: following a target
+  // publishes nothing while nothing changes.
+  if (stored == cause_class) return false;
+  Transaction transaction(database_);
+  if (cause_class) {
+    Statement write(database_,
+                    "INSERT INTO cclc_component_intervention_causes("
+                    "controllable_component_id,control_domain_id,cause_class,observed_at_ns) "
+                    "VALUES(?,?,?,?) ON CONFLICT(controllable_component_id,control_domain_id) "
+                    "DO UPDATE SET cause_class=excluded.cause_class,"
+                    "observed_at_ns=excluded.observed_at_ns");
+    write.Bind(1, component.value());
+    write.Bind(2, domain.value());
+    write.Bind(3, static_cast<std::int64_t>(*cause_class));
+    write.Bind(4, observed_at_ns);
+    Require(!write.Step(), "component_lifecycle_journal_corrupt",
+            "intervention cause write returned a row");
+  } else {
+    Statement clear(database_,
+                    "DELETE FROM cclc_component_intervention_causes "
+                    "WHERE controllable_component_id=? AND control_domain_id=?");
+    clear.Bind(1, component.value());
+    clear.Bind(2, domain.value());
+    Require(!clear.Step(), "component_lifecycle_journal_corrupt",
+            "intervention cause clear returned a row");
+  }
+  transaction.Commit();
+  return true;
+}
+
+std::vector<ComponentLifecycleInterventionCauseDTO>
+SqliteCCLCJournal::Impl::LoadInterventionCauses(const ControllableComponentId& component) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement rows(database_,
+                 "SELECT control_domain_id,cause_class,observed_at_ns "
+                 "FROM cclc_component_intervention_causes WHERE controllable_component_id=? "
+                 "ORDER BY control_domain_id");
+  rows.Bind(1, component.value());
+  std::vector<ComponentLifecycleInterventionCauseDTO> result;
+  while (rows.Step()) {
+    ComponentLifecycleInterventionCauseDTO cause{
+        component, ControlDomainId(rows.Text(0)),
+        static_cast<LifecycleBlockingCauseClassDTO>(rows.Integer(1)), rows.Integer(2)};
+    Require(cause.locally_valid() && result.size() < kMaxLifecycleResolvedDomains,
+            "component_lifecycle_journal_corrupt", "intervention cause rows are invalid");
+    result.push_back(std::move(cause));
+  }
+  return result;
+}
+
+bool SqliteCCLCJournal::Impl::RecordLifecycleTargetReached(const ControllableComponentId& component,
+                                                           const bool reached) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  const auto row = ReadLifecycleTargetLocked(component);
+  // Only a present target carries the marker; an unchanged one writes nothing.
+  if (!row || !row->second || row->first.reached == reached) return false;
+  Transaction transaction(database_);
+  // Reaching the target again ends the recovery of the last incident.
+  Statement write(database_,
+                  "UPDATE cclc_component_lifecycle_targets SET reached=?,"
+                  "recovered_cause=CASE WHEN ?=1 THEN NULL ELSE recovered_cause END "
+                  "WHERE controllable_component_id=? AND present=1");
+  write.Bind(1, static_cast<std::int64_t>(reached ? 1 : 0));
+  write.Bind(2, static_cast<std::int64_t>(reached ? 1 : 0));
+  write.Bind(3, component.value());
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "lifecycle target reached write returned a row");
+  transaction.Commit();
+  return true;
+}
+
+namespace {
+
+constexpr std::size_t kMaximumRetainedComponentIncidents = 256U;
+constexpr std::size_t kMaximumRetainedComponentIncidentEvents = 1024U;
+constexpr std::size_t kMaximumComponentIncidentRecordBytes = 256U * 1024U;
+
+[[nodiscard]] std::string EncodeVendorCodes(const std::vector<std::string>& codes) {
+  content_identity::CanonicalValue::Array values;
+  for (const auto& code : codes) values.emplace_back(code);
+  return content_identity::canonical_json(content_identity::CanonicalValue(std::move(values)));
+}
+
+[[nodiscard]] std::vector<std::string> DecodeVendorCodes(const std::string& json) {
+  const auto value = content_identity::parse_canonical_json(json);
+  Require(value.is_array() && value.as_array().size() <= kMaxComponentIncidentVendorCodes,
+          "component_lifecycle_journal_corrupt", "incident vendor codes are invalid");
+  std::vector<std::string> codes;
+  for (const auto& code : value.as_array()) {
+    Require(code.is_string(), "component_lifecycle_journal_corrupt",
+            "incident vendor code is invalid");
+    codes.push_back(code.as_string());
+  }
+  return codes;
+}
+
+}  // namespace
+
+std::optional<ComponentIncidentRecordDTO>
+SqliteCCLCJournal::Impl::ReadOpenComponentIncidentLocked(const ControllableComponentId& component) {
+  Statement row(database_,
+                "SELECT incident_id,cause_class,vendor_codes_json,detected_at_ns,summary,"
+                "containment_state,record_json FROM cclc_component_incidents "
+                "WHERE controllable_component_id=? AND acknowledged=0");
+  row.Bind(1, component.value());
+  if (!row.Step()) return std::nullopt;
+  ComponentIncidentRecordDTO record{
+      ComponentLifecycleIncidentDTO{row.Text(0),
+                                    component,
+                                    static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(1)),
+                                    DecodeVendorCodes(row.Text(2)),
+                                    row.Integer(3),
+                                    row.Text(4),
+                                    std::nullopt,
+                                    {},
+                                    static_cast<ComponentIncidentContainmentStateDTO>(row.Integer(5)),
+                                    std::nullopt,
+                                    std::nullopt,
+                                    false,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt},
+      row.Text(6)};
+  // A requested containment's Stop reference lives in the record payload.
+  if (record.incident.containment_state == ComponentIncidentContainmentStateDTO::kRequested) {
+    record.incident.containment_state = ComponentIncidentContainmentStateDTO::kFailed;
+    Require(record.incident.locally_valid(), "component_lifecycle_journal_corrupt",
+            "open incident row is invalid");
+    record.incident.containment_state = ComponentIncidentContainmentStateDTO::kRequested;
+  } else {
+    Require(record.incident.locally_valid(), "component_lifecycle_journal_corrupt",
+            "open incident row is invalid");
+  }
+  Require(!row.Step(), "component_lifecycle_journal_corrupt",
+          "component has more than one open incident");
+  return record;
+}
+
+void SqliteCCLCJournal::Impl::AppendComponentIncidentEventLocked(
+    const std::string_view event_kind, const std::string& incident_id,
+    const std::int64_t occurred_at_ns, const std::string& payload_json) {
+  const auto next = ScalarInteger(
+      database_, "SELECT coalesce(max(event_sequence),0)+1 FROM cclc_component_incident_events");
+  Statement write(database_,
+                  "INSERT INTO cclc_component_incident_events("
+                  "event_sequence,incident_id,event_kind,occurred_at_ns,payload_json) "
+                  "VALUES(?,?,?,?,?)");
+  write.Bind(1, next);
+  write.Bind(2, incident_id);
+  write.Bind(3, event_kind);
+  write.Bind(4, occurred_at_ns);
+  write.Bind(5, payload_json);
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "incident event write returned a row");
+  // Bounded history: the oldest events are dropped; sequences never repeat
+  // because the newest row always survives.
+  Statement trim(database_,
+                 "DELETE FROM cclc_component_incident_events WHERE event_sequence <= ?");
+  trim.Bind(1, next - static_cast<std::int64_t>(kMaximumRetainedComponentIncidentEvents));
+  Require(!trim.Step(), "component_lifecycle_journal_corrupt",
+          "incident event trim returned a row");
+}
+
+bool SqliteCCLCJournal::Impl::ComponentInUnadoptedApplyPlan(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  if (!ReadUnsettledNativeApplyPlanLocked()) return false;
+  Statement named(database_,
+                  "SELECT 1 FROM cclc_native_apply_plan_components "
+                  "WHERE controllable_component_id=?1 UNION ALL "
+                  "SELECT 1 FROM cclc_native_apply_plan_removals "
+                  "WHERE removal_kind='component' AND identity=?1");
+  named.Bind(1, component.value());
+  return named.Step();
+}
+
+ComponentIncidentRecordDTO SqliteCCLCJournal::Impl::OpenComponentIncident(
+    const ComponentIncidentRecordDTO& record) {
+  const auto& incident = record.incident;
+  Require(incident.locally_valid() && !incident.acknowledged &&
+              incident.containment_state == ComponentIncidentContainmentStateDTO::kPending &&
+              !record.record_json.empty() &&
+              record.record_json.size() <= kMaximumComponentIncidentRecordBytes,
+          "component_lifecycle_incident_invalid", "component incident is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  if (auto existing = ReadOpenComponentIncidentLocked(incident.controllable_component_id)) {
+    return std::move(*existing);
+  }
+  Transaction transaction(database_);
+  const auto sequence = ScalarInteger(
+      database_, "SELECT coalesce(max(incident_sequence),0)+1 FROM cclc_component_incidents");
+  Statement write(database_,
+                  "INSERT INTO cclc_component_incidents("
+                  "incident_id,incident_sequence,controllable_component_id,cause_class,"
+                  "vendor_codes_json,detected_at_ns,summary,containment_state,record_json,"
+                  "acknowledged) VALUES(?,?,?,?,?,?,?,0,?,0)");
+  write.Bind(1, incident.incident_id);
+  write.Bind(2, sequence);
+  write.Bind(3, incident.controllable_component_id.value());
+  write.Bind(4, static_cast<std::int64_t>(incident.cause_class));
+  write.Bind(5, EncodeVendorCodes(incident.vendor_codes));
+  write.Bind(6, incident.detected_at_ns);
+  write.Bind(7, incident.summary);
+  write.Bind(8, record.record_json);
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "incident write returned a row");
+  // Bounded: acknowledged incidents beyond the retention are dropped (their
+  // record stays in history); open ones are never dropped.
+  Statement trim(database_,
+                 "DELETE FROM cclc_component_incidents WHERE acknowledged=1 AND "
+                 "incident_sequence <= ?");
+  trim.Bind(1, sequence - static_cast<std::int64_t>(kMaximumRetainedComponentIncidents));
+  Require(!trim.Step(), "component_lifecycle_journal_corrupt",
+          "incident trim returned a row");
+  transaction.Commit();
+  return record;
+}
+
+std::optional<ComponentIncidentRecordDTO> SqliteCCLCJournal::Impl::LoadOpenComponentIncident(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  return ReadOpenComponentIncidentLocked(component);
+}
+
+bool SqliteCCLCJournal::Impl::RecordComponentIncidentContainment(
+    const std::string& incident_id, const ComponentIncidentContainmentStateDTO state,
+    const std::string& record_json, const std::int64_t occurred_at_ns) {
+  Require(!incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
+              state != ComponentIncidentContainmentStateDTO::kPending && !record_json.empty() &&
+              record_json.size() <= kMaximumComponentIncidentRecordBytes && occurred_at_ns >= 0,
+          "component_lifecycle_incident_invalid", "incident containment record is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement write(database_,
+                  "UPDATE cclc_component_incidents SET containment_state=?,record_json=? "
+                  "WHERE incident_id=? AND acknowledged=0 AND containment_state=0");
+  write.Bind(1, static_cast<std::int64_t>(state));
+  write.Bind(2, record_json);
+  write.Bind(3, incident_id);
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "incident containment write returned a row");
+  if (sqlite3_changes(database_) != 1) return false;
+  AppendComponentIncidentEventLocked(kComponentIncidentEventKind, incident_id, occurred_at_ns,
+                                     record_json);
+  transaction.Commit();
+  return true;
+}
+
+bool SqliteCCLCJournal::Impl::AcknowledgeComponentIncident(
+    const ComponentLifecycleIncidentDTO& acknowledged, const std::string& payload_json) {
+  Require(acknowledged.acknowledged && acknowledged.acknowledged_at_ns.has_value() &&
+              acknowledged.acknowledged_by.has_value() && !acknowledged.acknowledged_by->empty() &&
+              !acknowledged.incident_id.empty() &&
+              acknowledged.incident_id.size() <= kMaxComponentIncidentIdBytes &&
+              !payload_json.empty() && payload_json.size() <= kMaximumComponentIncidentRecordBytes,
+          "component_lifecycle_incident_invalid", "incident acknowledgement is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement close(database_,
+                  "UPDATE cclc_component_incidents SET acknowledged=1,acknowledged_by=?,"
+                  "acknowledged_at_ns=?,acknowledgement_request_id=? "
+                  "WHERE incident_id=? AND controllable_component_id=? AND acknowledged=0");
+  close.Bind(1, *acknowledged.acknowledged_by);
+  close.Bind(2, *acknowledged.acknowledged_at_ns);
+  if (acknowledged.acknowledgement_request_id) {
+    close.Bind(3, acknowledged.acknowledgement_request_id->value());
+  } else {
+    close.BindNull(3);
+  }
+  close.Bind(4, acknowledged.incident_id);
+  close.Bind(5, acknowledged.controllable_component_id.value());
+  Require(!close.Step(), "component_lifecycle_journal_corrupt",
+          "incident acknowledgement returned a row");
+  if (sqlite3_changes(database_) != 1) return false;
+  // The acknowledgement clears what fresh status alone would otherwise have
+  // to clear, and starts the component over: it must reach its target again
+  // before a further loss is a new incident.
+  Statement causes(database_,
+                   "DELETE FROM cclc_component_intervention_causes "
+                   "WHERE controllable_component_id=?");
+  causes.Bind(1, acknowledged.controllable_component_id.value());
+  Require(!causes.Step(), "component_lifecycle_journal_corrupt",
+          "intervention cause removal returned a row");
+  Statement reached(database_,
+                    "UPDATE cclc_component_lifecycle_targets SET reached=0,recovered_cause=? "
+                    "WHERE controllable_component_id=?");
+  reached.Bind(1, static_cast<std::int64_t>(acknowledged.cause_class));
+  reached.Bind(2, acknowledged.controllable_component_id.value());
+  Require(!reached.Step(), "component_lifecycle_journal_corrupt",
+          "lifecycle target reached reset returned a row");
+  AppendComponentIncidentEventLocked(kComponentIncidentAcknowledgedEventKind,
+                                     acknowledged.incident_id, *acknowledged.acknowledged_at_ns,
+                                     payload_json);
+  transaction.Commit();
+  return true;
+}
+
+std::optional<ComponentIncidentRecoveryDTO> SqliteCCLCJournal::Impl::LoadComponentIncidentRecovery(
+    const ControllableComponentId& component, const RequestId& request_id) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement row(database_,
+                "SELECT incident_id,cause_class,acknowledged_by,acknowledged_at_ns "
+                "FROM cclc_component_incidents WHERE controllable_component_id=? AND "
+                "acknowledged=1 AND acknowledgement_request_id=? "
+                "ORDER BY incident_sequence DESC LIMIT 1");
+  row.Bind(1, component.value());
+  row.Bind(2, request_id.value());
+  if (!row.Step()) return std::nullopt;
+  ComponentIncidentRecoveryDTO recovery{row.Text(0), component,
+                                        static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(1)),
+                                        row.Text(2), row.Integer(3)};
+  Require(recovery.locally_valid(), "component_lifecycle_journal_corrupt",
+          "acknowledged incident row is invalid");
+  return recovery;
+}
+
+bool SqliteCCLCJournal::Impl::UpdateOpenComponentIncident(
+    const std::string& incident_id, const LifecycleBlockingCauseClassDTO cause_class,
+    const std::vector<std::string>& vendor_codes, const std::string& record_json) {
+  Require(!incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
+              lifecycle_cause_requires_intervention(cause_class) &&
+              vendor_codes.size() <= kMaxComponentIncidentVendorCodes && !record_json.empty() &&
+              record_json.size() <= kMaximumComponentIncidentRecordBytes,
+          "component_lifecycle_incident_invalid", "incident update is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement write(database_,
+                  "UPDATE cclc_component_incidents SET cause_class=?,vendor_codes_json=?,"
+                  "record_json=? WHERE incident_id=? AND acknowledged=0");
+  write.Bind(1, static_cast<std::int64_t>(cause_class));
+  write.Bind(2, EncodeVendorCodes(vendor_codes));
+  write.Bind(3, record_json);
+  write.Bind(4, incident_id);
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "incident update returned a row");
+  if (sqlite3_changes(database_) != 1) return false;
+  transaction.Commit();
+  return true;
+}
+
+std::vector<ComponentIncidentEventDTO> SqliteCCLCJournal::Impl::LoadComponentIncidentEvents(
+    const std::uint64_t after_sequence, const std::size_t limit) {
+  Require(FitsSqliteInteger(after_sequence) && limit > 0U &&
+              limit <= kMaxComponentIncidentEventPage,
+          "component_lifecycle_incident_invalid", "incident event page is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement rows(database_,
+                 "SELECT event_sequence,event_kind,incident_id,occurred_at_ns,payload_json "
+                 "FROM cclc_component_incident_events WHERE event_sequence > ? "
+                 "ORDER BY event_sequence LIMIT ?");
+  rows.Bind(1, static_cast<std::int64_t>(after_sequence));
+  rows.Bind(2, static_cast<std::int64_t>(limit));
+  std::vector<ComponentIncidentEventDTO> result;
+  while (rows.Step()) {
+    result.push_back({Positive(rows.Integer(0), "incident event sequence"), rows.Text(1),
+                      rows.Text(2), rows.Integer(3), rows.Text(4)});
+  }
+  return result;
 }
 
 void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_terminal_count,
@@ -5811,6 +6496,97 @@ Result<void> SqliteCCLCJournal::AdoptNativeApplyFacts(
 Result<bool> SqliteCCLCJournal::HasNativeApplyFacts(
     const ActiveBundlePublicationReceiptDTO& publication) {
   return AsResult<bool>([&]() { return impl_->HasNativeApplyFacts(publication); });
+}
+
+Result<ComponentLifecycleTargetDTO> SqliteCCLCJournal::SetLifecycleTarget(
+    const ControllableComponentId& component, const LifecycleTargetStateDTO requested_state,
+    const LifecycleTargetOriginDTO origin) {
+  return AsResult<ComponentLifecycleTargetDTO>(
+      [&]() { return impl_->SetLifecycleTarget(component, requested_state, origin); });
+}
+
+Result<std::vector<ComponentLifecycleTargetDTO>> SqliteCCLCJournal::LoadLifecycleTargets() {
+  return AsResult<std::vector<ComponentLifecycleTargetDTO>>(
+      [&]() { return impl_->LoadLifecycleTargets(); });
+}
+
+Result<std::optional<ComponentLifecycleTargetDTO>> SqliteCCLCJournal::LoadLifecycleTarget(
+    const ControllableComponentId& component) {
+  return AsResult<std::optional<ComponentLifecycleTargetDTO>>(
+      [&]() { return impl_->LoadLifecycleTarget(component); });
+}
+
+Result<bool> SqliteCCLCJournal::RecordInterventionCause(
+    const ControllableComponentId& component, const ControlDomainId& domain,
+    const std::optional<LifecycleBlockingCauseClassDTO> cause_class,
+    const std::int64_t observed_at_ns) {
+  return AsResult<bool>([&]() {
+    return impl_->RecordInterventionCause(component, domain, cause_class, observed_at_ns);
+  });
+}
+
+Result<std::vector<ComponentLifecycleInterventionCauseDTO>>
+SqliteCCLCJournal::LoadInterventionCauses(const ControllableComponentId& component) {
+  return AsResult<std::vector<ComponentLifecycleInterventionCauseDTO>>(
+      [&]() { return impl_->LoadInterventionCauses(component); });
+}
+
+Result<bool> SqliteCCLCJournal::RecordLifecycleTargetReached(
+    const ControllableComponentId& component, const bool reached) {
+  return AsResult<bool>([&]() { return impl_->RecordLifecycleTargetReached(component, reached); });
+}
+
+Result<bool> SqliteCCLCJournal::ComponentInUnadoptedApplyPlan(
+    const ControllableComponentId& component) {
+  return AsResult<bool>([&]() { return impl_->ComponentInUnadoptedApplyPlan(component); });
+}
+
+Result<ComponentIncidentRecordDTO> SqliteCCLCJournal::OpenComponentIncident(
+    const ComponentIncidentRecordDTO& record) {
+  return AsResult<ComponentIncidentRecordDTO>(
+      [&]() { return impl_->OpenComponentIncident(record); });
+}
+
+Result<std::optional<ComponentIncidentRecordDTO>> SqliteCCLCJournal::LoadOpenComponentIncident(
+    const ControllableComponentId& component) {
+  return AsResult<std::optional<ComponentIncidentRecordDTO>>(
+      [&]() { return impl_->LoadOpenComponentIncident(component); });
+}
+
+Result<bool> SqliteCCLCJournal::RecordComponentIncidentContainment(
+    const std::string& incident_id, const ComponentIncidentContainmentStateDTO state,
+    const std::string& record_json, const std::int64_t occurred_at_ns) {
+  return AsResult<bool>([&]() {
+    return impl_->RecordComponentIncidentContainment(incident_id, state, record_json,
+                                                     occurred_at_ns);
+  });
+}
+
+Result<bool> SqliteCCLCJournal::AcknowledgeComponentIncident(
+    const ComponentLifecycleIncidentDTO& acknowledged, const std::string& payload_json) {
+  return AsResult<bool>(
+      [&]() { return impl_->AcknowledgeComponentIncident(acknowledged, payload_json); });
+}
+
+Result<std::optional<ComponentIncidentRecoveryDTO>>
+SqliteCCLCJournal::LoadComponentIncidentRecovery(const ControllableComponentId& component,
+                                                 const RequestId& request_id) {
+  return AsResult<std::optional<ComponentIncidentRecoveryDTO>>(
+      [&]() { return impl_->LoadComponentIncidentRecovery(component, request_id); });
+}
+
+Result<bool> SqliteCCLCJournal::UpdateOpenComponentIncident(
+    const std::string& incident_id, const LifecycleBlockingCauseClassDTO cause_class,
+    const std::vector<std::string>& vendor_codes, const std::string& record_json) {
+  return AsResult<bool>([&]() {
+    return impl_->UpdateOpenComponentIncident(incident_id, cause_class, vendor_codes, record_json);
+  });
+}
+
+Result<std::vector<ComponentIncidentEventDTO>> SqliteCCLCJournal::LoadComponentIncidentEvents(
+    const std::uint64_t after_sequence, const std::size_t limit) {
+  return AsResult<std::vector<ComponentIncidentEventDTO>>(
+      [&]() { return impl_->LoadComponentIncidentEvents(after_sequence, limit); });
 }
 
 void SqliteCCLCJournal::Close() {

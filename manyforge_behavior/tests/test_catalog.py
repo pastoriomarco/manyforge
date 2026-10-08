@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:6e62827057b520c2869f4aca330a002b6f737f4482299ca2ad222371cf06d6a2"
+EXPECTED_CATALOG_DIGEST = "sha256:5431cf57379b786ab05dccf2252ffa27cd6441ce32edbe76a7eef0f5ea995529"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -51,7 +51,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
-    assert len(catalog.entries) == 51
+    assert len(catalog.entries) == 49
     assert (
         len(
             {
@@ -60,7 +60,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
                 for engine_id, implementation_id in entry.runner_implementation_ids.items()
             }
         )
-        == 51
+        == 49
     )
 
 
@@ -111,9 +111,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
 def test_effectful_requirements_are_explicit_target_commands() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     expected = {
-        "execution.pause",
         "execution.reset",
-        "execution.resume",
         "execution.runtime_scale.operation_scoped",
         "execution.stop.soft",
         "execution.trajectory.execute",

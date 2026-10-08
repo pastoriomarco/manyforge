@@ -1,7 +1,0 @@
-{
-  "api_version": "manyforge.capability_definition.v1",
-  "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-  "capability_id": "execution.pause",
-  "provider_binding_kind": "control_binding",
-  "scope": "target_binding"
-}

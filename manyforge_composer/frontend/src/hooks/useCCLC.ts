@@ -15,6 +15,7 @@ import type {
 import type { ExecutionIdentity } from '../types/robotControl';
 
 const POLL_INTERVAL_MS = 250;
+const OBSERVATION_INTERVAL_MS = 2000;
 let fallbackIdentitySequence = 0;
 
 export interface CCLCController {
@@ -50,7 +51,7 @@ export function browserRequestIdentity(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${fallbackIdentitySequence.toString(36)}`;
 }
 
-function requestContext(
+export function requestContext(
   ownerEpoch: string,
   correlation: string,
 ): CCLCRequestContext {
@@ -243,6 +244,14 @@ export function useCCLC(
           admissionGeneration,
         ),
       );
+      if (result.incidentRecovery !== null) {
+        // Authorization-only Recover of an open incident: nothing to track;
+        // re-read so the closed incident and resumed progress are shown.
+        setTransaction(null);
+        setPendingTransaction(null);
+        await readCurrent();
+        return;
+      }
       if (result.transactionId === null) {
         throw new Error(`CCLC lifecycle request was ${result.replayStatus}`);
       }
@@ -312,6 +321,36 @@ export function useCCLC(
       setBusy(false);
     }
   }, [pendingTransaction, readCurrent]);
+
+  // Keep presenting the owner's current target progress and readiness without
+  // an operator acknowledgement. This only re-reads CCLC; it decides nothing.
+  const transactionOpen = pendingTransaction !== null && !transaction?.terminalResult;
+  const observing = enabled && componentId.trim() !== '' && !busy && !transactionOpen;
+  useEffect(() => {
+    if (!observing) return undefined;
+    let active = true;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+    const observe = async () => {
+      try {
+        await readCurrent(controller.signal);
+      } catch (reason) {
+        if (!active) return;
+        setSnapshot(null);
+        setRouteTemplates(null);
+        setReadUnavailableReason(
+          reason instanceof Error ? reason.message : 'CCLC state is unavailable',
+        );
+      }
+      if (active) timeout = setTimeout(observe, OBSERVATION_INTERVAL_MS);
+    };
+    timeout = setTimeout(observe, OBSERVATION_INTERVAL_MS);
+    return () => {
+      active = false;
+      controller.abort();
+      if (timeout !== null) clearTimeout(timeout);
+    };
+  }, [observing, readCurrent]);
 
   useEffect(() => {
     if (!enabled || pendingTransaction === null || transaction?.terminalResult) {

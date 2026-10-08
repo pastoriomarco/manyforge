@@ -59,7 +59,7 @@ ______________________________________________________________________
 
 | Component                                 | Language         | Responsibility                                                                                                                                                                                                              |
 | ----------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `manyforge_core`                          | C++20            | Execution kernel: lifecycle state machine, terminal authority, stop/pause/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.**                         |
+| `manyforge_core`                          | C++20            | Execution kernel: lifecycle state machine, terminal authority, stop/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.**                               |
 | `manyforge_deployment`                    | C++20            | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                                            |
 | `manyforge_component_manager`             | C++20            | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                                            |
 | `manyforge_headless`                      | C++20 + pybind11 | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters.                          |
@@ -522,8 +522,9 @@ ______________________________________________________________________
 ## Execution lifecycle
 
 Every motion moves through an explicit, guarded state machine — no implicit
-transitions from outside the kernel (simplified below; a resumable `Paused`
-state also exists for operator pause/resume):
+transitions from outside the kernel (simplified below). There is no
+operation Pause: Stop halts a move, a new move continues toward a target, and
+runtime speed scale 0 freezes in place without cancelling:
 
 ```
 Idle → Planning → Validating → Executing → Completed

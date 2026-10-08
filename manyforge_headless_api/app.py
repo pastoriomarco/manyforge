@@ -484,6 +484,12 @@ def create_app(
             core,
             event_execution,
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
+            # Its own short-bounded client: an unreachable CCLC owner must not
+            # hold up operation-event ingestion beyond one short exchange.
+            cclc=CCLCOpenRequestClient(
+                config.execution_run_root,
+                timeout_seconds=min(config.cclc_timeout_seconds, 1.0),
+            ),
         )
         # Its own thread, reading the owner's published projection without the
         # core lock: neither event-pump work nor any core call can delay the
@@ -1623,38 +1629,6 @@ def create_app(
                 "execution_operation_path_invalid",
                 "operation identity in the path and request body must match",
             )
-
-    @app.post("/api/execution/operations/{operation_id}/pause")
-    async def execution_pause(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
-        request: Request,
-    ) -> JSONResponse:
-        require_matching_operation(operation_id, body.operation_id)
-        return execution_response(
-            await rest_execution_command(
-                command_kind="operation_pause",
-                payload=body.model_dump(mode="json"),
-                request_context=body.request_context,
-                transport_request=request,
-            )
-        )
-
-    @app.post("/api/execution/operations/{operation_id}/resume")
-    async def execution_resume(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
-        request: Request,
-    ) -> JSONResponse:
-        require_matching_operation(operation_id, body.operation_id)
-        return execution_response(
-            await rest_execution_command(
-                command_kind="operation_resume",
-                payload=body.model_dump(mode="json"),
-                request_context=body.request_context,
-                transport_request=request,
-            )
-        )
 
     @app.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(

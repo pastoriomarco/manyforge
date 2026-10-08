@@ -611,5 +611,113 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
                    .ok());
 }
 
+TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
+       ConfigurationObservationAcceptsDeclaredComponentsOnlyOnItsOwnRead) {
+  const auto facts = source_facts(bundle());
+  const auto receipt = publication(bundle());
+  const FilesystemVerifiedRetainedProductArtifactSource artifacts(
+      package_root());
+  const auto kernel_current =
+      [](std::optional<core::ActiveControlConfigurationDTO> configuration) {
+        return [configuration](const core::ControlDomainId &)
+                   -> core::Result<
+                       std::optional<core::ActiveControlConfigurationDTO>> {
+          return core::Result<
+              std::optional<core::ActiveControlConfigurationDTO>>::
+              Ok(configuration);
+        };
+      };
+  const std::vector<ControllerLifecycleSourceOccurrenceDTO> sources{
+      {facts.domain->control_domain_id, facts.provider.provider_runtime_unit_id,
+       facts.provider.provider_runtime_epoch}};
+
+  // An adopted ROS Apply: the component is Declared, the route is current.
+  auto declared = bootstrap_facts(facts);
+  declared.readback.components.front().durable_generation =
+      core::ComponentLifecycleGeneration(1U);
+  declared.readback.components.front().current_state =
+      core::ComponentLifecycleStateDTO::kDeclared;
+  declared.readback.domains.front().current_active_control_configuration =
+      active_configuration(facts);
+  ASSERT_TRUE(declared.readback.locally_valid());
+  ActivePublicationReader declared_publication(receipt);
+  VerifiedRouteSelectionCurrentSnapshotSource declared_source(
+      bundle(), declared_publication, receipt, declared, artifacts, sources,
+      kernel_current(active_configuration(facts)));
+  const auto selection = declared_source.ReadCurrentRouteSelectionSnapshot(
+      bundle().retained_bundle_id(), bundle().value().cell_graph.graph_revision,
+      *facts.desired);
+  ASSERT_FALSE(selection.ok());
+  EXPECT_EQ(selection.error().details.at("reason"),
+            "route_snapshot_verification_failed");
+  const auto observed = declared_source.ReadCurrentRouteConfigurationObservation(
+      bundle().retained_bundle_id(), bundle().value().cell_graph.graph_revision,
+      *facts.desired);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().value().active_control_configuration,
+            active_configuration(facts));
+  EXPECT_EQ(observed.value().expected_controller_domain().value().source_runtime_unit_id,
+            facts.provider.provider_runtime_unit_id);
+
+  // No lifecycle fact at all (and a numbered fact without a state) is
+  // still observable; the Kernel's current route is the configuration.
+  auto missing = bootstrap_facts(facts);
+  missing.readback.components.front().durable_generation =
+      core::ComponentLifecycleGeneration(2U);
+  ActivePublicationReader missing_publication(receipt);
+  VerifiedRouteSelectionCurrentSnapshotSource missing_source(
+      bundle(), missing_publication, receipt, missing, artifacts, sources,
+      kernel_current(active_configuration(facts)));
+  EXPECT_FALSE(missing_source
+                   .ReadCurrentRouteSelectionSnapshot(
+                       bundle().retained_bundle_id(),
+                       bundle().value().cell_graph.graph_revision,
+                       *facts.desired)
+                   .ok());
+  const auto missing_observed =
+      missing_source.ReadCurrentRouteConfigurationObservation(
+          bundle().retained_bundle_id(),
+          bundle().value().cell_graph.graph_revision, *facts.desired);
+  ASSERT_TRUE(missing_observed.ok()) << missing_observed.error().message;
+  EXPECT_EQ(missing_observed.value().value().active_control_configuration,
+            active_configuration(facts));
+
+  // CCLC durable and Kernel current configuration must still agree.
+  auto other = active_configuration(facts);
+  other.active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(2U);
+  ActivePublicationReader disagreeing_publication(receipt);
+  VerifiedRouteSelectionCurrentSnapshotSource disagreeing(
+      bundle(), disagreeing_publication, receipt, declared, artifacts, sources,
+      kernel_current(other));
+  const auto disagreement = disagreeing.ReadCurrentRouteConfigurationObservation(
+      bundle().retained_bundle_id(), bundle().value().cell_graph.graph_revision,
+      *facts.desired);
+  ASSERT_FALSE(disagreement.ok());
+  EXPECT_EQ(disagreement.error().details.at("reason"),
+            "current_configuration_owner_mismatch");
+
+  // The retained identity and the controller source stay exact.
+  EXPECT_FALSE(declared_source
+                   .ReadCurrentRouteConfigurationObservation(
+                       core::RetainedBundleId("bundle.foreign"),
+                       bundle().value().cell_graph.graph_revision,
+                       *facts.desired)
+                   .ok());
+  ActivePublicationReader foreign_publication(receipt);
+  VerifiedRouteSelectionCurrentSnapshotSource foreign(
+      bundle(), foreign_publication, receipt, declared, artifacts,
+      {{facts.domain->control_domain_id,
+        core::RuntimeUnitId("foreign-controller-runtime"),
+        facts.provider.provider_runtime_epoch}},
+      kernel_current(active_configuration(facts)));
+  EXPECT_FALSE(foreign
+                   .ReadCurrentRouteConfigurationObservation(
+                       bundle().retained_bundle_id(),
+                       bundle().value().cell_graph.graph_revision,
+                       *facts.desired)
+                   .ok());
+}
+
 } // namespace
 } // namespace manyforge::deployment

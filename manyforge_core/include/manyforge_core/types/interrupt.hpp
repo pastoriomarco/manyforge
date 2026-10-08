@@ -147,7 +147,6 @@ enum class InterruptExecutionPhase {
   kPlanning,
   kValidation,
   kTrajectoryExecution,
-  kPaused,
   kHeld,
   kRecovery,
 };
@@ -379,7 +378,6 @@ inline const char* to_string(InterruptExecutionPhase phase) {
     case kPlanning: return "planning";
     case kValidation: return "validation";
     case kTrajectoryExecution: return "trajectory_execution";
-    case kPaused: return "paused";
     case kHeld: return "held";
     case kRecovery: return "recovery";
   }
@@ -393,7 +391,6 @@ inline std::optional<InterruptExecutionPhase> interrupt_phase_from_state(
     case kPlanning: return InterruptExecutionPhase::kPlanning;
     case kValidating: return InterruptExecutionPhase::kValidation;
     case kExecuting: return InterruptExecutionPhase::kTrajectoryExecution;
-    case kPaused: return InterruptExecutionPhase::kPaused;
     case kInterrupted: return InterruptExecutionPhase::kHeld;
     case kInterventionRequired: return InterruptExecutionPhase::kHeld;
     default: return std::nullopt;

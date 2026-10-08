@@ -872,7 +872,7 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 70U);
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 68U);
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());

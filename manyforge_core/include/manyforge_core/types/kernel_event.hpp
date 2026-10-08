@@ -30,8 +30,6 @@ enum class KernelEventType {
   kExecuteCompleted,   // execution phase completed
   kStopRequested,      // stop requested
   kStopIssued,         // stop issued to backend
-  kPauseRequested,     // pause requested
-  kResumeRequested,    // resume requested
   kRuntimeVelocityScaleChanged,  // runtime velocity scale changed
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
   kFailedValidationAcknowledged,  // retryable validation failure acknowledged

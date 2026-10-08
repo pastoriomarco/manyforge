@@ -49,8 +49,6 @@ _NATIVE_EXECUTION_COMMANDS = frozenset(
     {
         "operation_start",
         "operation_stop",
-        "operation_pause",
-        "operation_resume",
         "operation_reset",
         "operation_acknowledge_completed",
         "cell_full_stop",
@@ -64,8 +62,6 @@ _STANDALONE_EXECUTION_CONTROL_REVISION = 1
 _MISSING = object()
 _MANUAL_OPERATION_CONTROLS = frozenset(
     {
-        "operation_pause",
-        "operation_resume",
         "operation_reset",
         "operation_acknowledge_completed",
     }
@@ -474,19 +470,13 @@ class HeadlessExecutionControlDispatch:
                     attribution,
                 )
             elif kind in {
-                "operation_pause",
-                "operation_resume",
                 "operation_reset",
                 "operation_acknowledge_completed",
             }:
                 model = OperationControlRequest.model_validate(
                     {**payload, "request_context": context}
                 )
-                if kind == "operation_pause":
-                    result = self._service.execution_pause(model, attribution)
-                elif kind == "operation_resume":
-                    result = self._service.execution_resume(model, attribution)
-                elif kind == "operation_reset":
+                if kind == "operation_reset":
                     result = self._service.execution_reset(model, attribution)
                 else:
                     result = self._service.execution_acknowledge_completed(

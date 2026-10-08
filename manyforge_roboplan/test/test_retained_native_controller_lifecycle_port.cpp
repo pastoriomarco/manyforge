@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
@@ -423,6 +425,55 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->details.at("reason"),
             "external_brand_lifecycle_observer_only");
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     ConcurrentBrandObserversNeverRejectEachOthersNewerSample) {
+  FakeClock clock;
+  clock.set(5'000);
+  const ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      ControlDomainId("domain.arm"),
+      ControlDomainRevision("domain-revision"),
+      ProviderInstanceId("provider.external"),
+      ProviderManifestId("provider-manifest.external"),
+      ProviderManifestRevision("provider-manifest-revision"),
+      RuntimeUnitId("runtime.native"),
+      RuntimeEpoch("runtime-epoch.1"),
+      ContentDigest("catalog-digest")};
+  // Every sample is a newer external generation, as when the controller
+  // binding changes between two observers' samples.
+  std::atomic<std::uint64_t> generation{0U};
+  auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
+      occurrence,
+      [&generation](const ControlDomainId &, const TimePoint) {
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+            {++generation, ComponentLifecycleStateDTO::kActive, true, {}});
+      },
+      clock, 1'000);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+  const BrandLifecycleObservationQueryDTO query{
+      LifecycleTransactionId("transaction"),
+      LifecycleTransactionGeneration(1U),
+      ControllableComponentId("robot.1"),
+      occurrence.control_domain_id,
+      occurrence.control_domain_revision,
+      occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,
+      occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id,
+      occurrence.provider_runtime_epoch};
+
+  std::atomic<int> rejected{0};
+  std::vector<std::thread> observers;
+  for (int thread = 0; thread < 4; ++thread) {
+    observers.emplace_back([&] {
+      for (int sample = 0; sample < 500; ++sample) {
+        if (!created.value()->Observe(query).ok()) ++rejected;
+      }
+    });
+  }
+  for (auto &observer : observers) observer.join();
+  EXPECT_EQ(rejected.load(), 0);
 }
 
 } // namespace

@@ -294,10 +294,36 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
     return verify_route_selection_current_snapshot(std::move(snapshot));
   }
 
+  [[nodiscard]] Result<RouteConfigurationObservationSnapshot>
+  ReadCurrentRouteConfigurationObservation(
+      const RetainedBundleId& bundle_id, const GraphRevision& graph_revision,
+      const DesiredControlConfigurationDTO& desired) const override {
+    ++observation_read_count_;
+    auto snapshot = CurrentSnapshot();
+    {
+      std::lock_guard lock(mutex_);
+      snapshot.active_control_configuration = active_configuration_;
+      snapshot.expected_controller_domain.source_runtime_epoch = runtime_epoch_;
+    }
+    if (snapshot.retained_bundle_id != bundle_id || snapshot.graph_revision != graph_revision ||
+        snapshot.expected_controller_domain.desired_configuration != desired) {
+      return Result<RouteConfigurationObservationSnapshot>::Err(
+          ErrorDTO{"route_snapshot_mismatch", "unexpected route snapshot query", {}});
+    }
+    // The component lifecycle state is not part of an observation closure.
+    return verify_route_configuration_observation_snapshot(
+        {snapshot.retained_bundle_id, snapshot.graph_revision,
+         snapshot.active_control_configuration, snapshot.expected_controller_domain});
+  }
+
   [[nodiscard]] std::size_t read_count() const noexcept { return read_count_.load(); }
+  [[nodiscard]] std::size_t observation_read_count() const noexcept {
+    return observation_read_count_.load();
+  }
 
  private:
   mutable std::atomic<std::size_t> read_count_{0U};
+  mutable std::atomic<std::size_t> observation_read_count_{0U};
   mutable std::mutex mutex_;
   std::optional<ActiveControlConfigurationDTO> active_configuration_;
   RuntimeEpoch runtime_epoch_{"runtime-epoch.1"};
@@ -898,6 +924,60 @@ TEST(RouteSelectionCoordinator, ObservationDoesNotNeedAdmissionOrRepairMismatche
     EXPECT_FALSE(publication.value());
     EXPECT_FALSE(coordinator.accepting_new_requests());
   }
+}
+
+TEST(RouteSelectionCoordinator, ObservationAcceptsADeclaredComponentWhileRouteSelectionRejectsIt) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  UnusedComponentSnapshotSource component_snapshots;
+  UnusedCatalogSource catalogs;
+  UnusedBrandResolver brand_resolver;
+  RecoveryAwareAdmissionPort admission;
+  FakeRouteSnapshotSource snapshots;
+  snapshots.SetComponentState(ComponentLifecycleStateDTO::kDeclared);
+  auto controller = std::make_shared<FakeControllerPort>(true);
+  FakeControllerResolver resolver(controller);
+  FakeClock clock;
+  clock.set(100);
+  WaitableManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(
+      Config(), journal, reservations, component_snapshots, catalogs, brand_resolver, admission,
+      clock, scheduler,
+      ComponentLifecycleCoordinatorRouteServices{&snapshots, &resolver, nullptr, nullptr});
+
+  // Route selection keeps its strict closure: a Declared expectation is not
+  // a route-admission permission.
+  const auto selection = snapshots.ReadCurrentRouteSelectionSnapshot(
+      RetainedBundleId("bundle.1"), GraphRevision("graph.1"), Desired());
+  ASSERT_FALSE(selection.ok());
+  EXPECT_EQ(selection.error().details.at("reason"), "shape_invalid");
+
+  // Configuration observation (Stop recovery) still qualifies the controller.
+  const auto observed = coordinator.ObserveRouteConfiguration(
+      RetainedBundleId("bundle.1"), GraphRevision("graph.1"), Desired(),
+      ExpectedActiveControlConfigurationDTO{ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+                                            std::nullopt, std::nullopt});
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().second.disposition,
+            ControllerLifecycleReconciliationDispositionDTO::kReconciled);
+  EXPECT_EQ(snapshots.read_count(), 1U);
+  EXPECT_EQ(snapshots.observation_read_count(), 1U);
+  // Identity and the controller source are still exact.
+  snapshots.SetRuntimeEpoch(RuntimeEpoch("runtime-epoch.foreign"));
+  EXPECT_FALSE(coordinator
+                   .ObserveRouteConfiguration(RetainedBundleId("bundle.1"),
+                                              GraphRevision("graph.1"), Desired())
+                   .ok());
+  snapshots.SetRuntimeEpoch(RuntimeEpoch("runtime-epoch.1"));
+  EXPECT_FALSE(coordinator
+                   .ObserveRouteConfiguration(RetainedBundleId("bundle.foreign"),
+                                              GraphRevision("graph.1"), Desired())
+                   .ok());
+  EXPECT_EQ(controller->dispatch_count(), 0U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+  EXPECT_FALSE(coordinator.accepting_new_requests());
 }
 
 TEST(RouteSelectionCoordinator, ObservationRejectsMissingReadServicesBeforeStart) {

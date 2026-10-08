@@ -30,13 +30,8 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
       return to == ExecutionState::kStopping || to == ExecutionState::kInterrupted ||
              to == ExecutionState::kCompleted || to == ExecutionState::kFailed ||
              to == ExecutionState::kInterventionRequired;
-    case ExecutionState::kPaused:
-      return to == ExecutionState::kValidating ||  // resume re-validates
-             to == ExecutionState::kInterrupted || to == ExecutionState::kStopping ||
-             to == ExecutionState::kInterventionRequired;
     case ExecutionState::kStopping:
       return to == ExecutionState::kStopped ||
-             to == ExecutionState::kPaused ||  // deceleration complete from pause
              // Per spec/230 §3.4: a successful
              // complete_move_on_signal trip transitions
              // Stopping -> Completed once the controlled stop

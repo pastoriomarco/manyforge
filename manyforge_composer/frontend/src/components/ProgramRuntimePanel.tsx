@@ -22,6 +22,7 @@ import {
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
+import { incidentFacts } from '../state/componentLifecyclePresentation';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
@@ -699,13 +700,15 @@ export function deriveTransportGuidance({
       title: 'Cell recovery required',
       message: `${humanizeReasonCode(fault.reasonCode)} · ${
         fault.recoveryStatus.replaceAll('_', ' ')
-      }. Motion remains blocked.`,
+      }. Motion remains blocked.${robot.componentIncidents.map(({ componentId, incident }) =>
+        ` Incident on ${componentId}: ${incidentFacts(incident)}.`).join('')}`,
       busy: robot.stopFaultRecoveryPending,
       actions: [{
         id: 'recover-cell',
         label: robot.stopFaultRecoveryPending
           ? 'Checking recovery'
-          : fault.recoveryStatus === 'ready' ? 'Recover cell' : 'Retry recovery',
+          : fault.recoveryStatus === 'ready' || robot.componentIncidents.length > 0
+            ? 'Recover cell' : 'Retry recovery',
         disabled: robot.stopFaultRecoveryPending,
         run: () => { void robot.recoverStopFault(); },
       }],
@@ -1453,6 +1456,26 @@ export function ProgramTransportControls({
                 ? ' The cell can be recovered.'
                 : ' The cell stays blocked until the backend confirms it is safe.'}
             </p>
+            {robot.componentIncidents.length > 0 && (
+              <ul aria-label="Open component incidents">
+                {robot.componentIncidents.map(({ componentId, incident }) => (
+                  <li key={incident.incidentId}>
+                    <strong>{componentId}</strong>: {incidentFacts(incident)}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {robot.componentIncidents.length > 0 && (
+              <p className="muted">
+                Recover cell acknowledges these incidents, then recovers the cell when it is ready.
+                Motion never resumes by itself.
+              </p>
+            )}
+            {robot.componentIncidentsUnavailableReason && (
+              <p className="inline-message severity-warning">
+                Component incidents are unavailable: {robot.componentIncidentsUnavailableReason}
+              </p>
+            )}
             {robot.stopFaultRecoveryError && (
               <p className="inline-message severity-error">{robot.stopFaultRecoveryError}</p>
             )}
@@ -1468,7 +1491,8 @@ export function ProgramTransportControls({
               >
                 {robot.stopFaultRecoveryPending
                   ? 'Checking recovery'
-                  : fullCellStop.fault.recoveryStatus === 'ready' ? 'Recover cell' : 'Check again'}
+                  : fullCellStop.fault.recoveryStatus === 'ready' || robot.componentIncidents.length > 0
+                    ? 'Recover cell' : 'Check again'}
               </button>
             </div>
           </section>

@@ -351,8 +351,6 @@ export function RobotControlPanelView({
     revert,
     stop,
     controlPending,
-    pause,
-    resume,
     reset,
     retry,
   } = controller;
@@ -1292,20 +1290,6 @@ export function RobotControlPanelView({
                 <div className="robot-control-operation">
                   <OperationProgress operation={state.operation} ownerEpoch={status?.ownerEpoch} source={controller.controlSource} />
                   {state.operation.resident && !recoveryRequired && <div className="robot-control-operation-actions">
-                    <button
-                      type="button"
-                      disabled={state.operation.state !== 'executing' || controlPending !== null}
-                      onClick={() => { void pause(); }}
-                    >
-                      {controlPending === 'pause' ? 'Sending Pause' : 'Pause'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={state.operation.state !== 'paused' || controlPending !== null}
-                      onClick={() => { void resume(); }}
-                    >
-                      {controlPending === 'resume' ? 'Sending Resume' : 'Resume'}
-                    </button>
                     {resetOperationControl}
                   </div>}
                 </div>

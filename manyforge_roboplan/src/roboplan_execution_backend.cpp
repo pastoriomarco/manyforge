@@ -720,8 +720,7 @@ core::Result<void> RoboPlanExecutionBackend::RetirePreparedExecution(
 core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
     const core::PreparedOperationParticipantDTO &participant,
     const core::ControllerGoalId &controller_goal_id,
-    core::ControllerGoalGeneration controller_goal_generation,
-    bool resume_dispatch) {
+    core::ControllerGoalGeneration controller_goal_generation) {
   const auto rejected = [&](std::string reason) {
     core::ExecutionSnapshot snapshot;
     snapshot.timestamp_ns = clock_.now();
@@ -781,8 +780,6 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
   const auto &trajectory =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload)
           .trajectory;
-  if (resume_dispatch && state_.running.load(std::memory_order_acquire))
-    request_active_controlled_stop();
   auto handle = execute_with_clock(trajectory, prepared_execution_clock_,
                                    participant.participant_id);
   handle.controller_goal_id = controller_goal_id;
@@ -834,15 +831,7 @@ core::ExecutionHandle RoboPlanExecutionBackend::Dispatch(
     const core::ControllerGoalId &controller_goal_id,
     core::ControllerGoalGeneration controller_goal_generation) {
   return dispatch_prepared(participant, controller_goal_id,
-                           controller_goal_generation, false);
-}
-
-core::ExecutionHandle RoboPlanExecutionBackend::DispatchResume(
-    const core::PreparedOperationParticipantDTO &participant,
-    const core::ControllerGoalId &controller_goal_id,
-    core::ControllerGoalGeneration controller_goal_generation) {
-  return dispatch_prepared(participant, controller_goal_id,
-                           controller_goal_generation, true);
+                           controller_goal_generation);
 }
 
 void RoboPlanExecutionBackend::observe_stop_qualification(
@@ -897,7 +886,6 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
   }
   const bool at_rest_state =
       state == core::ExecutionState::kIdle ||
-      state == core::ExecutionState::kPaused ||
       state == core::ExecutionState::kStopped ||
       state == core::ExecutionState::kCompleted ||
       state == core::ExecutionState::kFailed ||
@@ -1252,8 +1240,6 @@ void RoboPlanExecutionBackend::execution_worker(
   }
 
   while (true) {
-    const bool pause_requested = state_.pause_requested.load();
-
     if (st.stop_requested()) {
       observe_stop_qualification(detail::NativeStopQualificationEvent::
                                      kWorkerStopObservedBeforeTerminal);
@@ -1267,43 +1253,6 @@ void RoboPlanExecutionBackend::execution_worker(
                                                  stopped_snapshot_ns);
       }
       break;
-    }
-
-    if (pause_requested) {
-      // A paused worker consumes scale intent without advancing trajectory
-      // time. Its dormant register is the starting scale of a later Resume.
-      {
-        std::lock_guard scale_lock(runtime_velocity_scale_mutex_);
-        if (controlled_stop_runtime_scale_freeze_depth_ == 0) {
-          applied_runtime_scale =
-              runtime_velocity_scale_.load(std::memory_order_acquire);
-        }
-        governor = core::detail::RuntimeScaleGovernor(
-            applied_runtime_scale,
-            {bounds.max_rate_per_s, bounds.max_rate_change_per_s2});
-        std::lock_guard<std::mutex> state_lock(state_mutex_);
-        state_.active_runtime_velocity_scale = applied_runtime_scale;
-        state_.active_runtime_scale_rate_per_s = 0.0;
-        state_.active_runtime_scale_target = applied_runtime_scale;
-      }
-      publish_snapshot(core::ExecutionState::kPaused,
-                       get_execution_snapshot().progress, latest_positions);
-      std::unique_lock<std::mutex> lock(execution_mutex_);
-      execution_cv_.wait(lock, [this, &st, applied_runtime_scale]() {
-        if (st.stop_requested() || !state_.pause_requested.load())
-          return true;
-        std::lock_guard scale_lock(runtime_velocity_scale_mutex_);
-        return controlled_stop_runtime_scale_freeze_depth_ == 0 &&
-               runtime_velocity_scale_.load(std::memory_order_acquire) !=
-                   applied_runtime_scale;
-      });
-      last_tick_ns = clock_.now();
-      if (st.stop_requested() || state_.pause_requested.load()) {
-        continue;
-      }
-      publish_snapshot(core::ExecutionState::kExecuting,
-                       get_execution_snapshot().progress, latest_positions);
-      continue;
     }
 
     std::int64_t now_ns;
@@ -1413,7 +1362,7 @@ void RoboPlanExecutionBackend::execution_worker(
         lock, std::chrono::nanoseconds(config_.execution_tick_period_ns),
         [this, &st, coordinated = static_cast<bool>(common_clock),
          target_scale = governor.target_scale()]() {
-          if (st.stop_requested() || state_.pause_requested.load())
+          if (st.stop_requested())
             return true;
           if (coordinated)
             return false;
@@ -1433,7 +1382,7 @@ void RoboPlanExecutionBackend::execution_worker(
 
 void RoboPlanExecutionBackend::request_execution_worker_stop() noexcept {
   {
-    // The worker's paused wait observes these predicates under the same
+    // The worker's tick wait observes these predicates under the same
     // mutex. Mutating them while holding it prevents a notify from landing
     // between predicate evaluation and the actual wait (a lost wake-up).
     std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1443,7 +1392,6 @@ void RoboPlanExecutionBackend::request_execution_worker_stop() noexcept {
 }
 
 void RoboPlanExecutionBackend::request_execution_worker_stop_locked() noexcept {
-  state_.pause_requested.store(false, std::memory_order_release);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
   if (worker_thread_.joinable())
@@ -1473,7 +1421,6 @@ void RoboPlanExecutionBackend::publish_execution_inactive() noexcept {
     // Publish the terminal predicate under that mutex, then wake waiters.
     std::lock_guard<std::mutex> lock(execution_mutex_);
     state_.running.store(false, std::memory_order_release);
-    state_.pause_requested.store(false, std::memory_order_release);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
   }
@@ -1511,7 +1458,7 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_with_clock(
   // Retire the prior worker before publishing any state for the new
   // occurrence. Starting the replacement first lets the old worker's final
   // running=false publication race the new running=true fact and can strand a
-  // Resume waiter. jthread move-assignment eventually joins too, but only
+  // waiter. jthread move-assignment eventually joins too, but only
   // after the replacement has already started.
   if (worker_thread_.joinable()) {
     request_execution_worker_stop();
@@ -1579,7 +1526,6 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_with_clock(
     last_execution_generation_.store(execution_generation,
                                      std::memory_order_release);
     state_.running.store(true, std::memory_order_release);
-    state_.pause_requested.store(false, std::memory_order_release);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     worker_thread_ = std::jthread(
@@ -1641,7 +1587,6 @@ RoboPlanExecutionBackend::sync_observed_state_before_planning() {
   const auto now_ns = clock_.now();
   const auto state = get_execution_snapshot().state;
   const bool at_rest = state == core::ExecutionState::kIdle ||
-                       state == core::ExecutionState::kPaused ||
                        state == core::ExecutionState::kStopped ||
                        state == core::ExecutionState::kCompleted ||
                        state == core::ExecutionState::kFailed ||
@@ -3269,33 +3214,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   return result;
 }
 
-core::PauseResultDTO RoboPlanExecutionBackend::pause() {
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    if (!state_.running.load(std::memory_order_acquire)) {
-      return core::PauseResultDTO{
-          false, core::ErrorDTO{
-                     core::kErrorInvalidRequest, "No execution in flight", {}}};
-    }
-    state_.pause_requested.store(true, std::memory_order_release);
-    state_.natural_completion_stop_requested.store(false,
-                                                   std::memory_order_release);
-  }
-  execution_cv_.notify_all();
-  return core::PauseResultDTO{true, std::nullopt};
-}
-
-core::ExecutionHandle
-RoboPlanExecutionBackend::resume(const core::TrajectoryDTO &trajectory) {
-  if (state_.running.load(std::memory_order_acquire)) {
-    request_active_controlled_stop();
-  }
-  // execute_trajectory joins the prior worker before publishing replacement
-  // state. This single retirement boundary is simpler than separately
-  // waiting for running=false and then racing the still-returning worker.
-  return execute_trajectory(trajectory);
-}
-
 core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   const auto reset_timeout =
       std::chrono::duration<double>(config_.reset_completion_timeout_s);
@@ -3391,8 +3309,7 @@ std::optional<double> RoboPlanExecutionBackend::stopped_trajectory_time_s(
       execution_generation != state_.active_trajectory_generation ||
       !state_.original_path_cursor_valid || !state_.active_trajectory ||
       state_.active_trajectory->waypoints.empty() ||
-      (phase != core::ExecutionState::kPaused &&
-       phase != core::ExecutionState::kStopped &&
+      (phase != core::ExecutionState::kStopped &&
        phase != core::ExecutionState::kCompleted) ||
       !std::isfinite(state_.active_trajectory_time_s) ||
       state_.active_trajectory_time_s < 0.0 ||
@@ -3438,8 +3355,7 @@ RoboPlanExecutionBackend::runtime_velocity_scale_status() const {
   const bool active = state_.running.load(std::memory_order_acquire);
   auto target = runtime_velocity_scale_.load(std::memory_order_acquire);
   std::optional<core::CoordinatedRuntimeScaleCommandDTO> coordinated_command;
-  if (active && !state_.pause_requested.load(std::memory_order_acquire) &&
-      active_execution_clock_) {
+  if (active && active_execution_clock_) {
     if (const auto shared = active_execution_clock_->target()) {
       target = shared->scale;
       coordinated_command = shared->command;

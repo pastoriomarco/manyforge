@@ -291,6 +291,19 @@ class HeadlessCorePort(Protocol):
         **kwargs: Any,
     ) -> dict[str, Any]: ...
 
+    def component_lifecycle_condition_scope(self) -> dict[str, Any]: ...
+
+    def observe_component_lifecycle_conditions(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]: ...
+
+    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]: ...
+
+    def record_cclc_incident_event(
+        self, *, cclc_owner_epoch: str, event_json: str
+    ) -> dict[str, Any]: ...
+
     def shutdown(self) -> None: ...
 
 
@@ -795,6 +808,39 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("mark_operation_event_source_unknown", **kwargs),
             method="mark_operation_event_source_unknown",
+        )
+
+    def component_lifecycle_condition_scope(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("component_lifecycle_condition_scope"),
+            method="component_lifecycle_condition_scope",
+        )
+
+    def observe_component_lifecycle_conditions(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("observe_component_lifecycle_conditions", **kwargs),
+            method="observe_component_lifecycle_conditions",
+        )
+
+    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("mark_component_lifecycle_source_unknown"),
+            method="mark_component_lifecycle_source_unknown",
+        )
+
+    def record_cclc_incident_event(
+        self, *, cclc_owner_epoch: str, event_json: str
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "record_cclc_incident_event",
+                cclc_owner_epoch=cclc_owner_epoch,
+                event_json=event_json,
+            ),
+            method="record_cclc_incident_event",
         )
 
     def shutdown(self) -> None:

@@ -674,6 +674,29 @@ TEST(ResolvedStopBasePlanResolverTest,
             published.stop_readiness.value()
                 .resolved_stop_base_plan.resolved_stop_base_plan_id);
 
+  {
+    // A parent Apply installs the route of a Declared (command-closed)
+    // component; a state without a lifecycle fact is still refused.
+    auto declared = components;
+    declared.front().expected_component_lifecycle_state =
+        core::ComponentLifecycleStateDTO::kDeclared;
+    MemoryPlanRepository declared_repository;
+    const auto installed = resolve_store_and_verify_route_readiness_batch(
+        *retained.bundle, source, expected, active, declared, participants,
+        declared_repository);
+    ASSERT_TRUE(installed.ok()) << installed.error().message;
+    auto undeclared = components;
+    undeclared.front().expected_component_lifecycle_state =
+        core::ComponentLifecycleStateDTO::kUndeclared;
+    MemoryPlanRepository undeclared_repository;
+    const auto refused = resolve_store_and_verify_route_readiness_batch(
+        *retained.bundle, source, expected, active, undeclared, participants,
+        undeclared_repository);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "route_readiness_batch_shape_invalid");
+  }
+
   const std::vector<core::RuntimeParticipantBinding> missing;
   batch = resolve_store_and_verify_route_readiness_batch(
       *retained.bundle, source, expected, active, components, missing,

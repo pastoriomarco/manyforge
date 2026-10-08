@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -1930,7 +1931,7 @@ def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
     def event(state: str) -> dict[str, Any]:
         return {"record_kind": "state_observed", "payload": {"operation_state": {"state": state}}}
 
-    for state in ("completed", "paused", "stopped", "failed", "interrupted",
+    for state in ("completed", "stopped", "failed", "interrupted",
                   "intervention_required", "cancelled_pre_dispatch"):
         assert ExecutionEventPump._operation_is_settled(event(state)), state  # noqa: SLF001
     for state in ("queued", "planning", "validating", "prepared", "executing", "stopping"):
@@ -1969,3 +1970,358 @@ def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
         threading.Event().wait(0.01)
     pump.shutdown()
     assert core.alarm_refreshes >= refreshes + 3
+
+
+class _ComponentConditionCore(_RecordingCore):
+    def __init__(self, component_ids: list[str]) -> None:
+        super().__init__()
+        self.component_ids = component_ids
+        self.observed: list[dict[str, Any]] = []
+        self.marked_unknown = 0
+
+    def component_lifecycle_condition_scope(self) -> dict[str, Any]:
+        return {"component_ids": list(self.component_ids)}
+
+    def observe_component_lifecycle_conditions(self, **kwargs: Any) -> dict[str, Any]:
+        self.observed.append(kwargs)
+        return {"status": "observed"}
+
+    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:
+        self.marked_unknown += 1
+        return {"status": "marked_unknown"}
+
+
+def _component_snapshot(component_id: str, cause: str) -> dict[str, Any]:
+    return {
+        "active_public_pointer_digest": "sha256:" + "a" * 64,
+        "component_lifecycle_generation": 3,
+        "component_lifecycle_state": "active",
+        "controllable_component_id": component_id,
+        "domains": [
+            {
+                "control_domain_id": "domain.arm",
+                "current_resources": ["resource.arm"],
+                "topology_revision": "topology.rev",
+            }
+        ],
+        "graph_revision": "graph.1",
+        "lifecycle_progress": {
+            "blocking_cause_class": cause,
+            "blocking_reason": None,
+            "delayed": True,
+            "incident": None,
+            "next_intent": None,
+            "phase": "satisfied",
+            "waiting_since_ns": 1_759_900_000_000,
+        },
+        "lifecycle_target": {
+            "origin": "startup",
+            "requested_state": "active",
+            "target_generation": 1,
+        },
+        "provider_occurrences": [],
+        "retained_bundle_id": "bundle.1",
+        "snapshot_digest": "sha256:" + "b" * 64,
+    }
+
+
+class _FakeCCLC:
+    def __init__(self) -> None:
+        self.epochs = ["cclc.epoch.1"]
+        self.snapshots: dict[str, Any] = {}
+        self.calls: list[str] = []
+
+    def owner_identity(self) -> dict[str, Any]:
+        self.calls.append("owner_identity")
+        epoch = self.epochs[0] if len(self.epochs) == 1 else self.epochs.pop(0)
+        if isinstance(epoch, Exception):
+            raise epoch
+        return {"request_owner_epoch": epoch}
+
+    def component_snapshot(self, component_id: str) -> dict[str, Any]:
+        self.calls.append(component_id)
+        value = self.snapshots[component_id]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def _condition_pump(
+    core: _ComponentConditionCore, cclc: _FakeCCLC | None
+) -> ExecutionEventPump:
+    return ExecutionEventPump(  # type: ignore[arg-type]
+        core, _PagedExecution(), cclc=cclc, component_condition_poll_seconds=5.0
+    )
+
+
+def test_component_conditions_forward_only_condition_facts_at_a_bounded_cadence() -> None:
+    core = _ComponentConditionCore(["arm", "gripper"])
+    cclc = _FakeCCLC()
+    cclc.snapshots = {
+        "arm": _component_snapshot("arm", "emergency_stop"),
+        "gripper": HeadlessApiError("component_lifecycle_snapshot_unavailable", "no row"),
+    }
+    pump = _condition_pump(core, cclc)
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 1
+    observed = core.observed[0]
+    assert observed["cclc_owner_epoch"] == "cclc.epoch.1"
+    assert observed["unavailable_component_ids"] == ["gripper"]
+    snapshots = rfc8785.dumps(
+        [
+            {
+                "component_lifecycle_state": "active",
+                "controllable_component_id": "arm",
+                "domains": [
+                    {
+                        "control_domain_id": "domain.arm",
+                        "current_resources": ["resource.arm"],
+                    }
+                ],
+                "graph_revision": "graph.1",
+                "lifecycle_progress": {
+                    "blocking_cause_class": "emergency_stop",
+                    "blocking_reason": None,
+                    "incident": None,
+                    "phase": "satisfied",
+                },
+                "lifecycle_target": {
+                    "origin": "startup",
+                    "requested_state": "active",
+                    "target_generation": 1,
+                },
+                "retained_bundle_id": "bundle.1",
+            }
+        ]
+    ).decode("utf-8")
+    # Wait timing is presentation only and never crosses the boundary.
+    assert observed["snapshots_json"] == snapshots
+    # Within the period nothing is read again.
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 1
+    assert cclc.calls == ["owner_identity", "arm", "gripper", "owner_identity"]
+
+
+def test_component_conditions_need_no_cclc_without_components() -> None:
+    core = _ComponentConditionCore([])
+    cclc = _FakeCCLC()
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    _condition_pump(core, None)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert cclc.calls == []
+    assert core.observed == []
+    assert core.marked_unknown == 0
+
+
+def test_unreachable_cclc_keeps_component_conditions_at_unknown_quality() -> None:
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.marked_unknown == 1
+    assert core.observed == []
+
+    # Losing the owner in the middle of the read is the same communication loss.
+    cclc = _FakeCCLC()
+    cclc.snapshots = {"arm": HeadlessApiError("cclc_owner_unavailable", "lost")}
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.marked_unknown == 2
+    assert core.observed == []
+
+
+def test_component_conditions_reconcile_promptly_after_an_apply_replaced_cclc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: an Apply that replaces the CCLC owner makes it briefly
+    # unreachable, and unknown quality holds the Alarm Lifecycle Owner
+    # unreconciled (motion admission refused). The next read must follow at
+    # the pump cadence, not one whole condition period after the owner is
+    # back; only an accepted observation waits the full period.
+    clock = [100.0]
+    monkeypatch.setattr(
+        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
+    )
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
+    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
+    pump = _condition_pump(core, cclc)
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.marked_unknown == 1
+
+    cclc.epochs = ["cclc.epoch.2"]
+    clock[0] += 0.05
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.observed == []
+    clock[0] += 0.06
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert [value["cclc_owner_epoch"] for value in core.observed] == ["cclc.epoch.2"]
+
+    clock[0] += 0.1
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 1
+
+    # A scope that changed under the read completed nothing either.
+    core.observe_component_lifecycle_conditions = (  # type: ignore[method-assign]
+        lambda **kwargs: core.observed.append(kwargs) or {"status": "scope_changed"}
+    )
+    clock[0] += 5.0
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    clock[0] += 0.11
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 3
+
+
+def test_component_conditions_skip_a_read_that_spans_two_cclc_owners() -> None:
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.epochs = ["cclc.epoch.1", "cclc.epoch.2"]
+    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.observed == []
+    assert core.marked_unknown == 0
+
+
+def test_component_conditions_forward_an_open_incident_without_its_timing() -> None:
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    snapshot = _component_snapshot("arm", "provider_lost")
+    snapshot["lifecycle_progress"]["phase"] = "blocked"
+    snapshot["lifecycle_progress"]["incident"] = {
+        "acknowledged": False,
+        "cause_class": "provider_lost",
+        "detected_at_ns": 1_759_900_000_000,
+        "incident_id": "incident.arm.1",
+        "summary": "Controller lost",
+        "vendor_codes": ["exit=137"],
+    }
+    cclc.snapshots = {"arm": snapshot}
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    forwarded = json.loads(core.observed[0]["snapshots_json"])
+    assert forwarded[0]["lifecycle_progress"]["incident"] == {
+        "cause_class": "provider_lost",
+        "incident_id": "incident.arm.1",
+        "summary": "Controller lost",
+        "vendor_codes": ["exit=137"],
+    }
+
+
+def _cclc_incident_event(sequence: int, incident_id: str = "incident.arm.1") -> dict[str, Any]:
+    kind = "component_incident" if sequence % 2 else "component_incident_acknowledged"
+    return {
+        "event_kind": kind,
+        "event_sequence": sequence,
+        "incident_id": incident_id,
+        "occurred_at_ns": 1_000 + sequence,
+        "payload": {"event_kind": kind, "incident_id": incident_id},
+    }
+
+
+class _IncidentCore(_RecordingCore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded: list[tuple[str, dict[str, Any]]] = []
+        self.keys: set[tuple[str, str]] = set()
+        self.reject_next = False
+
+    def record_cclc_incident_event(
+        self, *, cclc_owner_epoch: str, event_json: str
+    ) -> dict[str, Any]:
+        event = json.loads(event_json)
+        if self.reject_next:
+            self.reject_next = False
+            return {"event_id": None, "status": "rejected"}
+        key = (event["incident_id"], event["event_kind"])
+        if key in self.keys:
+            return {"event_id": None, "status": "duplicate"}
+        self.keys.add(key)
+        self.recorded.append((cclc_owner_epoch, event))
+        return {"event_id": f"event-{len(self.recorded)}", "status": "recorded"}
+
+
+class _IncidentCCLC(_FakeCCLC):
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.events = events
+        self.reads: list[tuple[int, int]] = []
+
+    def incident_events(self, after_sequence: int, limit: int) -> dict[str, Any]:
+        self.reads.append((after_sequence, limit))
+        page = [row for row in self.events if row["event_sequence"] > after_sequence][:limit]
+        return {
+            "events": page,
+            "through_sequence": page[-1]["event_sequence"] if page else after_sequence,
+        }
+
+
+def test_cclc_incident_events_are_recorded_once_in_order_at_a_bounded_cadence() -> None:
+    core = _IncidentCore()
+    cclc = _IncidentCCLC([_cclc_incident_event(1), _cclc_incident_event(2)])
+    pump = _condition_pump(core, cclc)
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert [event["event_sequence"] for _epoch, event in core.recorded] == [1, 2]
+    assert {epoch for epoch, _event in core.recorded} == {"cclc.epoch.1"}
+    assert core.recorded[0][1] == _cclc_incident_event(1)
+    # Within the period nothing is read again; afterwards only newer events.
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads == [(0, 64)]
+    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
+    cclc.events.append(_cclc_incident_event(3, "incident.arm.2"))
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads[-1] == (2, 64)
+    assert [event["event_sequence"] for _epoch, event in core.recorded] == [1, 2, 3]
+
+
+def test_cclc_incident_events_survive_a_lost_cursor_without_duplicates() -> None:
+    core = _IncidentCore()
+    events = [_cclc_incident_event(1), _cclc_incident_event(2)]
+    _condition_pump(core, _IncidentCCLC(events))._record_cclc_incident_events()  # noqa: SLF001
+    # A restarted reader (fresh pump, cursor zero) replays: the core answers
+    # duplicates and nothing is recorded twice.
+    restarted = _IncidentCCLC(events)
+    _condition_pump(core, restarted)._record_cclc_incident_events()  # noqa: SLF001
+    assert restarted.reads == [(0, 64)]
+    assert len(core.recorded) == 2
+
+
+def test_cclc_incident_events_retry_a_rejected_event_and_follow_the_owner_epoch() -> None:
+    core = _IncidentCore()
+    cclc = _IncidentCCLC([_cclc_incident_event(1), _cclc_incident_event(2)])
+    pump = _condition_pump(core, cclc)
+    core.reject_next = True
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert core.recorded == []
+    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads == [(0, 64), (0, 64)]
+    assert len(core.recorded) == 2
+    # A new CCLC owner restarts the cursor; recorded events stay deduplicated.
+    cclc.epochs = ["cclc.epoch.2"]
+    cclc.events = [_cclc_incident_event(1, "incident.arm.9")]
+    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads[-1] == (0, 64)
+    assert core.recorded[-1] == ("cclc.epoch.2", _cclc_incident_event(1, "incident.arm.9"))
+
+
+def test_cclc_incident_events_continue_immediately_after_a_full_page() -> None:
+    core = _IncidentCore()
+    cclc = _IncidentCCLC(
+        [_cclc_incident_event(index, f"incident.{index}") for index in range(1, 66)]
+    )
+    pump = _condition_pump(core, cclc)
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert len(core.recorded) == 64
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads == [(0, 64), (64, 64)]
+    assert len(core.recorded) == 65
+
+
+def test_cclc_incident_events_wait_quietly_for_an_unreachable_owner() -> None:
+    core = _IncidentCore()
+    cclc = _IncidentCCLC([_cclc_incident_event(1)])
+    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
+    pump = _condition_pump(core, cclc)
+    pump._record_cclc_incident_events()  # noqa: SLF001
+    assert cclc.reads == []
+    assert core.recorded == []
+    assert not pump._incident_events_failing  # noqa: SLF001

@@ -44,8 +44,6 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kExecuteCompleted: return "execute_completed";
     case kStopRequested: return "stop_requested";
     case kStopIssued: return "stop_issued";
-    case kPauseRequested: return "pause_requested";
-    case kResumeRequested: return "resume_requested";
     case kRuntimeVelocityScaleChanged: return "runtime_velocity_scale_changed";
     case kCompletedAcknowledged: return "completed_acknowledged";
     case kFailedValidationAcknowledged:

@@ -9,6 +9,10 @@ import type {
 } from '../types/cclc';
 import { OverlayPanel } from './OverlayPanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import {
+  componentLifecyclePresentation,
+  componentLifecycleToneClass,
+} from '../state/componentLifecyclePresentation';
 
 const ACTIONS: Array<{
   intent: CCLCLifecycleIntent;
@@ -50,6 +54,22 @@ export function lifecycleActionUnavailableReason(
     return mutationUnavailableReason ?? 'Lifecycle changes require current Idle admission.';
   }
   return null;
+}
+
+function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapshot }) {
+  const presentation = componentLifecyclePresentation(snapshot);
+  return (
+    <div className="cclc-lifecycle-summary" role="status" aria-label="Component lifecycle status">
+      <span className={componentLifecycleToneClass(presentation.tone)}>
+        {presentation.message}
+      </span>
+      <p className="muted">Requested target: {presentation.target}</p>
+      <p className="muted">Achieved: {presentation.achieved}</p>
+      <p className="muted">Readiness: {presentation.readiness}</p>
+      {presentation.incident !== null && <p>Incident: {presentation.incident}</p>}
+      <p>{presentation.consequence}</p>
+    </div>
+  );
 }
 
 type PendingConfirmation =
@@ -144,6 +164,7 @@ export function CCLCPanelView({
             {' · '}{snapshot.lifecycleState}
             {' · generation '}{snapshot.lifecycleGeneration}
           </p>
+          <ComponentLifecycleSummary snapshot={snapshot} />
           <p className="muted">
             {snapshot.domains.length} control domain(s)
             {' · '}{snapshot.providers.length} provider occurrence(s)

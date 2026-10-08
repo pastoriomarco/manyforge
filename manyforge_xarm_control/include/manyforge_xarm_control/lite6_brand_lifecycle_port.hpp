@@ -16,15 +16,37 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
 
 #include <manyforge_core/ports/ibrand_lifecycle_port.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_xarm_control/xarm_ros_transport_session.hpp>
 
 namespace manyforge::xarm_control {
+
+/// Diagnostic vendor-code facts copied verbatim from the latest fresh vendor
+/// report for incident records (addendum 2 `vendor_codes`). They are never
+/// catalog predicate inputs. Rendering: a token is the code itself (`C2`), an
+/// integer is `<last id segment>=<value>` (`mode=0`, `state=4`). Facts whose
+/// value is not established by the report are omitted.
+inline constexpr std::string_view kVendorCodeErrorFactId =
+    "manyforge.vendor_code.error";
+inline constexpr std::string_view kVendorCodeModeFactId =
+    "manyforge.vendor_code.mode";
+inline constexpr std::string_view kVendorCodePowerCycleFactId =
+    "manyforge.vendor_code.power_cycle";
+inline constexpr std::string_view kVendorCodeStateFactId =
+    "manyforge.vendor_code.state";
+inline constexpr std::string_view kVendorCodeWarningFactId =
+    "manyforge.vendor_code.warning";
+/// Token value of `kVendorCodePowerCycleFactId` for servo faults C10-C17.
+inline constexpr std::string_view kPowerCycleRequiredToken =
+    "power_cycle_required";
 
 /// Exact immutable provider-occurrence identity selected by the active
 /// deployment/runtime join. One adapter instance serves only this occurrence.
@@ -105,10 +127,41 @@ private:
       const core::BrandLifecycleObservationQueryDTO &query) const noexcept;
   [[nodiscard]] bool matches_occurrence(
       const core::BrandLifecyclePrimitiveIntentDTO &intent) const noexcept;
+  // Classifies one fresh vendor report's mode/state against the last
+  // explained pair and this port's own in-flight or just-completed primitive.
+  void track_vendor_control(const XArmObservedState &observed,
+                            std::int64_t now_ns);
+
+  /// One vendor mode/state pair; -1 is unknown.
+  struct VendorControlPair final {
+    int mode = -1;
+    int state = -1;
+  };
+
+  /// The own primitive whose expected vendor effect explains a mode/state
+  /// change while it is in flight or for a bounded settle window after it
+  /// returned, until a report shows its final expected pair.
+  struct OwnPrimitiveExpectation final {
+    XArmLifecycleCommand command;
+    VendorControlPair base;
+    std::optional<std::int64_t> completed_at_ns;
+  };
 
   Lite6BrandLifecyclePortConfig config_;
   core::IClock &clock_;
   std::unique_ptr<ILite6BrandLifecycleTransport> transport_;
+  // Last intervention-requiring cause established from a vendor report. A
+  // connected observation without a report cannot clear it.
+  std::mutex cause_mutex_;
+  core::LifecycleBlockingCauseClassDTO last_intervention_cause_{
+      core::LifecycleBlockingCauseClassDTO::kNone};
+  // Unrequested mode/state change detection (guarded by cause_mutex_).
+  std::optional<VendorControlPair> explained_pair_;
+  std::optional<VendorControlPair> last_reported_pair_;
+  std::optional<OwnPrimitiveExpectation> own_expectation_;
+  bool external_control_detected_ = false;
+  // Vendor error code of the latest fresh report; -1 when unknown.
+  int last_reported_error_code_ = -1;
 };
 
 } // namespace manyforge::xarm_control

@@ -33,7 +33,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "2.4.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:6e62827057b520c2869f4aca330a002b6f737f4482299ca2ad222371cf06d6a2"
+    "sha256:5431cf57379b786ab05dccf2252ffa27cd6441ce32edbe76a7eef0f5ea995529"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -68,10 +68,8 @@ _OWNER_APIS = {
     "kernel.command_target",
     "kernel.full_stop",
     "kernel.operation",
-    "kernel.pause",
     "kernel.recovery",
     "kernel.reset",
-    "kernel.resume",
     "kernel.runtime_scaling",
     "kernel.stop",
     "model.kinematics",
@@ -94,9 +92,7 @@ _TARGET_CAPABILITIES = {
     "execution.control.admittance",
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
-    "execution.pause",
     "execution.reset",
-    "execution.resume",
     "execution.runtime_scale.operation_scoped",
     "execution.stop.motion.hard_deceleration",
     "execution.stop.motion.soft_on_path",

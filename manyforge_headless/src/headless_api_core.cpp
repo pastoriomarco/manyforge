@@ -694,6 +694,16 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           0U,
           {},
           std::nullopt,
+      },
+      component_lifecycle_adapter_{
+          config_.owner_id + ".cclc-lifecycle-condition-adapter",
+          "runtime_health",
+          "manyforge.alarm_adapter.cclc_condition",
+          {},
+          0U,
+          0U,
+          {},
+          std::nullopt,
       } {
   RegisterAdapterEpochLocked(runtime_health_adapter_,
                              config_.owner_epoch + ".runtime-health");
@@ -2457,6 +2467,456 @@ CanonicalValue HeadlessApiCore::MarkOperationEventSourceUnknown(
   });
 }
 
+namespace {
+
+constexpr std::string_view kComponentLifecycleConditionSchemaVersion =
+    "manyforge.component_lifecycle_condition.v1";
+constexpr std::string_view kComponentLifecycleFaultDefinition =
+    "manyforge.runtime.component_lifecycle_fault";
+constexpr std::size_t kMaximumComponentLifecycleConditionScope = 256U;
+
+/// Blocking cause classes held as a lifecycle fault (spec 530 §3.3,
+/// 2026-10-08; incident classes of the 2026-10-08 addendum 2).
+/// `configuration` stays in CCLC/control-domain reconciliation status and
+/// `availability` is not a lifecycle fault.
+bool ComponentLifecycleFaultCause(const std::string_view cause) {
+  return cause == "emergency_stop" || cause == "protective_stop" ||
+         cause == "safeguard_stop" || cause == "fault" || cause == "unknown" ||
+         cause == "collision" || cause == "external_control" ||
+         cause == "provider_lost";
+}
+
+bool KnownBlockingCauseClass(const std::string_view cause) {
+  return ComponentLifecycleFaultCause(cause) || cause == "none" ||
+         cause == "availability" || cause == "configuration";
+}
+
+/// A nullable object member; absent and null are both no value.
+const CanonicalValue *NullableObjectMember(const CanonicalValue &root,
+                                           const std::string_view name) {
+  const auto *member = root.find_object_member(name);
+  if (member == nullptr ||
+      std::holds_alternative<std::nullptr_t>(member->storage())) {
+    return nullptr;
+  }
+  Require(member->is_object(), "headless_component_lifecycle_invalid",
+          "CCLC component snapshot " + std::string(name) +
+              " must be an object or null");
+  return member;
+}
+
+CanonicalValue NullableText(const CanonicalValue *root,
+                            const std::string_view name) {
+  if (root == nullptr) {
+    return CanonicalValue(nullptr);
+  }
+  const auto &member = RequiredMember(*root, name);
+  if (std::holds_alternative<std::nullptr_t>(member.storage())) {
+    return member;
+  }
+  Require(std::holds_alternative<std::string>(member.storage()),
+          "headless_component_lifecycle_invalid",
+          "CCLC component snapshot " + std::string(name) +
+              " must be text or null");
+  return member;
+}
+
+} // namespace
+
+CanonicalValue HeadlessApiCore::ComponentLifecycleConditionScope() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_ids", StringArrayValue(alarm_component_ids_)},
+      {"schema_version",
+       CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
+  });
+}
+
+CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
+    std::string cclc_owner_epoch, CanonicalValue snapshots,
+    std::vector<std::string> unavailable_component_ids) {
+  const auto *rows = std::get_if<CanonicalValue::Array>(&snapshots.storage());
+  Require(!cclc_owner_epoch.empty() && cclc_owner_epoch.size() <= 256U &&
+              content_identity::is_utf8_nfc(cclc_owner_epoch) &&
+              rows != nullptr &&
+              rows->size() + unavailable_component_ids.size() <=
+                  kMaximumComponentLifecycleConditionScope,
+          "headless_component_lifecycle_invalid",
+          "component lifecycle observation envelope is malformed");
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+
+  struct Observed final {
+    AlarmSubject subject;
+    bool lifecycle_fault{};
+    CanonicalValue details;
+    CanonicalValue correlations;
+  };
+  std::set<std::string> named;
+  for (const auto &component : unavailable_component_ids) {
+    Require(!component.empty() && named.insert(component).second,
+            "headless_component_lifecycle_invalid",
+            "unavailable component ids must be unique and non-empty");
+  }
+  std::map<std::string, Observed> observed;
+  for (const auto &row : *rows) {
+    Require(row.is_object(), "headless_component_lifecycle_invalid",
+            "CCLC component snapshot must be an object");
+    auto component = RequiredString(row, "controllable_component_id");
+    Require(!component.empty() && named.insert(component).second,
+            "headless_component_lifecycle_invalid",
+            "CCLC component snapshots must name unique components");
+    std::set<std::string> resources;
+    CanonicalValue::Array domain_ids;
+    for (const auto &domain : RequiredArray(row, "domains")) {
+      domain_ids.emplace_back(RequiredString(domain, "control_domain_id"));
+      for (const auto &resource : RequiredArray(domain, "current_resources")) {
+        const auto *resource_id = std::get_if<std::string>(&resource.storage());
+        Require(resource_id != nullptr && !resource_id->empty(),
+                "headless_component_lifecycle_invalid",
+                "component resources must be non-empty text");
+        resources.insert(*resource_id);
+      }
+    }
+    const auto *target = NullableObjectMember(row, "lifecycle_target");
+    const auto *progress = NullableObjectMember(row, "lifecycle_progress");
+    const auto cause = progress == nullptr
+                           ? std::string("none")
+                           : RequiredString(*progress, "blocking_cause_class");
+    Require(KnownBlockingCauseClass(cause),
+            "headless_component_lifecycle_invalid",
+            "CCLC component snapshot names an unknown blocking cause class");
+    // An open incident (addendum 2, 2026-10-08) holds the condition until
+    // the operator's acknowledgement is accepted and CCLC publishes
+    // `incident: null`; a current intervention cause holds it as well.
+    const auto *incident =
+        progress == nullptr ? nullptr
+                            : NullableObjectMember(*progress, "incident");
+    CanonicalValue::Object details{
+        {"blocking_cause_class", CanonicalValue(cause)},
+        {"blocking_reason", NullableText(progress, "blocking_reason")},
+        {"component_lifecycle_state",
+         CanonicalValue(RequiredString(row, "component_lifecycle_state"))},
+    };
+    if (incident != nullptr) {
+      const auto id = RequiredString(*incident, "incident_id");
+      const auto incident_class = RequiredString(*incident, "cause_class");
+      Require(!id.empty() && id.size() <= 128U &&
+                  KnownBlockingCauseClass(incident_class) &&
+                  incident_class != "none" && incident_class != "availability",
+              "headless_component_lifecycle_invalid",
+              "CCLC component snapshot incident is malformed");
+      for (const auto &code : RequiredArray(*incident, "vendor_codes")) {
+        const auto *text = std::get_if<std::string>(&code.storage());
+        Require(text != nullptr && !text->empty() && text->size() <= 64U,
+                "headless_component_lifecycle_invalid",
+                "CCLC component snapshot incident vendor codes are malformed");
+      }
+      Require(RequiredArray(*incident, "vendor_codes").size() <= 16U,
+              "headless_component_lifecycle_invalid",
+              "CCLC component snapshot incident names too many vendor codes");
+      // Present only while the incident is open: the returned record keeps
+      // the identity of the incident that raised it.
+      details.emplace_back("incident_cause_class",
+                           CanonicalValue(incident_class));
+      details.emplace_back("incident_id", CanonicalValue(id));
+      details.emplace_back("incident_summary",
+                           CanonicalValue(RequiredString(*incident, "summary")));
+      details.emplace_back("incident_vendor_codes",
+                           RequiredMember(*incident, "vendor_codes"));
+    }
+    details.emplace_back("lifecycle_phase", NullableText(progress, "phase"));
+    details.emplace_back(
+        "requested_state",
+        target == nullptr
+            ? CanonicalValue(nullptr)
+            : CanonicalValue(RequiredString(*target, "requested_state")));
+    details.emplace_back(
+        "target_generation",
+        target == nullptr
+            ? CanonicalValue(nullptr)
+            : Number(RequiredCounter(*target, "target_generation", 1U),
+                     "target_generation"));
+    Observed value{
+        AlarmSubject{"component", component,
+                     std::vector<std::string>(resources.begin(),
+                                              resources.end())},
+        incident != nullptr || ComponentLifecycleFaultCause(cause),
+        CanonicalValue(std::move(details)),
+        CanonicalValue(CanonicalValue::Object{
+            {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
+            {"control_domain_ids", CanonicalValue(std::move(domain_ids))},
+            {"controllable_component_id", CanonicalValue(component)},
+            {"graph_revision", RequiredMember(row, "graph_revision")},
+            {"retained_bundle_id", RequiredMember(row, "retained_bundle_id")},
+        }),
+    };
+    observed.insert_or_assign(std::move(component), std::move(value));
+  }
+  const std::set<std::string> scope(alarm_component_ids_.begin(),
+                                    alarm_component_ids_.end());
+  const auto response = [&](const std::string_view status) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version",
+         CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
+        {"source_owner_epoch", CanonicalValue(cclc_owner_epoch)},
+        {"status", CanonicalValue(std::string(status))},
+    });
+  };
+  if (named != scope) {
+    // The active configuration changed between the scope read and this
+    // observation; the next observation names the new scope.
+    return response("scope_changed");
+  }
+  if (scope.empty() && component_lifecycle_adapter_.source_epoch.empty()) {
+    return response("empty");
+  }
+
+  if (component_lifecycle_adapter_.source_epoch != cclc_owner_epoch) {
+    // A replacement CCLC owner restarts source ordering: restate every
+    // tracked point under the new epoch.
+    for (auto &[key, state] : component_conditions_) {
+      static_cast<void>(key);
+      state.fingerprint.clear();
+    }
+  }
+  RegisterAdapterEpochLocked(component_lifecycle_adapter_, cclc_owner_epoch);
+  for (const auto &[component, value] : observed) {
+    SynchronizeComponentConditionLocked(
+        component_lifecycle_adapter_,
+        std::string(kComponentLifecycleFaultDefinition), component,
+        value.subject, value.lifecycle_fault, value.details,
+        value.correlations);
+  }
+  // A component that left the active configuration has no lifecycle row:
+  // its raised conditions return to normal and are forgotten.
+  std::vector<std::pair<std::string, std::string>> removed;
+  for (const auto &[key, state] : component_conditions_) {
+    if (!named.contains(key.second)) {
+      removed.push_back(key);
+    }
+  }
+  for (const auto &key : removed) {
+    const auto state = component_conditions_.at(key);
+    SynchronizeComponentConditionLocked(
+        component_lifecycle_adapter_, key.first, key.second, state.subject, false,
+        CanonicalValue(CanonicalValue::Object{
+            {"reason", CanonicalValue("component_removed")}}),
+        CanonicalValue(CanonicalValue::Object{
+            {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
+            {"controllable_component_id", CanonicalValue(key.second)},
+        }));
+    component_conditions_.erase(key);
+  }
+  alarm_owner_.CompleteSourceSnapshot(component_lifecycle_adapter_.source_id,
+                                      component_lifecycle_adapter_.source_epoch,
+                                      AlarmConditionQuality::kGood);
+  return response("observed");
+}
+
+CanonicalValue HeadlessApiCore::MarkComponentLifecycleSourceUnknown() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const bool registered = !component_lifecycle_adapter_.source_epoch.empty();
+  if (registered) {
+    // Unknown quality cannot clear: raised conditions stay active.
+    alarm_owner_.MarkSourceQualityUnknown(
+        component_lifecycle_adapter_.source_id,
+        component_lifecycle_adapter_.source_epoch);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version",
+       CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
+      {"status",
+       CanonicalValue(registered ? "marked_unknown" : "not_registered")},
+  });
+}
+
+namespace {
+
+constexpr std::string_view kCCLCIncidentHistorySchemaVersion =
+    "manyforge.cclc_incident_history_record.v1";
+constexpr std::size_t kMaximumRecordedCCLCIncidentEvents = 2048U;
+
+} // namespace
+
+CanonicalValue
+HeadlessApiCore::RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
+                                         CanonicalValue event) {
+  const std::string code = "headless_cclc_incident_event_invalid";
+  Require(!cclc_owner_epoch.empty() && cclc_owner_epoch.size() <= 256U &&
+              content_identity::is_utf8_nfc(cclc_owner_epoch) &&
+              event.is_object() && event.as_object().size() == 5U,
+          code, "CCLC incident event envelope is malformed");
+  const auto event_kind = RequiredString(event, "event_kind");
+  const auto incident_id = RequiredString(event, "incident_id");
+  const auto &details = RequiredMember(event, "payload");
+  const auto *sequence =
+      std::get_if<double>(&RequiredMember(event, "event_sequence").storage());
+  Require((event_kind == "component_incident" ||
+           event_kind == "component_incident_acknowledged") &&
+              incident_id.size() <= 128U &&
+              content_identity::is_utf8_nfc(incident_id) &&
+              sequence != nullptr && std::isfinite(*sequence) &&
+              *sequence >= 1.0 && std::floor(*sequence) == *sequence &&
+              *sequence <= static_cast<double>(kMaximumSafeInteger) &&
+              details.is_object() &&
+              RequiredString(details, "incident_id") == incident_id &&
+              RequiredString(details, "event_kind") == event_kind,
+          code, "CCLC incident event does not match its record");
+  const auto cclc_occurred_at_ns = content_identity::parse_nonnegative_int64(
+      RequiredMember(event, "occurred_at_ns"));
+  const auto key = std::make_pair(incident_id, event_kind);
+  const auto response = [&](const std::string_view status,
+                            const std::optional<std::string> &event_id) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"event_id", OptionalStringValue(event_id)},
+        {"schema_version",
+         CanonicalValue(std::string(kCCLCIncidentHistorySchemaVersion))},
+        {"status", CanonicalValue(std::string(status))},
+    });
+  };
+
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    if (recorded_cclc_incident_events_.contains(key)) {
+      return response("duplicate", std::nullopt);
+    }
+    store = history_store_;
+  }
+  // A restarted reader replays from its cursor; the durable record of an
+  // earlier process answers it. The read stays outside the core lock.
+  HistorianQuery query;
+  query.components = {"manyforge.cclc"};
+  query.event_types = {event_kind};
+  query.correlations = {{"incident_id", incident_id}};
+  query.limit = 1U;
+  const bool durable = !store->Query(query).events.empty();
+
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  if (recorded_cclc_incident_events_.size() >=
+      kMaximumRecordedCCLCIncidentEvents) {
+    recorded_cclc_incident_events_.clear();
+  }
+  if (durable || recorded_cclc_incident_events_.contains(key)) {
+    recorded_cclc_incident_events_.insert(key);
+    return response("duplicate", std::nullopt);
+  }
+  // Historian time is this owner's recording time: CCLC stamps its own
+  // monotonic clock, kept in the record as `cclc_occurred_at_ns`.
+  auto historian_event = MakeHistorianEvent(
+      "manyforge.cclc", event_kind,
+      event_kind == "component_incident" ? "ERROR" : "INFO",
+      clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
+      CanonicalValue(CanonicalValue::Object{
+          {"cclc_occurred_at_ns",
+           content_identity::nonnegative_int64_value(cclc_occurred_at_ns)},
+          {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
+          {"clock_owner", CanonicalValue("headless:" + config_.owner_epoch)},
+          {"details", details},
+          {"event_kind", CanonicalValue(event_kind)},
+          {"event_sequence", CanonicalValue(*sequence)},
+          {"incident_id", CanonicalValue(incident_id)},
+          {"schema_version",
+           CanonicalValue("manyforge.cclc_incident_history_event.v1")},
+      }));
+  const auto event_id = historian_event.event_id;
+  const bool recorded = historian_.TryEnqueue(std::move(historian_event));
+  if (recorded) {
+    recorded_cclc_incident_events_.insert(key);
+  } else {
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian delivery queue rejected a CCLC incident event");
+  }
+  SynchronizeHistorianHealthLocked();
+  return response(recorded ? "recorded" : "rejected",
+                  recorded ? std::optional(event_id) : std::nullopt);
+}
+
+void HeadlessApiCore::SynchronizeComponentConditionLocked(
+    AdapterCursor &cursor, const std::string &definition_id,
+    const std::string &component_id, const AlarmSubject &subject,
+    const bool active, const CanonicalValue &details,
+    const CanonicalValue &correlations) {
+  const auto key = std::make_pair(definition_id, component_id);
+  auto found = component_conditions_.find(key);
+  if (found == component_conditions_.end() && !active) {
+    return;
+  }
+  const auto submit = [&](const AlarmSubject &scope, const bool raise) {
+    Require(cursor.source_sequence < kMaximumSafeInteger,
+            "headless_adapter_sequence_exhausted",
+            "component lifecycle alarm adapter sequence is exhausted");
+    ++cursor.source_sequence;
+    AlarmConditionUpdate update{
+        definition_id,
+        scope,
+        raise,
+        cursor.source_id,
+        cursor.source_epoch,
+        cursor.source_sequence,
+        clocks_.monotonic_time_ns(),
+        clocks_.wall_time_text(),
+        AlarmConditionQuality::kGood,
+        CanonicalValue(CanonicalValue::Object{}),
+        details,
+        {},
+        correlations,
+    };
+    try {
+      const auto mutation = alarm_owner_.Submit(std::move(update));
+      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+      return true;
+    } catch (const OperatorAlarmError &error) {
+      // A component whose resources are outside the active configuration
+      // (or that has none) cannot be scoped. The refusal is counted by the
+      // owner; the same state is retried only after the configuration or
+      // the observation changes.
+      if (error.code() != "operator_alarm_scope_inactive" &&
+          error.code() != "operator_alarm_scope_invalid") {
+        throw;
+      }
+      return false;
+    }
+  };
+  if (found != component_conditions_.end() && found->second.active &&
+      found->second.subject != subject) {
+    // The resources changed while raised: the old point returns to normal.
+    static_cast<void>(submit(found->second.subject, false));
+    found->second = ComponentConditionState{subject, false, {}};
+  }
+  const CanonicalValue condition(CanonicalValue::Object{
+      {"active", CanonicalValue(active)},
+      {"details", details},
+      {"registry",
+       alarm_registry_identity_.has_value()
+           ? CanonicalValue(alarm_registry_identity_->first + "\n" +
+                            alarm_registry_identity_->second)
+           : CanonicalValue(nullptr)},
+      {"resource_ids", StringArrayValue(subject.resource_ids)},
+  });
+  const auto fingerprint = content_identity::framed_sha256(
+      "manyforge-headless-component-lifecycle-condition", "v1", condition);
+  if (found != component_conditions_.end()) {
+    if (found->second.fingerprint == fingerprint) {
+      return;
+    }
+    if (!found->second.active && !active) {
+      // Nothing raised to return to normal.
+      found->second = ComponentConditionState{subject, false, fingerprint};
+      return;
+    }
+  }
+  const bool admitted = submit(subject, active);
+  component_conditions_.insert_or_assign(
+      key, ComponentConditionState{subject, active && admitted, fingerprint});
+}
+
 void HeadlessApiCore::Shutdown() {
   {
     std::lock_guard lock(mutex_);
@@ -3534,9 +3994,15 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         resources.insert(resource.resource_id.value());
       }
     }
+    std::set<std::string> components;
+    for (const auto &component :
+         bundle->value().cell_graph.controllable_components) {
+      components.insert(component.controllable_component_id.value());
+    }
     alarm_owner_.ReplaceResourceRegistry(
         AlarmResourceRegistry{*bundle_id, *graph_revision, std::move(resources)});
     alarm_registry_identity_ = std::move(identity);
+    alarm_component_ids_.assign(components.begin(), components.end());
     alarm_owner_.ReconcileHealth(kAlarmResourceRegistryHealthCode);
     ReconsiderRefusedOperationConditionsLocked();
   } catch (const std::exception &error) {

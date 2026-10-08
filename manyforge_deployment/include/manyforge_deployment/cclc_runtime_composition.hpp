@@ -3,6 +3,7 @@
 #include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 
 #include <filesystem>
+#include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 #include <manyforge_core/cclc_open_request.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
@@ -41,6 +42,8 @@ struct CCLCRuntimeCompositionConfig final {
       core::kDefaultResolvedStopBasePlanRepositoryBytes};
   std::uint64_t maximum_single_resolved_stop_plan_bytes{
       core::kMaximumResolvedStopBasePlanEncodedBytes};
+  /// CCLC-owned requested-target follower, started with the composition.
+  core::CCLCLifecycleTargetDriverConfig lifecycle_target_driver{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool trusted_roots_valid() const noexcept;
@@ -98,6 +101,9 @@ public:
   [[nodiscard]] const core::ComponentLifecycleCoordinator &
   coordinator() const noexcept;
   [[nodiscard]] core::ICCLCOpenRequestPort &open_request_port() noexcept;
+  /// Event-driven wakeups (observation publication, configuration change)
+  /// are delivered through `Wake`; the driver never runs on the caller.
+  [[nodiscard]] core::CCLCLifecycleTargetDriver &lifecycle_target_driver() noexcept;
   [[nodiscard]] const std::filesystem::path &open_request_socket_path() const;
   [[nodiscard]] const std::filesystem::path &
   ros_open_request_socket_path() const;
@@ -141,6 +147,9 @@ private:
   VerifiedRouteSelectionCurrentSnapshotSource route_snapshot_source_;
   VerifiedRouteConfigurationPublicationPort route_publication_port_;
   core::ComponentLifecycleCoordinator coordinator_;
+  core::CoordinatorLifecycleTargetDriverPorts target_driver_ports_;
+  // Declared after the coordinator: destroyed (stopped) before it.
+  core::CCLCLifecycleTargetDriver target_driver_;
   core::ComponentLifecycleCoordinatorOpenRequestPort open_request_port_;
   std::unique_ptr<CCLCOpenRequestUnixServer> http_open_request_server_;
   std::unique_ptr<CCLCOpenRequestUnixServer> ros_open_request_server_;

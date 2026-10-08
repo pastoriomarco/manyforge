@@ -382,7 +382,6 @@ MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
 
 bool operator_controlled_stop_allowed(ExecutionState state) {
   return state == ExecutionState::kExecuting ||
-         state == ExecutionState::kPaused ||
          state == ExecutionState::kStopping;
 }
 

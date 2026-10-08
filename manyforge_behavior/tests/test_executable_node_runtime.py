@@ -305,8 +305,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 51
-    assert sum(item.adapter_build_qualified for item in dispositions) == 45
+    assert len(dispositions) == len(environment.registry.rows) == 49
+    assert sum(item.adapter_build_qualified for item in dispositions) == 43
     assert sum(not item.adapter_build_qualified for item in dispositions) == 6
     assert all(
         (

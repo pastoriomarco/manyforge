@@ -112,23 +112,6 @@
         "N6-a3",
         "N7"
       ],
-      "active_capability_id": "execution.pause",
-      "applicability": [
-        "arm"
-      ],
-      "binding_kind": "control_binding",
-      "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-      "disposition": "retained_binding_only_until_runtime_claim_gate",
-      "historical_capability_id": "execution.pause",
-      "owner_boundary": "native_control",
-      "runtime_claim_gate": "N7",
-      "scope": "target_binding"
-    },
-    {
-      "acceptance_steps": [
-        "N6-a3",
-        "N7"
-      ],
       "active_capability_id": "execution.reset",
       "applicability": [
         "arm"
@@ -137,23 +120,6 @@
       "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
       "disposition": "retained_binding_only_until_runtime_claim_gate",
       "historical_capability_id": "execution.reset",
-      "owner_boundary": "native_control",
-      "runtime_claim_gate": "N7",
-      "scope": "target_binding"
-    },
-    {
-      "acceptance_steps": [
-        "N6-a3",
-        "N7"
-      ],
-      "active_capability_id": "execution.resume",
-      "applicability": [
-        "arm"
-      ],
-      "binding_kind": "control_binding",
-      "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
-      "disposition": "retained_binding_only_until_runtime_claim_gate",
-      "historical_capability_id": "execution.resume",
       "owner_boundary": "native_control",
       "runtime_claim_gate": "N7",
       "scope": "target_binding"

@@ -33,7 +33,6 @@ enum class OperationStateKind {
   kPrepared,
   kDispatching,
   kExecuting,
-  kPaused,
   kStopping,
   kCompleted,
   kStopped,
@@ -386,8 +385,6 @@ struct StopAcceptedDTO final {
     const StopAcceptedDTO& accepted) noexcept;
 
 enum class OperationControlKind {
-  kPause,
-  kResume,
   kReset,
   kAcknowledgeCompleted,
 };
@@ -415,7 +412,7 @@ struct OperationControlAcceptedDTO final {
   RequestReplayStatusDTO replay_status;
   OperationId operation_id;
   OperationRevision accepted_against_revision;
-  OperationControlKind control{OperationControlKind::kPause};
+  OperationControlKind control{OperationControlKind::kReset};
   OperationRevision operation_revision_after_acceptance;
   std::int64_t accepted_at_ns{};
 

@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:65832e1ce71cf1fd2f1ab1de5a16580742d6290195a8d0af5e8146b95ada5813";
+    "sha256:ee78bb448062b0c4784697b876fa37653ed56402887488b108deb72a0b163ea3";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -79,7 +79,7 @@ struct CapabilityDefinitionDescriptor {
 
 /// Exact spec-240 active registry. Frozen legacy replacement rows are not
 /// capability definitions.
-inline constexpr std::array<CapabilityDefinitionDescriptor, 70>
+inline constexpr std::array<CapabilityDefinitionDescriptor, 68>
     kBuiltinCapabilityDefinitionRegistry{{
         {"planning.motion.joint_goal",
          "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
@@ -219,14 +219,6 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 70>
          std::nullopt},
         {"execution.stop.motion.hard_deceleration",
          "sha256:6ba753aeeb103943923c7964cba8239661d462498c35a437c1682d0dc1f90e70",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
-         std::nullopt},
-        {"execution.pause",
-         "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
-         std::nullopt},
-        {"execution.resume",
-         "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
          std::nullopt},
         {"execution.reset",
@@ -425,14 +417,14 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 70>
   return count;
 }
 
-static_assert(kBuiltinCapabilityDefinitionRegistry.size() == 70U);
+static_assert(kBuiltinCapabilityDefinitionRegistry.size() == 68U);
 static_assert(capability_definition_ids_are_unique());
-static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 34U);
+static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 32U);
 static_assert(capability_scope_count(CapabilityScope::kCellGlobal) == 28U);
 static_assert(capability_scope_count(CapabilityScope::kControlDomain) == 8U);
 static_assert(capability_provider_binding_kind_count(
                   CapabilityProviderBindingKind::kCapabilityProviderBinding) == 47U);
 static_assert(
-    capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 23U);
+    capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 21U);
 
 }  // namespace manyforge::core

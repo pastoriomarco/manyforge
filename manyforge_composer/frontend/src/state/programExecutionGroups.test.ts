@@ -184,15 +184,14 @@ describe('hardware-acting node rule', () => {
       const id = entry.split('\n', 1)[0].trim();
       const owner = /^ {4}owner_api: (\S+)$/m.exec(entry)?.[1];
       const kernelControl = new Set([
-        'kernel.stop', 'kernel.full_stop', 'kernel.pause', 'kernel.resume',
-        'kernel.reset', 'kernel.runtime_scaling']);
+        'kernel.stop', 'kernel.full_stop', 'kernel.reset', 'kernel.runtime_scaling']);
       if ((/^ {4}effectful: true$/m.test(entry)
           && (owner === 'kernel.operation' || owner === 'kernel.command_target'))
           || (owner !== undefined && kernelControl.has(owner))) derived.add(id);
     }
     expect([...HARDWARE_ACTING_NODE_IDS].sort()).toEqual([...derived].sort());
     expect(derived.has('gripper.check_status')).toBe(false);
-    expect(derived.has('kernel.resume_operation')).toBe(true);
+    expect(derived.has('kernel.reset_operation')).toBe(true);
     expect(derived.has('kernel.full_stop')).toBe(true);
   });
 
@@ -205,24 +204,24 @@ describe('hardware-acting node rule', () => {
         leaf('out', 'io.set_output', 'all', 'io'),
         leaf('status', 'gripper.check_status', 'all', 'gripper'),
         leaf('input', 'io.wait_for_input', 'all', 'io'),
-        leaf('resume', 'kernel.resume_operation', 'all', 'arm'),
+        leaf('reset', 'kernel.reset_operation', 'all', 'arm'),
       ],
     };
     const scopes = executionGroupScopes([tree], ['arm']);
     const all = scopes.find((scope) => scope.groupId === 'all')!;
-    expect([...all.hardwareNodeIds].sort()).toEqual(['grip', 'move', 'out', 'resume']);
+    expect([...all.hardwareNodeIds].sort()).toEqual(['grip', 'move', 'out', 'reset']);
     expect(all.targetRoleIds).toEqual(['arm', 'gripper', 'io']);
     expect(all.motionTargetRoleIds).toEqual(['arm']);
     expect(executionGroupVisibilityUnavailableReason(scopes, ['arm'])).toContain('Show All');
     expect(executionGroupDisplay(['all', 'arm'], undefined, scopes))
       .toEqual({ preferred: ['arm'], shown: ['all', 'arm'], fallback: 'uncovered' });
     // Uncovered reads and waits do not force All.
-    const resume = tree.children[5];
+    const reset = tree.children[5];
     tree.children = [tree.children[0], tree.children[3], tree.children[4]];
     expect(executionGroupDisplay(['all', 'arm'], undefined, executionGroupScopes([tree], ['arm'])).fallback)
       .toBeNull();
-    // An uncovered Kernel control (here Resume) does.
-    tree.children = [...tree.children, resume];
+    // An uncovered Kernel control (here Reset) does.
+    tree.children = [...tree.children, reset];
     expect(executionGroupDisplay(['all', 'arm'], undefined, executionGroupScopes([tree], ['arm'])).fallback)
       .toBe('uncovered');
   });

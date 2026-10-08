@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <string>
@@ -68,6 +69,18 @@ class ICCLCOpenRequestPort {
       const LifecycleTransactionId& transaction_id) = 0;
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component_id) const = 0;
+  /// Requested lifecycle target and progress shown beside the component
+  /// snapshot. Both are absent when no target is recorded or composed.
+  [[nodiscard]] virtual Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
+      const ControllableComponentId&) const {
+    return Result<ComponentLifecycleTargetViewDTO>::Ok({});
+  }
+  /// Durable component-incident history events after `after_sequence`, for
+  /// the Headless historian pipe (contract item 5). None when not composed.
+  [[nodiscard]] virtual Result<std::vector<ComponentIncidentEventDTO>> ReadIncidentEvents(
+      std::uint64_t, std::size_t) {
+    return Result<std::vector<ComponentIncidentEventDTO>>::Ok({});
+  }
   [[nodiscard]] virtual Result<CCLCRouteSelectionTemplateSetDTO> ReadRouteSelectionTemplates(
       const ControllableComponentId& component_id) const = 0;
   [[nodiscard]] virtual Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
@@ -88,7 +101,8 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
   ComponentLifecycleCoordinatorOpenRequestPort(
       ComponentLifecycleCoordinator& coordinator,
       const ICCLCCurrentComponentSnapshotSource& current_component_source,
-      const ICCLCRouteSelectionTemplateSource& route_template_source) noexcept;
+      const ICCLCRouteSelectionTemplateSource& route_template_source,
+      CCLCLifecycleTargetDriver* target_driver = nullptr) noexcept;
 
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
@@ -99,6 +113,10 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
       const LifecycleTransactionId& transaction_id) override;
   [[nodiscard]] Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component_id) const override;
+  [[nodiscard]] Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
+      const ControllableComponentId& component_id) const override;
+  [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> ReadIncidentEvents(
+      std::uint64_t after_sequence, std::size_t limit) override;
   [[nodiscard]] Result<CCLCRouteSelectionTemplateSetDTO> ReadRouteSelectionTemplates(
       const ControllableComponentId& component_id) const override;
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
@@ -112,6 +130,7 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
   ComponentLifecycleCoordinator& coordinator_;
   const ICCLCCurrentComponentSnapshotSource& current_component_source_;
   const ICCLCRouteSelectionTemplateSource& route_template_source_;
+  CCLCLifecycleTargetDriver* target_driver_;
 };
 
 /// Decode one exact RFC-8785 request, stamp the supplied transport-derived

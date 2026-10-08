@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.4.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:6e62827057b520c2869f4aca330a002b6f737f4482299ca2ad222371cf06d6a2
+catalog_digest: sha256:5431cf57379b786ab05dccf2252ffa27cd6441ce32edbe76a7eef0f5ea995529
 schema_types:
   coordinate_position:
     type: object
@@ -2899,86 +2899,6 @@ entries:
   runners:
     py_trees:
       implementation_id: kernel_full_stop_v1
-  observability:
-    event_family: manyforge.program.node
-- id: kernel.pause_operation
-  name: Pause operation
-  category: recovery
-  description: Pause one exact runtime-selected operation.
-  stability: stable
-  tags:
-  - kernel
-  - pause
-  profiles:
-    min_program_profile: composable-cell-v1
-  kind: leaf
-  children:
-    min: 0
-    max: 0
-  parameters:
-  - id: target_role
-    required: true
-    schema:
-      type: string
-      semantic_type: target_role
-  required_capabilities:
-  - capability_id: execution.pause
-    scope: target_binding
-    target_parameter: target_role
-    effectful: true
-  owner_context:
-    kind: current_operation
-    required: true
-  execution:
-    blocking: true
-    cancellable: false
-    owner_api: kernel.pause
-  outcomes:
-    success: operation_paused
-    failure: pause_failed
-  runners:
-    py_trees:
-      implementation_id: kernel_pause_operation_v1
-  observability:
-    event_family: manyforge.program.node
-- id: kernel.resume_operation
-  name: Resume operation
-  category: recovery
-  description: Resume one exact runtime-selected paused operation.
-  stability: stable
-  tags:
-  - kernel
-  - resume
-  profiles:
-    min_program_profile: composable-cell-v1
-  kind: leaf
-  children:
-    min: 0
-    max: 0
-  parameters:
-  - id: target_role
-    required: true
-    schema:
-      type: string
-      semantic_type: target_role
-  required_capabilities:
-  - capability_id: execution.resume
-    scope: target_binding
-    target_parameter: target_role
-    effectful: true
-  owner_context:
-    kind: current_operation
-    required: true
-  execution:
-    blocking: true
-    cancellable: false
-    owner_api: kernel.resume
-  outcomes:
-    success: operation_resumed
-    failure: resume_failed
-  runners:
-    py_trees:
-      implementation_id: kernel_resume_operation_v1
   observability:
     event_family: manyforge.program.node
 - id: kernel.reset_operation

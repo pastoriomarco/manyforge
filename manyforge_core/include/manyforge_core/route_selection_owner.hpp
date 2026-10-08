@@ -60,6 +60,60 @@ class RouteSelectionCurrentSnapshot final {
 [[nodiscard]] Result<RouteSelectionCurrentSnapshot> verify_route_selection_current_snapshot(
     RouteSelectionCurrentSnapshotDTO value);
 
+/// Observation-only current closure of one retained domain: the exact
+/// retained identity, the agreed current configuration (CCLC durable and
+/// Kernel current) and the expected controller domain. It carries no
+/// component lifecycle expectation or fence scope, so it observes a Declared
+/// component or one without lifecycle facts. It is not a route-selection
+/// snapshot and can never admit a route change, claim or fence.
+struct RouteConfigurationObservationSnapshotDTO final {
+  RetainedBundleId retained_bundle_id;
+  GraphRevision graph_revision;
+  std::optional<ActiveControlConfigurationDTO> active_control_configuration;
+  ControllerLifecycleExpectedDomainDTO expected_controller_domain;
+
+  friend bool operator==(const RouteConfigurationObservationSnapshotDTO&,
+                         const RouteConfigurationObservationSnapshotDTO&) = default;
+};
+
+/// Sealed observation-only closure; constructed only by its verifier.
+class RouteConfigurationObservationSnapshot final {
+ public:
+  RouteConfigurationObservationSnapshot(const RouteConfigurationObservationSnapshot&) = default;
+  RouteConfigurationObservationSnapshot& operator=(const RouteConfigurationObservationSnapshot&) =
+      default;
+  RouteConfigurationObservationSnapshot(RouteConfigurationObservationSnapshot&&) noexcept =
+      default;
+  RouteConfigurationObservationSnapshot& operator=(
+      RouteConfigurationObservationSnapshot&&) noexcept = default;
+
+  [[nodiscard]] const RouteConfigurationObservationSnapshotDTO& value() const noexcept {
+    return value_;
+  }
+  [[nodiscard]] const ControllerLifecycleExpectedDomain& expected_controller_domain()
+      const noexcept {
+    return expected_controller_domain_;
+  }
+
+ private:
+  RouteConfigurationObservationSnapshot(RouteConfigurationObservationSnapshotDTO value,
+                                        ControllerLifecycleExpectedDomain expected_controller_domain)
+      : value_(std::move(value)),
+        expected_controller_domain_(std::move(expected_controller_domain)) {}
+
+  RouteConfigurationObservationSnapshotDTO value_;
+  ControllerLifecycleExpectedDomain expected_controller_domain_;
+
+  friend Result<RouteConfigurationObservationSnapshot>
+  verify_route_configuration_observation_snapshot(RouteConfigurationObservationSnapshotDTO);
+};
+
+/// Verifies the retained identity, the expected controller domain and that
+/// any current configuration is exact truth for that domain. Component
+/// lifecycle state is deliberately not part of this closure.
+[[nodiscard]] Result<RouteConfigurationObservationSnapshot>
+verify_route_configuration_observation_snapshot(RouteConfigurationObservationSnapshotDTO value);
+
 /// Construct one candidate-generation active configuration exclusively from
 /// sealed retained facts and the adapter-observed selected configuration.
 /// The desired configuration is used only as the reconciliation comparator;

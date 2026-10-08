@@ -132,12 +132,6 @@ class _Transport:
             },
         }
 
-    def pause(self, operation_id: str, body: Mapping[str, Any]):
-        return self._control("pause", operation_id, body)
-
-    def resume(self, operation_id: str, body: Mapping[str, Any]):
-        return self._control("resume", operation_id, body)
-
     def reset(self, operation_id: str, body: Mapping[str, Any]):
         result = self._control("reset", operation_id, body)
         self.resident[operation_id] = False
@@ -298,8 +292,6 @@ def _control_port():
                     *(
                         {"capability_id": cap, "command_schema": None}
                         for cap in (
-                            "execution.pause",
-                            "execution.resume",
                             "execution.reset",
                             "execution.stop.soft",
                             "execution.runtime_scale.operation_scoped",
@@ -454,16 +446,12 @@ def test_recovery_node_rejects_ambiguous_stale_or_unoffered_work_before_effect(f
 @pytest.mark.parametrize(
     "node,state",
     [
-        ("kernel.pause_operation", "paused"),
-        ("kernel.pause_operation", "completed"),
-        ("kernel.resume_operation", "executing"),
         ("kernel.reset_operation", "stopped"),
     ],
 )
 def test_control_node_submits_once_then_observes_owner_outcome(node, state):
     owner, transport = _control_port()
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.1")
-    transport.operations["controlled"]["state"] = "paused" if "resume" in node else "executing"
     task = owner.controls.start(node, identity, OwnerNodeInputs({"target_role": "arm"}))
     assert task.state is OwnerTaskState.ACTIVE
     assert len(transport.controls) == len(transport.queries) == 1
@@ -515,9 +503,6 @@ def test_stop_control_node_waits_for_exact_stop_certificate(full, terminal, succ
 @pytest.mark.parametrize(
     "node,observed",
     [
-        ("kernel.pause_operation", "paused"),
-        ("kernel.pause_operation", "completed"),
-        ("kernel.resume_operation", "executing"),
         ("kernel.reset_operation", "intervention_required"),
     ],
 )
@@ -619,7 +604,7 @@ def test_control_query_cannot_cross_program_scope(field, value):
     transport.operations["controlled"][field] = value
     with pytest.raises(ProductionPortError, match="crossed"):
         owner.controls.start(
-            "kernel.pause_operation",
+            "kernel.reset_operation",
             NodeAttemptIdentity("program-run.1", "control", "attempt.bad"),
             OwnerNodeInputs({"target_role": "arm"}),
         )
@@ -637,9 +622,8 @@ def test_control_task_retention_is_pending_only_and_cancel_never_reissues_effect
     for index in range(1000):
         identity = NodeAttemptIdentity("program-run.1", "control", f"attempt.{index}")
         task = owner.controls.start(
-            "kernel.pause_operation", identity, OwnerNodeInputs({"target_role": "arm"})
+            "kernel.reset_operation", identity, OwnerNodeInputs({"target_role": "arm"})
         )
-        transport.operations["controlled"]["state"] = "paused"
         assert owner.controls.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
         owner.controls.acknowledge(task.task_id, identity)
     identity = NodeAttemptIdentity("program-run.1", "control", "attempt.cancel")

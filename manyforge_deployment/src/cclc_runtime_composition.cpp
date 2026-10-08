@@ -101,7 +101,8 @@ bool CCLCRuntimeCompositionConfig::locally_valid() const noexcept {
          maximum_single_resolved_stop_plan_bytes <=
              core::kMaximumResolvedStopBasePlanEncodedBytes &&
          maximum_single_resolved_stop_plan_bytes <=
-             maximum_resolved_stop_plan_bytes;
+             maximum_resolved_stop_plan_bytes &&
+         lifecycle_target_driver.locally_valid();
 }
 
 bool CCLCRuntimeCompositionConfig::trusted_roots_valid() const noexcept {
@@ -190,6 +191,13 @@ core::Result<void> CCLCRuntimeComposition::Start() {
     }
     http_open_request_server_ = std::move(http_server.value());
     ros_open_request_server_ = std::move(ros_server.value());
+    // Target following starts only after CCLC admission and transports are
+    // open; it submits through the same coordinator as every caller.
+    auto following = target_driver_.Start();
+    if (!following.ok()) {
+      coordinator_.CloseAdmission();
+      return following;
+    }
     return core::Result<void>::Ok();
   } catch (const std::exception &exception) {
     coordinator_.CloseAdmission();
@@ -253,10 +261,19 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                        &route_snapshot_source_, &port_registry_,
                        &kernel_route_fence_port, &route_publication_port_},
                    component_command_readiness_port),
+      target_driver_ports_(
+          coordinator_, lifecycle_snapshot_source_, lifecycle_catalog_source,
+          port_registry_, kernel_cell_admission_port,
+          [this] { return journal_.LoadComponentsWithUnsettledLifecycle(); }),
+      target_driver_(config_.lifecycle_target_driver, journal_,
+                     target_driver_ports_, clock, scheduler),
       open_request_port_(coordinator_, lifecycle_snapshot_source_,
-                         route_snapshot_source_) {}
+                         route_snapshot_source_, &target_driver_) {}
 
-CCLCRuntimeComposition::~CCLCRuntimeComposition() = default;
+CCLCRuntimeComposition::~CCLCRuntimeComposition() {
+  // Stop following before any transport or owner it submits through goes.
+  target_driver_.Stop();
+}
 
 core::ComponentLifecycleCoordinator &
 CCLCRuntimeComposition::coordinator() noexcept {
@@ -271,6 +288,11 @@ CCLCRuntimeComposition::coordinator() const noexcept {
 core::ICCLCOpenRequestPort &
 CCLCRuntimeComposition::open_request_port() noexcept {
   return open_request_port_;
+}
+
+core::CCLCLifecycleTargetDriver &
+CCLCRuntimeComposition::lifecycle_target_driver() noexcept {
+  return target_driver_;
 }
 
 const std::filesystem::path &

@@ -213,7 +213,6 @@ template <typename StrongId>
     case OperationStateKind::kPrepared:
     case OperationStateKind::kDispatching:
     case OperationStateKind::kExecuting:
-    case OperationStateKind::kPaused:
     case OperationStateKind::kStopping:
     case OperationStateKind::kCompleted:
     case OperationStateKind::kStopped:
@@ -242,7 +241,6 @@ template <typename StrongId>
     case OperationStateKind::kPrepared:
     case OperationStateKind::kDispatching:
     case OperationStateKind::kExecuting:
-    case OperationStateKind::kPaused:
     case OperationStateKind::kStopping:
       return false;
   }

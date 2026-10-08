@@ -50,10 +50,6 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   Result<std::uint64_t> execute(const ExecuteRequestDTO&) override {
     return unsupported<std::uint64_t>();
   }
-  PauseResultDTO pause() override { return {false, unsupported_error()}; }
-  ResumeResultDTO resume(std::optional<std::uint64_t> = std::nullopt) override {
-    return {false, unsupported_error()};
-  }
   ResetResultDTO reset(std::optional<std::uint64_t> = std::nullopt) override {
     return {false, unsupported_error()};
   }
@@ -89,13 +85,6 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   Result<void> DispatchPreparedMotion(std::uint64_t, const ContentDigest&) override {
     return unsupported<void>();
   }
-  Result<void> PrepareResumeMotion(std::uint64_t, ResolvedPreparedMotionResumeRequestDTO) override {
-    return unsupported<void>();
-  }
-  Result<void> DispatchPreparedResumeMotion(std::uint64_t, const ContentDigest&) override {
-    return unsupported<void>();
-  }
-  Result<void> CancelPreparedResumeMotion(std::uint64_t) override { return unsupported<void>(); }
   Result<void> CancelPreparedMotion(std::uint64_t) override { return unsupported<void>(); }
 
  private:

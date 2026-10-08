@@ -178,11 +178,6 @@ public:
   execute(const core::ExecuteRequestDTO &) override {
     return unused<std::uint64_t>();
   }
-  [[nodiscard]] core::PauseResultDTO pause() override { return {}; }
-  [[nodiscard]] core::ResumeResultDTO
-  resume(std::optional<std::uint64_t>) override {
-    return {};
-  }
   [[nodiscard]] core::ResetResultDTO
   reset(std::optional<std::uint64_t>) override {
     return {};

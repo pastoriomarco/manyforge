@@ -144,7 +144,7 @@ the cause.
 - Cooperative-interrupt removal artifacts: a node still issuing
   cooperative-style cancellation that the new latch model rejects as
   a class violation. Check `interrupt_source_class_violation` events.
-- Stop / pause issued from another surface (Composer UI, MCP tool,
+- Stop issued from another surface (Composer UI, MCP tool,
   bringup script) — the launcher's `status` verb shows which surface
   is connected.
 

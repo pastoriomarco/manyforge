@@ -3191,120 +3191,6 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
-     ResumeCannotInheritPausedExecutionAcrossComponentEpochChange) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_resume_environment_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_resume_environment_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_resume_environment_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_resume_environment_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend,
-                                [](const ControllerBindingSnapshot &candidate) {
-                                  return candidate.valid;
-                                })
-          .has_value());
-
-  auto admission =
-      admitted_snapshot_for(*config.controller_binding, clock.now());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_environment_pinned = false;
-  const auto initial_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < initial_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_environment_pinned = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(initial_environment_pinned);
-
-  const auto initial_handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
-  ASSERT_TRUE(server.wait_for_goal_count(1));
-  ASSERT_TRUE(server.publish_feedback(0.0));
-  const auto pause = backend.pause();
-  ASSERT_TRUE(pause.accepted)
-      << (pause.error.has_value() ? pause.error->message : "");
-  const auto cancel_deadline = std::chrono::steady_clock::now() + 2s;
-  while (server.cancel_requests() == 0 &&
-         std::chrono::steady_clock::now() < cancel_deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_GT(server.cancel_requests(), 0u);
-  ASSERT_TRUE(server.cancel_current_goal());
-  ASSERT_TRUE(initial_handle.wait_for_completion(2'000'000'000));
-  EXPECT_EQ(initial_handle.get_snapshot().state, core::ExecutionState::kPaused);
-  const auto paused_pin = backend.testing_resumable_environment_pin();
-  ASSERT_TRUE(paused_pin.has_value());
-  EXPECT_EQ(paused_pin->transport_owner_component_epoch, "owner-epoch-1");
-
-  admission.generation += 1;
-  admission.lifecycle_generation += 1;
-  admission.observed_timestamp_ns += 1;
-  admission.received_timestamp_ns += 1;
-  admission.fresh_until_ns += 1;
-  admission.transport_owner_component_epoch = "owner-epoch-2";
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-
-  bool replacement_environment_pinned = false;
-  const auto replacement_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < replacement_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      replacement_environment_pinned = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(replacement_environment_pinned);
-  const auto provisional_pin = backend.testing_planning_environment_pin();
-  ASSERT_TRUE(provisional_pin.has_value());
-  EXPECT_EQ(provisional_pin->transport_owner_component_epoch, "owner-epoch-2");
-
-  const auto resumed_handle =
-      backend.resume(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_TRUE(resumed_handle.wait_for_completion(2'000'000'000));
-  const auto terminal = resumed_handle.get_snapshot();
-  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(terminal.error.has_value());
-  EXPECT_EQ(terminal.error->details.at("reason_code"),
-            ros2_control_fault_reason::kExecutionAdmissionRejected);
-  EXPECT_EQ(terminal.error->details.at("reason"),
-            "execution_environment_epoch_changed");
-  EXPECT_EQ(server.goal_count(), 1u);
-  EXPECT_FALSE(backend.testing_resumable_environment_pin().has_value());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
      ActivityChangeDuringGoalResponseCannotEscapeGenerationFence) {
   const std::string suffix = unique_suffix();
   const std::string action_name = "/manyforge_binding_goal_race_fjt_" + suffix;
@@ -4463,8 +4349,8 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
-     StopAndPauseIntentWinWhileMeasuredCompletionGateIsPending) {
-  const auto run_case = [](bool pause) {
+     StopIntentWinsWhileMeasuredCompletionGateIsPending) {
+  {
     const std::string suffix = unique_suffix();
     const std::string action_name = "/manyforge_terminal_intent_fjt_" + suffix;
     const std::string joint_state_topic =
@@ -4517,19 +4403,11 @@ TEST(Ros2ControlExecutionBackendTest,
     }
     ASSERT_TRUE(backend.testing_completion_gate_pending());
 
-    if (pause) {
-      EXPECT_TRUE(backend.pause().accepted);
-    } else {
-      EXPECT_TRUE(backend.stop().accepted);
-    }
+    EXPECT_TRUE(backend.stop().accepted);
     ASSERT_TRUE(handle.wait_for_completion(500'000'000));
     EXPECT_EQ(backend.get_execution_snapshot().state,
-              pause ? core::ExecutionState::kPaused
-                    : core::ExecutionState::kStopped);
-  };
-
-  run_case(false);
-  run_case(true);
+              core::ExecutionState::kStopped);
+  }
 }
 
 TEST(Ros2ControlExecutionBackendTest,

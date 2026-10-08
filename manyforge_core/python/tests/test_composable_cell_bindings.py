@@ -890,10 +890,10 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 70
-    assert len({row.capability_id for row in registry}) == 70
+    assert len(registry) == 68
+    assert len({row.capability_id for row in registry}) == 68
     assert (
-        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 34
+        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 32
     )
     assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
     assert (
@@ -913,11 +913,11 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kControlBinding
             for row in registry
         )
-        == 23
+        == 21
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:65832e1ce71cf1fd2f1ab1de5a16580742d6290195a8d0af5e8146b95ada5813"
+        "sha256:ee78bb448062b0c4784697b876fa37653ed56402887488b108deb72a0b163ea3"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1874,7 +1874,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:4ff0c6d3d2e4cf9eae515f0ba3343404e3f30939a08f886aadfe26fa57fe173d",
+            "sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905",
         ),
     }
     assert (

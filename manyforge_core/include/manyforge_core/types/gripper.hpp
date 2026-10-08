@@ -55,7 +55,6 @@ inline constexpr const char* gripper_projection_state_name(GripperProjectionStat
 enum class GripperInvalidationReason {
   kReset,
   kStop,
-  kPause,
   kReplacement,
   kDeploymentSwap,
   kShutdown,

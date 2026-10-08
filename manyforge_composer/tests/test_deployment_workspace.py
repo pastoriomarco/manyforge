@@ -2311,7 +2311,7 @@ def test_run_rejects_unapplied_program_draft_before_transport() -> None:
     assert response.json()["detail"]["code"] == "execution_program_draft_unapplied"
 
 
-@pytest.mark.parametrize("command_kind", ["program_motion_start", "operation_start", "operation_resume",
+@pytest.mark.parametrize("command_kind", ["program_motion_start", "operation_start",
                                          "direct_http_operation", "direct_http_refused"])
 def test_only_program_start_rejects_unapplied_deployment_before_transport(command_kind: str) -> None:
     state = ComposerState()

@@ -880,23 +880,6 @@ public:
   }
 
   [[nodiscard]] core::Result<void>
-  PrepareResumeMotion(std::uint64_t,
-                      core::ResolvedPreparedMotionResumeRequestDTO) override {
-    return Unsupported<void>();
-  }
-
-  [[nodiscard]] core::Result<void>
-  DispatchPreparedResumeMotion(std::uint64_t,
-                               const core::ContentDigest &) override {
-    return Unsupported<void>();
-  }
-
-  [[nodiscard]] core::Result<void>
-  CancelPreparedResumeMotion(std::uint64_t) override {
-    return Unsupported<void>();
-  }
-
-  [[nodiscard]] core::Result<void>
   CancelPreparedMotion(std::uint64_t execution_id) override {
     if (!prepared_snapshot_.has_value() ||
         prepared_snapshot_->execution_id != execution_id) {
@@ -932,13 +915,6 @@ public:
     return Unsupported<void>();
   }
 
-  [[nodiscard]] core::PauseResultDTO pause() override {
-    return {true, std::nullopt};
-  }
-  [[nodiscard]] core::ResumeResultDTO
-  resume(std::optional<std::uint64_t>) override {
-    return {true, std::nullopt};
-  }
   [[nodiscard]] core::ResetResultDTO
   reset(std::optional<std::uint64_t>) override {
     return {true, std::nullopt};

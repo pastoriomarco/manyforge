@@ -35,7 +35,7 @@ namespace {
                                      ProgramRunId("program-run.b"),
                                      OperationRevision(5U),
                                      StopGeneration(6U),
-                                     OperationStateKind::kPaused,
+                                     OperationStateKind::kExecuting,
                                      true,
                                      false,
                                      {ControllableComponentId("robot.b")},

@@ -10,7 +10,7 @@ it('advances only the exact active operation and leaves terminal state authorita
     expect(operationProgressValue(operation, 'owner.1', [{ ...sample, ...patch }])).toBe(0.1);
   }
   expect(operationProgressValue({ ...operation, state: 'completed', progress: 1 }, 'owner.1', [sample])).toBe(1);
-  expect(operationProgressValue({ ...operation, state: 'paused' }, 'owner.1', [sample])).toBe(0.1);
+  expect(operationProgressValue({ ...operation, state: 'stopping' }, 'owner.1', [sample])).toBe(0.1);
 });
 
 it('strictly parses bounded progress samples', () => {

@@ -31,14 +31,12 @@ using Object = CanonicalValue::Object;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-constexpr std::array<std::string_view, 21U> kNativeArmCapabilities{{
+constexpr std::array<std::string_view, 19U> kNativeArmCapabilities{{
     "execution.contact.geometric",
     "execution.contact.geometric_signed_penetration",
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
-    "execution.pause",
     "execution.reset",
-    "execution.resume",
     "execution.runtime_scale.operation_scoped",
     "execution.stop.soft",
     "execution.trajectory.execute",
@@ -453,8 +451,7 @@ struct ComponentProjection final {
           capability == "execution.contact.geometric" ||
           capability == "execution.contact.geometric_signed_penetration" ||
           capability.starts_with("execution.feedback.") ||
-          capability == "execution.pause" || capability == "execution.reset" ||
-          capability == "execution.resume" ||
+          capability == "execution.reset" ||
           capability == "execution.runtime_scale.operation_scoped" ||
           capability == "execution.stop.soft" ||
           capability == "execution.trajectory.execute" ||

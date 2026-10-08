@@ -10498,7 +10498,6 @@ const OPERATION_STATES = new Set<OperationStateName>([
   'prepared',
   'dispatching',
   'executing',
-  'paused',
   'stopping',
   'completed',
   'stopped',

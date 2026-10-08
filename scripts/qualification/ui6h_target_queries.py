@@ -4,7 +4,8 @@ Run only in the pinned image, with an already checked maintained package and
 current native/Headless builds. Uses the maintained workbench's real startup
 and shutdown, but a private package, private state and container-local ports.
 The default Program is read-only; --controls adds simulated native motion,
-Pause/scale/Resume and two short manual gripper moves before the Program.
+a Program-owned runtime scale and two short manual gripper moves before the
+Program.
 No fixture substitutes for an owner response.
 """
 
@@ -805,7 +806,7 @@ def main() -> None:
     parser.add_argument(
         "--controls",
         action="store_true",
-        help="Also qualify Program-owned Pause/scale/Resume during native motion",
+        help="Also qualify Program-owned runtime scale during native motion",
     )
     parser.add_argument(
         "--selections",
@@ -1069,8 +1070,6 @@ def main() -> None:
         program["target_roles"]["arm"]["required_capabilities"].extend(
             {"capability_id": name, "parameters": {}, "disposition": "required"}
             for name in (
-                "execution.pause",
-                "execution.resume",
                 "model.kinematics.fk",
                 "execution.runtime_scale.operation_scoped",
             )
@@ -1092,7 +1091,7 @@ def main() -> None:
                     (0.6, 0.0, 1.5707963267948966, 0.0, 0.0, 0.0)
                 )
             ],
-            # The controls row additionally scales to 0.4 after Pause. Keep
+            # The controls row additionally scales to 0.4 mid-motion. Keep
             # that semantic check short without changing Stop-profile rows.
             velocity_scale=0.4 if args.controls else 0.2,
             acceleration_scale=0.25,
@@ -1138,28 +1137,10 @@ def main() -> None:
                     "parameters": {"duration_s": 0.5},
                 },
                 {
-                    "node_id": "kernel.pause_operation",
-                    "instance_id": "pause",
-                    "children": [],
-                    "parameters": {"target_role": "arm"},
-                },
-                {
-                    "node_id": "timer",
-                    "instance_id": "pause_hold",
-                    "children": [],
-                    "parameters": {"duration_s": 0.25},
-                },
-                {
                     "node_id": "kernel.set_runtime_scale",
                     "instance_id": "scale",
                     "children": [],
                     "parameters": {"target_role": "arm", "scale": 0.4},
-                },
-                {
-                    "node_id": "kernel.resume_operation",
-                    "instance_id": "resume",
-                    "children": [],
-                    "parameters": {"target_role": "arm"},
                 },
             ],
         }
@@ -2882,7 +2863,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                 return
             queried_operation: str | None = None
             observed_operation_scale = False
-            resume_actor = None
             last_program = None
             operation_query = ProgramOperationQuery.model_validate(
                 {
@@ -2895,7 +2875,7 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
             )
 
             def terminal():
-                nonlocal queried_operation, observed_operation_scale, resume_actor, last_program
+                nonlocal queried_operation, observed_operation_scale, last_program
                 current = client.program_run(run_id)
                 last_program = current
                 nodes = current.get("node_statuses", {})
@@ -2967,41 +2947,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                         ):
                             assert scale["effective_scale"] == 0.4, selected
                             observed_operation_scale = True
-                if (
-                    args.controls
-                    and queried_operation
-                    and resume_actor is None
-                    and nodes.get("resume") in {"running", "success"}
-                ):
-                    # Check the actual current command record before normal
-                    # completion cleanup compacts it to the latest control.
-                    journal_path = (
-                        workbench.STATE_ROOT
-                        / "execution-state/operation-journal.sqlite3"
-                    )
-                    with sqlite3.connect(
-                        f"file:{journal_path}?mode=ro", uri=True
-                    ) as journal:
-                        controls = [
-                            json.loads(row[0])
-                            for row in journal.execute(
-                                "SELECT payload_json FROM journal_records "
-                                "WHERE record_kind = 'control_accepted' AND operation_id = ?",
-                                (queried_operation,),
-                            )
-                        ]
-                    resumes = [
-                        row for row in controls if row["result"]["control"] == "resume"
-                    ]
-                    if resumes:
-                        assert len(resumes) == 1, controls
-                        resume_actor = resumes[0]["intent"]["execution_scope"]
-                        assert (
-                            resume_actor["node_instance_id"] == "resume"
-                        ), resume_actor
-                        assert resume_actor["node_attempt_id"].startswith(
-                            "attempt:"
-                        ), resume_actor
                 return current if current["state"] != "running" else None
 
             try:
@@ -3049,10 +2994,7 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                         "controlled_motion",
                         "controls",
                         "motion_setup",
-                        "pause",
-                        "pause_hold",
                         "scale",
-                        "resume",
                     )
                 }
             )
@@ -3076,7 +3018,7 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                 ), evidence
                 assert not evidence["coverage"]["truncated"], evidence
             if args.controls:
-                assert queried_operation and observed_operation_scale and resume_actor
+                assert queried_operation and observed_operation_scale
                 assert native.read(queried_operation)["resident"] is False
                 try:
                     native.query_operation(operation_query)
@@ -3107,7 +3049,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                     "gripper": gripper,
                     "program_run": result,
                     "manual_operations": manual_operations,
-                    "resume_actor": resume_actor,
                     "private_state": str(state),
                 },
                 sort_keys=True,

@@ -646,24 +646,6 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_pause(
-        self,
-        request: OperationControlRequest,
-        attribution: TrustedAttribution,
-    ) -> dict[str, Any]:
-        return self._execution().pause(
-            request, trusted_principal_id=attribution.principal_id
-        )
-
-    def execution_resume(
-        self,
-        request: OperationControlRequest,
-        attribution: TrustedAttribution,
-    ) -> dict[str, Any]:
-        return self._execution().resume(
-            request, trusted_principal_id=attribution.principal_id
-        )
-
     def execution_reset(
         self,
         request: OperationControlRequest,

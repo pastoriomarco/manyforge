@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
@@ -3346,6 +3347,489 @@ TEST(HeadlessApiCore,
   }
   std::this_thread::sleep_for(100ms);
   EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
+}
+
+/// The CCLC component snapshot members the lifecycle-cause adapters read.
+CanonicalValue ComponentConditionSnapshot(
+    const std::string &component, const std::string &resource,
+    const std::string &achieved, const std::string &phase,
+    const std::string &cause, const std::string &requested = "active",
+    const double target_generation = 1.0) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_lifecycle_state", CanonicalValue(achieved)},
+      {"controllable_component_id", CanonicalValue(component)},
+      {"domains",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"control_domain_id", CanonicalValue("domain.arm")},
+           {"current_resources",
+            CanonicalValue(CanonicalValue::Array{CanonicalValue(resource)})},
+       })})},
+      {"graph_revision", CanonicalValue("graph.test")},
+      {"lifecycle_progress",
+       CanonicalValue(CanonicalValue::Object{
+           {"blocking_cause_class", CanonicalValue(cause)},
+           {"blocking_reason",
+            cause == "none" ? CanonicalValue(nullptr)
+                            : CanonicalValue("reason." + cause)},
+           {"phase", CanonicalValue(phase)},
+       })},
+      {"lifecycle_target",
+       CanonicalValue(CanonicalValue::Object{
+           {"origin", CanonicalValue("startup")},
+           {"requested_state", CanonicalValue(requested)},
+           {"target_generation", CanonicalValue(target_generation)},
+       })},
+      {"retained_bundle_id", CanonicalValue("bundle.test")},
+  });
+}
+
+/// The component-lifecycle fixture: the single-arm configuration is active
+/// and its controllable component and first resource are named.
+struct ComponentConditionFixture final {
+  TemporaryDirectory directory;
+  std::string component;
+  std::string resource;
+  std::unique_ptr<HeadlessApiCore> core;
+
+  ComponentConditionFixture() {
+    const auto configurations = LoadRegistryConfigurations();
+    const auto &components =
+        configurations.single->value().cell_graph.controllable_components;
+    if (components.empty()) {
+      throw std::runtime_error("registry fixture has no component");
+    }
+    component = components.front().controllable_component_id.value();
+    resource = ResourceIds(*configurations.single).front();
+    PublishActiveConfiguration(directory, *configurations.single, 1U);
+    core = std::make_unique<HeadlessApiCore>(
+        RegistryConfig(directory, "api.epoch.1"), Clocks());
+    // Observing the projection establishes the alarm resource registry.
+    static_cast<void>(core->AlarmSnapshot());
+  }
+
+  CanonicalValue Observe(const CanonicalValue &snapshot,
+                         const std::string &epoch = "cclc.epoch.1") {
+    return core->ObserveComponentLifecycleConditions(
+        epoch, CanonicalValue(CanonicalValue::Array{snapshot}), {});
+  }
+};
+
+const CanonicalValue *AlarmFor(const CanonicalValue &snapshot,
+                               const std::string_view definition) {
+  const CanonicalValue *found = nullptr;
+  for (const auto &alarm : Array(snapshot, "alarms")) {
+    if (Text(alarm, "definition_id") == definition) {
+      if (found != nullptr) {
+        throw std::runtime_error("expected at most one alarm per definition");
+      }
+      found = &alarm;
+    }
+  }
+  return found;
+}
+
+constexpr std::string_view kComponentLifecycleFault =
+    "manyforge.runtime.component_lifecycle_fault";
+
+TEST(HeadlessApiCore,
+     SafetyStopHoldsComponentLifecycleFaultAcrossCommunicationLossUntilFreshClear) {
+  ComponentConditionFixture fixture;
+  const auto scope_value = fixture.core->ComponentLifecycleConditionScope();
+  const auto &scope = Array(scope_value, "component_ids");
+  ASSERT_EQ(scope.size(), 1U);
+  EXPECT_EQ(std::get<std::string>(scope.front().storage()), fixture.component);
+
+  EXPECT_EQ(Text(fixture.Observe(ComponentConditionSnapshot(
+                     fixture.component, fixture.resource, "active",
+                     "satisfied", "none")),
+                 "status"),
+            "observed");
+  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
+
+  // An emergency stop after the component reached its target.
+  const auto stopped = ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "active", "satisfied",
+      "emergency_stop");
+  static_cast<void>(fixture.Observe(stopped));
+  auto snapshot = fixture.core->AlarmSnapshot();
+  ASSERT_EQ(Array(snapshot, "alarms").size(), 1U);
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_kind"), "component");
+  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), fixture.component);
+  EXPECT_EQ(Array(Member(*alarm, "subject"), "resource_ids"),
+            (CanonicalValue::Array{CanonicalValue(fixture.resource)}));
+  EXPECT_EQ(Text(Member(*alarm, "details"), "blocking_cause_class"),
+            "emergency_stop");
+  const auto activation = Text(*alarm, "activation_id");
+  const auto revision = Unsigned(*alarm, "record_revision");
+
+  // An unchanged observation submits nothing.
+  static_cast<void>(fixture.Observe(stopped));
+  snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_EQ(Unsigned(*AlarmFor(snapshot, kComponentLifecycleFault),
+                     "record_revision"),
+            revision);
+
+  // CCLC unreachable, then the component unread: the condition stays.
+  EXPECT_EQ(Text(fixture.core->MarkComponentLifecycleSourceUnknown(), "status"),
+            "marked_unknown");
+  snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
+                 "lifecycle_state"),
+            "active_unacknowledged");
+  static_cast<void>(fixture.core->ObserveComponentLifecycleConditions(
+      "cclc.epoch.1", CanonicalValue(CanonicalValue::Array{}),
+      {fixture.component}));
+  snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
+                 "lifecycle_state"),
+            "active_unacknowledged");
+  // CCLC retains the class across controller communication loss as well;
+  // availability alone is never a lifecycle fault.
+  static_cast<void>(fixture.Observe(stopped));
+  EXPECT_EQ(Text(*AlarmFor(fixture.core->AlarmSnapshot(),
+                           kComponentLifecycleFault),
+                 "activation_id"),
+            activation);
+
+  // Fresh status clears the cause: the alarm returns to normal and still
+  // awaits acknowledgement (automatic recovery acknowledges nothing).
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "active", "satisfied", "none")));
+  snapshot = fixture.core->AlarmSnapshot();
+  ASSERT_EQ(Array(snapshot, "alarms").size(), 1U);
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
+}
+
+TEST(HeadlessApiCore,
+     FaultAndUnknownCausesAreLifecycleFaultsButConfigurationIsNot) {
+  ComponentConditionFixture fixture;
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "declared", "blocked",
+      "configuration")));
+  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "disabled", "satisfied", "fault",
+      "disabled")));
+  auto snapshot = fixture.core->AlarmSnapshot();
+  ASSERT_NE(AlarmFor(snapshot, kComponentLifecycleFault), nullptr);
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "declared", "blocked", "unknown")));
+  snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
+                 "lifecycle_state"),
+            "active_unacknowledged");
+  EXPECT_EQ(Text(Member(*AlarmFor(snapshot, kComponentLifecycleFault),
+                        "details"),
+                 "blocking_cause_class"),
+            "unknown");
+}
+
+/// `snapshot` with an open incident in its lifecycle progress.
+CanonicalValue WithIncident(const CanonicalValue &snapshot,
+                            const std::string &incident_id,
+                            const std::string &cause) {
+  auto row = snapshot.as_object();
+  for (auto &[name, value] : row) {
+    if (name != "lifecycle_progress") {
+      continue;
+    }
+    auto progress = value.as_object();
+    progress.emplace_back(
+        "incident",
+        CanonicalValue(CanonicalValue::Object{
+            {"acknowledged", CanonicalValue(false)},
+            {"cause_class", CanonicalValue(cause)},
+            {"detected_at_ns", CanonicalValue(1000.0)},
+            {"incident_id", CanonicalValue(incident_id)},
+            {"summary", CanonicalValue("Controller lost")},
+            {"vendor_codes",
+             CanonicalValue(CanonicalValue::Array{CanonicalValue("C2")})},
+        }));
+    value = CanonicalValue(std::move(progress));
+  }
+  return CanonicalValue(std::move(row));
+}
+
+TEST(HeadlessApiCore,
+     OpenIncidentHoldsComponentLifecycleFaultUntilItsAcknowledgementClearsIt) {
+  ComponentConditionFixture fixture;
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "active", "satisfied", "none")));
+  const auto lost = WithIncident(
+      ComponentConditionSnapshot(fixture.component, fixture.resource, "active",
+                                 "blocked", "provider_lost"),
+      "incident.1", "provider_lost");
+  static_cast<void>(fixture.Observe(lost));
+  auto snapshot = fixture.core->AlarmSnapshot();
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_id"), "incident.1");
+  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_cause_class"),
+            "provider_lost");
+  EXPECT_EQ(Array(Member(*alarm, "details"), "incident_vendor_codes"),
+            (CanonicalValue::Array{CanonicalValue("C2")}));
+  const auto activation = Text(*alarm, "activation_id");
+
+  // Readiness returning does not end the incident: only its acknowledgement
+  // (the incident gone from a fresh snapshot) does.
+  static_cast<void>(fixture.Observe(WithIncident(
+      ComponentConditionSnapshot(fixture.component, fixture.resource, "active",
+                                 "blocked", "none"),
+      "incident.1", "provider_lost")));
+  snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
+                 "lifecycle_state"),
+            "active_unacknowledged");
+
+  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+      fixture.component, fixture.resource, "active", "satisfied", "none")));
+  snapshot = fixture.core->AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  // The alarm itself still follows the catalog's acknowledgement rule.
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
+  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_id"), "incident.1");
+}
+
+TEST(HeadlessApiCore, EveryIncidentCauseClassIsAComponentLifecycleFault) {
+  for (const std::string cause : {"collision", "external_control",
+                                  "provider_lost", "emergency_stop",
+                                  "protective_stop", "safeguard_stop"}) {
+    ComponentConditionFixture fixture;
+    static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+        fixture.component, fixture.resource, "active", "blocked", cause)));
+    EXPECT_NE(AlarmFor(fixture.core->AlarmSnapshot(), kComponentLifecycleFault),
+              nullptr)
+        << cause;
+  }
+  ComponentConditionFixture fixture;
+  EXPECT_THROW(static_cast<void>(fixture.Observe(WithIncident(
+                   ComponentConditionSnapshot(fixture.component,
+                                              fixture.resource, "active",
+                                              "blocked", "availability"),
+                   "incident.1", "availability"))),
+               OperatorAlarmError);
+  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
+}
+
+TEST(HeadlessApiCore, ComponentLifecycleObservationMustNameTheCurrentScope) {
+  ComponentConditionFixture fixture;
+  EXPECT_EQ(Text(fixture.core->MarkComponentLifecycleSourceUnknown(), "status"),
+            "not_registered");
+  EXPECT_EQ(Text(fixture.core->ObserveComponentLifecycleConditions(
+                     "cclc.epoch.1", CanonicalValue(CanonicalValue::Array{}),
+                     {}),
+                 "status"),
+            "scope_changed");
+  EXPECT_EQ(Text(fixture.Observe(ComponentConditionSnapshot(
+                     "component.elsewhere", fixture.resource, "active",
+                     "satisfied", "emergency_stop")),
+                 "status"),
+            "scope_changed");
+  const auto snapshot = fixture.core->AlarmSnapshot();
+  EXPECT_TRUE(Array(snapshot, "alarms").empty());
+  EXPECT_THROW(
+      static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
+          fixture.component, fixture.resource, "active", "satisfied",
+          "intervention"))),
+      OperatorAlarmError);
+}
+
+TEST(HeadlessApiCore,
+     ComponentLifecycleSourceReconcilesAfterAnApplyRemovesAComponent) {
+  // Regression: an Apply that retires a component replaces the CCLC owner,
+  // which is briefly unreachable. The first observation of the new scope
+  // under the new owner epoch must reconcile the source (the owner admits
+  // motion again) and return the removed component's raised condition.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto component_ids = [](const deployment::RetainedBundle &bundle) {
+    std::set<std::string> ids;
+    for (const auto &component :
+         bundle.value().cell_graph.controllable_components) {
+      ids.insert(component.controllable_component_id.value());
+    }
+    return ids;
+  };
+  const auto single_components = component_ids(*configurations.single);
+  const auto dual_components = component_ids(*configurations.dual);
+  std::vector<std::string> removed_components;
+  std::set_difference(dual_components.begin(), dual_components.end(),
+                      single_components.begin(), single_components.end(),
+                      std::back_inserter(removed_components));
+  ASSERT_EQ(single_components.size(), 1U);
+  ASSERT_EQ(removed_components.size(), 1U);
+  const auto kept = *single_components.begin();
+  const auto removed = removed_components.front();
+  const auto single_resources = ResourceIds(*configurations.single);
+  std::vector<std::string> removed_resources;
+  for (const auto &resource : ResourceIds(*configurations.dual)) {
+    if (std::find(single_resources.begin(), single_resources.end(),
+                  resource) == single_resources.end()) {
+      removed_resources.push_back(resource);
+    }
+  }
+  ASSERT_FALSE(removed_resources.empty());
+
+  PublishActiveConfiguration(directory, *configurations.dual, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.AlarmSnapshot());
+  const auto unknown_runtime_sources = [&]() {
+    const auto snapshot = core.AlarmSnapshot();
+    for (const auto &domain : Array(snapshot, "domains")) {
+      if (Text(domain, "domain") == "runtime_health") {
+        return Unsigned(domain, "unknown_source_count");
+      }
+    }
+    throw std::runtime_error("runtime_health domain is missing");
+  };
+  const auto baseline = unknown_runtime_sources();
+
+  EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
+                     "cclc.epoch.1",
+                     CanonicalValue(CanonicalValue::Array{
+                         ComponentConditionSnapshot(kept, single_resources.front(),
+                                                    "active", "satisfied", "none"),
+                         ComponentConditionSnapshot(
+                             removed, removed_resources.front(), "active",
+                             "satisfied", "emergency_stop"),
+                     }),
+                     {}),
+                 "status"),
+            "observed");
+  ASSERT_NE(AlarmFor(core.AlarmSnapshot(), kComponentLifecycleFault), nullptr);
+  EXPECT_EQ(unknown_runtime_sources(), baseline);
+
+  // Apply: the CCLC owner is replaced and briefly unreachable.
+  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
+            "marked_unknown");
+  EXPECT_EQ(unknown_runtime_sources(), baseline + 1U);
+  PublishActiveConfiguration(directory, *configurations.single, 2U);
+  static_cast<void>(core.AlarmSnapshot());
+  EXPECT_EQ(Array(core.ComponentLifecycleConditionScope(), "component_ids"),
+            (CanonicalValue::Array{CanonicalValue(kept)}));
+
+  EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
+                     "cclc.epoch.2",
+                     CanonicalValue(CanonicalValue::Array{
+                         ComponentConditionSnapshot(kept, single_resources.front(),
+                                                    "active", "satisfied", "none"),
+                     }),
+                     {}),
+                 "status"),
+            "observed");
+  EXPECT_EQ(unknown_runtime_sources(), baseline);
+  const auto snapshot = core.AlarmSnapshot();
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), removed);
+  EXPECT_FALSE(std::get<bool>(Member(*alarm, "active").storage()));
+}
+
+TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {
+  TemporaryDirectory directory;
+  const auto event = [](const std::string &kind, const double sequence) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"event_kind", CanonicalValue(kind)},
+        {"event_sequence", CanonicalValue(sequence)},
+        {"incident_id", CanonicalValue("incident.component.arm.5000")},
+        {"occurred_at_ns", CanonicalValue(5000.0)},
+        {"payload",
+         CanonicalValue(CanonicalValue::Object{
+             {"cause_class", CanonicalValue("emergency_stop")},
+             {"event_kind", CanonicalValue(kind)},
+             {"incident_id", CanonicalValue("incident.component.arm.5000")},
+             {"stop", CanonicalValue(CanonicalValue::Object{
+                          {"stop_generation", CanonicalValue(1.0)},
+                          {"stop_id", CanonicalValue("stop.1")}})},
+         })},
+    });
+  };
+  HistorianQuery query;
+  query.components.insert("manyforge.cclc");
+  const auto durable = [&query](HeadlessApiCore &core, const std::size_t count) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    CanonicalValue page;
+    do {
+      page = core.HistoryPage(query);
+      if (Array(page, "events").size() == count) break;
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return page;
+  };
+  {
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+    const auto opened =
+        core.RecordCCLCIncidentEvent("cclc.epoch.1", event("component_incident", 1.0));
+    EXPECT_EQ(Text(opened, "status"), "recorded");
+    EXPECT_EQ(Text(opened, "schema_version"),
+              "manyforge.cclc_incident_history_record.v1");
+    // The same event again (a replayed cursor) is not enqueued twice.
+    EXPECT_EQ(Text(core.RecordCCLCIncidentEvent("cclc.epoch.1",
+                                                event("component_incident", 1.0)),
+                   "status"),
+              "duplicate");
+    EXPECT_EQ(Text(core.RecordCCLCIncidentEvent(
+                       "cclc.epoch.1", event("component_incident_acknowledged", 2.0)),
+                   "status"),
+              "recorded");
+    const auto page = durable(core, 2U);
+    ASSERT_EQ(Array(page, "events").size(), 2U);
+    const auto &newest = Member(Array(page, "events").front(), "event");
+    EXPECT_EQ(Text(newest, "event_type"), "component_incident_acknowledged");
+    EXPECT_EQ(Text(newest, "severity"), "INFO");
+    const auto &oldest = Member(Array(page, "events").back(), "event");
+    EXPECT_EQ(Text(oldest, "event_type"), "component_incident");
+    EXPECT_EQ(Text(oldest, "severity"), "ERROR");
+    const auto &payload = Member(oldest, "payload");
+    EXPECT_EQ(Text(payload, "schema_version"),
+              "manyforge.cclc_incident_history_event.v1");
+    EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
+    EXPECT_EQ(Text(payload, "cclc_owner_epoch"), "cclc.epoch.1");
+    EXPECT_EQ(Text(payload, "incident_id"), "incident.component.arm.5000");
+    EXPECT_EQ(content_identity::canonical_json(Member(payload, "cclc_occurred_at_ns")),
+              "5000");
+    EXPECT_EQ(Text(Member(payload, "details"), "cause_class"), "emergency_stop");
+
+    // Malformed or mismatched events are refused before any record.
+    auto mismatched = event("component_incident", 3.0).as_object();
+    for (auto &[key, value] : mismatched) {
+      if (key == "incident_id") value = CanonicalValue("incident.other");
+    }
+    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
+                     "cclc.epoch.1", CanonicalValue(mismatched))),
+                 OperatorAlarmError);
+    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
+                     "cclc.epoch.1", event("component_incident_reopened", 3.0))),
+                 OperatorAlarmError);
+    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
+                     "cclc.epoch.1", event("component_incident", 0.0))),
+                 OperatorAlarmError);
+    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
+                     "", event("component_incident", 3.0))),
+                 OperatorAlarmError);
+    core.Shutdown();
+  }
+  // A restarted reader replays from a lost cursor: the durable history
+  // answers, so nothing is recorded twice.
+  HeadlessApiCore replacement(Config(directory, "api.epoch.2"), Clocks());
+  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent(
+                     "cclc.epoch.1", event("component_incident", 1.0)),
+                 "status"),
+            "duplicate");
+  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent(
+                     "cclc.epoch.1", event("component_incident_acknowledged", 2.0)),
+                 "status"),
+            "duplicate");
+  EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
 }
 
 } // namespace

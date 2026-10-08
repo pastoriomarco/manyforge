@@ -296,6 +296,36 @@ public:
           current_stop_fault = std::nullopt);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
+  /// Controllable components of the active configuration whose CCLC
+  /// snapshots the component-lifecycle alarm conditions are derived from.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ComponentLifecycleConditionScope();
+  /// Derive the safety-stop alarm condition (spec 530 §3.3, 2026-10-08)
+  /// from CCLC component snapshots: an open component incident or an
+  /// intervention-requiring blocking cause holds `component_lifecycle_fault`
+  /// (incident id in the details) until the acknowledged incident is gone
+  /// from a fresh snapshot. `snapshots`
+  /// and `unavailable_component_ids` together must name exactly the current
+  /// scope; an unavailable component keeps its conditions unchanged. Only a
+  /// changed condition is submitted.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveComponentLifecycleConditions(
+      std::string cclc_owner_epoch,
+      manyforge::content_identity::CanonicalValue snapshots,
+      std::vector<std::string> unavailable_component_ids);
+  /// CCLC is unreachable: its conditions keep their state at unknown quality.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  MarkComponentLifecycleSourceUnknown();
+  /// Record one CCLC incident history event (addendum 2 contract item 5,
+  /// `component_incident` / `component_incident_acknowledged`) as historian
+  /// component `manyforge.cclc`, event type = event kind, with the CCLC
+  /// fields as details. Idempotent per (incident id, event kind): an event
+  /// this process already enqueued or the durable history already holds is
+  /// `duplicate`, so a lost reader cursor never records it twice. A full
+  /// historian queue answers `rejected` (nothing recorded; retry later).
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
+                          manyforge::content_identity::CanonicalValue event);
   void Shutdown();
 
 private:
@@ -394,6 +424,21 @@ private:
   /// after every change of the retained refusals; unchanged state is not
   /// resubmitted.
   void SynchronizeAlarmScopeConditionLocked();
+  /// Last submitted state of one component-lifecycle condition point.
+  struct ComponentConditionState final {
+    AlarmSubject subject;
+    bool active{};
+    std::string fingerprint;
+  };
+  /// Submit `active` for one (definition, component) point when it differs
+  /// from the last submission. A never-raised point is not cleared, and a
+  /// point whose subject changed while active is first cleared under its
+  /// old subject.
+  void SynchronizeComponentConditionLocked(
+      AdapterCursor &cursor, const std::string &definition_id,
+      const std::string &component_id, const AlarmSubject &subject,
+      bool active, const manyforge::content_identity::CanonicalValue &details,
+      const manyforge::content_identity::CanonicalValue &correlations);
   void RegisterAdapterEpochLocked(AdapterCursor &cursor,
                                   std::string source_epoch);
   [[nodiscard]] AlarmMutation SubmitAdapterUpdateLocked(
@@ -444,6 +489,18 @@ private:
   AdapterCursor scene_adapter_;
   AdapterCursor operation_adapter_;
   AdapterCursor alarm_scope_adapter_;
+  /// CCLC lifecycle condition (`component_lifecycle_fault`). It follows the
+  /// CCLC owner epoch and is registered only after the first complete
+  /// observation.
+  AdapterCursor component_lifecycle_adapter_;
+  /// Controllable components of the active configuration, sorted.
+  std::vector<std::string> alarm_component_ids_;
+  /// (definition id, component id) -> last submitted state.
+  std::map<std::pair<std::string, std::string>, ComponentConditionState>
+      component_conditions_;
+  /// (incident id, event kind) of CCLC incident events enqueued by this
+  /// process; bounded, the durable history answers beyond it.
+  std::set<std::pair<std::string, std::string>> recorded_cclc_incident_events_;
   std::uint64_t operation_native_sequence_{};
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;

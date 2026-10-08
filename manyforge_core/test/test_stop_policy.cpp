@@ -27,12 +27,6 @@ class StopPolicyTest : public ::testing::Test {
     (void)sm.try_transition(ExecutionState::kValidating);
     (void)sm.try_transition(ExecutionState::kExecuting);
   }
-
-  void go_to_paused() {
-    go_to_executing();
-    policy.request_pause();
-    scheduler.advance_to(clock.now());  // fires Stopping→Paused
-  }
 };
 
 // --- Soft stop ---
@@ -51,15 +45,6 @@ TEST_F(StopPolicyTest, SoftStopFromExecuting_DecelerationViaScheduler) {
   // Deceleration complete.
   scheduler.advance_to(1500);
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-  EXPECT_EQ(stop_callback_count, 1);
-}
-
-TEST_F(StopPolicyTest, SoftStopFromPaused_Immediate) {
-  go_to_paused();
-  EXPECT_TRUE(policy.request_soft_stop(500).ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-  EXPECT_TRUE(policy.stop_requested());
-  EXPECT_EQ(invalidate_count, 1);
   EXPECT_EQ(stop_callback_count, 1);
 }
 
@@ -148,16 +133,6 @@ TEST_F(StopPolicyTest, HardStopFromIdle_Fails) {
   EXPECT_FALSE(policy.request_hard_stop().ok());
 }
 
-// --- Pause ---
-TEST_F(StopPolicyTest, PauseFromExecuting_DecelerationToPaused) {
-  go_to_executing();
-  EXPECT_TRUE(policy.request_pause().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopping);
-
-  scheduler.advance_to(clock.now());
-  EXPECT_EQ(sm.status().state, ExecutionState::kPaused);
-}
-
 TEST_F(StopPolicyTest,
        HardStopCallbackFailureFromExecutingEntersInterventionRequired) {
   go_to_executing();
@@ -175,27 +150,6 @@ TEST_F(StopPolicyTest,
   EXPECT_TRUE(policy.stop_requested());
   EXPECT_EQ(invalidate_count, 1);
   EXPECT_EQ(stop_callback_count, 1);
-}
-
-TEST_F(StopPolicyTest, PauseFromNonExecuting_Fails) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_FALSE(policy.request_pause().ok());
-}
-
-TEST_F(StopPolicyTest, PauseFromIdle_Fails) {
-  EXPECT_FALSE(policy.request_pause().ok());
-}
-
-// --- Resume ---
-TEST_F(StopPolicyTest, ResumeFromPaused_ToValidating) {
-  go_to_paused();
-  EXPECT_TRUE(policy.request_resume().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kValidating);
-}
-
-TEST_F(StopPolicyTest, ResumeFromNonPaused_Fails) {
-  go_to_executing();
-  EXPECT_FALSE(policy.request_resume().ok());
 }
 
 // --- Reset ---

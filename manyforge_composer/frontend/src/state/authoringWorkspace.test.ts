@@ -224,7 +224,7 @@ describe('authoringWorkspace', () => {
     const state = headlessState(5, {}, {
       authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
     });
-    for (const operationState of ['executing', 'paused', 'stopping']) {
+    for (const operationState of ['executing', 'stopping']) {
       state.executionControlStatus = {
         manualOperations: [{ resident: true, state: operationState }],
       } as never;

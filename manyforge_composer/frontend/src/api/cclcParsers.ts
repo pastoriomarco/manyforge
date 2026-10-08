@@ -1,13 +1,23 @@
 import { parseNanoseconds } from '../types/nanoseconds';
 import type {
   CCLCAdmission,
+  CCLCBlockingCauseClass,
   CCLCComponentExpectation,
   CCLCComponentSnapshot,
   CCLCOwnerIdentity,
   CCLCDesiredBindingRoute,
+  CCLCComponentIncident,
   CCLCDesiredConfiguration,
   CCLCExpectedActiveConfiguration,
+  CCLCIncidentCauseClass,
+  CCLCIncidentRecovery,
+  CCLCLifecycleIntent,
+  CCLCLifecycleProgress,
+  CCLCLifecycleProgressPhase,
   CCLCLifecycleState,
+  CCLCLifecycleTarget,
+  CCLCLifecycleTargetOrigin,
+  CCLCLifecycleTargetState,
   CCLCRouteTemplate,
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
@@ -43,6 +53,30 @@ const LIFECYCLE_ACTION_STATES = new Set([
   'reserved', 'not_started', 'executing', 'verifying', 'reconciling',
   'succeeded', 'failed', 'outcome_unknown',
 ]);
+const TARGET_STATES = new Set<CCLCLifecycleTargetState>(['active', 'prepared', 'disabled']);
+const TARGET_ORIGINS = new Set<CCLCLifecycleTargetOrigin>(['startup', 'operator', 'program']);
+const PROGRESS_PHASES = new Set<CCLCLifecycleProgressPhase>([
+  'satisfied', 'waiting_for_prerequisites', 'transition_in_progress',
+  'outcome_uncertain', 'blocked', 'cancelled',
+]);
+const LIFECYCLE_INTENTS = new Set<CCLCLifecycleIntent>([
+  'prepare', 'enable', 'disable', 'recover',
+]);
+const BLOCKING_CAUSE_CLASSES = new Set<CCLCBlockingCauseClass>([
+  'none', 'availability', 'emergency_stop', 'protective_stop', 'safeguard_stop',
+  'fault', 'configuration', 'unknown', 'collision', 'external_control',
+  'provider_lost',
+]);
+const INCIDENT_CAUSE_CLASSES = new Set<CCLCIncidentCauseClass>([
+  'emergency_stop', 'protective_stop', 'safeguard_stop', 'fault',
+  'configuration', 'unknown', 'collision', 'external_control', 'provider_lost',
+]);
+// Owner-issued diagnostic text; wider than identity text but still bounded.
+const MAX_BLOCKING_REASON_BYTES = 1024;
+const MAX_INCIDENT_ID_BYTES = 128;
+const MAX_INCIDENT_SUMMARY_BYTES = 1024;
+const MAX_VENDOR_CODES = 16;
+const MAX_VENDOR_CODE_BYTES = 64;
 
 function fail(path: string, expected: string): never {
   throw new Error(`${path} must be ${expected}`);
@@ -303,12 +337,119 @@ function templateAt(value: unknown, path: string): CCLCRouteTemplate {
   };
 }
 
+function closedTextAt<T extends string>(
+  value: unknown,
+  allowed: ReadonlySet<T>,
+  path: string,
+  expected: string,
+): T {
+  const spelling = textAt(value, path);
+  if (!allowed.has(spelling as T)) fail(path, expected);
+  return spelling as T;
+}
+
+function lifecycleTargetAt(value: unknown, path: string): CCLCLifecycleTarget | null {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exact(row, ['origin', 'requested_state', 'target_generation'], path);
+  return {
+    requestedState: closedTextAt(
+      row.requested_state, TARGET_STATES, `${path}.requested_state`,
+      'active, prepared or disabled',
+    ),
+    origin: closedTextAt(
+      row.origin, TARGET_ORIGINS, `${path}.origin`, 'startup, operator or program',
+    ),
+    targetGeneration: integerAt(row.target_generation, `${path}.target_generation`),
+  };
+}
+
+function boundedNfcText(value: unknown, maximumBytes: number): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.normalize('NFC') === value
+    && new TextEncoder().encode(value).length <= maximumBytes;
+}
+
+function incidentAt(value: unknown, path: string): CCLCComponentIncident | null {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exact(row, [
+    'acknowledged', 'cause_class', 'detected_at_ns', 'incident_id', 'summary',
+    'vendor_codes',
+  ], path);
+  if (!boundedNfcText(row.incident_id, MAX_INCIDENT_ID_BYTES)) {
+    fail(`${path}.incident_id`, 'bounded non-empty NFC text');
+  }
+  if (!boundedNfcText(row.summary, MAX_INCIDENT_SUMMARY_BYTES)) {
+    fail(`${path}.summary`, 'bounded non-empty NFC text');
+  }
+  const codes = row.vendor_codes;
+  if (
+    !Array.isArray(codes)
+    || codes.length > MAX_VENDOR_CODES
+    || !codes.every((code) => boundedNfcText(code, MAX_VENDOR_CODE_BYTES))
+  ) {
+    fail(`${path}.vendor_codes`, `at most ${MAX_VENDOR_CODES} bounded vendor codes`);
+  }
+  if (row.acknowledged !== false) fail(`${path}.acknowledged`, 'false');
+  return {
+    incidentId: row.incident_id,
+    causeClass: closedTextAt(
+      row.cause_class, INCIDENT_CAUSE_CLASSES, `${path}.cause_class`,
+      'an intervention cause class',
+    ),
+    vendorCodes: [...codes] as string[],
+    detectedAtNs: parseNanoseconds(row.detected_at_ns, `${path}.detected_at_ns`),
+    summary: row.summary,
+    acknowledged: false,
+  };
+}
+
+function lifecycleProgressAt(
+  value: unknown,
+  path: string,
+): CCLCLifecycleProgress | null {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exact(row, [
+    'blocking_cause_class', 'blocking_reason', 'delayed', 'incident',
+    'next_intent', 'phase', 'waiting_since_ns',
+  ], path);
+  const reason = row.blocking_reason;
+  if (reason !== null && !boundedNfcText(reason, MAX_BLOCKING_REASON_BYTES)) {
+    fail(`${path}.blocking_reason`, 'bounded non-empty NFC text or null');
+  }
+  return {
+    phase: closedTextAt(
+      row.phase, PROGRESS_PHASES, `${path}.phase`, 'a known lifecycle progress phase',
+    ),
+    nextIntent: row.next_intent === null
+      ? null
+      : closedTextAt(
+        row.next_intent, LIFECYCLE_INTENTS, `${path}.next_intent`,
+        'a known lifecycle intent or null',
+      ),
+    blockingCauseClass: closedTextAt(
+      row.blocking_cause_class, BLOCKING_CAUSE_CLASSES,
+      `${path}.blocking_cause_class`, 'a known blocking cause class',
+    ),
+    blockingReason: reason as string | null,
+    waitingSinceNs: row.waiting_since_ns === null
+      ? null
+      : parseNanoseconds(row.waiting_since_ns, `${path}.waiting_since_ns`),
+    delayed: booleanAt(row.delayed, `${path}.delayed`),
+    incident: incidentAt(row.incident, `${path}.incident`),
+  };
+}
+
 export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapshot {
   const row = objectAt(value, 'cclcComponent');
   exact(row, [
     'active_public_pointer_digest', 'component_lifecycle_generation',
     'component_lifecycle_state', 'controllable_component_id', 'domains',
-    'graph_revision', 'provider_occurrences', 'publication_generation',
+    'graph_revision', 'lifecycle_progress', 'lifecycle_target',
+    'provider_occurrences', 'publication_generation',
     'retained_bundle_id', 'snapshot_digest',
   ], 'cclcComponent');
   const state = textAt(
@@ -457,6 +598,14 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     graphRevision: textAt(row.graph_revision, 'cclcComponent.graph_revision'),
     domains,
     providers,
+    lifecycleTarget: lifecycleTargetAt(
+      row.lifecycle_target,
+      'cclcComponent.lifecycle_target',
+    ),
+    lifecycleProgress: lifecycleProgressAt(
+      row.lifecycle_progress,
+      'cclcComponent.lifecycle_progress',
+    ),
   };
 }
 
@@ -626,7 +775,14 @@ export function parseCCLCAdmission(
   kind: 'lifecycle' | 'route',
 ): CCLCAdmission {
   const row = objectAt(value, 'cclcAdmission');
-  exact(row, ['acceptance', 'replay_status', 'status'], 'cclcAdmission');
+  const recovered = kind === 'lifecycle' && 'incident_recovery' in row;
+  exact(
+    row,
+    recovered
+      ? ['acceptance', 'incident_recovery', 'replay_status', 'status']
+      : ['acceptance', 'replay_status', 'status'],
+    'cclcAdmission',
+  );
   const replayStatus = textAt(row.replay_status, 'cclcAdmission.replay_status');
   if (!REPLAY_STATES.has(replayStatus)) {
     fail('cclcAdmission.replay_status', 'a known replay disposition');
@@ -661,11 +817,46 @@ export function parseCCLCAdmission(
   if (status !== null && status.transactionId !== transactionId) {
     fail('cclcAdmission.status', 'the accepted transaction status');
   }
+  let incidentRecovery: CCLCIncidentRecovery | null = null;
+  if (recovered) {
+    // Authorization-only: no transaction, and only an accepted or replayed
+    // request can carry it.
+    if (
+      row.acceptance !== null
+      || row.status !== null
+      || (replayStatus !== 'accepted_new' && replayStatus !== 'replayed_exact')
+    ) {
+      fail('cclcAdmission.incident_recovery', 'an authorization-only accepted Recover');
+    }
+    incidentRecovery = incidentRecoveryAt(row.incident_recovery, 'cclcAdmission.incident_recovery');
+  }
   return {
     replayStatus: replayStatus as CCLCAdmission['replayStatus'],
     requestId,
     transactionId,
     status,
+    incidentRecovery,
+  };
+}
+
+function incidentRecoveryAt(value: unknown, path: string): CCLCIncidentRecovery {
+  const row = objectAt(value, path);
+  exact(row, [
+    'acknowledged_at_ns', 'acknowledged_by', 'cause_class', 'controllable_component_id',
+    'incident_id',
+  ], path);
+  if (!boundedNfcText(row.incident_id, MAX_INCIDENT_ID_BYTES)) {
+    fail(`${path}.incident_id`, 'bounded non-empty NFC text');
+  }
+  return {
+    incidentId: row.incident_id,
+    componentId: textAt(row.controllable_component_id, `${path}.controllable_component_id`),
+    causeClass: closedTextAt(
+      row.cause_class, INCIDENT_CAUSE_CLASSES, `${path}.cause_class`,
+      'an intervention cause class',
+    ),
+    acknowledgedBy: textAt(row.acknowledged_by, `${path}.acknowledged_by`),
+    acknowledgedAtNs: parseNanoseconds(row.acknowledged_at_ns, `${path}.acknowledged_at_ns`),
   };
 }
 

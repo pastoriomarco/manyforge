@@ -87,8 +87,10 @@ class ComponentLifecycleCoordinator final {
       const RouteSelectionIntentDTO& intent);
   /// Owner-local read: qualify the current source and report observed controller
   /// truth, including mismatch. Requires no request admission, claim or fence;
-  /// never publishes readiness, changes controllers or clears a fault. The
-  /// caller runs this bounded adapter read off the scheduler/control lane.
+  /// never publishes readiness, changes controllers or clears a fault. It uses
+  /// the observation-only snapshot (no component lifecycle expectation), so a
+  /// Declared component is observable while route selection stays refused.
+  /// The caller runs this bounded adapter read off the scheduler/control lane.
   [[nodiscard]] Result<
       std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>>
   ObserveRouteConfiguration(

@@ -85,17 +85,11 @@ public:
   Dispatch(const core::PreparedOperationParticipantDTO &participant,
            const core::ControllerGoalId &controller_goal_id,
            core::ControllerGoalGeneration controller_goal_generation) override;
-  core::ExecutionHandle DispatchResume(
-      const core::PreparedOperationParticipantDTO &participant,
-      const core::ControllerGoalId &controller_goal_id,
-      core::ControllerGoalGeneration controller_goal_generation) override;
 
   core::ExecutionHandle
   execute_trajectory(const core::TrajectoryDTO &trajectory) override;
   core::Result<void> sync_observed_state_before_planning() override;
   core::StopResultDTO stop() override;
-  core::PauseResultDTO pause() override;
-  core::ExecutionHandle resume(const core::TrajectoryDTO &trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
   std::optional<double>
@@ -171,7 +165,6 @@ private:
   struct ExecutionStateData {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
-    std::atomic<bool> pause_requested{false};
     std::atomic<bool> natural_completion_stop_requested{false};
     std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
     std::uint64_t active_trajectory_generation{};
@@ -255,8 +248,7 @@ private:
   core::ExecutionHandle
   dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
                     const core::ControllerGoalId &controller_goal_id,
-                    core::ControllerGoalGeneration controller_goal_generation,
-                    bool resume_dispatch);
+                    core::ControllerGoalGeneration controller_goal_generation);
 
   struct PendingTerminalSceneProjection {
     std::vector<double> joint_positions;
@@ -285,7 +277,7 @@ private:
   mutable std::mutex state_mutex_;
   std::condition_variable_any stop_snapshot_cv_;
   // On-demand observations of the native scaler itself, independent of the
-  // motion stream (which intentionally has no ticks while paused).
+  // motion stream (which has no ticks while idle).
   mutable std::uint64_t runtime_scale_observation_sequence_{};
   std::condition_variable execution_cv_;
   std::jthread worker_thread_;

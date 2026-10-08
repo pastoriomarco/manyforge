@@ -648,6 +648,12 @@ export const api = {
         ) {
           throw new Error('lifecycle acceptance does not match its request');
         }
+        if (
+          result.incidentRecovery !== null
+          && result.incidentRecovery.componentId !== request.controllable_component_id
+        ) {
+          throw new Error('incident recovery does not match its request');
+        }
         return result;
       },
       signal,

@@ -318,11 +318,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::uint64_t execution_id) const override;
   Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
                                       const ContentDigest& prepared_contract_digest) override;
-  Result<void> PrepareResumeMotion(std::uint64_t execution_id,
-                                   ResolvedPreparedMotionResumeRequestDTO request) override;
-  Result<void> DispatchPreparedResumeMotion(std::uint64_t execution_id,
-                                            const ContentDigest& prepared_contract_digest) override;
-  Result<void> CancelPreparedResumeMotion(std::uint64_t execution_id) override;
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
   Result<std::uint64_t> PrepareCapabilityCommand(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override;
@@ -361,12 +356,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Accepted stop invalidates older lifecycle/recovery commands by bumping
   /// `control_command_epoch()`. Stop is never rejectable by epoch staleness.
   StopResultDTO stop();
-
-  /// Non-blocking pause. Only valid from Executing.
-  PauseResultDTO pause() override;
-
-  /// Non-blocking resume. Only valid from Paused.
-  ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Non-blocking reset. Valid from any state except Idle.
   ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
@@ -599,9 +588,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                         const CollisionWorldLeaseInventory& projection_inventory,
                                         std::uint32_t planning_attempt_index = 0,
                                         const RobotStateDTO* start_state_override = nullptr);
-  Result<PlanningSuccess> plan_resume_trajectory_with_evidence(
-      ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-      const TrajectoryDTO& interrupted_trajectory, std::optional<double> original_cursor_s);
   Result<PlanningSuccess> plan_motion_continuation(
       ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       const detail::MotionResumeIntent& continuation);
@@ -1077,7 +1063,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
   // Serializes low-rate lifecycle authority transitions across execute, stop,
-  // pause, resume, reset, and acknowledge.
+  // reset, and acknowledge.
   std::mutex lifecycle_mutex_;
   /// A native preview holds lifecycle_mutex_ for exclusive planner access
   /// while it plans. Lifecycle commands that must not wait for that planning

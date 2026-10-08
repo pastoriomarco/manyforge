@@ -43,6 +43,8 @@ add_library(manyforge_core
   src/component_lifecycle_admission.cpp
   src/component_lifecycle_coordinator.cpp
   src/cclc_open_request.cpp
+  src/cclc_lifecycle_target_driver.cpp
+  src/component_incident.cpp
   src/cell_admission.cpp
   src/kernel_cell_admission_owner.cpp
   src/manager_liveness.cpp
@@ -118,6 +120,7 @@ add_library(manyforge_core
   src/stop_intent.cpp
   src/stop_scope_resolver.cpp
   src/stop_fault_recovery.cpp
+  src/stop_fault_latch_origin.cpp
   src/orphan_resource_reconciliation.cpp
   src/stop_surveillance.cpp
   src/stop_terminal_reducer.cpp
@@ -607,6 +610,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_sqlite_cclc_journal PRIVATE
       manyforge_core_sqlite_cclc_journal GTest::gtest_main)
     gtest_discover_tests(test_sqlite_cclc_journal
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_cclc_lifecycle_target_driver
+      test/test_cclc_lifecycle_target_driver.cpp)
+    target_link_libraries(test_cclc_lifecycle_target_driver PRIVATE
+      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+    gtest_discover_tests(test_cclc_lifecycle_target_driver
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     add_executable(test_component_lifecycle_coordinator

@@ -34,8 +34,7 @@ _SERVER_SEQUENCE = re.compile(r'("server_sequence"\s*:\s*")([1-9][0-9]*)(")')
 # which checks the shared Draft under the authoring serialization lock.
 _HTTP_ADMITTED_COMMANDS = frozenset({
     "program_run", "program_motion_start", "program_motion_resume",
-    "program_resume_full_stop", "operation_start", "operation_resume",
-    "execution_recovery",
+    "program_resume_full_stop", "operation_start", "execution_recovery",
 })
 _LOGGER = logging.getLogger(__name__)
 

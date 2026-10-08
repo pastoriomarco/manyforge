@@ -6,6 +6,7 @@
 #include <manyforge_core/route_selection.hpp>
 #include <manyforge_core/types/cclc.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -193,6 +194,10 @@ struct CCLCLifecycleRequestResultDTO final {
   std::optional<ComponentLifecycleStatusDTO> status;
   /// Exact known no-admission outcome; no transaction identity was minted.
   std::optional<ErrorDTO> rejection{};
+  /// An operator Recover accepted as the authorization-only recovery of an
+  /// open component incident (addendum 2): no transaction was minted and no
+  /// vendor primitive is dispatched.
+  std::optional<ComponentIncidentRecoveryDTO> incident_recovery{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };

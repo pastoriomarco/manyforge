@@ -710,6 +710,20 @@ template <typename StrongCounter>
       {"status",
        value.status.has_value() ? lifecycle_status_value(*value.status) : CanonicalValue(nullptr)}};
   if (value.rejection) fields.emplace_back("rejection", error_value(*value.rejection));
+  // Present only for the authorization-only Recover of an open incident.
+  if (value.incident_recovery) {
+    const auto& recovery = *value.incident_recovery;
+    fields.emplace_back(
+        "incident_recovery",
+        CanonicalValue(CanonicalValue::Object{
+            {"acknowledged_at_ns",
+             safe_unsigned(static_cast<std::uint64_t>(recovery.acknowledged_at_ns))},
+            {"acknowledged_by", CanonicalValue(recovery.acknowledged_by)},
+            {"cause_class", CanonicalValue(std::string(to_string(recovery.cause_class)))},
+            {"controllable_component_id",
+             CanonicalValue(recovery.controllable_component_id.value())},
+            {"incident_id", CanonicalValue(recovery.incident_id)}}));
+  }
   return CanonicalValue(std::move(fields));
 }
 
@@ -773,8 +787,64 @@ template <typename StrongCounter>
   return CanonicalValue(std::move(fields));
 }
 
+// Requested target and progress beside the snapshot (ADR-0026 §7,
+// 2026-10-08). Neither is a snapshot member, digest input or admission input.
+[[nodiscard]] CanonicalValue lifecycle_target_value(
+    const std::optional<ComponentLifecycleTargetDTO>& value) {
+  if (!value) return CanonicalValue(nullptr);
+  return CanonicalValue(CanonicalValue::Object{
+      {"origin", CanonicalValue(std::string(to_string(value->origin)))},
+      {"requested_state", CanonicalValue(std::string(to_string(value->requested_state)))},
+      {"target_generation", safe_unsigned(value->target_generation)}});
+}
+
+// Contract item 2 (addendum 2): the open incident, null when none. Times are
+// owner-clock nanoseconds and must stay I-JSON safe integers.
+[[nodiscard]] CanonicalValue lifecycle_incident_value(
+    const std::optional<ComponentLifecycleIncidentDTO>& value) {
+  if (!value) return CanonicalValue(nullptr);
+  if (!value->locally_valid() || value->acknowledged ||
+      !content_identity::is_utf8_nfc(value->summary)) {
+    throw std::invalid_argument("lifecycle incident is outside its closed shape");
+  }
+  CanonicalValue::Array codes;
+  for (const auto& code : value->vendor_codes) codes.emplace_back(code);
+  return CanonicalValue(CanonicalValue::Object{
+      {"acknowledged", CanonicalValue(false)},
+      {"cause_class", CanonicalValue(std::string(to_string(value->cause_class)))},
+      {"detected_at_ns", safe_unsigned(static_cast<std::uint64_t>(value->detected_at_ns))},
+      {"incident_id", CanonicalValue(value->incident_id)},
+      {"summary", CanonicalValue(value->summary)},
+      {"vendor_codes", CanonicalValue(std::move(codes))}});
+}
+
+[[nodiscard]] CanonicalValue lifecycle_progress_value(
+    const std::optional<ComponentLifecycleProgressDTO>& value) {
+  if (!value) return CanonicalValue(nullptr);
+  if ((value->blocking_reason && (value->blocking_reason->empty() ||
+                                  value->blocking_reason->size() > 1024U)) ||
+      (value->waiting_since_ns && *value->waiting_since_ns < 0)) {
+    throw std::invalid_argument("lifecycle progress is outside its closed shape");
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"blocking_cause_class", CanonicalValue(std::string(to_string(value->blocking_cause_class)))},
+      {"blocking_reason", value->blocking_reason ? CanonicalValue(*value->blocking_reason)
+                                                 : CanonicalValue(nullptr)},
+      {"delayed", CanonicalValue(value->delayed)},
+      {"incident", lifecycle_incident_value(value->incident)},
+      {"next_intent", value->next_intent
+                          ? CanonicalValue(std::string(to_string(*value->next_intent)))
+                          : CanonicalValue(nullptr)},
+      {"phase", CanonicalValue(std::string(to_string(value->phase)))},
+      {"waiting_since_ns",
+       value->waiting_since_ns
+           ? safe_unsigned(static_cast<std::uint64_t>(*value->waiting_since_ns))
+           : CanonicalValue(nullptr)}});
+}
+
 [[nodiscard]] CanonicalValue component_snapshot_value(
-    const ComponentLifecycleCurrentSnapshotDTO& value) {
+    const ComponentLifecycleCurrentSnapshotDTO& value,
+    const ComponentLifecycleTargetViewDTO& target_view) {
   CanonicalValue::Array domains;
   domains.reserve(value.domains.size());
   for (const auto& domain : value.domains) {
@@ -827,6 +897,8 @@ template <typename StrongCounter>
       {"controllable_component_id", CanonicalValue(value.controllable_component_id.value())},
       {"domains", CanonicalValue(std::move(domains))},
       {"graph_revision", CanonicalValue(publication.request.candidate_graph_revision.value())},
+      {"lifecycle_progress", lifecycle_progress_value(target_view.progress)},
+      {"lifecycle_target", lifecycle_target_value(target_view.target)},
       {"provider_occurrences", CanonicalValue(std::move(providers))},
       {"publication_generation", safe_unsigned(publication.publication_generation.value())},
       {"retained_bundle_id",
@@ -911,24 +983,65 @@ bool CCLCRouteSelectionTemplateSetDTO::locally_valid() const noexcept {
 ComponentLifecycleCoordinatorOpenRequestPort::ComponentLifecycleCoordinatorOpenRequestPort(
     ComponentLifecycleCoordinator& coordinator,
     const ICCLCCurrentComponentSnapshotSource& current_component_source,
-    const ICCLCRouteSelectionTemplateSource& route_template_source) noexcept
+    const ICCLCRouteSelectionTemplateSource& route_template_source,
+    CCLCLifecycleTargetDriver* target_driver) noexcept
     : coordinator_(coordinator),
       current_component_source_(current_component_source),
-      route_template_source_(route_template_source) {}
+      route_template_source_(route_template_source),
+      target_driver_(target_driver) {}
+
+Result<ComponentLifecycleTargetViewDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleTargetView(
+    const ControllableComponentId& component_id) const {
+  if (target_driver_ == nullptr) {
+    return Result<ComponentLifecycleTargetViewDTO>::Ok({});
+  }
+  return target_driver_->ReadTargetView(component_id);
+}
 
 RequestOwnerEpoch
 ComponentLifecycleCoordinatorOpenRequestPort::ReadRequestOwnerEpoch() const {
   return coordinator_.request_owner_epoch();
 }
 
+Result<std::vector<ComponentIncidentEventDTO>>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadIncidentEvents(const std::uint64_t after_sequence,
+                                                                 const std::size_t limit) {
+  if (target_driver_ == nullptr) return Result<std::vector<ComponentIncidentEventDTO>>::Ok({});
+  return target_driver_->LoadIncidentEvents(after_sequence, limit);
+}
+
 Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPort::SubmitLifecycle(
     const ComponentLifecycleIntentDTO& intent) {
-  return coordinator_.SubmitLifecycle(intent);
+  // The operator's Recover of an open incident is authorization-only: it is
+  // recorded without a CCLC transaction, so a latched cell does not refuse it.
+  // Every other request (and a Recover without an open incident) goes through
+  // ordinary CCLC admission unchanged.
+  if (target_driver_ != nullptr) {
+    auto recovered = target_driver_->RecoverIncident(intent);
+    if (!recovered.ok()) return Result<CCLCLifecycleRequestResultDTO>::Err(recovered.error());
+    if (recovered.value()) {
+      return Result<CCLCLifecycleRequestResultDTO>::Ok(std::move(*recovered.value()));
+    }
+  }
+  auto result = coordinator_.SubmitLifecycle(intent);
+  // An open (operator) Prepare/Enable/Disable sets the requested target only
+  // once CCLC accepted it as new; a rejection or replay records nothing.
+  if (target_driver_ != nullptr && result.ok() &&
+      result.value().replay_status == RequestReplayStatusDTO::kAcceptedNew &&
+      result.value().acceptance.has_value() && !result.value().rejection.has_value()) {
+    static_cast<void>(target_driver_->RecordOperatorRequest(intent));
+  }
+  return result;
 }
 
 Result<std::optional<CCLCLifecycleRequestResultDTO>>
 ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleRequestResult(
     const ComponentLifecycleIntentDTO& intent) {
+  if (target_driver_ != nullptr) {
+    auto recovered = target_driver_->ReadIncidentRecovery(intent);
+    if (!recovered.ok() || recovered.value()) return recovered;
+  }
   return coordinator_.ReadLifecycleRequestResult(intent);
 }
 
@@ -1013,7 +1126,43 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
       if (!verified.ok()) {
         return encode_response(error_response_value(command, verified.error()));
       }
-      return encode_response(response_value(command, component_snapshot_value(result.value())));
+      auto target_view = port.ReadLifecycleTargetView(result.value().controllable_component_id);
+      if (!target_view.ok()) {
+        return encode_response(error_response_value(command, target_view.error()));
+      }
+      return encode_response(response_value(
+          command, component_snapshot_value(result.value(), target_view.value())));
+    }
+    if (command == "incident_events") {
+      exact_object(payload, {"after_sequence", "limit"}, {}, "incident events request");
+      const auto after = content_identity::parse_nonnegative_int64(
+          member(payload, "after_sequence", "incident events request"));
+      const auto limit = content_identity::parse_nonnegative_int64(
+          member(payload, "limit", "incident events request"));
+      if (limit < 1 || limit > static_cast<std::int64_t>(kMaxComponentIncidentEventPage)) {
+        fail("incident events limit is outside its bound");
+      }
+      auto result = port.ReadIncidentEvents(static_cast<std::uint64_t>(after),
+                                            static_cast<std::size_t>(limit));
+      if (!result.ok()) {
+        return encode_response(error_response_value(command, result.error()));
+      }
+      CanonicalValue::Array events;
+      auto through = static_cast<std::uint64_t>(after);
+      for (const auto& event : result.value()) {
+        events.emplace_back(CanonicalValue::Object{
+            {"event_kind", CanonicalValue(event.event_kind)},
+            {"event_sequence", safe_unsigned(event.sequence)},
+            {"incident_id", CanonicalValue(event.incident_id)},
+            {"occurred_at_ns", safe_unsigned(static_cast<std::uint64_t>(
+                                   std::max<std::int64_t>(0, event.occurred_at_ns)))},
+            {"payload", content_identity::parse_canonical_json(event.payload_json)}});
+        through = std::max(through, event.sequence);
+      }
+      return encode_response(response_value(
+          command, CanonicalValue(CanonicalValue::Object{
+                       {"events", CanonicalValue(std::move(events))},
+                       {"through_sequence", safe_unsigned(through)}})));
     }
     if (command == "route_templates") {
       exact_object(payload, {"controllable_component_id"}, {}, "route template request");

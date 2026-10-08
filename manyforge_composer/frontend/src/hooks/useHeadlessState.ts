@@ -188,8 +188,7 @@ const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v1';
 // the shared Draft (an unapplied Draft refuses Execute/Run/Resume/Retry).
 const HTTP_ADMITTED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'program_run', 'program_motion_start', 'program_motion_resume',
-  'program_resume_full_stop', 'operation_start', 'operation_resume',
-  'execution_recovery',
+  'program_resume_full_stop', 'operation_start', 'execution_recovery',
 ]);
 const CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000;
 const CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000;
@@ -223,8 +222,6 @@ export type ExecutionControlCommandKind =
   | 'gripper_confirm'
   | 'operation_start'
   | 'operation_stop'
-  | 'operation_pause'
-  | 'operation_resume'
   | 'operation_reset'
   | 'operation_acknowledge_completed'
   | 'cell_full_stop'
@@ -235,8 +232,6 @@ export type ExecutionControlCommandKind =
 const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'operation_start',
   'operation_stop',
-  'operation_pause',
-  'operation_resume',
   'operation_reset',
   'operation_acknowledge_completed',
   'cell_full_stop',

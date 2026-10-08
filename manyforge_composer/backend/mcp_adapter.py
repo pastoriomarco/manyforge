@@ -121,8 +121,6 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "capability_preview": ("POST", "/api/execution/capability-command-previews"),
         "submit": ("POST", "/api/execution/operations"),
         "operation": ("GET", "/api/execution/operations/{operation_id}"),
-        "pause": ("POST", "/api/execution/operations/{operation_id}/pause"),
-        "resume": ("POST", "/api/execution/operations/{operation_id}/resume"),
         "reset": ("POST", "/api/execution/operations/{operation_id}/reset"),
         "stop": ("POST", "/api/execution/stops"),
         "full_stop": ("POST", "/api/execution/full-stop"),

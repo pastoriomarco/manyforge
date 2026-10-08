@@ -1,3 +1,5 @@
+import type { Nanoseconds } from './nanoseconds';
+
 export type CCLCLifecycleIntent = 'prepare' | 'enable' | 'disable' | 'recover';
 
 export interface CCLCOwnerIdentity {
@@ -44,6 +46,65 @@ export interface CCLCProviderOccurrence {
   providerRuntimeUnitId: string;
 }
 
+export type CCLCLifecycleTargetState = 'active' | 'prepared' | 'disabled';
+export type CCLCLifecycleTargetOrigin = 'startup' | 'operator' | 'program';
+
+/** The requested lifecycle target CCLC follows; distinct from the achieved state. */
+export interface CCLCLifecycleTarget {
+  requestedState: CCLCLifecycleTargetState;
+  origin: CCLCLifecycleTargetOrigin;
+  targetGeneration: number;
+}
+
+export type CCLCLifecycleProgressPhase =
+  | 'satisfied'
+  | 'waiting_for_prerequisites'
+  | 'transition_in_progress'
+  | 'outcome_uncertain'
+  | 'blocked'
+  | 'cancelled';
+
+export type CCLCBlockingCauseClass =
+  | 'none'
+  | 'availability'
+  | 'emergency_stop'
+  | 'protective_stop'
+  | 'safeguard_stop'
+  | 'fault'
+  | 'configuration'
+  | 'unknown'
+  | 'collision'
+  | 'external_control'
+  | 'provider_lost';
+
+/** Cause of an open incident; never `none` or `availability`. */
+export type CCLCIncidentCauseClass = Exclude<CCLCBlockingCauseClass, 'none' | 'availability'>;
+
+/**
+ * An unexpected change after the component reached its target. It stays
+ * open until the operator's `recover` acknowledgement is accepted; the full
+ * record stays in history.
+ */
+export interface CCLCComponentIncident {
+  incidentId: string;
+  causeClass: CCLCIncidentCauseClass;
+  vendorCodes: string[];
+  detectedAtNs: Nanoseconds;
+  summary: string;
+  acknowledged: false;
+}
+
+/** CCLC-issued progress toward the requested target; presentation only. */
+export interface CCLCLifecycleProgress {
+  phase: CCLCLifecycleProgressPhase;
+  nextIntent: CCLCLifecycleIntent | null;
+  blockingCauseClass: CCLCBlockingCauseClass;
+  blockingReason: string | null;
+  waitingSinceNs: Nanoseconds | null;
+  delayed: boolean;
+  incident: CCLCComponentIncident | null;
+}
+
 export interface CCLCComponentSnapshot {
   componentId: string;
   lifecycleGeneration: number;
@@ -52,6 +113,8 @@ export interface CCLCComponentSnapshot {
   graphRevision: string;
   domains: CCLCComponentDomain[];
   providers: CCLCProviderOccurrence[];
+  lifecycleTarget: CCLCLifecycleTarget | null;
+  lifecycleProgress: CCLCLifecycleProgress | null;
 }
 
 export interface CCLCExpectedActiveConfiguration {
@@ -163,4 +226,20 @@ export interface CCLCAdmission {
   requestId: string | null;
   transactionId: string | null;
   status: CCLCTransactionStatus | null;
+  /**
+   * Present only when CCLC answered the operator's `recover` of an open
+   * incident authorization-only: the incident is closed without a lifecycle
+   * transaction (`transactionId` and `status` are null) and the requested
+   * target is followed again once ordinary admission is open.
+   */
+  incidentRecovery: CCLCIncidentRecovery | null;
+}
+
+/** The operator's accepted acknowledgement of one open component incident. */
+export interface CCLCIncidentRecovery {
+  incidentId: string;
+  componentId: string;
+  causeClass: CCLCIncidentCauseClass;
+  acknowledgedBy: string;
+  acknowledgedAtNs: Nanoseconds;
 }

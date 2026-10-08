@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 import socket
+import unicodedata
 from typing import Any, Protocol
 
 import rfc8785
@@ -49,6 +50,8 @@ class CCLCOpenPort(Protocol):
 
     def route_status(self, transaction_id: str) -> dict[str, Any] | None: ...
 
+    def incident_events(self, after_sequence: int, limit: int) -> dict[str, Any]: ...
+
 
 def _canonical_json(value: Mapping[str, Any], *, error_code: str, label: str) -> bytes:
     try:
@@ -58,6 +61,254 @@ def _canonical_json(value: Mapping[str, Any], *, error_code: str, label: str) ->
             error_code,
             f"{label} is not canonically encodable: {exc}",
         ) from exc
+
+
+_TARGET_STATES = frozenset({"active", "prepared", "disabled"})
+_TARGET_ORIGINS = frozenset({"startup", "operator", "program"})
+_PROGRESS_PHASES = frozenset(
+    {
+        "satisfied",
+        "waiting_for_prerequisites",
+        "transition_in_progress",
+        "outcome_uncertain",
+        "blocked",
+        "cancelled",
+    }
+)
+_PROGRESS_INTENTS = frozenset({"prepare", "enable", "disable", "recover"})
+_BLOCKING_CAUSE_CLASSES = frozenset(
+    {
+        "none",
+        "availability",
+        "emergency_stop",
+        "protective_stop",
+        "safeguard_stop",
+        "fault",
+        "configuration",
+        "unknown",
+        "collision",
+        "external_control",
+        "provider_lost",
+    }
+)
+_INCIDENT_CAUSE_CLASSES = _BLOCKING_CAUSE_CLASSES - {"none", "availability"}
+_MAX_BLOCKING_REASON_BYTES = 1024
+_MAX_INCIDENT_ID_BYTES = 128
+_MAX_INCIDENT_SUMMARY_BYTES = 1024
+_MAX_VENDOR_CODES = 16
+_MAX_VENDOR_CODE_BYTES = 64
+_MAX_INT64 = 2**63 - 1
+_MAX_SAFE_INTEGER = 2**53 - 1
+INCIDENT_EVENT_KINDS = frozenset(
+    {"component_incident", "component_incident_acknowledged"}
+)
+MAX_INCIDENT_EVENT_PAGE = 64
+
+
+def _is_int(value: Any) -> bool:
+    return type(value) is int
+
+
+def _member(value: Any, allowed: frozenset[str]) -> bool:
+    return isinstance(value, str) and value in allowed
+
+
+def _bounded_text(value: Any, maximum: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= maximum
+    )
+
+
+def _valid_incident(incident: Any) -> bool:
+    """One open component incident (addendum 2 contract item 2), or null."""
+
+    if incident is None:
+        return True
+    if not isinstance(incident, dict) or set(incident) != {
+        "acknowledged",
+        "cause_class",
+        "detected_at_ns",
+        "incident_id",
+        "summary",
+        "vendor_codes",
+    }:
+        return False
+    codes = incident["vendor_codes"]
+    summary = incident["summary"]
+    return (
+        _bounded_text(incident["incident_id"], _MAX_INCIDENT_ID_BYTES)
+        and _member(incident["cause_class"], _INCIDENT_CAUSE_CLASSES)
+        and isinstance(codes, list)
+        and len(codes) <= _MAX_VENDOR_CODES
+        and all(_bounded_text(code, _MAX_VENDOR_CODE_BYTES) for code in codes)
+        and _is_int(incident["detected_at_ns"])
+        and 0 <= incident["detected_at_ns"] <= _MAX_INT64
+        and _bounded_text(summary, _MAX_INCIDENT_SUMMARY_BYTES)
+        and unicodedata.is_normalized("NFC", summary)
+        and incident["acknowledged"] is False
+    )
+
+
+def _invalid_lifecycle_fact(field: str) -> HeadlessApiError:
+    return HeadlessApiError(
+        "cclc_open_response_invalid",
+        f"CCLC component snapshot {field} is invalid",
+    )
+
+
+def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
+    """Fail closed on a malformed requested target or target progress.
+
+    The snapshot is otherwise forwarded unchanged; these two owner-issued
+    facts carry closed enums that Composer presents, so Headless rejects an
+    unknown key or spelling instead of forwarding an unpresentable state.
+    """
+
+    if "lifecycle_target" in snapshot:
+        target = snapshot["lifecycle_target"]
+        if target is not None and (
+            not isinstance(target, dict)
+            or set(target) != {"origin", "requested_state", "target_generation"}
+            or not _member(target["requested_state"], _TARGET_STATES)
+            or not _member(target["origin"], _TARGET_ORIGINS)
+            or not _is_int(target["target_generation"])
+            or not 1 <= target["target_generation"] <= _MAX_INT64
+        ):
+            raise _invalid_lifecycle_fact("lifecycle_target")
+    if "lifecycle_progress" in snapshot:
+        progress = snapshot["lifecycle_progress"]
+        if progress is None:
+            return
+        if (
+            not isinstance(progress, dict)
+            or set(progress)
+            != {
+                "blocking_cause_class",
+                "blocking_reason",
+                "delayed",
+                "incident",
+                "next_intent",
+                "phase",
+                "waiting_since_ns",
+            }
+            or not _member(progress["phase"], _PROGRESS_PHASES)
+            or (
+                progress["next_intent"] is not None
+                and not _member(progress["next_intent"], _PROGRESS_INTENTS)
+            )
+            or not _member(
+                progress["blocking_cause_class"], _BLOCKING_CAUSE_CLASSES
+            )
+            or (
+                progress["blocking_reason"] is not None
+                and not _bounded_text(
+                    progress["blocking_reason"], _MAX_BLOCKING_REASON_BYTES
+                )
+            )
+            or (
+                progress["waiting_since_ns"] is not None
+                and (
+                    not _is_int(progress["waiting_since_ns"])
+                    or not 0 <= progress["waiting_since_ns"] <= _MAX_INT64
+                )
+            )
+            or type(progress["delayed"]) is not bool
+            or not _valid_incident(progress["incident"])
+        ):
+            raise _invalid_lifecycle_fact("lifecycle_progress")
+
+
+def _validate_incident_recovery(
+    result: Mapping[str, Any], intent: Mapping[str, Any]
+) -> None:
+    """Fail closed on a malformed authorization-only incident Recover.
+
+    CCLC answers the operator's Recover of an open incident without a
+    lifecycle transaction: `acceptance` and `status` are null and
+    `incident_recovery` names the closed incident. The key is optional and
+    absent for every other request.
+    """
+
+    if "incident_recovery" not in result:
+        return
+    recovery = result["incident_recovery"]
+    component_id = intent.get("controllable_component_id")
+    if (
+        not isinstance(recovery, dict)
+        or set(recovery)
+        != {
+            "acknowledged_at_ns",
+            "acknowledged_by",
+            "cause_class",
+            "controllable_component_id",
+            "incident_id",
+        }
+        or not _bounded_text(recovery["incident_id"], _MAX_INCIDENT_ID_BYTES)
+        or not _member(recovery["cause_class"], _INCIDENT_CAUSE_CLASSES)
+        or not _bounded_text(recovery["acknowledged_by"], 1024)
+        or not _is_int(recovery["acknowledged_at_ns"])
+        or not 0 <= recovery["acknowledged_at_ns"] <= _MAX_SAFE_INTEGER
+        or recovery["controllable_component_id"] != component_id
+        or result.get("acceptance") is not None
+        or result.get("status") is not None
+        or result.get("replay_status") not in {"accepted_new", "replayed_exact"}
+        or "rejection" in result
+    ):
+        raise HeadlessApiError(
+            "cclc_open_response_invalid",
+            "CCLC incident recovery result is invalid",
+        )
+
+
+def _validate_incident_events(
+    result: Mapping[str, Any], after_sequence: int, limit: int
+) -> None:
+    """Strict ordered page of incident history events (contract item 5)."""
+
+    def invalid(reason: str) -> HeadlessApiError:
+        return HeadlessApiError(
+            "cclc_open_response_invalid",
+            f"CCLC incident events {reason}",
+        )
+
+    events = result.get("events")
+    through = result.get("through_sequence")
+    if (
+        set(result) != {"events", "through_sequence"}
+        or not isinstance(events, list)
+        or len(events) > limit
+        or not _is_int(through)
+    ):
+        raise invalid("page is malformed")
+    previous = after_sequence
+    for event in events:
+        if not isinstance(event, dict) or set(event) != {
+            "event_kind",
+            "event_sequence",
+            "incident_id",
+            "occurred_at_ns",
+            "payload",
+        }:
+            raise invalid("row is malformed")
+        sequence = event["event_sequence"]
+        payload = event["payload"]
+        if (
+            not _is_int(sequence)
+            or not previous < sequence <= _MAX_SAFE_INTEGER
+            or not _member(event["event_kind"], INCIDENT_EVENT_KINDS)
+            or not _bounded_text(event["incident_id"], _MAX_INCIDENT_ID_BYTES)
+            or not _is_int(event["occurred_at_ns"])
+            or not 0 <= event["occurred_at_ns"] <= _MAX_SAFE_INTEGER
+            or not isinstance(payload, dict)
+            or payload.get("incident_id") != event["incident_id"]
+            or payload.get("event_kind") != event["event_kind"]
+        ):
+            raise invalid("row is invalid or out of order")
+        previous = sequence
+    if through != previous:
+        raise invalid("cursor does not match the page")
 
 
 class CCLCOpenRequestClient:
@@ -235,6 +486,7 @@ class CCLCOpenRequestClient:
                 "cclc_open_response_identity_mismatch",
                 "CCLC component snapshot identity does not match its request",
             )
+        _validate_lifecycle_target_facts(result)
         return result
 
     def route_templates(self, component_id: str) -> dict[str, Any]:
@@ -282,12 +534,36 @@ class CCLCOpenRequestClient:
                 "cclc_open_response_identity_mismatch",
                 "CCLC lifecycle acceptance does not match its request",
             )
+        _validate_incident_recovery(result, intent)
         return result
 
     def lifecycle_request_result(
         self, intent: Mapping[str, Any]
     ) -> dict[str, Any] | None:
-        return self._request_result("lifecycle_request_result", intent)
+        result = self._request_result("lifecycle_request_result", intent)
+        if result is not None:
+            _validate_incident_recovery(result, intent)
+        return result
+
+    def incident_events(self, after_sequence: int, limit: int) -> dict[str, Any]:
+        """Read incident history events after `after_sequence`, in order."""
+
+        if (
+            not _is_int(after_sequence)
+            or not 0 <= after_sequence <= _MAX_SAFE_INTEGER
+            or not _is_int(limit)
+            or not 1 <= limit <= MAX_INCIDENT_EVENT_PAGE
+        ):
+            raise ValueError("incident event cursor or limit is outside its bound")
+        result = self._require_object(
+            self._exchange(
+                "incident_events",
+                {"after_sequence": after_sequence, "limit": limit},
+            ),
+            command="incident_events",
+        )
+        _validate_incident_events(result, after_sequence, limit)
+        return result
 
     def route_request_result(self, intent: Mapping[str, Any]) -> dict[str, Any] | None:
         return self._request_result("route_request_result", intent)

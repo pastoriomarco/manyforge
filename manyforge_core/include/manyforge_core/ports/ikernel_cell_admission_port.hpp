@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/operator_alarm_attention.hpp>
 
@@ -32,6 +33,19 @@ class IKernelCellAdmissionPort {
         ErrorDTO{"cell_admission_operator_alarm_attention_unsupported",
                  "Kernel operator-alarm attention publication is unsupported",
                  {}});
+  }
+  /// CCLC component-incident containment (addendum 2, 2026-10-08): one
+  /// system-attributed cell Full Stop through the Kernel's ordinary Stop
+  /// ingress that always latches a cell Stop fault, even on an idle cell.
+  /// Returns at acceptance and never waits for the physical outcome; a
+  /// repeated request for the same incident is an exact replay.
+  [[nodiscard]] virtual Result<ComponentIncidentContainmentReceiptDTO>
+  RequestComponentIncidentContainment(const ComponentIncidentContainmentIntentDTO& intent) {
+    static_cast<void>(intent);
+    return Result<ComponentIncidentContainmentReceiptDTO>::Err(
+        ErrorDTO{"cell_admission_incident_containment_unsupported",
+                 "Kernel component-incident containment is unsupported",
+                 {{"reason", "incident_containment_unsupported"}}});
   }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) = 0;

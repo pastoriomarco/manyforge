@@ -251,11 +251,6 @@ public:
       override {
     return Require()->settle_addressed_participant_stop(request);
   }
-  core::PauseResultDTO pause() override { return Require()->pause(); }
-  core::ResumeResultDTO resume(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
-    return Require()->resume(expected_epoch);
-  }
   core::ResetResultDTO reset(
       std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
     return Require()->reset(expected_epoch);

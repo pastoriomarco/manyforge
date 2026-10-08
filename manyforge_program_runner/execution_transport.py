@@ -273,12 +273,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             )
         return getattr(super(), method)(request, trusted_principal_id=None)
 
-    def pause(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._mapped_control("pause", operation_id, body)
-
-    def resume(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._mapped_control("resume", operation_id, body)
-
     def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._mapped_control("reset", operation_id, body)
 

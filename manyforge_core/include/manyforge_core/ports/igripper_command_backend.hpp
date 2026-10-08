@@ -57,7 +57,7 @@ class IGripperCommandBackend {
   /// establishes a new lifecycle boundary.
   virtual void invalidate_gripper_commands(GripperInvalidationReason reason) noexcept = 0;
 
-  /// Open command admission after a successful reset, resume, or new execute
+  /// Open command admission after a successful reset or new execute
   /// admission. Implementations must invalidate any preflight work captured
   /// before the preceding close/open boundary.
   virtual void authorize_gripper_commands() noexcept = 0;

@@ -41,6 +41,7 @@
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
@@ -2067,8 +2068,6 @@ enum class CommandKind {
   kReadStop,
   kGetOperationRecovery,
   kApplyOperationRecovery,
-  kPause,
-  kResume,
   kReset,
   kAcknowledgeCompleted,
   kStop,
@@ -2705,11 +2704,7 @@ struct Command final {
     return decoded;
   }
   CommandKind kind;
-  if (command == "pause") {
-    kind = CommandKind::kPause;
-  } else if (command == "resume") {
-    kind = CommandKind::kResume;
-  } else if (command == "reset") {
+  if (command == "reset") {
     kind = CommandKind::kReset;
   } else if (command == "acknowledge_completed") {
     kind = CommandKind::kAcknowledgeCompleted;
@@ -3146,8 +3141,6 @@ PickPlacePlanningResultValue(const std::string_view sequence_id,
     return "dispatching";
   case core::OperationStateKind::kExecuting:
     return "executing";
-  case core::OperationStateKind::kPaused:
-    return "paused";
   case core::OperationStateKind::kStopping:
     return "stopping";
   case core::OperationStateKind::kCompleted:
@@ -3192,10 +3185,6 @@ AcceptedValue(const core::OperationAcceptedDTO &value) {
 
 [[nodiscard]] std::string_view ControlName(core::OperationControlKind control) {
   switch (control) {
-  case core::OperationControlKind::kPause:
-    return "pause";
-  case core::OperationControlKind::kResume:
-    return "resume";
   case core::OperationControlKind::kReset:
     return "reset";
   case core::OperationControlKind::kAcknowledgeCompleted:
@@ -9835,7 +9824,8 @@ CellControlBindingRepresentatives(const Composition &composition) {
 
 void DetachRetainedCCLC(Composition &composition);
 
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+// Both hosts adopt exactly what the Kernel reads back at the planned
+// generations; a ROS plan's Declared component reads back command-closed.
 [[nodiscard]] core::NativeApplyFactAdoptionDTO ReadNativeApplyFacts(
     Composition &composition,
     const core::ActiveBundlePublicationReceiptDTO &publication,
@@ -9956,7 +9946,6 @@ void DetachRetainedCCLC(Composition &composition);
             });
   return facts;
 }
-#endif
 
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 [[nodiscard]] RetainedNativeCellRuntime &RequireNativeCellRuntime(
@@ -10473,8 +10462,6 @@ void AttachRetainedNativeCCLC(Composition &composition,
   core::IClock *owner_clock = nullptr;
   core::IScheduler *owner_scheduler = nullptr;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  // Parent-Apply fact adoption below belongs to the native CCLC path.
-  static_cast<void>(parent_apply);
   Require(composition.runtime != nullptr &&
               composition.runtime->clock != nullptr &&
               composition.runtime->scheduler != nullptr,
@@ -10546,6 +10533,10 @@ void AttachRetainedNativeCCLC(Composition &composition,
 
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   bool parent_apply_facts_adopted = false;
+#endif
+  // Both hosts adopt their own recorded plan while the parent Apply fence is
+  // still held. A ROS plan adopts its Declared components and the routes it
+  // actually published; ordinary CCLC Prepare/Enable reopens afterwards.
   if (parent_apply.has_value()) {
     fence_owner.RunWithExactHeldSuccessor(
         *parent_apply, active_publication.value(), [&] {
@@ -10569,9 +10560,10 @@ void AttachRetainedNativeCCLC(Composition &composition,
           }
           journal.Close();
         });
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
     parent_apply_facts_adopted = true;
-  }
 #endif
+  }
 
   auto artifact_source = std::make_unique<
       deployment::FilesystemVerifiedRetainedProductArtifactSource>(
@@ -12437,6 +12429,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   candidate.retained_bundle_id(),
                   candidate.value().cell_graph.graph_revision,
                   {}, {}, {}, {}, {}, {}};
+              // ROS lifecycle plans only observe ros2_control: Apply installs
+              // routes and Stop readiness but enables nothing. The component
+              // stays Declared (command-closed) until ordinary CCLC
+              // Prepare/Enable; an explicit Disable is still preserved.
+              plan_request.changed_component_state =
+                  core::ComponentLifecycleStateDTO::kDeclared;
               for (const auto &component :
                    candidate.value().cell_graph.controllable_components)
                 plan_request.components.push_back(
@@ -13988,9 +13986,26 @@ private:
       std::optional<bool> controller_configuration_ready;
       std::optional<bool> fault_present;
       std::optional<bool> transport_ready;
+      std::optional<core::LifecycleBlockingCauseClassDTO> blocking_cause;
       CanonicalValue::Array facts;
       facts.reserve(observation.facts.size());
       for (const auto &fact : observation.facts) {
+        // The standard cause-class token is reported beside, not inside, the
+        // retained boolean readiness facts of this status schema.
+        if (fact.lifecycle_fact_id.value() ==
+            core::kLifecycleBlockingCauseFactId) {
+          Require(fact.locally_valid() &&
+                      fact.value.kind ==
+                          core::LifecycleFactValueKindDTO::kToken &&
+                      fact.value.token_value.has_value() &&
+                      !blocking_cause.has_value(),
+                  "ROS lifecycle cause fact is not one exact token");
+          blocking_cause = core::parse_lifecycle_blocking_cause_class(
+              *fact.value.token_value);
+          Require(blocking_cause.has_value(),
+                  "ROS lifecycle cause fact names no known cause class");
+          continue;
+        }
         Require(fact.locally_valid() &&
                     fact.value.kind ==
                         core::LifecycleFactValueKindDTO::kBoolean &&
@@ -14020,6 +14035,9 @@ private:
                          *transport_ready;
       every_domain_ready = every_domain_ready && ready;
       domains.emplace_back(CanonicalValue::Object{
+          {"blocking_cause_class",
+           CanonicalValue(std::string(core::to_string(blocking_cause.value_or(
+               core::LifecycleBlockingCauseClassDTO::kUnknown))))},
           {"component_lifecycle_state",
            CanonicalValue(
                std::string(core::to_string(observation.component_state)))},
@@ -16616,12 +16634,6 @@ private:
     const auto control_result =
         [&]() -> core::Result<core::OperationControlAcceptedDTO> {
       switch (command.kind) {
-      case CommandKind::kPause:
-        return composition.active_addressed_kernel()->pause(
-            *command.control);
-      case CommandKind::kResume:
-        return composition.active_addressed_kernel()->resume(
-            *command.control);
       case CommandKind::kReset:
         return composition.active_addressed_kernel()->reset(
             *command.control);
@@ -17136,7 +17148,7 @@ private:
   ///   It reaches only the stable Kernel, without the composition lock, so
   ///   neither planning nor an Apply delays it. Each request is a bounded
   ///   copy under the Kernel's state lock.
-  /// - Ordinary socket: operation controls (Reset, Pause, Resume,
+  /// - Ordinary socket: operation controls (Reset,
   ///   acknowledgement), events, reads, Program selection and capture, cell
   ///   admission and recovery. It never waits for planning, submission
   ///   ordering or a Manager round trip; those go to deferred lanes.

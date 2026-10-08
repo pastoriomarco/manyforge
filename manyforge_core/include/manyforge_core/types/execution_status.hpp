@@ -17,7 +17,6 @@ enum class ExecutionState {
   /// recorded on the InterruptLatch; the state itself is the observable
   /// interrupted annotation from spec/260.
   kInterrupted,
-  kPaused,
   kStopping,
   kStopped,
   kCompleted,
@@ -36,7 +35,6 @@ inline const char* to_string(ExecutionState state) {
     case kValidating: return "Validating";
     case kExecuting: return "Executing";
     case kInterrupted: return "Interrupted";
-    case kPaused: return "Paused";
     case kStopping: return "Stopping";
     case kStopped: return "Stopped";
     case kCompleted: return "Completed";

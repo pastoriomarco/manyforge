@@ -1020,16 +1020,6 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    def pause_operation(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._operation_control(operation_id, "pause", body)
-
-    def resume_operation(
-        self, operation_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._operation_control(operation_id, "resume", body)
-
     def reset_operation(
         self, operation_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:

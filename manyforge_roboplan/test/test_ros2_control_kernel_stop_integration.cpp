@@ -439,21 +439,6 @@ public:
   }
 
   [[nodiscard]] core::Result<void>
-  PrepareResumeMotion(std::uint64_t,
-                      core::ResolvedPreparedMotionResumeRequestDTO) override {
-    return Unsupported<void>();
-  }
-  [[nodiscard]] core::Result<void>
-  DispatchPreparedResumeMotion(std::uint64_t,
-                               const core::ContentDigest &) override {
-    return Unsupported<void>();
-  }
-  [[nodiscard]] core::Result<void>
-  CancelPreparedResumeMotion(std::uint64_t) override {
-    return Unsupported<void>();
-  }
-
-  [[nodiscard]] core::Result<void>
   CancelPreparedMotion(std::uint64_t execution_id) override {
     std::lock_guard lock(mutex_);
     if (!snapshot_.has_value() || snapshot_->execution_id != execution_id) {
@@ -554,15 +539,6 @@ public:
             recovery_});
   }
 
-  [[nodiscard]] core::PauseResultDTO pause() override {
-    return {false, core::ErrorDTO{"unsupported_capability",
-                                  "test engine does not pause", {}}};
-  }
-  [[nodiscard]] core::ResumeResultDTO
-  resume(std::optional<std::uint64_t>) override {
-    return {false, core::ErrorDTO{"unsupported_capability",
-                                  "test engine does not resume", {}}};
-  }
   [[nodiscard]] core::ResetResultDTO
   reset(std::optional<std::uint64_t>) override {
     return {false, core::ErrorDTO{"unsupported_capability",
@@ -777,6 +753,9 @@ private:
         request.binding.resources,
         request.binding.model_group_binding.compiled_joint_names,
         {{0.0, zeros, zeros, zeros}, {8.0, zeros, zeros, zeros}}};
+    // Production planners always attach runtime-scale bounds.
+    trajectory.runtime_scale_bounds =
+        core::TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0, 1.0, std::nullopt};
     PlanResultDTO planning_result{trajectory, std::nullopt, projection};
     CollisionWorldRevision world{1U, Sha('c')};
     CollisionDecision decision;
@@ -1028,9 +1007,11 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
       "/manyforge_kernel_ros2_control_stop_fjt_" + fixture::unique_suffix();
   fixture::FakeFjtServer server(action_name);
   auto sink = std::make_shared<fixture::StateSink>();
-  Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler,
-      fixture::backend_config(binding, action_name));
+  // As in the Isaac commanded-simulation profile: no controller
+  // speed-scaling input, so bounded trajectories run at nominal timing.
+  auto config = fixture::backend_config(binding, action_name);
+  config.enable_jtc_speed_scaling_input = false;
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
   RecordingRos2ControlStopPort port(backend);
   Ros2ControlPreparedMotionEngine engine(backend);
 

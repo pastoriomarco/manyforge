@@ -31,7 +31,7 @@ export function operationProgressValue(
   ownerEpoch: string | undefined,
   samples: readonly OperationProgressSample[],
 ): number {
-  // Terminal/Pause/Stop truth always wins, including a late progress delta.
+  // Terminal/Stop truth always wins, including a late progress delta.
   const sample = operation.state === 'executing' ? samples.find((row) => (
     row.owner_epoch === ownerEpoch && row.operation_id === operation.operationId
     && row.operation_revision === operation.operationRevision

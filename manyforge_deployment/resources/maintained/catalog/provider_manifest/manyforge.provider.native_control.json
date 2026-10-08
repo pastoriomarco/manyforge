@@ -58,24 +58,8 @@
       ]
     },
     {
-      "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-      "capability_id": "execution.pause",
-      "required_endpoint_role_ids": [
-        "command",
-        "state"
-      ]
-    },
-    {
       "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
       "capability_id": "execution.reset",
-      "required_endpoint_role_ids": [
-        "command",
-        "state"
-      ]
-    },
-    {
-      "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
-      "capability_id": "execution.resume",
       "required_endpoint_role_ids": [
         "command",
         "state"
@@ -170,5 +154,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.native_control",
-  "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb"
+  "provider_manifest_revision": "sha256:72a97879729eced7b536ff94d98f90aa97f43d2cb1a222388e0e8195c23c72de"
 }

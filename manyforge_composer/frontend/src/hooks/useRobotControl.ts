@@ -27,6 +27,12 @@ import {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { StructuredError } from '../types/api';
 import type { HeadlessStateSource } from './useHeadlessState';
+import {
+  acknowledgeComponentIncidents,
+  stopFaultRecoveryMissing,
+  useComponentIncidents,
+} from './useComponentIncidents';
+import type { OpenComponentIncident } from './useComponentIncidents';
 import type {
   ManualCartesianDefaults,
   ManualMotionSettings,
@@ -224,7 +230,7 @@ export interface RobotControlController {
   unappliedChanges?: boolean;
   controlSource?: HeadlessStateSource | null;
   setManualPanelVisible: (visible: boolean) => void;
-  controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
+  controlPending: 'stop' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
   runtimeScalePending: boolean;
@@ -233,6 +239,9 @@ export interface RobotControlController {
   fullStopError: string | null;
   stopFaultRecoveryPending: boolean;
   stopFaultRecoveryError: string | null;
+  /** Open component incidents (CCLC snapshots) while the cell is latched. */
+  componentIncidents: OpenComponentIncident[];
+  componentIncidentsUnavailableReason: string | null;
   selectRobot: (componentId: string, motionTargetId: string) => void;
   selectTool: (gripperTargetId: string) => void;
   selectMode: (mode: RobotControlMode) => void;
@@ -255,8 +264,6 @@ export interface RobotControlController {
   dismissFullStopError: () => void;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
-  pause: () => Promise<void>;
-  resume: () => Promise<void>;
   reset: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
   commitRuntimeScale: () => void;
@@ -277,7 +284,7 @@ export function useRobotControl(
     initialRobotControlState,
   );
   const [controlPending, setControlPending] = useState<
-    'stop' | 'pause' | 'resume' | 'reset' | null
+    'stop' | 'reset' | null
   >(null);
   const [runtimeScaleStatus, setRuntimeScaleStatus] = useState<RuntimeScaleControlStatus | null>(null);
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
@@ -302,7 +309,7 @@ export function useRobotControl(
     setAuthoringPending(pendingAuthoringInputs.current.size > 0);
   }, []);
   const pendingOperationControl = useRef<{
-    control: 'stop' | 'pause' | 'resume' | 'reset'; ownerEpoch: string; operationId: string;
+    control: 'stop' | 'reset'; ownerEpoch: string; operationId: string;
   } | null>(null);
   const runtimeScaleStatusRef = useRef<RuntimeScaleControlStatus | null>(null);
   const runtimeScaleQueued = useRef<number | null>(null);
@@ -601,7 +608,7 @@ export function useRobotControl(
   }, [state.status?.ownerEpoch, state.generation, state.phase]);
 
   const sendOperationControl = useCallback(async (
-    control: 'stop' | 'pause' | 'resume' | 'reset',
+    control: 'stop' | 'reset',
     kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0],
     payload: Record<string, unknown>,
   ) => {
@@ -972,6 +979,19 @@ export function useRobotControl(
     }
   }, [clearRuntimeScaleQueue, controlSource, enabled, state.status]);
 
+  const cellFaultOpen = state.status?.cellStopAction.fault != null
+    && state.status.cellStopAction.fault.state !== 'cleared';
+  const statusComponents = state.status?.components;
+  const incidentComponentIds = useMemo(
+    () => (statusComponents ?? []).map((component) => component.controllableComponentId),
+    [statusComponents],
+  );
+  const componentIncidents = useComponentIncidents(enabled && cellFaultOpen, incidentComponentIds);
+  const refreshComponentIncidents = componentIncidents.refresh;
+
+  // "Recover cell" is one operator action (addendum 2, contract item 6):
+  // acknowledge every open component incident, then submit the exact cell
+  // recovery only when its offer is ready; otherwise say what is missing.
   const recoverStopFault = useCallback(async () => {
     const status = state.status;
     const fault = status?.cellStopAction.fault;
@@ -986,7 +1006,18 @@ export function useRobotControl(
     setStopFaultRecoveryPending(true);
     setStopFaultRecoveryError(null);
     try {
-      await api.execution.recoverStopFault(status.ownerEpoch, requestId());
+      const acknowledged = await acknowledgeComponentIncidents(
+        status.components.map((component) => component.controllableComponentId),
+        latestSnapshot.current?.authoringAdmission.admissionGeneration ?? null,
+      );
+      const offer = await api.execution.stopFault();
+      if (offer !== null && offer.recoveryStatus !== 'ready') {
+        if (stopFaultRecoveryRequest.current === pending) {
+          setStopFaultRecoveryError(stopFaultRecoveryMissing(offer, acknowledged));
+        }
+      } else if (offer !== null) {
+        await api.execution.recoverStopFault(status.ownerEpoch, requestId());
+      }
     } catch (error: unknown) {
       if (stopFaultRecoveryRequest.current === pending) {
         setStopFaultRecoveryError(
@@ -998,23 +1029,10 @@ export function useRobotControl(
         stopFaultRecoveryRequest.current = null;
         setStopFaultRecoveryPending(false);
       }
+      refreshComponentIncidents();
     }
-  }, [enabled, state.status]);
+  }, [enabled, refreshComponentIncidents, state.status]);
 
-  const controlOperation = useCallback(async (control: 'pause' | 'resume') => {
-    const operation = state.operation;
-    if (pendingOperationControl.current !== null || state.status === null || operation === null
-      || (control === 'pause' && operation.state !== 'executing')
-      || (control === 'resume' && operation.state !== 'paused')) return;
-    await sendOperationControl(control, control === 'pause' ? 'operation_pause' : 'operation_resume', {
-      operation_id: operation.operationId,
-      expected_operation_revision: operation.operationRevision,
-      reason: `operator Robot Control ${control}`,
-    });
-  }, [sendOperationControl, state.operation, state.status]);
-
-  const pause = useCallback(async () => controlOperation('pause'), [controlOperation]);
-  const resume = useCallback(async () => controlOperation('resume'), [controlOperation]);
   const reset = useCallback(async () => {
     const operation = state.operation;
     if (pendingOperationControl.current !== null || state.status === null || operation === null
@@ -1067,6 +1085,8 @@ export function useRobotControl(
     fullStopError,
     stopFaultRecoveryPending,
     stopFaultRecoveryError,
+    componentIncidents: componentIncidents.incidents,
+    componentIncidentsUnavailableReason: componentIncidents.unavailableReason,
     selectRobot,
     selectTool,
     selectMode,
@@ -1089,8 +1109,6 @@ export function useRobotControl(
     dismissFullStopError,
     dismissRuntimeScaleError,
     dismissError,
-    pause,
-    resume,
     reset,
     setRuntimeScale,
     commitRuntimeScale,
@@ -1103,9 +1121,7 @@ export function useRobotControl(
     editMoveToJoints,
     editJoint,
     editPose,
-    pause,
     reset,
-    resume,
     retry,
     revert,
     runtimeScaleDraft,
@@ -1114,6 +1130,8 @@ export function useRobotControl(
     fullStopError,
     stopFaultRecoveryPending,
     stopFaultRecoveryError,
+    componentIncidents.incidents,
+    componentIncidents.unavailableReason,
     runtimeScalePending,
     runtimeScaleStatus,
     selectMode,

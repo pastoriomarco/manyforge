@@ -67,8 +67,6 @@ ExecutionCommandKind = Literal[
     "gripper_confirm",
     "operation_start",
     "operation_stop",
-    "operation_pause",
-    "operation_resume",
     "operation_reset",
     "operation_acknowledge_completed",
     "cell_full_stop",

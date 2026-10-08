@@ -499,7 +499,6 @@ std::optional<std::string_view> execution_backend_status_field_error(
   switch (status.state) {
     case ExecutionBackendStateDTO::kAccepted:
     case ExecutionBackendStateDTO::kExecuting:
-    case ExecutionBackendStateDTO::kPaused:
     case ExecutionBackendStateDTO::kCompleted:
       return status.error.has_value()
                  ? std::optional<std::string_view>("execution_backend_status_error_invalid")

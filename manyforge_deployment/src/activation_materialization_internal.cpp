@@ -1550,7 +1550,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 44U)) {
+       source_files(catalog_root / "capability_definition", 42U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1568,7 +1568,7 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 23U) {
+  if (target_capabilities.size() != 21U) {
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
@@ -1692,7 +1692,7 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 16U ||
+          manifest.value().offered_capabilities.size() != 14U ||
           manifest.value().provider_contracts.size() != 2U ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1721,7 +1721,7 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 27U ||
+          manifest.value().offered_capabilities.size() != 25U ||
           manifest.value().provider_contracts.size() != 2U ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1975,7 +1975,7 @@ void verify_scenarios(const std::filesystem::path &root,
     // lifecycle capability definitions); the Lite6 vendor providers are no
     // longer selected by native scenarios.
     const std::size_t expected_catalog_count =
-        (scenario.ros2_control_execution ? 53U : 54U) +
+        (scenario.ros2_control_execution ? 51U : 52U) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(
@@ -2002,7 +2002,7 @@ void verify_scenarios(const std::filesystem::path &root,
         graph.model_instances.size() != 1U ||
         graph.runtime_units.size() != 1U ||
         graph.control_bindings.size() !=
-            (scenario.ros2_control_execution ? 12U : 13U) ||
+            (scenario.ros2_control_execution ? 10U : 11U) ||
         applicability.capability_provider_bindings.size() != 26U) {
       throw std::invalid_argument("maintained scenario has an incomplete "
                                   "component/runtime/capability closure: " +
@@ -2287,10 +2287,10 @@ void verify_scenarios(const std::filesystem::path &root,
     const bool has_operation_scale =
         historical_capabilities.erase(
             "execution.runtime_scale.operation_scoped") == 1U;
-    if (historical_capabilities.size() != 36U ||
+    if (historical_capabilities.size() != 34U ||
         has_operation_scale == scenario.ros2_control_execution) {
       throw std::invalid_argument(
-          "maintained scenario does not retain all 36 historical facilities: " +
+          "maintained scenario does not retain all 34 historical facilities: " +
           std::string(scenario.source));
     }
     const auto &component = graph.controllable_components.front();
@@ -2468,7 +2468,7 @@ int run_maintained_example_qualification(int argc, char **argv) {
           "maintained scenario documents lost a Program Binding");
     }
     std::cout
-        << "13 deployments, 5 shared families, 36 historical facilities, "
+        << "13 deployments, 5 shared families, 34 historical facilities, "
            "15 durable Program Bindings, and 15 self-contained scenario "
            "documents validated\n";
     return 0;

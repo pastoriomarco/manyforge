@@ -1287,7 +1287,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     }
 
     with _composer(client) as composer:
-        for endpoint in ("pause", "resume", "reset", "acknowledge-completed"):
+        for endpoint in ("reset", "acknowledge-completed"):
             response = composer.post(
                 f"/api/execution/operations/operation-1/{endpoint}",
                 json=control,
@@ -1383,7 +1383,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             == 422
         )
         mismatch = composer.post(
-            "/api/execution/operations/operation-2/pause", json=control
+            "/api/execution/operations/operation-2/reset", json=control
         )
 
     assert mismatch.status_code == 400
@@ -1397,8 +1397,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         or item["path"] == "/api/execution/runtime-scale-control"
     ]
     assert [item["path"].rsplit("/", 1)[-1] for item in forwarded] == [
-        "pause",
-        "resume",
         "reset",
         "acknowledge-completed",
         "stops",
@@ -1410,15 +1408,15 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "runtime-scale-control",
     ]
     assert forwarded[0]["body"] == control
-    assert forwarded[4]["body"] == stop
-    assert forwarded[5]["body"] == full_stop
-    assert forwarded[6]["method"] == "GET"
-    assert forwarded[7]["body"] == recovery
-    assert forwarded[8]["body"] == scale_control
-    assert forwarded[9]["method"] == "GET"
-    assert forwarded[10]["method"] == "GET"
+    assert forwarded[2]["body"] == stop
+    assert forwarded[3]["body"] == full_stop
+    assert forwarded[4]["method"] == "GET"
+    assert forwarded[5]["body"] == recovery
+    assert forwarded[6]["body"] == scale_control
+    assert forwarded[7]["method"] == "GET"
+    assert forwarded[8]["method"] == "GET"
     assert json.loads(
-        dict(parse_qsl(forwarded[10]["query"]))["group_targets"]
+        dict(parse_qsl(forwarded[8]["query"]))["group_targets"]
     ) == [
         {"component_role_id": "robot-a", "target_role_id": "arm"},
         {"component_role_id": "robot-b", "target_role_id": "arm"},

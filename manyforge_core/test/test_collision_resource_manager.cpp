@@ -98,9 +98,6 @@ TEST(CollisionResourceManagerTest,
           resources, ExecutionState::kExecuting));
   EXPECT_TRUE(
       CollisionResourceManager::validation_conflicts_with_active_runtime_monitor(
-          resources, ExecutionState::kPaused));
-  EXPECT_TRUE(
-      CollisionResourceManager::validation_conflicts_with_active_runtime_monitor(
           resources, ExecutionState::kStopping));
 }
 

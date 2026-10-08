@@ -45,12 +45,6 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorStopFailed) {
     return ErrorCode::kStopFailed;
   }
-  if (error.code == kErrorPauseFailed) {
-    return ErrorCode::kPauseFailed;
-  }
-  if (error.code == kErrorResumeFailed) {
-    return ErrorCode::kResumeFailed;
-  }
   if (error.code == kErrorResetFailed) {
     return ErrorCode::kResetFailed;
   }

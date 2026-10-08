@@ -28,6 +28,7 @@
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_xarm_control/generated/lite6_brand_lifecycle_product_identity.hpp>
 #include <manyforge_xarm_control/lite6_brand_lifecycle_catalog.hpp>
 #include <manyforge_xarm_control/lite6_brand_lifecycle_port.hpp>
@@ -188,6 +189,7 @@ primitive_intent(std::string primitive_id) {
   result.recovery_required = FactState::kFalse;
   result.mode = 1;
   result.state = 4;
+  result.error_code = 0;
   result.warning_code = 0;
   return result;
 }
@@ -339,11 +341,14 @@ TEST(Lite6BrandLifecyclePort, NormalizesExactStatesAndRejectsCrossEpoch) {
   ASSERT_NE(feedback, nullptr);
   ASSERT_TRUE(feedback->value.token_value.has_value());
   EXPECT_EQ(*feedback->value.token_value, "stopped");
-  EXPECT_TRUE(std::all_of(disabled.value().facts.begin(),
-                          disabled.value().facts.end(), [](const auto &fact) {
-                            return fact.value.kind !=
-                                   core::LifecycleFactValueKindDTO::kInteger;
-                          }));
+  // Catalog facts are normalized, never raw vendor numbers; raw mode/state
+  // appear only as diagnostic vendor-code facts.
+  EXPECT_TRUE(std::all_of(
+      disabled.value().facts.begin(), disabled.value().facts.end(),
+      [](const auto &fact) {
+        return fact.lifecycle_fact_id.value().rfind("xarm.", 0U) != 0U ||
+               fact.value.kind != core::LifecycleFactValueKindDTO::kInteger;
+      }));
 
   fake->observation.motion_enabled = FactState::kTrue;
   fake->observation.state = 5;
@@ -441,6 +446,8 @@ TEST(Lite6BrandLifecyclePort, CatalogSelectsTheFrozenBrandOnlySequences) {
   ++fake->observation.generation;
   observation = port.Observe(observation_query());
   ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(observation.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
   EXPECT_EQ(selected_primitive(core::ComponentLifecycleIntentKindDTO::kRecover,
                                core::ComponentLifecycleStateDTO::kDisabled,
                                catalog.value(), observation.value()),
@@ -455,6 +462,83 @@ TEST(Lite6BrandLifecyclePort, CatalogSelectsTheFrozenBrandOnlySequences) {
                                core::ComponentLifecycleStateDTO::kDisabled,
                                catalog.value(), observation.value()),
             kXArmClearWarningPrimitiveId);
+}
+
+[[nodiscard]] std::string
+cause_class(const core::BrandLifecycleObservationDTO &observation) {
+  const auto *fact =
+      find_fact(observation, core::kLifecycleBlockingCauseFactId);
+  if (fact == nullptr ||
+      fact->value.kind != core::LifecycleFactValueKindDTO::kToken ||
+      !fact->value.token_value.has_value()) {
+    return {};
+  }
+  return *fact->value.token_value;
+}
+
+TEST(Lite6BrandLifecyclePort, FaultCauseClassPrecedesDisabledAndIsSticky) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+
+  auto observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(observation.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(cause_class(observation.value()), "none");
+
+  // A stopped drive-disabled arm with a vendor error keeps lifecycle state
+  // Disabled (Recover requires it) but its cause class is fault. A positive
+  // error code without a more specific documented meaning is a fault.
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  fake->observation.error_code = 22;
+  ++fake->observation.generation;
+  observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(observation.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(cause_class(observation.value()), "fault");
+
+  // A connected owner without a vendor report cannot clear the fault.
+  auto unreported = disabled_observation();
+  unreported.generation = fake->observation.generation + 1U;
+  unreported.motion_enabled = FactState::kUnknown;
+  unreported.fault_present = FactState::kUnknown;
+  unreported.recovery_required = FactState::kUnknown;
+  unreported.vendor_control_ready = FactState::kUnknown;
+  unreported.blocking_reason_codes = {"xarm_report_unavailable"};
+  fake->observation = unreported;
+  observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(observation.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDegraded);
+  EXPECT_EQ(cause_class(observation.value()), "fault");
+
+  // Fresh clean vendor status clears it; a later report loss is availability.
+  fake->observation = disabled_observation();
+  fake->observation.generation = unreported.generation + 1U;
+  observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(cause_class(observation.value()), "none");
+  unreported.generation = fake->observation.generation + 1U;
+  fake->observation = unreported;
+  observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(cause_class(observation.value()), "availability");
+
+  // A vendor warning is not classified without qualification.
+  fake->observation = disabled_observation();
+  fake->observation.generation = unreported.generation + 1U;
+  fake->observation.warning_code = 17;
+  observation = port.Observe(observation_query());
+  ASSERT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_EQ(observation.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(cause_class(observation.value()), "unknown");
 }
 
 TEST(Lite6BrandLifecyclePort, DispatchesOnlyCatalogPrimitivesWithExactTruth) {
@@ -523,6 +607,395 @@ TEST(Lite6BrandLifecyclePort, DispatchesOnlyCatalogPrimitivesWithExactTruth) {
             core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain);
   EXPECT_EQ(uncertain.effect, core::LifecyclePrimitiveEffectDTO::kPossible);
   EXPECT_FALSE(uncertain.known_result.has_value());
+}
+
+
+[[nodiscard]] XArmObservedState active_observation() {
+  auto result = disabled_observation();
+  result.motion_enabled = FactState::kTrue;
+  result.vendor_control_ready = FactState::kTrue;
+  result.mode = 1;
+  result.state = 2;
+  return result;
+}
+
+// Token value, or empty when the fact is absent or not a token.
+[[nodiscard]] std::string
+token_fact(const core::BrandLifecycleObservationDTO &observation,
+           std::string_view id) {
+  const auto *fact = find_fact(observation, id);
+  if (fact == nullptr ||
+      fact->value.kind != core::LifecycleFactValueKindDTO::kToken) {
+    return {};
+  }
+  return fact->value.token_value.value_or(std::string());
+}
+
+// Integer value, or -1 when the fact is absent or not an integer.
+[[nodiscard]] std::int64_t
+integer_fact(const core::BrandLifecycleObservationDTO &observation,
+             std::string_view id) {
+  const auto *fact = find_fact(observation, id);
+  if (fact == nullptr ||
+      fact->value.kind != core::LifecycleFactValueKindDTO::kInteger) {
+    return -1;
+  }
+  return fact->value.integer_value.value_or(-1);
+}
+
+// Observes the fake's current report after bumping its generation.
+[[nodiscard]] core::BrandLifecycleObservationDTO
+observe_changed(Lite6BrandLifecyclePort &port, FakeSupervisedSession &fake) {
+  ++fake.observation.generation;
+  auto observation = port.Observe(observation_query());
+  EXPECT_TRUE(observation.ok()) << observation.error().message;
+  EXPECT_TRUE(observation.value().locally_valid());
+  return observation.value();
+}
+
+[[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
+dispatch(Lite6BrandLifecyclePort &port, std::string_view primitive) {
+  return port.Dispatch(primitive_intent(std::string(primitive)),
+                       std::stop_token{});
+}
+
+TEST(XArmBrandLifecyclePort, ClassifiesUFactoryControllerErrorCodes) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+
+  auto observation = observe_changed(port, *fake);
+  EXPECT_EQ(cause_class(observation), "none");
+  EXPECT_EQ(integer_fact(observation, kVendorCodeModeFactId), 1);
+  EXPECT_EQ(integer_fact(observation, kVendorCodeStateFactId), 4);
+  EXPECT_EQ(find_fact(observation, kVendorCodeErrorFactId), nullptr);
+  EXPECT_EQ(find_fact(observation, kVendorCodeWarningFactId), nullptr);
+
+  struct Row {
+    int error_code;
+    std::string_view cause;
+    bool power_cycle;
+  };
+  for (const Row row : {Row{1, "emergency_stop", false},
+                        Row{2, "emergency_stop", false},
+                        Row{3, "emergency_stop", false},
+                        Row{31, "collision", false},
+                        Row{10, "fault", true},
+                        Row{12, "fault", true},
+                        Row{17, "fault", true},
+                        Row{9, "fault", false},
+                        Row{18, "fault", false},
+                        Row{22, "fault", false}}) {
+    SCOPED_TRACE(row.error_code);
+    fake->observation = disabled_observation();
+    fake->observation.generation = observation.observation_generation;
+    fake->observation.mode = 0;
+    fake->observation.fault_present = FactState::kTrue;
+    fake->observation.recovery_required = FactState::kTrue;
+    fake->observation.error_code = row.error_code;
+    observation = observe_changed(port, *fake);
+    // Fault precedence: the drive-disabled stopped arm stays Disabled.
+    EXPECT_EQ(observation.observed_state,
+              core::ComponentLifecycleStateDTO::kDisabled);
+    EXPECT_EQ(cause_class(observation), row.cause);
+    EXPECT_EQ(token_fact(observation, kVendorCodeErrorFactId),
+              "C" + std::to_string(row.error_code));
+    EXPECT_EQ(integer_fact(observation, kVendorCodeModeFactId), 0);
+    EXPECT_EQ(integer_fact(observation, kVendorCodeStateFactId), 4);
+    if (row.power_cycle) {
+      EXPECT_EQ(token_fact(observation, kVendorCodePowerCycleFactId),
+                std::string(kPowerCycleRequiredToken));
+    } else {
+      EXPECT_EQ(find_fact(observation, kVendorCodePowerCycleFactId), nullptr);
+    }
+  }
+
+  // A real Lite 6 (firmware 2.7.0) reported C2 with fault flags; the error
+  // code alone already establishes the class.
+  fake->observation = disabled_observation();
+  fake->observation.generation = observation.observation_generation;
+  fake->observation.error_code = 2;
+  observation = observe_changed(port, *fake);
+  EXPECT_EQ(cause_class(observation), "emergency_stop");
+
+  // Emergency stop survives report loss; vendor codes are not invented.
+  fake->observation.motion_enabled = FactState::kUnknown;
+  fake->observation.fault_present = FactState::kUnknown;
+  fake->observation.recovery_required = FactState::kUnknown;
+  fake->observation.error_code = -1;
+  fake->observation.warning_code = -1;
+  fake->observation.mode = -1;
+  fake->observation.state = -1;
+  fake->observation.blocking_reason_codes = {"xarm_report_unavailable"};
+  observation = observe_changed(port, *fake);
+  EXPECT_EQ(cause_class(observation), "emergency_stop");
+  EXPECT_EQ(find_fact(observation, kVendorCodeErrorFactId), nullptr);
+  EXPECT_EQ(find_fact(observation, kVendorCodeModeFactId), nullptr);
+
+  // Warning only: not classified (no documented protective-stop code).
+  fake->observation = disabled_observation();
+  fake->observation.generation = observation.observation_generation;
+  fake->observation.warning_code = 23;
+  observation = observe_changed(port, *fake);
+  EXPECT_EQ(cause_class(observation), "unknown");
+  EXPECT_EQ(integer_fact(observation, kVendorCodeWarningFactId), 23);
+}
+
+TEST(XArmBrandLifecyclePort, RefusesErrorClearingBeforeServoFaultPowerCycle) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  fake->observation.error_code = 14;
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  static_cast<void>(observe_changed(port, *fake));
+
+  const auto refused = dispatch(port, kXArmClearErrorPrimitiveId);
+  EXPECT_EQ(refused.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->details.at("reason"), "power_cycle_required");
+  EXPECT_TRUE(fake->commands.empty());
+
+  // Another error code may be cleared.
+  fake->observation.error_code = 22;
+  static_cast<void>(observe_changed(port, *fake));
+  const auto cleared = dispatch(port, kXArmClearErrorPrimitiveId);
+  EXPECT_EQ(cleared.known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(fake->commands.size(), 1U);
+}
+
+TEST(XArmBrandLifecyclePort, OwnPrimitiveEffectsAreNeverExternalControl) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  fake->observation.mode = 0;
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // Prepare: enable drives (state stays 4), then select joint-servo mode
+  // with the vendor's intermediate mode-1/state-4 report.
+  ASSERT_EQ(dispatch(port, kXArmEnableMotionPrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.motion_enabled = FactState::kTrue;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  ASSERT_EQ(dispatch(port, kXArmSelectJointServoModePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.mode = 1;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  fake->observation.state = 5;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // Enable: ready state; then own ros2_control motion alternates 1 and 2.
+  ASSERT_EQ(dispatch(port, kXArmSetReadyStatePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.state = 2;
+  fake->observation.vendor_control_ready = FactState::kTrue;
+  auto observation = observe_changed(port, *fake);
+  EXPECT_EQ(observation.observed_state,
+            core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(cause_class(observation), "none");
+  clock.set(clock.now() + 60'000'000'000LL);
+  fake->observation.state = 1;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  fake->observation.state = 2;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // Disable: stopped state through deceleration, then drives off.
+  ASSERT_EQ(dispatch(port, kXArmSetStoppedStatePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.state = 6;
+  fake->observation.vendor_control_ready = FactState::kFalse;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  fake->observation.state = 4;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  ASSERT_EQ(dispatch(port, kXArmDisableMotionPrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.motion_enabled = FactState::kFalse;
+  fake->observation.mode = 0;
+  observation = observe_changed(port, *fake);
+  EXPECT_EQ(observation.observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(cause_class(observation), "none");
+
+  // An own primitive whose outcome is unknown still explains its effect.
+  fake->next_result = {XArmLifecycleResultState::kOutcomeUnknownAfterDispatch,
+                       true,
+                       true,
+                       -1,
+                       "lost_response",
+                       0U,
+                       false};
+  ASSERT_EQ(dispatch(port, kXArmEnableMotionPrimitiveId).dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain);
+  fake->observation.motion_enabled = FactState::kTrue;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+}
+
+TEST(XArmBrandLifecyclePort, UnrequestedModeOrStateChangeIsStickyExternalControl) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = active_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // A vendor-UI jog leaves position mode / mode-changed state without a
+  // ManyForge request.
+  fake->observation.mode = 0;
+  fake->observation.state = 5;
+  fake->observation.vendor_control_ready = FactState::kFalse;
+  auto observation = observe_changed(port, *fake);
+  EXPECT_EQ(cause_class(observation), "external_control");
+  EXPECT_EQ(integer_fact(observation, kVendorCodeModeFactId), 0);
+  EXPECT_EQ(integer_fact(observation, kVendorCodeStateFactId), 5);
+
+  // Sticky across report loss and while the status stays unexplained,
+  // and even when the robot is returned to the explained pair.
+  auto unreported = fake->observation;
+  unreported.motion_enabled = FactState::kUnknown;
+  unreported.fault_present = FactState::kUnknown;
+  unreported.recovery_required = FactState::kUnknown;
+  unreported.mode = -1;
+  unreported.state = -1;
+  unreported.blocking_reason_codes = {"xarm_report_unavailable"};
+  const auto reported = fake->observation;
+  fake->observation = unreported;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+  fake->observation = reported;
+  fake->observation.generation = unreported.generation;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+  fake->observation.mode = 1;
+  fake->observation.state = 2;
+  fake->observation.vendor_control_ready = FactState::kTrue;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+  fake->observation.mode = 0;
+  fake->observation.state = 5;
+  fake->observation.vendor_control_ready = FactState::kFalse;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+
+  // A requested Disable (stop direction) does not acknowledge it.
+  ASSERT_EQ(dispatch(port, kXArmSetStoppedStatePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.state = 4;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+
+  // The next non-stop primitive (dispatched by CCLC only after the
+  // operator's acknowledgement) re-baselines from the fresh report.
+  ASSERT_EQ(dispatch(port, kXArmSelectJointServoModePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.mode = 1;
+  fake->observation.state = 5;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+  ASSERT_EQ(dispatch(port, kXArmSetReadyStatePrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.state = 2;
+  fake->observation.vendor_control_ready = FactState::kTrue;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // A stop ManyForge did not request, after the own primitive settled.
+  clock.set(clock.now() + 6'000'000'000LL);
+  fake->observation.state = 4;
+  fake->observation.vendor_control_ready = FactState::kFalse;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+}
+
+TEST(XArmBrandLifecyclePort, ModesManyForgeNeverSelectsAreExternalControl) {
+  for (const int mode : {2, 4}) {
+    SCOPED_TRACE(mode);
+    core::FakeClock clock;
+    clock.set(10'000);
+    auto transport = std::make_unique<FakeSupervisedSession>();
+    auto *fake = transport.get();
+    fake->observation = disabled_observation();
+    fake->observation.mode = mode;
+    Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+    // Even on the first report, and even while an own primitive is in
+    // flight or settling.
+    EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+    ASSERT_EQ(dispatch(port, kXArmEnableMotionPrimitiveId).known_result,
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+    EXPECT_EQ(cause_class(observe_changed(port, *fake)), "external_control");
+  }
+}
+
+TEST(XArmBrandLifecyclePort, ErrorClassPrecedesExternalControl) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = active_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+
+  // An emergency stop reports mode 0 / state 4: the error explains it.
+  fake->observation.mode = 0;
+  fake->observation.state = 4;
+  fake->observation.motion_enabled = FactState::kFalse;
+  fake->observation.vendor_control_ready = FactState::kFalse;
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  fake->observation.error_code = 2;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "emergency_stop");
+
+  // Recover clears the error from the explained stopped pair.
+  ASSERT_EQ(dispatch(port, kXArmClearErrorPrimitiveId).known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  fake->observation.fault_present = FactState::kFalse;
+  fake->observation.recovery_required = FactState::kFalse;
+  fake->observation.error_code = 0;
+  EXPECT_EQ(cause_class(observe_changed(port, *fake)), "none");
+}
+
+TEST(XArmBrandLifecyclePort, NonZeroVendorReturnIsAnUnknownOutcome) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+
+  fake->next_result = {XArmLifecycleResultState::kResponseReceived,
+                       true,
+                       true,
+                       9,
+                       "vendor_rejected",
+                       0U,
+                       false};
+  const auto rejected = dispatch(port, kXArmEnableMotionPrimitiveId);
+  ASSERT_TRUE(rejected.locally_valid());
+  EXPECT_EQ(rejected.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain);
+  EXPECT_EQ(rejected.effect, core::LifecyclePrimitiveEffectDTO::kPossible);
+  EXPECT_FALSE(rejected.known_result.has_value());
+  ASSERT_TRUE(rejected.error.has_value());
+  EXPECT_EQ(rejected.error->code, "xarm_lifecycle_primitive_outcome_unknown");
+  EXPECT_EQ(rejected.error->details.at("reason"),
+            "vendor_return_code_9:vendor_rejected");
+  EXPECT_EQ(fake->commands.size(), 1U);
+
+  // Attempted but not permitted is equally unknown, never a known failure.
+  fake->next_result.permitted = false;
+  fake->next_result.return_code = 0;
+  const auto unpermitted = dispatch(port, kXArmEnableMotionPrimitiveId);
+  EXPECT_EQ(unpermitted.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain);
+
+  // Not attempted by the owner remains not dispatched.
+  fake->next_result.attempted = false;
+  const auto refused = dispatch(port, kXArmEnableMotionPrimitiveId);
+  EXPECT_EQ(refused.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
 }
 
 } // namespace

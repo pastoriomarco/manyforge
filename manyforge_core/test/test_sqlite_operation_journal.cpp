@@ -1258,22 +1258,22 @@ TEST(SqliteOperationJournalTest, TypedControlScaleAndStopRecordsRoundTripAsTermi
         journal.RecordOperationAccepted(first_epoch, intent, Acceptance(intent, state), state)
             .ok());
 
-    const OperationControlRequestDTO pause_request{
-        PublicRequestContextDTO{RequestId("request.pause.1"), first_epoch, "journal-test",
+    const OperationControlRequestDTO reset_request{
+        PublicRequestContextDTO{RequestId("request.reset.1"), first_epoch, "journal-test",
                                 std::nullopt},
         state.operation_id, state.operation_revision, std::nullopt};
     const auto prior_revision = state.operation_revision;
     state.operation_revision = OperationRevision(2U);
     state.updated_at_ns = 11;
-    const OperationControlAcceptedDTO pause_accepted{pause_request.request_context.request_id,
+    const OperationControlAcceptedDTO reset_accepted{reset_request.request_context.request_id,
                                                      RequestReplayStatusDTO::kAcceptedNew,
                                                      state.operation_id,
                                                      prior_revision,
-                                                     OperationControlKind::kPause,
+                                                     OperationControlKind::kReset,
                                                      state.operation_revision,
                                                      state.updated_at_ns};
     ASSERT_TRUE(
-        journal.RecordControlAccepted(first_epoch, pause_request, pause_accepted, state).ok());
+        journal.RecordControlAccepted(first_epoch, reset_request, reset_accepted, state).ok());
 
     const RuntimeScaleRequestDTO scale_request{
         PublicRequestContextDTO{RequestId("request.scale.1"), first_epoch, "journal-test",
@@ -2516,9 +2516,8 @@ TEST(SqliteOperationJournalTest,
                                     epoch, "journal-test", std::nullopt},
             state.operation_id, state.operation_revision, std::nullopt};
         const auto prior_revision = state.operation_revision;
-        const bool pause = update % 2U == 1U;
         state.operation_revision = OperationRevision(state.operation_revision.value() + 1U);
-        state.state = pause ? OperationStateKind::kPaused : OperationStateKind::kExecuting;
+        state.state = OperationStateKind::kExecuting;
         state.participants.front().state = state.state;
         ++state.updated_at_ns;
         const OperationControlAcceptedDTO control{
@@ -2526,7 +2525,7 @@ TEST(SqliteOperationJournalTest,
             RequestReplayStatusDTO::kAcceptedNew,
             state.operation_id,
             prior_revision,
-            pause ? OperationControlKind::kPause : OperationControlKind::kResume,
+            OperationControlKind::kReset,
             state.operation_revision,
             state.updated_at_ns};
         const auto controlled = journal.RecordControlAccepted(epoch, request, control, state);
@@ -2583,9 +2582,8 @@ TEST(SqliteOperationJournalTest, ActiveOperationControlUpdatesConsumeOneDurableA
             "journal-test", std::nullopt},
         first.operation_id, first.operation_revision, std::nullopt};
     const auto prior_revision = first.operation_revision;
-    const bool pause = update % 2U == 1U;
     first.operation_revision = OperationRevision(first.operation_revision.value() + 1U);
-    first.state = pause ? OperationStateKind::kPaused : OperationStateKind::kExecuting;
+    first.state = OperationStateKind::kExecuting;
     first.participants.front().state = first.state;
     ++first.updated_at_ns;
     const OperationControlAcceptedDTO accepted{
@@ -2593,7 +2591,7 @@ TEST(SqliteOperationJournalTest, ActiveOperationControlUpdatesConsumeOneDurableA
         RequestReplayStatusDTO::kAcceptedNew,
         first.operation_id,
         prior_revision,
-        pause ? OperationControlKind::kPause : OperationControlKind::kResume,
+        OperationControlKind::kReset,
         first.operation_revision,
         first.updated_at_ns};
     ASSERT_TRUE(journal.RecordControlAccepted(epoch, request, accepted, first).ok());

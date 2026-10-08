@@ -77,8 +77,6 @@ adapters:
       - execution.feedback.phase_events
       - execution.feedback.state_snapshots
       - execution.stop.soft
-      - execution.pause
-      - execution.resume
       - execution.reset
     config:
       resolution_marker: __MANYFORGE_SUPERVISED_RUNTIME_BINDING__

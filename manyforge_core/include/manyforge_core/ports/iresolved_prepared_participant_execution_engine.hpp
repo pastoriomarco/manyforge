@@ -42,21 +42,6 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
 };
 
-/// Owner-minted authority for one fresh Resume of an already-dispatched
-/// participant.  Stable binding/readiness facts remain sealed
-/// in the resident preparation session; these are the only facts that change
-/// for the new immutable participant and controller goal.
-struct ResolvedPreparedMotionResumeRequestDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision{0U};
-  OperationParticipantId participant_id;
-  ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation{0U};
-  std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;
-  std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
-  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
-};
-
 enum class ResolvedPreparedMotionExecutionStateDTO : std::uint8_t {
   kPreparing = 0,
   kPrepared,
@@ -76,12 +61,11 @@ struct ResolvedPreparedMotionExecutionSnapshotDTO final {
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<ErrorDTO> error;
-  /// Exact trajectory position for last_dispatched_participant, NOT an
-  /// unexecuted current candidate (which may belong to a failed Resume);
+  /// Exact trajectory position for last_dispatched_participant;
   /// absent while moving, after an uncertain replacement, or without support.
   /// This is continuation data, not a Stop certificate or dispatch permission.
   std::optional<double> stopped_trajectory_time_s{};
-  /// Last verified dispatch, distinct from an unexecuted Resume candidate.
+  /// Last verified dispatch.
   /// Shared immutable reference only; no additional product copy or authority.
   std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant{};
 };
@@ -141,24 +125,6 @@ class IResolvedPreparedParticipantExecutionEngine {
   /// repeated or stale identities fail before backend dispatch.
   virtual Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
                                               const ContentDigest& prepared_contract_digest) = 0;
-
-  /// Begin side-effect-free re-preparation of one paused, already-dispatched
-  /// motion under owner-minted current operation/goal authority.  The
-  /// preparation is observed through ObservePreparedMotion; it cannot dispatch
-  /// until DispatchPreparedResumeMotion releases the coordinated barrier.
-  virtual Result<void> PrepareResumeMotion(std::uint64_t execution_id,
-                                           ResolvedPreparedMotionResumeRequestDTO request) = 0;
-
-  /// Release one exact freshly prepared Resume product.  The subordinate must
-  /// invoke IExecutionBackend::DispatchResume and reject any returned handle
-  /// that does not preserve the new goal generation and contract digest.
-  virtual Result<void> DispatchPreparedResumeMotion(
-      std::uint64_t execution_id, const ContentDigest& prepared_contract_digest) = 0;
-
-  /// Cancel an in-flight Resume preparation before its dispatch barrier is
-  /// released.  This performs no physical Stop; terminal containment remains
-  /// owned by the addressed Kernel.
-  virtual Result<void> CancelPreparedResumeMotion(std::uint64_t execution_id) = 0;
 
   /// Bounded pre-dispatch cancellation. This requests cancellation of active
   /// planning/validation and releases a waiting prepare barrier; it never calls

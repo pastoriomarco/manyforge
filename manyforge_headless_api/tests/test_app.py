@@ -1003,16 +1003,6 @@ class FakeExecution:
         self.principals.append((kind, trusted_principal_id))
         return {"ok": True, "command": kind, "accepted": {"control": kind}}
 
-    def pause(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
-        return self._control("pause", request, trusted_principal_id)
-
-    def resume(
-        self, request: object, *, trusted_principal_id: str | None
-    ) -> dict[str, Any]:
-        return self._control("resume", request, trusted_principal_id)
-
     def reset(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
@@ -1187,8 +1177,6 @@ class FakeProgramRunner:
             "program_manual_handover",
             "operation_start",
             "operation_stop",
-            "operation_pause",
-            "operation_resume",
             "operation_reset",
             "operation_acknowledge_completed",
             "cell_full_stop",
@@ -3388,8 +3376,6 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert not any("runtime-overrides" in path for path in paths)
     assert "/api/program/runs/{program_run_id}/blackboard-values" in paths
     assert {
-        "/api/execution/operations/{operation_id}/pause",
-        "/api/execution/operations/{operation_id}/resume",
         "/api/execution/operations/{operation_id}/reset",
         "/api/execution/operations/{operation_id}/acknowledge-completed",
         "/api/execution/runtime-scale-control",
@@ -3871,7 +3857,7 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     }
 
     with TestClient(app) as client:
-        for endpoint in ("pause", "resume", "reset", "acknowledge-completed"):
+        for endpoint in ("reset", "acknowledge-completed"):
             response = client.post(
                 f"/api/execution/operations/operation-1/{endpoint}",
                 json=control,
@@ -3963,8 +3949,6 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
         )
 
     assert [kind for kind, _request in execution.requests] == [
-        "pause",
-        "resume",
         "reset",
         "acknowledge_completed",
         "stop",
@@ -3980,8 +3964,6 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
         ],
     }
     assert execution.principals == [
-        ("pause", None),
-        ("resume", None),
         ("reset", None),
         ("acknowledge_completed", None),
         ("stop", None),
@@ -4073,11 +4055,11 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
     }
     with TestClient(app) as client:
         forged = client.post(
-            "/api/execution/operations/operation-1/pause",
+            "/api/execution/operations/operation-1/reset",
             json={**body, "principal_id": "forged"},
         )
         forged_context = client.post(
-            "/api/execution/operations/operation-1/pause",
+            "/api/execution/operations/operation-1/reset",
             json={
                 **body,
                 "request_context": {
@@ -4086,12 +4068,12 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
                 },
             },
         )
-        accepted = client.post("/api/execution/operations/operation-1/pause", json=body)
+        accepted = client.post("/api/execution/operations/operation-1/reset", json=body)
 
     assert forged.status_code == 422
     assert forged_context.status_code == 422
     assert accepted.status_code == 200
-    assert execution.principals == [("pause", "operator.7")]
+    assert execution.principals == [("reset", "operator.7")]
 
 
 def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -> None:
@@ -4112,7 +4094,7 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
     }
     with TestClient(app) as client:
         mismatch = client.post(
-            "/api/execution/operations/operation-1/pause",
+            "/api/execution/operations/operation-1/reset",
             json={
                 "request_context": context,
                 "operation_id": "operation-2",

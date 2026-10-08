@@ -48,7 +48,7 @@ progress-only samples do not append journal records. Headless coalesces changes
 on its existing event-pump wake; no extra polling connection or cold-state
 rebuild is involved. An empty list clears prior samples. The browser applies
 samples only to an executing operation with matching owner, ID and revision;
-lifecycle, Pause, Stop and terminal state always take precedence. Unchanged
+lifecycle, Stop and terminal state always take precedence. Unchanged
 progress produces no control publication.
 
 ## Two independent states

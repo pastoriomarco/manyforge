@@ -7,7 +7,6 @@ void ExecutionWorkerSignals::mark_started() {
     std::lock_guard<std::mutex> lock(mutex_);
     execution_complete_ = false;
     abandoned_ = false;
-    resume_requested_ = false;
   }
   cv_.notify_all();
 }
@@ -38,29 +37,6 @@ bool ExecutionWorkerSignals::wait_for_completion(std::int64_t timeout_ns) {
   }
   cv_.wait(lock, [this]() { return execution_complete_ || abandoned_; });
   return execution_complete_;
-}
-
-void ExecutionWorkerSignals::request_resume() {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    resume_requested_ = true;
-  }
-  cv_.notify_all();
-}
-
-bool ExecutionWorkerSignals::consume_resume_request() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const bool requested = resume_requested_;
-  resume_requested_ = false;
-  return requested;
-}
-
-void ExecutionWorkerSignals::clear_resume_request() {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    resume_requested_ = false;
-  }
-  cv_.notify_all();
 }
 
 void ExecutionWorkerSignals::notify() {

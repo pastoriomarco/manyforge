@@ -43,8 +43,6 @@ enum class ErrorCode {
     kExecutionAborted,
     kExecutionTimeout,
     kStopFailed,
-    kPauseFailed,
-    kResumeFailed,
     kResetFailed,
     kInternalError,
     kInvariantViolation,
@@ -87,8 +85,6 @@ inline const char* to_string(ErrorCode code) {
         case kExecutionAborted: return "execution_aborted";
         case kExecutionTimeout: return "execution_timeout";
         case kStopFailed: return "stop_failed";
-        case kPauseFailed: return "pause_failed";
-        case kResumeFailed: return "resume_failed";
         case kResetFailed: return "reset_failed";
         case kInternalError: return "internal_error";
         case kInvariantViolation: return "invariant_violation";
@@ -290,8 +286,6 @@ inline const char* kErrorExecutionRejected = "execution_rejected";
 inline const char* kErrorExecutionAborted = "execution_aborted";
 inline const char* kErrorExecutionTimeout = "execution_timeout";
 inline const char* kErrorStopFailed = "stop_failed";
-inline const char* kErrorPauseFailed = "pause_failed";
-inline const char* kErrorResumeFailed = "resume_failed";
 inline const char* kErrorResetFailed = "reset_failed";
 
 // Internal

@@ -895,8 +895,11 @@ class ComponentLifecycleCoordinator::Impl final {
           "route_services_missing"));
     }
     try {
-      auto snapshot = route_services_->current_snapshot_source->ReadCurrentRouteSelectionSnapshot(
-          retained_bundle_id, graph_revision, desired_configuration);
+      // Observation never needs route-selection permission: a Declared
+      // component (or one without lifecycle facts) is still observable.
+      auto snapshot =
+          route_services_->current_snapshot_source->ReadCurrentRouteConfigurationObservation(
+              retained_bundle_id, graph_revision, desired_configuration);
       if (!snapshot.ok()) return Result<Readback>::Err(snapshot.error());
       if (expected_current) {
         const auto& current = snapshot.value().value().active_control_configuration;

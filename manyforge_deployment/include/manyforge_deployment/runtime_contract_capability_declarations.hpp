@@ -25,14 +25,12 @@ inline constexpr std::array<std::string_view, 14U> kLogicalSceneServices{{
     "scene.shape.sphere",
 }};
 
-inline constexpr std::array<std::string_view, 22U> kExecutionServices{{
+inline constexpr std::array<std::string_view, 20U> kExecutionServices{{
     "execution.contact.geometric",
     "execution.contact.geometric_signed_penetration",
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
-    "execution.pause",
     "execution.reset",
-    "execution.resume",
     "execution.stop.soft",
     "execution.trajectory.execute",
     "model.kinematics.fk",

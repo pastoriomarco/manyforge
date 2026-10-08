@@ -69,7 +69,6 @@ _ACTIVE_STATES: Final = frozenset(
         ExecutionState.PREPARED.value,
         ExecutionState.DISPATCHING.value,
         ExecutionState.EXECUTING.value,
-        ExecutionState.PAUSED.value,
         ExecutionState.STOPPING.value,
     }
 )
@@ -2873,8 +2872,6 @@ class _NativeKernelControlTaskPort:
     """One-shot controls; only pending observations are retained locally."""
 
     _CAPABILITIES = {
-        "kernel.pause_operation": "execution.pause",
-        "kernel.resume_operation": "execution.resume",
         "kernel.reset_operation": "execution.reset",
         "kernel.stop_operation": "execution.stop.soft",
         "kernel.set_runtime_scale": "execution.runtime_scale.operation_scoped",
@@ -3003,8 +3000,6 @@ class _NativeKernelControlTaskPort:
                     )
                 else:
                     method = {
-                        "kernel.pause_operation": kernel.pause,
-                        "kernel.resume_operation": kernel.resume,
                         "kernel.reset_operation": kernel.reset,
                     }[node_id]
                     response = method(
@@ -3143,7 +3138,7 @@ class _NativeKernelControlTaskPort:
             ) != task.accepted.get("operation_revision_after_acceptance"):
                 state, reason = OwnerTaskState.FAILED, "operation_control_superseded"
             elif envelope.get("control_pending") is True:
-                pass  # observed Paused/Executing is not completed provider work
+                pass  # an observed Executing state is not completed provider work
             elif envelope.get("control_pending") is not False:
                 raise ProductionPortError("control completion is unavailable")
             elif task.node_id == "kernel.reset_operation":
@@ -3151,16 +3146,6 @@ class _NativeKernelControlTaskPort:
                     state = OwnerTaskState.SUCCEEDED
                 else:
                     state, reason = OwnerTaskState.FAILED, "operation_reset_failed"
-            elif task.node_id == "kernel.pause_operation" and operation.get("state") in {
-                "paused",
-                "completed",
-            }:
-                state = OwnerTaskState.SUCCEEDED
-            elif task.node_id == "kernel.resume_operation" and operation.get("state") in {
-                "executing",
-                "completed",
-            }:
-                state = OwnerTaskState.SUCCEEDED
             elif operation.get("state") not in _ACTIVE_STATES:
                 state, reason = OwnerTaskState.FAILED, "operation_control_interrupted"
         if state is not OwnerTaskState.ACTIVE:

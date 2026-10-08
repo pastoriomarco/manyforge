@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/ports/icclc_journal.hpp>
+#include <manyforge_core/ports/icclc_lifecycle_target_store.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <memory>
 #include <optional>
@@ -13,7 +14,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 13;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 15;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -54,10 +55,16 @@ struct NativeApplyPlanRequestDTO final {
   std::vector<ActiveControlConfigurationDTO> retained_routes;
   /// Predecessor domains the Apply removes; never in `compiled_routes`.
   std::vector<ControlDomainId> removed_domains;
+  /// The state of each changed component without an explicit Disable: kActive
+  /// when the host enables it during Apply (native), kDeclared when the host
+  /// only observes an externally managed controller (ROS 2 control) and the
+  /// component reaches readiness later through ordinary CCLC Prepare/Enable.
+  ComponentLifecycleStateDTO changed_component_state{ComponentLifecycleStateDTO::kActive};
 };
 
 /// CCLC's recorded decision for one native Apply: which components keep an
-/// explicit Disable (their gate stays closed) and the generations the
+/// explicit Disable (their gate stays closed), whether the others start
+/// Active or only Declared, and the generations the
 /// candidate routes and component facts use. Generations continue from the
 /// journal's watermarks and every earlier plan, so an A->B->A sequence never
 /// reuses or falls behind a generation.
@@ -93,7 +100,7 @@ struct NativeApplyFactAdoptionDTO final {
 /// The adapter is deliberately separate from the pure Core target. It uses a
 /// closed binary DTO codec and a defensive fixed-schema database; it does not
 /// acquire lifecycle semantics or call any external primitive.
-class SqliteCCLCJournal final : public ICCLCJournal {
+class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTargetStore {
  public:
   SqliteCCLCJournal(std::filesystem::path database_path, CellId cell_id,
                     std::size_t exact_result_history_capacity = kDefaultCCLCExactResultHistory,
@@ -225,11 +232,52 @@ class SqliteCCLCJournal final : public ICCLCJournal {
   /// runtime route readback. The facts must equal the recorded plan.
   /// Repetition of the same promotion is read-only; another candidate or
   /// unsettled CCLC transaction fails closed.
+  /// The same transaction sets each changed component's requested target:
+  /// `disabled` when the plan keeps an explicit Disable, otherwise the startup
+  /// target `active`; retained components keep theirs and components leaving
+  /// the adopted set have theirs cancelled.
   [[nodiscard]] Result<void> AdoptNativeApplyFacts(
       const NativeApplyFactAdoptionDTO& adoption);
 
   [[nodiscard]] Result<bool> HasNativeApplyFacts(
       const ActiveBundlePublicationReceiptDTO& publication);
+
+  /// Requested lifecycle targets (session-scoped). Adoption of an Apply's
+  /// facts initializes or cancels them atomically; see AdoptNativeApplyFacts.
+  [[nodiscard]] Result<ComponentLifecycleTargetDTO> SetLifecycleTarget(
+      const ControllableComponentId& component, LifecycleTargetStateDTO requested_state,
+      LifecycleTargetOriginDTO origin) override;
+  [[nodiscard]] Result<std::vector<ComponentLifecycleTargetDTO>> LoadLifecycleTargets() override;
+  [[nodiscard]] Result<std::optional<ComponentLifecycleTargetDTO>> LoadLifecycleTarget(
+      const ControllableComponentId& component) override;
+  [[nodiscard]] Result<bool> RecordInterventionCause(
+      const ControllableComponentId& component, const ControlDomainId& domain,
+      std::optional<LifecycleBlockingCauseClassDTO> cause_class,
+      std::int64_t observed_at_ns) override;
+  [[nodiscard]] Result<std::vector<ComponentLifecycleInterventionCauseDTO>>
+  LoadInterventionCauses(const ControllableComponentId& component) override;
+  /// Component incidents and their bounded durable history events
+  /// (addendum 2, 2026-10-08); session-scoped like the targets.
+  [[nodiscard]] Result<bool> RecordLifecycleTargetReached(
+      const ControllableComponentId& component, bool reached) override;
+  [[nodiscard]] Result<bool> ComponentInUnadoptedApplyPlan(
+      const ControllableComponentId& component) override;
+  [[nodiscard]] Result<ComponentIncidentRecordDTO> OpenComponentIncident(
+      const ComponentIncidentRecordDTO& record) override;
+  [[nodiscard]] Result<std::optional<ComponentIncidentRecordDTO>> LoadOpenComponentIncident(
+      const ControllableComponentId& component) override;
+  [[nodiscard]] Result<bool> RecordComponentIncidentContainment(
+      const std::string& incident_id, ComponentIncidentContainmentStateDTO state,
+      const std::string& record_json, std::int64_t occurred_at_ns) override;
+  [[nodiscard]] Result<bool> AcknowledgeComponentIncident(
+      const ComponentLifecycleIncidentDTO& acknowledged, const std::string& payload_json) override;
+  [[nodiscard]] Result<std::optional<ComponentIncidentRecoveryDTO>> LoadComponentIncidentRecovery(
+      const ControllableComponentId& component, const RequestId& request_id) override;
+  [[nodiscard]] Result<bool> UpdateOpenComponentIncident(
+      const std::string& incident_id, LifecycleBlockingCauseClassDTO cause_class,
+      const std::vector<std::string>& vendor_codes, const std::string& record_json) override;
+  [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> LoadComponentIncidentEvents(
+      std::uint64_t after_sequence, std::size_t limit) override;
 
   void Close();
 

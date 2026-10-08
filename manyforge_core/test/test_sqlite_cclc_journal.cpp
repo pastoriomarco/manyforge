@@ -3618,5 +3618,456 @@ TEST(SqliteCCLCJournal, NativeApplyPlanNeverReusesAGenerationAndKeepsAnExplicitD
   EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDisabled);
 }
 
+TEST(SqliteCCLCJournal, ObservedControllerApplyAdoptsDeclaredComponentsAndPublishedRoutes) {
+  ScopedTemporaryDirectory temporary;
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  const auto compiled = route.active_control_configuration_generation.value();
+  const auto declared_request = [&](const std::string& apply_id, const std::string& bundle) {
+    auto request = NativeApplyPlanRequest(apply_id, 1U, bundle, route);
+    request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+    return request;
+  };
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    // Only Active (native) or Declared (observed controller) may be asked for.
+    auto prepared = declared_request("apply.invalid", "bundle.a");
+    prepared.changed_component_state = ComponentLifecycleStateDTO::kPrepared;
+    const auto invalid = journal.PlanNativeApply(prepared);
+    ASSERT_FALSE(invalid.ok());
+    EXPECT_EQ(invalid.error().code, "component_lifecycle_native_apply_invalid");
+
+    const auto plan = journal.PlanNativeApply(declared_request("apply.1", "bundle.a"));
+    ASSERT_TRUE(plan.ok()) << plan.error().message;
+    ASSERT_EQ(plan.value().components.size(), 1U);
+    EXPECT_EQ(plan.value().components.front().state, ComponentLifecycleStateDTO::kDeclared);
+    EXPECT_EQ(plan.value().components.front().generation, ComponentLifecycleGeneration(1U));
+    ASSERT_EQ(plan.value().routes.size(), 1U);
+    EXPECT_EQ(plan.value().routes.front().generation.value(), compiled);
+    // The same delegation cannot be replayed as an enabling Apply.
+    const auto enabling =
+        journal.PlanNativeApply(NativeApplyPlanRequest("apply.1", 1U, "bundle.a", route));
+    ASSERT_FALSE(enabling.ok());
+    EXPECT_EQ(enabling.error().code, "component_lifecycle_native_apply_conflict");
+    const auto replay = journal.PlanNativeApply(declared_request("apply.1", "bundle.a"));
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().components.front().state, ComponentLifecycleStateDTO::kDeclared);
+    EXPECT_EQ(replay.value().components.front().generation, ComponentLifecycleGeneration(1U));
+
+    // Readiness the host never established cannot be adopted.
+    const auto publication = NativeApplyPublication("apply.1", 1U, "bundle.a", 2U);
+    auto active = plan.value().components;
+    active.front().state = ComponentLifecycleStateDTO::kActive;
+    const auto claimed_active = journal.AdoptNativeApplyFacts({publication, active, {route}});
+    ASSERT_FALSE(claimed_active.ok());
+    EXPECT_EQ(claimed_active.error().code, "component_lifecycle_native_apply_unplanned");
+    auto other_route = route;
+    other_route.active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(compiled + 1U);
+    EXPECT_FALSE(
+        journal.AdoptNativeApplyFacts({publication, plan.value().components, {other_route}}).ok());
+
+    const NativeApplyFactAdoptionDTO exact{publication, plan.value().components, {route}};
+    ASSERT_TRUE(journal.AdoptNativeApplyFacts(exact).ok());
+    ASSERT_TRUE(journal.AdoptNativeApplyFacts(exact).ok());
+    const auto settled = journal.ReadUnsettledNativeApplyPlan();
+    ASSERT_TRUE(settled.ok());
+    EXPECT_FALSE(settled.value().has_value());
+    const auto fact =
+        journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+    ASSERT_TRUE(fact.ok());
+    EXPECT_EQ(fact.value().durable_generation, ComponentLifecycleGeneration(1U));
+    EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
+    const auto current = journal.LoadCurrentActiveControlConfiguration(route.control_domain_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_TRUE(current.value().has_value());
+    EXPECT_EQ(*current.value(), route);
+    journal.Close();
+  }
+  {
+    // A later Load keeps the component Declared and continues past every
+    // generation the first one used.
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const auto second = journal.PlanNativeApply(declared_request("apply.2", "bundle.b"));
+    ASSERT_TRUE(second.ok()) << second.error().message;
+    EXPECT_EQ(second.value().components.front().state, ComponentLifecycleStateDTO::kDeclared);
+    EXPECT_EQ(second.value().components.front().generation, ComponentLifecycleGeneration(2U));
+    EXPECT_EQ(second.value().routes.front().generation.value(), compiled + 1U);
+    auto second_route = route;
+    second_route.active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(compiled + 1U);
+    ASSERT_TRUE(journal
+                    .AdoptNativeApplyFacts({NativeApplyPublication("apply.2", 1U, "bundle.b", 3U),
+                                            second.value().components,
+                                            {second_route}})
+                    .ok());
+    journal.Close();
+  }
+  {
+    // The operator explicitly disabled the component.
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(JournalPath(temporary).c_str(), &database), SQLITE_OK);
+    const auto update = "UPDATE lifecycle_component_current_facts SET component_lifecycle_state=" +
+                        std::to_string(static_cast<int>(ComponentLifecycleStateDTO::kDisabled));
+    ASSERT_EQ(sqlite3_exec(database, update.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  }
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto third = journal.PlanNativeApply(declared_request("apply.3", "bundle.a"));
+  ASSERT_TRUE(third.ok()) << third.error().message;
+  EXPECT_EQ(third.value().components.front().state, ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(third.value().components.front().generation, ComponentLifecycleGeneration(3U));
+  EXPECT_EQ(third.value().routes.front().generation.value(), compiled + 2U);
+  // A Disabled plan replays under either changed-state request: only the
+  // non-Disabled changed components are bound to it.
+  EXPECT_TRUE(journal.PlanNativeApply(declared_request("apply.3", "bundle.a")).ok());
+}
+
+// --- Requested lifecycle targets (ADR-0026 §7 amendment, 2026-10-08) ---
+
+TEST(SqliteCCLCJournal, AdoptionInitializesTheStartupTargetAtomically) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  const ControllableComponentId component("component.1");
+  auto request = NativeApplyPlanRequest("apply.1", 1U, "bundle.a", route);
+  request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+  const auto plan = journal.PlanNativeApply(request);
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  // Nothing is targeted before the facts are adopted.
+  ASSERT_TRUE(journal.LoadLifecycleTargets().ok());
+  EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+  EXPECT_FALSE(journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kPrepared,
+                                          LifecycleTargetOriginDTO::kOperator)
+                   .ok());
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.1", 1U, "bundle.a", 2U),
+                                          plan.value().components,
+                                          {route}})
+                  .ok());
+  const auto targets = journal.LoadLifecycleTargets();
+  ASSERT_TRUE(targets.ok());
+  ASSERT_EQ(targets.value().size(), 1U);
+  EXPECT_EQ(targets.value().front(),
+            (ComponentLifecycleTargetDTO{component, LifecycleTargetStateDTO::kActive,
+                                         LifecycleTargetOriginDTO::kStartup, 1U}));
+  // Exact adoption replay is read-only: the generation does not advance.
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.1", 1U, "bundle.a", 2U),
+                                          plan.value().components,
+                                          {route}})
+                  .ok());
+  EXPECT_EQ(journal.LoadLifecycleTarget(component).value()->target_generation, 1U);
+
+  // An operator request replaces it with the next generation.
+  const auto disabled = journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kDisabled,
+                                                   LifecycleTargetOriginDTO::kOperator);
+  ASSERT_TRUE(disabled.ok()) << disabled.error().message;
+  EXPECT_EQ(disabled.value().target_generation, 2U);
+  EXPECT_EQ(journal.LoadLifecycleTarget(component).value(), disabled.value());
+}
+
+TEST(SqliteCCLCJournal, SupersedingApplyReplacesOrCancelsTargetsAndKeepsAnExplicitDisable) {
+  ScopedTemporaryDirectory temporary;
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  const ControllableComponentId component("component.1");
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const auto plan =
+        journal.PlanNativeApply(NativeApplyPlanRequest("apply.1", 1U, "bundle.a", route));
+    ASSERT_TRUE(plan.ok());
+    ASSERT_TRUE(journal
+                    .AdoptNativeApplyFacts({NativeApplyPublication("apply.1", 1U, "bundle.a", 2U),
+                                            plan.value().components,
+                                            {route}})
+                    .ok());
+    ASSERT_TRUE(journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kDisabled,
+                                           LifecycleTargetOriginDTO::kOperator)
+                    .ok());
+    journal.Close();
+  }
+  {
+    // The operator's Disable completed.
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(JournalPath(temporary).c_str(), &database), SQLITE_OK);
+    const auto update = "UPDATE lifecycle_component_current_facts SET component_lifecycle_state=" +
+                        std::to_string(static_cast<int>(ComponentLifecycleStateDTO::kDisabled));
+    ASSERT_EQ(sqlite3_exec(database, update.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  }
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  auto next_route = route;
+  next_route.active_control_configuration_generation = ActiveControlConfigurationGeneration(
+      route.active_control_configuration_generation.value() + 1U);
+  const auto second =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.2", 1U, "bundle.b", route));
+  ASSERT_TRUE(second.ok());
+  ASSERT_EQ(second.value().components.front().state, ComponentLifecycleStateDTO::kDisabled);
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.2", 1U, "bundle.b", 3U),
+                                          second.value().components,
+                                          {next_route}})
+                  .ok());
+  // The explicit Disable survives the superseding Apply unchanged.
+  EXPECT_EQ(journal.LoadLifecycleTarget(component).value(),
+            (ComponentLifecycleTargetDTO{component, LifecycleTargetStateDTO::kDisabled,
+                                         LifecycleTargetOriginDTO::kOperator, 2U}));
+  ASSERT_TRUE(journal
+                  .RecordInterventionCause(component, ControlDomainId("domain.1"),
+                                           LifecycleBlockingCauseClassDTO::kFault, 10)
+                  .ok());
+
+  // An Apply that removes the component cancels its target and causes.
+  const auto removal = NativeApplyPlanRequestWithDelta(
+      "apply.3", "bundle.c", {}, {}, {}, {component}, {}, {route.control_domain_id});
+  const auto removed = journal.PlanNativeApply(removal);
+  ASSERT_TRUE(removed.ok()) << removed.error().message;
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.3", 1U, "bundle.c", 4U),
+                                          removed.value().components,
+                                          {}})
+                  .ok());
+  EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+  EXPECT_FALSE(journal.LoadLifecycleTarget(component).value().has_value());
+  EXPECT_TRUE(journal.LoadInterventionCauses(component).value().empty());
+
+  // Re-adding it starts a fresh startup target with a newer generation.
+  auto readd_route = route;
+  readd_route.active_control_configuration_generation = ActiveControlConfigurationGeneration(
+      route.active_control_configuration_generation.value() + 2U);
+  const auto readded =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.4", 1U, "bundle.a", route));
+  ASSERT_TRUE(readded.ok()) << readded.error().message;
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.4", 1U, "bundle.a", 5U),
+                                          readded.value().components,
+                                          {readd_route}})
+                  .ok())
+      << "re-add adoption";
+  EXPECT_EQ(journal.LoadLifecycleTarget(component).value(),
+            (ComponentLifecycleTargetDTO{component, LifecycleTargetStateDTO::kActive,
+                                         LifecycleTargetOriginDTO::kStartup, 3U}));
+}
+
+TEST(SqliteCCLCJournal, InterventionCauseSurvivesReopenUntilFreshStatusClearsIt) {
+  ScopedTemporaryDirectory temporary;
+  const ControllableComponentId component("component.1");
+  const ControlDomainId domain("domain.1");
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const auto recorded = journal.RecordInterventionCause(
+        component, domain, LifecycleBlockingCauseClassDTO::kEmergencyStop, 100);
+    ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+    EXPECT_TRUE(recorded.value());
+    // The same cause is not rewritten.
+    EXPECT_FALSE(journal
+                     .RecordInterventionCause(component, domain,
+                                              LifecycleBlockingCauseClassDTO::kEmergencyStop, 200)
+                     .value());
+    // Only intervention-requiring classes are retained.
+    EXPECT_FALSE(journal
+                     .RecordInterventionCause(component, domain,
+                                              LifecycleBlockingCauseClassDTO::kAvailability, 300)
+                     .ok());
+    journal.Close();
+  }
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto causes = journal.LoadInterventionCauses(component);
+  ASSERT_TRUE(causes.ok());
+  ASSERT_EQ(causes.value().size(), 1U);
+  EXPECT_EQ(causes.value().front(),
+            (ComponentLifecycleInterventionCauseDTO{
+                component, domain, LifecycleBlockingCauseClassDTO::kEmergencyStop, 100}));
+  EXPECT_TRUE(journal.RecordInterventionCause(component, domain, std::nullopt, 400).value());
+  EXPECT_TRUE(journal.LoadInterventionCauses(component).value().empty());
+  EXPECT_FALSE(journal.RecordInterventionCause(component, domain, std::nullopt, 500).value());
+}
+
+// --- Component incidents (addendum 2, 2026-10-08) ---
+
+[[nodiscard]] ComponentIncidentRecordDTO TestIncident(const std::string& id,
+                                                      const ControllableComponentId& component,
+                                                      const LifecycleBlockingCauseClassDTO cause,
+                                                      const std::int64_t detected_at_ns) {
+  ComponentLifecycleIncidentDTO incident{id,
+                                         component,
+                                         cause,
+                                         {"C2", "mode=0"},
+                                         detected_at_ns,
+                                         "Component lost its controller.",
+                                         std::nullopt,
+                                         {},
+                                         ComponentIncidentContainmentStateDTO::kPending,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         false,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         std::nullopt};
+  return {incident, ComponentIncidentEventPayload(
+                        incident, LifecycleIncidentRecoveryPolicyFor(
+                                      DefaultLifecycleIncidentRecoveryPolicy(), cause),
+                        kComponentIncidentEventKind)};
+}
+
+TEST(SqliteCCLCJournal, OpenIncidentSurvivesReopenAndOnlyTheOperatorsRecoverClosesIt) {
+  ScopedTemporaryDirectory temporary;
+  const ControllableComponentId component("component.1");
+  const auto opened =
+      TestIncident("incident.1", component, LifecycleBlockingCauseClassDTO::kProviderLost, 100);
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const auto stored = journal.OpenComponentIncident(opened);
+    ASSERT_TRUE(stored.ok()) << stored.error().message;
+    EXPECT_EQ(stored.value(), opened);
+    // One open incident per component: a second detection returns it.
+    const auto again = journal.OpenComponentIncident(
+        TestIncident("incident.2", component, LifecycleBlockingCauseClassDTO::kFault, 200));
+    ASSERT_TRUE(again.ok());
+    EXPECT_EQ(again.value().incident.incident_id, "incident.1");
+    ASSERT_TRUE(journal
+                    .RecordInterventionCause(component, ControlDomainId("domain.1"),
+                                             LifecycleBlockingCauseClassDTO::kEmergencyStop, 150)
+                    .ok());
+    journal.Close();
+  }
+  // In-session host replacement: a new journal owner sees the same incident.
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto open = journal.LoadOpenComponentIncident(component);
+  ASSERT_TRUE(open.ok()) << open.error().message;
+  ASSERT_TRUE(open.value().has_value());
+  EXPECT_EQ(*open.value(), opened);
+  EXPECT_TRUE(journal.LoadComponentIncidentEvents(0U, 16U).value().empty());
+
+  // Containment is recorded once, with its history event.
+  const auto contained = ComponentIncidentRecordWithContainment(
+      opened.record_json, ComponentIncidentContainmentStateDTO::kRequested,
+      ComponentIncidentContainmentReceiptDTO{StopId("stop.7"), StopGeneration(3U), {}, std::nullopt},
+      std::nullopt);
+  ASSERT_TRUE(journal
+                  .RecordComponentIncidentContainment(
+                      "incident.1", ComponentIncidentContainmentStateDTO::kRequested, contained, 110)
+                  .value());
+  EXPECT_FALSE(journal
+                   .RecordComponentIncidentContainment(
+                       "incident.1", ComponentIncidentContainmentStateDTO::kRequested, contained,
+                       120)
+                   .value());
+  // A further change while open: the most recent cause wins.
+  const auto changed = ComponentIncidentRecordWithChange(
+      contained, 130, LifecycleBlockingCauseClassDTO::kEmergencyStop, {"C2", "mode=0", "C1"});
+  ASSERT_TRUE(journal
+                  .UpdateOpenComponentIncident("incident.1",
+                                               LifecycleBlockingCauseClassDTO::kEmergencyStop,
+                                               {"C2", "mode=0", "C1"}, changed)
+                  .value());
+  auto current = journal.LoadOpenComponentIncident(component).value();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(current->incident.cause_class, LifecycleBlockingCauseClassDTO::kEmergencyStop);
+  EXPECT_EQ(current->incident.vendor_codes, (std::vector<std::string>{"C2", "mode=0", "C1"}));
+  EXPECT_EQ(current->incident.containment_state, ComponentIncidentContainmentStateDTO::kRequested);
+  EXPECT_EQ(current->record_json, changed);
+
+  auto acknowledged = current->incident;
+  acknowledged.acknowledged = true;
+  acknowledged.acknowledged_by = "operator.ada";
+  acknowledged.acknowledged_at_ns = 140;
+  acknowledged.acknowledgement_request_id = RequestId("operator.recover.1");
+  const auto payload = ComponentIncidentAcknowledgedPayload(current->record_json, acknowledged);
+  ASSERT_TRUE(journal.AcknowledgeComponentIncident(acknowledged, payload).value());
+  EXPECT_FALSE(journal.AcknowledgeComponentIncident(acknowledged, payload).value());
+  EXPECT_FALSE(journal.LoadOpenComponentIncident(component).value().has_value());
+  EXPECT_TRUE(journal.LoadInterventionCauses(component).value().empty());
+  const auto recovery =
+      journal.LoadComponentIncidentRecovery(component, RequestId("operator.recover.1"));
+  ASSERT_TRUE(recovery.ok() && recovery.value().has_value());
+  EXPECT_EQ(*recovery.value(),
+            (ComponentIncidentRecoveryDTO{"incident.1", component,
+                                          LifecycleBlockingCauseClassDTO::kEmergencyStop,
+                                          "operator.ada", 140}));
+  EXPECT_FALSE(journal.LoadComponentIncidentRecovery(component, RequestId("other"))
+                   .value()
+                   .has_value());
+
+  const auto events = journal.LoadComponentIncidentEvents(0U, 16U);
+  ASSERT_TRUE(events.ok()) << events.error().message;
+  ASSERT_EQ(events.value().size(), 2U);
+  EXPECT_EQ(events.value()[0].sequence, 1U);
+  EXPECT_EQ(events.value()[0].event_kind, kComponentIncidentEventKind);
+  EXPECT_EQ(events.value()[0].payload_json, contained);
+  EXPECT_EQ(events.value()[1].sequence, 2U);
+  EXPECT_EQ(events.value()[1].event_kind, kComponentIncidentAcknowledgedEventKind);
+  EXPECT_NE(events.value()[1].payload_json.find(R"("acknowledged_by":"operator.ada")"),
+            std::string::npos);
+  EXPECT_NE(events.value()[1].payload_json.find(R"("timeline":[{"at_ns":100,)"),
+            std::string::npos);
+  EXPECT_EQ(journal.LoadComponentIncidentEvents(1U, 16U).value().size(), 1U);
+  EXPECT_FALSE(journal.LoadComponentIncidentEvents(0U, 0U).ok());
+
+  // After the Recover a new detection opens a new incident.
+  const auto next = journal.OpenComponentIncident(
+      TestIncident("incident.3", component, LifecycleBlockingCauseClassDTO::kCollision, 300));
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(next.value().incident.incident_id, "incident.3");
+}
+
+TEST(SqliteCCLCJournal, ReachedTargetIsResetByApplyAndByTheOperatorsRecover) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  const ControllableComponentId component("component.1");
+  const auto plan =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.1", 1U, "bundle.a", route));
+  ASSERT_TRUE(plan.ok());
+  // While the recorded plan is unadopted its component's change is requested.
+  EXPECT_TRUE(journal.ComponentInUnadoptedApplyPlan(component).value());
+  EXPECT_FALSE(
+      journal.ComponentInUnadoptedApplyPlan(ControllableComponentId("component.other")).value());
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.1", 1U, "bundle.a", 2U),
+                                          plan.value().components,
+                                          {route}})
+                  .ok());
+  EXPECT_FALSE(journal.ComponentInUnadoptedApplyPlan(component).value());
+  EXPECT_FALSE(journal.LoadLifecycleTarget(component).value()->reached);
+  EXPECT_TRUE(journal.RecordLifecycleTargetReached(component, true).value());
+  EXPECT_FALSE(journal.RecordLifecycleTargetReached(component, true).value());
+  // An operator target keeps it.
+  ASSERT_TRUE(journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kActive,
+                                         LifecycleTargetOriginDTO::kOperator)
+                  .ok());
+  EXPECT_TRUE(journal.LoadLifecycleTarget(component).value()->reached);
+
+  // The operator's Recover starts the component over and remembers the cause.
+  auto record = TestIncident("incident.1", component,
+                             LifecycleBlockingCauseClassDTO::kExternalControl, 10);
+  ASSERT_TRUE(journal.OpenComponentIncident(record).ok());
+  record.incident.acknowledged = true;
+  record.incident.acknowledged_by = "operator.ada";
+  record.incident.acknowledged_at_ns = 20;
+  ASSERT_TRUE(journal.AcknowledgeComponentIncident(record.incident, record.record_json).value());
+  auto target = journal.LoadLifecycleTargets().value().front();
+  EXPECT_FALSE(target.reached);
+  EXPECT_EQ(target.recovered_cause, LifecycleBlockingCauseClassDTO::kExternalControl);
+  // Reaching the target again ends that recovery.
+  EXPECT_TRUE(journal.RecordLifecycleTargetReached(component, true).value());
+  target = journal.LoadLifecycleTargets().value().front();
+  EXPECT_TRUE(target.reached);
+  EXPECT_FALSE(target.recovered_cause.has_value());
+
+  // A later Apply that changes the component starts a fresh startup phase.
+  auto next_route = route;
+  next_route.active_control_configuration_generation = ActiveControlConfigurationGeneration(
+      route.active_control_configuration_generation.value() + 1U);
+  const auto second =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.2", 1U, "bundle.b", route));
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.2", 1U, "bundle.b", 3U),
+                                          second.value().components,
+                                          {next_route}})
+                  .ok());
+  EXPECT_FALSE(journal.LoadLifecycleTarget(component).value()->reached);
+}
+
 }  // namespace
 }  // namespace manyforge::core

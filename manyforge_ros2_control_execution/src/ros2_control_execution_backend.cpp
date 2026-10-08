@@ -160,7 +160,6 @@ void schedule_commanded_idle_heartbeat(
 
 bool is_settled_execution_state(const core::ExecutionState state) noexcept {
   switch (state) {
-  case core::ExecutionState::kPaused:
   case core::ExecutionState::kStopped:
   case core::ExecutionState::kCompleted:
   case core::ExecutionState::kFailed:
@@ -768,7 +767,6 @@ Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
     terminal_ = true;
     stop_requested_ = true;
     natural_completion_stop_requested_ = false;
-    pause_requested_ = false;
     active_goal_handle_.reset();
     active_goal_id_.reset();
   }
@@ -1071,7 +1069,13 @@ core::PrepareParticipantResultDTO Ros2ControlExecutionBackend::Prepare(
   }
   const auto &motion =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload);
-  if (motion.trajectory.runtime_scale_bounds) {
+  // The planner attaches runtime-scale bounds to every trajectory; their
+  // presence does not qualify this provider's time law (spec 210). With the
+  // controller speed-scaling input enabled this backend would retime through
+  // an unqualified path, so it refuses. Without it the applied scale stays 1.0
+  // and is reported truthfully, so the trajectory runs at its nominal timing.
+  if (motion.trajectory.runtime_scale_bounds &&
+      config_.enable_jtc_speed_scaling_input) {
     return reject("controller_runtime_time_law_not_qualified");
   }
   if (motion.trajectory.resources != participant.resources ||
@@ -1118,8 +1122,7 @@ core::Result<void> Ros2ControlExecutionBackend::RetirePreparedExecution(
 core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
     const core::PreparedOperationParticipantDTO &participant,
     const core::ControllerGoalId &controller_goal_id,
-    core::ControllerGoalGeneration controller_goal_generation,
-    bool resume_dispatch) {
+    core::ControllerGoalGeneration controller_goal_generation) {
   const auto rejected = [&](std::string reason) {
     core::ExecutionSnapshot snapshot;
     snapshot.timestamp_ns = clock_.now();
@@ -1185,8 +1188,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::dispatch_prepared(
   const auto &trajectory =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload)
           .trajectory;
-  auto handle =
-      resume_dispatch ? resume(trajectory) : execute_trajectory(trajectory);
+  auto handle = execute_trajectory(trajectory);
   handle.controller_goal_id = controller_goal_id;
   handle.controller_goal_generation = controller_goal_generation;
   handle.prepared_contract_digest = participant.prepared_contract_digest;
@@ -1236,15 +1238,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::Dispatch(
     const core::ControllerGoalId &controller_goal_id,
     core::ControllerGoalGeneration controller_goal_generation) {
   return dispatch_prepared(participant, controller_goal_id,
-                           controller_goal_generation, false);
-}
-
-core::ExecutionHandle Ros2ControlExecutionBackend::DispatchResume(
-    const core::PreparedOperationParticipantDTO &participant,
-    const core::ControllerGoalId &controller_goal_id,
-    core::ControllerGoalGeneration controller_goal_generation) {
-  return dispatch_prepared(participant, controller_goal_id,
-                           controller_goal_generation, true);
+                           controller_goal_generation);
 }
 
 core::Result<void> Ros2ControlExecutionBackend::RebindRoute(
@@ -2551,7 +2545,7 @@ void Ros2ControlExecutionBackend::on_action_result(
     // the only place the distinction survives.
     last_action_result_code_ = result.code;
     if (controlled_stop_preempt_in_progress_ &&
-        (stop_requested_ || pause_requested_ || canceled)) {
+        (stop_requested_ || canceled)) {
       // A managed controlled stop preempts the active JTC goal with a second
       // FollowJointTrajectory goal. The terminal result for the OLD goal is
       // only evidence that preemption happened; the managed replacement goal
@@ -3276,8 +3270,7 @@ void Ros2ControlExecutionBackend::assign_joint_sample(
 }
 
 void Ros2ControlExecutionBackend::set_running_locked(
-    bool running, ProgressRetirement progress_retirement,
-    ResumeAuthorityRetention resume_authority_retention) noexcept {
+    bool running, ProgressRetirement progress_retirement) noexcept {
   const auto previous_generation =
       running_generation_.load(std::memory_order_acquire);
   const bool activity_changed = running_ != running;
@@ -3303,9 +3296,6 @@ void Ros2ControlExecutionBackend::set_running_locked(
     running_flag_.store(false, std::memory_order_release);
     completion_gate_request_.reset();
     active_dispatch_authority_.reset();
-    if (resume_authority_retention == ResumeAuthorityRetention::kDiscard) {
-      resumable_dispatch_authority_.reset();
-    }
     if (progress_retirement == ProgressRetirement::kRetireImmediately &&
         execution_progress_publication_ != nullptr) {
       execution_progress_publication_->invalidate();
@@ -3747,7 +3737,6 @@ bool Ros2ControlExecutionBackend::install_dispatch_authority_pin(
     return false;
   }
   active_dispatch_authority_ = pin;
-  resumable_dispatch_authority_ = pin;
   return true;
 }
 
@@ -4086,7 +4075,6 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
       !joint_positions.empty()) {
     const bool at_rest_state =
         state == core::ExecutionState::kIdle ||
-        state == core::ExecutionState::kPaused ||
         state == core::ExecutionState::kStopped ||
         state == core::ExecutionState::kCompleted ||
         state == core::ExecutionState::kFailed ||
@@ -4152,7 +4140,6 @@ bool Ros2ControlExecutionBackend::publish_passive_observed_snapshot(
   }
   switch (snapshot_.state) {
   case core::ExecutionState::kIdle:
-  case core::ExecutionState::kPaused:
   case core::ExecutionState::kStopped:
   case core::ExecutionState::kCompleted:
   case core::ExecutionState::kFailed:
@@ -4293,7 +4280,6 @@ bool Ros2ControlExecutionBackend::complete_forced_managed_stop_execution(
     terminal_generation = running_generation_.load(std::memory_order_acquire);
     stop_requested_ = false;
     natural_completion_stop_requested_ = false;
-    pause_requested_ = false;
     active_goal_handle_.reset();
     active_goal_id_.reset();
     active_trajectory_.reset();
@@ -4507,7 +4493,6 @@ Ros2ControlExecutionBackend::complete_managed_controlled_stop_execution() {
     set_running_locked(false);
     stop_requested_ = false;
     natural_completion_stop_requested_ = false;
-    pause_requested_ = false;
     active_goal_handle_.reset();
     active_goal_id_.reset();
     active_trajectory_.reset();
@@ -4613,7 +4598,6 @@ Ros2ControlExecutionBackend::resync_after_intervention_if_needed(
       terminal_ = true;
       stop_requested_ = false;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       goal_accepted_ = false;
       first_feedback_seen_ = false;
       result_received_ = false;
@@ -4673,7 +4657,6 @@ Ros2ControlExecutionBackend::resync_after_intervention_if_needed(
     terminal_ = true;
     stop_requested_ = false;
     natural_completion_stop_requested_ = false;
-    pause_requested_ = false;
     goal_accepted_ = false;
     first_feedback_seen_ = false;
     result_received_ = false;
@@ -4951,10 +4934,8 @@ void Ros2ControlExecutionBackend::commit_action_result_terminal(
     return;
   }
 
-  const bool pause_requested = pause_requested_;
   const bool stop_requested = stop_requested_;
-  if (!pause_requested && !stop_requested &&
-      active_dispatch_authority_.has_value()) {
+  if (!stop_requested && active_dispatch_authority_.has_value()) {
     auto authority =
         current_active_dispatch_authority_locked(*active_dispatch_authority_);
     if (!authority.admitted) {
@@ -4977,10 +4958,7 @@ void Ros2ControlExecutionBackend::commit_action_result_terminal(
 
   const auto current_snapshot = get_execution_snapshot();
   core::ExecutionState terminal_state = core::ExecutionState::kFailed;
-  if (pause_requested) {
-    terminal_state = core::ExecutionState::kPaused;
-    failure.reset();
-  } else if (stop_requested || canceled) {
+  if (stop_requested || canceled) {
     terminal_state = core::ExecutionState::kStopped;
     failure.reset();
   } else if (!failure.has_value()) {
@@ -5007,8 +4985,7 @@ void Ros2ControlExecutionBackend::commit_action_result_terminal(
                                     failure, execution_generation);
   }
 
-  if ((pause_requested || stop_requested || canceled) &&
-      stop_requested_at_.has_value()) {
+  if ((stop_requested || canceled) && stop_requested_at_.has_value()) {
     const auto latency_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             result_received_at - *stop_requested_at_)
@@ -5019,9 +4996,7 @@ void Ros2ControlExecutionBackend::commit_action_result_terminal(
 
   terminal_ = true;
   resync_required_ = terminal_state == core::ExecutionState::kFailed;
-  set_running_locked(false, ProgressRetirement::kRetireImmediately,
-                     pause_requested ? ResumeAuthorityRetention::kPreserve
-                                     : ResumeAuthorityRetention::kDiscard);
+  set_running_locked(false, ProgressRetirement::kRetireImmediately);
   natural_completion_stop_requested_ = false;
   active_goal_handle_.reset();
   active_goal_id_.reset();
@@ -5029,7 +5004,7 @@ void Ros2ControlExecutionBackend::commit_action_result_terminal(
   active_trajectory_time_s_ = 0.0;
   active_runtime_velocity_scale_ = 1.0;
 
-  if (!pause_requested && !current_snapshot.joint_positions_rad.empty()) {
+  if (!current_snapshot.joint_positions_rad.empty()) {
     project_terminal_scene_positions(
         current_snapshot.joint_positions_rad,
         uses_authored_backend_state() ? clock_.now()
@@ -5071,7 +5046,7 @@ void Ros2ControlExecutionBackend::process_completion_gate(
       if (!completion_gate_matches_locked(request)) {
         return;
       }
-      terminal_intent_pending = stop_requested_ || pause_requested_;
+      terminal_intent_pending = stop_requested_;
       dispatch_authority = active_dispatch_authority_;
     }
     if (terminal_intent_pending) {
@@ -5166,10 +5141,8 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
     return;
   }
 
-  const bool pause_requested = pause_requested_;
   const bool stop_requested = stop_requested_;
-  if (!pause_requested && !stop_requested &&
-      active_dispatch_authority_.has_value()) {
+  if (!stop_requested && active_dispatch_authority_.has_value()) {
     auto authority =
         current_active_dispatch_authority_locked(*active_dispatch_authority_);
     if (!authority.admitted) {
@@ -5195,11 +5168,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
   const auto current_snapshot = get_execution_snapshot();
   core::ExecutionState terminal_state = core::ExecutionState::kCompleted;
   double terminal_progress = 1.0;
-  if (pause_requested) {
-    terminal_state = core::ExecutionState::kPaused;
-    terminal_progress = current_snapshot.progress;
-    failure.reset();
-  } else if (stop_requested) {
+  if (stop_requested) {
     terminal_state = core::ExecutionState::kStopped;
     terminal_progress = current_snapshot.progress;
     failure.reset();
@@ -5236,7 +5205,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     const auto now = std::chrono::steady_clock::now();
     const JointSample *newest = nullptr;
-    if (pause_requested || stop_requested) {
+    if (stop_requested) {
       newest = select_latest_passive_sample_ptr_locked(now);
     } else {
       const auto selected = select_latest_passive_sample_after_locked(
@@ -5257,7 +5226,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
         const bool measurement_gate_failure =
             failure.has_value() && failure->details.contains("phase") &&
             failure->details.at("phase") == "terminal_result_state_gate";
-        if (!pause_requested && !stop_requested &&
+        if (!stop_requested &&
             (!failure.has_value() || measurement_gate_failure)) {
           std::string final_error;
           if (final_state_matches(*request.trajectory, *newest, final_error)) {
@@ -5296,7 +5265,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
           terminal_source_timestamp_ns = snapshot_.source_timestamp_ns;
         }
       } catch (const std::exception &exc) {
-        if (!pause_requested && !stop_requested) {
+        if (!stop_requested) {
           failure = make_ros2_control_fault_error(
               core::ErrorCode::kExecutionAborted,
               std::string("Terminal physical-state sample was incomplete: ") +
@@ -5346,9 +5315,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
   set_running_locked(false,
                      terminal_state == core::ExecutionState::kCompleted
                          ? ProgressRetirement::kPreserveTerminalHandoff
-                         : ProgressRetirement::kRetireImmediately,
-                     pause_requested ? ResumeAuthorityRetention::kPreserve
-                                     : ResumeAuthorityRetention::kDiscard);
+                         : ProgressRetirement::kRetireImmediately);
   natural_completion_stop_requested_ = false;
   active_goal_handle_.reset();
   active_goal_id_.reset();
@@ -5356,7 +5323,7 @@ void Ros2ControlExecutionBackend::commit_completion_gate_terminal(
   active_trajectory_time_s_ = 0.0;
   active_runtime_velocity_scale_ = 1.0;
 
-  if ((pause_requested || stop_requested) && stop_requested_at_.has_value()) {
+  if (stop_requested && stop_requested_at_.has_value()) {
     const auto latency_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - *stop_requested_at_)
@@ -5523,7 +5490,6 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
       terminal_ = false;
       stop_requested_ = false;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       goal_accepted_ = false;
       first_feedback_seen_ = false;
       result_received_ = false;
@@ -6008,7 +5974,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
           completion_gate_matches_locked(*completion_gate_request_)) {
         completion_gate = completion_gate_request_;
       }
-      cancel_pending = stop_requested_ || pause_requested_;
+      cancel_pending = stop_requested_;
       controlled_stop_replacement_active = controlled_stop_preempt_in_progress_;
       natural_completion_stop_requested = natural_completion_stop_requested_;
       cancel_timeout = cancel_pending && !controlled_stop_replacement_active &&
@@ -6061,7 +6027,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
           }
         }
       }
-      // Plain JTC cancel/pause waits for the old goal to terminate and is
+      // Plain JTC cancel waits for the old goal to terminate and is
       // guarded by `stop_completion_timeout_s` above. Managed controlled-stop
       // replacements also set stop_requested_ so the UI sees Stopping, but
       // their terminal deadline is enforced by execute_controlled_stop(wait_s).
@@ -6142,7 +6108,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
                                     : snapshot_source_timestamp_ns);
       }
       // Audit 6C (finding 2.5): wake on first feedback / terminal /
-      // stop-pause intent instead of sleeping out the period
+      // stop intent instead of sleeping out the period
       // (on_action_feedback notifies execution_cv_ on the first-feedback
       // transition).
       {
@@ -6151,7 +6117,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
             lock, std::chrono::duration<double>(config_.monitor_period_s),
             [this]() {
               return first_feedback_seen_ || terminal_ || !running_ ||
-                     stop_requested_ || pause_requested_ ||
+                     stop_requested_ ||
                      completion_gate_request_.has_value();
             });
       }
@@ -6416,7 +6382,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
     }
     // Audit 6C (finding 2.5): the period still PACES the tick (waking on
     // every 100 Hz sample would burn CPU for nothing), but terminal and
-    // stop/pause intent wake the worker immediately instead of waiting out
+    // stop intent wake the worker immediately instead of waiting out
     // the remainder of the slice.
     {
       std::unique_lock<std::mutex> lock(execution_mutex_);
@@ -6424,7 +6390,7 @@ void Ros2ControlExecutionBackend::monitor_worker(
           lock, std::chrono::duration<double>(config_.monitor_period_s),
           [this]() {
             return terminal_ || !running_ || stop_requested_ ||
-                   pause_requested_ || completion_gate_request_.has_value();
+                   completion_gate_request_.has_value();
           });
     }
   }
@@ -6486,7 +6452,6 @@ core::StopResultDTO Ros2ControlExecutionBackend::stop_if_running_generation(
     } else {
       stop_requested_ = true;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       stop_requested_at_ = std::chrono::steady_clock::now();
       cancel_requested = static_cast<bool>(active_goal_handle_) ||
                          controlled_stop_preempt_in_progress_;
@@ -7871,7 +7836,6 @@ Ros2ControlExecutionBackend::execute_controlled_stop_impl(
       std::lock_guard<std::mutex> lock(execution_mutex_);
       stop_requested_ = true;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       stop_requested_at_ = std::chrono::steady_clock::now();
       controlled_stop_preempt_in_progress_ = true;
       controlled_stop_command_reference_.reset();
@@ -8333,7 +8297,6 @@ Ros2ControlExecutionBackend::execute_controlled_stop_impl(
       std::lock_guard<std::mutex> lock(execution_mutex_);
       stop_requested_ = true;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       stop_requested_at_ = std::chrono::steady_clock::now();
       controlled_stop_preempt_in_progress_ = true;
       controlled_stop_command_reference_.reset();
@@ -8684,7 +8647,6 @@ Ros2ControlExecutionBackend::execute_controlled_stop_impl(
     }
     stop_requested_ = true;
     natural_completion_stop_requested_ = false;
-    pause_requested_ = false;
     stop_requested_at_ = std::chrono::steady_clock::now();
     if (active_goal_handle_) {
       active_goal_to_cancel = active_goal_handle_;
@@ -8953,83 +8915,6 @@ Ros2ControlExecutionBackend::execute_controlled_stop_impl(
   return result;
 }
 
-core::PauseResultDTO Ros2ControlExecutionBackend::pause() {
-  core::ExecutionSnapshot snapshot;
-  GoalHandleFJT::SharedPtr goal_to_cancel;
-  bool cancel_requested = false;
-  bool resync_required = false;
-  std::uint64_t publication_generation = 0;
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    resync_required = resync_required_;
-    if (resync_required_) {
-      snapshot = get_execution_snapshot();
-    } else if (!running_ && terminal_) {
-      return core::PauseResultDTO{false,
-                                  make_error(core::ErrorCode::kInvalidRequest,
-                                             "No execution in flight")};
-    } else {
-      pause_requested_ = true;
-      stop_requested_ = false;
-      natural_completion_stop_requested_ = false;
-      stop_requested_at_ = std::chrono::steady_clock::now();
-      cancel_requested = static_cast<bool>(active_goal_handle_);
-      if (cancel_requested) {
-        goal_to_cancel = active_goal_handle_;
-        snapshot = get_execution_snapshot();
-      } else {
-        set_running_locked(false, ProgressRetirement::kRetireImmediately,
-                           ResumeAuthorityRetention::kPreserve);
-        terminal_ = true;
-        snapshot = get_execution_snapshot();
-      }
-      publication_generation =
-          running_generation_.load(std::memory_order_acquire);
-    }
-  }
-  if (resync_required) {
-    return core::PauseResultDTO{
-        false,
-        operator_intervention_error(core::ErrorCode::kPauseFailed,
-                                    "ros2_control execution backend requires "
-                                    "observed-state resync before reuse",
-                                    "pause_resync_required", snapshot.state)};
-  }
-  execution_cv_.notify_all();
-  cancel_goal_if_known(goal_to_cancel);
-  const auto state = cancel_requested ? core::ExecutionState::kStopping
-                                      : core::ExecutionState::kPaused;
-  if (uses_authored_backend_state()) {
-    publish_snapshot(state, snapshot.progress, snapshot.joint_positions_rad,
-                     std::nullopt, "", publication_generation);
-  } else {
-    (void)publish_observed_metadata(state, snapshot.progress, std::nullopt,
-                                    publication_generation);
-  }
-  cancel_all_gripper_commands();
-  execution_cv_.notify_all();
-  return core::PauseResultDTO{true, std::nullopt};
-}
-
-core::ExecutionHandle
-Ros2ControlExecutionBackend::resume(const core::TrajectoryDTO &trajectory) {
-  std::optional<DispatchAuthorityPin> resumable_environment;
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    resumable_environment = resumable_dispatch_authority_;
-  }
-  if (resumable_environment.has_value()) {
-    // plan_resume_trajectory() captured the current environment after its
-    // observed-state barrier. Replace that provisional pin with the original
-    // dispatch environment: the final linearization check will admit only if
-    // every startup epoch still matches. A restarted component can therefore
-    // never inherit a paused execution.
-    std::lock_guard<std::mutex> lock(dispatch_admission_mutex_);
-    planning_environment_authority_ = std::move(resumable_environment);
-  }
-  return execute_trajectory(trajectory);
-}
-
 core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
   disarm_commanded_idle_heartbeat();
   const auto publish_reset_transition =
@@ -9081,7 +8966,6 @@ core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
       terminal_ = true;
       stop_requested_ = false;
       natural_completion_stop_requested_ = false;
-      pause_requested_ = false;
       stop_requested_at_.reset();
       controlled_stop_preempt_in_progress_ = false;
       controlled_stop_command_reference_.reset();

@@ -298,6 +298,7 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
       && STOPPED_HOLDS.includes(environment.hold),
     programCycle: cycle,
     authoringWorkspace: identity(environment),
+    authoringWorkspaceContainment: null,
   } as unknown as ComposerHeadlessState;
 }
 

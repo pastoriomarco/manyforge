@@ -21,7 +21,7 @@ not own or emulate:
 
 - controller streaming or a real-time loop;
 - planning, collision consequence, or execution terminal truth;
-- Stop, Pause, Resume, Reset, or recovery authority;
+- Stop, Reset, or recovery authority;
 - component lifecycle or controller-route authority;
 - alarm, scene, measured-state, or runtime-health truth; or
 - endpoint, credential, process, or provider selection.

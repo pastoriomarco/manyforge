@@ -1230,3 +1230,39 @@ describe('headless intent client', () => {
     );
   });
 });
+
+it('accepts an authorization-only incident Recover only for the requested component', async () => {
+  const recovered = {
+    acceptance: null,
+    incident_recovery: {
+      acknowledged_at_ns: 9_000,
+      acknowledged_by: 'manyforge_composer',
+      cause_class: 'provider_lost',
+      controllable_component_id: 'component.arm',
+      incident_id: 'incident.component.arm.1',
+    },
+    replay_status: 'accepted_new',
+    status: null,
+  };
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(response(recovered))
+    .mockResolvedValueOnce(response(recovered));
+  vi.stubGlobal('fetch', fetchMock);
+  const request = (componentId: string) => ({
+    request_context: {
+      request_id: 'request.recover.1',
+      request_owner_epoch: 'cclc.epoch.1',
+      source_label: 'manyforge_composer',
+      correlation_id: null,
+    },
+    controllable_component_id: componentId,
+    intent: 'recover',
+  }) as unknown as Parameters<typeof api.cclc.submitLifecycle>[0];
+
+  await expect(api.cclc.submitLifecycle(request('component.arm'))).resolves.toMatchObject({
+    transactionId: null,
+    incidentRecovery: { incidentId: 'incident.component.arm.1', componentId: 'component.arm' },
+  });
+  await expect(api.cclc.submitLifecycle(request('component.gripper')))
+    .rejects.toThrow('incident recovery does not match its request');
+});

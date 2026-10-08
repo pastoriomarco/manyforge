@@ -24,6 +24,7 @@
 #include <manyforge_core/runtime_participant_policy.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
+#include <manyforge_core/stop_fault_latch_origin.hpp>
 #include <manyforge_core/stop_fault_recovery.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -283,11 +284,6 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// pre-dispatch recheck then evaluate the published motion-attention
   /// projection and fail closed while it is missing, unreconciled or stale.
   std::optional<OperatorAlarmAttentionPolicyDTO> operator_alarm_attention;
-  /// Qualification seam; production compositions leave it empty. Invoked
-  /// without the state lock after a prepared Resume barrier is claimed and
-  /// before its first participant's dispatch is released: the window that
-  /// the final pre-dispatch attention recheck must close (spec 530 §11).
-  std::function<void(const OperationId&)> prepared_resume_barrier_claimed_seam;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -355,10 +351,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<CapabilityCommandPreviewResultDTO> preview_capability_command(
       const OperationIntentDTO& intent);
 
-  [[nodiscard]] Result<OperationControlAcceptedDTO> pause(
-      const OperationControlRequestDTO& request);
-  [[nodiscard]] Result<OperationControlAcceptedDTO> resume(
-      const OperationControlRequestDTO& request);
   [[nodiscard]] Result<OperationControlAcceptedDTO> reset(
       const OperationControlRequestDTO& request);
   [[nodiscard]] Result<OperationControlAcceptedDTO> acknowledge_completed(
@@ -401,6 +393,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
       const StopCertificateId& certificate_id) const;
   [[nodiscard]] std::optional<StopFaultLatchDTO> get_stop_fault_latch() const;
+  /// Why the Stop behind this latch was requested (operator traceability
+  /// only; no latch is recovered automatically). Only containment Stops this
+  /// Kernel issued itself are `kProviderAvailabilityLoss` (Manager liveness
+  /// loss) or `kComponentIncident` (CCLC incident); that attribution is
+  /// resident only, so a replacement Kernel reports the certificate-derived
+  /// origin or `kUnattributed`.
+  [[nodiscard]] StopFaultLatchOriginDTO get_stop_fault_latch_origin(
+      const StopFaultLatchDTO& latch) const;
   [[nodiscard]] Result<std::optional<StopFaultRecoveryOfferDTO>> get_stop_fault_recovery_offer()
       const;
   /// Refresh owner-held recovery predicates without clearing the fault or
@@ -455,6 +455,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> check_program_node_motion_attention(
       const ProgramNodeMotionAttentionCheckDTO& request) const;
   void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
+  /// Component-incident containment: a cell Full Stop under this Kernel's own
+  /// request identity (owner epoch + incident id) whose transaction latches a
+  /// `physical_rest_unproven` Stop fault, so the cell stays latched even when
+  /// it was idle until the operator's exact Stop-fault recovery.
+  [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestComponentIncidentContainment(
+      const ComponentIncidentContainmentIntentDTO& intent) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
 
@@ -685,9 +691,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramNodeAdmissionEvidenceDTO& evidence) const;
   [[nodiscard]] Result<void> validate_program_execution_scope_locked(
       const OperationIntentDTO& intent) const;
-  [[nodiscard]] Result<void> validate_program_resume_scope_locked(
-      const OperationIntentDTO& intent,
-      const std::optional<ProgramNodeExecutionScopeDTO>& actor) const;
   [[nodiscard]] Result<void> reconcile_manual_operation_admission_locked();
   [[nodiscard]] Result<void> validate_manual_operation_settlement(
       const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release) const;
@@ -719,8 +722,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const RuntimeScaleStatusDTO* scale, const char* reason,
       std::span<const PreparedMotionDiagnosticsDTO> diagnostics = {});
   [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
-                                                     IResolvedParticipantExecutionEngine* engine);
-  [[nodiscard]] Result<void> advance_prepared_resume(const OperationId& operation_id,
                                                      IResolvedParticipantExecutionEngine* engine);
   [[nodiscard]] Result<void> advance_prepared_capability_command(
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine);
@@ -787,11 +788,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
                                        OperationControlEffectHandle handle) noexcept override;
   void settle_completed_control_locked(const OperationId& operation_id);
-  void settle_completed_resume_locked(const OperationId& operation_id);
   OperationStateDTO capture_control_failure_locked(ActiveOperation& operation);
-  void cancel_prepared_resume(const OperationId& operation_id,
-                              IResolvedPreparedParticipantExecutionEngine& engine,
-                              std::uint64_t subordinate_id);
   void ProjectStop(StopControlWorkToken token) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,
                            std::uint64_t schedule_generation) noexcept;
@@ -807,7 +804,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop(
       EmergencyStopProjectedIntentDTO intent,
       const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
-      const MalformedStopIngressDTO* malformed_ingress = nullptr);
+      const MalformedStopIngressDTO* malformed_ingress = nullptr,
+      std::optional<StopFaultTriggerDTO> required_fault_latch = std::nullopt);
   // One acceptance boundary shared by physical and captured-node selections.
   // Publish only after state_mutex_ is released; the existing workers own all
   // provider effects and journal projection.
@@ -818,8 +816,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop_locked(
       EmergencyStopProjectedIntentDTO intent, StopWorkHandoff& handoff, TimePoint accepted_at_ns,
       const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
-      const MalformedStopIngressDTO* malformed_ingress = nullptr);
+      const MalformedStopIngressDTO* malformed_ingress = nullptr,
+      std::optional<StopFaultTriggerDTO> required_fault_latch = std::nullopt);
   void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
+  void attribute_containment_stop_locked(const StopAcceptedDTO& stopped,
+                                         StopFaultLatchOriginDTO origin);
   [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
 
   RuntimeParticipantRegistry registry_;
@@ -936,6 +937,17 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   StopFaultLatchGeneration cell_stop_fault_latch_generation_{0U};
   std::optional<StopFaultLatchDTO> active_stop_fault_latch_;
   bool manager_liveness_motion_inhibited_{};
+  struct AttributedContainmentStop final {
+    StopId stop_id;
+    StopGeneration stop_generation;
+    StopFaultLatchOriginDTO origin;
+  };
+  /// Fresh containment Stops this Kernel issued itself (bounded, newest last).
+  std::vector<AttributedContainmentStop> attributed_containment_stops_;
+  /// Accepted incident containments by incident id (bounded, newest last):
+  /// a repeated request for one incident returns its Stop, never a new one.
+  std::vector<std::pair<std::string, ComponentIncidentContainmentReceiptDTO>>
+      incident_containments_;
   bool motion_admission_closed_{};
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };

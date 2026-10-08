@@ -54,11 +54,28 @@ public:
       const core::DesiredControlConfigurationDTO &desired_configuration)
       const override;
 
+  /// Observation-only closure (Stop recovery / configuration observation):
+  /// a Declared component or one without lifecycle facts is accepted, while
+  /// ReadCurrentRouteSelectionSnapshot keeps rejecting it.
+  [[nodiscard]] core::Result<core::RouteConfigurationObservationSnapshot>
+  ReadCurrentRouteConfigurationObservation(
+      const core::RetainedBundleId &expected_retained_bundle_id,
+      const core::GraphRevision &expected_graph_revision,
+      const core::DesiredControlConfigurationDTO &desired_configuration)
+      const override;
+
   [[nodiscard]] core::Result<core::CCLCRouteSelectionTemplateSetDTO>
   ReadCurrentRouteSelectionTemplates(
       const core::ControllableComponentId &component_id) const override;
 
 private:
+  [[nodiscard]] core::Result<core::RouteSelectionCurrentSnapshotDTO>
+  ReadCurrentRouteClosure(
+      const core::RetainedBundleId &expected_retained_bundle_id,
+      const core::GraphRevision &expected_graph_revision,
+      const core::DesiredControlConfigurationDTO &desired_configuration,
+      bool observation_only) const;
+
   const RetainedBundle &retained_bundle_;
   const core::IActiveBundlePublicationReader &active_publication_reader_;
   core::ActiveBundlePublicationReceiptDTO expected_active_publication_;

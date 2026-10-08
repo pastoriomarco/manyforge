@@ -2132,7 +2132,6 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
       motion_status.state == core::ExecutionState::kValidating ||
       motion_status.state == core::ExecutionState::kExecuting ||
       motion_status.state == core::ExecutionState::kInterrupted ||
-      motion_status.state == core::ExecutionState::kPaused ||
       motion_status.state == core::ExecutionState::kStopping ||
       motion_status.state == core::ExecutionState::kInterventionRequired) {
     return fail("native_product_reseal_motion_not_idle",
@@ -2445,7 +2444,6 @@ core::Result<void> refresh_retained_native_runtime_model_for_apply(
       motion_status.state == core::ExecutionState::kValidating ||
       motion_status.state == core::ExecutionState::kExecuting ||
       motion_status.state == core::ExecutionState::kInterrupted ||
-      motion_status.state == core::ExecutionState::kPaused ||
       motion_status.state == core::ExecutionState::kStopping ||
       motion_status.state == core::ExecutionState::kInterventionRequired) {
     return fail("native_model_refresh_motion_not_idle",

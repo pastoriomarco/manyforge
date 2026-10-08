@@ -92,38 +92,12 @@ TEST_F(StateMachineTest, ExecutingToFailed) {
   EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
 }
 
-TEST_F(StateMachineTest, PausedToValidating) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  (void)sm.try_transition(ExecutionState::kPaused);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
-}
-
-TEST_F(StateMachineTest, PausedToStopping) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  (void)sm.try_transition(ExecutionState::kPaused);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
-}
-
 TEST_F(StateMachineTest, StoppingToStopped) {
   (void)sm.try_transition(ExecutionState::kPlanning);
   (void)sm.try_transition(ExecutionState::kValidating);
   (void)sm.try_transition(ExecutionState::kExecuting);
   (void)sm.try_transition(ExecutionState::kStopping);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, StoppingToPaused) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
 TEST_F(StateMachineTest, PlanningToInterrupted) {
@@ -164,11 +138,6 @@ TEST_F(StateMachineTest, PlanningToExecutingInvalid) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
-TEST_F(StateMachineTest, PlanningToPausedInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPaused).ok());
-}
-
 TEST_F(StateMachineTest, ValidatingToPlanningForAuthoritativeReplan) {
   (void)sm.try_transition(ExecutionState::kPlanning);
   (void)sm.try_transition(ExecutionState::kValidating);
@@ -181,24 +150,6 @@ TEST_F(StateMachineTest, ExecutingToPlanningInvalid) {
   (void)sm.try_transition(ExecutionState::kValidating);
   (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
-}
-
-TEST_F(StateMachineTest, ExecutingToPausedInvalid) {
-  // Executing → Paused is NOT direct — must go through Stopping
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPaused).ok());
-}
-
-TEST_F(StateMachineTest, PausedToExecutingInvalid) {
-  // Paused → Executing is NOT direct — must go through Validating
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  (void)sm.try_transition(ExecutionState::kPaused);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, StoppingToExecutingInvalid) {
@@ -245,31 +196,6 @@ TEST(StateMachineTerminalAuthority, ContainedStopSerializesExecutingThroughStopp
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
   EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
                              {ExecutionState::kExecuting, ExecutionState::kStopping},
-                             {ExecutionState::kStopping, ExecutionState::kStopped}}));
-}
-
-TEST(StateMachineTerminalAuthority, ContainedStopSerializesPausedThroughStoppingToStopped) {
-  FakeClock clock;
-  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
-  ExecutionStateMachine sm{
-      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
-  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
-  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-  ASSERT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
-  ASSERT_TRUE(sm.try_transition(ExecutionState::kPaused).ok());
-  transitions.clear();
-  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
-
-  const auto outcome = committer.commit(
-      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
-
-  EXPECT_TRUE(outcome.ok());
-  EXPECT_EQ(outcome.previous, ExecutionState::kPaused);
-  EXPECT_EQ(outcome.committed, ExecutionState::kStopped);
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
-                             {ExecutionState::kPaused, ExecutionState::kStopping},
                              {ExecutionState::kStopping, ExecutionState::kStopped}}));
 }
 
@@ -344,16 +270,6 @@ TEST_F(StateMachineTest, ResetFromExecuting) {
   (void)sm.try_transition(ExecutionState::kPlanning);
   (void)sm.try_transition(ExecutionState::kValidating);
   (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromPaused) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  (void)sm.try_transition(ExecutionState::kPaused);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
@@ -441,17 +357,6 @@ TEST_F(StateMachineTest, StopFromExecutingPath) {
   (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, PausePath) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  (void)sm.try_transition(ExecutionState::kPaused);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_EQ(sm.status().state, ExecutionState::kExecuting);
 }
 
 // --- Callbacks ---

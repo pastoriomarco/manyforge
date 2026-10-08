@@ -250,10 +250,6 @@ public:
   Dispatch(const core::PreparedOperationParticipantDTO &participant,
            const core::ControllerGoalId &controller_goal_id,
            core::ControllerGoalGeneration controller_goal_generation) override;
-  core::ExecutionHandle DispatchResume(
-      const core::PreparedOperationParticipantDTO &participant,
-      const core::ControllerGoalId &controller_goal_id,
-      core::ControllerGoalGeneration controller_goal_generation) override;
 
   /// Rebind one quiescent adapter to a verified successor route and its exact
   /// Program-scoped aliases. Old prepared replay membership is discarded
@@ -272,8 +268,6 @@ public:
   execute_trajectory(const core::TrajectoryDTO &trajectory) override;
   core::Result<void> sync_observed_state_before_planning() override;
   core::StopResultDTO stop() override;
-  core::PauseResultDTO pause() override;
-  core::ExecutionHandle resume(const core::TrajectoryDTO &trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
   const core::ObservedRobotStatePublication *
@@ -747,12 +741,6 @@ public:
     return planning_environment_authority_;
   }
 
-  std::optional<DispatchAuthorityPin>
-  testing_resumable_environment_pin() const {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    return resumable_dispatch_authority_;
-  }
-
   const std::string &execution_backend_component_epoch() const noexcept {
     return execution_backend_component_epoch_;
   }
@@ -887,8 +875,7 @@ private:
   core::ExecutionHandle
   dispatch_prepared(const core::PreparedOperationParticipantDTO &participant,
                     const core::ControllerGoalId &controller_goal_id,
-                    core::ControllerGoalGeneration controller_goal_generation,
-                    bool resume_dispatch);
+                    core::ControllerGoalGeneration controller_goal_generation);
   void initialize_observed_state_publication();
   void initialize_prepared_participant_bindings();
   void validate_injected_observed_state_publication();
@@ -1008,15 +995,9 @@ private:
     kRetireImmediately,
     kPreserveTerminalHandoff,
   };
-  enum class ResumeAuthorityRetention {
-    kDiscard,
-    kPreserve,
-  };
   void set_running_locked(bool running,
                           ProgressRetirement progress_retirement =
-                              ProgressRetirement::kRetireImmediately,
-                          ResumeAuthorityRetention resume_authority_retention =
-                              ResumeAuthorityRetention::kDiscard) noexcept;
+                              ProgressRetirement::kRetireImmediately) noexcept;
   void testing_store_latest_joint_sample_impl(
       std::vector<std::string> joint_names, std::vector<double> positions,
       std::chrono::steady_clock::time_point received_at,
@@ -1306,7 +1287,6 @@ private:
   bool terminal_ = true;
   bool stop_requested_ = false;
   bool natural_completion_stop_requested_ = false;
-  bool pause_requested_ = false;
   bool goal_accepted_ = false;
   bool first_feedback_seen_ = false;
   bool result_received_ = false;
@@ -1342,10 +1322,6 @@ private:
   std::optional<std::chrono::steady_clock::time_point> tracking_error_since_;
   std::optional<TrackingErrorPeak> peak_tracking_error_;
   std::optional<DispatchAuthorityPin> active_dispatch_authority_;
-  // The original dispatch environment survives only a successful Pause. A
-  // resumed trajectory is freshly planned, but it may not cross a component
-  // replacement boundary and silently inherit the prior execution.
-  std::optional<DispatchAuthorityPin> resumable_dispatch_authority_;
 
   // Phase 2.7A binding/admission publications. Publishers serialize with the
   // bounded dispatch enqueue through this NRT mutex; runtime readers acquire

@@ -533,6 +533,10 @@ bool CCLCLifecycleRequestResultDTO::locally_valid() const noexcept {
   }
   const bool accepted = replay_status == RequestReplayStatusDTO::kAcceptedNew ||
                         replay_status == RequestReplayStatusDTO::kReplayedExact;
+  if (incident_recovery) {
+    return accepted && !acceptance && !status && !rejection &&
+           incident_recovery->locally_valid();
+  }
   if (rejection) {
     return accepted && !acceptance && !status && error_valid(rejection) &&
            rejection->details.contains("effect") &&

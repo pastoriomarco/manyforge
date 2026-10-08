@@ -145,7 +145,14 @@ const controller = vi.hoisted(() => ({
       cartesianMaxBlendDeviationRad: 0.01, jointLimits: {} },
     generation: 1,
     intent: {},
-    preview: {},
+    // Approval compares the receipt with the displayed Scene revision.
+    preview: {
+      sceneRevision: {
+        scene_id: 'scene-1',
+        revision_id: 1,
+        content_hash: 'sha256:scene',
+      },
+    },
     ghost: null,
     ghostStale: false,
     operation: null,
@@ -160,6 +167,8 @@ const controller = vi.hoisted(() => ({
   fullStopError: null,
   stopFaultRecoveryPending: false,
   stopFaultRecoveryError: null,
+  componentIncidents: [],
+  componentIncidentsUnavailableReason: null,
   motionTargets: [] as Array<Record<string, unknown>>,
   gripperTargets: [] as Array<Record<string, unknown>>,
   selectRobot: vi.fn(),
@@ -175,8 +184,6 @@ const controller = vi.hoisted(() => ({
   fullStop: vi.fn(),
   recoverStopFault: vi.fn(),
   dismissFullStopError: vi.fn(),
-  pause: vi.fn(),
-  resume: vi.fn(),
   reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
@@ -353,7 +360,7 @@ describe('RobotControlPanel layout', () => {
     }
   });
 
-  it('renders exact-operation Pause, Resume, and eligible Reset controls', () => {
+  it('renders the eligible exact-operation Reset control without Pause or Resume', () => {
     const state = controller.state as unknown as Record<string, unknown>;
     state.phase = 'executing';
     state.operation = {
@@ -367,15 +374,9 @@ describe('RobotControlPanel layout', () => {
       terminalError: null,
     };
     let markup = renderToStaticMarkup(<RobotControlPanel enabled />);
-    expect(markup).toMatch(/<button type="button">Pause<\/button>/);
-    expect(markup).toMatch(/<button type="button" disabled="">Resume<\/button>/);
+    expect(markup).not.toMatch(/>Pause<\/button>/);
+    expect(markup).not.toMatch(/>Resume<\/button>/);
     expect(markup).toContain('Reset operation');
-
-    state.operation = { ...(state.operation as Record<string, unknown>), state: 'paused' };
-    markup = renderToStaticMarkup(<RobotControlPanel enabled />);
-    expect(markup).toContain('paused · 40%');
-    expect(markup).not.toContain('Executing');
-    expect(markup).toMatch(/<button type="button">Resume<\/button>/);
 
     state.phase = 'completed';
     state.operation = {

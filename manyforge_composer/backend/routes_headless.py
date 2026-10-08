@@ -760,8 +760,7 @@ def create_headless_router(
         kind = body.command_envelope.command_kind
         start = kind in {
             "program_run", "program_motion_start", "program_motion_resume",
-            "program_resume_full_stop", "operation_start", "operation_resume",
-            "execution_recovery",
+            "program_resume_full_stop", "operation_start", "execution_recovery",
         }
         request = body.model_dump(mode="json")
 
@@ -843,26 +842,6 @@ def create_headless_router(
                     ),
                 },
             )
-
-    @router.post("/api/execution/operations/{operation_id}/pause")
-    async def execution_pause(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
-    ) -> dict[str, Any]:
-        require_matching_operation(operation_id, body.operation_id)
-        return await control_call(
-            lambda: client.pause_operation(operation_id, body.model_dump())
-        )
-
-    @router.post("/api/execution/operations/{operation_id}/resume")
-    async def execution_resume(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
-    ) -> dict[str, Any]:
-        require_matching_operation(operation_id, body.operation_id)
-        return await control_call(
-            lambda: client.resume_operation(operation_id, body.model_dump())
-        )
 
     @router.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(

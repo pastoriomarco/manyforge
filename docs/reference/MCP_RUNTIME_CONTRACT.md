@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-06 18:51:47 UTC
+  Last regenerated: 2026-10-08 14:53:41 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1940,8 +1940,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "gripper_confirm",
               "operation_start",
               "operation_stop",
-              "operation_pause",
-              "operation_resume",
               "operation_reset",
               "operation_acknowledge_completed",
               "cell_full_stop",
@@ -7968,72 +7966,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "action",
           "path"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/execution/operations/{operation_id}/pause",
-        "properties": {
-          "action": {
-            "const": "pause",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/OperationControlRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "operation_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/execution/operations/{operation_id}/resume",
-        "properties": {
-          "action": {
-            "const": "resume",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/OperationControlRequest"
-          },
-          "path": {
-            "additionalProperties": false,
-            "properties": {
-              "operation_id": {
-                "maxLength": 512,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "operation_id"
-            ],
-            "type": "object"
-          }
-        },
-        "required": [
-          "action",
-          "path",
-          "body"
         ],
         "type": "object"
       },

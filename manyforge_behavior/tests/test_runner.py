@@ -64,12 +64,6 @@ class RecordingTransport:
             },
         }
 
-    def pause(self, operation_id, body):
-        return self._control("pause", operation_id, body)
-
-    def resume(self, operation_id, body):
-        return self._control("resume", operation_id, body)
-
     def reset(self, operation_id, body):
         return self._control("reset", operation_id, body)
 

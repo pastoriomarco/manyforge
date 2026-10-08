@@ -121,8 +121,8 @@ TEST(RuntimeContractRegistry,
       });
   ASSERT_NE(native, registry.contracts().end());
   ASSERT_NE(ros2_control, registry.contracts().end());
-  check_offer(native->offer(), 38U);
-  check_offer(ros2_control->offer(), 41U);
+  check_offer(native->offer(), 36U);
+  check_offer(ros2_control->offer(), 39U);
   const auto has_operation_scale = [](const auto &offer) {
     return std::any_of(offer.provided_capabilities.begin(),
                        offer.provided_capabilities.end(), [](const auto &ref) {

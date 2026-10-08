@@ -28,23 +28,6 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
   Result<std::uint64_t> execute(const ExecuteRequestDTO&) override {
     return Result<std::uint64_t>::Err(unsupported());
   }
-  PauseResultDTO pause() override {
-    std::unique_lock lock(mutex_);
-    ++pause_calls_;
-    pause_thread_ = std::this_thread::get_id();
-    entered_ = true;
-    changed_.notify_all();
-    if (throw_pause_) {
-      throw std::runtime_error("fixture pause failure");
-    }
-    changed_.wait(lock, [this] { return !block_pause_; });
-    return {pause_accepted_, pause_accepted_ ? std::nullopt : std::optional(unsupported())};
-  }
-  ResumeResultDTO resume(std::optional<std::uint64_t>) override {
-    std::lock_guard lock(mutex_);
-    ++resume_calls_;
-    return {true, std::nullopt};
-  }
   ResetResultDTO reset(std::optional<std::uint64_t>) override { return {false, unsupported()}; }
   ResetResultDTO reset_after_certified_containment(std::uint64_t,
                                                    std::optional<std::uint64_t>) override {
@@ -54,9 +37,16 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
   }
   AcknowledgeCompletedResultDTO acknowledge_completed(const std::uint64_t execution_id,
                                                       std::optional<std::uint64_t>) override {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     ++acknowledge_calls_;
     acknowledged_execution_id_ = execution_id;
+    effect_thread_ = std::this_thread::get_id();
+    entered_ = true;
+    changed_.notify_all();
+    if (throw_effect_) {
+      throw std::runtime_error("fixture acknowledgement failure");
+    }
+    changed_.wait(lock, [this] { return !block_effect_; });
     return {true, std::nullopt};
   }
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
@@ -98,22 +88,6 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
   Result<void> DispatchPreparedMotion(std::uint64_t, const ContentDigest&) override {
     return Result<void>::Err(unsupported());
   }
-  Result<void> PrepareResumeMotion(std::uint64_t, ResolvedPreparedMotionResumeRequestDTO) override {
-    std::unique_lock lock(mutex_);
-    ++prepare_resume_calls_;
-    prepare_resume_entered_ = true;
-    changed_.notify_all();
-    changed_.wait(lock, [this] { return !block_prepare_resume_; });
-    return Result<void>::Ok();
-  }
-  Result<void> DispatchPreparedResumeMotion(std::uint64_t, const ContentDigest&) override {
-    return Result<void>::Err(unsupported());
-  }
-  Result<void> CancelPreparedResumeMotion(std::uint64_t) override {
-    std::lock_guard lock(mutex_);
-    ++cancel_prepared_resume_calls_;
-    return Result<void>::Ok();
-  }
   Result<void> CancelPreparedMotion(std::uint64_t) override {
     return Result<void>::Err(unsupported());
   }
@@ -134,53 +108,29 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
     return Result<void>::Err(unsupported());
   }
 
-  void BlockPause() {
+  void BlockEffect() {
     std::lock_guard lock(mutex_);
-    block_pause_ = true;
+    block_effect_ = true;
     entered_ = false;
   }
-  void ReleasePause() {
+  void ReleaseEffect() {
     {
       std::lock_guard lock(mutex_);
-      block_pause_ = false;
+      block_effect_ = false;
     }
     changed_.notify_all();
   }
-  void ThrowPause() {
+  void ThrowEffect() {
     std::lock_guard lock(mutex_);
-    throw_pause_ = true;
+    throw_effect_ = true;
   }
-  void BlockPrepareResume() {
-    std::lock_guard lock(mutex_);
-    block_prepare_resume_ = true;
-    prepare_resume_entered_ = false;
-  }
-  void ReleasePrepareResume() {
-    {
-      std::lock_guard lock(mutex_);
-      block_prepare_resume_ = false;
-    }
-    changed_.notify_all();
-  }
-  [[nodiscard]] bool WaitForPrepareResume() {
-    std::unique_lock lock(mutex_);
-    return changed_.wait_for(lock, 1s, [this] { return prepare_resume_entered_; });
-  }
-  [[nodiscard]] bool WaitForPause() {
+  [[nodiscard]] bool WaitForEffect() {
     std::unique_lock lock(mutex_);
     return changed_.wait_for(lock, 1s, [this] { return entered_; });
   }
-  [[nodiscard]] std::size_t pause_calls() const {
+  [[nodiscard]] std::thread::id effect_thread() const {
     std::lock_guard lock(mutex_);
-    return pause_calls_;
-  }
-  [[nodiscard]] std::thread::id pause_thread() const {
-    std::lock_guard lock(mutex_);
-    return pause_thread_;
-  }
-  [[nodiscard]] std::size_t resume_calls() const {
-    std::lock_guard lock(mutex_);
-    return resume_calls_;
+    return effect_thread_;
   }
   [[nodiscard]] std::size_t acknowledge_calls() const {
     std::lock_guard lock(mutex_);
@@ -198,14 +148,6 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
     std::lock_guard lock(mutex_);
     return reset_gripper_calls_;
   }
-  [[nodiscard]] std::size_t prepare_resume_calls() const {
-    std::lock_guard lock(mutex_);
-    return prepare_resume_calls_;
-  }
-  [[nodiscard]] std::size_t cancel_prepared_resume_calls() const {
-    std::lock_guard lock(mutex_);
-    return cancel_prepared_resume_calls_;
-  }
   [[nodiscard]] std::string reset_gripper_target() const {
     std::lock_guard lock(mutex_);
     return reset_gripper_target_;
@@ -222,20 +164,13 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
  private:
   mutable std::mutex mutex_;
   std::condition_variable changed_;
-  bool block_pause_{};
+  bool block_effect_{};
   bool entered_{};
-  bool throw_pause_{};
-  bool block_prepare_resume_{};
-  bool prepare_resume_entered_{};
-  bool pause_accepted_{true};
-  std::size_t pause_calls_{};
-  std::thread::id pause_thread_{};
-  std::size_t resume_calls_{};
+  bool throw_effect_{};
+  std::thread::id effect_thread_{};
   std::size_t acknowledge_calls_{};
   std::size_t reset_after_containment_calls_{};
   std::size_t reset_gripper_calls_{};
-  std::size_t prepare_resume_calls_{};
-  std::size_t cancel_prepared_resume_calls_{};
   std::string reset_gripper_target_;
   std::uint64_t reset_gripper_command_id_{};
   std::uint64_t reset_gripper_generation_{};
@@ -270,8 +205,8 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
 
 [[nodiscard]] OperationControlEffectRequest request(
     FakeEngine& engine, const std::string& operation, const std::string& participant,
-    const OperationControlKind control = OperationControlKind::kPause,
-    const std::uint64_t subordinate_id = 0U) {
+    const OperationControlKind control = OperationControlKind::kAcknowledgeCompleted,
+    const std::uint64_t subordinate_id = 1U) {
   return OperationControlEffectRequest{&engine,
                                        OperationId(operation),
                                        OperationParticipantId(participant),
@@ -280,10 +215,7 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
                                        subordinate_id,
                                        OperationParticipantPayloadKind::kMotion,
                                        {},
-                                       0U,
-                                       nullptr,
-                                       {},
-                                       {}};
+                                       0U};
 }
 
 [[nodiscard]] OperationControlEffectTakeResult WaitForResult(
@@ -305,30 +237,6 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
     std::this_thread::yield();
   }
   return !executor.has_active_calls();
-}
-
-[[nodiscard]] OperationControlEffectRequest resume_request(
-    FakeEngine& engine, std::shared_ptr<std::atomic_bool> cancellation_requested) {
-  auto authority = std::make_shared<const ResolvedPreparedMotionResumeRequestDTO>(
-      ResolvedPreparedMotionResumeRequestDTO{OperationId("operation.resume"),
-                                             OperationRevision(2U),
-                                             OperationParticipantId("participant.resume"),
-                                             ControllerGoalId("goal.resume"),
-                                             ControllerGoalGeneration(2U),
-                                             {},
-                                             {}});
-  return OperationControlEffectRequest{&engine,
-                                       authority->operation_id,
-                                       authority->participant_id,
-                                       authority->operation_revision,
-                                       OperationControlKind::kResume,
-                                       77U,
-                                       OperationParticipantPayloadKind::kMotion,
-                                       {},
-                                       0U,
-                                       &engine,
-                                       std::move(authority),
-                                       std::move(cancellation_requested)};
 }
 
 TEST(BoundedOperationControlExecutorTest, ConstructionRequiresCanonicalDistinctEngineLanes) {
@@ -354,7 +262,7 @@ TEST(BoundedOperationControlExecutorTest,
             OperationControlEffectTakeStatus::kCompleted);
   ASSERT_EQ(executor.Release(*first.handle), OperationControlEffectReleaseStatus::kReleased);
   ASSERT_TRUE(WaitForNoCalls(executor));
-  const auto worker_before = retained.pause_thread();
+  const auto worker_before = retained.effect_thread();
   ASSERT_NE(worker_before, std::thread::id{});
 
   EXPECT_EQ(executor.ReconfigureEngines({&retained, &added}),
@@ -369,7 +277,7 @@ TEST(BoundedOperationControlExecutorTest,
   ASSERT_EQ(WaitForResult(executor, *second.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*second.handle), OperationControlEffectReleaseStatus::kReleased);
-  EXPECT_EQ(retained.pause_thread(), worker_before);
+  EXPECT_EQ(retained.effect_thread(), worker_before);
   const auto new_effect = executor.TryStart(request(added, "operation.added", "participant.added"));
   ASSERT_TRUE(new_effect.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *new_effect.handle));
@@ -384,14 +292,14 @@ TEST(BoundedOperationControlExecutorTest, IncrementalUpdateRejectsLiveEffectWith
   Receiver receiver;
   FakeEngine retained;
   FakeEngine replacement;
-  retained.BlockPause();
+  retained.BlockEffect();
   BoundedOperationControlExecutor executor({&retained}, receiver);
   const auto active = executor.TryStart(request(retained, "operation.live", "participant.live"));
   ASSERT_TRUE(active.handle.has_value());
-  ASSERT_TRUE(retained.WaitForPause());
+  ASSERT_TRUE(retained.WaitForEffect());
   EXPECT_EQ(executor.ReconfigureEngines({&replacement}), OperationControlLaneUpdateStatus::kBusy);
   EXPECT_EQ(executor.capacity(), 1U);
-  retained.ReleasePause();
+  retained.ReleaseEffect();
   ASSERT_TRUE(receiver.Wait(executor, *active.handle));
   ASSERT_EQ(WaitForResult(executor, *active.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
@@ -407,14 +315,14 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
   Receiver receiver;
   FakeEngine blocked_engine;
   FakeEngine fast_engine;
-  blocked_engine.BlockPause();
+  blocked_engine.BlockEffect();
   BoundedOperationControlExecutor executor({&blocked_engine, &fast_engine}, receiver);
   ASSERT_TRUE(executor.prequalified_ready());
 
   const auto blocked = executor.TryStart(request(blocked_engine, "operation.a", "participant.a"));
   ASSERT_EQ(blocked.status, OperationControlEffectStartStatus::kStarted);
   ASSERT_TRUE(blocked.handle.has_value());
-  ASSERT_TRUE(blocked_engine.WaitForPause());
+  ASSERT_TRUE(blocked_engine.WaitForEffect());
 
   const auto fast = executor.TryStart(request(fast_engine, "operation.b", "participant.b"));
   ASSERT_EQ(fast.status, OperationControlEffectStartStatus::kStarted);
@@ -428,7 +336,7 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
 
   executor.CloseIngress();
   EXPECT_FALSE(executor.DrainFor(10ms));
-  blocked_engine.ReleasePause();
+  blocked_engine.ReleaseEffect();
   ASSERT_TRUE(receiver.Wait(executor, *blocked.handle));
   EXPECT_EQ(WaitForResult(executor, *blocked.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
@@ -439,14 +347,14 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
 TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenAndReleased) {
   Receiver receiver;
   FakeEngine engine;
-  engine.BlockPause();
+  engine.BlockEffect();
   BoundedOperationControlExecutor executor({&engine}, receiver);
   const auto first = executor.TryStart(request(engine, "operation.a", "participant.a"));
   ASSERT_TRUE(first.handle.has_value());
-  ASSERT_TRUE(engine.WaitForPause());
+  ASSERT_TRUE(engine.WaitForEffect());
   EXPECT_EQ(executor.TryStart(request(engine, "operation.b", "participant.b")).status,
             OperationControlEffectStartStatus::kLaneBusy);
-  engine.ReleasePause();
+  engine.ReleaseEffect();
   ASSERT_TRUE(receiver.Wait(executor, *first.handle));
   EXPECT_EQ(WaitForResult(executor, *first.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
@@ -460,7 +368,7 @@ TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenA
   EXPECT_EQ(executor.TryTake(*first.handle).status, OperationControlEffectTakeStatus::kStaleHandle);
   auto second_result = WaitForResult(executor, *second.handle);
   ASSERT_EQ(second_result.status, OperationControlEffectTakeStatus::kCompleted);
-  EXPECT_EQ(engine.acknowledge_calls(), 1U);
+  EXPECT_EQ(engine.acknowledge_calls(), 2U);
   EXPECT_EQ(engine.acknowledged_execution_id(), 77U);
   EXPECT_EQ(executor.Release(*second.handle), OperationControlEffectReleaseStatus::kReleased);
   executor.CloseIngress();
@@ -470,7 +378,7 @@ TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenA
 TEST(BoundedOperationControlExecutorTest, ThrowingEffectRetainsExactFailureIdentity) {
   Receiver receiver;
   FakeEngine engine;
-  engine.ThrowPause();
+  engine.ThrowEffect();
   BoundedOperationControlExecutor executor({&engine}, receiver);
   const auto started = executor.TryStart(request(engine, "operation.throw", "participant.throw"));
   ASSERT_TRUE(started.handle.has_value());
@@ -483,36 +391,6 @@ TEST(BoundedOperationControlExecutorTest, ThrowingEffectRetainsExactFailureIdent
   EXPECT_FALSE(result.result->accepted);
   ASSERT_TRUE(result.result->error.has_value());
   EXPECT_EQ(result.result->error->details.at("reason"), "operation_control_effect_threw");
-  EXPECT_EQ(executor.Release(*started.handle), OperationControlEffectReleaseStatus::kReleased);
-  executor.CloseIngress();
-  EXPECT_TRUE(executor.DrainFor(1s));
-}
-
-TEST(BoundedOperationControlExecutorTest,
-     ResumeUsesPreparedAuthorityAndCancelsWhenStopWinsDuringPreparation) {
-  Receiver receiver;
-  FakeEngine engine;
-  engine.BlockPrepareResume();
-  BoundedOperationControlExecutor executor({&engine}, receiver);
-  auto cancellation_requested = std::make_shared<std::atomic_bool>(false);
-  const auto started = executor.TryStart(resume_request(engine, cancellation_requested));
-  ASSERT_TRUE(started.handle.has_value());
-  ASSERT_TRUE(engine.WaitForPrepareResume());
-  cancellation_requested->store(true, std::memory_order_release);
-  engine.ReleasePrepareResume();
-  ASSERT_TRUE(receiver.Wait(executor, *started.handle));
-  const auto result = WaitForResult(executor, *started.handle);
-  ASSERT_EQ(result.status, OperationControlEffectTakeStatus::kCompleted);
-  ASSERT_TRUE(result.result.has_value());
-  EXPECT_FALSE(result.result->accepted);
-  EXPECT_TRUE(result.result->prepared_resume_created);
-  EXPECT_TRUE(result.result->prepared_resume_cleanup_finished);
-  ASSERT_TRUE(result.result->error.has_value());
-  EXPECT_EQ(result.result->error->details.at("reason"),
-            "prepared_resume_superseded_during_prepare");
-  EXPECT_EQ(engine.prepare_resume_calls(), 1U);
-  EXPECT_EQ(engine.cancel_prepared_resume_calls(), 1U);
-  EXPECT_EQ(engine.resume_calls(), 0U);
   EXPECT_EQ(executor.Release(*started.handle), OperationControlEffectReleaseStatus::kReleased);
   executor.CloseIngress();
   EXPECT_TRUE(executor.DrainFor(1s));
@@ -544,10 +422,7 @@ TEST(BoundedOperationControlExecutorTest,
                                     91U,
                                     OperationParticipantPayloadKind::kCapabilityCommand,
                                     "gripper.target",
-                                    6U,
-                                    nullptr,
-                                    {},
-                                    {}});
+                                    6U});
   ASSERT_TRUE(command.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *command.handle));
   const auto command_result = WaitForResult(executor, *command.handle);

@@ -17,7 +17,6 @@ def test_execution_state_enum():
     assert manyforge_core_py.ExecutionState.kValidating == manyforge_core_py.kValidating
     assert manyforge_core_py.ExecutionState.kExecuting == manyforge_core_py.kExecuting
     assert manyforge_core_py.ExecutionState.kInterrupted == manyforge_core_py.kInterrupted
-    assert manyforge_core_py.ExecutionState.kPaused == manyforge_core_py.kPaused
     assert manyforge_core_py.ExecutionState.kStopping == manyforge_core_py.kStopping
     assert manyforge_core_py.ExecutionState.kStopped == manyforge_core_py.kStopped
     assert manyforge_core_py.ExecutionState.kCompleted == manyforge_core_py.kCompleted
@@ -221,22 +220,6 @@ def test_stop_result_dto():
     import manyforge_core_py
     
     r = manyforge_core_py.StopResultDTO()
-    assert r.accepted is False
-
-
-def test_pause_result_dto():
-    """Test PauseResultDTO creation and attributes."""
-    import manyforge_core_py
-    
-    r = manyforge_core_py.PauseResultDTO()
-    assert r.accepted is False
-
-
-def test_resume_result_dto():
-    """Test ResumeResultDTO creation and attributes."""
-    import manyforge_core_py
-    
-    r = manyforge_core_py.ResumeResultDTO()
     assert r.accepted is False
 
 

@@ -514,7 +514,6 @@ export type OperationStateName =
   | 'prepared'
   | 'dispatching'
   | 'executing'
-  | 'paused'
   | 'stopping'
   | 'completed'
   | 'stopped'

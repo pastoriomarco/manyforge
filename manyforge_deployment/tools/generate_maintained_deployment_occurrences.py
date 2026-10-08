@@ -124,16 +124,6 @@ CAPABILITIES: Final = {
         "target_binding",
         "control_binding",
     ),
-    "execution.pause": (
-        "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-        "target_binding",
-        "control_binding",
-    ),
-    "execution.resume": (
-        "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
-        "target_binding",
-        "control_binding",
-    ),
     "execution.reset": (
         "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
         "target_binding",
@@ -302,8 +292,6 @@ ARM_CAPABILITIES: Final = tuple(
             "execution.feedback.phase_events",
             "execution.feedback.state_snapshots",
             "execution.stop.soft",
-            "execution.pause",
-            "execution.resume",
             "execution.reset",
             "execution.contact.geometric",
             "execution.contact.geometric_signed_penetration",
@@ -322,7 +310,8 @@ ARM_CAPABILITIES: Final = tuple(
         }
     )
 )
-# The historical closure remains the original 36 facilities. Scaling is an
+# The historical closure is the original 36 facilities less the removed
+# operation Pause/Resume (maintainer, 2026-10-08). Scaling is an
 # additional native-qualified realization, not an unqualified ROS claim.
 NATIVE_ARM_CAPABILITIES: Final = tuple(
     sorted((*ARM_CAPABILITIES, "execution.runtime_scale.operation_scoped"))
@@ -3260,9 +3249,9 @@ def historical_capability_closure() -> dict[str, Any]:
     active_ids = sorted(
         set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES + CELL_CAPABILITIES)
     )
-    if len(active_ids) != 36:
+    if len(active_ids) != 34:
         raise GenerationError(
-            "historical capability closure must contain exactly 36 active IDs"
+            "historical capability closure must contain exactly 34 active IDs"
         )
     rows: list[dict[str, Any]] = []
     for capability_id in active_ids:

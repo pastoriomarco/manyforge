@@ -29,6 +29,8 @@ const snapshot: CCLCComponentSnapshot = {
   retainedBundleId: 'bundle.1',
   graphRevision: 'graph.1',
   providers: [],
+  lifecycleTarget: null,
+  lifecycleProgress: null,
   domains: [{
     controlDomainId: 'domain.arm',
     controlDomainRevision: 'domain.revision.1',

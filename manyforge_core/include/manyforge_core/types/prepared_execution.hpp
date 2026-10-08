@@ -78,7 +78,6 @@ struct PrepareParticipantResultDTO final {
 enum class ExecutionBackendStateDTO : std::uint8_t {
   kAccepted = 0,
   kExecuting,
-  kPaused,
   kCompleted,
   kFailed,
   kCancelled,
@@ -90,8 +89,6 @@ enum class ExecutionBackendStateDTO : std::uint8_t {
       return "accepted";
     case ExecutionBackendStateDTO::kExecuting:
       return "executing";
-    case ExecutionBackendStateDTO::kPaused:
-      return "paused";
     case ExecutionBackendStateDTO::kCompleted:
       return "completed";
     case ExecutionBackendStateDTO::kFailed:
@@ -171,7 +168,7 @@ prepared_participant_backend_physical_binding_field_error(
     const PreparedOperationParticipantDTO& participant, PrepareParticipantResultStateDTO state,
     std::optional<ErrorDTO> error = std::nullopt);
 
-/// Validate the immediate handle returned by Dispatch/DispatchResume.  A
+/// Validate the immediate handle returned by Dispatch.  A
 /// prepared dispatch is not admitted into runtime observation unless the
 /// backend echoes the exact Kernel goal generation and prepared-contract
 /// digest and supplies both bounded observation callbacks.

@@ -1184,7 +1184,7 @@ bool engines_require_single_context_exclusivity(
 }
 
 bool runtime_monitor_may_hold_collision_engine(ExecutionState state) {
-  return state == ExecutionState::kExecuting || state == ExecutionState::kPaused ||
+  return state == ExecutionState::kExecuting ||
          state == ExecutionState::kStopping;
 }
 

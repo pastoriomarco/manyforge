@@ -18,6 +18,8 @@ function controller(): CCLCController {
       graphRevision: 'graph.1',
       domains: [],
       providers: [],
+      lifecycleTarget: null,
+      lifecycleProgress: null,
     },
     routeTemplates: {
       componentId: 'component.arm',
@@ -56,6 +58,38 @@ describe('CCLC presentation', () => {
     expect(html).not.toContain('Recover / restart');
     expect(html).not.toContain('Stop / disable');
     expect(html).toContain('Owner-issued state');
+  });
+
+  it('shows target, achieved state, readiness and consequence while manual controls stay available', () => {
+    const waiting = controller();
+    waiting.snapshot = {
+      ...waiting.snapshot!,
+      lifecycleTarget: { requestedState: 'active', origin: 'startup', targetGeneration: 2 },
+      lifecycleProgress: {
+        phase: 'waiting_for_prerequisites',
+        nextIntent: 'enable',
+        blockingCauseClass: 'availability',
+        blockingReason: 'controller_manager not ready',
+        waitingSinceNs: 1_000,
+        delayed: true,
+        incident: null,
+      },
+    };
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true,
+      mutationAvailable: true,
+      mutationUnavailableReason: null,
+      controller: waiting,
+    }));
+    expect(html).toContain('Startup delayed — still waiting');
+    expect(html).toContain('Requested target: active (requested by startup configuration, target 2)');
+    expect(html).toContain('Achieved: prepared · generation 4');
+    expect(html).toContain('controller_manager not ready');
+    expect(html).toContain('Motion is unavailable until the component reaches its requested target.');
+    expect(html).toContain('aria-label="Component lifecycle status"');
+    expect(html).not.toMatch(/acknowledge|keep watching|resume watching/i);
+    expect(html).toMatch(/<button[^>]*title="Enable the prepared component[^"]*"[^>]*>Enable<\/button>/);
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Enable<\/button>/);
   });
 
   it('keeps read unavailability local to the lifecycle panel', () => {

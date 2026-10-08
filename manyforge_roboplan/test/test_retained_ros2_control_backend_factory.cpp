@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -746,6 +747,48 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       core::ControlDomainId("domain.arm"), clock.now());
   ASSERT_TRUE(unchanged.ok());
   EXPECT_EQ(unchanged.value().source_generation, 2U);
+
+  const auto boolean_fact_value = [](const auto &snapshot,
+                                     const std::string &id) {
+    for (const auto &fact : snapshot.facts) {
+      if (fact.lifecycle_fact_id.value() == id) {
+        return fact.value.boolean_value;
+      }
+    }
+    return std::optional<bool>{};
+  };
+  EXPECT_EQ(boolean_fact_value(active.value(),
+                               "external.controller_inactive_unrequested"),
+            std::optional<bool>(false));
+
+  // Fresh status with the controller deactivated after it was active: the
+  // cause stays availability and the diagnostic fact marks it unrequested.
+  ros2_control_execution::ControllerBindingSnapshot deactivated;
+  deactivated.activity_generation = 2U;
+  deactivated.contract_generation_id = "binding.generation";
+  deactivated.observed_timestamp_ns = clock.now();
+  deactivated.received_timestamp_ns = clock.now();
+  deactivated.fresh_until_ns = clock.now() + 1'000;
+  deactivated.controller_active = false;
+  deactivated.hardware_active = true;
+  deactivated.controller_type_matches = true;
+  deactivated.claimed_interfaces_match = true;
+  deactivated.state_interfaces_available = true;
+  deactivated.conflicting_claims_absent = true;
+  deactivated.valid = false;
+  deactivated.reason_codes = {"trajectory_controller_inactive"};
+  backend->testing_publish_controller_binding_snapshot(std::move(deactivated));
+  const auto inactive = handle->ReadLifecycleSnapshot(
+      core::ControlDomainId("domain.arm"), clock.now());
+  ASSERT_TRUE(inactive.ok()) << inactive.error().message;
+  EXPECT_EQ(inactive.value().source_generation, 3U);
+  EXPECT_FALSE(inactive.value().exact_controller_configuration_active);
+  EXPECT_EQ(boolean_fact_value(inactive.value(),
+                               "external.controller_inactive_unrequested"),
+            std::optional<bool>(true));
+  EXPECT_EQ(boolean_fact_value(inactive.value(),
+                               "external.controller_configuration_ready"),
+            std::optional<bool>(false));
 
   const auto rebound = handle->BindBackend(backend, binding, std::nullopt);
   ASSERT_FALSE(rebound.ok());

@@ -602,8 +602,6 @@ template <typename StrongId>
       return "dispatching";
     case OperationStateKind::kExecuting:
       return "executing";
-    case OperationStateKind::kPaused:
-      return "paused";
     case OperationStateKind::kStopping:
       return "stopping";
     case OperationStateKind::kCompleted:
@@ -632,7 +630,6 @@ template <typename StrongId>
       OperationStateKind::kPrepared,
       OperationStateKind::kDispatching,
       OperationStateKind::kExecuting,
-      OperationStateKind::kPaused,
       OperationStateKind::kStopping,
       OperationStateKind::kCompleted,
       OperationStateKind::kStopped,
@@ -688,10 +685,6 @@ template <typename StrongId>
 
 [[nodiscard]] std::string_view ControlName(OperationControlKind control) {
   switch (control) {
-    case OperationControlKind::kPause:
-      return "pause";
-    case OperationControlKind::kResume:
-      return "resume";
     case OperationControlKind::kReset:
       return "reset";
     case OperationControlKind::kAcknowledgeCompleted:

@@ -125,6 +125,34 @@ Result<RouteSelectionCurrentSnapshot> verify_route_selection_current_snapshot(
       RouteSelectionCurrentSnapshot(std::move(value), std::move(expected.value())));
 }
 
+Result<RouteConfigurationObservationSnapshot> verify_route_configuration_observation_snapshot(
+    RouteConfigurationObservationSnapshotDTO value) {
+  const auto observation_error = [](std::string reason, std::string message) {
+    return Result<RouteConfigurationObservationSnapshot>::Err(
+        ErrorDTO{"route_configuration_observation_invalid",
+                 std::move(message),
+                 {{"reason", std::move(reason)}}});
+  };
+  if (!bounded_identity(value.retained_bundle_id) || !bounded_identity(value.graph_revision)) {
+    return observation_error("shape_invalid",
+                             "the configuration observation has an invalid retained identity");
+  }
+  auto expected = verify_controller_lifecycle_expected_domain(value.expected_controller_domain);
+  if (!expected.ok()) {
+    return observation_error("expected_domain_invalid",
+                             "the configuration observation expected-domain closure is invalid");
+  }
+  if (value.active_control_configuration.has_value() &&
+      !active_configuration_matches_domain(*value.active_control_configuration,
+                                           expected.value().value())) {
+    return observation_error(
+        "current_configuration_invalid",
+        "the configuration observation current configuration is not exact domain truth");
+  }
+  return Result<RouteConfigurationObservationSnapshot>::Ok(
+      RouteConfigurationObservationSnapshot(std::move(value), std::move(expected.value())));
+}
+
 Result<ActiveControlConfigurationDTO> ResolveRouteSelectionActiveControlConfiguration(
     const RouteSelectionAcceptedDTO& acceptance,
     const ControllerLifecycleExpectedDomain& expected_controller_domain,

@@ -2077,5 +2077,114 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_FALSE(coordinator.accepting_new_requests());
 }
 
+[[nodiscard]] NativeApplyPlanRequestDTO DeclaredNativeApplyPlanRequest() {
+  return {{ApplyId("apply.ros"), ApplyGeneration(1U)},
+          RetainedBundleId("bundle.1"),
+          GraphRevision("graph.1"),
+          {ControllableComponentId("component.1")},
+          {},
+          {},
+          {},
+          {},
+          {},
+          ComponentLifecycleStateDTO::kDeclared};
+}
+
+TEST(ComponentLifecycleCoordinator, ObservedControllerApplyReopensPrepareOnlyAfterDeclaredAdoption) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  // A ROS-style parent Apply records a plan that only declares its component.
+  const auto plan = journal.PlanNativeApply(DeclaredNativeApplyPlanRequest());
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  ASSERT_EQ(plan.value().components.size(), 1U);
+  ASSERT_EQ(plan.value().components.front().state, ComponentLifecycleStateDTO::kDeclared);
+  const auto declared_generation = plan.value().components.front().generation;
+
+  const auto catalog = PrepareCatalog();
+  auto intent_at = [&](const RequestOwnerEpoch& owner, std::string request_id) {
+    auto intent = PrepareIntent(owner);
+    intent.request_context.request_id = RequestId(std::move(request_id));
+    intent.expected_component_lifecycle_generation = declared_generation;
+    return intent;
+  };
+  {
+    CCLCDomainReservationTable reservations;
+    FakeSnapshotSource snapshots({Snapshot("snapshot.declared", ComponentLifecycleStateDTO::kDeclared,
+                                           declared_generation, catalog)});
+    FakeCatalogSource catalogs(catalog);
+    auto port = std::make_shared<FakeBrandPort>(
+        journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                         ComponentLifecycleStateDTO::kPrepared});
+    FakeResolver resolver(port, catalog);
+    FakeCellAdmissionPort kernel;
+    FakeClock clock;
+    clock.set(100);
+    ManualScheduler scheduler;
+    ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                              resolver, kernel, clock, scheduler);
+    ASSERT_TRUE(coordinator.Start().ok());
+    // While the plan is unadopted, ordinary Prepare stays closed.
+    const auto refused = coordinator.SubmitLifecycle(
+        intent_at(coordinator.request_owner_epoch(), "request.before-adoption"));
+    const auto code = !refused.ok() ? refused.error().code
+                      : refused.value().rejection.has_value()
+                          ? refused.value().rejection->code
+                          : std::string{};
+    EXPECT_EQ(code, "component_lifecycle_native_apply_unsettled");
+    EXPECT_EQ(port->dispatch_count(), 0U);
+  }
+
+  // The host adopts exactly the Declared plan under its held Apply fence.
+  const auto publication = [] {
+    auto receipt = ActivePublication();
+    receipt.request.transaction_ref =
+        NamedApplyPublicationTransactionDTO{ApplyId("apply.ros"), ApplyGeneration(1U)};
+    receipt.request.expected_previous_publication_generation =
+        ActiveBundlePublicationGeneration(1U);
+    return receipt;
+  }();
+  ASSERT_TRUE(publication.valid());
+  const auto adopted =
+      journal.AdoptNativeApplyFacts({publication, plan.value().components, {}});
+  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot("snapshot.declared", ComponentLifecycleStateDTO::kDeclared,
+                                         declared_generation, catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port, catalog);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(200);
+  ManualScheduler scheduler;
+  auto config = Config();
+  config.request_owner_epoch = RequestOwnerEpoch("cclc-owner.2");
+  ComponentLifecycleCoordinator coordinator(config, journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted = coordinator.SubmitLifecycle(
+      intent_at(coordinator.request_owner_epoch(), "request.after-adoption"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value())
+      << (accepted.value().rejection ? accepted.value().rejection->code : std::string{});
+  // The transition continues past the adopted generation; nothing is reused.
+  EXPECT_GT(accepted.value().acceptance->component_lifecycle_generation.value(),
+            declared_generation.value());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value().has_value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  const auto fact = journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok());
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kPrepared);
+}
+
 }  // namespace
 }  // namespace manyforge::core

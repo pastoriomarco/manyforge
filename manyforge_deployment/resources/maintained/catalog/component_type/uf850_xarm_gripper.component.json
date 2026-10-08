@@ -21,16 +21,8 @@
           "capability_id": "execution.feedback.state_snapshots"
         },
         {
-          "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-          "capability_id": "execution.pause"
-        },
-        {
           "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
           "capability_id": "execution.reset"
-        },
-        {
-          "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
-          "capability_id": "execution.resume"
         },
         {
           "capability_definition_revision": "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
@@ -181,7 +173,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "uf850_xarm_gripper.component",
-  "component_type_revision": "sha256:4c75cf700a093323e10191d14b7fd5061eb261fc3180d17d951a7cb605eaca78",
+  "component_type_revision": "sha256:d81166fb03da9956d9f6bcdd53b4e308207d3114fa67caa1d10355cfdf19385e",
   "model_mounts": [],
   "model_roles": [
     {

@@ -139,6 +139,168 @@ def test_client_rejects_owner_error_and_noncanonical_response(tmp_path: Path) ->
     thread.join(timeout=2)
 
 
+def _target_snapshot() -> dict[str, Any]:
+    return {
+        "controllable_component_id": "component.arm",
+        "component_lifecycle_generation": 4,
+        "lifecycle_progress": {
+            "blocking_cause_class": "availability",
+            "blocking_reason": "controller_manager not ready",
+            "delayed": True,
+            "incident": None,
+            "next_intent": "enable",
+            "phase": "waiting_for_prerequisites",
+            "waiting_since_ns": 1_000,
+        },
+        "lifecycle_target": {
+            "origin": "startup",
+            "requested_state": "active",
+            "target_generation": 1,
+        },
+    }
+
+
+def _snapshot_through_client(tmp_path: Path, snapshot: dict[str, Any]) -> dict[str, Any]:
+    thread = _serve_once(
+        tmp_path,
+        lambda _request: rfc8785.dumps(_response("component_snapshot", snapshot)),
+    )
+    try:
+        return CCLCOpenRequestClient(tmp_path).component_snapshot("component.arm")
+    finally:
+        thread.join(timeout=2)
+        (tmp_path / CCLC_SOCKET_FILE).unlink(missing_ok=True)
+
+
+def test_client_passes_lifecycle_target_and_progress_through_unchanged(
+    tmp_path: Path,
+) -> None:
+    snapshot = _target_snapshot()
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+    nulls = _target_snapshot()
+    nulls["lifecycle_target"] = None
+    nulls["lifecycle_progress"] = None
+    assert _snapshot_through_client(tmp_path, nulls) == nulls
+
+    satisfied = _target_snapshot()
+    satisfied["lifecycle_progress"].update(
+        blocking_cause_class="none",
+        blocking_reason=None,
+        delayed=False,
+        next_intent=None,
+        phase="satisfied",
+        waiting_since_ns=None,
+    )
+    assert _snapshot_through_client(tmp_path, satisfied) == satisfied
+
+
+@pytest.mark.parametrize(
+    ("field", "key", "invalid"),
+    [
+        ("lifecycle_target", "requested_state", "degraded"),
+        ("lifecycle_target", "origin", "browser"),
+        ("lifecycle_target", "target_generation", 0),
+        ("lifecycle_target", "target_generation", True),
+        ("lifecycle_target", "unexpected", 1),
+        ("lifecycle_progress", "phase", "retrying"),
+        ("lifecycle_progress", "next_intent", "restart"),
+        ("lifecycle_progress", "blocking_cause_class", "estop"),
+        ("lifecycle_progress", "blocking_cause_class", ["fault"]),
+        ("lifecycle_progress", "blocking_reason", ""),
+        ("lifecycle_progress", "waiting_since_ns", -1),
+        ("lifecycle_progress", "delayed", 1),
+        ("lifecycle_progress", "acknowledged", True),
+    ],
+)
+def test_client_rejects_unknown_lifecycle_target_or_progress_facts(
+    tmp_path: Path, field: str, key: str, invalid: Any
+) -> None:
+    snapshot = _target_snapshot()
+    snapshot[field][key] = invalid
+    with pytest.raises(HeadlessApiError, match=field) as captured:
+        _snapshot_through_client(tmp_path, snapshot)
+    assert captured.value.code == "cclc_open_response_invalid"
+
+
+def _incident_snapshot() -> dict[str, Any]:
+    snapshot = _target_snapshot()
+    snapshot["lifecycle_progress"].update(
+        blocking_cause_class="collision",
+        blocking_reason="controller reported C31",
+        delayed=False,
+        next_intent="recover",
+        phase="blocked",
+        incident={
+            "acknowledged": False,
+            "cause_class": "collision",
+            "detected_at_ns": 1_759_900_000_000,
+            "incident_id": "incident.component.arm.1",
+            "summary": "Collision detected while executing",
+            "vendor_codes": ["C31", "state=4", "mode=0"],
+        },
+    )
+    return snapshot
+
+
+@pytest.mark.parametrize("cause", ["collision", "external_control", "provider_lost"])
+def test_client_passes_an_open_incident_through_unchanged(
+    tmp_path: Path, cause: str
+) -> None:
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["blocking_cause_class"] = cause
+    snapshot["lifecycle_progress"]["incident"]["cause_class"] = cause
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+    snapshot["lifecycle_progress"]["incident"]["vendor_codes"] = []
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid"),
+    [
+        ("cause_class", "availability"),
+        ("cause_class", "none"),
+        ("cause_class", "crash"),
+        ("incident_id", ""),
+        ("incident_id", "i" * 129),
+        ("vendor_codes", "C31"),
+        ("vendor_codes", [""]),
+        ("vendor_codes", ["c" * 65]),
+        ("vendor_codes", ["C"] * 17),
+        ("detected_at_ns", -1),
+        ("detected_at_ns", 1.5),
+        ("summary", ""),
+        ("summary", "s" * 1025),
+        ("summary", "Cafe\u0301"),
+        ("acknowledged", True),
+        ("unexpected", 1),
+    ],
+)
+def test_client_rejects_a_malformed_incident(
+    tmp_path: Path, key: str, invalid: Any
+) -> None:
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["incident"][key] = invalid
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress") as captured:
+        _snapshot_through_client(tmp_path, snapshot)
+    assert captured.value.code == "cclc_open_response_invalid"
+
+
+def test_client_requires_the_incident_key(tmp_path: Path) -> None:
+    snapshot = _target_snapshot()
+    del snapshot["lifecycle_progress"]["incident"]
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _snapshot_through_client(tmp_path, snapshot)
+
+
+def test_client_rejects_a_lifecycle_progress_with_a_missing_key(tmp_path: Path) -> None:
+    snapshot = _target_snapshot()
+    del snapshot["lifecycle_progress"]["delayed"]
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress") as captured:
+        _snapshot_through_client(tmp_path, snapshot)
+    assert captured.value.code == "cclc_open_response_invalid"
+
+
 def _lifecycle_request(*, confirmed: bool) -> dict[str, Any]:
     return {
         "request_context": {
@@ -343,3 +505,170 @@ def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
     invalid = _lifecycle_request(confirmed=True)
     invalid["caller_asserted_principal"] = "operator"
     assert client.post("/api/cclc/lifecycle/requests", json=invalid).status_code == 422
+
+
+def _through_client(
+    tmp_path: Path,
+    command: str,
+    result: dict[str, Any] | None,
+    call: Callable[[CCLCOpenRequestClient], Any],
+    observed: list[dict[str, Any]] | None = None,
+) -> Any:
+    def handler(request: dict[str, Any]) -> bytes:
+        if observed is not None:
+            observed.append(request)
+        return rfc8785.dumps(_response(command, result))
+
+    thread = _serve_once(tmp_path, handler)
+    try:
+        return call(CCLCOpenRequestClient(tmp_path))
+    finally:
+        thread.join(timeout=2)
+        (tmp_path / CCLC_SOCKET_FILE).unlink(missing_ok=True)
+
+
+def _incident_recovery_result(replay_status: str = "accepted_new") -> dict[str, Any]:
+    return {
+        "acceptance": None,
+        "incident_recovery": {
+            "acknowledged_at_ns": 9_000,
+            "acknowledged_by": "test-client",
+            "cause_class": "emergency_stop",
+            "controllable_component_id": "component.arm",
+            "incident_id": "incident.component.arm.5000",
+        },
+        "replay_status": replay_status,
+        "status": None,
+    }
+
+
+def test_client_forwards_an_authorization_only_incident_recovery(tmp_path: Path) -> None:
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent["intent"] = "recover"
+    submitted = _through_client(
+        tmp_path,
+        "lifecycle_submit",
+        _incident_recovery_result(),
+        lambda client: client.submit_lifecycle(intent),
+    )
+    assert submitted == _incident_recovery_result()
+    replayed = _through_client(
+        tmp_path,
+        "lifecycle_request_result",
+        _incident_recovery_result("replayed_exact"),
+        lambda client: client.lifecycle_request_result(intent),
+    )
+    assert replayed == _incident_recovery_result("replayed_exact")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: result["incident_recovery"].update(
+            controllable_component_id="component.gripper"
+        ),
+        lambda result: result["incident_recovery"].update(cause_class="availability"),
+        lambda result: result["incident_recovery"].update(acknowledged_at_ns=-1),
+        lambda result: result["incident_recovery"].update(summary="extra"),
+        lambda result: result.update(replay_status="request_id_conflict"),
+        lambda result: result.update(
+            status={"acceptance": {"lifecycle_transaction_id": "lifecycle.1"}}
+        ),
+        lambda result: result.update(incident_recovery=None),
+    ],
+)
+def test_client_rejects_a_malformed_incident_recovery(
+    tmp_path: Path, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent["intent"] = "recover"
+    result = _incident_recovery_result()
+    mutate(result)
+    with pytest.raises(HeadlessApiError) as captured:
+        _through_client(
+            tmp_path,
+            "lifecycle_submit",
+            result,
+            lambda client: client.submit_lifecycle(intent),
+        )
+    assert captured.value.code == "cclc_open_response_invalid"
+
+
+def _incident_event(sequence: int, kind: str = "component_incident") -> dict[str, Any]:
+    return {
+        "event_kind": kind,
+        "event_sequence": sequence,
+        "incident_id": "incident.component.arm.5000",
+        "occurred_at_ns": 5_000 + sequence,
+        "payload": {
+            "cause_class": "emergency_stop",
+            "event_kind": kind,
+            "incident_id": "incident.component.arm.5000",
+            "detected_at_ns": 5_000,
+        },
+    }
+
+
+def test_client_reads_ordered_incident_events(tmp_path: Path) -> None:
+    observed: list[dict[str, Any]] = []
+    page = {
+        "events": [
+            _incident_event(3),
+            _incident_event(4, "component_incident_acknowledged"),
+        ],
+        "through_sequence": 4,
+    }
+    result = _through_client(
+        tmp_path,
+        "incident_events",
+        page,
+        lambda client: client.incident_events(2, 64),
+        observed,
+    )
+    assert result == page
+    assert observed[0]["command"] == "incident_events"
+    assert observed[0]["payload"] == {"after_sequence": 2, "limit": 64}
+    empty = _through_client(
+        tmp_path,
+        "incident_events",
+        {"events": [], "through_sequence": 9},
+        lambda client: client.incident_events(9, 1),
+    )
+    assert empty == {"events": [], "through_sequence": 9}
+    with pytest.raises(ValueError):
+        CCLCOpenRequestClient(tmp_path).incident_events(0, 65)
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {"events": [_incident_event(3)], "through_sequence": 4},
+        {"events": [_incident_event(2)], "through_sequence": 2},
+        {"events": [_incident_event(4), _incident_event(3)], "through_sequence": 3},
+        {"events": [{**_incident_event(3), "event_kind": "other"}], "through_sequence": 3},
+        {
+            "events": [{**_incident_event(3), "incident_id": "incident.other"}],
+            "through_sequence": 3,
+        },
+        {
+            "events": [{**_incident_event(3), "occurred_at_ns": -1}],
+            "through_sequence": 3,
+        },
+        {"events": [{**_incident_event(3), "extra": 1}], "through_sequence": 3},
+        {"events": [], "through_sequence": 2, "extra": None},
+        {"events": [], "through_sequence": 3},
+    ],
+)
+def test_client_rejects_malformed_incident_events(
+    tmp_path: Path, page: dict[str, Any]
+) -> None:
+    with pytest.raises(HeadlessApiError) as captured:
+        _through_client(
+            tmp_path,
+            "incident_events",
+            page,
+            lambda client: client.incident_events(2, 64),
+        )
+    assert captured.value.code == "cclc_open_response_invalid"

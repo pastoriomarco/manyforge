@@ -658,6 +658,12 @@
   gap: 0.45rem;
 }
 
+.cclc-lifecycle-summary {
+  display: grid;
+  justify-items: start;
+  gap: 0.25rem;
+}
+
 .cclc-provider-card,
 .cclc-route-row,
 .cclc-transaction {

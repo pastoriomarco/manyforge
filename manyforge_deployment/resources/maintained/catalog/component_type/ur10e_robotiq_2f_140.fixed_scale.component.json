@@ -21,16 +21,8 @@
           "capability_id": "execution.feedback.state_snapshots"
         },
         {
-          "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
-          "capability_id": "execution.pause"
-        },
-        {
           "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
           "capability_id": "execution.reset"
-        },
-        {
-          "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
-          "capability_id": "execution.resume"
         },
         {
           "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
@@ -177,7 +169,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur10e_robotiq_2f_140.fixed_scale.component",
-  "component_type_revision": "sha256:600a4e67a63f393c0a582de5f02b3791eb79d3b2a2f45ce4cc995a091777b6b5",
+  "component_type_revision": "sha256:9498876c8f0e774e91e0c9863e17c215c116303f8355df6bf4558eea0a35c3ac",
   "model_mounts": [],
   "model_roles": [
     {

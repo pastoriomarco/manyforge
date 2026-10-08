@@ -22,13 +22,13 @@ class CoordinatedExecutionClock;
 /// Responsibilities:
 /// - Execute a time-parameterized joint trajectory
 /// - Provide phase feedback for kernel events
-/// - Provide stop/pause/resume/reset primitives with bounded kernel semantics
+/// - Provide stop/reset primitives with bounded kernel semantics
 ///
 /// Threading:
-/// - Stop/Pause/Resume admission MUST be non-blocking from the kernel caller perspective
+/// - Stop admission MUST be non-blocking from the kernel caller perspective
 /// - Reset MUST be prompt during planning/validation cancellation, but may wait
 ///   for a bounded stop-before-reset sequence while the robot is moving
-/// - Stop/Pause/Resume/Reset MUST be safe to call from a different thread than ExecuteTrajectory
+/// - Stop/Reset MUST be safe to call from a different thread than ExecuteTrajectory
 /// - The kernel MUST NOT issue concurrent ExecuteTrajectory calls to the same backend instance
 class IExecutionBackend : public IControlDomainExecutionPort {
  public:
@@ -36,7 +36,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
 
   /// Side-effect-free exact participant preparation. Implementations accept
   /// only the motion_execution payload. execution_id is the owning Kernel's
-  /// existing monotonic execution ID, unchanged across its Resume attempts.
+  /// existing monotonic execution ID.
   /// The backend and that ID owner share a lifetime. Retain current membership
   /// only; preparation never sends a transport command.
   virtual PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
@@ -64,12 +64,6 @@ class IExecutionBackend : public IControlDomainExecutionPort {
                                    const ControllerGoalId& controller_goal_id,
                                    ControllerGoalGeneration controller_goal_generation) = 0;
 
-  /// Resume remains a fresh goal-bound dispatch of a newly prepared immutable
-  /// participant; it cannot inherit a stale binding or controller generation.
-  virtual ExecutionHandle DispatchResume(const PreparedOperationParticipantDTO& participant,
-                                         const ControllerGoalId& controller_goal_id,
-                                         ControllerGoalGeneration controller_goal_generation) = 0;
-
   /// Execute a trajectory (spec 220 §4)
   ///
   /// @param trajectory The trajectory to execute
@@ -94,22 +88,6 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   ///
   /// @return StopResultDTO indicating whether stop was accepted
   virtual StopResultDTO stop() = 0;
-
-  /// Pause the current execution (spec 220 §4)
-  ///
-  /// If no execution is in flight, returns accepted=false with invalid_request.
-  ///
-  /// @return PauseResultDTO indicating whether pause was accepted
-  virtual PauseResultDTO pause() = 0;
-
-  /// Resume execution with a new trajectory (spec 220 §4)
-  ///
-  /// Resume takes a trajectory because the kernel may replan from the paused state;
-  /// the backend executes it as a fresh trajectory dispatch.
-  ///
-  /// @param trajectory The trajectory to resume with
-  /// @return ExecutionHandle for tracking the resumed execution
-  virtual ExecutionHandle resume(const TrajectoryDTO& trajectory) = 0;
 
   /// Reset the execution backend (spec 220 §4)
   ///
@@ -142,7 +120,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return nullptr;
   }
 
-  /// Original accepted-trajectory cursor retained at Pause/completed Stop.
+  /// Original accepted-trajectory cursor retained at completed Stop.
   /// This bounded local read is scoped to the exact dispatch generation. It
   /// does not renew lookahead liveness or prove settlement/admission. Missing
   /// or uncertain correspondence returns nullopt, never replacement progress.

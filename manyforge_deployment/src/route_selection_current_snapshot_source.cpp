@@ -96,11 +96,12 @@ VerifiedRouteSelectionCurrentSnapshotSource::
   }
 }
 
-core::Result<core::RouteSelectionCurrentSnapshot>
-VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
+core::Result<core::RouteSelectionCurrentSnapshotDTO>
+VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteClosure(
     const core::RetainedBundleId &expected_retained_bundle_id,
     const core::GraphRevision &expected_graph_revision,
-    const core::DesiredControlConfigurationDTO &desired_configuration) const {
+    const core::DesiredControlConfigurationDTO &desired_configuration,
+    const bool observation_only) const {
   if (!bounded_identity(expected_retained_bundle_id) ||
       !bounded_identity(expected_graph_revision) ||
       desired_configuration.control_domain_id.empty() ||
@@ -113,7 +114,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
       expected_graph_revision !=
           retained_bundle_.value().cell_graph.graph_revision ||
       !verify_retained_bundle_identity(retained_bundle_)) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "query_or_retained_identity_mismatch",
         "route current-snapshot query does not name the retained source");
   }
@@ -124,11 +125,11 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
   };
   const auto active_before = read_active();
   if (!active_before.ok()) {
-    return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+    return core::Result<core::RouteSelectionCurrentSnapshotDTO>::Err(
         active_before.error());
   }
   if (active_before.value() != expected_active_publication_) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "active_publication_changed",
         "active publication differs from the construction anchor");
   }
@@ -149,7 +150,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
       domain->controller_topology_id !=
           desired_configuration.controller_topology_id ||
       domain->topology_revision != desired_configuration.topology_revision) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "desired_domain_not_retained",
         "desired configuration is not the exact retained domain candidate");
   }
@@ -164,7 +165,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
       std::find(
           domain->runtime_unit_ids.begin(), domain->runtime_unit_ids.end(),
           source->source_runtime_unit_id) == domain->runtime_unit_ids.end()) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "controller_source_not_retained",
         "domain has no exact retained controller-lifecycle source");
   }
@@ -185,7 +186,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
                   binding->legal_control_route_ids.end(),
                   desired_route.control_route_id) ==
             binding->legal_control_route_ids.end()) {
-      return fail<core::RouteSelectionCurrentSnapshot>(
+      return fail<core::RouteSelectionCurrentSnapshotDTO>(
           "retained_binding_scope_incomplete",
           "desired route has no exact retained binding closure");
     }
@@ -198,7 +199,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
                               binding->control_binding_revision});
   }
   if (component_ids.empty() || resource_ids.empty()) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "domain_scope_empty",
         "retained domain resolves no complete component/resource scope");
   }
@@ -209,7 +210,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
   const auto facts =
       current_fact_reader_.LoadCurrentSnapshotFacts(components, domains);
   if (!facts.ok()) {
-    return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+    return core::Result<core::RouteSelectionCurrentSnapshotDTO>::Err(
         facts.error());
   }
   if (!facts.value().locally_valid() ||
@@ -217,7 +218,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
       facts.value().domains.size() != 1U ||
       facts.value().domains.front().control_domain_id !=
           domain->control_domain_id) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "current_fact_readback_mismatch",
         "atomic current-fact readback differs from the complete domain query");
   }
@@ -228,12 +229,15 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
   for (std::size_t index = 0U; index < components.size(); ++index) {
     const auto &fact = facts.value().components[index];
     if (fact.controllable_component_id != components[index]) {
-      return fail<core::RouteSelectionCurrentSnapshot>(
+      return fail<core::RouteSelectionCurrentSnapshotDTO>(
           "current_component_order_mismatch",
           "current lifecycle facts are not the requested canonical set");
     }
-    if (fact.durable_generation.has_value() != fact.current_state.has_value()) {
-      return fail<core::RouteSelectionCurrentSnapshot>(
+    // Observation needs no lifecycle expectation; only route selection
+    // requires exact numbered lifecycle truth for every component.
+    if (!observation_only &&
+        fact.durable_generation.has_value() != fact.current_state.has_value()) {
+      return fail<core::RouteSelectionCurrentSnapshotDTO>(
           "current_lifecycle_fact_unresolved",
           "numbered lifecycle truth has no exact current state");
     }
@@ -251,12 +255,12 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
     const auto kernel_current =
         kernel_current_configuration_source_(domain->control_domain_id);
     if (!kernel_current.ok()) {
-      return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+      return core::Result<core::RouteSelectionCurrentSnapshotDTO>::Err(
           kernel_current.error());
     }
     if (active_configuration.has_value() &&
         kernel_current.value() != active_configuration) {
-      return fail<core::RouteSelectionCurrentSnapshot>(
+      return fail<core::RouteSelectionCurrentSnapshotDTO>(
           "current_configuration_owner_mismatch",
           "CCLC durable and Kernel current route facts disagree");
     }
@@ -271,7 +275,7 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
             source->source_runtime_epoch &&
         active_configuration->state !=
             core::ActiveControlConfigurationStateDTO::kReconciled))) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "current_controller_source_mismatch",
         "durable active configuration belongs to another controller source");
   }
@@ -283,20 +287,20 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
         source->source_runtime_unit_id, source->source_runtime_epoch);
     expected_domain = loaded.sealed();
   } catch (const RetainedBundleError &error) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "controller_expected_domain_invalid", error.what());
   } catch (const std::exception &error) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "controller_expected_domain_load_failed", error.what());
   }
 
   const auto active_after = read_active();
   if (!active_after.ok()) {
-    return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+    return core::Result<core::RouteSelectionCurrentSnapshotDTO>::Err(
         active_after.error());
   }
   if (active_after.value() != active_before.value()) {
-    return fail<core::RouteSelectionCurrentSnapshot>(
+    return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "active_publication_changed_during_read",
         "active publication changed while joining current route facts");
   }
@@ -311,14 +315,61 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
       expected_retained_bundle_id,       expected_graph_revision,
       std::move(component_expectations), active_configuration,
       expected_domain->value(),          std::move(scope)};
+  return core::Result<core::RouteSelectionCurrentSnapshotDTO>::Ok(
+      std::move(snapshot));
+}
+
+core::Result<core::RouteSelectionCurrentSnapshot>
+VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionSnapshot(
+    const core::RetainedBundleId &expected_retained_bundle_id,
+    const core::GraphRevision &expected_graph_revision,
+    const core::DesiredControlConfigurationDTO &desired_configuration) const {
+  auto closure =
+      ReadCurrentRouteClosure(expected_retained_bundle_id,
+                              expected_graph_revision, desired_configuration,
+                              false);
+  if (!closure.ok()) {
+    return core::Result<core::RouteSelectionCurrentSnapshot>::Err(
+        closure.error());
+  }
   const auto verified =
-      core::verify_route_selection_current_snapshot(std::move(snapshot));
+      core::verify_route_selection_current_snapshot(std::move(closure.value()));
   if (!verified.ok()) {
     return fail<core::RouteSelectionCurrentSnapshot>(
         "route_snapshot_verification_failed", verified.error().message);
   }
   return verified;
 }
+
+core::Result<core::RouteConfigurationObservationSnapshot>
+VerifiedRouteSelectionCurrentSnapshotSource::
+    ReadCurrentRouteConfigurationObservation(
+        const core::RetainedBundleId &expected_retained_bundle_id,
+        const core::GraphRevision &expected_graph_revision,
+        const core::DesiredControlConfigurationDTO &desired_configuration)
+        const {
+  auto closure =
+      ReadCurrentRouteClosure(expected_retained_bundle_id,
+                              expected_graph_revision, desired_configuration,
+                              true);
+  if (!closure.ok()) {
+    return core::Result<core::RouteConfigurationObservationSnapshot>::Err(
+        closure.error());
+  }
+  // Only identity, controller source, agreed current configuration and the
+  // expected domain carry over; component lifecycle expectations do not.
+  auto &value = closure.value();
+  auto verified = core::verify_route_configuration_observation_snapshot(
+      {std::move(value.retained_bundle_id), std::move(value.graph_revision),
+       std::move(value.active_control_configuration),
+       std::move(value.expected_controller_domain)});
+  if (!verified.ok()) {
+    return fail<core::RouteConfigurationObservationSnapshot>(
+        "route_observation_verification_failed", verified.error().message);
+  }
+  return verified;
+}
+
 
 core::Result<core::CCLCRouteSelectionTemplateSetDTO>
 VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteSelectionTemplates(

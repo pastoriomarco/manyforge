@@ -279,6 +279,10 @@ RetainedExternallyManagedBrandLifecyclePort::Create(
 core::Result<core::BrandLifecycleObservationDTO>
 RetainedExternallyManagedBrandLifecyclePort::Observe(
     const core::BrandLifecycleObservationQueryDTO &query) {
+  // Sample and commit under one lock: concurrent observers (the lifecycle
+  // target driver and a coordinator transaction) must not reject each other's
+  // newer sample as a regressed generation.
+  std::lock_guard lock(state_->mutex);
   const auto now = state_->clock->now();
   if (!query.locally_valid() || !exact_occurrence(state_->occurrence, query) ||
       now < 0 ||
@@ -302,7 +306,6 @@ RetainedExternallyManagedBrandLifecyclePort::Observe(
         sampled.error());
   }
 
-  std::lock_guard lock(state_->mutex);
   if (!snapshot_successor(sampled.value(), state_->last_external_generation,
                           state_->last_external_snapshot) ||
       state_->next_source_sequence == 0U ||

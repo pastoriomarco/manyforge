@@ -1,8 +1,10 @@
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 
 #include <algorithm>
+#include <initializer_list>
 #include <limits>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -24,14 +26,116 @@ template <typename Value>
            std::nullopt}};
 }
 
+[[nodiscard]] core::LifecycleFactDTO
+cause_fact(const core::LifecycleBlockingCauseClassDTO cause) {
+  return {core::LifecycleFactId(
+              std::string(core::kLifecycleBlockingCauseFactId)),
+          {core::LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt,
+           std::string(core::to_string(cause))}};
+}
+
+// Fact ids are sorted: every `external.*` id precedes the standard
+// `manyforge.blocking_cause_class` id.
 [[nodiscard]] std::vector<core::LifecycleFactDTO>
-lifecycle_facts(const bool controller_ready, const bool fault_present,
-                const bool transport_ready) {
+lifecycle_facts(const bool controller_ready,
+                const bool controller_inactive_unrequested,
+                const bool fault_present, const bool transport_ready,
+                const core::LifecycleBlockingCauseClassDTO cause) {
   return {
       boolean_fact("external.controller_configuration_ready", controller_ready),
+      // Diagnostic only: fresh status shows the trajectory controller inactive
+      // or missing after the exact configuration was active. The cause stays
+      // `availability`; CCLC turns it into `provider_lost` after Active.
+      boolean_fact("external.controller_inactive_unrequested",
+                   controller_inactive_unrequested),
       boolean_fact("external.fault_present", fault_present),
       boolean_fact("external.transport_ready", transport_ready),
+      cause_fact(cause),
   };
+}
+
+[[nodiscard]] bool
+any_reason(const std::vector<std::string> &reasons,
+           const std::initializer_list<std::string_view> candidates) {
+  return std::any_of(reasons.begin(), reasons.end(),
+                     [&](const std::string &reason) {
+                       return std::find(candidates.begin(), candidates.end(),
+                                        reason) != candidates.end();
+                     });
+}
+
+[[nodiscard]] bool
+only_reasons(const std::vector<std::string> &reasons,
+             const std::initializer_list<std::string_view> candidates) {
+  return !reasons.empty() &&
+         std::all_of(reasons.begin(), reasons.end(),
+                     [&](const std::string &reason) {
+                       return std::find(candidates.begin(), candidates.end(),
+                                        reason) != candidates.end();
+                     });
+}
+
+// Classifies one fresh controller-manager binding snapshot. ros2_control
+// reports no emergency/protective/safeguard stop status, so those classes are
+// never claimed here. A deactivated hardware component may be a hardware error
+// as well as a deliberate deactivation, so it stays `unknown`.
+[[nodiscard]] core::LifecycleBlockingCauseClassDTO motion_binding_cause(
+    const ros2_control_execution::ControllerBindingSnapshot &snapshot) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  const auto &reasons = snapshot.reason_codes;
+  if (snapshot.valid && reasons.empty()) {
+    return Cause::kNone;
+  }
+  if (any_reason(reasons, {"hardware_command_interfaces_unavailable",
+                           "hardware_state_interfaces_unavailable"})) {
+    return Cause::kFault;
+  }
+  if (any_reason(reasons, {"trajectory_controller_duplicated",
+                           "trajectory_controller_type_mismatch",
+                           "trajectory_controller_claims_mismatch",
+                           "trajectory_controller_claim_conflict",
+                           "hardware_component_duplicated"})) {
+    return Cause::kConfiguration;
+  }
+  if (only_reasons(reasons, {"controller_activity_changed",
+                             "controller_activity_unobserved",
+                             "controller_binding_monitor_unavailable",
+                             "controller_list_service_unavailable",
+                             "controller_list_service_timeout",
+                             "hardware_list_service_unavailable",
+                             "hardware_list_service_timeout",
+                             "trajectory_controller_missing",
+                             "trajectory_controller_inactive",
+                             "hardware_component_missing"})) {
+    return Cause::kAvailability;
+  }
+  return Cause::kUnknown;
+}
+
+[[nodiscard]] core::LifecycleBlockingCauseClassDTO gripper_transport_cause(
+    const ros2_control_execution::Ros2GripperTransportReadinessSnapshot
+        &snapshot) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  const auto &reasons = snapshot.reason_codes;
+  if (snapshot.ready) {
+    return Cause::kNone;
+  }
+  if (any_reason(reasons, {"gripper_identity_missing",
+                           "gripper_transport_not_configured",
+                           "gripper_transport_kind_invalid"})) {
+    return Cause::kConfiguration;
+  }
+  if (only_reasons(reasons, {"gripper_action_server_unavailable",
+                             "gripper_command_subscriber_unavailable",
+                             "gripper_state_feedback_unavailable",
+                             "gripper_state_publisher_unavailable",
+                             "gripper_state_message_unreceived",
+                             "gripper_state_joint_unobserved",
+                             "gripper_state_feedback_stale",
+                             "gripper_transport_replaced"})) {
+    return Cause::kAvailability;
+  }
+  return Cause::kUnknown;
 }
 
 [[nodiscard]] bool binding_fault(
@@ -198,6 +302,11 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
   bool exact_configuration_ready = false;
   bool fault_present = false;
   bool transport_ready = false;
+  bool controller_inactive = false;
+  // Stale or missing status is an availability loss unless fresh status
+  // previously established an intervention-requiring cause (resolved below).
+  core::LifecycleBlockingCauseClassDTO observed_cause =
+      core::LifecycleBlockingCauseClassDTO::kAvailability;
   std::string signature;
   if (motion_domain.has_value() && control_domain_id == *motion_domain) {
     const auto snapshot = backend->controller_binding_snapshot();
@@ -208,6 +317,10 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
       transport_ready = fresh;
       exact_configuration_ready = fresh && snapshot->valid;
       fault_present = fresh && binding_fault(*snapshot);
+      if (fresh) {
+        observed_cause = motion_binding_cause(*snapshot);
+        controller_inactive = !snapshot->controller_active;
+      }
       if (exact_configuration_ready) {
         state = core::ComponentLifecycleStateDTO::kActive;
       } else if (fault_present) {
@@ -224,6 +337,7 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
     transport_ready = snapshot.ready;
     exact_configuration_ready = snapshot.ready;
     fault_present = !snapshot.configured;
+    observed_cause = gripper_transport_cause(snapshot);
     state = snapshot.ready  ? core::ComponentLifecycleStateDTO::kActive
             : fault_present ? core::ComponentLifecycleStateDTO::kFaulted
                             : core::ComponentLifecycleStateDTO::kDegraded;
@@ -235,6 +349,27 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
 
   std::lock_guard lock(mutex_);
   auto &generation = domain_generations_[control_domain_id];
+  // An availability observation cannot clear an intervention-requiring cause;
+  // any other classification is fresh status and replaces it.
+  const auto cause =
+      observed_cause == core::LifecycleBlockingCauseClassDTO::kAvailability &&
+              generation.last_intervention_cause !=
+                  core::LifecycleBlockingCauseClassDTO::kNone
+          ? generation.last_intervention_cause
+          : observed_cause;
+  if (observed_cause != core::LifecycleBlockingCauseClassDTO::kAvailability) {
+    generation.last_intervention_cause =
+        core::lifecycle_cause_requires_intervention(observed_cause)
+            ? observed_cause
+            : core::LifecycleBlockingCauseClassDTO::kNone;
+  }
+  generation.exact_configuration_seen =
+      generation.exact_configuration_seen || exact_configuration_ready;
+  const bool controller_inactive_unrequested =
+      controller_inactive && generation.exact_configuration_seen;
+  signature += ":cause:";
+  signature += core::to_string(cause);
+  signature += controller_inactive_unrequested ? ":inactive_unrequested" : "";
   if (generation.publication_generation == 0U) {
     generation.publication_generation = 1U;
     generation.source_signature = std::move(signature);
@@ -250,8 +385,9 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
   }
   RetainedExternallyManagedDomainSnapshot result{
       generation.publication_generation, state, exact_configuration_ready,
-      lifecycle_facts(exact_configuration_ready, fault_present,
-                      transport_ready)};
+      lifecycle_facts(exact_configuration_ready,
+                      controller_inactive_unrequested, fault_present,
+                      transport_ready, cause)};
   if (!result.locally_valid()) {
     return reject<RetainedExternallyManagedDomainSnapshot>(
         "ros2_control_lifecycle_snapshot_invalid",
