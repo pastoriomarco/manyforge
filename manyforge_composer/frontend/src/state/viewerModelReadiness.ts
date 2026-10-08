@@ -16,8 +16,22 @@ export type ViewerModelSynchronizingReason =
   | 'projection_stale'
   | 'identity_mismatch';
 
+/** Why a retained robot model cannot currently be verified. */
+export type ViewerModelRetainedReason = 'transport_delayed' | 'transport_stale';
+
 export type ViewerModelPresentation =
   | { status: 'ready'; manifest: SceneUrdfManifest }
+  | {
+      /**
+       * The model verified against this control session's last accepted
+       * snapshot stays mounted, but it is not current: the control transport
+       * is delayed or stale, so its Manager identity cannot be reconfirmed.
+       */
+      status: 'retained';
+      manifest: SceneUrdfManifest;
+      reason: ViewerModelRetainedReason;
+      message: string;
+    }
   | {
       status: 'synchronizing';
       reason: ViewerModelSynchronizingReason;
@@ -62,6 +76,17 @@ function resourceStateMessage<T>(
 /**
  * Admit robot geometry only when the current Manager publication, source
  * projection, and cached URDF all name the same ready composition.
+ *
+ * A delayed or stale control transport keeps the same control session (an
+ * actual close moves it to ``disconnected`` with a new snapshot barrier). In
+ * that case the robot model that the session's last accepted snapshot
+ * verifies is retained, mounted and marked not current (``retained``),
+ * instead of being unmounted and rebuilt on recovery: commands are disabled
+ * by the transport condition itself, and the not-verified notice keeps the
+ * view from being presented as healthy (spec 450 §5). Geometry stays hidden
+ * for a new or closed session (``connecting``/``disconnected``), semantic
+ * synchronization, an accepted or Manager transition, a stale projection, an
+ * identity mismatch and every unavailable case.
  */
 export function viewerModelPresentation(
   snapshot: ComposerHeadlessState | null,
@@ -78,7 +103,10 @@ export function viewerModelPresentation(
       message: 'Scenario activation is pending. The previous robot model is hidden until Manager publication settles.',
     };
   }
-  if (snapshot === null || transportStatus !== 'connected'
+  const transportUnverified = transportStatus === 'delayed'
+    || transportStatus === 'stale';
+  if (snapshot === null
+      || (transportStatus !== 'connected' && !transportUnverified)
       || semanticStatus === 'synchronizing') {
     return {
       status: 'synchronizing',
@@ -193,6 +221,15 @@ export function viewerModelPresentation(
       status: 'synchronizing',
       reason: 'identity_mismatch',
       message: 'The robot model identity does not match the active Manager composition. The previous model is hidden while it refreshes.',
+    };
+  }
+  if (transportUnverified) {
+    const condition = transportStatus === 'delayed' ? 'delayed' : 'stale';
+    return {
+      status: 'retained',
+      manifest: manifest.data,
+      reason: transportStatus === 'delayed' ? 'transport_delayed' : 'transport_stale',
+      message: `Control connection ${condition}: the last verified robot model is shown, but its current Manager identity cannot be confirmed. Do not rely on it for the current cell state.`,
     };
   }
   return { status: 'ready', manifest: manifest.data };

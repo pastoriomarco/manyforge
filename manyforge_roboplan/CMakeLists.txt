@@ -362,6 +362,7 @@ target_link_libraries(manyforge_roboplan_process_candidate_client
   PUBLIC
     manyforge_roboplan_planner_backend
   PRIVATE
+    manyforge_collision
     manyforge_roboplan_worker_protocol
     Threads::Threads)
 
@@ -372,6 +373,7 @@ target_include_directories(manyforge_roboplan_candidate_worker PRIVATE
 target_compile_definitions(manyforge_roboplan_candidate_worker PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
+  manyforge_collision
   manyforge_roboplan_worker_protocol
   manyforge_roboplan_native_candidate
   manyforge_roboplan_scene_factory)
@@ -711,10 +713,25 @@ if(BUILD_TESTING)
     if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
       add_executable(test_retained_ros2_control_backend_factory
         test/test_retained_ros2_control_backend_factory.cpp)
+      target_include_directories(test_retained_ros2_control_backend_factory PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
       target_link_libraries(test_retained_ros2_control_backend_factory PRIVATE
         manyforge_roboplan_ros2_control_runtime
+        manyforge_component_manager
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_backend_factory)
+
+      # Real addressed Kernel + real ros2_control backend Stop port against an
+      # in-process FollowJointTrajectory server (requires a ROS 2 runtime).
+      add_executable(test_ros2_control_kernel_stop_integration
+        test/test_ros2_control_kernel_stop_integration.cpp)
+      target_link_libraries(test_ros2_control_kernel_stop_integration PRIVATE
+        manyforge_roboplan_ros2_control_runtime
+        manyforge_roboplan_native_runtime_support
+        manyforge_core_sqlite_operation_journal
+        GTest::gtest_main)
+      gtest_discover_tests(test_ros2_control_kernel_stop_integration
+        PROPERTIES TIMEOUT 120)
     endif()
 
     add_executable(test_retained_stop_surveillance_owner
@@ -778,6 +795,7 @@ if(BUILD_TESTING)
       MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>"
       MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH="$<TARGET_FILE:fake_process_candidate_worker>")
     target_link_libraries(test_process_contained_candidate_client PRIVATE
+      manyforge_collision
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_scene_factory
       roboplan_example_models::roboplan_example_models
@@ -855,6 +873,10 @@ if(BUILD_TESTING)
     add_custom_target(
       generate_canonical_empty_product_package
       DEPENDS "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_ADMISSION}")
+    add_dependencies(test_managed_kernel_admission_gate
+      generate_canonical_empty_product_package)
+    target_compile_definitions(test_managed_kernel_admission_gate PRIVATE
+      MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}")
 
     if(NOT Python3_Interpreter_FOUND)
       message(FATAL_ERROR

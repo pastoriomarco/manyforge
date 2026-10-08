@@ -1686,6 +1686,10 @@ if(BUILD_TESTING)
     PrepareActivationStopLimitNames
     "examples/lite6_pick_and_place.scenario"
     --stop-limit-names)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationRos2Control
+    "examples/isaac-ur10e-light-scene.scenario"
+    --ros2-control)
 
   add_executable(test_model_source
     test/test_model_source.cpp)

@@ -8,12 +8,12 @@
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
   "members": {
     "assignment.yaml": "sha256:a0331144128edc4cae7f59ef4bf68bd0bc192d8fbfa1a9bb9de97b1025dcd098",
-    "deployment.yaml": "sha256:cbf6e933c61f0cf51efc37821099389b17e7337b60df4549ce2e0b2a02b0e5e4",
+    "deployment.yaml": "sha256:71bd298fb26dff0c1c1fea63a6d79fcdb9dca495922f054f2193dcd1a33e1ea2",
     "program.yaml": "sha256:1cd7edf5a0e98b5082786f4a388ed77638d89e72ee3b24b67f74442e43e0dc88"
   },
   "name": "isaac_manipulator_scene_light_ros2_control_collision",
   "saved_status": {
-    "checked_content_digest": "sha256:cadbda827329e57acae603cdb6def68f8823bb62c8f66aa7288f9428f54092ee",
+    "checked_content_digest": "sha256:0b23c11707b13d1400db829a2195d060b681ca1cedc932562bb0bb8b1a0df9eb",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

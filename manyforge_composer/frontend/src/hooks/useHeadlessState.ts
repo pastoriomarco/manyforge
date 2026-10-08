@@ -412,6 +412,164 @@ function sameSourceSection(
       || current.sourceGeneration === candidate.sourceGeneration);
 }
 
+function recordField(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/** What one Scene-runtime pose source contributes to the viewer. */
+function poseSourceViewerKey(value: unknown): unknown {
+  const source = recordField(value);
+  if (source === null) return value;
+  const payload = recordField(source.payload);
+  let values: unknown = null;
+  if (payload !== null) {
+    if ('source_error' in payload) {
+      values = payload.source_error;
+    } else if (payload.kind === 'joint_state') {
+      values = [payload.joint_names, payload.positions];
+    } else {
+      const pose = recordField(payload.pose);
+      values = pose === null ? payload.pose : [
+        pose.frame_id, pose.frame_kind, pose.position_m, pose.orientation_xyzw,
+      ];
+    }
+  }
+  // Sequences, stamps, observed/expiry times and epoch order are delivery
+  // diagnostics. Freshness and quality select the measured or neutral robot
+  // (``isFreshGood``), so their flips publish.
+  return [
+    source.object_id, source.policy_id, source.source_id, source.source_epoch,
+    source.quality, source.fresh, source.eligible, source.buffered,
+    payload?.kind ?? null, values,
+  ];
+}
+
+const sceneRuntimeViewerKeys = new WeakMap<object, string>();
+
+/**
+ * The Scene-runtime facts the viewer presents. The source generation also
+ * advances for every pose sample (as in the backend's
+ * ``_meaningful_runtime_key``), so it is not compared; per-source
+ * availability, freshness, quality and applied pose values are.
+ */
+export function sceneRuntimeViewerKey(
+  payload: Record<string, unknown> | null,
+): string {
+  if (payload === null) return 'null';
+  const cached = sceneRuntimeViewerKeys.get(payload);
+  if (cached !== undefined) return cached;
+  const state = recordField(payload.state);
+  let stateKey: unknown = payload.state;
+  if (state !== null) {
+    const rest: Record<string, unknown> = { ...state };
+    delete rest.updated_at_ns;
+    delete rest.counters;
+    rest.pose_sources = Array.isArray(state.pose_sources)
+      ? state.pose_sources.map(poseSourceViewerKey)
+      : state.pose_sources;
+    stateKey = rest;
+  }
+  const key = JSON.stringify({ ...payload, state: stateKey });
+  sceneRuntimeViewerKeys.set(payload, key);
+  return key;
+}
+
+/**
+ * Delivery diagnostics that never change what the shell shows as status,
+ * command enablement or freshness class (spec 450: receiver times, transport
+ * sequence counters and computed ages do not trigger shell publication).
+ * Pose-source freshness (``fresh``/``quality``) is not among them.
+ */
+const SHELL_DIAGNOSTIC_FIELDS = new Set([
+  'receiverAgeNs',
+  'projectionGeneration',
+  'source_sequence',
+  'source_epoch_order',
+  'observed_at_ns',
+  'expires_at_ns',
+  'updated_at_ns',
+  'process_observation_sequence',
+  'source_report_sequence',
+]);
+
+const runtimeShellKeys = new WeakMap<object, string>();
+
+function runtimeShellKey(runtime: ComposerHeadlessState['runtime']): string {
+  const cached = runtimeShellKeys.get(runtime);
+  if (cached !== undefined) return cached;
+  type Section = ComposerHeadlessState['runtime']['sections']['manager'];
+  // Manager heartbeats and Scene-runtime pose samples advance these source
+  // generations; only their presence is status. The logical-scene generation
+  // names owner content and Scene mutation identity, so it is kept.
+  const counted = (section: Section) => ({
+    ...section,
+    sourceGeneration: section.sourceGeneration !== null,
+  });
+  const key = JSON.stringify(
+    {
+      ...runtime,
+      sections: {
+        ...runtime.sections,
+        manager: counted(runtime.sections.manager),
+        sceneRuntime: counted(runtime.sections.sceneRuntime),
+      },
+    },
+    (name, value: unknown) => (SHELL_DIAGNOSTIC_FIELDS.has(name) ? undefined : value),
+  );
+  runtimeShellKeys.set(runtime, key);
+  return key;
+}
+
+/**
+ * Whether a candidate differs from the current snapshot only in delivery
+ * diagnostics. Unchanged domains keep their object identity across a merged
+ * delta; any other changed domain (or a new field) publishes.
+ */
+export function sameShellPublication(
+  current: ComposerHeadlessState | null,
+  candidate: ComposerHeadlessState,
+): boolean {
+  if (current === null) return false;
+  const left = current as unknown as Record<string, unknown>;
+  const right = candidate as unknown as Record<string, unknown>;
+  const names = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const name of names) {
+    if (name === 'snapshotSequence') continue;
+    if (name === 'runtime') {
+      if (current.runtime !== candidate.runtime
+          && runtimeShellKey(current.runtime) !== runtimeShellKey(candidate.runtime)) {
+        return false;
+      }
+      continue;
+    }
+    if (!Object.is(left[name], right[name])) return false;
+  }
+  return true;
+}
+
+/**
+ * The owner/model identity a retained (unverified) viewer frame depends on.
+ * Any change requires the ordinary identity barrier, so a frozen frame is
+ * never kept across it.
+ */
+export function sameViewerIdentity(
+  current: ComposerHeadlessState | null,
+  candidate: ComposerHeadlessState | null,
+): boolean {
+  if (current === null || candidate === null) return current === candidate;
+  const sections = (state: ComposerHeadlessState) => state.runtime.sections;
+  return current.receiverEpoch === candidate.receiverEpoch
+    && viewerModelRefreshKey(current) === viewerModelRefreshKey(candidate)
+    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
+    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
+    && sections(current).logicalScene.sourceOwnerEpoch
+      === sections(candidate).logicalScene.sourceOwnerEpoch
+    && sections(current).sceneRuntime.sourceOwnerEpoch
+      === sections(candidate).sceneRuntime.sourceOwnerEpoch;
+}
+
 export function sameViewerProjection(
   current: ComposerHeadlessState | null,
   candidate: ComposerHeadlessState,
@@ -430,6 +588,8 @@ export function sameViewerProjection(
       current.runtime.unavailableSections,
       candidate.runtime.unavailableSections,
     )
+    // The logical-scene generation names owner content (object poses and
+    // geometry) and keys Scene mesh URLs, so it still publishes.
     && sameSourceSection(
       current.runtime.sections.logicalScene,
       candidate.runtime.sections.logicalScene,
@@ -438,8 +598,12 @@ export function sameViewerProjection(
     && sameSourceSection(
       current.runtime.sections.sceneRuntime,
       candidate.runtime.sections.sceneRuntime,
-      true,
-    );
+      false,
+    )
+    && (current.runtime.sections.sceneRuntime.sourceGeneration === null)
+      === (candidate.runtime.sections.sceneRuntime.sourceGeneration === null)
+    && sceneRuntimeViewerKey(current.runtime.sections.sceneRuntime.payload)
+      === sceneRuntimeViewerKey(candidate.runtime.sections.sceneRuntime.payload);
 }
 
 type Listener = () => void;
@@ -1234,11 +1398,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 'control_websocket_recovered',
               );
               this.resolveCommandDeliveryFaultAfterResynchronization();
+              // The transport status changed to connected, so this publishes
+              // the current snapshot to both shell and viewer immediately.
+              // No deferred shell/viewer publication is needed afterwards.
               this.refreshControlCondition();
-              if (this.latest !== null) {
-                this.scheduleShell();
-                this.scheduleViewer();
-              }
             }
           }
           if (semanticChanged || confirmedNow) this.refreshControlCondition();
@@ -1562,6 +1725,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.controlSnapshotBarrierPending = false;
       this.executionTargetsWire = candidateExecutionTargetsWire;
       const viewerChanged = !progressOnly && !sameViewerProjection(this.latest, candidate);
+      // ``latest`` always advances; only a shell-visible change publishes.
+      const shellChanged = !progressOnly && (
+        kind === 'snapshot'
+        || record.event_class === 'critical'
+        || !sameShellPublication(this.latest, candidate));
       this.latest = candidate;
       if (progress !== null || kind === 'snapshot') {
         this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
@@ -1578,11 +1746,19 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.refreshControlCondition();
       this.advancePresentedFrame(candidate);
       this.resolveCommandDeliveryFaultAfterResynchronization();
-      if (this.controlHeartbeatConfirmed) {
+      if (!this.controlHeartbeatConfirmed) {
+        // A frozen, unverified viewer frame never outlives an identity
+        // change: publish it so the model is hidden behind the barrier.
+        if ((this.controlTransportStatus === 'delayed'
+            || this.controlTransportStatus === 'stale')
+          && !sameViewerIdentity(this.viewerResult.snapshot, candidate)) {
+          this.scheduleViewer();
+        }
+      } else {
         if (viewerChanged) this.scheduleViewer();
         // Progress wakes only its indicator; semantic owner changes retain
         // the normal shell path without another browser-side reduction.
-        if (!progressOnly) this.scheduleShell(record.event_class === 'critical');
+        if (shellChanged) this.scheduleShell(record.event_class === 'critical');
       }
     } catch (reason) {
       this.publishError(
@@ -1922,7 +2098,26 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     // do not erase the last coherent backend presentation or viewer scene.
     this.latestError = error;
     this.cancelStatePublications();
-    this.publishImmediate();
+    this.publishImmediate(this.viewerSnapshotForCondition());
+  }
+
+  /**
+   * While the same control session is delayed or stale, the viewer keeps the
+   * snapshot it was showing when the transport stopped being verified: the
+   * retained robot and Scene stay frozen at their last coherent frame (marked
+   * not current) instead of following unverified deltas. Entering the
+   * condition still publishes the newest snapshot received while connected;
+   * recovery, a new session and disconnection publish ``latest``.
+   */
+  private viewerSnapshotForCondition(): ComposerHeadlessState | null {
+    const unverified = (status: ControlTransportStatus) => (
+      status === 'delayed' || status === 'stale'
+    );
+    return unverified(this.controlTransportStatus)
+      && unverified(this.viewerResult.transportStatus)
+      && sameViewerIdentity(this.viewerResult.snapshot, this.latest)
+      ? this.viewerResult.snapshot
+      : this.latest;
   }
 
   private publishImmediate(

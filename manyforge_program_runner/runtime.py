@@ -1472,7 +1472,11 @@ class ProgramRuntime:
                 "running",
                 "recovery_required",
             },
-            "stop_recovery": cycle.state == "recovery_required",
+            # The cell-wide Stop-fault latch is Kernel-owned, not Program-owned.
+            # A latch taken while idle (manual operations, malformed Stop) has
+            # no Program Reset to consume it, so the exact Kernel recovery must
+            # stay reachable; it never resumes motion or touches the cycle.
+            "stop_recovery": cycle.state in {"idle_after_reset", "recovery_required"},
             "runtime_scale": cycle.state != "recovery_required",
         }
         if cycle.reconciliation_required:

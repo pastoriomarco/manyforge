@@ -123,11 +123,12 @@ public:
                           const std::string &group) const override {
     auto stage = RetainedPlanningModelStage::create_verified(
         inputs.planning_model, config_.execution_run_root);
-    auto package_paths = stage.package_paths();
-    package_paths.insert(package_paths.begin(), config_.package_root);
+    // Scene meshes resolve only below the approved scene-asset root; the
+    // retained package root is never a scene-mesh search path.
     auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_managed_native_projection", stage.loader_urdf_path(),
-        stage.srdf_path(), package_paths, group);
+        stage.srdf_path(), stage.package_paths(), group,
+        config_.scene_asset_root_fd);
     return RetainedCollisionWorldProjector::create_verified(
         std::move(shared_model), *inputs.bundle, inputs.model_map,
         inputs.planning_model);
@@ -251,7 +252,14 @@ public:
                   resolved.error()};
             }
             return std::move(resolved.value());
+          } else if constexpr (
+              std::is_same_v<T, component_manager::detail::
+                                    NativeProjectionProviderFreshnessRequest>) {
+            return ApplyProviderFreshness(value);
           } else {
+            static_assert(
+                std::is_same_v<T, component_manager::detail::
+                                      NativeProjectionEffectivePolicyRequest>);
             auto projected =
                 IdleHandle(value.native_runtime_binding, "policy_projection",
                            PolicyHandle(value.native_runtime_binding,
@@ -989,6 +997,36 @@ private:
     Require(result.presence_valid(),
             "progressing native projection transaction result is invalid");
     return result;
+  }
+
+  /// Freshness-only publication on the exact projection revision. It never
+  /// waits for or overtakes progressing projection work: a pending rebuild or
+  /// bootstrap on that projection refuses the confirmation, which the owner
+  /// then does not record.
+  [[nodiscard]] component_manager::detail::NativeProjectionRpcResponse
+  ApplyProviderFreshness(
+      const component_manager::detail::NativeProjectionProviderFreshnessRequest
+          &request) {
+    Require(request.valid(),
+            "native projection provider freshness request is invalid");
+    const auto &confirmation = request.confirmation;
+    auto projection =
+        RevisionHandle(request.native_runtime_binding,
+                       confirmation.expected_projection_revision);
+    if (WorkPendingFor(Key(request.native_runtime_binding), projection)) {
+      return component_manager::detail::NativeProjectionRpcFailure{
+          PendingOperationError("provider_freshness",
+                                request.native_runtime_binding)};
+    }
+    auto applied = projection->ApplyProviderFreshness(confirmation);
+    if (!applied.ok()) {
+      return component_manager::detail::NativeProjectionRpcFailure{
+          applied.error()};
+    }
+    return component_manager::detail::NativeProjectionProviderFreshnessResult{
+        confirmation.expected_projection_revision,
+        confirmation.scene_resource_id,
+        confirmation.evidence.provider_source_sequence};
   }
 
   [[nodiscard]] core::NativeProjectionBootstrapRebuildResultDTO

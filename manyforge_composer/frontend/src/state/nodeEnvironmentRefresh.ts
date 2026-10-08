@@ -102,3 +102,77 @@ export function refreshViewerModelsOnManagerChange(
   }
   return nextKey;
 }
+
+/** The Manager has a pending Apply or has not yet activated/converged. */
+export const MANAGER_ACTIVATION_PENDING = 'manager_activation_pending';
+
+/**
+ * The settled active identity of the Manager's applied selection.
+ *
+ * Returns the active identity once the Manager is ready, converged, has no
+ * incomplete Apply and no advertised maintenance operation;
+ * `MANAGER_ACTIVATION_PENDING` while an activation is still in progress; and
+ * `null` when the Manager section carries no usable evidence (unavailable,
+ * stale, gapped or malformed), which is not a transition in either direction.
+ * Heartbeats, Apply history and observation counters are deliberately absent.
+ */
+export function managerActivationSettlementKey(
+  snapshot: ComposerHeadlessState,
+): string | null {
+  const manager = snapshot.runtime.sections.manager;
+  const payload = objectValue(manager.payload);
+  if (!manager.available || manager.freshness !== 'fresh'
+      || manager.knownGaps.length > 0 || payload === null) {
+    return null;
+  }
+  const pending = pendingManagerApply(payload);
+  if (pending === null) return null;
+  const active = objectValue(payload.active);
+  const runtime = objectValue(payload.runtime);
+  const retainedBundleId = typeof active?.retained_bundle_id === 'string'
+    && active.retained_bundle_id.length > 0
+    ? active.retained_bundle_id
+    : null;
+  const graphRevision = typeof active?.graph_revision === 'string'
+    && active.graph_revision.length > 0
+    ? active.graph_revision
+    : null;
+  if (pending
+      || (snapshot.componentOverview.maintenanceOperation ?? null) !== null
+      || payload.manager_ready === false
+      || runtime?.converged === false
+      || retainedBundleId === null
+      || graphRevision === null) {
+    return MANAGER_ACTIVATION_PENDING;
+  }
+  return JSON.stringify({
+    receiverEpoch: snapshot.receiverEpoch,
+    sourceOwnerId: manager.sourceOwnerId,
+    sourceOwnerEpoch: manager.sourceOwnerEpoch,
+    cellId: typeof payload.cell_id === 'string' ? payload.cell_id : null,
+    retainedBundleId,
+    graphRevision,
+  });
+}
+
+/**
+ * Re-read resources that depend on the active applied selection (the node
+ * catalog, the Deployment workspace's Applied/runAdmission half) exactly once
+ * when the Manager's activation settles: pending -> active, or a different
+ * active identity. A read that raced the activation (e.g. a 503
+ * `program_applied_selection_not_active` while a Scenario Load was applying)
+ * therefore never stays terminal. The first observation only establishes the
+ * baseline, and an observation without evidence (`null`) keeps it.
+ */
+export function refreshOnManagerActivationSettled(
+  previousKey: string | null,
+  nextKey: string | null,
+  refreshers: readonly (() => unknown)[],
+): string | null {
+  if (nextKey === null) return previousKey;
+  if (previousKey !== null && previousKey !== nextKey
+      && nextKey !== MANAGER_ACTIVATION_PENDING) {
+    for (const refresh of refreshers) refresh();
+  }
+  return nextKey;
+}

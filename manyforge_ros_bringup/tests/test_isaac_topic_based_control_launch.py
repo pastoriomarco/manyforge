@@ -76,6 +76,7 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "runtime_namespace",
         "world_uri",
         "expected_world_name",
+        "require_existing_world",
         "additional_required_topics",
         "command_gate_owner_node",
         "command_gate_owner_namespace",
@@ -205,6 +206,29 @@ def test_launch_lite6_stack_omits_python_gripper_action_adapter(
         _node_executable(action) for action in released
     }
     assert len(released) == 6
+
+
+@pytest.mark.parametrize("require_existing_world", ["false", "true"])
+def test_existing_world_selection_reaches_only_the_scene_barrier(
+    monkeypatch: pytest.MonkeyPatch, require_existing_world: str
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
+    )
+    context = _launch_context(module)
+    assert context.launch_configurations["require_existing_world"] == "false"
+    context.launch_configurations["require_existing_world"] = require_existing_world
+    barrier = module._launch_setup(context)[0]
+    parameters = getattr(barrier, "_Node__parameters")[0]
+    selected = next(
+        value for key, value in parameters.items()
+        if perform_substitutions(context, key) == "require_existing_world"
+    )
+    assert selected is (require_existing_world == "true")
+    context.launch_configurations["require_existing_world"] = "invalid"
+    with pytest.raises(ValueError, match="require_existing_world"):
+        module._launch_setup(context)
 
 
 def test_launch_releases_exact_pose_observer_only_after_scene_barrier(

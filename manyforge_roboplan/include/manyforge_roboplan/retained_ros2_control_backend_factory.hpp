@@ -15,6 +15,8 @@ namespace manyforge::roboplan_backend {
 struct RetainedRos2ControlBackendConfig final {
   ros2_control_execution::Ros2ControlExecutionBackendConfig execution;
   std::optional<ros2_control_execution::Ros2GripperActionConfig> gripper;
+  /// Managed first installation starts the executor only after fenced ownership.
+  bool defer_ros_start{false};
 };
 
 /// Derive the sole addressed arm-state authority for a controller-backed

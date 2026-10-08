@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <manyforge_core/types/scene_edit.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <manyforge_roboplan/roboplan_scene_factory.hpp>
@@ -20,9 +21,15 @@ struct RoboPlanWorkerGeometryDTO final {
   std::string compiled_parent_frame;
   core::CollisionShapeDTO shape;
   core::Pose3DTO pose_in_parent;
-  /// Required only for MeshShapeDTO. This is a Manager-private, verified,
-  /// staged file; public scene callers never provide a filesystem path.
+  /// Present only for a model-local asset:// MeshShapeDTO. This is a
+  /// Manager-private, verified, staged file; public scene callers never
+  /// provide a filesystem path.
   std::optional<std::filesystem::path> resolved_mesh_path;
+  /// Present only for a relative Program scene MeshShapeDTO: the exact
+  /// `sha256:<hex>` the collision model pinned for its URI. The worker opens
+  /// the URI below its own scene-asset root descriptor, hashes the bytes it
+  /// loads, and refuses with `scene_mesh_content_changed` on mismatch.
+  std::optional<std::string> scene_mesh_content_digest{};
 };
 
 struct RoboPlanWorkerModelDTO final {
@@ -47,14 +54,22 @@ struct ProcessContainedCandidateClientConfig final {
   /// projection generation selected by the Kernel. Fixed-model tests leave
   /// this false.
   bool require_retained_projection{false};
-  /// Trusted, product-contained root for Program-authored scene meshes.
-  /// Relative mesh_resource_uri values are resolved below this one canonical
-  /// root before the worker is created. Model-local asset:// values continue
-  /// to resolve only through the retained planning-model stage.
-  std::optional<std::filesystem::path> scene_asset_root;
+  /// Directory descriptor of the approved scene-asset root (Manager-opened,
+  /// separate from the retained package root). Relative Program scene
+  /// mesh_resource_uri values resolve only below it, inside the worker, which
+  /// receives a duplicate as its reserved FD 9. Unset: relative scene meshes
+  /// fail closed. Model-local asset:// values continue to resolve only
+  /// through the retained planning-model stage.
+  std::optional<int> scene_asset_root_fd;
   /// When set, this inherited directory descriptor is the retained package
-  /// root used for managed scene assets. The worker receives it as FD 6.
+  /// root of a managed child. The worker receives it as FD 6; it is never a
+  /// scene-mesh root.
   std::optional<int> retained_package_root_fd;
+  /// Returns the collision model's pinned content digest for one relative
+  /// scene mesh URI (see ManyForgeCollisionEngine::scene_mesh_content_digest).
+  /// Required for every relative scene mesh; errors carry details["reason"].
+  std::function<core::Result<std::string>(const std::string &)>
+      scene_mesh_content_digest{};
 };
 
 /// Long-lived RoboPlan worker client.

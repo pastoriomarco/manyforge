@@ -8,7 +8,9 @@
 // unavailable historical case are named exactly once below instead of being
 // hidden in a skipped legacy body.
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_collision/scene_asset_root.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <memory>
@@ -692,6 +695,140 @@ TEST(CollisionQualificationPrimitivesTest,
     EXPECT_FALSE(disposition.restoration_gate.empty());
     EXPECT_FALSE(disposition.required_behavior.empty());
   }
+}
+
+void write_mesh(const std::filesystem::path& path, const std::string& bytes) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << bytes;
+}
+
+CollisionWorldSnapshot relative_mesh_snapshot(const std::string& uri,
+                                              const std::uint64_t revision) {
+  auto snapshot = minimal_snapshot();
+  snapshot.revision.revision_id = revision;
+  snapshot.revision.content_hash =
+      "sha256:relative-scene-mesh-" + std::to_string(revision);
+  snapshot.component_model_frames.push_back(
+      manyforge::core::CollisionComponentModelFrame{
+          manyforge::core::ControllableComponentId{"arm"},
+          manyforge::core::ModelInstanceId{"arm_model"},
+          manyforge::core::FrameRoleId{"base"},
+          "base",
+          manyforge::core::ModelRevision{"model-revision-1"},
+          {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}});
+  manyforge::core::CollisionWorldBody body;
+  body.body_id = manyforge::core::CollisionBodyId("scene/relative-mesh/shape/0");
+  body.owner_kind = manyforge::core::CollisionOwnerKind::kSceneResource;
+  body.frame_id = "world";
+  body.pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  manyforge::core::CollisionGeometryDescriptor geometry;
+  geometry.body_id = body.body_id;
+  geometry.owner_kind = body.owner_kind;
+  geometry.geometry_kind = manyforge::core::CollisionGeometryKind::kTriangleMesh;
+  geometry.local_pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  geometry.source_uri = uri;
+  geometry.mesh_scale = manyforge::core::Vector3DTO{1.0, 1.0, 1.0};
+  body.geometries.push_back(geometry);
+  snapshot.bodies.push_back(body);
+  return snapshot;
+}
+
+std::string sync_error(const CollisionResult& result) {
+  const auto found = result.raw_diagnostics.find("snapshot_sync_error");
+  return found == result.raw_diagnostics.end() ? std::string{} : found->second;
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     RelativeSceneMeshResolvesOnlyBelowTheApprovedSceneAssetRoot) {
+  TemporaryModel temporary;
+  const std::string triangle = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+  const auto outside = temporary.root / "outside";
+  const auto approved = temporary.root / "approved";
+  write_mesh(outside / "examples/x/meshes/outside.obj", triangle);
+  write_mesh(approved / "examples/x/meshes/a.obj", triangle);
+  // A repository-relative example mesh: the removed fallbacks would have
+  // found it through the current directory or the development /workspace.
+  const std::string repository_mesh =
+      "examples/isaac_manipulator_scene_light/meshes/"
+      "World__soup_can_collider_cooked.obj";
+
+  const auto previous_directory = std::filesystem::current_path();
+  struct RestoreDirectory final {
+    std::filesystem::path path;
+    ~RestoreDirectory() {
+      std::error_code ignored;
+      std::filesystem::current_path(path, ignored);
+    }
+  } restore{previous_directory};
+  std::filesystem::current_path(outside);
+
+  const auto urdf = temporary.root / "empty.urdf";
+  const auto srdf = temporary.root / "empty.srdf";
+  static_cast<void>(load_empty_collision_model(temporary));
+
+  {
+    // No approved root: relative scene meshes fail closed even when the
+    // file exists below the current directory.
+    const auto model = ManyForgeCollisionEngine::load_shared_model(
+        "unrooted", urdf, srdf, {temporary.root}, "arm");
+    ManyForgeCollisionEngine engine(model, nullptr);
+    const auto result = check(
+        engine, relative_mesh_snapshot("examples/x/meshes/outside.obj", 1U),
+        one_joint_query());
+    EXPECT_NE(sync_error(result).find("no approved scene-asset root"),
+              std::string::npos)
+        << sync_error(result);
+  }
+
+  const int root_fd =
+      ::open(approved.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  ASSERT_GE(root_fd, 0);
+  const auto model = ManyForgeCollisionEngine::load_shared_model(
+      "rooted", urdf, srdf, {temporary.root, repo_root()}, "arm", root_fd);
+  static_cast<void>(::close(root_fd));  // The model keeps its own duplicate.
+  {
+    ManyForgeCollisionEngine engine(model, nullptr);
+    for (const auto& [uri, revision] :
+         std::vector<std::pair<std::string, std::uint64_t>>{
+             {"examples/x/meshes/outside.obj", 2U},
+             {repository_mesh, 3U},
+             {"../outside/examples/x/meshes/outside.obj", 4U}}) {
+      const auto result =
+          check(engine, relative_mesh_snapshot(uri, revision), one_joint_query());
+      EXPECT_FALSE(sync_error(result).empty()) << uri;
+    }
+    const auto loaded = check(
+        engine, relative_mesh_snapshot("examples/x/meshes/a.obj", 5U),
+        one_joint_query());
+    EXPECT_TRUE(sync_error(loaded).empty()) << sync_error(loaded);
+  }
+  const auto pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
+      model, "examples/x/meshes/a.obj");
+  ASSERT_TRUE(pinned.ok()) << pinned.error().message;
+  EXPECT_EQ(pinned.value().rfind("sha256:", 0), 0U);
+
+  // Renaming the approved root does not change what the model reads.
+  std::filesystem::rename(approved, temporary.root / "approved-displaced");
+  ASSERT_TRUE(ManyForgeCollisionEngine::scene_mesh_content_digest(
+                  model, "examples/x/meshes/a.obj")
+                  .ok());
+
+  // Changed bytes after the first load: a fresh cache must refuse them.
+  write_mesh(temporary.root / "approved-displaced/examples/x/meshes/a.obj",
+             "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n");
+  ManyForgeCollisionEngine fresh(
+      model, ManyForgeCollisionEngine::make_shared_scene_cache(model));
+  const auto changed = check(
+      fresh, relative_mesh_snapshot("examples/x/meshes/a.obj", 6U),
+      one_joint_query());
+  EXPECT_NE(sync_error(changed).find("scene_mesh_content_changed"),
+            std::string::npos)
+      << sync_error(changed);
+  const auto still_pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
+      model, "examples/x/meshes/a.obj");
+  ASSERT_TRUE(still_pinned.ok());
+  EXPECT_EQ(still_pinned.value(), pinned.value());
 }
 
 }  // namespace

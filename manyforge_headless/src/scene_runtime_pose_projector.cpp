@@ -27,6 +27,8 @@ constexpr std::string_view kPoseApplicationRequestApiVersion =
     "manyforge.scene_runtime_pose_application.v1";
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::size_t kMaximumTextBytes = 1024U;
+constexpr std::string_view kProviderFreshnessUnsupported =
+    "provider_freshness_unsupported";
 
 core::ErrorDTO Error(const std::string_view code,
                      const std::string_view message,
@@ -290,6 +292,8 @@ ToString(const SceneRuntimePoseApplicationStatus status) noexcept {
     return "already_applied";
   case SceneRuntimePoseApplicationStatus::kSkippedAttached:
     return "skipped_attached";
+  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
+    return "freshness_confirmed";
   }
   return {};
 }
@@ -307,6 +311,7 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
            update_status.has_value();
   case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
   case SceneRuntimePoseApplicationStatus::kSkippedAttached:
+  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
     return scene_request_id.has_value() && !scene_request_id->empty() &&
            projection_revision.has_value() && projection_revision->valid() &&
            !update_status.has_value();
@@ -327,7 +332,8 @@ SceneRuntimePoseProjector::Apply(
     const std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
     const core::RetainedBundleId &active_retained_bundle_id,
     const core::GraphRevision &active_graph_revision,
-    const PoseSourceObservation &observation) {
+    const PoseSourceObservation &observation,
+    const std::optional<SceneRuntimePoseApplicationResult> &prior_application) {
   if (!observation.valid() || observation.source_epoch_order == 0U ||
       observation.source_sequence == 0U ||
       observation.quality != PoseSourceQuality::kGood ||
@@ -456,6 +462,83 @@ SceneRuntimePoseProjector::Apply(
           projection, std::nullopt};
       return core::Result<SceneRuntimePoseApplicationResult>::Ok(
           std::move(result));
+    }
+    // A strictly newer observation of the exact committed pose with the same
+    // origin and freshness budget only refreshes runtime freshness. The
+    // source timestamp is diagnostic and never gates this branch.
+    if (previous.source_freshness_budget_ns ==
+            evidence.source_freshness_budget_ns &&
+        previous.received_at_ns <= evidence.received_at_ns) {
+      core::Result<core::Pose3DTO> current_pose;
+      try {
+        current_pose = scene_authority_.GetObjectPose(
+            core::SceneResourceId(observation.key.object_id));
+      } catch (const std::exception &error) {
+        return core::Result<SceneRuntimePoseApplicationResult>::Err(
+            Error("scene_runtime_pose_scene_unavailable", error.what()));
+      }
+      if (!current_pose.ok()) {
+        return core::Result<SceneRuntimePoseApplicationResult>::Err(
+            Error("scene_runtime_pose_scene_unavailable",
+                  current_pose.error().message.empty()
+                      ? "logical-scene object pose is unavailable"
+                      : current_pose.error().message,
+                  {{"scene_error_code", current_pose.error().code}}));
+      }
+      if (current_pose.value() == decoded.pose) {
+        if (prior_application.has_value() &&
+            prior_application->status ==
+                SceneRuntimePoseApplicationStatus::kFreshnessConfirmed) {
+          // This exact observation was already confirmed; a replay reports
+          // the outcome again without refreshing freshness age.
+          auto result = SceneRuntimePoseApplicationResult{
+              SceneRuntimePoseApplicationStatus::kFreshnessConfirmed,
+              request_id, projection, std::nullopt};
+          return core::Result<SceneRuntimePoseApplicationResult>::Ok(
+              std::move(result));
+        }
+        core::Result<core::ProjectionRevisionDTO> confirmed;
+        try {
+          confirmed = scene_authority_.ConfirmProviderFreshness(
+              core::ProviderFreshnessConfirmationDTO{
+                  projection,
+                  core::SceneResourceId(observation.key.object_id),
+                  decoded.pose,
+                  evidence,
+              });
+        } catch (const std::exception &error) {
+          return core::Result<SceneRuntimePoseApplicationResult>::Err(
+              Error("scene_runtime_pose_scene_unavailable", error.what()));
+        }
+        if (confirmed.ok()) {
+          if (confirmed.value() != projection) {
+            return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
+                "scene_runtime_pose_freshness_confirmation_invalid",
+                "logical-scene owner changed the projection revision of a "
+                "freshness-only confirmation"));
+          }
+          auto result = SceneRuntimePoseApplicationResult{
+              SceneRuntimePoseApplicationStatus::kFreshnessConfirmed,
+              request_id, projection, std::nullopt};
+          return core::Result<SceneRuntimePoseApplicationResult>::Ok(
+              std::move(result));
+        }
+        if (confirmed.error().code != kProviderFreshnessUnsupported) {
+          // No Commit fallback: surface the owner's refusal with its complete
+          // details (including failed, applied and uncertain projections of a
+          // partial propagation) instead of a revision-advancing write.
+          auto details = confirmed.error().details;
+          details["scene_error_code"] = confirmed.error().code;
+          return core::Result<SceneRuntimePoseApplicationResult>::Err(
+              Error("scene_runtime_pose_freshness_confirmation_failed",
+                    confirmed.error().message.empty()
+                        ? "logical-scene owner rejected the freshness "
+                          "confirmation"
+                        : confirmed.error().message,
+                    std::move(details)));
+        }
+        // The authority has no freshness-only path: keep today's commit.
+      }
     }
   }
 

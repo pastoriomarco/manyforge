@@ -543,6 +543,53 @@ RetainedPlannerSceneProjection::ApplyTransaction(
   return success;
 }
 
+core::Result<void> RetainedPlannerSceneProjection::ApplyProviderFreshness(
+    const core::ProviderFreshnessConfirmationDTO &confirmation) {
+  std::lock_guard lock(mutex_);
+  if (!confirmation.valid()) {
+    return projection_error<void>(
+        "native projection received an incomplete provider freshness "
+        "confirmation",
+        "provider_freshness_invalid");
+  }
+  if (!HealthyAt(confirmation.expected_projection_revision)) {
+    return projection_error<void>(
+        "native projection is not healthy at the exact provider freshness "
+        "projection revision",
+        "provider_freshness_projection_unavailable");
+  }
+  if (auto refusal = ValidateProviderFreshnessAgainstCommittedScene(
+          *logical_snapshot_, confirmation);
+      refusal.has_value()) {
+    return core::Result<void>::Err(std::move(*refusal));
+  }
+  auto publisher = active_publisher_.load(std::memory_order_acquire);
+  if (!publisher) {
+    return projection_error<void>(
+        "native projection publisher became unavailable",
+        "provider_freshness_projection_unavailable");
+  }
+  try {
+    // The publisher re-validates against its own committed publication and
+    // swaps atomically; a refusal or exception leaves the prior publication,
+    // projection health and SceneRevision untouched.
+    auto published = publisher->publish_freshness(confirmation);
+    if (!published.ok()) {
+      return core::Result<void>::Err(published.error());
+    }
+  } catch (const std::exception &exception) {
+    return projection_error<void>(
+        "native projection freshness publication failed: " +
+            std::string(exception.what()),
+        "provider_freshness_publication_failed");
+  } catch (...) {
+    return projection_error<void>(
+        "native projection freshness publication failed",
+        "provider_freshness_publication_failed");
+  }
+  return core::Result<void>::Ok();
+}
+
 core::Result<core::CollisionWorldLeaseInventory>
 RetainedPlannerSceneProjection::RetainProjection(
     const core::ProjectionRevisionDTO &projection_revision,

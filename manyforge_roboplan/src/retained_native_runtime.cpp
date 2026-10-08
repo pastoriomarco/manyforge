@@ -11,6 +11,7 @@
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -3984,12 +3985,33 @@ build_retained_cell_stop_recovery_facts(
     }
     const auto &latch = *status.fault_latch;
     const auto sources = stop_surveillance_owner.SnapshotSources();
+    // Report why a configuration row is unreconciled, once per change of
+    // reason per domain, so a waiting recovery names its failing check.
+    const auto report_unreconciled = [](const std::string &domain,
+                                        const std::string &reason) {
+      static std::mutex mutex;
+      static std::map<std::string, std::string> last;
+      std::lock_guard lock(mutex);
+      auto &previous = last[domain];
+      if (previous == reason) {
+        return;
+      }
+      previous = reason;
+      if (!reason.empty()) {
+        std::cerr << "native Stop recovery configuration unreconciled: domain="
+                  << domain << " reason=" << reason << std::endl;
+      }
+    };
     for (auto &fact : facts.value().configuration_facts) {
+      const auto domain = fact.configuration.control_domain_id.value();
       if (configuration_source_override) {
         auto proof = configuration_source_override(fact.configuration);
         fact.reconciled = proof.ok();
         fact.evidence_digest =
             proof.ok() ? std::optional(proof.value()) : std::nullopt;
+        report_unreconciled(
+            domain, proof.ok() ? std::string()
+                               : proof.error().code + ": " + proof.error().message);
         continue;
       }
 
@@ -4011,6 +4033,12 @@ build_retained_cell_stop_recovery_facts(
         fact.reconciled = false;
         fact.evidence_digest.reset();
       }
+      report_unreconciled(
+          domain,
+          fact.reconciled ? std::string()
+          : !current.ok() ? "route_configuration_unreadable: " + current.error().message
+          : !current.value().has_value() ? std::string("route_configuration_unpublished")
+                                         : std::string("source_binding_mismatch"));
     }
 
     if (std::all_of(facts.value().configuration_facts.begin(),

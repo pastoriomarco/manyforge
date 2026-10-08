@@ -205,4 +205,68 @@ describe('viewerModelPresentation', () => {
     expect(result).toMatchObject({ status: 'synchronizing' });
     expect(result).not.toHaveProperty('manifest');
   });
+
+  it.each([
+    ['delayed', 'transport_delayed'],
+    ['stale', 'transport_stale'],
+  ] as const)(
+    'retains the verified model, marked not current, while transport is %s',
+    (transport, reason) => {
+      const loaded = manifest();
+      if (loaded.status !== 'ready') throw new Error('fixture manifest is not ready');
+      const result = viewerModelPresentation(
+        snapshot(), transport, 'current', false, sourceModel(), loaded,
+      );
+      expect(result).toMatchObject({ status: 'retained', reason });
+      // The same manifest object stays mounted: no rebuild on recovery.
+      expect(result.status === 'retained' && result.manifest).toBe(loaded.data);
+      expect(result.status === 'retained' && result.message).toContain(
+        `Control connection ${transport}`,
+      );
+    },
+  );
+
+  it.each(['connecting', 'disconnected'] as const)(
+    'still hides the model for a new or closed session (%s)',
+    (transport) => {
+      const result = viewerModelPresentation(
+        snapshot(), transport, 'current', false, sourceModel(), manifest(),
+      );
+      expect(result).toMatchObject({ status: 'synchronizing', reason: 'connecting' });
+      expect(result).not.toHaveProperty('manifest');
+    },
+  );
+
+  it('never retains across an identity barrier, transition or stale projection', () => {
+    const delayed = (
+      state: ComposerHeadlessState | null,
+      source = sourceModel(),
+      urdf = manifest(),
+      acceptedPending = false,
+      semantic: 'current' | 'synchronizing' | 'unavailable' = 'current',
+    ) => viewerModelPresentation(state, 'delayed', semantic, acceptedPending, source, urdf);
+    for (const result of [
+      // A Manager-selected identity that the cached model does not match.
+      delayed(snapshot({ activeBundleId: 'sha256:bundle-b' })),
+      delayed(snapshot(), sourceModel('sha256:bundle-b'), manifest('sha256:bundle-b')),
+      // Accepted activation or a pending Manager Apply.
+      delayed(snapshot(), sourceModel(), manifest(), true),
+      delayed(snapshot({ applyRecords: [{ incomplete: true }] })),
+      // Stale Manager projection, semantic synchronization, no snapshot.
+      delayed(snapshot({ freshness: 'stale' })),
+      delayed(snapshot(), sourceModel(), manifest(), false, 'synchronizing'),
+      delayed(null),
+      // Unavailable composition.
+      delayed(snapshot({ managerReady: false })),
+      delayed(snapshot(), sourceModel(), { status: 'error', message: 'gone' }),
+    ]) {
+      expect(result.status).not.toBe('retained');
+      expect(result.status).not.toBe('ready');
+      expect(result).not.toHaveProperty('manifest');
+    }
+    expect(delayed(snapshot({ activeBundleId: 'sha256:bundle-b' })))
+      .toMatchObject({ reason: 'identity_mismatch' });
+    expect(delayed(snapshot(), sourceModel(), manifest(), true))
+      .toMatchObject({ reason: 'transition' });
+  });
 });

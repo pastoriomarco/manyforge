@@ -119,12 +119,47 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::BindBackend(
                         "ROS runtime handle is already bound");
   }
   backend_ = std::move(backend);
+  motion_binding_ = motion_binding;
+  gripper_binding_ = gripper_binding;
   motion_domain_id_ = motion_domain;
   gripper_domain_id_ = gripper_domain;
   if (gripper_binding.has_value()) {
     gripper_id_ = gripper_binding->value().command_target_id.value();
   }
   return core::Result<void>::Ok();
+}
+
+bool RetainedRos2ControlRuntimeHandle::OwnsBackend(
+    const core::IExecutionBackend *backend,
+    const core::RuntimeParticipantBinding &motion_binding,
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding)
+    const {
+  std::lock_guard lock(mutex_);
+  const auto owned = backend_.lock();
+  return owned != nullptr && owned.get() == backend &&
+         motion_binding_.has_value() &&
+         motion_binding_->value() == motion_binding.value() &&
+         gripper_binding_.has_value() == gripper_binding.has_value() &&
+         (!gripper_binding.has_value() ||
+          gripper_binding_->value() == gripper_binding->value());
+}
+
+void RetainedRos2ControlRuntimeHandle::StartBackend() {
+  std::lock_guard lock(mutex_);
+  if (start_failure_ != nullptr)
+    std::rethrow_exception(start_failure_);
+  if (start_attempted_)
+    return;
+  const auto backend = backend_.lock();
+  if (backend == nullptr)
+    throw std::logic_error("ROS initial installation has no live backend");
+  start_attempted_ = true;
+  try {
+    backend->complete_ros_configuration();
+  } catch (...) {
+    start_failure_ = std::current_exception();
+    throw;
+  }
 }
 
 RetainedExternallyManagedDomainSnapshotSource

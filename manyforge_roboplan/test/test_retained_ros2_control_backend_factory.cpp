@@ -10,6 +10,8 @@
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
 #include <gtest/gtest.h>
+#include "managed_ros2_component_installation.hpp"
+#include <manyforge_core/gripper_participant_engine.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -475,6 +477,212 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_THROW(static_cast<void>(factory(binding, std::nullopt, nullptr,
                                          nullptr, clock, scheduler)),
                std::logic_error);
+}
+
+// This fixture owns a real ROS adapter and two independent subordinate engines;
+// no executor or remote controller is started by the receipt tests.
+struct InitialRosInstallationFixture final {
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  std::shared_ptr<NullExecutionStateSink> sink =
+      std::make_shared<NullExecutionStateSink>();
+  core::RuntimeParticipantBinding motion = commanded_binding();
+  core::RuntimeParticipantBinding tool = commanded_gripper_binding();
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  RetainedRos2ControlRuntimeHandle handle;
+  std::unique_ptr<core::GripperParticipantEngine> motion_engine;
+  std::unique_ptr<core::GripperParticipantEngine> gripper_engine;
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  const core::ContentDigest identity{std::string("sha256:") +
+                                     std::string(64, 'a')};
+  component_manager::ManagerSelectedRuntimeCompositionRequestDTO request{
+      identity,
+      core::ApplyId("apply.initial"),
+      core::ApplyGeneration(1U),
+      {motion.value().retained_bundle_id,
+       motion.value().graph_revision,
+       {core::SceneId(identity.value()), 1U, identity}},
+      core::ActiveBundlePublicationGeneration(1U),
+      identity,
+      identity,
+      1U,
+      core::RuntimeUnitId("runtime.ros2_control"),
+      core::RuntimeEpoch("runtime-epoch.1"),
+      core::RuntimeEpoch("manager.1"),
+      core::ConfigurationFenceId("fence.initial"),
+      core::ConfigurationFenceGeneration(1U),
+      {{motion.value().controllable_component_id},
+       {{core::ControlDomainId("domain.arm"), std::nullopt,
+         core::ControlDomainRevision("domain-revision")},
+        {core::ControlDomainId("domain.gripper"), std::nullopt,
+         core::ControlDomainRevision("domain-revision")}},
+       {{core::ControlBindingId("binding.arm"), std::nullopt,
+         core::ControlBindingRevision("binding-revision")},
+        {core::ControlBindingId("binding.gripper"), std::nullopt,
+         core::ControlBindingRevision("binding-revision")}},
+       {core::ResourceId("robot.gripper.1"),
+        core::ResourceId("robot.joint.1")}},
+      component_manager::ManagerSelectedRuntimeCompositionPhase::kFinalize,
+      {{{motion.value().controllable_component_id,
+         deployment::ApplyComponentDisposition::kAdd,
+         std::nullopt,
+         identity,
+         {},
+         {core::ControlDomainId("domain.arm"),
+          core::ControlDomainId("domain.gripper")},
+         {}}},
+       false,
+       {}},
+      {core::RetainedBundleId("empty.bundle"),
+       core::GraphRevision("empty.graph"),
+       {core::SceneId(identity.value()), 1U, identity}}};
+  core::CellGraphDTO predecessor{"manyforge.cell_graph/v1",
+                                 core::GraphRevision("empty.graph"),
+                                 core::CellId("cell"),
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {}};
+  core::CellGraphDTO candidate{"manyforge.cell_graph/v1",
+                               motion.value().graph_revision,
+                               predecessor.cell_id,
+                               {},
+                               {},
+                               {{motion.value().controllable_component_id,
+                                 motion.value().component_type_id,
+                                 motion.value().component_type_revision,
+                                 {},
+                                 {request.runtime_unit_id},
+                                 std::nullopt}},
+                               {},
+                               {},
+                               {}};
+
+  InitialRosInstallationFixture() {
+    ros2_control_execution::Ros2ControlExecutionBackendConfig config;
+    config.action_name = "/initial_install_fixture/follow_joint_trajectory";
+    config.required_joints = {"joint_1"};
+    config.transport_joint_names = {"source_joint_1"};
+    config.execution_state_source_mode = "commanded_sim";
+    config.initial_joint_positions_rad = {0.25};
+    config.enable_jtc_speed_scaling_input = false;
+    config.initialize_commanded_sim_on_controller_ready = false;
+    backend =
+        std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+            ros2_control_execution::Ros2ControlExecutionBackend::
+                TestingNoRosStartupTag{},
+            sink, "arm", clock, scheduler, config);
+    if (!handle.BindBackend(backend, motion, tool).ok())
+      throw std::logic_error("initial ROS fixture binding failed");
+    motion_engine =
+        std::make_unique<core::GripperParticipantEngine>(*backend, clock);
+    gripper_engine =
+        std::make_unique<core::GripperParticipantEngine>(*backend, clock);
+    for (const auto *binding : {&motion, &tool}) {
+      core::RuntimeParticipantExecutionRegistration registration{
+          *binding,     std::nullopt,
+          {},           core::MotionInterruptNodeCategory::kGeneric,
+          nullptr,      nullptr,
+          std::nullopt, nullptr,
+          std::nullopt, std::nullopt,
+          std::nullopt};
+      registration.engine =
+          binding == &motion ? motion_engine.get() : gripper_engine.get();
+      registration.stop_execution_port = backend.get();
+      registrations.push_back(std::move(registration));
+    }
+  }
+
+  component_manager::ManagerRuntimeComponentReceiptDTO receipt() const {
+    return detail::ReadInitialRos2ComponentReceipt(
+        request, identity, handle, backend.get(), backend.get(), motion, tool,
+        registrations, motion_engine.get(), gripper_engine.get());
+  }
+};
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     InitialInstallReceiptProvesActualOwnedParticipants) {
+  InitialRosInstallationFixture fixture;
+  ASSERT_TRUE(fixture.request.valid());
+  EXPECT_NO_THROW(detail::RequireInitialRos2ComponentInstallation(
+      fixture.request, fixture.predecessor, fixture.candidate));
+  const auto first = fixture.receipt();
+  EXPECT_TRUE(component_manager::ComponentReceiptsMatchRequest(fixture.request,
+                                                               {first}));
+  EXPECT_EQ(fixture.receipt(), first);
+  EXPECT_FALSE(first.predecessor_runtime_retained);
+  EXPECT_FALSE(first.product_binding_resealed);
+  EXPECT_FALSE(fixture.handle.controller_binding_snapshot().has_value());
+  EXPECT_THROW(fixture.handle.StartBackend(), std::logic_error);
+  // A failed deferred start remains failed; owner lifetime/receipt is
+  // preserved, and no replay can pretend that controller readiness was
+  // established.
+  EXPECT_THROW(fixture.handle.StartBackend(), std::logic_error);
+  EXPECT_EQ(fixture.receipt(), first);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     InitialInstallRejectsUnsupportedDeltaBeforeEffects) {
+  InitialRosInstallationFixture fixture;
+  fixture.predecessor.controllable_components =
+      fixture.candidate.controllable_components;
+  EXPECT_THROW(detail::RequireInitialRos2ComponentInstallation(
+                   fixture.request, fixture.predecessor, fixture.candidate),
+               std::invalid_argument);
+  fixture.predecessor.controllable_components.clear();
+  fixture.candidate.controllable_components.push_back(
+      fixture.candidate.controllable_components.front());
+  EXPECT_THROW(detail::RequireInitialRos2ComponentInstallation(
+                   fixture.request, fixture.predecessor, fixture.candidate),
+               std::invalid_argument);
+  fixture.candidate.controllable_components.pop_back();
+  for (const auto disposition :
+       {deployment::ApplyComponentDisposition::kRetain,
+        deployment::ApplyComponentDisposition::kRemove,
+        deployment::ApplyComponentDisposition::kReplace}) {
+    fixture.request.component_delta.components.front().disposition =
+        disposition;
+    EXPECT_THROW(detail::RequireInitialRos2ComponentInstallation(
+                     fixture.request, fixture.predecessor, fixture.candidate),
+                 std::invalid_argument);
+  }
+  EXPECT_FALSE(fixture.handle.controller_binding_snapshot().has_value());
+  fixture.request.component_delta.components.clear();
+  fixture.request.configuration_fence_scope = {};
+  fixture.candidate.controllable_components.clear();
+  EXPECT_NO_THROW(detail::RequireInitialRos2ComponentInstallation(
+      fixture.request, fixture.predecessor, fixture.candidate));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     InitialInstallReceiptRejectsStaleForeignAndDuplicateEvidence) {
+  InitialRosInstallationFixture fixture;
+  const auto original = fixture.request;
+  fixture.request.runtime_epoch = core::RuntimeEpoch("stale.epoch");
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  fixture.request.candidate_projection_revision.graph_revision =
+      core::GraphRevision("foreign.graph");
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  fixture.request.component_delta.components.front()
+      .candidate_runtime_identity =
+      core::ContentDigest(std::string("sha256:") + std::string(64, 'b'));
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  fixture.registrations.push_back(fixture.registrations.front());
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.registrations.pop_back();
+  fixture.registrations.front().engine = fixture.gripper_engine.get();
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.registrations.front().engine = fixture.motion_engine.get();
+  fixture.registrations.back().stop_execution_port = nullptr;
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.registrations.back().stop_execution_port = fixture.backend.get();
+  fixture.request.configuration_fence_scope.resources.pop_back();
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,

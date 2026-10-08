@@ -64,6 +64,35 @@ describe('viewer notice classification', () => {
     expect(retryModel).toHaveBeenCalledOnce();
   });
 
+  it('marks a retained robot model not verified without hiding it', () => {
+    const retainModel = vi.fn();
+    for (const reason of ['transport_delayed', 'transport_stale'] as const) {
+      const notices = viewerNotices(input({
+        retryModel: retainModel,
+        robotMeshFailure: 'link_2.glb failed.',
+        modelPresentation: {
+          status: 'retained',
+          manifest: {},
+          reason,
+          message: 'Control connection delayed: not confirmed.',
+        } as unknown as ViewerModelPresentation,
+      }));
+      // The hold-then-error rule applies (error after 500 ms, reported as an
+      // incident); a transport delay is not a known controlled transition.
+      expect(notices[0]).toMatchObject({
+        id: 'viewer.model',
+        severity: 'error',
+        title: 'Applied robot model not verified',
+        message: 'Control connection delayed: not confirmed.',
+        incidentKind: 'viewer_model_unavailable',
+      });
+      expect(notices[0].expectedDuringTransition).toBeUndefined();
+      expect(notices[0].busy).toBeUndefined();
+      // The displayed (retained) robot still reports its missing geometry.
+      expect(notices.map((notice) => notice.id)).toContain('viewer.robot-mesh');
+    }
+  });
+
   it('makes an unverified Applied Scene an error', () => {
     expect(viewerNotices(input({ staleScenePreview: true }))).toEqual([
       expect.objectContaining({

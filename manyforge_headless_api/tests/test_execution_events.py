@@ -684,6 +684,7 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
                 "stop_fault": {
                     "configuration_expectations": [expectation],
                     "latch": latch,
+                    "recovery_unavailable_reason": None,
                 },
             }
         return {
@@ -765,6 +766,24 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
     assert not client._valid_stop_fault_offer(invalid)
     invalid = copy.deepcopy(offer)
     invalid["latch"]["stop_certificate"]["stop_id"] = "wrong-stop"
+    assert not client._valid_stop_fault_offer(invalid)
+
+    # A certified latch names why recovery is unavailable instead of carrying
+    # an empty proof; a proof and a reason never appear together.
+    unavailable = copy.deepcopy(offer)
+    unavailable["configuration_expectations"] = []
+    unavailable["recovery_unavailable_reason"] = (
+        "stop_fault_recovery_installed_configuration_unavailable"
+    )
+    assert client._valid_stop_fault_offer(unavailable)
+    invalid = copy.deepcopy(unavailable)
+    invalid["recovery_unavailable_reason"] = None
+    assert not client._valid_stop_fault_offer(invalid)
+    invalid = copy.deepcopy(offer)
+    invalid["recovery_unavailable_reason"] = "stop_fault_recovery_installed_configuration_unavailable"
+    assert not client._valid_stop_fault_offer(invalid)
+    invalid = copy.deepcopy(offer)
+    del invalid["recovery_unavailable_reason"]
     assert not client._valid_stop_fault_offer(invalid)
 
 
@@ -1119,6 +1138,76 @@ def test_execution_client_verifies_complete_motion_preview_receipt(
     assert unsafe_revision.value.code == "execution_command_response_invalid"
 
 
+def _with_scene_revision(
+    response: dict[str, Any], scene_revision: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = response["preview_receipt"]
+    receipt["scene_revision"] = scene_revision
+    receipt.pop("receipt_digest")
+    receipt["receipt_digest"] = (
+        "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    ("revision_id", "scene_id", "accepted"),
+    [
+        (4, "sha256:" + "1" * 64, True),
+        (2, "sha256:" + "1" * 64, False),
+        (4, "sha256:" + "9" * 64, False),
+    ],
+)
+def test_motion_preview_receipt_may_name_a_newer_revision_of_the_same_scene(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    revision_id: int,
+    scene_id: str,
+    accepted: bool,
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    latched = {
+        "scene_id": scene_id,
+        "revision_id": revision_id,
+        "content_hash": "sha256:" + "3" * 64,
+    }
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        return _with_scene_revision(_preview_response(command["operation"]), latched)
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    if accepted:
+        response = client.preview_motion(request, trusted_principal_id=None)
+        assert response["preview_receipt"]["scene_revision"] == latched
+    else:
+        with pytest.raises(HeadlessApiError) as mismatch:
+            client.preview_motion(request, trusted_principal_id=None)
+        assert mismatch.value.code == "execution_command_response_identity_mismatch"
+
+
+def test_capability_command_preview_receipt_echoes_the_exact_scene_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_command_request()
+    newer = {
+        "scene_id": "sha256:" + "1" * 64,
+        "revision_id": 4,
+        "content_hash": "sha256:" + "3" * 64,
+    }
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        return _with_scene_revision(
+            _command_preview_response(command["operation"]), newer
+        )
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as mismatch:
+        client.preview_capability_command(request, trusted_principal_id=None)
+    assert mismatch.value.code == "execution_command_response_identity_mismatch"
+
+
 def test_execution_client_verifies_capability_command_preview_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1283,6 +1372,7 @@ def _stop_fault_response(stop_fault: Any) -> dict[str, Any]:
 
 def _active_stop_fault_offer() -> dict[str, Any]:
     return {
+        "recovery_unavailable_reason": None,
         "configuration_expectations": [],
         "latch": {
             "captured_operation_ids": [],
@@ -1742,6 +1832,7 @@ def test_event_pump_supplies_fresh_current_stop_fault_condition() -> None:
     execution.stop_fault_offer = {
         "configuration_expectations": [],
         "latch": latch,
+        "recovery_unavailable_reason": None,
     }
     pump = ExecutionEventPump(  # type: ignore[arg-type]
         core,

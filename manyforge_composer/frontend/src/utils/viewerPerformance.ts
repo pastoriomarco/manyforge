@@ -188,10 +188,20 @@ export function isSoftwareRenderer(renderer: string | null): boolean {
   return SOFTWARE_RENDERER_TOKENS.some((token) => normalized.includes(token));
 }
 
+type InspectableWebGLContext = Pick<
+  WebGLRenderingContext,
+  'VENDOR' | 'RENDERER' | 'getExtension' | 'getParameter'
+>;
+
 export function inspectViewerRenderer(
   gl: WebGLRenderer,
 ): ViewerRendererInspection {
-  const context = gl.getContext();
+  return inspectWebGLContext(gl.getContext());
+}
+
+function inspectWebGLContext(
+  context: InspectableWebGLContext,
+): ViewerRendererInspection {
   const debugInfo = context.getExtension('WEBGL_debug_renderer_info');
   const vendor = String(
     context.getParameter(debugInfo?.UNMASKED_VENDOR_WEBGL ?? context.VENDOR) ?? '',
@@ -210,6 +220,74 @@ export function inspectViewerRenderer(
     renderer: softwareRenderer || renderer || baseRenderer || null,
     software: softwareRenderer !== undefined,
   };
+}
+
+/**
+ * The renderer this page renders with. It is a property of the browser and
+ * its WebGL implementation, so it is inspected once per page and reused by
+ * every viewer Canvas mount.
+ */
+let pageRendererInspection: ViewerRendererInspection | null = null;
+
+function sameRendererInspection(
+  left: ViewerRendererInspection,
+  right: ViewerRendererInspection,
+): boolean {
+  return left.vendor === right.vendor
+    && left.renderer === right.renderer
+    && left.software === right.software;
+}
+
+/**
+ * The page's renderer inspection, probed before the first viewer Canvas is
+ * created. Context-creation settings (antialiasing) depend on whether the
+ * renderer is software, so knowing it first lets the Canvas be created once
+ * with its final settings instead of being created, inspected and remounted.
+ * The probe context is only dropped, never force-lost. Returns null when
+ * WebGL is unavailable; the Canvas's own inspection then fills the cache.
+ */
+export function pageViewerRendererInspection(
+  createCanvas: () => Pick<HTMLCanvasElement, 'getContext'> | null = () => (
+    typeof document === 'undefined' ? null : document.createElement('canvas')
+  ),
+): ViewerRendererInspection | null {
+  if (pageRendererInspection !== null) return pageRendererInspection;
+  try {
+    const canvas = createCanvas();
+    const attributes = {
+      alpha: false,
+      antialias: false,
+      powerPreference: 'high-performance',
+    } as const;
+    // Only WebGL contexts are requested; Pick<> drops getContext's overloads.
+    const context = (canvas?.getContext('webgl2', attributes)
+      ?? canvas?.getContext('webgl', attributes)
+      ?? null) as WebGL2RenderingContext | WebGLRenderingContext | null;
+    if (context === null) return null;
+    pageRendererInspection = inspectWebGLContext(context);
+  } catch {
+    return null;
+  }
+  return pageRendererInspection;
+}
+
+/**
+ * Record the inspection of a created viewer context as the page's renderer.
+ * Returns the cached object when nothing changed, so callers keep identity.
+ */
+export function rememberViewerRendererInspection(
+  next: ViewerRendererInspection,
+): ViewerRendererInspection {
+  if (pageRendererInspection === null
+      || !sameRendererInspection(pageRendererInspection, next)) {
+    pageRendererInspection = next;
+  }
+  return pageRendererInspection;
+}
+
+/** Test seam: forget the page renderer inspection. */
+export function resetViewerRendererInspectionForTest(): void {
+  pageRendererInspection = null;
 }
 
 /** The renderer settings for this browser, from its graphics profile. */

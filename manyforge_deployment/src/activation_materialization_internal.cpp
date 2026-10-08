@@ -2055,94 +2055,99 @@ void verify_scenarios(const std::filesystem::path &root,
              scenario.ros2_control_execution ? "commanded_sim" : "simulated")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
+    const auto motion_targets =
+        runtime.configuration.find("motion_target_limits");
+    const auto *motion_target_rows =
+        motion_targets == runtime.configuration.end()
+            ? nullptr
+            : std::get_if<core::JsonValueDTO::Array>(
+                  &motion_targets->second.value);
+    const auto *motion_target =
+        motion_target_rows == nullptr || motion_target_rows->size() != 1U
+            ? nullptr
+            : std::get_if<core::JsonObjectDTO>(
+                  &motion_target_rows->front().value);
+    const auto speed =
+        motion_target == nullptr
+            ? core::JsonObjectDTO::const_iterator{}
+            : motion_target->find("maximum_tcp_linear_speed_mps");
+    const auto *expected_target_speed_limit =
+        motion_target == nullptr || speed == motion_target->end()
+            ? nullptr
+            : std::get_if<double>(&speed->second.value);
+    if (expected_target_speed_limit == nullptr ||
+        !std::isfinite(*expected_target_speed_limit) ||
+        *expected_target_speed_limit <= 0.0) {
+      throw std::invalid_argument(
+          "maintained scenario has no valid Deployment TCP speed limit: " +
+          std::string(scenario.source));
+    }
+    core::JsonObjectDTO expected_motion_target{
+        {"command_target_id", core::JsonValueDTO{std::string("arm")}},
+        {"controllable_component_id",
+         core::JsonValueDTO{graph.controllable_components.front()
+                                .controllable_component_id.value()}},
+        {"maximum_tcp_linear_speed_mps",
+         core::JsonValueDTO{*expected_target_speed_limit}}};
     if (!scenario.ros2_control_execution) {
-      const auto motion_targets =
-          runtime.configuration.find("motion_target_limits");
-      const auto *motion_target_rows =
-          motion_targets == runtime.configuration.end()
-              ? nullptr
-              : std::get_if<core::JsonValueDTO::Array>(
-                    &motion_targets->second.value);
-      const auto *motion_target =
-          motion_target_rows == nullptr || motion_target_rows->size() != 1U
-              ? nullptr
-              : std::get_if<core::JsonObjectDTO>(
-                    &motion_target_rows->front().value);
-      const auto speed =
-          motion_target == nullptr
-              ? core::JsonObjectDTO::const_iterator{}
-              : motion_target->find("maximum_tcp_linear_speed_mps");
-      const auto *expected_target_speed_limit =
-          motion_target == nullptr || speed == motion_target->end()
-              ? nullptr
-              : std::get_if<double>(&speed->second.value);
-      if (expected_target_speed_limit == nullptr ||
-          !std::isfinite(*expected_target_speed_limit) ||
-          *expected_target_speed_limit <= 0.0) {
-        throw std::invalid_argument(
-            "maintained scenario has no valid Deployment TCP speed limit: " +
-            std::string(scenario.source));
-      }
-      expected_runtime_configuration.emplace(
-          "direct_control_joint_limits",
-          core::JsonValueDTO{core::JsonValueDTO::Array{}});
-      core::JsonObjectDTO expected_motion_target{
-          {"command_target_id", core::JsonValueDTO{std::string("arm")}},
-          {"controllable_component_id",
-           core::JsonValueDTO{graph.controllable_components.front()
-                                  .controllable_component_id.value()}},
-          {"maximum_tcp_linear_speed_mps",
-           core::JsonValueDTO{*expected_target_speed_limit}},
-          {"ordinary_motion_jerk",
-           core::JsonValueDTO{core::JsonObjectDTO{
-               {"enabled", core::JsonValueDTO{false}},
-               {"preset_reference_time_s", core::JsonValueDTO{1.0}},
-               {"joint_limits",
-                core::JsonValueDTO{core::JsonValueDTO::Array{}}}}}}};
+      expected_motion_target.emplace(
+          "ordinary_motion_jerk",
+          core::JsonValueDTO{core::JsonObjectDTO{
+              {"enabled", core::JsonValueDTO{false}},
+              {"preset_reference_time_s", core::JsonValueDTO{1.0}},
+              {"joint_limits",
+               core::JsonValueDTO{core::JsonValueDTO::Array{}}}}});
+    }
       expected_runtime_configuration.emplace(
           "motion_target_limits",
           core::JsonValueDTO{core::JsonValueDTO::Array{
               core::JsonValueDTO{std::move(expected_motion_target)}}});
-      if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
+      if (!scenario.ros2_control_execution) {
         expected_runtime_configuration.emplace(
-            "gripper_target_configurations",
-            core::JsonValueDTO{core::JsonValueDTO::Array{
-                core::JsonValueDTO{core::JsonObjectDTO{
-                    {"actuation_kind",
-                     core::JsonValueDTO{std::string("position_commanded")}},
-                    {"attach_frame",
-                     core::JsonValueDTO{std::string("link_tcp")}},
-                    {"auxiliary_frames",
-                     core::JsonValueDTO{
-                         core::JsonValueDTO::Array{core::JsonValueDTO{
-                             std::string("lite_gripper_base_link")}}}},
-                    {"closed_state_ref",
-                     core::JsonValueDTO{std::string("closed")}},
-                    {"command_duration_s", core::JsonValueDTO{0.8}},
-                    {"command_target_id",
-                     core::JsonValueDTO{std::string("gripper")}},
-                    {"controllable_component_id",
-                     core::JsonValueDTO{
-                         graph.controllable_components.front()
-                             .controllable_component_id.value()}},
-                    {"description", core::JsonValueDTO{std::string(
-                                        "Native simulated UFACTORY lite "
-                                        "pneumatic gripper.")}},
-                    {"mount_frame",
-                     core::JsonValueDTO{std::string("link_eef")}},
-                    {"open_state_ref", core::JsonValueDTO{std::string("open")}},
-                    {"tcp_frame", core::JsonValueDTO{std::string("link_tcp")}},
-                    {"touch_links",
-                     core::JsonValueDTO{core::JsonValueDTO::Array{
-                         core::JsonValueDTO{
-                             std::string("lite_gripper_base_link")},
-                         core::JsonValueDTO{
-                             std::string("lite_gripper_left_finger")},
-                         core::JsonValueDTO{
-                             std::string("lite_gripper_right_finger")}}}},
-                }}}});
+            "direct_control_joint_limits",
+            core::JsonValueDTO{core::JsonValueDTO::Array{}});
+        if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
+          expected_runtime_configuration.emplace(
+              "gripper_target_configurations",
+              core::JsonValueDTO{core::JsonValueDTO::Array{
+                  core::JsonValueDTO{core::JsonObjectDTO{
+                      {"actuation_kind",
+                       core::JsonValueDTO{std::string("position_commanded")}},
+                      {"attach_frame",
+                       core::JsonValueDTO{std::string("link_tcp")}},
+                      {"auxiliary_frames",
+                       core::JsonValueDTO{
+                           core::JsonValueDTO::Array{core::JsonValueDTO{
+                               std::string("lite_gripper_base_link")}}}},
+                      {"closed_state_ref",
+                       core::JsonValueDTO{std::string("closed")}},
+                      {"command_duration_s", core::JsonValueDTO{0.8}},
+                      {"command_target_id",
+                       core::JsonValueDTO{std::string("gripper")}},
+                      {"controllable_component_id",
+                       core::JsonValueDTO{
+                           graph.controllable_components.front()
+                               .controllable_component_id.value()}},
+                      {"description", core::JsonValueDTO{std::string(
+                                          "Native simulated UFACTORY lite "
+                                          "pneumatic gripper.")}},
+                      {"mount_frame",
+                       core::JsonValueDTO{std::string("link_eef")}},
+                      {"open_state_ref",
+                       core::JsonValueDTO{std::string("open")}},
+                      {"tcp_frame",
+                       core::JsonValueDTO{std::string("link_tcp")}},
+                      {"touch_links",
+                       core::JsonValueDTO{core::JsonValueDTO::Array{
+                           core::JsonValueDTO{
+                               std::string("lite_gripper_base_link")},
+                           core::JsonValueDTO{
+                               std::string("lite_gripper_left_finger")},
+                           core::JsonValueDTO{
+                               std::string("lite_gripper_right_finger")}}}},
+                  }}}});
+        }
       }
-    }
     if (scenario.ros2_control_execution) {
       expected_runtime_configuration.emplace(
           "isaac_profile",

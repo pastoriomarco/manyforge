@@ -92,6 +92,8 @@ import {
 import {
   inspectViewerRenderer,
   connectViewerQualification,
+  pageViewerRendererInspection,
+  rememberViewerRendererInspection,
   recordViewerModelBuild,
   recordViewerReactCommit,
   recordViewerRenderFrame,
@@ -602,6 +604,12 @@ function SceneObjectMeshAsset({
   return <primitive object={clone} />;
 }
 
+/** Drop a failed GLB from the loader cache so a later remount refetches it. */
+function forgetSceneMeshAsset(url: string): void {
+  (useGLTF as unknown as { clear?: (url: string) => void })
+    .clear?.(resolveStructuralAssetUrl(url));
+}
+
 function SceneObjectMesh({
   shape,
   ownerIdentity,
@@ -621,8 +629,9 @@ function SceneObjectMesh({
   const [error, setError] = useState<Error | null>(null);
   const draftId = draftIdentity?.draftId;
   const draftRevision = draftIdentity?.draftRevision;
-  const ownerEpoch = ownerIdentity?.ownerEpoch;
-  const ownerGeneration = ownerIdentity?.generation;
+  // Owner-scope URLs are content-addressed and stay valid across owner-epoch
+  // rotation and pose generations, so only presence of an owner matters.
+  const ownerBound = ownerIdentity !== undefined;
   const scaleX = shape.scale.x;
   const scaleY = shape.scale.y;
   const scaleZ = shape.scale.z;
@@ -630,27 +639,23 @@ function SceneObjectMesh({
     reportViewerQualificationError(failure);
     setError(failure);
   }, [setError]);
+  const isolateAssetError = useCallback((failure: Error) => {
+    if (url !== null) forgetSceneMeshAsset(url);
+    isolateError(failure);
+  }, [isolateError, url]);
   useEffect(() => {
     const controller = new AbortController();
     setUrl(null);
     setError(null);
     const scale = { x: scaleX, y: scaleY, z: scaleZ };
     const resolution = draftId === undefined || draftRevision === undefined
-      ? ownerEpoch === undefined || ownerGeneration === undefined
+      ? !ownerBound
         ? Promise.reject(new Error('Scene mesh has no exact source identity.'))
         : api.scene.resolveMesh(
             shape.resource_uri,
             scale,
             controller.signal,
-          ).then((asset) => {
-            if (
-              asset.source_owner_epoch !== ownerEpoch
-              || asset.source_generation !== ownerGeneration
-            ) {
-              throw new Error('Scene mesh belongs to a superseded owner generation.');
-            }
-            return asset.mesh_asset_url;
-          })
+          ).then((asset) => asset.mesh_asset_url)
       : api.scene.resolveProgramDraftMesh(
           shape.resource_uri,
           scale,
@@ -667,6 +672,7 @@ function SceneObjectMesh({
           return asset.mesh_asset_url;
         });
     void resolution.then((assetUrl) => {
+      if (controller.signal.aborted) return;
       setUrl(assetUrl);
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
@@ -679,8 +685,7 @@ function SceneObjectMesh({
     draftId,
     draftRevision,
     isolateError,
-    ownerEpoch,
-    ownerGeneration,
+    ownerBound,
     scaleX,
     scaleY,
     scaleZ,
@@ -696,7 +701,7 @@ function SceneObjectMesh({
     : url === null
     ? null
     : (
-      <AssetErrorBoundary resetKey={url} onError={isolateError}>
+      <AssetErrorBoundary resetKey={url} onError={isolateAssetError}>
         <Suspense fallback={null}>
           <SceneObjectMeshAsset
             url={url}
@@ -2449,6 +2454,12 @@ function useOutlineComponents(
     .map((line) => line.split('\u0000') as [string, string])), [key]);
 }
 
+const UNINSPECTED_RENDERER: ViewerRendererInspection = {
+  vendor: null,
+  renderer: null,
+  software: false,
+};
+
 const ViewerCanvas = memo(function ViewerCanvas({
   manifest,
   collisionsVisible,
@@ -2565,11 +2576,11 @@ const ViewerCanvas = memo(function ViewerCanvas({
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
     : window.devicePixelRatio;
-  const [inspection, setInspection] = useState<ViewerRendererInspection>({
-    vendor: null,
-    renderer: null,
-    software: false,
-  });
+  // Seeded from the page-level inspection so every mount is created with
+  // its final context settings; onCreated never flips the Canvas key.
+  const [inspection, setInspection] = useState<ViewerRendererInspection>(
+    () => pageViewerRendererInspection() ?? UNINSPECTED_RENDERER,
+  );
   const graphicsProfile = graphics[inspection.software ? 'software' : 'gpu'];
   const renderer = useMemo(() => ({
     ...inspection,
@@ -2731,8 +2742,10 @@ const ViewerCanvas = memo(function ViewerCanvas({
       onContextMenu={(event) => event.preventDefault()}
     >
     <Canvas
-      // Antialiasing is fixed when the WebGL context is created.
-      key={`${renderer.software ? 'software' : 'hardware'}:${renderer.antialias ? 'aa' : 'no-aa'}`}
+      // Only antialiasing is fixed when the WebGL context is created. The
+      // renderer kind is known before mount (page inspection), so the key does
+      // not depend on anything discovered in onCreated.
+      key={renderer.antialias ? 'aa' : 'no-aa'}
       frameloop="demand"
       dpr={renderer.effectiveDpr}
       gl={{
@@ -2744,10 +2757,8 @@ const ViewerCanvas = memo(function ViewerCanvas({
         if (qualificationEnabled && materializationStartedAtMs.current === null) {
           materializationStartedAtMs.current = performance.now();
         }
-        const next = inspectViewerRenderer(gl);
-        setInspection((current) => (
-          JSON.stringify(current) === JSON.stringify(next) ? current : next
-        ));
+        const next = rememberViewerRendererInspection(inspectViewerRenderer(gl));
+        setInspection(next);
         onRendererKind?.(next.software ? 'software' : 'gpu');
       }}
       style={{ background: VIEWPORT_COLORS.background }}
@@ -2858,6 +2869,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
           </AssetErrorBoundary>
         )}
         <LogicalSceneObjects
+          key={`logical-scene:${retryGeneration}`}
           objects={sceneObjects.filter(
             (object) => !observedSceneResourceIds.has(object.scene_resource_id),
           )}
@@ -2878,6 +2890,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
         />
         {runtimePresentation !== undefined && (
           <ObservedLogicalSceneObjects
+            key={`observed-scene:${retryGeneration}`}
             objects={sceneObjects}
             presentation={runtimePresentation}
             wireframe={wireframeVisible}

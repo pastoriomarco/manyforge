@@ -16,6 +16,7 @@
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
+#include <manyforge_core/types/scene_transaction.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -30,6 +31,18 @@ struct RetainedCollisionWorldPublicationContext final {
   std::string source_label;
   std::optional<std::string> correlation_id;
 };
+
+/// Checks one provider freshness confirmation against the exact committed
+/// logical scene it names: the object must exist, be unattached and
+/// cell-fixed in that cell at exactly the confirmed pose, and its committed
+/// provider evidence must share the confirmation's origin (provider instance,
+/// manifest id/revision, source epoch) and freshness budget with a strictly
+/// older provider source sequence and a received_at_ns not newer than the
+/// confirmation. Returns the refusal, or std::nullopt when it applies.
+[[nodiscard]] std::optional<core::ErrorDTO>
+ValidateProviderFreshnessAgainstCommittedScene(
+    const core::LogicalSceneSnapshotDTO &committed_scene,
+    const core::ProviderFreshnessConfirmationDTO &confirmation);
 
 /// Authoritative immutable collision-world projection over one exact retained
 /// model generation and logical-scene lineage.
@@ -56,6 +69,25 @@ public:
   [[nodiscard]] core::Result<core::CollisionWorldRevision>
   publish(const core::LogicalSceneSnapshotDTO &logical_scene,
           RetainedCollisionWorldPublicationContext context);
+
+  /// Freshness-only publication for one unchanged committed object.
+  ///
+  /// Retains the current world, policy, policy index and distance selections;
+  /// replaces only that object's freshness sidecar entries with
+  /// source_timestamp_ns = evidence.received_at_ns, advances the runtime
+  /// bundle epoch, and patches the current lease inventory (bundle sidecar and
+  /// the object's live-object freshness) so that only leases retained later
+  /// observe it. Already-retained lease inventories are never mutated.
+  ///
+  /// The confirmation is kept as a per-object override keyed by the exact
+  /// committed evidence and placement it was confirmed against. publish()
+  /// re-applies it only while that object's committed evidence and placement
+  /// are exactly unchanged, and discards it on any committed change to the
+  /// object's evidence, pose or attachment, or on object removal. A
+  /// confirmation at or below the current override's sequence is refused.
+  /// Returns the new runtime bundle epoch.
+  [[nodiscard]] core::Result<std::uint64_t>
+  publish_freshness(const core::ProviderFreshnessConfirmationDTO &confirmation);
 
   /// Reserve one process-local collision-world revision for an immutable
   /// owner-private candidate. The candidate is not published, but consuming
@@ -112,6 +144,14 @@ private:
   [[nodiscard]] bool
   retire_and_swap_locked(core::RuntimeCollisionQueryBundlePtr next);
 
+  /// One accepted freshness confirmation, derived from (never competing with)
+  /// the committed evidence and placement it was accepted against.
+  struct FreshnessOverride final {
+    core::SceneObjectProviderEvidenceDTO committed_evidence;
+    core::SceneObjectPlacementDTO committed_placement;
+    core::SceneObjectProviderEvidenceDTO confirmed_evidence;
+  };
+
   RetainedCollisionWorldProjector projector_;
   std::string publisher_id_;
   Clock clock_;
@@ -131,6 +171,9 @@ private:
   std::uint64_t owner_sequence_ = 0U;
   std::uint64_t runtime_epoch_ = 0U;
   std::string policy_content_hash_;
+  /// Keyed by scene resource id; in-memory only, so a host restart or a
+  /// projection rebuild (a new publisher) falls back to committed evidence.
+  std::map<std::string, FreshnessOverride> freshness_overrides_;
 
   std::atomic<core::RuntimeCollisionQueryBundlePtr> runtime_bundle_;
   std::array<core::RuntimeCollisionQueryBundlePtr,

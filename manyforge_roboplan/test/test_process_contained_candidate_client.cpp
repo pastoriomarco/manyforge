@@ -9,9 +9,12 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <functional>
+#include <manyforge_collision/scene_asset_root.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <roboplan/core/scene.hpp>
@@ -273,7 +276,7 @@ request(const ProcessFixture &fixture) {
 config(const std::filesystem::path &worker) {
   return ProcessContainedCandidateClientConfig{
       worker, 10s, 250ms, 500ms, 4U * 1024U * 1024U,
-      256U * 1024U * 1024U, false, std::nullopt, std::nullopt};
+      256U * 1024U * 1024U, false, std::nullopt, std::nullopt, {}};
 }
 
 [[nodiscard]] Pose3DTO identity_pose(double x_m = 0.0) {
@@ -538,140 +541,343 @@ TEST(ProcessContainedCandidateClientTest,
             values(fixture.goal));
 }
 
-TEST(ProcessContainedCandidateClientTest,
-     RetainedProjectionResolvesOnlyProductContainedRelativeSceneMeshes) {
-  auto fixture = make_fixture();
-  const auto asset_root =
-      std::filesystem::temp_directory_path() /
-      ("manyforge-program-scene-assets-" + std::to_string(::getpid()));
-  std::error_code ignored;
-  std::filesystem::remove_all(asset_root, ignored);
-  const auto mesh = asset_root / "examples/scene/meshes/fixture.obj";
-  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
-  {
-    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(stream.good());
-    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-    stream.flush();
-    ASSERT_TRUE(stream.good());
+class ScopedDirectoryDescriptor final {
+public:
+  explicit ScopedDirectoryDescriptor(const std::filesystem::path &root) {
+    // Like the host's inherited FD 9, keep the root above the descriptors
+    // that worker spawn rewrites (protocol, package root, executable).
+    const int opened = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (opened < 0) {
+      throw std::runtime_error("could not open test scene-asset root");
+    }
+    descriptor_ = ::fcntl(opened, F_DUPFD_CLOEXEC, 10);
+    static_cast<void>(::close(opened));
+    if (descriptor_ < 0) {
+      throw std::runtime_error("could not place test scene-asset root");
+    }
   }
 
-  auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
+  ~ScopedDirectoryDescriptor() { static_cast<void>(::close(descriptor_)); }
+
+  ScopedDirectoryDescriptor(const ScopedDirectoryDescriptor &) = delete;
+  ScopedDirectoryDescriptor &
+  operator=(const ScopedDirectoryDescriptor &) = delete;
+
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+private:
+  int descriptor_{-1};
+};
+
+constexpr std::string_view kSceneMeshUri = "examples/x/meshes/a.obj";
+constexpr std::string_view kTriangleObj =
+    "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+constexpr std::string_view kChangedTriangleObj =
+    "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n";
+
+void write_file(const std::filesystem::path &path, std::string_view bytes) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  stream.flush();
+  if (!stream.good()) {
+    throw std::runtime_error("could not write test file");
+  }
+}
+
+/// Emulates the collision model: the first read of each URI below the scene
+/// descriptor pins its digest; later queries return the pinned digest.
+[[nodiscard]] std::function<Result<std::string>(const std::string &)>
+pinned_scene_mesh_digests(const int scene_root_fd) {
+  auto pinned = std::make_shared<std::map<std::string, std::string>>();
+  return [scene_root_fd, pinned](const std::string &uri) {
+    if (const auto found = pinned->find(uri); found != pinned->end()) {
+      return Result<std::string>::Ok(found->second);
+    }
+    std::string error;
+    const auto opened =
+        collision::OpenedSceneMesh::open(scene_root_fd, uri, error);
+    if (!opened.has_value()) {
+      return Result<std::string>::Err(ErrorDTO{
+          "invalid_request", error, {{"reason", "scene_mesh_unavailable"}}});
+    }
+    pinned->emplace(uri, opened->content_digest());
+    return Result<std::string>::Ok(opened->content_digest());
+  };
+}
+
+[[nodiscard]] RoboPlanCandidateProjectionDTO
+scene_mesh_projection(const std::uint64_t revision, const std::string &uri,
+                      const std::vector<Vector3DTO> &scales = {
+                          Vector3DTO{1.0, 1.0, 1.0}}) {
+  CollisionWorldBody body;
+  body.body_id = CollisionBodyId(std::string(kSceneBodyId));
+  body.owner_kind = CollisionOwnerKind::kSceneResource;
+  body.frame_id = "base";
+  body.pose = identity_pose(100.0);
+  for (const auto &scale : scales) {
+    CollisionGeometryDescriptor geometry;
+    geometry.body_id = body.body_id;
+    geometry.owner_kind = body.owner_kind;
+    geometry.geometry_kind = CollisionGeometryKind::kTriangleMesh;
+    geometry.local_pose = identity_pose();
+    geometry.source_uri = uri;
+    geometry.mesh_scale = scale;
+    body.geometries.push_back(std::move(geometry));
+  }
+  auto policy = std::make_shared<CollisionPolicySnapshot>();
+  policy->policy_id = "process-client-scene-mesh-projection";
+  policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
+  policy->allowed_touch_link_pairs.push_back(projected_allowed_pair());
+  auto world =
+      CollisionWorldSnapshotBuilder()
+          .set_publisher_id("process-client-scene-mesh-test")
+          .set_revision_id(revision)
+          .set_policy_overlay_content_hash(policy->revision.content_hash)
+          .add_body(component_body())
+          .add_body(std::move(body))
+          .build_shared();
+  if (!world.ok()) {
+    throw std::runtime_error(world.error().message);
+  }
+  return RoboPlanCandidateProjectionDTO{
+      ProjectionLeaseBindingDTO{
+          ProjectionRevisionDTO{
+              RetainedBundleId("retained-bundle-a"),
+              GraphRevision("graph-revision-a"),
+              SceneRevision{SceneId(std::string(kDigestZero)), revision,
+                            ContentDigest(std::string(revision % 2U == 1U
+                                                          ? kDigestZero
+                                                          : kDigestOne))}},
+          ProjectionLeaseId("process-client-scene-mesh-lease-" +
+                            std::to_string(revision))},
+      std::move(world.value()), std::move(policy)};
+}
+
+/// A package root without examples/ and a separate scene root holding the
+/// relative scene mesh, below one per-test temporary parent.
+struct SeparatedSceneRoots final {
+  explicit SeparatedSceneRoots(const std::string &name)
+      : parent(std::filesystem::temp_directory_path() /
+               ("manyforge-" + name + "-" + std::to_string(::getpid()))),
+        package_root(parent / "package"), scene_root(parent / "scene") {
+    std::error_code ignored;
+    std::filesystem::remove_all(parent, ignored);
+    std::filesystem::create_directories(package_root);
+    write_file(scene_root / kSceneMeshUri, kTriangleObj);
+  }
+  ~SeparatedSceneRoots() {
+    std::error_code ignored;
+    std::filesystem::remove_all(parent, ignored);
+  }
+  SeparatedSceneRoots(const SeparatedSceneRoots &) = delete;
+  SeparatedSceneRoots &operator=(const SeparatedSceneRoots &) = delete;
+
+  std::filesystem::path parent;
+  std::filesystem::path package_root;
+  std::filesystem::path scene_root;
+};
+
+[[nodiscard]] ProcessContainedCandidateClientConfig
+scene_mesh_config(const std::filesystem::path &worker,
+                  const std::optional<int> scene_root_fd,
+                  const std::optional<int> package_root_fd = 6) {
+  auto process_config = config(worker);
   process_config.require_retained_projection = true;
-  process_config.scene_asset_root = asset_root;
-  ProcessContainedRoboPlanCandidateClient client(
-      fixture.model, fixture.binding,
-      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
-      std::move(process_config));
-
-  const auto traversal = client.select_retained_projection(
-      projection(1U, 1U, false, "../outside.obj"));
-  ASSERT_FALSE(traversal.ok());
-  EXPECT_EQ(traversal.error().details.at("reason"),
-            "native_planner_projection_selection_failed");
-
-  const auto selected = client.select_retained_projection(
-      projection(2U, 2U, false,
-                 "examples/scene/meshes/fixture.obj"));
-  ASSERT_TRUE(selected.ok()) << selected.error().message;
-
-  const auto missing = client.select_retained_projection(
-      projection(3U, 3U, false,
-                 "examples/scene/meshes/missing.obj"));
-  ASSERT_FALSE(missing.ok());
-  EXPECT_NE(missing.error().message.find("asset is unavailable"),
-            std::string::npos);
-  std::filesystem::remove_all(asset_root, ignored);
+  process_config.retained_package_root_fd = package_root_fd;
+  process_config.scene_asset_root_fd = scene_root_fd;
+  if (scene_root_fd.has_value()) {
+    process_config.scene_mesh_content_digest =
+        pinned_scene_mesh_digests(*scene_root_fd);
+  }
+  return process_config;
 }
 
 TEST(ProcessContainedCandidateClientTest,
-     RetainedWorkerKeepsDescriptorBoundSceneAssetsAcrossRootReplacement) {
+     RetainedWorkerResolvesWorkspaceRelativeSceneMeshUnderSceneAssetDescriptor) {
   auto fixture = make_fixture();
-  const auto root_parent =
-      std::filesystem::temp_directory_path() /
-      ("manyforge-worker-fd6-" + std::to_string(::getpid()));
-  const auto package_a = root_parent / "package-a";
-  const auto package_b = root_parent / "package-b";
-  const auto mesh = package_a / "examples/scene/meshes/fixture.obj";
-  std::error_code ignored;
-  std::filesystem::remove_all(root_parent, ignored);
-  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
-  {
-    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(stream.good());
-    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-    stream.flush();
-    ASSERT_TRUE(stream.good());
-  }
-  ASSERT_TRUE(std::filesystem::create_directory(package_b));
-  ScopedPackageRootDescriptor package_root(package_a);
-
-  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
-  process_config.require_retained_projection = true;
-  process_config.scene_asset_root = std::filesystem::path("/proc/self/fd/6");
-  process_config.retained_package_root_fd = 6;
+  SeparatedSceneRoots roots("worker-scene-root");
+  ASSERT_FALSE(std::filesystem::exists(roots.package_root / "examples"));
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDirectoryDescriptor scene_root(roots.scene_root);
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
-      std::move(process_config));
+      scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                        scene_root.get()));
+  const std::vector<Vector3DTO> scales{Vector3DTO{1.0, 1.0, 1.0},
+                                       Vector3DTO{1.0, 1.5, 1.15}};
 
   const auto selected = client.select_retained_projection(
-      projection(1U, 1U, false, "examples/scene/meshes/fixture.obj"));
+      scene_mesh_projection(1U, std::string(kSceneMeshUri), scales));
   ASSERT_TRUE(selected.ok()) << selected.error().message;
-
-  const auto displaced = root_parent / "package-a-displaced";
-  std::filesystem::rename(package_a, displaced);
-  std::filesystem::rename(package_b, package_a);
-  ASSERT_TRUE(std::filesystem::is_directory(package_a));
   const auto planned = client.compute(request(fixture));
   ASSERT_TRUE(planned.ok()) << planned.error().message;
-  std::filesystem::remove_all(root_parent, ignored);
+
+  // Rename the approved root and put a different tree at its old path. The
+  // descriptor still names the original directory and its exact bytes.
+  std::filesystem::rename(roots.scene_root, roots.parent / "scene-displaced");
+  write_file(roots.scene_root / kSceneMeshUri, kChangedTriangleObj);
+  const auto reselected = client.select_retained_projection(
+      scene_mesh_projection(2U, std::string(kSceneMeshUri), scales));
+  ASSERT_TRUE(reselected.ok()) << reselected.error().message;
+  const auto replanned = client.compute(request(fixture));
+  ASSERT_TRUE(replanned.ok()) << replanned.error().message;
 }
 
 TEST(ProcessContainedCandidateClientTest,
-     RetainedWorkerMapsAlternateSourceDescriptorToReservedWorkerFd) {
+     RetainedWorkerRefusesSceneMeshesOutsideTheSceneAssetDescriptor) {
   auto fixture = make_fixture();
-  const auto root_parent =
-      std::filesystem::temp_directory_path() /
-      ("manyforge-worker-fd-alt-" + std::to_string(::getpid()));
-  const auto package_a = root_parent / "package-a";
-  const auto package_b = root_parent / "package-b";
-  const auto mesh = package_a / "examples/scene/meshes/fixture.obj";
-  std::error_code ignored;
-  std::filesystem::remove_all(root_parent, ignored);
-  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
-  {
-    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(stream.good());
-    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-    stream.flush();
-    ASSERT_TRUE(stream.good());
-  }
-  ASSERT_TRUE(std::filesystem::create_directory(package_b));
-  ScopedPackageRootDescriptor package_root(package_a);
-  ScopedDuplicatePackageRootDescriptor alternate_root(6);
+  SeparatedSceneRoots roots("worker-scene-refusals");
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDirectoryDescriptor scene_root(roots.scene_root);
+  const auto refused = [](const Result<void> &result,
+                          std::string_view message) {
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"),
+              "native_planner_projection_selection_failed");
+    EXPECT_NE(result.error().message.find(message), std::string::npos)
+        << result.error().message;
+  };
 
-  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
-  process_config.require_retained_projection = true;
-  process_config.scene_asset_root = std::filesystem::path(
-      "/proc/self/fd/" + std::to_string(alternate_root.get()));
-  process_config.retained_package_root_fd = alternate_root.get();
+  {
+    // No scene descriptor: the existing fail-closed error, even though the
+    // package root descriptor is configured.
+    ProcessContainedRoboPlanCandidateClient unconfigured(
+        fixture.model, fixture.binding,
+        RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+        scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                          std::nullopt));
+    refused(unconfigured.select_retained_projection(scene_mesh_projection(
+                1U, std::string(kSceneMeshUri))),
+            "has no exact staged asset path");
+  }
+
+  const auto meshes = roots.scene_root / "examples/x/meshes";
+  std::filesystem::create_directory_symlink(meshes.parent_path(),
+                                            roots.scene_root / "examples/link");
+  std::filesystem::create_symlink(meshes / "a.obj", meshes / "leaf.obj");
+  write_file(roots.package_root / "examples/x/meshes/package-only.obj",
+             kTriangleObj);
+  {
+    const std::filesystem::path oversized = meshes / "oversized.obj";
+    write_file(oversized, kTriangleObj);
+    std::filesystem::resize_file(oversized,
+                                 collision::kMaximumSceneMeshBytes + 1U);
+  }
+
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
-      std::move(process_config));
+      scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                        scene_root.get()));
+  refused(client.select_retained_projection(
+              scene_mesh_projection(1U, "../scene/" + std::string(kSceneMeshUri))),
+          "asset path is invalid");
+  refused(client.select_retained_projection(
+              scene_mesh_projection(2U, "examples/link/meshes/a.obj")),
+          "scene mesh is unavailable");
+  refused(client.select_retained_projection(
+              scene_mesh_projection(3U, "examples/x/meshes/leaf.obj")),
+          "scene mesh is unavailable");
+  refused(client.select_retained_projection(
+              scene_mesh_projection(4U, "examples/x/meshes/oversized.obj")),
+          "byte bound");
+  refused(client.select_retained_projection(
+              scene_mesh_projection(5U, "examples/x/meshes/package-only.obj")),
+          "scene mesh is unavailable");
 
+  // The worker re-walks below its own descriptor: a leaf replaced by a
+  // symlink after the digest was pinned is still refused.
   const auto selected = client.select_retained_projection(
-      projection(1U, 1U, false, "examples/scene/meshes/fixture.obj"));
+      scene_mesh_projection(6U, std::string(kSceneMeshUri)));
   ASSERT_TRUE(selected.ok()) << selected.error().message;
+  ASSERT_TRUE(client.compute(request(fixture)).ok());
+  std::filesystem::rename(meshes / "a.obj", meshes / "a-original.obj");
+  std::filesystem::create_symlink(meshes / "a-original.obj", meshes / "a.obj");
+  ASSERT_TRUE(client
+                  .select_retained_projection(
+                      scene_mesh_projection(7U, std::string(kSceneMeshUri)))
+                  .ok());
+  const auto symlinked = client.compute(request(fixture));
+  ASSERT_FALSE(symlinked.ok());
+  EXPECT_EQ(symlinked.error().details.at("reason"),
+            "native_planner_worker_protocol_failure");
+}
 
-  const auto displaced = root_parent / "package-a-displaced";
-  std::filesystem::rename(package_a, displaced);
-  std::filesystem::rename(package_b, package_a);
-  ASSERT_TRUE(std::filesystem::is_directory(package_a));
+TEST(ProcessContainedCandidateClientTest,
+     RetainedWorkerRefusesSceneMeshContentChangedAfterFirstLoad) {
+  auto fixture = make_fixture();
+  SeparatedSceneRoots roots("worker-scene-content");
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDirectoryDescriptor scene_root(roots.scene_root);
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                        scene_root.get()));
+
+  ASSERT_TRUE(client
+                  .select_retained_projection(
+                      scene_mesh_projection(1U, std::string(kSceneMeshUri)))
+                  .ok());
+  const auto first = client.compute(request(fixture));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+
+  // Same path, different bytes: the worker generation for the next
+  // projection hashes what it loads and refuses the pinned-digest mismatch.
+  write_file(roots.scene_root / kSceneMeshUri, kChangedTriangleObj);
+  ASSERT_TRUE(client
+                  .select_retained_projection(
+                      scene_mesh_projection(2U, std::string(kSceneMeshUri)))
+                  .ok());
+  const auto changed = client.compute(request(fixture));
+  ASSERT_FALSE(changed.ok());
+  EXPECT_EQ(changed.error().details.at("reason"), "scene_mesh_content_changed");
+
+  // A digest source that itself observed changed bytes refuses selection
+  // with the same reason.
+  auto process_config = scene_mesh_config(
+      MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH, scene_root.get());
+  process_config.scene_mesh_content_digest = [](const std::string &) {
+    return Result<std::string>::Err(ErrorDTO{
+        "invalid_request", "scene_mesh_content_changed: bytes differ",
+        {{"reason", "scene_mesh_content_changed"}}});
+  };
+  ProcessContainedRoboPlanCandidateClient refusing(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+  const auto refused = refusing.select_retained_projection(
+      scene_mesh_projection(1U, std::string(kSceneMeshUri)));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "scene_mesh_content_changed");
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RetainedWorkerMapsAlternateSourceDescriptorsToReservedWorkerFds) {
+  auto fixture = make_fixture();
+  SeparatedSceneRoots roots("worker-fd-alt");
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDuplicatePackageRootDescriptor alternate_package_root(6);
+  ScopedDirectoryDescriptor opened_scene_root(roots.scene_root);
+  ScopedDuplicatePackageRootDescriptor alternate_scene_root(
+      opened_scene_root.get());
+
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                        alternate_scene_root.get(),
+                        alternate_package_root.get()));
+  ASSERT_TRUE(client
+                  .select_retained_projection(
+                      scene_mesh_projection(1U, std::string(kSceneMeshUri)))
+                  .ok());
+  std::filesystem::rename(roots.scene_root, roots.parent / "scene-displaced");
+  ASSERT_TRUE(std::filesystem::create_directory(roots.scene_root));
   const auto planned = client.compute(request(fixture));
   ASSERT_TRUE(planned.ok()) << planned.error().message;
-  std::filesystem::remove_all(root_parent, ignored);
 }
 
 TEST(ProcessContainedCandidateClientTest,
@@ -793,7 +999,7 @@ TEST(ProcessContainedCandidateClientTest,
   auto projected = replacement;
   projected.geometries.push_back(RoboPlanWorkerGeometryDTO{
       "projected", "base", BoxShapeDTO{{0.1, 0.1, 0.1}}, identity_pose(),
-      std::nullopt});
+      std::nullopt, std::nullopt});
   const auto rejected = client.replace_retained_model(projected);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),

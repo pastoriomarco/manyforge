@@ -3007,6 +3007,20 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         with pytest.raises(HeadlessClientError) as stale_scene:
             composer.preview_motion(stale_scene_intent)
         assert stale_scene.value.code == "scene_changed_during_validation"
+        # The host accepts an earlier revision of the same Scene (a status read
+        # that lags a scene edit or a before-planning latch) but never another
+        # Scene lineage. This standalone fixture has no Scene owner, so the
+        # earlier-revision acceptance is covered where a Scene can advance.
+        other_scene_intent = copy.deepcopy(direct_intent)
+        other_scene_intent["request_context"][
+            "request_id"
+        ] = "composer-direct-other-scene"
+        other_scene_intent["expected_scene_revision"]["scene_id"] = (
+            "sha256:" + "0" * 64
+        )
+        with pytest.raises(HeadlessClientError) as other_scene:
+            composer.preview_motion(other_scene_intent)
+        assert other_scene.value.code == "scene_changed_during_validation"
 
         direct_accepted = composer.execute(direct_intent)
         direct_operation_id = direct_accepted["accepted"]["operation_id"]

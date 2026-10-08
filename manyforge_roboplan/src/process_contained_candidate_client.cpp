@@ -32,6 +32,8 @@
 #include <thread>
 #include <utility>
 
+#include <manyforge_collision/scene_asset_root.hpp>
+
 #include "roboplan_worker_protocol.hpp"
 
 extern char **environ;
@@ -70,78 +72,63 @@ native_geometry_name(const std::string_view body_id,
   return result;
 }
 
-[[nodiscard]] std::filesystem::path
-resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
-                           const std::optional<std::filesystem::path>
-                               &scene_asset_root,
-                           const std::optional<int>
-                               &retained_package_root_fd,
-                           const std::string_view uri) {
+/// A relative scene mesh whose bytes differ from the collision model's
+/// pinned digest; reported with reason `scene_mesh_content_changed`.
+class SceneMeshContentChangedError final : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+};
+
+struct ProjectedMesh final {
+  std::optional<std::filesystem::path> resolved_mesh_path;
+  std::optional<std::string> scene_mesh_content_digest;
+};
+
+[[nodiscard]] ProjectedMesh
+project_mesh(const RoboPlanWorkerModelDTO &model,
+             const ProcessContainedCandidateClientConfig &config,
+             const std::string &uri) {
   constexpr std::string_view kAssetPrefix = "asset://";
-  const bool model_asset = uri.starts_with(kAssetPrefix);
-  if ((model_asset && model.package_paths.size() != 1U) ||
-      (!model_asset &&
-       (!scene_asset_root.has_value() || uri.find("://") != uri.npos))) {
+  if (!uri.starts_with(kAssetPrefix)) {
+    // Program scene mesh: resolved only inside the worker, below its own
+    // scene-asset root descriptor. Here only its syntax and the collision
+    // model's pinned digest are bound into the projection.
+    if (!config.scene_asset_root_fd.has_value() ||
+        uri.find("://") != uri.npos) {
+      throw std::invalid_argument(
+          "retained worker mesh has no exact staged asset path");
+    }
+    if (!collision::is_plain_relative_resource_path(uri)) {
+      throw std::invalid_argument("retained worker mesh asset path is invalid");
+    }
+    if (!config.scene_mesh_content_digest) {
+      throw std::invalid_argument(
+          "retained worker scene mesh has no content digest source");
+    }
+    auto digest = config.scene_mesh_content_digest(uri);
+    if (!digest.ok()) {
+      const auto reason = digest.error().details.find("reason");
+      if (reason != digest.error().details.end() &&
+          reason->second == collision::kSceneMeshContentChangedReason) {
+        throw SceneMeshContentChangedError(digest.error().message);
+      }
+      throw std::invalid_argument("retained worker scene mesh is unavailable: " +
+                                  digest.error().message);
+    }
+    return ProjectedMesh{std::nullopt, std::move(digest.value())};
+  }
+  const auto relative_text = uri.substr(kAssetPrefix.size());
+  if (model.package_paths.size() != 1U) {
     throw std::invalid_argument(
         "retained worker mesh has no exact staged asset path");
   }
-  const std::filesystem::path relative(
-      model_asset ? uri.substr(kAssetPrefix.size()) : uri);
-  if (relative.empty() || relative.is_absolute() ||
-      relative != relative.lexically_normal() ||
-      std::any_of(relative.begin(), relative.end(), [](const auto &part) {
-        return part.empty() || part == "." || part == "..";
-      })) {
+  if (!collision::is_plain_relative_resource_path(relative_text)) {
     throw std::invalid_argument("retained worker mesh asset path is invalid");
   }
-  if (!model_asset && retained_package_root_fd.has_value()) {
-    const int retained_root_fd = *retained_package_root_fd;
-    struct stat root_status {};
-    if (::fstat(retained_root_fd, &root_status) != 0 ||
-        !S_ISDIR(root_status.st_mode)) {
-      throw std::invalid_argument(
-          "retained worker descriptor root is unavailable");
-    }
-    int current = ::fcntl(retained_root_fd, F_DUPFD_CLOEXEC, 9);
-    if (current < 0) {
-      throw std::invalid_argument(
-          "retained worker descriptor root could not be duplicated");
-    }
-    struct Close final {
-      int descriptor;
-      ~Close() {
-        if (descriptor >= 0) {
-          static_cast<void>(::close(descriptor));
-        }
-      }
-    } close_current{current};
-    for (auto part = relative.begin(); part != relative.end(); ++part) {
-      const bool last = std::next(part) == relative.end();
-      const int next = ::openat(
-          current, part->c_str(),
-          O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
-              (last ? 0 : O_DIRECTORY));
-      if (next < 0) {
-        throw std::invalid_argument(
-            "retained worker mesh is unavailable below descriptor root");
-      }
-      static_cast<void>(::close(current));
-      current = next;
-      close_current.descriptor = current;
-    }
-    struct stat selected_status {};
-    if (::fstat(current, &selected_status) != 0 ||
-        !S_ISREG(selected_status.st_mode)) {
-      throw std::invalid_argument("retained worker mesh is not a regular file");
-    }
-    // The source descriptor can be any inherited directory FD in the managed
-    // host. start_worker maps it to FD 6 in the worker process.
-    return std::filesystem::path("/proc/self/fd/6") / relative;
-  }
+  const std::filesystem::path relative(relative_text);
   std::error_code filesystem_error;
-  const auto root = std::filesystem::canonical(
-      model_asset ? model.package_paths.front() : *scene_asset_root,
-      filesystem_error);
+  const auto root = std::filesystem::canonical(model.package_paths.front(),
+                                               filesystem_error);
   if (filesystem_error || !std::filesystem::is_directory(root)) {
     throw std::invalid_argument(
         "retained worker package root cannot be resolved");
@@ -158,7 +145,7 @@ resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
     throw std::invalid_argument(
         "retained worker mesh escapes its staged package root");
   }
-  return selected;
+  return ProjectedMesh{selected, std::nullopt};
 }
 
 [[nodiscard]] core::CollisionShapeDTO
@@ -199,9 +186,7 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
 
 [[nodiscard]] RoboPlanWorkerModelDTO
 project_worker_model(const RoboPlanWorkerModelDTO &base,
-                     const std::optional<std::filesystem::path>
-                         &scene_asset_root,
-                     const std::optional<int> &retained_package_root_fd,
+                     const ProcessContainedCandidateClientConfig &config,
                      const RoboPlanCandidateProjectionDTO &projection) {
   if (!projection.projection_binding.valid() || !projection.world ||
       !projection.policy) {
@@ -224,18 +209,17 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
     for (std::size_t index = 0U; index < body.geometries.size(); ++index) {
       const auto &geometry = body.geometries[index];
       auto shape = projected_shape(geometry);
-      std::optional<std::filesystem::path> mesh_path;
+      ProjectedMesh mesh_source;
       if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
-        mesh_path = resolve_retained_mesh_path(model, scene_asset_root,
-                                               retained_package_root_fd,
-                                               mesh->resource_uri);
+        mesh_source = project_mesh(model, config, mesh->resource_uri);
       }
       const auto name = native_geometry_name(body.body_id, index);
       names.push_back(name);
       model.geometries.push_back(RoboPlanWorkerGeometryDTO{
           name, body.frame_id, std::move(shape),
           core::multiply_poses(body.pose, geometry.local_pose),
-          std::move(mesh_path)});
+          std::move(mesh_source.resolved_mesh_path),
+          std::move(mesh_source.scene_mesh_content_digest)});
       if (model.geometries.size() > kMaximumProjectedWorkerGeometries) {
         throw std::invalid_argument(
             "retained worker projection exceeds the geometry bound");
@@ -317,6 +301,7 @@ enum class RequestFailureKind {
   kTimeout,
   kTransport,
   kProtocol,
+  kSceneMeshContentChanged,
 };
 
 class RequestFailure final : public std::runtime_error {
@@ -629,6 +614,12 @@ request_failure_error(const RequestFailure &failure, bool ik) {
                  "RoboPlan worker became unavailable",
                  ik ? "native_ik_worker_unavailable"
                     : "native_planner_worker_unavailable");
+  case RequestFailureKind::kSceneMeshContentChanged:
+    return error(ik ? core::ErrorCode::kIkFailed
+                    : core::ErrorCode::kPlanningFailed,
+                 "Scene mesh bytes differ from the bytes the collision model "
+                 "loaded",
+                 std::string(collision::kSceneMeshContentChangedReason));
   }
   return error(core::ErrorCode::kInternalError, "RoboPlan worker failed",
                "native_worker_failure");
@@ -700,11 +691,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
     if (config.retained_package_root_fd.has_value()) {
       const int retained_root_fd = *config.retained_package_root_fd;
-      const std::string expected_root =
-          "/proc/self/fd/" + std::to_string(retained_root_fd);
-      if (retained_root_fd < 6 || retained_root_fd == 7 ||
-          !config.scene_asset_root.has_value() ||
-          config.scene_asset_root->generic_string() != expected_root) {
+      if (retained_root_fd < 6 || retained_root_fd == 7) {
         throw std::invalid_argument(
             "RoboPlan retained package descriptor must name its exact "
             "inherited root");
@@ -718,19 +705,20 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             "RoboPlan retained package descriptor is not inherited");
       }
     }
-    if (config.scene_asset_root.has_value()) {
-      std::error_code filesystem_error;
-      if (config.retained_package_root_fd.has_value()) {
-        return;
-      }
-      const auto canonical = std::filesystem::canonical(
-          *config.scene_asset_root, filesystem_error);
-      if (filesystem_error || !canonical.is_absolute() ||
-          !std::filesystem::is_directory(canonical)) {
+    if (config.scene_asset_root_fd.has_value()) {
+      // The descriptor is duplicated (close-on-exec) at each spawn and mapped
+      // to the worker's reserved FD, so it must not alias a descriptor that
+      // spawn itself rewrites or the separate retained package root.
+      const int scene_root_fd = *config.scene_asset_root_fd;
+      struct stat status {};
+      if (scene_root_fd <= worker_protocol::kProtocolDescriptor ||
+          (config.retained_package_root_fd.has_value() &&
+           (scene_root_fd == *config.retained_package_root_fd ||
+            scene_root_fd == 6)) ||
+          ::fstat(scene_root_fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
         throw std::invalid_argument(
-            "RoboPlan process-contained scene asset root is invalid");
+            "RoboPlan scene-asset root descriptor is invalid");
       }
-      config.scene_asset_root = canonical;
     }
   }
 
@@ -755,9 +743,13 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
     RoboPlanWorkerModelDTO projected;
     try {
-      projected = project_worker_model(source, config.scene_asset_root,
-                                       config.retained_package_root_fd,
-                                       projection);
+      projected = project_worker_model(source, config, projection);
+    } catch (const SceneMeshContentChangedError &exception) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan worker projection failed: " +
+                    std::string(exception.what()),
+                std::string(collision::kSceneMeshContentChangedReason)));
     } catch (const std::exception &exception) {
       return core::Result<void>::Err(
           error(core::ErrorCode::kInvalidRequest,
@@ -920,6 +912,24 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             "could not preserve the retained package descriptor for worker");
       }
     }
+    // The scene-asset root is mapped last from a close-on-exec copy above
+    // every rewritten descriptor, so no earlier action can clobber it.
+    UniqueFd scene_root_copy;
+    if (config.scene_asset_root_fd.has_value()) {
+      const int source_scene_fd = *config.scene_asset_root_fd;
+      const int scene_target = worker_protocol::kSceneAssetRootDescriptor;
+      scene_root_copy.reset(
+          ::fcntl(source_scene_fd, F_DUPFD_CLOEXEC, scene_target + 1));
+      if (!scene_root_copy ||
+          (source_scene_fd != scene_target &&
+           ::posix_spawn_file_actions_addclose(&actions, source_scene_fd) !=
+               0) ||
+          ::posix_spawn_file_actions_adddup2(&actions, scene_root_copy.get(),
+                                             scene_target) != 0) {
+        throw std::runtime_error(
+            "could not preserve the scene-asset root descriptor for worker");
+      }
+    }
 
     const std::string executable = config.worker_executable.string();
     const std::string parent_pid = std::to_string(::getpid());
@@ -935,6 +945,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                                std::string(std::strerror(spawned)));
     }
     child_socket.reset();
+    scene_root_copy.reset();
 
     try {
       auto signal = std::make_shared<ProcessSignalHandle>(open_pidfd(child));
@@ -954,8 +965,11 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
           receive_frame(worker->socket.get(), config.maximum_response_bytes,
                         request, deadline);
       if (ready.type == MessageType::kProtocolError) {
-        static_cast<void>(
-            worker_protocol::decode_protocol_error(ready.payload));
+        if (worker_protocol::decode_protocol_error(ready.payload) ==
+            worker_protocol::kSceneMeshContentChangedDetail) {
+          throw RequestFailure(RequestFailureKind::kSceneMeshContentChanged,
+                               "worker scene mesh content changed");
+        }
         throw RequestFailure(RequestFailureKind::kProtocol,
                              "worker rejected initialization");
       }

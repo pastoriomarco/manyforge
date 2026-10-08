@@ -237,10 +237,20 @@ native_execution_configuration(std::string_view controllable_component_id,
   return CanonicalValue(std::move(configuration));
 }
 
-[[nodiscard]] inline CanonicalValue ros2_control_execution_configuration() {
+[[nodiscard]] inline CanonicalValue ros2_control_execution_configuration(
+    std::string_view motion_limit_target_id = kLite6ArmTargetId) {
   return CanonicalValue(CanonicalValue::Object{
       {"mode", CanonicalValue("commanded_sim")},
       {"isaac_profile", CanonicalValue("lite6")},
+      {"motion_target_limits",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(std::string(kLite6ControllableComponentId))},
+               {"command_target_id",
+                CanonicalValue(std::string(motion_limit_target_id))},
+               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+           })})},
       {"planner_rng_seed", CanonicalValue(12345.0)},
       {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{
                                           CanonicalValue(0.0),
@@ -1967,7 +1977,8 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
            std::string_view containment_granularity = "resource",
            bool gripper_only = false,
            std::optional<double> initial_joint1_position_rad = std::nullopt,
-           bool shared_native_domain = false) {
+           bool shared_native_domain = false,
+           std::string_view ros_motion_limit_target_id = kLite6ArmTargetId) {
   const bool aggregate = catalog.gripper_capability.has_value();
   if (gripper_only && (!aggregate || instance_count != 1U)) {
     throw std::logic_error(
@@ -2050,12 +2061,13 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
                  : detail::native_execution_runtime_profile_revision())},
         {"dependency_runtime_unit_ids",
          CanonicalValue(CanonicalValue::Array{})},
-        {"configuration", ros2_control_execution
-                              ? ros2_control_execution_configuration()
-                              : native_execution_configuration(
-                                    component_id, aggregate,
-                                    catalog.gripper_confirmation.has_value(),
-                                    !gripper_only, initial_joint1_position_rad)},
+        {"configuration",
+         ros2_control_execution
+             ? ros2_control_execution_configuration(ros_motion_limit_target_id)
+             : native_execution_configuration(
+                   component_id, aggregate,
+                   catalog.gripper_confirmation.has_value(), !gripper_only,
+                   initial_joint1_position_rad)},
     });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
@@ -2685,7 +2697,8 @@ make_lite6_controllable_retention_fixture(
     const std::vector<core::StopTimingParametersDTO> &stop_timings = {},
     bool gripper_only = false,
     std::optional<double> initial_joint1_position_rad = std::nullopt,
-    bool shared_native_domain = false) {
+    bool shared_native_domain = false,
+    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (gripper_only &&
       (!aggregate_gripper || !native_motion || !stoppable ||
@@ -2749,7 +2762,8 @@ make_lite6_controllable_retention_fixture(
   }
   const auto graph = fixture_detail::make_graph(
       structural, catalog, instance_count, cell_id, containment_granularity,
-      gripper_only, initial_joint1_position_rad, shared_native_domain);
+      gripper_only, initial_joint1_position_rad, shared_native_domain,
+      ros_motion_limit_target_id);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled
@@ -3029,10 +3043,13 @@ make_lite6_native_motion_retention_fixture() {
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_ros2_control_motion_retention_fixture(bool stoppable = false) {
+make_lite6_ros2_control_motion_retention_fixture(
+    bool stoppable = false,
+    std::string_view motion_limit_target_id = kLite6ArmTargetId) {
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, stoppable, "resource", false,
-      {}, {}, true);
+      {}, {}, true, false, {}, false, std::nullopt, false,
+      motion_limit_target_id);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

@@ -2793,7 +2793,7 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
       : ros2_control_execution
           ? detail::ros2_control_execution_runtime_retrieval_contract_revision()
           : detail::reference_runtime_retrieval_contract_revision(),
-      native_execution
+      (native_execution || ros2_control_execution)
           ? std::optional<core::ManagerLivenessPolicyDTO>(
                 native_execution_runtime_contract::manager_liveness_policy())
           : std::nullopt);

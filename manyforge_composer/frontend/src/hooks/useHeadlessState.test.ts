@@ -10,6 +10,8 @@ import {
   executionCommandPayload,
   getHeadlessStateQualificationSnapshot,
   parseExecutionObservationFrame,
+  sameShellPublication,
+  sameViewerIdentity,
   sameViewerProjection,
   useHeadlessStateSource,
   useViewerHeadlessState,
@@ -221,6 +223,120 @@ describe('Headless owner-frame admission', () => {
     const next = structuredClone(current);
     Object.assign(next.runtime.sections.manager.payload!, change);
     expect(sameViewerProjection(current, next)).toBe(false);
+  });
+
+  it('compares the Scene runtime by what it presents, not by its generation', () => {
+    const poseSource = (overrides: Record<string, unknown> = {}) => ({
+      object_id: 'part', policy_id: 'viewer.measured_object', source_id: 'camera',
+      source_epoch: 'camera.1', source_epoch_order: 1, source_sequence: 10,
+      observed_at_ns: '100', expires_at_ns: '200', quality: 'good', fresh: true,
+      eligible: true, buffered: false,
+      payload: {
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind: 'simulation_entity_pose',
+        source: { entity: 'part' },
+        pose: {
+          frame_id: 'cell', frame_kind: 'cell_frame', position_m: [1, 2, 3],
+          orientation_xyzw: [0, 0, 0, 1], source_stamp_ns: '90',
+        },
+      },
+      ...overrides,
+    });
+    const withRuntime = (generation: number, sources: unknown[], updatedAt = '1') => {
+      const value = state('receiver.epoch.1', 2);
+      value.runtime.sections.sceneRuntime.sourceGeneration = generation;
+      value.runtime.sections.sceneRuntime.payload = {
+        api_version: 'manyforge.scene_runtime_source.v1',
+        cell_id: 'cell',
+        state: {
+          state: 'open', updated_at_ns: updatedAt, counters: { samples: generation },
+          pose_sources: sources,
+        },
+      };
+      return value;
+    };
+    const current = withRuntime(1, [poseSource()]);
+    // A new pose sample with the same applied pose: delivery diagnostics only.
+    expect(sameViewerProjection(current, withRuntime(2, [poseSource({
+      source_sequence: 11, observed_at_ns: '110', expires_at_ns: '210',
+    })], '2'))).toBe(true);
+    // A freshness flip selects measured vs neutral presentation: publish.
+    expect(sameViewerProjection(current, withRuntime(2, [
+      poseSource({ fresh: false }),
+    ]))).toBe(false);
+    expect(sameViewerProjection(current, withRuntime(2, [
+      poseSource({ quality: 'unknown' }),
+    ]))).toBe(false);
+    // A changed applied pose value: publish.
+    const moved = poseSource();
+    (moved.payload.pose as { position_m: number[] }).position_m = [1, 2, 4];
+    expect(sameViewerProjection(current, withRuntime(2, [moved]))).toBe(false);
+    // Availability of the source and its generation still publish.
+    const unavailable = withRuntime(1, [poseSource()]);
+    unavailable.runtime.sections.sceneRuntime.freshness = 'stale';
+    expect(sameViewerProjection(current, unavailable)).toBe(false);
+    expect(sameViewerProjection(current, withRuntime(1, []))).toBe(false);
+  });
+
+  it('skips shell publication only for delivery diagnostics', () => {
+    const current = state('receiver.epoch.1', 2);
+    const diagnostic = structuredClone(current);
+    diagnostic.snapshotSequence += 1;
+    diagnostic.runtime.projectionGeneration += 1;
+    diagnostic.runtime.sections.manager.receiverAgeNs = 99;
+    diagnostic.runtime.sections.manager.sourceGeneration = 7;
+    diagnostic.runtime.sections.sceneRuntime.sourceGeneration = 7;
+    // Unchanged domains keep their identity in a merged delta.
+    for (const name of [
+      'alarms', 'componentOverview', 'programCycle', 'authoringAdmission',
+      'authoringWorkspace', 'executionControlStatus',
+    ] as const) {
+      (diagnostic as unknown as Record<string, unknown>)[name] = current[name];
+    }
+    expect(sameShellPublication(current, diagnostic)).toBe(true);
+
+    const visible = [
+      (next: ComposerHeadlessState) => { next.runtime.sections.manager.freshness = 'stale'; },
+      (next: ComposerHeadlessState) => { next.runtime.sections.logicalScene.sourceGeneration = 9; },
+      (next: ComposerHeadlessState) => { next.runtime.sections.sceneRuntime.sourceGeneration = null; },
+      (next: ComposerHeadlessState) => { next.runtime.reasons = ['manager_unavailable']; },
+      (next: ComposerHeadlessState) => { next.alarms = { ...next.alarms, liveCount: 1 }; },
+      (next: ComposerHeadlessState) => {
+        next.authoringAdmission = { ...next.authoringAdmission, admissionGeneration: 2 };
+      },
+    ];
+    for (const change of visible) {
+      const next = { ...diagnostic, runtime: structuredClone(diagnostic.runtime) };
+      change(next);
+      expect(sameShellPublication(current, next)).toBe(false);
+    }
+  });
+
+  it('keeps a retained viewer frame only while its owner and model identity holds', () => {
+    const current = state('receiver.epoch.1', 2);
+    const later = structuredClone(current);
+    later.runtime.projectionGeneration += 3;
+    later.runtime.sections.logicalScene.sourceGeneration = 5;
+    expect(sameViewerIdentity(current, later)).toBe(true);
+    for (const change of [
+      (next: ComposerHeadlessState) => { next.receiverEpoch = 'receiver.epoch.2'; },
+      (next: ComposerHeadlessState) => { next.runtime.projectionOwnerEpoch = 'other'; },
+      (next: ComposerHeadlessState) => {
+        next.runtime.sections.logicalScene.sourceOwnerEpoch = 'scene.epoch.2';
+      },
+      (next: ComposerHeadlessState) => {
+        next.runtime.sections.manager.sourceOwnerEpoch = 'manager.epoch.2';
+      },
+      (next: ComposerHeadlessState) => {
+        next.runtime.sections.manager.payload = {
+          active: { retained_bundle_id: 'bundle.2', graph_revision: 'graph.2' },
+        };
+      },
+    ]) {
+      const next = structuredClone(current);
+      change(next);
+      expect(sameViewerIdentity(current, next)).toBe(false);
+    }
   });
 
   it('invalidates the viewer when Manager evidence becomes unavailable', () => {
@@ -1639,6 +1755,157 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('freezes the viewer frame while delayed or stale until identity changes', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    let stateSequence = 1;
+    const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: String(++stateSequence),
+      received_client_sequence: '2',
+      event_class: 'cold',
+      control: {
+        receiver_incarnation: 'headless.receiver.1',
+        semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1,
+        freshness: controlFreshness(1),
+      },
+      shell: { complete: false, runtime },
+    });
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    animationFrames.shift()!(16);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    const coherent = source.getViewerSnapshot().snapshot;
+
+    vi.advanceTimersByTime(500);
+    expect(source.getViewerSnapshot()).toMatchObject({
+      transportStatus: 'delayed', snapshot: coherent,
+    });
+    // An unverified Scene update in the same identity does not move the
+    // retained frame, neither on arrival nor at the stale classification.
+    const sceneUpdate = wireState(1).runtime as Record<string, unknown>;
+    const sections = sceneUpdate.sections as Record<string, Record<string, unknown>>;
+    sections.logical_scene = { ...sections.logical_scene, source_generation: 2 };
+    runtimeDelta(sceneUpdate);
+    expect(animationFrames).toHaveLength(0);
+    vi.advanceTimersByTime(500);
+    expect(source.getViewerSnapshot()).toMatchObject({
+      transportStatus: 'stale', snapshot: coherent,
+    });
+    expect(source.getShellSnapshot().snapshot?.runtime.sections.logicalScene.sourceGeneration)
+      .toBe(2);
+
+    // A new owner identity crosses the barrier: the frozen frame is dropped.
+    const ownerChange = structuredClone(sceneUpdate);
+    (ownerChange.sections as Record<string, Record<string, unknown>>).manager.source_owner_epoch =
+      'source.epoch.2';
+    runtimeDelta(ownerChange);
+    expect(animationFrames).toHaveLength(1);
+    animationFrames.shift()!(32);
+    expect(source.getViewerSnapshot().snapshot?.runtime.sections.manager.sourceOwnerEpoch)
+      .toBe('source.epoch.2');
+    source.dispose();
+  });
+
+  it('does not publish the shell for deltas that change only delivery diagnostics', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static shell: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('window', { location: { href: 'http://composer.test/' } });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    let stateSequence = 1;
+    const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: String(++stateSequence),
+      received_client_sequence: '2',
+      event_class: 'cold',
+      control: {
+        receiver_incarnation: 'headless.receiver.1',
+        semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1,
+        freshness: controlFreshness(1),
+      },
+      shell: { complete: false, runtime },
+    });
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    const shellChanged = vi.fn();
+    source.subscribeShell(shellChanged);
+    const published = source.getShellSnapshot();
+
+    const diagnosticRuntime = (projectionGeneration: number, ageNs: number) => {
+      const runtime = wireState(1).runtime as Record<string, unknown>;
+      runtime.projection_generation = projectionGeneration;
+      const sections = runtime.sections as Record<string, Record<string, unknown>>;
+      sections.manager = {
+        ...sections.manager, source_generation: projectionGeneration, receiver_age_ns: ageNs,
+      };
+      sections.scene_runtime = {
+        ...sections.scene_runtime, source_generation: projectionGeneration, receiver_age_ns: ageNs,
+      };
+      return runtime;
+    };
+    runtimeDelta(diagnosticRuntime(2, 5));
+    runtimeDelta(diagnosticRuntime(3, 9));
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(shellChanged).not.toHaveBeenCalled();
+    expect(source.getShellSnapshot()).toBe(published);
+
+    // A visible change still publishes, carrying the newest data.
+    const visible = diagnosticRuntime(4, 11);
+    (visible.sections as Record<string, Record<string, unknown>>).manager.freshness = 'stale';
+    runtimeDelta(visible);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(shellChanged).toHaveBeenCalledTimes(1);
+    expect(source.getShellSnapshot().snapshot?.runtime.projectionGeneration).toBe(4);
+    source.dispose();
   });
 
   it('echoes a newer semantic heartbeat while its replaceable projection catches up', () => {

@@ -49,6 +49,7 @@ import {
   candidateGripperPresentation,
   candidateToolPresentation,
   createExecutionRobotPresentationReader,
+  frozenMeasuredRobotPresentationReader,
   executionRobotPresentation,
   runtimeScenePresentation,
   candidateObservationEpoch,
@@ -1573,11 +1574,18 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     programController.state.transitionStatus,
     sourceModelState,
   ]);
+  // A retained model stays mounted (marked not current) on the same
+  // manifest object, so ready <-> retained changes do not rebuild it.
+  const modelRetained = modelPresentation.status === 'retained';
+  const presentedManifest = modelPresentation.status === 'ready'
+    || modelPresentation.status === 'retained'
+    ? modelPresentation.manifest
+    : null;
   const viewerManifest = useMemo<StructuralResourceState<SceneUrdfManifest>>(
-    () => modelPresentation.status === 'ready'
-      ? { status: 'ready', data: modelPresentation.manifest }
+    () => presentedManifest !== null
+      ? { status: 'ready', data: presentedManifest }
       : { status: 'loading' },
-    [modelPresentation],
+    [presentedManifest],
   );
   const retryViewerModel = useCallback(() => {
     onRetry();
@@ -1617,9 +1625,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       ));
     }
   }, [facts, productIdentity, resetPresentationHeld]);
-  const readyManifest = modelPresentation.status === 'ready'
-    ? modelPresentation.manifest
-    : null;
+  const readyManifest = presentedManifest;
   const objects = presentationFacts?.logicalScene.snapshot?.objects
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
   const ownerSceneKnown = presentationFacts !== null;
@@ -1695,15 +1701,19 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     readyManifest,
     motionDescriptor,
   ), [motionDescriptor, presentationFacts, readyManifest, sourceValue]);
-  const executionObservationPresentation = useMemo(
-    () => createExecutionRobotPresentationReader(
+  const executionObservationPresentation = useMemo(() => {
+    const live = createExecutionRobotPresentationReader(
       source,
       sourceValue,
       readyManifest,
       motionDescriptor,
-    ),
-    [motionDescriptor, readyManifest, source, sourceValue],
-  );
+    );
+    // A retained robot is not verified: it keeps its last coherent pose
+    // instead of following samples while the control transport is unverified.
+    return modelRetained
+      ? frozenMeasuredRobotPresentationReader(live.readMeasuredRobotPresentation())
+      : live;
+  }, [modelRetained, motionDescriptor, readyManifest, source, sourceValue]);
   // The measured robot pose comes only from the live observation stream. The
   // control-state copy of observed joints is refreshed only at control changes
   // and motion ends, so it can be older than the robot (and than a pose

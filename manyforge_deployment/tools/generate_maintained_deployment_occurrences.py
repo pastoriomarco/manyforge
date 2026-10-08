@@ -52,7 +52,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:4ff0c6d3d2e4cf9eae515f0ba3343404e3f30939a08f886aadfe26fa57fe173d"
+    "sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -2165,9 +2165,13 @@ def graph_and_applicability(
     occurrence = deployment["component_occurrence_id"]
     family_id = family["model_family_id"]
     ros2_control = "ros2_control_runtime" in runtime_restoration_profile
-    runtime_configuration = runtime_restoration_profile[
+    runtime_configuration = copy.deepcopy(runtime_restoration_profile[
         "ros2_control_runtime" if ros2_control else "native_runtime"
-    ]
+    ])
+    if ros2_control:
+        # The source cap is explicit demo policy; bind it to this occurrence.
+        for limit in runtime_configuration["motion_target_limits"]:
+            limit["controllable_component_id"] = occurrence
     key_prefix = "ros2_control:" if ros2_control else ""
     component_ref = refs[
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"

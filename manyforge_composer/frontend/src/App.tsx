@@ -38,7 +38,9 @@ import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
 import {
+  managerActivationSettlementKey,
   nodeEnvironmentRefreshKey,
+  refreshOnManagerActivationSettled,
   refreshViewerModelsOnManagerChange,
   viewerModelRefreshKey,
 } from './state/nodeEnvironmentRefresh';
@@ -236,6 +238,7 @@ export default function App() {
   );
   const nodeEnvironmentWakeKey = useRef<string | null>(null);
   const viewerModelWakeKey = useRef<string | null>(null);
+  const managerActivationWakeKey = useRef<string | null>(null);
   useEffect(() => {
     if (health.status === 'ready') {
       structuralRetryAttempt.current = 0;
@@ -291,6 +294,22 @@ export default function App() {
     nodeEnvironmentWakeKey.current = key;
     retryNodeEnvironment();
   }, [headlessEnabled, headlessSnapshot, retryNodeEnvironment]);
+  // The catalog and the Deployment workspace (its Applied/runAdmission half)
+  // depend on the active applied selection, which settles after an accepted
+  // Load/Apply from any client. Re-read both once when it settles.
+  const refreshDeploymentWorkspace = deploymentController.refresh;
+  useEffect(() => {
+    if (!headlessEnabled) {
+      managerActivationWakeKey.current = null;
+      return;
+    }
+    if (headlessSnapshot === null) return;
+    managerActivationWakeKey.current = refreshOnManagerActivationSettled(
+      managerActivationWakeKey.current,
+      managerActivationSettlementKey(headlessSnapshot),
+      [retryCatalog, refreshDeploymentWorkspace],
+    );
+  }, [headlessEnabled, headlessSnapshot, refreshDeploymentWorkspace, retryCatalog]);
   useEffect(() => {
     if (!headlessEnabled) {
       viewerModelWakeKey.current = null;

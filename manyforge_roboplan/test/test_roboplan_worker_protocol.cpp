@@ -113,18 +113,27 @@ TEST(RoboPlanWorkerProtocolTest,
               std::vector<double>{3.0}}},
           {RoboPlanWorkerGeometryDTO{
                "box-a", "cell-frame", BoxShapeDTO{{1.0, 2.0, 3.0}},
-               {{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
+               {{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt, std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "sphere-a", "cell-frame", SphereShapeDTO{0.25},
-               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
+               std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "cylinder-a", "cell-frame", CylinderShapeDTO{0.2, 0.7},
-               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
+               std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "mesh-a", "cell-frame",
                MeshShapeDTO{"asset://mesh-a", {1.0, 1.5, 2.0}},
                {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
-               "/resources/mesh-a.stl"}},
+               "/resources/mesh-a.stl", std::nullopt},
+           RoboPlanWorkerGeometryDTO{
+               "scene-mesh-a", "cell-frame",
+               MeshShapeDTO{"examples/x/meshes/a.obj", {1.0, 1.5, 1.15}},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
+               std::string("sha256:"
+                           "2222222222222222222222222222222222222222222222222"
+                           "222222222222222")}},
           {{"body-a", "body-b"}, {"body-c", "body-d"}}},
       binding(), RoboPlanCandidateComputerConfig{0x1234U, 4096U, 0.02}};
 
@@ -137,7 +146,7 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded.model.joint_limits, input.model.joint_limits);
   EXPECT_EQ(decoded.model.allowed_collision_pairs,
             input.model.allowed_collision_pairs);
-  ASSERT_EQ(decoded.model.geometries.size(), 4U);
+  ASSERT_EQ(decoded.model.geometries.size(), 5U);
   EXPECT_EQ(std::get<BoxShapeDTO>(decoded.model.geometries[0].shape)
                 .dimensions_m,
             Vector3DTO(1.0, 2.0, 3.0));
@@ -152,6 +161,10 @@ TEST(RoboPlanWorkerProtocolTest,
             "asset://mesh-a");
   EXPECT_EQ(decoded.model.geometries[3].resolved_mesh_path,
             std::filesystem::path("/resources/mesh-a.stl"));
+  EXPECT_FALSE(decoded.model.geometries[3].scene_mesh_content_digest);
+  EXPECT_FALSE(decoded.model.geometries[4].resolved_mesh_path);
+  EXPECT_EQ(decoded.model.geometries[4].scene_mesh_content_digest,
+            input.model.geometries[4].scene_mesh_content_digest);
   EXPECT_EQ(decoded.binding, input.binding);
   EXPECT_EQ(decoded.candidate_config.rng_seed,
             input.candidate_config.rng_seed);

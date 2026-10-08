@@ -5411,6 +5411,41 @@ FailedFinalizeResult(const ProjectionBootstrapFinalizeDTO &request,
   return result;
 }
 
+/// Process-local latest accepted provider freshness confirmation for one
+/// object. It applies only while the retained bundle, graph and the committed
+/// object snapshot it was confirmed against are all unchanged; request-epoch
+/// rotation alone does not affect it.
+struct ProviderFreshnessRecord final {
+  core::RetainedBundleId retained_bundle_id;
+  GraphRevision graph_revision;
+  SceneObjectSnapshotDTO confirmed_against;
+  core::SceneObjectProviderEvidenceDTO accepted;
+};
+
+[[nodiscard]] bool
+SameProviderOrigin(const core::SceneObjectProviderEvidenceDTO &left,
+                   const core::SceneObjectProviderEvidenceDTO &right) noexcept {
+  return left.provider_instance_id == right.provider_instance_id &&
+         left.provider_manifest_id == right.provider_manifest_id &&
+         left.provider_manifest_revision == right.provider_manifest_revision &&
+         left.provider_source_epoch == right.provider_source_epoch;
+}
+
+[[nodiscard]] const SceneObjectSnapshotDTO *
+FindSceneObject(const LogicalSceneSnapshotDTO &snapshot,
+                const core::SceneResourceId &scene_resource_id) {
+  const auto found = std::lower_bound(
+      snapshot.objects.begin(), snapshot.objects.end(), scene_resource_id,
+      [](const SceneObjectSnapshotDTO &object,
+         const core::SceneResourceId &id) {
+        return object.scene_resource_id < id;
+      });
+  return found == snapshot.objects.end() ||
+                 found->scene_resource_id != scene_resource_id
+             ? nullptr
+             : &*found;
+}
+
 } // namespace
 
 std::string_view
@@ -5732,6 +5767,8 @@ public:
     std::lock_guard operation_lock(maintenance_operation_mutex_);
     std::lock_guard lock(mutex_);
     InvalidateSceneCommitState();
+    provider_freshness_records_.clear();
+    provider_sequence_watermarks_.clear();
     auto lifecycle_lock = sqlite_lifecycle_internal::
         AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
     if (database_ == nullptr) {
@@ -5825,6 +5862,53 @@ public:
   mutable std::mutex mutex_;
   sqlite3 *database_{};
   mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
+  /// Drops freshness records and sequence watermarks of objects that no
+  /// longer exist in `snapshot`.
+  void PruneProviderFreshnessState(const LogicalSceneSnapshotDTO &snapshot) {
+    const auto absent = [&](const auto &entry) {
+      return FindSceneObject(snapshot, entry.first) == nullptr;
+    };
+    std::erase_if(provider_freshness_records_, absent);
+    std::erase_if(provider_sequence_watermarks_, absent);
+  }
+
+  /// Raises the object's same-origin sequence high-water mark, or resets it
+  /// to `evidence` when the provider origin changed.
+  void AdvanceProviderSequenceWatermark(
+      const SceneResourceId &scene_resource_id,
+      const core::SceneObjectProviderEvidenceDTO &evidence) {
+    const auto [watermark, inserted] =
+        provider_sequence_watermarks_.try_emplace(scene_resource_id, evidence);
+    if (!inserted &&
+        (!SameProviderOrigin(watermark->second, evidence) ||
+         evidence.provider_source_sequence >
+             watermark->second.provider_source_sequence)) {
+      watermark->second = evidence;
+    }
+  }
+
+  /// The same-origin sequence high-water mark for `evidence`, if any.
+  [[nodiscard]] std::optional<std::uint64_t> ProviderSequenceWatermark(
+      const SceneResourceId &scene_resource_id,
+      const core::SceneObjectProviderEvidenceDTO &evidence) const {
+    const auto watermark = provider_sequence_watermarks_.find(scene_resource_id);
+    if (watermark == provider_sequence_watermarks_.end() ||
+        !SameProviderOrigin(watermark->second, evidence)) {
+      return std::nullopt;
+    }
+    return watermark->second.provider_source_sequence;
+  }
+
+  /// Never persisted: owner reconstruction starts with no confirmations.
+  std::map<SceneResourceId, ProviderFreshnessRecord>
+      provider_freshness_records_;
+  /// Per-object (provider origin, highest accepted provider source sequence)
+  /// over committed evidence and confirmations. Only the origin fields and
+  /// the sequence are meaningful. It survives record clearing, history
+  /// compaction and unrelated commits for the owner process lifetime, and is
+  /// reset only by object removal or a committed origin change.
+  std::map<SceneResourceId, core::SceneObjectProviderEvidenceDTO>
+      provider_sequence_watermarks_;
 };
 
 CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
@@ -6411,6 +6495,7 @@ CanonicalEmptySceneOwner::BeginMaintenanceInitialization(
 
   std::unique_lock lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
+  impl_->provider_freshness_records_.clear();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   auto found = std::find_if(
@@ -6904,6 +6989,7 @@ CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
   std::lock_guard operation_lock(impl_->maintenance_operation_mutex_);
   std::unique_lock lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
+  impl_->provider_freshness_records_.clear();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   auto found = std::find_if(
@@ -7486,6 +7572,8 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     }
   }
 
+  impl_->PruneProviderFreshnessState(*observed_state.active_scene_snapshot);
+
   std::vector<RequiredSceneProjection> projections;
   const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
   projections.reserve(required_bindings.size());
@@ -7540,6 +7628,28 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   } catch (const std::exception &error) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                   "live_scene_snapshot_unavailable", error.what());
+  }
+
+  const auto *pose_update =
+      std::get_if<core::UpdateObjectPoseRequestDTO>(&request.operation);
+  if (pose_update != nullptr && pose_update->provider_evidence.has_value()) {
+    // Accepted freshness confirmations also bound later committed evidence.
+    const auto &next = *pose_update->provider_evidence;
+    if (const auto watermark = impl_->ProviderSequenceWatermark(
+            pose_update->scene_resource_id, next);
+        watermark.has_value() && next.provider_source_sequence <= *watermark) {
+      return reject(
+          core::RequestReplayStatusDTO::kAcceptedNew,
+          "scene_object_state_conflict",
+          "provider source sequence did not advance",
+          {{"reason", "provider_source_sequence_not_increasing"},
+           {"scene_resource_id", pose_update->scene_resource_id.value()},
+           {"provider_instance_id", next.provider_instance_id.value()},
+           {"provider_source_epoch", next.provider_source_epoch},
+           {"previous_provider_source_sequence", std::to_string(*watermark)},
+           {"received_provider_source_sequence",
+            std::to_string(next.provider_source_sequence)}});
+    }
   }
 
   if (program_reset_mutation) {
@@ -7767,6 +7877,17 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
   impl_->StoreSceneCommitState(observed_state, observed_transactions,
                                external_data_version);
+  // A committed write that touches a confirmed object supersedes its
+  // freshness-only confirmation; removal also resets its watermark.
+  impl_->PruneProviderFreshnessState(candidate->snapshot);
+  std::erase_if(impl_->provider_freshness_records_, [&](const auto &entry) {
+    return *FindSceneObject(candidate->snapshot, entry.first) !=
+           entry.second.confirmed_against;
+  });
+  if (pose_update != nullptr && pose_update->provider_evidence.has_value()) {
+    impl_->AdvanceProviderSequenceWatermark(pose_update->scene_resource_id,
+                                            *pose_update->provider_evidence);
+  }
 
   SceneCommitResultDTO result{
       request.request_context.request_id,
@@ -7783,6 +7904,272 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         "successful scene commit cannot form a valid public result");
   }
   return result;
+}
+
+core::Result<ProjectionRevisionDTO>
+CanonicalEmptySceneOwner::ConfirmProviderFreshness(
+    const core::ProviderFreshnessConfirmationDTO &confirmation) {
+  using ConfirmationResult = core::Result<ProjectionRevisionDTO>;
+  const auto reject = [](const std::string_view code,
+                         const std::string_view message,
+                         std::map<std::string, std::string> details = {}) {
+    return ConfirmationResult::Err(
+        SceneError(code, message, std::move(details)));
+  };
+  if (!confirmation.valid()) {
+    return reject("invalid_request",
+                  "provider freshness confirmation is malformed");
+  }
+  try {
+    ValidateBoundedIdentity(confirmation.scene_resource_id.value(),
+                            "scene_resource_id");
+  } catch (const std::invalid_argument &error) {
+    return reject("invalid_request", error.what());
+  }
+  const auto &scene_resource_id = confirmation.scene_resource_id;
+  const auto &observed = confirmation.evidence;
+  const auto conflict = [&](const std::string_view reason,
+                            const std::string_view message,
+                            std::map<std::string, std::string> details = {}) {
+    details.emplace("reason", std::string(reason));
+    details.emplace("scene_resource_id", scene_resource_id.value());
+    return reject("scene_object_state_conflict", message, std::move(details));
+  };
+
+  // Same writer exclusion as Commit: compaction, maintenance and every other
+  // scene write hold this mutex, and AccessStatus closes writes during
+  // bootstrap, maintenance and unresolved/desynchronized projection states.
+  std::lock_guard lock(impl_->mutex_);
+  ProjectionRevisionDTO active;
+  std::optional<SceneObjectSnapshotDTO> object;
+  std::vector<core::ProjectionNativeRuntimeBindingDTO> required_bindings;
+  {
+    const auto &cached = impl_->ReadSceneCommitState();
+    const auto &state = cached.durable_state;
+    if (!state.active_projection.has_value() ||
+        !state.active_scene_snapshot.has_value()) {
+      return reject("live_scene_snapshot_unavailable",
+                    "logical-scene bootstrap is not finalized");
+    }
+    if (!AccessStatus(state).scene_writes_open) {
+      return reject("live_scene_snapshot_unavailable",
+                    "logical-scene projection is unavailable or "
+                    "desynchronized");
+    }
+    if (confirmation.expected_projection_revision !=
+        *state.active_projection) {
+      return reject(
+          "stale_revision",
+          "expected composite projection revision is no longer active");
+    }
+    const auto *found =
+        FindSceneObject(*state.active_scene_snapshot, scene_resource_id);
+    if (found == nullptr) {
+      return reject("object_not_found", "scene resource does not exist",
+                    {{"scene_resource_id", scene_resource_id.value()}});
+    }
+    impl_->PruneProviderFreshnessState(*state.active_scene_snapshot);
+    active = *state.active_projection;
+    object = *found;
+    required_bindings = ActiveNativeRuntimeBindings(state);
+  }
+
+  const auto *fixed =
+      std::get_if<core::CellFixedSceneObjectPlacementDTO>(&object->placement);
+  if (fixed == nullptr) {
+    return conflict("provider_freshness_object_attached",
+                    "a carried object pose is derived from its attachment");
+  }
+  if (!SamePose(fixed->pose_in_cell, confirmation.pose_in_cell)) {
+    return conflict("provider_freshness_pose_changed",
+                    "observed pose differs from the committed pose");
+  }
+  if (!object->provider_evidence.has_value()) {
+    return conflict("provider_freshness_evidence_missing",
+                    "committed object has no provider evidence to refresh");
+  }
+  const auto &committed = *object->provider_evidence;
+  if (observed.provider_instance_id != committed.provider_instance_id ||
+      observed.provider_manifest_id != committed.provider_manifest_id ||
+      observed.provider_manifest_revision !=
+          committed.provider_manifest_revision ||
+      observed.provider_source_epoch != committed.provider_source_epoch) {
+    return conflict("provider_freshness_origin_changed",
+                    "observed provider origin differs from the committed "
+                    "evidence");
+  }
+  if (observed.source_freshness_budget_ns !=
+      committed.source_freshness_budget_ns) {
+    return conflict("provider_freshness_budget_changed",
+                    "observed freshness budget differs from the committed "
+                    "evidence");
+  }
+
+  auto &records = impl_->provider_freshness_records_;
+  if (const auto record = records.find(scene_resource_id);
+      record != records.end() &&
+      (record->second.retained_bundle_id != active.retained_bundle_id ||
+       record->second.graph_revision != active.graph_revision ||
+       record->second.confirmed_against != *object)) {
+    records.erase(record);
+  }
+  const auto record = records.find(scene_resource_id);
+  const auto &latest =
+      record == records.end() ? committed : record->second.accepted;
+  const auto previous_sequence = std::max(
+      latest.provider_source_sequence,
+      impl_->ProviderSequenceWatermark(scene_resource_id, observed)
+          .value_or(0U));
+  if (observed.provider_source_sequence <= previous_sequence) {
+    return conflict(
+        "provider_freshness_sequence_not_increasing",
+        "provider source sequence did not advance",
+        {{"previous_provider_source_sequence",
+          std::to_string(previous_sequence)},
+         {"received_provider_source_sequence",
+          std::to_string(observed.provider_source_sequence)}});
+  }
+  if (observed.received_at_ns < latest.received_at_ns) {
+    return conflict("provider_freshness_received_at_regressed",
+                    "provider observation is older than the latest accepted "
+                    "evidence");
+  }
+
+  std::vector<RequiredSceneProjection> projections;
+  projections.reserve(required_bindings.size());
+  for (const auto &binding : required_bindings) {
+    try {
+      auto projection =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!projection.preflight_health.healthy_for_target(active)) {
+        return reject("live_scene_snapshot_unavailable",
+                      "a required native scene projection is not healthy at "
+                      "the exact current revision");
+      }
+      projections.push_back(std::move(projection));
+    } catch (const std::exception &error) {
+      return reject("live_scene_snapshot_unavailable", error.what());
+    } catch (...) {
+      return reject("live_scene_snapshot_unavailable",
+                    "native scene projection health threw a non-standard "
+                    "exception");
+    }
+  }
+
+  // Every precondition holds: the observation is accepted before any native
+  // effect, so a partial fan-out can never be replayed to renew freshness.
+  const auto previous_record =
+      record == records.end()
+          ? std::nullopt
+          : std::optional<ProviderFreshnessRecord>(record->second);
+  const auto previous_watermark =
+      impl_->provider_sequence_watermarks_.contains(scene_resource_id)
+          ? std::optional<core::SceneObjectProviderEvidenceDTO>(
+                impl_->provider_sequence_watermarks_.at(scene_resource_id))
+          : std::nullopt;
+  impl_->AdvanceProviderSequenceWatermark(scene_resource_id, observed);
+  records.insert_or_assign(
+      scene_resource_id,
+      ProviderFreshnessRecord{active.retained_bundle_id, active.graph_revision,
+                              *object, observed});
+
+  const auto append = [](std::string &list, const std::string_view value) {
+    if (!list.empty()) {
+      list += ',';
+    }
+    list += value;
+  };
+  std::string applied_ordinals;
+  std::string applied_runtime_units;
+  std::string failed_ordinals;
+  std::string failed_runtime_units;
+  // A lost acknowledgement or a throwing call has an unknown effect: the
+  // projection may already publish the confirmed freshness.
+  std::string uncertain_ordinals;
+  std::string uncertain_runtime_units;
+  std::optional<ErrorDTO> first_failure;
+  bool every_failure_unsupported = true;
+  for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
+    const auto &projection = projections[ordinal];
+    std::optional<ErrorDTO> failure;
+    try {
+      const auto applied =
+          projection.projection->ApplyProviderFreshness(confirmation);
+      if (!applied.ok()) {
+        failure = applied.error();
+      }
+    } catch (const std::exception &error) {
+      failure = SceneError("scene_projection_call_failed", error.what());
+    } catch (...) {
+      failure = SceneError("scene_projection_call_failed",
+                           "native scene projection threw a non-standard "
+                           "exception");
+    }
+    const auto &runtime_unit =
+        projection.preflight_health.native_runtime_binding.runtime_unit_id
+            .value();
+    if (!failure.has_value()) {
+      append(applied_ordinals, std::to_string(ordinal));
+      append(applied_runtime_units, runtime_unit);
+      continue;
+    }
+    append(failed_ordinals, std::to_string(ordinal));
+    append(failed_runtime_units, runtime_unit);
+    if (failure->code == "projection_state_uncertain" ||
+        failure->code == "scene_projection_call_failed") {
+      append(uncertain_ordinals, std::to_string(ordinal));
+      append(uncertain_runtime_units, runtime_unit);
+    }
+    every_failure_unsupported = every_failure_unsupported &&
+                                failure->code == "provider_freshness_unsupported";
+    if (!first_failure.has_value()) {
+      first_failure = std::move(failure);
+    }
+  }
+  if (!first_failure.has_value()) {
+    return ConfirmationResult::Ok(active);
+  }
+
+  std::map<std::string, std::string> details{
+      {"reason", "provider_freshness_projection_failed"},
+      {"uncertain_projection_ordinals", uncertain_ordinals},
+      {"uncertain_runtime_unit_ids", uncertain_runtime_units},
+      {"scene_resource_id", scene_resource_id.value()},
+      {"failed_projection_ordinals", failed_ordinals},
+      {"failed_runtime_unit_ids", failed_runtime_units},
+      {"applied_projection_ordinals", applied_ordinals},
+      {"applied_runtime_unit_ids", applied_runtime_units},
+      {"projection_error_code", first_failure->code},
+      {"projection_error_message", first_failure->message},
+  };
+  if (applied_ordinals.empty() && every_failure_unsupported) {
+    // No freshness path exists and nothing was published: restore the prior
+    // state so the caller's ordinary Commit fallback can carry this sequence.
+    if (previous_record.has_value()) {
+      records.insert_or_assign(scene_resource_id, *previous_record);
+    } else {
+      records.erase(scene_resource_id);
+    }
+    if (previous_watermark.has_value()) {
+      impl_->provider_sequence_watermarks_.insert_or_assign(
+          scene_resource_id, *previous_watermark);
+    } else {
+      impl_->provider_sequence_watermarks_.erase(scene_resource_id);
+    }
+    details["reason"] = "provider_freshness_unsupported";
+    return reject("provider_freshness_unsupported",
+                  "no required native projection supports freshness-only "
+                  "publication",
+                  std::move(details));
+  }
+  // The accepted observation stays recorded: projections that applied it are
+  // fresh; a projection that definitely refused keeps its older freshness and
+  // ages out fail-closed; an uncertain one (lost acknowledgement or throwing
+  // call) may or may not have published it, and is reported as uncertain.
+  return reject("provider_freshness_projection_failed",
+                "a required native projection did not apply the freshness "
+                "confirmation",
+                std::move(details));
 }
 
 std::optional<SceneCommitResultDTO> CanonicalEmptySceneOwner::ReadCommitResult(

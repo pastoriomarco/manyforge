@@ -727,6 +727,10 @@ std::string encode_initialization(const WorkerInitializationDTO& value) {
             [](Encoder& nested, const std::filesystem::path& path) {
               nested.string(path.string());
             });
+        out.optional(geometry.scene_mesh_content_digest,
+                     [](Encoder& nested, const std::string& digest) {
+                       nested.string(digest);
+                     });
       });
   encoder.vector(
       value.model.allowed_collision_pairs,
@@ -767,11 +771,12 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
       [](Decoder& input) {
         return RoboPlanWorkerGeometryDTO{
             input.string(), input.string(), read_shape(input),
-            read_pose(input), input.optional<std::filesystem::path>(
-                                  [](Decoder& nested) {
-                                    return std::filesystem::path(
-                                        nested.string());
-                                  })};
+            read_pose(input),
+            input.optional<std::filesystem::path>([](Decoder& nested) {
+              return std::filesystem::path(nested.string());
+            }),
+            input.optional<std::string>(
+                [](Decoder& nested) { return nested.string(); })};
       });
   model.allowed_collision_pairs =
       decoder.vector<std::pair<std::string, std::string>>(

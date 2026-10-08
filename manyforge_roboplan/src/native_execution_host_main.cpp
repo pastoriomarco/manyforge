@@ -74,6 +74,7 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
+#include "managed_ros2_component_installation.hpp"
 #include <manyforge_roboplan/retained_ros2_control_admission_owner.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
@@ -162,6 +163,8 @@ constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr int kManagedPackageRootFd = 6;
 constexpr int kManagedProgramArtifactRootFd = 8;
+// Optional Manager-opened scene-asset root; never a retained package root.
+constexpr int kManagedSceneAssetRootFd = 9;
 constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
 // Recovery evidence is not a control deadline. Refresh it at 20 Hz on the
@@ -222,7 +225,10 @@ void HandleStopSignal(int) {
   if (wake >= 0) {
     const int saved_errno = errno;
     const std::uint64_t one = 1U;
-    static_cast<void>(::write(wake, &one, sizeof(one)));
+    const ssize_t written = ::write(wake, &one, sizeof(one));
+    // This nonblocking wake is best effort; the stop flag above remains the
+    // authoritative signal fact. Preserve the interrupted code's errno.
+    static_cast<void>(written);
     errno = saved_errno;
   }
 }
@@ -604,6 +610,9 @@ struct ManagedRuntimeChildConfig final {
   int manager_liveness_channel_fd{-1};
   int package_root_fd{-1};
   int program_artifact_root_fd{-1};
+  /// Approved scene-asset root for relative scene meshes; absent when the
+  /// Manager has none configured (relative scene meshes then fail closed).
+  std::optional<int> scene_asset_root_fd;
   std::filesystem::path package_root;
   std::filesystem::path program_artifact_root;
   std::filesystem::path manager_state_root;
@@ -672,6 +681,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-program-artifact-root-fd") {
       config.program_artifact_root_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-scene-asset-root-fd") {
+      config.scene_asset_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
     } else if (option == "--manyforge-managed-manager-run-root") {
@@ -704,7 +715,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 15U && seen.size() <= 18U &&
+  Require(seen.size() >= 15U && seen.size() <= 19U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -735,6 +746,18 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
               program_artifact_flags >= 0 &&
               (program_artifact_flags & FD_CLOEXEC) == 0,
           "managed package-root descriptor is not a retained directory");
+  if (config.scene_asset_root_fd.has_value()) {
+    struct stat scene_asset_status {};
+    const int scene_asset_flags =
+        ::fcntl(*config.scene_asset_root_fd, F_GETFD);
+    Require(*config.scene_asset_root_fd == kManagedSceneAssetRootFd &&
+                ::fstat(*config.scene_asset_root_fd, &scene_asset_status) ==
+                    0 &&
+                S_ISDIR(scene_asset_status.st_mode) && scene_asset_flags >= 0 &&
+                (scene_asset_flags & FD_CLOEXEC) == 0,
+            "managed scene-asset root descriptor is not an inherited "
+            "directory");
+  }
   config.package_root = std::filesystem::path("/proc/self/fd") /
                         std::to_string(config.package_root_fd);
   config.program_artifact_root =
@@ -3684,6 +3707,10 @@ StopFaultOfferValue(const core::StopFaultRecoveryOfferDTO &offer) {
   return CanonicalValue(CanonicalValue::Object{
       {"configuration_expectations", CanonicalValue(std::move(rows))},
       {"latch", StopFaultLatchValue(offer.latch)},
+      {"recovery_unavailable_reason",
+       offer.recovery_unavailable_reason
+           ? CanonicalValue(*offer.recovery_unavailable_reason)
+           : CanonicalValue(nullptr)},
   });
 }
 
@@ -7049,6 +7076,9 @@ struct CompositionBuildInput final {
   // The selected package root may be either retained descriptor in a managed
   // child. Candidate workers receive whichever exact root was selected as FD 6.
   std::optional<int> retained_package_root_fd{};
+  // Manager-opened scene-asset root (managed FD 9), shared by the collision
+  // model and the candidate worker. Absent: relative scene meshes fail closed.
+  std::optional<int> scene_asset_root_fd{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -8195,7 +8225,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           direct_control_motion_binding.value().value().controllable_component_id);
 #endif
   std::optional<double> deployment_motion_target_limit;
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::vector<std::pair<core::ControllableComponentId,
                         core::CommandTargetId>> expected_motion_limits;
   expected_motion_limits.reserve(direct_control_inventory.motion.size());
@@ -8227,7 +8256,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                          limit.command_target_id};
       });
   Require(configured_motion_limits == expected_motion_limits,
-          "native Deployment must contain exactly one TCP-speed maximum for "
+          "execution Deployment must contain exactly one TCP-speed maximum for "
           "every motion-capable target and no unknown target");
   const auto motion_limit =
       std::find_if(retained_runtime_configuration.motion_target_limits.begin(),
@@ -8244,9 +8273,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                    });
   Require(motion_limit !=
               retained_runtime_configuration.motion_target_limits.end(),
-          "native Deployment has no limit for the exact motion target");
+          "execution Deployment has no limit for the exact motion target");
   deployment_motion_target_limit = motion_limit->maximum_tcp_linear_speed_mps;
-#endif
   auto selected_initial_joint_positions =
       retained_runtime_configuration.initial_joint_positions_rad;
   const auto selected_resource_count =
@@ -8355,11 +8383,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   if (publisher == nullptr) {
     const auto &group =
         direct_control_motion_binding.value().value().model_groups.front();
-    auto package_paths = stage.package_paths();
-    package_paths.insert(package_paths.begin(), input.package_root);
+    // The retained package root is not a scene-mesh root: relative scene
+    // meshes resolve only below the separately approved scene-asset root.
     collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_i6_native_execution_host", stage.loader_urdf_path(),
-        stage.srdf_path(), package_paths, group.compiled_group_name);
+        stage.srdf_path(), stage.package_paths(), group.compiled_group_name,
+        input.scene_asset_root_fd);
     auto collision_projector = RetainedCollisionWorldProjector::create_verified(
         collision_model, *input.bundle, input.model_map, *retained_model);
     const auto logical_scene =
@@ -8402,8 +8431,15 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           ProcessContainedCandidateClientConfig{
               .worker_executable = input.candidate_worker,
               .require_retained_projection = true,
-              .scene_asset_root = input.package_root,
-              .retained_package_root_fd = input.retained_package_root_fd});
+              .scene_asset_root_fd = input.scene_asset_root_fd,
+              .retained_package_root_fd = input.retained_package_root_fd,
+              // The worker must load exactly the scene-mesh bytes this
+              // composition's collision model loaded (or first pinned).
+              .scene_mesh_content_digest =
+                  [collision_model](const std::string &uri) {
+                    return collision::ManyForgeCollisionEngine::
+                        scene_mesh_content_digest(collision_model, uri);
+                  }});
   Require(candidate_client->requires_retained_projection(),
           "production native planner must consume the exact retained scene "
           "projection");
@@ -8512,6 +8548,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   runtime_input.ordinary_motion_jerk = motion_limit->ordinary_motion_jerk;
 #endif
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   for (const auto &limit :
        retained_runtime_configuration.direct_control_joint_limits) {
     const auto &target = runtime_input.motion_binding.value();
@@ -8524,6 +8561,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                                       limit.max_jerk_rad_s3});
     }
   }
+#endif
   if (input.planner_scene_projection != nullptr) {
     runtime_input.planning_scene_synchronizer =
         std::make_shared<ManagerPlanningSceneSynchronizer>(
@@ -8539,6 +8577,9 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           retained_runtime_configuration, direct_control_motion_binding.value(),
           std::optional<core::RuntimeParticipantBinding>{
               direct_control_gripper_binding.value()});
+  ros2_control_backend_config.defer_ros_start = input.managed_component_delta.has_value();
+  if (ros2_control_backend_config.defer_ros_start)
+    ros2_control_backend_config.execution.initialize_commanded_sim_on_controller_ready = false;
   Require(ros2_control_backend_config.execution.controller_binding.has_value(),
           "retained Isaac ROS profile has no controller binding contract");
   const std::string ros2_control_binding_contract_generation_id =
@@ -8689,18 +8730,17 @@ BuildSingleProductComposition(CompositionBuildInput input) {
          direct_control_joint_limits.error().message);
   }
   auto manual_control_descriptors = BuildManualControlDescriptors(
-      direct_control_motion_binding.value(),
-      direct_control_gripper_binding,
+      direct_control_motion_binding.value(), direct_control_gripper_binding,
       direct_control_joint_limits.value(), runtime->gripper_position_limits,
       runtime->motion_participant_policy,
       runtime->deployment_maximum_tcp_linear_speed_mps,
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       &motion_limit->ordinary_motion_jerk,
-#else
-      nullptr,
-#endif
       retained_runtime_configuration.direct_control_joint_limits,
       retained_runtime_configuration.gripper_target_configurations,
+#else
+      nullptr, {}, {},
+#endif
       input.model_map, retained_model_documents);
   const auto selected_component_id =
       input.selected_component_id.value_or(
@@ -8861,12 +8901,10 @@ BuildProductComposition(CompositionBuildInput input) {
     // loader accepts an empty group for frame-only use; no planner is built.
     auto stage = RetainedPlanningModelStage::create_verified(
         *model, input.execution_run_root);
-    auto package_paths = stage.package_paths();
-    package_paths.insert(package_paths.begin(), input.package_root);
     input.collision_shared_model =
         collision::ManyForgeCollisionEngine::load_shared_model(
             "manyforge_native_gripper_frame_model",
-            stage.loader_urdf_path(), stage.srdf_path(), package_paths,
+            stage.loader_urdf_path(), stage.srdf_path(), stage.package_paths(),
             groups.empty() ? std::string{} : groups.front());
   }
   auto component_ids = motion_component_ids;
@@ -10435,6 +10473,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
   core::IClock *owner_clock = nullptr;
   core::IScheduler *owner_scheduler = nullptr;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // Parent-Apply fact adoption below belongs to the native CCLC path.
+  static_cast<void>(parent_apply);
   Require(composition.runtime != nullptr &&
               composition.runtime->clock != nullptr &&
               composition.runtime->scheduler != nullptr,
@@ -11080,6 +11120,7 @@ TryBuildCurrentManagedCompositionInput(
       {},
       {},
       ManagedPackageRootDescriptor(config, selected_package_root),
+      config.scene_asset_root_fd,
   };
 }
 
@@ -11245,6 +11286,10 @@ struct ManagedBootstrapStopProduct final {
                   request.component_delta,
           "managed component delta differs from the verified predecessor and candidate");
 
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  detail::RequireInitialRos2ComponentInstallation(
+      request, predecessor->value().cell_graph, bundle->value().cell_graph);
+#endif
   if (bundle->value().cell_graph.controllable_components.empty()) {
     return std::nullopt;
   }
@@ -11317,6 +11362,7 @@ struct ManagedBootstrapStopProduct final {
       request.component_delta,
       {},
       ManagedPackageRootDescriptor(config, candidate_package_root),
+      config.scene_asset_root_fd,
   };
 }
 
@@ -11442,9 +11488,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       },
       admission_gate);
   const ManagedProjectionRegistryConfig projection_config{
-      config.package_root, config.program_artifact_root,
+      config.package_root,       config.program_artifact_root,
       config.execution_run_root, config.runtime_unit_id,
-      config.runtime_epoch};
+      config.runtime_epoch,      config.scene_asset_root_fd};
   ManagedProjectionRegistry projections(
       projection_config,
       MakeFilesystemManagedProjectionAssetSource(projection_config),
@@ -12037,12 +12083,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       std::rethrow_exception(selected_composition_failure);
     }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-    // Dynamic ROS2 component ownership is deliberately not advertised by the
-    // current provider. Refuse before any candidate effect; an empty receipt
-    // must never be reported as a successful installed component set.
-    if (!request.component_delta.components.empty())
-      Fail("ros2_component_delta_not_qualified: dynamic ROS2 component "
-           "installation requires a lifecycle provider receipt");
+    // Reject unsupported ownership changes before current-composition recovery
+    // or candidate construction can start a ROS endpoint/executor.
+    const auto selected_ros_candidate = LoadExactManagedCandidateBundle(config, request);
+    const auto selected_ros_predecessor = LoadManagedBundleAtPinnedRoot(
+        config, request.predecessor_projection_revision.retained_bundle_id);
+    Require(selected_ros_candidate.has_value() && selected_ros_predecessor.has_value() &&
+                deployment::derive_apply_component_delta(
+                    *selected_ros_predecessor->bundle, *selected_ros_candidate->bundle) ==
+                    request.component_delta,
+            "ROS installation delta differs from verified predecessor and candidate");
+    detail::RequireInitialRos2ComponentInstallation(
+        request, selected_ros_predecessor->bundle->value().cell_graph,
+        selected_ros_candidate->bundle->value().cell_graph);
 #endif
     const auto read_installed_receipts = [&] {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -12054,8 +12107,26 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      ? active_managed_composition.get()
                      : nullptr));
 #else
-      return std::vector<
-          component_manager::ManagerRuntimeComponentReceiptDTO>{};
+      if (request.component_delta.components.empty())
+        return std::vector<component_manager::ManagerRuntimeComponentReceiptDTO>{};
+      const auto *candidate = active_managed_composition.get();
+      Require(candidate != nullptr && candidate->runtime != nullptr &&
+                  candidate->bundle != nullptr &&
+                  candidate->ros2_control_runtime_handle != nullptr &&
+                  candidate->runtime->gripper_binding.has_value() &&
+                  candidate->active_addressed_kernel() == stable_addressed_kernel(),
+              "ROS installed component has no stable live execution owner");
+      const auto identity = deployment::derive_component_runtime_identity(
+          *candidate->bundle, candidate->controllable_component_id);
+      Require(identity.has_value(), "ROS installed component has no sealed product identity");
+      return std::vector<component_manager::ManagerRuntimeComponentReceiptDTO>{
+          detail::ReadInitialRos2ComponentReceipt(
+              request, *identity, *candidate->ros2_control_runtime_handle,
+              candidate->runtime->execution.get(), candidate->runtime->gripper.get(),
+              candidate->runtime->motion_binding, *candidate->runtime->gripper_binding,
+              candidate->component_registrations(),
+              candidate->runtime->participant_engine_for(true),
+              candidate->runtime->participant_engine_for(false))};
 #endif
     };
     const core::ConfigurationFenceStatusQueryDTO fence_query{
@@ -12365,7 +12436,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                    fence_query.owner_transaction.apply_generation},
                   candidate.retained_bundle_id(),
                   candidate.value().cell_graph.graph_revision,
-                  {}, {}};
+                  {}, {}, {}, {}, {}, {}};
               for (const auto &component :
                    candidate.value().cell_graph.controllable_components)
                 plan_request.components.push_back(
@@ -12494,6 +12565,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         prepared_is_empty = true;
         prepared_managed_composition_is_empty = false;
       } else if (!preparing_composition_request.has_value()) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+        Require(active_managed_composition == nullptr &&
+                    retired_managed_composition == nullptr &&
+                    stable_addressed_kernel() != nullptr,
+                "ROS initial installation has a nonempty or missing predecessor owner");
+#endif
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
         VerifyRetainedNativePredecessors(active_managed_composition.get(),
                                           request);
@@ -12543,6 +12620,22 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
 
     if (start_builder) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      // Preparation creates only closed-gate ROS endpoints. Qualify the exact
+      // authority before it starts; executor activation remains fenced below.
+      try {
+        // Added-domain configuration facts do not exist until installation.
+        // Qualify the durable predecessor authority without requiring them.
+        fence_owner.RunWithExactHeldPredecessor(
+            fence_query, request.expected_predecessor_publication_generation,
+            request.expected_predecessor_public_pointer_digest, [] {});
+      } catch (...) {
+        std::lock_guard lock(managed_composition_mutex);
+        managed_composition_failure = std::current_exception();
+        managed_composition_building = false;
+        throw;
+      }
+#endif
       managed_composition_builder = std::jthread(
           [&, request, shared_clock = std::move(shared_clock),
            shared_scheduler = std::move(shared_scheduler),
@@ -13069,6 +13162,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                    staged.error().message);
               }
             }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+            // The candidate, stable Kernel and Stop engines are now retained
+            // under this exact Apply fence. Executor start does not wait for a
+            // controller or issue a home goal; observed readiness remains NRT.
+            Require(candidate.ros2_control_runtime_handle != nullptr,
+                    "installed ROS component has no bound runtime handle");
+            candidate.ros2_control_runtime_handle->StartBackend();
+#endif
             InstallDirectSceneFrameResolver(projections, candidate);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
             if (candidate.runtime != nullptr)
@@ -16172,15 +16273,32 @@ private:
       auto preview_intent = *command.operation;
       const auto predecessor = composition.runtime->collision_publisher
                                    ->current_scene_snapshot_lease_inventory();
+      // A preview receipt is explanatory evidence, not authority (spec 210
+      // §3.10.1): the client's status read may lag the owner-minted,
+      // monotonic Scene revision. Accept an earlier revision of the same
+      // Scene and compute on the current one; the receipt names the revision
+      // actually used. A future revision or a different Scene is refused.
       if (!predecessor.has_value() ||
           !preview_intent.expected_scene_revision.has_value() ||
-          *preview_intent.expected_scene_revision !=
+          preview_intent.expected_scene_revision->scene_id !=
               predecessor->projection_binding.projection_revision
-                  .scene_revision) {
+                  .scene_revision.scene_id ||
+          preview_intent.expected_scene_revision->revision_id >
+              predecessor->projection_binding.projection_revision
+                  .scene_revision.revision_id ||
+          // An equal revision id names exactly the current revision.
+          (preview_intent.expected_scene_revision->revision_id ==
+               predecessor->projection_binding.projection_revision
+                   .scene_revision.revision_id &&
+           *preview_intent.expected_scene_revision !=
+               predecessor->projection_binding.projection_revision
+                   .scene_revision)) {
         return ErrorResponse(
             "scene_changed_during_validation",
             "motion preview does not name the pre-latch scene revision");
       }
+      preview_intent.expected_scene_revision =
+          predecessor->projection_binding.projection_revision.scene_revision;
       if (composition.runtime->planning_scene_synchronizer != nullptr) {
         auto synchronized = composition.runtime->planning_scene_synchronizer
                                 ->SynchronizeBeforePlanning();
@@ -16719,7 +16837,10 @@ private:
   /// when this surface is stopping.
   void WakeLanes() noexcept {
     const std::uint64_t one = 1U;
-    static_cast<void>(::write(lane_wake_.get(), &one, sizeof(one)));
+    const ssize_t written = ::write(lane_wake_.get(), &one, sizeof(one));
+    // The eventfd is nonblocking and stays readable after the first wake;
+    // subsequent best-effort writes do not change the stopping decision.
+    static_cast<void>(written);
   }
 
   [[nodiscard]] bool LanesWoken() const noexcept {

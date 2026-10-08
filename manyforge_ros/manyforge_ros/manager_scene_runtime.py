@@ -56,6 +56,7 @@ _SCENE_APPLICATION_STATUSES = {
     "buffered",
     "committed",
     "deferred_before_planning",
+    "freshness_confirmed",
     "not_requested",
     "skipped_attached",
 }
@@ -520,6 +521,8 @@ class ManagerSceneRuntimeClient:
                 or request_id is None
                 or update_status is not None
             ):
+                # already_applied, skipped_attached and freshness_confirmed
+                # carry the unchanged current projection and no update status.
                 raise ValueError("idempotent or skipped observation result is invalid")
             if projection is not None and (
                 projection.retained_bundle_id
@@ -536,6 +539,7 @@ class ManagerSceneRuntimeClient:
                     "already_applied",
                     "committed",
                     "deferred_before_planning",
+                    "freshness_confirmed",
                     "skipped_attached",
                 }:
                     raise ValueError(
@@ -548,7 +552,12 @@ class ManagerSceneRuntimeClient:
                 intent.policy_id != "continuous_unattached"
                 or disposition not in {"apply_now", "duplicate"}
                 or application_status
-                not in {"already_applied", "committed", "skipped_attached"}
+                not in {
+                    "already_applied",
+                    "committed",
+                    "freshness_confirmed",
+                    "skipped_attached",
+                }
             ):
                 raise ValueError("observation application contradicts its policy")
         except (TypeError, ValueError) as exc:

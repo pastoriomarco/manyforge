@@ -122,7 +122,8 @@
               "operational_timeout_ns": 3000000000,
               "settling_allowance_ns": 1500000000
             }
-          }
+          },
+          "maximum_tcp_linear_speed_mps": 0.15
         }
       }
     }

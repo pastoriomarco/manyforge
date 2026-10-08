@@ -10578,7 +10578,7 @@ ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
     // before terminal containment. The current response already carries its
     // waiting status; an empty expectation table cannot authorize recovery.
     return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(
-        StopFaultRecoveryOfferDTO{*active_stop_fault_latch_, {}});
+        StopFaultRecoveryOfferDTO{*active_stop_fault_latch_, {}, std::nullopt});
   }
   const auto terminal = std::find_if(
       stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
@@ -10594,28 +10594,29 @@ ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
         "stop_fault_recovery_offer_terminal_missing", ErrorCode::kInvariantViolation);
   }
 
-  std::map<ControlDomainId, StopFaultRecoveryConfigurationExpectationDTO> by_domain;
-  for (const auto& scope : (*terminal)->status.scope_entries) {
-    const auto* participant = std::get_if<StopParticipantScopeFactsDTO>(&scope.facts);
-    if (participant == nullptr) {
-      continue;
-    }
-    const StopFaultRecoveryConfigurationExpectationDTO row{
-        participant->control_domain_id, participant->active_control_configuration_id,
-        participant->active_control_configuration_generation};
-    const auto [found, inserted] = by_domain.emplace(row.control_domain_id, row);
-    if (!inserted && found->second != row) {
-      return reject<std::optional<StopFaultRecoveryOfferDTO>>(
-          "Stop terminal status contains conflicting control-domain configuration truth",
-          "stop_fault_recovery_offer_configuration_conflict", ErrorCode::kInvariantViolation);
-    }
+  // One shared owner derives this table and the native facts table. A
+  // cell-wide Stop that captured no participant configuration (for example
+  // a recognized-malformed Stop promoted to Full while idle) is offered the
+  // installed control domains' active configurations. When no such proof
+  // exists the latch is still published, explicitly unavailable.
+  std::vector<const RuntimeParticipantBinding*> installed_bindings;
+  installed_bindings.reserve(registrations_.size());
+  for (const auto& registration : registrations_) {
+    installed_bindings.push_back(&registration.binding);
   }
-
-  StopFaultRecoveryOfferDTO offer{*active_stop_fault_latch_, {}};
-  offer.configuration_expectations.reserve(by_domain.size());
-  for (const auto& [domain_id, row] : by_domain) {
-    static_cast<void>(domain_id);
-    offer.configuration_expectations.push_back(row);
+  auto expectations =
+      StopFaultRecoveryConfigurationExpectations((*terminal)->status, installed_bindings);
+  if (!expectations.ok() &&
+      expectations.error().code == kStopFaultRecoveryTerminalConfigurationConflict) {
+    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
+        "Stop terminal status contains conflicting control-domain configuration truth",
+        "stop_fault_recovery_offer_configuration_conflict", ErrorCode::kInvariantViolation);
+  }
+  StopFaultRecoveryOfferDTO offer{*active_stop_fault_latch_, {}, std::nullopt};
+  if (expectations.ok()) {
+    offer.configuration_expectations = std::move(expectations.value());
+  } else {
+    offer.recovery_unavailable_reason = expectations.error().code;
   }
   if (stop_fault_recovery_offer_field_error(offer).has_value()) {
     return reject<std::optional<StopFaultRecoveryOfferDTO>>(

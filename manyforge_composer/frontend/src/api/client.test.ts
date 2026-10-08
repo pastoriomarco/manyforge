@@ -288,6 +288,39 @@ describe('runtime-scale control reads', () => {
   });
 });
 
+it('accepts a certified latch that names why recovery is unavailable, never an empty proof', async () => {
+  const { parseStopFaultRecoveryOffer } = await import('./parsers');
+  const offer = (expectations: unknown[], reason: string | null) => ({
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'get_stop_fault',
+    ok: true,
+    stop_fault: {
+      recovery_unavailable_reason: reason,
+      configuration_expectations: expectations,
+      latch: {
+        cell_id: 'cell.1', graph_revision: 'sha256:graph', latch_generation: 1,
+        latch_id: 'stop-fault.1', recovery_assessment_revision: 1,
+        recovery_status: 'waiting_for_configuration', retained_bundle_id: 'sha256:bundle',
+        state: 'latched',
+        stop_certificate: {
+          stop_certificate_id: 'stop-certificate.1', stop_certificate_revision: 1,
+          stop_generation: 1, stop_id: 'stop.1',
+        },
+      },
+    },
+  });
+  const row = {
+    active_control_configuration_generation: 1,
+    active_control_configuration_id: 'active.arm',
+    control_domain_id: 'robot.arm.control',
+  };
+  const reason = 'stop_fault_recovery_installed_configuration_unavailable';
+  expect(parseStopFaultRecoveryOffer(offer([], reason))?.recoveryUnavailableReason).toBe(reason);
+  expect(parseStopFaultRecoveryOffer(offer([row], null))?.recoveryUnavailableReason).toBeNull();
+  expect(() => parseStopFaultRecoveryOffer(offer([], null))).toThrow();
+  expect(() => parseStopFaultRecoveryOffer(offer([row], reason))).toThrow();
+});
+
 it('composes an identity-fenced stop-fault recovery from the live offer', async () => {
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(response({
@@ -295,6 +328,7 @@ it('composes an identity-fenced stop-fault recovery from the live offer', async 
       command: 'get_stop_fault',
       ok: true,
       stop_fault: {
+        recovery_unavailable_reason: null,
         configuration_expectations: [{
           active_control_configuration_generation: 4,
           active_control_configuration_id: 'active.arm',

@@ -8,6 +8,7 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace manyforge::deployment {
 
@@ -17,6 +18,12 @@ namespace detail {
 
 [[nodiscard]] native_execution_runtime_contract::OrdinaryMotionJerkSettings
 decode_ordinary_motion_jerk_settings(const core::JsonObjectDTO& source);
+
+[[nodiscard]] std::vector<
+    native_execution_runtime_contract::Configuration::MotionTargetLimit>
+decode_execution_motion_target_limits(
+    const core::JsonValueDTO::Array &motion_target_limits,
+    bool include_ordinary_jerk);
 
 // The artifact-role/media contract is unchanged. This payload version pins the
 // infrastructure-only projection; candidate controller settings stay in the

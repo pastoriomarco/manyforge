@@ -3,7 +3,7 @@
 Historical test blob ``26431589ac4534354e3d33e2120fcaeb6822b112``
 at ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` contains six
 cases.  Content identity, bounded conversion, source containment, and file-size
-admission remain active below. Owner authorization, generation fencing,
+admission remain active below. Owner authorization of content-addressed URLs,
 resource containment, bounded conversion/cache, and HTTP delivery are current.
 """
 
@@ -620,25 +620,32 @@ class _SceneClient:
     def __init__(self, source_uri: str) -> None:
         self.source_uri = source_uri
         self.generation = 7
+        self.owner_epoch = "scene.epoch.1"
+        self.cell_id = "cell.1"
+        self.freshness = "fresh"
+        self.removed = False
+        self.scale = {"x": 1.0, "y": 2.0, "z": 3.0}
+        self.pose_x = 0.0
 
     def scene(self) -> dict[str, object]:
         return {
             "schema_version": "manyforge.scene_projection.v1",
             "logical_scene": {
                 "available": True,
-                "freshness": "fresh",
+                "freshness": self.freshness,
                 "known_gaps": [],
-                "source_owner_epoch": "scene.epoch.1",
+                "source_owner_epoch": self.owner_epoch,
                 "source_generation": self.generation,
                 "payload": {
                     "api_version": "manyforge.logical_scene_source.v1",
                     "snapshot": {
-                        "cell_id": "cell.1",
-                        "objects": [{
+                        "cell_id": self.cell_id,
+                        "objects": [] if self.removed else [{
+                            "pose": {"position_m": {"x_m": self.pose_x}},
                             "collision_shapes": [{
                                 "type": "mesh",
                                 "resource_uri": self.source_uri,
-                                "scale": {"x": 1.0, "y": 2.0, "z": 3.0},
+                                "scale": self.scale,
                             }],
                         }],
                     },
@@ -676,7 +683,7 @@ class _DraftSession:
         }
 
 
-def test_owner_bound_route_converts_and_fences_superseded_generation(
+def test_owner_mesh_url_is_content_addressed_and_stable_across_owner_changes(
     tmp_path: Path,
 ) -> None:
     mesh_file = tmp_path / "part.obj"
@@ -695,27 +702,94 @@ def test_owner_bound_route_converts_and_fences_superseded_generation(
     metadata = client.get("/api/scene/object-meshes/resolve", params=params)
     assert metadata.status_code == 200
     asset = metadata.json()
-    assert asset["schema_version"] == "manyforge.scene_mesh_asset.v1"
-    assert asset["source_generation"] == 7
-    assert "owner_epoch=scene.epoch.1" in asset["mesh_asset_url"]
-    assert "generation=7" in asset["mesh_asset_url"]
+    assert asset == {
+        "schema_version": "manyforge.scene_mesh_asset.v2",
+        "asset_hash": asset["asset_hash"],
+        "mesh_asset_url": f"/api/scene/object-meshes/{asset['asset_hash']}.glb",
+        "mesh_asset_status": "pending",
+        "last_error": None,
+    }
+    url = asset["mesh_asset_url"]
+    assert "?" not in url
 
-    converted = client.get(asset["mesh_asset_url"])
+    converted = client.get(url)
     assert converted.status_code == 200
     assert converted.headers["content-type"] == "model/gltf-binary"
     assert converted.content.startswith(b"glTF")
-    assert converted.headers["x-manyforge-scene-generation"] == "7"
+    assert "x-manyforge-scene-generation" not in converted.headers
+    assert "x-manyforge-scene-owner-epoch" not in converted.headers
 
+    # Pose-only generation changes and owner-epoch rotation (transaction-log
+    # compaction) keep the same URL valid with identical bytes.
     state.headless_client.generation = 8
-    stale = client.get(asset["mesh_asset_url"])
-    assert stale.status_code == 409
-    assert stale.json()["detail"]["code"] == "scene_mesh_owner_generation_changed"
+    state.headless_client.pose_x = 0.5
+    after_pose = client.get(url)
+    assert after_pose.status_code == 200
+    assert after_pose.content == converted.content
+
+    state.headless_client.owner_epoch = "scene.epoch.2"
+    state.headless_client.generation = 0
+    after_rotation = client.get(url)
+    assert after_rotation.status_code == 200
+    assert after_rotation.content == converted.content
 
     replacement = client.get("/api/scene/object-meshes/resolve", params=params)
     assert replacement.status_code == 200
-    assert replacement.json()["asset_hash"] == asset["asset_hash"]
-    assert "generation=8" in replacement.json()["mesh_asset_url"]
-    assert client.get(replacement.json()["mesh_asset_url"]).status_code == 200
+    assert replacement.json()["mesh_asset_url"] == url
+    assert replacement.json()["mesh_asset_status"] == "ok"
+
+    # Any current reference resolving to the same content authorizes it.
+    state.headless_client.source_uri = str(mesh_file)
+    other_spelling = client.get(url)
+    assert other_spelling.status_code == 200
+    assert other_spelling.content == converted.content
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ("removed", "scene_mesh_not_owner_authorized"),
+        ("uri", "scene_mesh_not_owner_authorized"),
+        ("scale", "scene_mesh_not_owner_authorized"),
+        ("stale", "scene_mesh_owner_projection_stale"),
+        ("content", "scene_mesh_source_changed"),
+        ("symlink", "scene_mesh_input_invalid"),
+    ],
+)
+def test_owner_mesh_url_refuses_unreferenced_or_changed_source(
+    tmp_path: Path, change: str, code: str,
+) -> None:
+    mesh_file = tmp_path / "part.obj"
+    _write_obj(mesh_file)
+    state = _SceneState(tmp_path, "part.obj")
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    client = TestClient(app)
+    asset = client.get("/api/scene/object-meshes/resolve", params={
+        "resource_uri": "part.obj", "scale_x": 1, "scale_y": 2, "scale_z": 3,
+    }).json()
+    url = asset["mesh_asset_url"]
+    first = client.get(url)
+    assert first.status_code == 200
+    if change == "removed":
+        state.headless_client.removed = True
+    elif change == "uri":
+        state.headless_client.source_uri = "other.obj"
+    elif change == "scale":
+        state.headless_client.scale["x"] = 2.0
+    elif change == "stale":
+        state.headless_client.freshness = "stale"
+    elif change == "content":
+        mesh_file.write_text(mesh_file.read_text() + "\n# changed content\n")
+    elif change == "symlink":
+        outside = tmp_path.parent / "outside.obj"
+        _write_obj(outside)
+        mesh_file.unlink()
+        mesh_file.symlink_to(outside)
+    response = client.get(url)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == code
+    assert response.content != first.content
 
 
 def test_owner_bound_route_rejects_unowned_and_outside_sources(tmp_path: Path) -> None:
@@ -751,6 +825,59 @@ def test_owner_bound_route_rejects_unowned_and_outside_sources(tmp_path: Path) -
     )
     assert outside_root.status_code == 409
     assert outside_root.json()["detail"]["code"] == "scene_mesh_input_invalid"
+
+
+@pytest.mark.parametrize(
+    ("source_uri", "expected_status", "error_message"),
+    [
+        ("examples/part.obj", 200, None),
+        ("outside.obj", 409, "allowed local source"),
+        ("examples/linked.obj", 409, "symlink"),
+    ],
+)
+def test_workspace_relative_owner_mesh_preserves_narrow_root_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_uri: str,
+    expected_status: int,
+    error_message: str | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    root = workspace / "examples"
+    root.mkdir(parents=True)
+    _write_obj(root / "part.obj")
+    outside = workspace / "outside.obj"
+    _write_obj(outside)
+    (root / "linked.obj").symlink_to(outside)
+    monkeypatch.chdir(workspace)
+    state = _SceneState(root, source_uri)
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    client = TestClient(app)
+
+    metadata = client.get(
+        "/api/scene/object-meshes/resolve",
+        params={
+            "resource_uri": source_uri,
+            "scale_x": 1.0,
+            "scale_y": 2.0,
+            "scale_z": 3.0,
+        },
+    )
+    assert metadata.status_code == expected_status
+    if error_message is not None:
+        assert metadata.json()["detail"]["code"] == "scene_mesh_input_invalid"
+        assert error_message in metadata.json()["detail"]["message"]
+    else:
+        asset = metadata.json()
+        assert asset["mesh_asset_url"] == (
+            f"/api/scene/object-meshes/{asset['asset_hash']}.glb"
+        )
+        converted = client.get(asset["mesh_asset_url"])
+        assert converted.status_code == 200
+        assert converted.headers["content-type"] == "model/gltf-binary"
+        assert converted.content.startswith(b"glTF")
+    assert state.allowed_fs_roots == [str(root)]
 
 
 def test_program_draft_mesh_route_is_revision_bound_and_cache_is_scope_separated(

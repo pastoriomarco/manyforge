@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ComposerHeadlessState } from '../types/headless';
 import {
+  MANAGER_ACTIVATION_PENDING,
+  managerActivationSettlementKey,
   nodeEnvironmentRefreshKey,
+  refreshOnManagerActivationSettled,
   refreshViewerModelsOnManagerChange,
   viewerModelRefreshKey,
 } from './nodeEnvironmentRefresh';
@@ -175,5 +178,163 @@ describe('viewerModelRefreshKey', () => {
     expect(viewerModelRefreshKey(reconciling)).not.toBe(
       viewerModelRefreshKey(converged),
     );
+  });
+});
+
+function activeManager(): ComposerHeadlessState {
+  const state = snapshot();
+  state.runtime.sections.manager.sourceGeneration = 1;
+  const payload = state.runtime.sections.manager.payload as Record<string, unknown>;
+  payload.cell_id = 'cell';
+  payload.manager_ready = true;
+  payload.runtime = { converged: true };
+  payload.apply = { records: [{ incomplete: false }] };
+  state.componentOverview.maintenanceOperation = null;
+  return state;
+}
+
+function managerPayload(state: ComposerHeadlessState): Record<string, unknown> {
+  return state.runtime.sections.manager.payload as Record<string, unknown>;
+}
+
+describe('managerActivationSettlementKey', () => {
+  it('reports pending while an Apply, maintenance, readiness or convergence is outstanding', () => {
+    const applying = activeManager();
+    managerPayload(applying).apply = { records: [{ incomplete: true }] };
+    expect(managerActivationSettlementKey(applying)).toBe(MANAGER_ACTIVATION_PENDING);
+
+    const maintenance = activeManager();
+    maintenance.componentOverview.maintenanceOperation = {
+      applyId: 'apply.1',
+      applyGeneration: 1,
+      phase: 'intent_persisted',
+      affectedRuntimeUnitIds: [],
+      reasonCode: 'planned_maintenance_in_progress',
+    };
+    expect(managerActivationSettlementKey(maintenance)).toBe(MANAGER_ACTIVATION_PENDING);
+
+    const notReady = activeManager();
+    managerPayload(notReady).manager_ready = false;
+    expect(managerActivationSettlementKey(notReady)).toBe(MANAGER_ACTIVATION_PENDING);
+
+    const reconciling = activeManager();
+    managerPayload(reconciling).runtime = { converged: false };
+    expect(managerActivationSettlementKey(reconciling)).toBe(MANAGER_ACTIVATION_PENDING);
+
+    const inactive = activeManager();
+    managerPayload(inactive).active = null;
+    expect(managerActivationSettlementKey(inactive)).toBe(MANAGER_ACTIVATION_PENDING);
+  });
+
+  it('carries no evidence for an unavailable, stale, gapped or malformed Manager section', () => {
+    const stale = activeManager();
+    stale.runtime.sections.manager.freshness = 'stale';
+    expect(managerActivationSettlementKey(stale)).toBeNull();
+
+    const unavailable = activeManager();
+    unavailable.runtime.sections.manager.available = false;
+    expect(managerActivationSettlementKey(unavailable)).toBeNull();
+
+    const gapped = activeManager();
+    gapped.runtime.sections.manager.knownGaps = ['apply'];
+    expect(managerActivationSettlementKey(gapped)).toBeNull();
+
+    const malformed = activeManager();
+    delete managerPayload(malformed).apply;
+    expect(managerActivationSettlementKey(malformed)).toBeNull();
+  });
+
+  it('names the active identity and ignores heartbeat, history and execution churn', () => {
+    const settled = activeManager();
+    const key = managerActivationSettlementKey(settled);
+    expect(key).not.toBeNull();
+    expect(key).not.toBe(MANAGER_ACTIVATION_PENDING);
+
+    const churn = structuredClone(settled);
+    churn.runtime.sections.manager.sourceGeneration = 7;
+    churn.runtime.sections.manager.receiverAgeNs = 500;
+    managerPayload(churn).apply = {
+      records: [{ incomplete: false }, { incomplete: false }],
+    };
+    churn.runtime.projectionGeneration = 99;
+    churn.componentOverview.overviewRevision = 'sha256:overview-2';
+    churn.componentOverview.components[0]!.status = 'offline';
+    churn.programCycle.cycleGeneration = 3;
+    churn.authoringWorkspace.deploymentDraftRevision = 4;
+    expect(managerActivationSettlementKey(churn)).toBe(key);
+
+    const rebound = structuredClone(settled);
+    (managerPayload(rebound).active as Record<string, unknown>).retained_bundle_id = 'sha256:other';
+    expect(managerActivationSettlementKey(rebound)).not.toBe(key);
+  });
+});
+
+describe('refreshOnManagerActivationSettled', () => {
+  function observe(states: ComposerHeadlessState[]) {
+    const refreshCatalog = vi.fn();
+    const refreshDeploymentWorkspace = vi.fn();
+    let wakeKey: string | null = null;
+    for (const state of states) {
+      wakeKey = refreshOnManagerActivationSettled(
+        wakeKey,
+        managerActivationSettlementKey(state),
+        [refreshCatalog, refreshDeploymentWorkspace],
+      );
+    }
+    return { refreshCatalog, refreshDeploymentWorkspace };
+  }
+
+  it('refreshes the catalog and Deployment workspace exactly once when a Scenario Load settles', () => {
+    const before = activeManager();
+    const accepted = structuredClone(before);
+    managerPayload(accepted).apply = { records: [{ incomplete: true }] };
+    const published = structuredClone(accepted);
+    (managerPayload(published).active as Record<string, unknown>).retained_bundle_id = 'sha256:loaded';
+    managerPayload(published).manager_ready = false;
+    const reconciling = structuredClone(published);
+    managerPayload(reconciling).apply = { records: [{ incomplete: false }] };
+    managerPayload(reconciling).manager_ready = true;
+    managerPayload(reconciling).runtime = { converged: false };
+    const settled = structuredClone(reconciling);
+    managerPayload(settled).runtime = { converged: true };
+    const heartbeat = structuredClone(settled);
+    heartbeat.runtime.sections.manager.sourceGeneration = 9;
+
+    const { refreshCatalog, refreshDeploymentWorkspace } = observe([
+      before, accepted, published, reconciling, settled, heartbeat, settled,
+    ]);
+    expect(refreshCatalog).toHaveBeenCalledOnce();
+    expect(refreshDeploymentWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it('refreshes when a pending first observation settles, but not on the first settled observation', () => {
+    const pending = activeManager();
+    managerPayload(pending).apply = { records: [{ incomplete: true }] };
+    const settled = activeManager();
+
+    const fromPending = observe([pending, settled]);
+    expect(fromPending.refreshCatalog).toHaveBeenCalledOnce();
+    expect(fromPending.refreshDeploymentWorkspace).toHaveBeenCalledOnce();
+
+    const fromSettled = observe([settled]);
+    expect(fromSettled.refreshCatalog).not.toHaveBeenCalled();
+    expect(fromSettled.refreshDeploymentWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh for unrelated deltas or a stale gap around the same identity', () => {
+    const settled = activeManager();
+    const churn = structuredClone(settled);
+    churn.runtime.sections.manager.sourceGeneration = 5;
+    churn.componentOverview.components[0]!.status = 'offline';
+    churn.programCycle.state = 'running';
+    churn.authoringWorkspace.workspaceRevision = 12;
+    const stale = structuredClone(settled);
+    stale.runtime.sections.manager.freshness = 'stale';
+
+    const { refreshCatalog, refreshDeploymentWorkspace } = observe([
+      settled, churn, stale, settled, churn,
+    ]);
+    expect(refreshCatalog).not.toHaveBeenCalled();
+    expect(refreshDeploymentWorkspace).not.toHaveBeenCalled();
   });
 });

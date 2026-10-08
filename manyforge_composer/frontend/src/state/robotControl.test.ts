@@ -8,6 +8,7 @@ import {
   initialRobotControlState,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlCandidatePresentationAllowed,
+  robotControlPreviewApprovable,
   robotControlReducer,
   selectedStatusForState,
   type ManualMotionSettings,
@@ -821,6 +822,119 @@ describe('addressed Robot Control state', () => {
       type: 'preview_resolved', generation: ready.generation, receipt: ready.preview!,
     });
     expect(late).toBe(changed);
+  });
+
+  describe('motion preview computed on a latched Scene revision', () => {
+    const planningMotion = () => {
+      const status = statusFixture();
+      let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+      state = robotControlReducer(state, { type: 'edit', positionsRad: [0.25, 0.5] });
+      const intent = buildJointMotionIntent(status, [0.25, 0.5], 'latched-1');
+      state = robotControlReducer(state, { type: 'preview_started', generation: state.generation, intent });
+      const latched = {
+        ...status.sceneRevision,
+        revision_id: status.sceneRevision.revision_id + 1,
+        content_hash: 'sha256:' + 'c'.repeat(64),
+      };
+      const receipt = { ...receiptFixture(status, 'latched-1', [0.25, 0.5]), sceneRevision: latched };
+      return { state, status, receipt, latched };
+    };
+
+    it('is not approvable until status shows the receipt revision, which does not invalidate it', () => {
+      const { state: planning, status, receipt, latched } = planningMotion();
+      const ready = robotControlReducer(planning, {
+        type: 'preview_resolved', generation: planning.generation, receipt,
+      });
+      expect(ready.phase).toBe('ready');
+      expect(ready.preview).toBe(receipt);
+      expect(robotControlPreviewApprovable(ready)).toBe(false);
+      expect(robotControlReducer(ready, { type: 'approve_started' })).toBe(ready);
+
+      const caughtUp = robotControlReducer(ready, {
+        type: 'status_refreshed', status: { ...structuredClone(status), sceneRevision: { ...latched } },
+      });
+      expect(caughtUp.phase).toBe('ready');
+      expect(caughtUp.generation).toBe(ready.generation);
+      expect(caughtUp.preview).toBe(receipt);
+      expect(caughtUp.intent).toBe(ready.intent);
+      expect(robotControlPreviewApprovable(caughtUp)).toBe(true);
+      expect(robotControlReducer(caughtUp, { type: 'approve_started' }).phase).toBe('approving');
+
+      const moved = robotControlReducer(caughtUp, {
+        type: 'status_refreshed',
+        status: { ...structuredClone(status), sceneRevision: { ...latched, revision_id: latched.revision_id + 1 } },
+      });
+      expect(moved.phase).toBe('planning');
+      expect(moved.preview).toBeNull();
+      expect(moved.generation).toBeGreaterThan(caughtUp.generation);
+    });
+
+    it('keeps a ready receipt while status advances toward its revision', () => {
+      const { state: planning, status } = planningMotion();
+      const base = status.sceneRevision;
+      const ahead = { ...base, revision_id: base.revision_id + 3, content_hash: 'sha256:' + 'e'.repeat(64) };
+      const receipt = { ...receiptFixture(status, 'latched-1', [0.25, 0.5]), sceneRevision: ahead };
+      const ready = robotControlReducer(planning, {
+        type: 'preview_resolved', generation: planning.generation, receipt,
+      });
+      expect(ready.phase).toBe('ready');
+      const toward = robotControlReducer(ready, {
+        type: 'status_refreshed',
+        status: { ...structuredClone(status), sceneRevision: { ...base, revision_id: base.revision_id + 1 } },
+      });
+      expect(toward.phase).toBe('ready');
+      expect(toward.preview).toBe(receipt);
+      expect(toward.generation).toBe(ready.generation);
+      expect(robotControlPreviewApprovable(toward)).toBe(false);
+      const reached = robotControlReducer(toward, {
+        type: 'status_refreshed', status: { ...structuredClone(status), sceneRevision: { ...ahead } },
+      });
+      expect(robotControlPreviewApprovable(reached)).toBe(true);
+      const passed = robotControlReducer(reached, {
+        type: 'status_refreshed',
+        status: { ...structuredClone(status), sceneRevision: { ...ahead, revision_id: ahead.revision_id + 1 } },
+      });
+      expect(passed.phase).toBe('planning');
+      expect(passed.preview).toBeNull();
+    });
+
+    it('keeps an in-flight preview across the latch and re-previews only older evidence', () => {
+      const { state: planning, status, receipt, latched } = planningMotion();
+      const latchedStatus = { ...structuredClone(status), sceneRevision: { ...latched } };
+      const awaiting = robotControlReducer(planning, { type: 'status_refreshed', status: latchedStatus });
+      expect(awaiting.phase).toBe('planning');
+      expect(awaiting.generation).toBe(planning.generation);
+      expect(awaiting.intent).toBe(planning.intent);
+
+      const ready = robotControlReducer(awaiting, {
+        type: 'preview_resolved', generation: awaiting.generation, receipt,
+      });
+      expect(ready.phase).toBe('ready');
+      expect(robotControlPreviewApprovable(ready)).toBe(true);
+
+      const older = robotControlReducer(awaiting, {
+        type: 'preview_resolved', generation: awaiting.generation,
+        receipt: receiptFixture(status, 'latched-1', [0.25, 0.5]),
+      });
+      expect(older.phase).toBe('planning');
+      expect(older.preview).toBeNull();
+      expect(older.intent).toBeNull();
+      expect(older.generation).toBeGreaterThan(awaiting.generation);
+    });
+
+    it('rejects a receipt older than the intent or for another Scene', () => {
+      const { state: planning, status, receipt } = planningMotion();
+      for (const sceneRevision of [
+        { ...status.sceneRevision, revision_id: status.sceneRevision.revision_id - 1 },
+        { ...receipt.sceneRevision, scene_id: 'sha256:' + 'd'.repeat(64) },
+      ]) {
+        const rejected = robotControlReducer(planning, {
+          type: 'preview_resolved', generation: planning.generation, receipt: { ...receipt, sceneRevision },
+        });
+        expect(rejected.phase).toBe('blocked');
+        expect(rejected.preview).toBeNull();
+      }
+    });
   });
 
   it('fails closed instead of choosing among multiple resident operations', () => {

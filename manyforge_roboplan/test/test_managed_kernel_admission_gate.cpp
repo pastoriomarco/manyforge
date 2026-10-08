@@ -101,13 +101,19 @@ TextMember(const deployment::CanonicalValue &root,
 }
 
 struct OwnerFixture final {
-  OwnerFixture()
-      : retained_root(std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
+  explicit OwnerFixture(bool canonical_empty = false)
+      : retained_root(
+            canonical_empty
+                ? std::filesystem::path(
+                      MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT)
+                : std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
                       "retained-package"),
         bundle_source(retained_root) {
     const auto manifest = deployment::parse_strict_json_model_yaml(
-        ReadFile(std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
-                 "manifest.json"));
+        ReadFile(canonical_empty
+                     ? retained_root / "canonical-empty-admission.json"
+                     : std::filesystem::path(MANYFORGE_I6_NATIVE_FIXTURE_ROOT) /
+                           "manifest.json"));
     bundle = bundle_source.get_verified(core::RetainedBundleId(
         TextMember(manifest.root(), "retained_bundle_id")));
     if (bundle == nullptr) {
@@ -776,3 +782,87 @@ TEST(ManagedKernelAdmissionGate,
 }
 
 } // namespace
+
+TEST(ManagedKernelApplyFenceOwner,
+     InitialComponentPreparationPinsEmptyPredecessorBeforeCandidateStaging) {
+  OwnerFixture fixture(true);
+  ASSERT_TRUE(
+      fixture.bundle->value().cell_graph.controllable_components.empty());
+  ManagedKernelAdmissionGate gate;
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      std::vector<core::ResourceId>{},
+      std::vector<core::DomainActiveControlConfigurationDTO>{},
+      gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  ManagedKernelApplyFenceOwner owner(fixture.Config("initial-add"), gate);
+  auto scope = AffectedScope();
+  scope.domains.front().predecessor_control_domain_revision.reset();
+  scope.bindings.front().predecessor_control_binding_revision.reset();
+  const core::RuntimeEpoch manager_epoch("manager.initial-add");
+  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  ASSERT_TRUE(observed.presence_valid());
+  ASSERT_TRUE(observed.active_control_configurations.empty());
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      {core::RequestId("request.initial-add"),
+       core::RequestOwnerEpoch("manager-owner.initial-add"), "initial-add-test",
+       std::nullopt},
+      {core::ApplyId("apply.initial-add"), core::ApplyGeneration(1U)},
+      scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      observed.operation_resource_generation,
+      observed.configuration_fence_generation,
+      {},
+      "prepare a first component under the empty predecessor fence"};
+  const auto accepted = owner.Acquire(intent);
+  ASSERT_TRUE(accepted.matches(intent));
+  const core::ConfigurationFenceStatusQueryDTO query{
+      intent.owner_transaction, accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, scope, manager_epoch};
+  // Status requires installed candidate configurations; preparation must not.
+  EXPECT_THROW(static_cast<void>(owner.QueryStatus(query)), std::runtime_error);
+  unsigned effects = 0U;
+  const auto prepare = [&](const auto &selected) {
+    owner.RunWithExactHeldPredecessor(
+        selected, observed.execution_host_epoch.publication_generation,
+        observed.active_public_pointer_digest, [&] { ++effects; });
+  };
+  EXPECT_NO_THROW(prepare(query));
+  EXPECT_EQ(effects, 1U);
+  auto wrong = query;
+  wrong.expected_scope.resources.pop_back();
+  EXPECT_THROW(prepare(wrong), std::runtime_error);
+  wrong = query;
+  wrong.configuration_fence_id =
+      core::ConfigurationFenceId("missing.initial-add");
+  EXPECT_THROW(prepare(wrong), std::runtime_error);
+  EXPECT_EQ(effects, 1U);
+  gate.ReleaseFence(query.configuration_fence_id, scope);
+  EXPECT_THROW(prepare(query), std::runtime_error);
+  EXPECT_EQ(effects, 1U);
+}
+
+TEST(ManagedKernelAdmissionGate,
+     MissingOrChangedFenceRejectsComponentStartBeforeEffects) {
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  const core::ConfigurationFenceId fence_id("fence.initial-component");
+  unsigned effects = 0U;
+  EXPECT_THROW(gate.RunWithExactHeldFence(fence_id, scope, [&] { ++effects; }),
+               std::runtime_error);
+  EXPECT_EQ(effects, 0U);
+  gate.RestoreFence(fence_id, scope);
+  auto wrong_scope = scope;
+  wrong_scope.resources.pop_back();
+  EXPECT_THROW(
+      gate.RunWithExactHeldFence(fence_id, wrong_scope, [&] { ++effects; }),
+      std::runtime_error);
+  EXPECT_EQ(effects, 0U);
+  gate.RunWithExactHeldFence(fence_id, scope, [&] { ++effects; });
+  EXPECT_EQ(effects, 1U);
+  gate.ReleaseFence(fence_id, scope);
+  EXPECT_THROW(gate.RunWithExactHeldFence(fence_id, scope, [&] { ++effects; }),
+               std::runtime_error);
+  EXPECT_EQ(effects, 1U);
+}

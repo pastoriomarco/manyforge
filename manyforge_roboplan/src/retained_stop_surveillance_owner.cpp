@@ -1342,41 +1342,26 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
       }
     }
 
-    std::map<core::ControlDomainId,
-             core::StopFaultRecoveryConfigurationExpectationDTO>
-        expectations;
-    for (const auto &scope : status.scope_entries) {
-      const auto *participant =
-          std::get_if<core::StopParticipantScopeFactsDTO>(&scope.facts);
-      if (participant == nullptr)
-        continue;
-      const core::StopFaultRecoveryConfigurationExpectationDTO expectation{
-          participant->control_domain_id,
-          participant->active_control_configuration_id,
-          participant->active_control_configuration_generation};
-      const auto [found, inserted] =
-          expectations.emplace(expectation.control_domain_id, expectation);
-      if (!inserted && found->second != expectation) {
-        return invalid<core::StopFaultRecoveryFactsDTO>(
-            "native_stop_recovery_configuration_conflict",
-            "terminal Stop scope contains conflicting configuration facts");
-      }
+    // The same shared owner derives the Kernel offer table, so offer, intent
+    // and facts cannot diverge. An idle cell-wide Stop uses the installed
+    // sources' control domains; no installed proof fails closed.
+    std::vector<const core::RuntimeParticipantBinding *> installed_bindings;
+    installed_bindings.reserve(sources.size());
+    for (const auto &source : sources) {
+      installed_bindings.push_back(&source.binding);
     }
-    if (expectations.empty()) {
-      for (const auto &source : sources) {
-        const auto &path = *source.binding.value().control_path;
-        expectations.emplace(path.control_domain_id,
-                             core::StopFaultRecoveryConfigurationExpectationDTO{
-                                 path.control_domain_id,
-                                 path.active_control_configuration_id,
-                                 path.active_control_configuration_generation});
-      }
+    auto expectations = core::StopFaultRecoveryConfigurationExpectations(
+        status, installed_bindings);
+    if (!expectations.ok()) {
+      return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+          expectations.error());
     }
 
     std::vector<core::StopFaultRecoveryConfigurationFactDTO>
         configuration_facts;
-    configuration_facts.reserve(expectations.size());
-    for (const auto &[domain, expectation] : expectations) {
+    configuration_facts.reserve(expectations.value().size());
+    for (const auto &expectation : expectations.value()) {
+      const auto &domain = expectation.control_domain_id;
       std::optional<core::ContentDigest> evidence;
       const bool exact =
           std::any_of(sources.begin(), sources.end(), [&](const auto &source) {

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_terminal_state.hpp>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -89,6 +91,46 @@ struct StopFaultRecoveryEvaluationDTO final {
     const StopFaultRecoveryFactsDTO& facts) noexcept;
 [[nodiscard]] std::optional<std::string_view> stop_fault_recovery_evaluation_field_error(
     const StopFaultRecoveryEvaluationDTO& evaluation) noexcept;
+
+/// Error codes of the shared configuration-expectation owner below. Only the
+/// terminal conflict is an invariant violation; every other code means the
+/// recovery configuration proof is unavailable for the current latch.
+inline constexpr std::string_view kStopFaultRecoveryTerminalConfigurationConflict =
+    "stop_fault_recovery_terminal_configuration_conflict";
+inline constexpr std::string_view kStopFaultRecoveryParticipantConfigurationMissing =
+    "stop_fault_recovery_participant_configuration_missing";
+inline constexpr std::string_view kStopFaultRecoveryInstalledConfigurationUnavailable =
+    "stop_fault_recovery_installed_configuration_unavailable";
+inline constexpr std::string_view kStopFaultRecoveryInstalledConfigurationInvalid =
+    "stop_fault_recovery_installed_configuration_invalid";
+inline constexpr std::string_view kStopFaultRecoveryInstalledConfigurationConflict =
+    "stop_fault_recovery_installed_configuration_conflict";
+
+/// True for an explicit Full Stop or a Stop promoted to Full (for example a
+/// recognized-malformed Stop request).
+[[nodiscard]] bool stop_status_cell_wide(const StopStatusDTO& status) noexcept;
+
+/// The installed control domains' active configurations, one canonical row
+/// per domain, read from the sealed installed bindings of the exact retained
+/// product. Fails closed when no installed binding has a control path, when a
+/// binding crosses the expected product or carries an invalid identity, or
+/// when one domain has two active configurations. Never fabricates rows.
+[[nodiscard]] Result<std::vector<StopFaultRecoveryConfigurationExpectationDTO>>
+InstalledControlDomainConfigurations(
+    std::span<const RuntimeParticipantBinding* const> installed_bindings,
+    const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision);
+
+/// The sole recovery configuration table for one exact latched terminal
+/// status, shared by the Kernel offer and the native recovery-facts owner so
+/// offer, intent and facts cannot diverge. Participant scope rows are
+/// authoritative. Only a cell-wide Stop whose terminal captured no participant
+/// configuration uses InstalledControlDomainConfigurations for the latch's
+/// retained product. The Stop scope, certificate and captured resources are
+/// never changed.
+[[nodiscard]] Result<std::vector<StopFaultRecoveryConfigurationExpectationDTO>>
+StopFaultRecoveryConfigurationExpectations(
+    const StopStatusDTO& terminal_status,
+    std::span<const RuntimeParticipantBinding* const> installed_bindings);
 
 [[nodiscard]] Result<StopFaultLatchDTO> AssessStopFaultRecovery(
     const StopStatusDTO& terminal_status, const StopFaultRecoveryFactsDTO& facts);

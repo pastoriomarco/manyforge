@@ -69,6 +69,13 @@ public:
 
   [[nodiscard]] core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override;
+  /// Freshness-only publication for one unchanged committed object. Requires
+  /// health at exactly the expected projection revision and an unattached
+  /// cell-fixed object whose committed pose and evidence origin/budget match
+  /// with an older committed sequence; never changes projection health,
+  /// SceneRevision, the collision world or the effective policy.
+  [[nodiscard]] core::Result<void> ApplyProviderFreshness(
+      const core::ProviderFreshnessConfirmationDTO &confirmation) override;
   [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
   RetainProjection(const core::ProjectionRevisionDTO &projection_revision,
                    core::ProjectionLeaseId projection_lease_id) override;

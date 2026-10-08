@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -38,6 +39,7 @@
 #include "deployment_catalog_codec_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "retention_store_fixtures.hpp"
@@ -1591,6 +1593,62 @@ TEST(RetainedBundleMaterializer,
 }
 
 TEST(RetainedBundleMaterializer,
+     ExecutionMotionLimitDecoderPreservesCapsAndRefusesInvalidOrDuplicateRows) {
+  const auto row = [](const double maximum) {
+    return core::JsonValueDTO{core::JsonObjectDTO{
+        {"controllable_component_id",
+         core::JsonValueDTO{std::string("isaac_ur10e_light_robot")}},
+        {"command_target_id", core::JsonValueDTO{std::string("arm")}},
+        {"maximum_tcp_linear_speed_mps", core::JsonValueDTO{maximum}},
+    }};
+  };
+  const auto valid = detail::decode_execution_motion_target_limits(
+      core::JsonValueDTO::Array{row(0.25)}, false);
+  ASSERT_EQ(valid.size(), 1U);
+  EXPECT_DOUBLE_EQ(valid.front().maximum_tcp_linear_speed_mps, 0.25);
+  EXPECT_FALSE(valid.front().ordinary_motion_jerk.enabled);
+  for (const double invalid :
+       {0.0, -0.1, 1001.0, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()}) {
+    EXPECT_THROW(
+        static_cast<void>(detail::decode_execution_motion_target_limits(
+            core::JsonValueDTO::Array{row(invalid)}, false)),
+        RetainedBundleError);
+  }
+  EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
+                   core::JsonValueDTO::Array{row(0.25), row(0.25)}, false)),
+               RetainedBundleError);
+  auto missing = row(0.25);
+  std::get<core::JsonObjectDTO>(missing.value).erase("command_target_id");
+  EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
+                   core::JsonValueDTO::Array{missing}, false)),
+               RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     Ros2ControlConfigurationRejectsSchemaValidLimitForAnUnhostedTarget) {
+  const auto fixture = test::make_lite6_ros2_control_motion_retention_fixture(
+      false, "unhosted_arm");
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+  const auto &unit = bundle->value().cell_graph.runtime_units.front();
+  EXPECT_TRUE(detail::ros2_control_execution_runtime_configuration_is_qualified(
+      unit.configuration));
+  EXPECT_THROW(
+      static_cast<void>(
+          ros2_control_execution_runtime_contract::require_configuration(
+              *bundle, unit.runtime_unit_id)),
+      RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
      Ros2ControlMotionLite6RetainsDistinctExactRuntimeProduct) {
   const auto fixture =
       test::make_lite6_ros2_control_motion_retention_fixture();
@@ -1649,9 +1707,33 @@ TEST(RetainedBundleMaterializer,
   const CanonicalValue parsed_manifest =
       detail::parse_and_verify_ros2_control_execution_runtime_manifest(
           manifest);
+  const auto &liveness =
+      native_execution_runtime_contract::manager_liveness_policy();
+  const auto &retained_liveness = member(parsed_manifest, "manager_liveness_policy");
+  EXPECT_EQ(string_member(retained_liveness, "runtime_policy_id"),
+            liveness.runtime_policy_id.value());
+  EXPECT_EQ(string_member(retained_liveness, "runtime_policy_revision"),
+            liveness.runtime_policy_revision.value());
+  EXPECT_EQ(std::get<double>(
+                member(retained_liveness, "heartbeat_period_ns").storage()),
+            static_cast<double>(liveness.heartbeat_period_ns));
+  EXPECT_EQ(std::get<double>(
+                member(retained_liveness, "expiry_timeout_ns").storage()),
+            static_cast<double>(liveness.expiry_timeout_ns));
+  EXPECT_EQ(string_member(retained_liveness, "local_safe_state_contract_id"),
+            liveness.local_safe_state_contract_id.value());
+  EXPECT_EQ(string_member(retained_liveness, "local_safe_state_contract_revision"),
+            liveness.local_safe_state_contract_revision.value());
+  const auto changed_liveness = replace_once(
+      manifest, "\"heartbeat_period_ns\":250000000",
+      "\"heartbeat_period_ns\":250000001");
+  EXPECT_THROW(static_cast<void>(
+      detail::parse_and_verify_ros2_control_execution_runtime_manifest(
+          changed_liveness)),
+      RetainedBundleError);
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
-      R"({"collision_monitor_period_ms":100,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","planner_rng_seed":12345,"runtime_collision_immediate_query_budget_ms":75,"runtime_collision_lookahead_cycle_budget_ms":350,"runtime_collision_lookahead_max_samples":32,"runtime_collision_lookahead_query_budget_ms":75,"runtime_collision_lookahead_s":2,"runtime_collision_lookahead_workers":4,"runtime_dynamic_body_max_age_cap_ms":1000,"validation_collision_workers":4})");
+      R"({"collision_monitor_period_ms":100,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","motion_target_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","maximum_tcp_linear_speed_mps":0.15}],"planner_rng_seed":12345,"runtime_collision_immediate_query_budget_ms":75,"runtime_collision_lookahead_cycle_budget_ms":350,"runtime_collision_lookahead_max_samples":32,"runtime_collision_lookahead_query_budget_ms":75,"runtime_collision_lookahead_s":2,"runtime_collision_lookahead_workers":4,"runtime_dynamic_body_max_age_cap_ms":1000,"validation_collision_workers":4})");
   EXPECT_NO_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
@@ -1660,6 +1742,13 @@ TEST(RetainedBundleMaterializer,
       ros2_control_execution_runtime_contract::require_configuration(
           *bundle, group.runtime_unit_id);
   EXPECT_EQ(runtime_configuration.isaac_profile, "lite6");
+  ASSERT_EQ(runtime_configuration.motion_target_limits.size(), 1U);
+  const auto &motion_limit = runtime_configuration.motion_target_limits.front();
+  EXPECT_EQ(motion_limit.controllable_component_id.value(),
+            test::kLite6ControllableComponentId);
+  EXPECT_EQ(motion_limit.command_target_id.value(), "arm");
+  EXPECT_DOUBLE_EQ(motion_limit.maximum_tcp_linear_speed_mps, 0.15);
+  EXPECT_FALSE(motion_limit.ordinary_motion_jerk.enabled);
   EXPECT_EQ(runtime_configuration.planner_rng_seed, 12345U);
   EXPECT_EQ(runtime_configuration.initial_joint_positions_rad,
             (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));

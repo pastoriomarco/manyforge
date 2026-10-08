@@ -126,10 +126,16 @@ struct StopFaultRecoveryConfigurationExpectationDTO final {
 /// Atomic current fault/recovery context. Before a certificate exists this
 /// carries only the waiting latch and an empty configuration table: it does
 /// not authorize recovery. The actionable table derives from the same exact
-/// resident terminal status, never from caller input or separate reads.
+/// resident terminal status (or, for a cell-wide Stop that captured no
+/// participant configuration, from the installed control domains through
+/// StopFaultRecoveryConfigurationExpectations), never from caller input.
+/// When a certified latch has no provable configuration table the offer
+/// still publishes the latch, with an empty table and a non-empty
+/// recovery_unavailable_reason; it never carries an empty proof.
 struct StopFaultRecoveryOfferDTO final {
   StopFaultLatchDTO latch;
   std::vector<StopFaultRecoveryConfigurationExpectationDTO> configuration_expectations;
+  std::optional<std::string> recovery_unavailable_reason;
 
   friend bool operator==(const StopFaultRecoveryOfferDTO&,
                          const StopFaultRecoveryOfferDTO&) = default;

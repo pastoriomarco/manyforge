@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -22,6 +23,7 @@
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "runtime_only_retention_fixture.hpp"
+#include "canonical_empty_admission_internal.hpp"
 
 namespace manyforge::component_manager {
 namespace {
@@ -187,6 +189,55 @@ MaterializeNativeRuntimePackage(const std::filesystem::path &root,
           root),
       std::make_unique<
           deployment::FilesystemVerifiedRetainedProductArtifactSource>(root),
+  };
+}
+
+[[nodiscard]] RuntimePackage
+MaterializeRosRuntimePackage(const std::filesystem::path &root,
+                             bool empty = false,
+                             std::string_view motion_limit_target =
+                                 deployment::test::kLite6ArmTargetId) {
+  auto fixture = deployment::test::make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, "runtime_only_cell", false, false,
+      "resource", false, {}, {}, true, false, {}, false, std::nullopt, false,
+      motion_limit_target);
+  const deployment::test::Lite6ControllableCompilerInputArtifactSource
+      input_source(fixture);
+  auto qualified = fixture.qualified;
+  if (empty) {
+    const std::vector<deployment::QualifiedRuntimeProfile> profiles{
+        *fixture.ros2_control_execution_runtime_profile};
+    const auto derived =
+        deployment::detail::derive_cell_scoped_canonical_empty_deployment(
+            fixture.qualified.deployment(), profiles);
+    const auto composition = deployment::compose_cell_occurrences(
+        derived.graph(), {}, {});
+    const auto overlay = deployment::select_site_overlay_for_deployment(
+        derived.applicability_inputs().value().site_overlay_ref,
+        derived.applicability_inputs().value().external_resources, nullptr);
+    const auto applicability = deployment::qualify_cell_applicability(
+        composition, derived.applicability_inputs(), profiles, {}, {}, {},
+        {}, {}, {}, {}, {}, overlay);
+    qualified = deployment::qualify_deployment_for_retention(
+        derived, deployment::compile_cell_ir(applicability));
+  }
+  deployment::FilesystemBuildManifestRepository manifests(root);
+  deployment::FilesystemCatalogArtifactStore catalogs(root);
+  deployment::FilesystemRawArtifactStore artifacts(root);
+  deployment::FilesystemRetainedBundleRepository bundles(root);
+  auto bundle = deployment::detail::RetainedBundleMaterializer::
+      materialize_store_and_reload_production(
+          qualified, manifests, input_source,
+          empty ? std::span<const deployment::BuildQualifiedStructuralModelPreparation>{}
+                : fixture.structural_preparations(),
+          catalogs, artifacts, bundles);
+  if (bundle == nullptr) {
+    throw std::runtime_error("ROS continuity fixture produced no retained bundle");
+  }
+  return {
+      std::move(bundle),
+      std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(root),
+      std::make_unique<deployment::FilesystemVerifiedRetainedProductArtifactSource>(root),
   };
 }
 
@@ -1551,6 +1602,81 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_FALSE(journal.ReadRuntimeConvergenceIntent(intent.apply_id,
                                                    intent.apply_generation)
                    .has_value());
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     RosExecutionHostDerivedEmptyRetainsExactCandidateProduct) {
+  ScopedPackageRoot root;
+  const auto predecessor = MaterializeRosRuntimePackage(root.path(), true);
+  const auto candidate = MaterializeRosRuntimePackage(root.path());
+  EXPECT_TRUE(predecessor.bundle->value().cell_graph.controllable_components.empty());
+  EXPECT_FALSE(candidate.bundle->value().cell_graph.controllable_components.empty());
+  EXPECT_EQ(predecessor.bundle->value().cell_graph.runtime_units,
+            candidate.bundle->value().cell_graph.runtime_units);
+  EXPECT_EQ(predecessor.bundle->value().compiled_products.runtime_unit_products,
+            candidate.bundle->value().compiled_products.runtime_unit_products);
+  for (const auto *package : {&predecessor, &candidate}) {
+    const auto product = deployment::verify_runtime_unit_product(
+        *package->bundle,
+        package->bundle->value().cell_graph.runtime_units.front().runtime_unit_id,
+        *package->artifact_source);
+    ASSERT_TRUE(product.has_value());
+    ASSERT_TRUE(product->manager_liveness_policy().has_value());
+    EXPECT_EQ(*product->manager_liveness_policy(),
+              deployment::native_execution_runtime_contract::manager_liveness_policy());
+  }
+  EXPECT_TRUE(VerifyNativeExecutionHostContinuity(
+      *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source).ok());
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     RosExecutionHostRemovalOrReplacementRejectsBeforeRuntimeEffect) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state_root;
+  const auto predecessor = MaterializeRosRuntimePackage(root.path(), true);
+  const auto removed = MaterializeRuntimePackage(root.path());
+  const auto replaced = MaterializeNativeRuntimePackage(root.path());
+  const auto drifted = MaterializeRosRuntimePackage(root.path(), false, "unhosted_arm");
+  // An installed native fence owner cannot turn into a ROS owner during Apply.
+  const auto native_to_ros = VerifyNativeExecutionHostContinuity(
+      *replaced.bundle, *predecessor.bundle, *predecessor.artifact_source);
+  ASSERT_FALSE(native_to_ros.ok());
+  EXPECT_EQ(native_to_ros.error().details.at("reason"),
+            "candidate_native_host_missing");
+  for (const auto *candidate : {&removed, &replaced, &drifted}) {
+    auto intent = ApplyIntent(*predecessor.bundle);
+    intent.candidate_retained_bundle_id = candidate->bundle->retained_bundle_id();
+    intent.candidate_graph_revision = candidate->bundle->value().cell_graph.graph_revision;
+    const auto continuity = VerifyNativeExecutionHostContinuity(
+        *predecessor.bundle, *candidate->bundle, *predecessor.artifact_source);
+    ASSERT_FALSE(continuity.ok());
+    EXPECT_EQ(continuity.error().code, "native_execution_host_incompatible");
+    EXPECT_EQ(continuity.error().details.at("reason"),
+              candidate == &drifted ? "native_product_identity_changed"
+                                    : "candidate_native_host_missing");
+    const auto database = state_root.path() /
+        (candidate->bundle->retained_bundle_id().value().substr(7U) + ".sqlite3");
+    SqliteManagerApplyJournal journal(database, intent.cell_id);
+    SqliteManagerApplyJournal reader(database, intent.cell_id);
+    CurrentPublicationReader publication(PredecessorPublication(intent));
+    ScriptedRuntimePorts ports(reader);
+    ManagerApplyRuntimeConvergenceCoordinator coordinator(
+        journal, publication, *predecessor.artifact_source, ports, ports,
+        "linux", std::string(deployment::ros2_control_execution_runtime_contract::
+                                 kLaunchEnvironmentContract),
+        [] { return 1'000U; });
+    EXPECT_THROW(static_cast<void>(coordinator.ConvergeOrRecover(
+        intent, *predecessor.bundle, *candidate->bundle,
+        ActiveBundlePublicationGeneration(3U))),
+        ManagerRuntimeConvergenceCoordinatorError);
+    EXPECT_EQ(publication.read_calls, 0);
+    EXPECT_EQ(ports.observe_calls, 0);
+    EXPECT_EQ(ports.ensure_calls, 0);
+    EXPECT_FALSE(journal.ReadIntent(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadFenceAttempt(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadFenceAcceptance(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadRuntimeConvergenceIntent(intent.apply_id, intent.apply_generation).has_value());
+  }
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,

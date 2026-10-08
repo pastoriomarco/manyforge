@@ -32,6 +32,11 @@ public:
 /// adoption, public socket, executable/argument selection, or caller
 /// authorization. A child is staged-ready only after its direct status report
 /// matches the verified retained product and reports a closed command surface.
+///
+/// `scene_asset_root`, when non-empty, is the approved root for relative
+/// Program scene meshes. It is opened once here, kept for the adapter's
+/// lifetime, and passed to every child as an inherited directory descriptor;
+/// it is never a retained package root.
 class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
@@ -54,7 +59,8 @@ public:
       std::string operating_system, std::string launch_environment_contract,
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
-      std::filesystem::path activation_root = {});
+      std::filesystem::path activation_root = {},
+      std::filesystem::path scene_asset_root = {});
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -69,7 +75,8 @@ public:
       std::vector<std::string> launch_environment_contracts,
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
-      std::filesystem::path activation_root = {});
+      std::filesystem::path activation_root = {},
+      std::filesystem::path scene_asset_root = {});
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =

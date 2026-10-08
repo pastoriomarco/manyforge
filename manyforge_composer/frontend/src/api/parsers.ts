@@ -3494,9 +3494,13 @@ export function parseDeploymentWorkspaceResponse(
   if (runReady === (runReason !== null)) {
     return fail(`${path}.runAdmission`, 'a reason exactly while Run is blocked');
   }
-  if (runReady !== (
-    deploymentRevision === null || deploymentRevision === managerRevision
-  )) {
+  // A compiled Draft revision is compared exactly. A Draft without one (empty,
+  // or source-referenced intent) is compared by the backend on documents, so
+  // only require that a ready Run names an Applied identity.
+  if (
+    (deploymentRevision !== null && runReady !== (deploymentRevision === managerRevision))
+    || (runReady && managerScenarioId === null)
+  ) {
     return fail(
       `${path}.runAdmission`,
       'the exact Deployment Draft and Manager Applied comparison',
@@ -6079,13 +6083,10 @@ export function parseSceneMeshAssetMetadata(
     record,
     [
       'asset_hash',
-      'cell_id',
       'last_error',
       'mesh_asset_status',
       'mesh_asset_url',
       'schema_version',
-      'source_generation',
-      'source_owner_epoch',
     ],
     'sceneMeshAsset',
   );
@@ -6093,10 +6094,10 @@ export function parseSceneMeshAssetMetadata(
     record.schema_version,
     'sceneMeshAsset.schema_version',
   );
-  if (schemaVersion !== 'manyforge.scene_mesh_asset.v1') {
+  if (schemaVersion !== 'manyforge.scene_mesh_asset.v2') {
     return fail(
       'sceneMeshAsset.schema_version',
-      'manyforge.scene_mesh_asset.v1',
+      'manyforge.scene_mesh_asset.v2',
     );
   }
   const assetHash = stringAt(record.asset_hash, 'sceneMeshAsset.asset_hash');
@@ -6123,36 +6124,16 @@ export function parseSceneMeshAssetMetadata(
       'present exactly for parse_failed status',
     );
   }
-  const sourceOwnerEpoch = stringAt(
-    record.source_owner_epoch,
-    'sceneMeshAsset.source_owner_epoch',
-  );
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(sourceOwnerEpoch)) {
-    return fail('sceneMeshAsset.source_owner_epoch', 'a bounded owner epoch');
-  }
-  const sourceGeneration = integerAt(
-    record.source_generation,
-    'sceneMeshAsset.source_generation',
-  );
-  const cellId = stringAt(record.cell_id, 'sceneMeshAsset.cell_id');
-  if (!cellId || cellId.length > 256) {
-    return fail('sceneMeshAsset.cell_id', 'a bounded non-empty cell ID');
-  }
   const meshAssetUrl = stringAt(
     record.mesh_asset_url,
     'sceneMeshAsset.mesh_asset_url',
   );
-  const expectedParams = new URLSearchParams({
-    owner_epoch: sourceOwnerEpoch,
-    generation: String(sourceGeneration),
-  });
-  if (
-    meshAssetUrl
-    !== `/api/scene/object-meshes/${assetHash}.glb?${expectedParams.toString()}`
-  ) {
+  // Content-addressed: the URL names the asset only, never an owner epoch or
+  // generation; the backend reauthorizes it against current owner truth.
+  if (meshAssetUrl !== `/api/scene/object-meshes/${assetHash}.glb`) {
     return fail(
       'sceneMeshAsset.mesh_asset_url',
-      'the exact owner-generation-bound asset URL',
+      'the exact content-addressed asset URL',
     );
   }
   return {
@@ -6160,9 +6141,6 @@ export function parseSceneMeshAssetMetadata(
     asset_hash: assetHash,
     mesh_asset_url: meshAssetUrl,
     mesh_asset_status: status as SceneMeshAssetMetadata['mesh_asset_status'],
-    source_owner_epoch: sourceOwnerEpoch,
-    source_generation: sourceGeneration,
-    cell_id: cellId,
     last_error: lastError,
   };
 }
@@ -7638,7 +7616,7 @@ export function parseStopFaultRecoveryOffer(
   const offer = objectAt(envelope.stop_fault, 'stopFaultResponse.stop_fault');
   exactKeysAt(
     offer,
-    ['configuration_expectations', 'latch'],
+    ['configuration_expectations', 'latch', 'recovery_unavailable_reason'],
     'stopFaultResponse.stop_fault',
   );
   const latch = objectAt(offer.latch, 'stopFaultResponse.stop_fault.latch');
@@ -7724,9 +7702,20 @@ export function parseStopFaultRecoveryOffer(
       ),
     };
   });
+  const recoveryUnavailableReason = offer.recovery_unavailable_reason === null
+    ? null
+    : stringAt(
+      offer.recovery_unavailable_reason,
+      'stopFaultResponse.stop_fault.recovery_unavailable_reason',
+    );
+  // A certified latch carries a non-empty proof or a named unavailable reason,
+  // never both; an uncertified latch carries neither.
   if (
-    (expectations.length === 0
-      && !(certificate === null && recoveryStatus === 'waiting_for_observation'))
+    (certificate === null
+      ? expectations.length !== 0
+        || recoveryUnavailableReason !== null
+        || recoveryStatus !== 'waiting_for_observation'
+      : (expectations.length === 0) === (recoveryUnavailableReason === null))
     || expectations.some((row, index) => (
       index > 0
       && expectations[index - 1].controlDomainId >= row.controlDomainId
@@ -7759,6 +7748,7 @@ export function parseStopFaultRecoveryOffer(
     ),
     stopCertificate: certificate,
     configurationExpectations: expectations,
+    recoveryUnavailableReason,
   };
 }
 
@@ -8625,14 +8615,17 @@ function manualControlGripperDescriptorAt(
   }
   const authoredValues = [
     description, actuationKind, commandDurationS, openStateRef, closedStateRef,
-    sourceGroupName, mountFrame, attachFrame, tcpFrame,
+    mountFrame, attachFrame, tcpFrame,
   ];
+  // A retained SRDF group and its presets can exist without authored tool
+  // configuration. Once configured, the complete configuration needs both.
   const configured = authoredValues.some((item) => item !== null)
     || touchLinks.length > 0
     || auxiliaryFrames.length > 0;
   if (
     (configured && (
       authoredValues.some((item) => item === null)
+      || sourceGroupName === null
       || description?.trim() === ''
       || commandDurationS === null
       || commandDurationS <= 0

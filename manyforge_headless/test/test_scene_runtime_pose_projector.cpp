@@ -153,6 +153,17 @@ public:
     return result;
   }
 
+  core::Result<core::ProjectionRevisionDTO> ConfirmProviderFreshness(
+      const core::ProviderFreshnessConfirmationDTO &confirmation) override {
+    ++confirmation_count;
+    last_confirmation = confirmation;
+    if (confirmation_error.has_value()) {
+      return core::Result<core::ProjectionRevisionDTO>::Err(
+          *confirmation_error);
+    }
+    return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
+  }
+
   core::Result<core::Pose3DTO>
   GetObjectPose(const core::SceneResourceId &) const override {
     if (!state.exists) {
@@ -169,7 +180,29 @@ public:
   std::optional<core::ErrorDTO> failure;
   std::optional<core::SceneTransactionRequestDTO> last_request;
   std::size_t commit_count{};
+  std::optional<core::ErrorDTO> confirmation_error;
+  std::optional<core::ProviderFreshnessConfirmationDTO> last_confirmation;
+  std::size_t confirmation_count{};
 };
+
+PoseSourceObservation Newer(PoseSourceObservation observation,
+                            const std::uint64_t sequence) {
+  const auto budget = observation.expires_at_ns - observation.observed_at_ns;
+  observation.source_sequence = sequence;
+  observation.observed_at_ns += 250;
+  observation.expires_at_ns = observation.observed_at_ns + budget;
+  return observation;
+}
+
+core::Result<SceneRuntimePoseApplicationResult>
+ApplyTo(SceneRuntimePoseProjector &projector, const FakeSceneAuthority &scene,
+        const std::vector<core::CapabilityProviderBindingDTO> &providers,
+        const PoseSourceObservation &observation,
+        const std::optional<SceneRuntimePoseApplicationResult> &prior =
+            std::nullopt) {
+  return projector.Apply(providers, scene.projection.retained_bundle_id,
+                         scene.projection.graph_revision, observation, prior);
+}
 
 TEST(SceneRuntimePoseProjector,
      CommitsExactProviderEvidenceAndRecognizesDurableReplay) {
@@ -335,6 +368,192 @@ TEST(SceneRuntimePoseProjector,
   EXPECT_EQ(failed.error().code, "scene_runtime_pose_commit_failed");
   EXPECT_EQ(failed.error().details.at("scene_error_code"),
             "native_projection_failed");
+}
+
+TEST(SceneRuntimePoseProjector,
+     ConfirmsFreshnessOfUnchangedPoseWithoutCommitting) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  SceneRuntimePoseProjector projector(scene, cell_id);
+  const std::vector providers{Provider(cell_id)};
+  const auto initial = ApplyTo(projector, scene, providers, Observation());
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  const auto committed_projection = scene.projection;
+
+  // The source timestamp is diagnostic only and never blocks confirmation.
+  const auto newer =
+      Newer(Observation(PosePayload(0.25, 1.0, 1500000000)), 3U);
+  const auto confirmed = ApplyTo(projector, scene, providers, newer);
+
+  ASSERT_TRUE(confirmed.ok()) << confirmed.error().message;
+  ASSERT_TRUE(confirmed.value().valid());
+  EXPECT_EQ(confirmed.value().status,
+            SceneRuntimePoseApplicationStatus::kFreshnessConfirmed);
+  EXPECT_EQ(ToString(confirmed.value().status), "freshness_confirmed");
+  EXPECT_EQ(confirmed.value().projection_revision, committed_projection);
+  EXPECT_FALSE(confirmed.value().update_status.has_value());
+  EXPECT_EQ(scene.commit_count, 1U);
+  EXPECT_EQ(scene.projection, committed_projection);
+  ASSERT_EQ(scene.confirmation_count, 1U);
+  ASSERT_TRUE(scene.last_confirmation.has_value());
+  EXPECT_TRUE(scene.last_confirmation->valid());
+  EXPECT_EQ(scene.last_confirmation->expected_projection_revision,
+            committed_projection);
+  EXPECT_EQ(scene.last_confirmation->scene_resource_id.value(), "box");
+  EXPECT_EQ(scene.last_confirmation->pose_in_cell, scene.pose);
+  const auto &evidence = scene.last_confirmation->evidence;
+  EXPECT_EQ(evidence.provider_source_sequence, 3U);
+  EXPECT_EQ(evidence.received_at_ns, newer.observed_at_ns);
+  EXPECT_EQ(evidence.source_timestamp_ns, 1500000000);
+  EXPECT_EQ(evidence.source_freshness_budget_ns, 900);
+  ASSERT_TRUE(scene.state.provider_evidence.has_value());
+  const auto &committed_evidence = *scene.state.provider_evidence;
+  EXPECT_EQ(committed_evidence.provider_source_sequence, 2U);
+  EXPECT_EQ(evidence.provider_instance_id,
+            committed_evidence.provider_instance_id);
+  EXPECT_EQ(evidence.provider_manifest_id,
+            committed_evidence.provider_manifest_id);
+  EXPECT_EQ(evidence.provider_manifest_revision,
+            committed_evidence.provider_manifest_revision);
+  EXPECT_EQ(evidence.provider_source_epoch,
+            committed_evidence.provider_source_epoch);
+
+  // A replay of the accepted confirmation neither re-confirms nor commits.
+  const auto replay = ApplyTo(projector, scene, providers, newer,
+                              confirmed.value());
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().status,
+            SceneRuntimePoseApplicationStatus::kFreshnessConfirmed);
+  EXPECT_EQ(replay.value().projection_revision, committed_projection);
+  EXPECT_EQ(scene.confirmation_count, 1U);
+  EXPECT_EQ(scene.commit_count, 1U);
+
+  // The committed evidence is untouched, so an equal-sequence replay of the
+  // committed observation remains already applied.
+  const auto already_applied =
+      ApplyTo(projector, scene, providers, Observation());
+  ASSERT_TRUE(already_applied.ok()) << already_applied.error().message;
+  EXPECT_EQ(already_applied.value().status,
+            SceneRuntimePoseApplicationStatus::kAlreadyApplied);
+  EXPECT_EQ(scene.confirmation_count, 1U);
+  EXPECT_EQ(scene.commit_count, 1U);
+}
+
+TEST(SceneRuntimePoseProjector, CommitsChangedPoseBudgetOrOriginInstead) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  SceneRuntimePoseProjector projector(scene, cell_id);
+  const std::vector providers{Provider(cell_id)};
+  ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
+
+  const auto moved = ApplyTo(projector, scene, providers,
+                             Newer(Observation(PosePayload(0.5)), 3U));
+  ASSERT_TRUE(moved.ok()) << moved.error().message;
+  EXPECT_EQ(moved.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.commit_count, 2U);
+
+  auto rebudgeted = Newer(Observation(PosePayload(0.5)), 4U);
+  rebudgeted.expires_at_ns += 100;
+  const auto budget = ApplyTo(projector, scene, providers, rebudgeted);
+  ASSERT_TRUE(budget.ok()) << budget.error().message;
+  EXPECT_EQ(budget.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.commit_count, 3U);
+
+  auto other_epoch = Newer(Observation(PosePayload(0.5)), 5U);
+  other_epoch.source_epoch = "source-epoch.2";
+  const auto origin = ApplyTo(projector, scene, providers, other_epoch);
+  ASSERT_TRUE(origin.ok()) << origin.error().message;
+  EXPECT_EQ(origin.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.commit_count, 4U);
+  EXPECT_EQ(scene.confirmation_count, 0U);
+}
+
+TEST(SceneRuntimePoseProjector, FallsBackToCommitOnlyWhenUnsupported) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  SceneRuntimePoseProjector projector(scene, cell_id);
+  const std::vector providers{Provider(cell_id)};
+  ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
+
+  scene.confirmation_error = core::ErrorDTO{
+      "provider_freshness_unsupported", "confirmation is unsupported", {}};
+  const auto fallback =
+      ApplyTo(projector, scene, providers, Newer(Observation(), 3U));
+  ASSERT_TRUE(fallback.ok()) << fallback.error().message;
+  EXPECT_EQ(fallback.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.confirmation_count, 1U);
+  EXPECT_EQ(scene.commit_count, 2U);
+
+  scene.confirmation_error = core::ErrorDTO{
+      "provider_freshness_projection_failed",
+      "a required native projection did not apply the freshness confirmation",
+      {{"reason", "provider_freshness_projection_failed"},
+       {"failed_projection_ordinals", "1"},
+       {"applied_projection_ordinals", "0"},
+       {"uncertain_projection_ordinals", "1"}}};
+  const auto failed =
+      ApplyTo(projector, scene, providers, Newer(Observation(), 4U));
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error().code,
+            "scene_runtime_pose_freshness_confirmation_failed");
+  EXPECT_EQ(failed.error().details.at("scene_error_code"),
+            "provider_freshness_projection_failed");
+  // Partial-propagation details survive the projector boundary.
+  EXPECT_EQ(failed.error().details.at("failed_projection_ordinals"), "1");
+  EXPECT_EQ(failed.error().details.at("applied_projection_ordinals"), "0");
+  EXPECT_EQ(failed.error().details.at("uncertain_projection_ordinals"), "1");
+  EXPECT_EQ(scene.confirmation_count, 2U);
+  EXPECT_EQ(scene.commit_count, 2U);
+}
+
+TEST(SceneRuntimePoseProjector, DefaultAuthorityFallsBackToCommit) {
+  struct DefaultConfirmationAuthority final : core::ISceneAuthority {
+    explicit DefaultConfirmationAuthority(FakeSceneAuthority &delegate)
+        : delegate(delegate) {}
+    core::SceneCommitResultDTO
+    Commit(const core::SceneTransactionRequestDTO &request) override {
+      return delegate.Commit(request);
+    }
+    core::RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
+      return delegate.CurrentRequestOwnerEpoch();
+    }
+    core::ProjectionRevisionDTO CurrentProjectionRevision() const override {
+      return delegate.CurrentProjectionRevision();
+    }
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO>
+    LogicalSnapshot() const override {
+      return nullptr;
+    }
+    std::vector<core::SceneObjectSnapshotDTO> GetSceneObjects() const override {
+      return {};
+    }
+    core::SceneObjectStateDTO
+    GetObjectState(const core::SceneResourceId &id) const override {
+      return delegate.GetObjectState(id);
+    }
+    core::Result<core::Pose3DTO>
+    GetObjectPose(const core::SceneResourceId &id) const override {
+      return delegate.GetObjectPose(id);
+    }
+    FakeSceneAuthority &delegate;
+  };
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  DefaultConfirmationAuthority authority(scene);
+  SceneRuntimePoseProjector projector(authority, cell_id);
+  const std::vector providers{Provider(cell_id)};
+  ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
+  const auto fallback =
+      ApplyTo(projector, scene, providers, Newer(Observation(), 3U));
+  ASSERT_TRUE(fallback.ok()) << fallback.error().message;
+  EXPECT_EQ(fallback.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.commit_count, 2U);
+  EXPECT_EQ(scene.confirmation_count, 0U);
 }
 
 } // namespace

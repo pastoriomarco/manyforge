@@ -261,11 +261,16 @@ std::optional<std::string_view> stop_fault_latch_field_error(
 
 std::optional<std::string_view> stop_fault_recovery_offer_field_error(
     const StopFaultRecoveryOfferDTO& offer) noexcept {
+  const bool recovery_unavailable = offer.recovery_unavailable_reason.has_value();
   if (stop_fault_latch_field_error(offer.latch).has_value() ||
       offer.latch.state == StopFaultLatchStateDTO::kCleared ||
-      (offer.latch.stop_certificate.has_value() && offer.configuration_expectations.empty()) ||
+      (recovery_unavailable &&
+       (offer.recovery_unavailable_reason->empty() ||
+        offer.recovery_unavailable_reason->size() > kMaximumStopReasonBytes)) ||
+      (offer.latch.stop_certificate.has_value() &&
+       offer.configuration_expectations.empty() != recovery_unavailable) ||
       (!offer.latch.stop_certificate.has_value() &&
-       (!offer.configuration_expectations.empty() ||
+       (!offer.configuration_expectations.empty() || recovery_unavailable ||
         offer.latch.state != StopFaultLatchStateDTO::kLatched ||
         offer.latch.recovery_status != StopFaultRecoveryStatusDTO::kWaitingForObservation ||
         offer.latch.terminal_projection.state != StopDurableProjectionStateDTO::kPending ||

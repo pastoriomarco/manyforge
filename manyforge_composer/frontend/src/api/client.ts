@@ -1392,12 +1392,16 @@ export const api = {
           || receipt.programRunId !== intent.program_run_id
           || receipt.graphRevision !== intent.expected_graph_revision
           || receipt.retainedBundleId !== intent.expected_retained_bundle_id
+          // The owner may latch observations before planning, so the receipt
+          // can name a newer revision of the same Scene (never an older one).
           || receipt.sceneRevision.scene_id
             !== intent.expected_scene_revision.scene_id
           || receipt.sceneRevision.revision_id
-            !== intent.expected_scene_revision.revision_id
-          || receipt.sceneRevision.content_hash
-            !== intent.expected_scene_revision.content_hash
+            < intent.expected_scene_revision.revision_id
+          || (receipt.sceneRevision.revision_id
+            === intent.expected_scene_revision.revision_id
+            && receipt.sceneRevision.content_hash
+              !== intent.expected_scene_revision.content_hash)
           || receipt.componentRoleId !== participant.component_role_id
           || receipt.targetRoleId !== participant.target_role_id
           || receipt.requiredCapabilityId

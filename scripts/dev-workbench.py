@@ -112,9 +112,14 @@ def _json(value: Any) -> str:
     return json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
 
 
-def _run(command: Sequence[str], *, cwd: Path | None = None) -> None:
+def _run(
+    command: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     print("+ " + " ".join(command), flush=True)
-    completed = subprocess.run(command, cwd=cwd, check=False)
+    completed = subprocess.run(command, cwd=cwd, env=env, check=False)
     if completed.returncode != 0:
         raise WorkbenchError(
             f"command failed with exit {completed.returncode}: {' '.join(command)}"
@@ -243,6 +248,69 @@ def _ensure_current_native_backend() -> tuple[Path, Path]:
     return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
 
 
+def _ensure_current_ros_backend() -> tuple[Path, Path, Path]:
+    """Prepare the separately installed ROS product; never launch a provider."""
+
+    build_root = BUILD_ROOT / "isaac"
+    ros_build = build_root / "roboplan"
+    overlay = build_root / "ros-overlay/install/setup.bash"
+    environment = os.environ.copy()
+    environment.update(
+        WORKSPACE=str(WORKSPACE),
+        MANYFORGE_ROS2_CONTROL_BUILD_ROOT=str(build_root),
+        MANYFORGE_ROBOPLAN_BUILD_DIR=str(ros_build),
+        MANYFORGE_ISAAC_ROS_OVERLAY=str(build_root / "ros-overlay"),
+        CMAKE_BUILD_PARALLEL_LEVEL=_build_jobs(),
+        CMAKE_GENERATOR="Ninja",
+        MANYFORGE_ROS2_CONTROL_BUILD_TESTING="OFF",
+    )
+    _run(
+        (str(WORKSPACE / "scripts/ros/build-ros2-control-runtime.sh"),),
+        env=environment,
+    )
+    # One ROS-enabled graph also supplies the command-closed native bootstrap
+    # and shared planner worker, without recompiling their dependency closure.
+    _run(
+        (
+            "cmake", "--build", str(ros_build), "--parallel", _build_jobs(),
+            "--target", "manyforge_native_execution_host", "--", "-k", "0",
+        ),
+        env=environment,
+    )
+    host = ros_build / "manyforge_ros2_control_execution_host"
+    targets = (
+        ros_build / "manyforge_native_execution_host",
+        ros_build / "manyforge_roboplan_candidate_worker",
+        host,
+    )
+    for target in targets:
+        _regular_file(target, f"current {target.name}", executable=True)
+    _regular_file(overlay, "current ROS overlay setup")
+    # The build helper's exports belong to its subprocess. Import the generated
+    # overlay before spawning the Runner or Manager; Manager's installed-target
+    # children inherit this same environment through their existing protocol.
+    completed = subprocess.run(
+        ("bash", "-c", 'source "$1" >/dev/null && env -0', "bash", str(overlay)),
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        raise WorkbenchError("cannot source the current ROS overlay")
+    for entry in completed.stdout.split(b"\0"):
+        if entry:
+            key, value = os.fsdecode(entry).split("=", 1)
+            os.environ[key] = value
+    return targets
+
+
+def _stage_runtime_targets(sources: Sequence[Path], installed: Path) -> None:
+    for source in sources:
+        target = installed / source.name
+        shutil.copy2(source, target)
+        _regular_file(target, f"installed {source.name}", executable=True)
+
+
 def _ensure_activation_preparer() -> Path:
     """Build repository-owned activation and empty-bootstrap tools."""
 
@@ -316,6 +384,99 @@ def _ensure_repository_bootstrap_package() -> Path:
         package_root / BOOTSTRAP_ADMISSION,
         "repository canonical-empty admission",
     )
+    return package_root
+
+
+def _capture_ros_bootstrap_project(
+    project_path: str, *, allowed_root: Path
+) -> tuple[dict[str, Any], str]:
+    """Capture the intended first Load through the ordinary authoring owners."""
+
+    from manyforge_behavior.model_source_capture import (
+        ModelSourceCaptureError,
+        capture_deployment_model_sources,
+    )
+    from manyforge_behavior.node_environment import build_node_environment
+    from manyforge_composer.backend.authoring_forest import (
+        AuthoringForestError,
+        derive_candidate,
+        validate_invariants,
+    )
+    from manyforge_composer.backend.scenario_artifacts import (
+        ScenarioArtifactError,
+        capture_scenario_artifact,
+    )
+
+    try:
+        scenario, source_path, source_digest = capture_scenario_artifact(
+            project_path, allowed_roots=[str(allowed_root)]
+        )
+        deployment = scenario["deployment_draft"]
+        runtime_kinds = {
+            component.get("configuration", {}).get("runtime_kind")
+            for component in (deployment or {}).get("components", [])
+            if "runtime_kind" in component.get("configuration", {})
+        }
+        if runtime_kinds != {"ros2_control"}:
+            raise WorkbenchError(
+                "ROS startup requires an intended first Scenario with only "
+                "ros2_control execution components"
+            )
+        catalog = build_node_environment().catalog
+        authoring = scenario["program_draft"]
+        if authoring is None or scenario["program_role_assignment"] is None:
+            raise WorkbenchError("intended first ROS Scenario is incomplete")
+        validate_invariants(authoring, catalog)
+        program, diagnostics = derive_candidate(authoring, catalog)
+        no_program = authoring.get("forest") == [] and not authoring.get("scene")
+        if diagnostics or (program is None and not no_program):
+            raise WorkbenchError(
+                "intended first ROS Scenario has an incomplete authored Program"
+            )
+        captured = {
+            "scenario_id": scenario["scenario_id"],
+            "source_document_digest": source_digest,
+            "deployment": deployment,
+            "model_source_closure": capture_deployment_model_sources(
+                deployment, project_root=Path(source_path)
+            ),
+            "program": program.to_dict() if program is not None else None,
+            "program_role_assignment": scenario["program_role_assignment"],
+        }
+    except (ScenarioArtifactError, AuthoringForestError, ModelSourceCaptureError) as error:
+        raise WorkbenchError(str(error)) from error
+    return captured, source_path
+
+
+def _ensure_ros_bootstrap_package(
+    captured: dict[str, Any], *, activation_preparer: Path
+) -> Path:
+    """Publish the exact first Deployment's empty predecessor before Manager."""
+
+    from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
+    from manyforge_headless_api.activation_preparer import ActivationPreparer
+    from manyforge_headless_api.native import HeadlessApiError
+
+    captured_digest = raw_sha256_digest(canonical_json_bytes(captured))
+    digest = hashlib.sha256(
+        f"ros-workbench:{WORKBENCH_CELL_ID}\0{captured_digest}\0".encode()
+    )
+    digest.update(activation_preparer.read_bytes())
+    package_root = BOOTSTRAP_ROOT / digest.hexdigest()
+    package_root.mkdir(parents=True, exist_ok=True)
+    try:
+        preparer = ActivationPreparer(
+            executable=activation_preparer,
+            capability_root=WORKSPACE,
+            activation_root=package_root,
+            runtime_cell_id=WORKBENCH_CELL_ID,
+            timeout_seconds=180,
+            publish_canonical_empty=True,
+        )
+        preparer.prepare(captured_input_digest=captured_digest, **captured)
+    except HeadlessApiError as error:
+        raise WorkbenchError(str(error)) from error
+    _regular_file(package_root / BOOTSTRAP_ADMISSION, "ROS canonical-empty admission")
     return package_root
 
 
@@ -472,6 +633,8 @@ class Workbench:
         composer_port: int,
         frontend_port: int,
         artifact_root: Path | None = None,
+        ros2_control: bool = False,
+        bootstrap_project_path: str | None = None,
     ) -> None:
         self.project_path = project_path
         self.headless_port = headless_port
@@ -479,6 +642,8 @@ class Workbench:
         self.composer_port = composer_port
         self.frontend_port = frontend_port
         self.artifact_root = artifact_root or WORKSPACE / "examples"
+        self.ros2_control = ros2_control
+        self.bootstrap_project_path = bootstrap_project_path
         self.scenario_id: str | None = None
         self.processes: list[tuple[str, subprocess.Popen[bytes]]] = []
         self.stop_requested = False
@@ -526,7 +691,37 @@ class Workbench:
             command.extend(("--startup-scenario-document", self.project_path))
         return command
 
+    def _runtime_targets(self) -> tuple[Path, ...]:
+        if not self.ros2_control:
+            return _ensure_current_native_backend()
+        return _ensure_current_ros_backend()
+
+    def _simulation_control_arguments(self) -> tuple[str, ...]:
+        if not self.ros2_control:
+            return ()
+        config = WORKSPACE / "manyforge_ros_bringup/config/isaac_program_simulation_site.json"
+        _regular_file(config, "Isaac Program simulation site configuration")
+        return ("--simulation-control-config", str(config))
+
     def start(self) -> None:
+        if self.bootstrap_project_path is not None and (
+            not self.ros2_control or self.project_path is not None
+        ):
+            raise WorkbenchError("--bootstrap-project requires --ros2-control and excludes --project")
+        ros_capture: dict[str, Any] | None = None
+        if self.ros2_control:
+            intended_project = self.bootstrap_project_path or self.project_path
+            if intended_project is None:
+                raise WorkbenchError(
+                    "--ros2-control requires --bootstrap-project or --project "
+                    "selecting the intended first Scenario"
+                )
+            ros_capture, source_path = _capture_ros_bootstrap_project(
+                intended_project, allowed_root=self.artifact_root
+            )
+            if self.project_path is not None:
+                self.project_path = source_path
+                self.scenario_id = ros_capture["scenario_id"]
         for port in (
             self.headless_port,
             self.runner_port,
@@ -538,12 +733,12 @@ class Workbench:
                     f"required development port {port} is already in use"
                 )
         current_headless_extension = _ensure_current_backend()
-        current_native_targets = _ensure_current_native_backend()
+        current_runtime_targets = self._runtime_targets()
         activation_preparer = _ensure_activation_preparer()
         bootstrap_root: Path
         bootstrap_admission = BOOTSTRAP_ADMISSION
         cell_id = WORKBENCH_CELL_ID
-        if self.project_path is not None:
+        if self.project_path is not None and not self.ros2_control:
             from manyforge_composer.backend.scenario_artifacts import (
                 ScenarioArtifactError,
                 capture_scenario_artifact,
@@ -558,7 +753,10 @@ class Workbench:
                 raise WorkbenchError(str(error)) from error
             self.project_path = project_path
             self.scenario_id = project["scenario_id"]
-        bootstrap_root = _ensure_repository_bootstrap_package()
+        bootstrap_root = (
+            _ensure_ros_bootstrap_package(ros_capture, activation_preparer=activation_preparer)
+            if ros_capture is not None else _ensure_repository_bootstrap_package()
+        )
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",
@@ -578,14 +776,20 @@ class Workbench:
         manager = installed / "manyforge_manager_daemon"
         shutil.copy2(MANAGER_BINARY, manager)
         _regular_file(manager, "installed Manager", executable=True)
-        for source in current_native_targets:
-            target = installed / source.name
-            shutil.copy2(source, target)
-            _regular_file(target, f"installed {source.name}", executable=True)
+        _stage_runtime_targets(current_runtime_targets, installed)
         manager_socket = paths["manager_run"] / "manager-command.sock"
         runner_socket = paths["manager_run"] / "program-runner-liveness.sock"
         _remove_stale_socket(manager_socket, "Manager command socket")
         _remove_stale_socket(runner_socket, "Program runner liveness socket")
+        if ros_capture is not None:
+            current_capture, _ = _capture_ros_bootstrap_project(
+                source_path, allowed_root=self.artifact_root
+            )
+            if current_capture != ros_capture:
+                raise WorkbenchError(
+                    "intended first ROS Scenario changed during startup preparation; "
+                    "no runtime was started"
+                )
         # Bring up the two reconciliation services before Manager.  A new
         # Manager must be able to reconcile the retained Program Runner owner
         # on its first heartbeat; starting Manager first creates a needless
@@ -615,6 +819,7 @@ class Workbench:
                 "program-runner.development-workbench",
                 "--persistent-key-register-path",
                 str(_persistent_key_register_path()),
+                *self._simulation_control_arguments(),
             ),
         )
         self._spawn(
@@ -706,6 +911,10 @@ class Workbench:
                 bootstrap_admission,
                 "--program-runner-liveness-socket",
                 str(runner_socket),
+                # Development value only: relative Program scene meshes such
+                # as examples/<name>/meshes/*.obj resolve below the checkout.
+                "--scene-asset-root",
+                str(WORKSPACE),
             ),
         )
         _wait_until(
@@ -987,11 +1196,22 @@ def _parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "status"):
         command = subcommands.add_parser(name)
-        command.add_argument("--project")
+        projects = command.add_mutually_exclusive_group()
+        projects.add_argument("--project")
         command.add_argument("--headless-port", type=int, default=9010)
         command.add_argument("--runner-port", type=int, default=9011)
         command.add_argument("--composer-port", type=int, default=9020)
         command.add_argument("--frontend-port", type=int, default=3000)
+        if name == "serve":
+            projects.add_argument(
+                "--bootstrap-project",
+                help="select the first ROS Scenario for empty startup, without loading it",
+            )
+            command.add_argument(
+                "--ros2-control",
+                action="store_true",
+                help="prepare the development ROS execution product and simulation port",
+            )
     return parser
 
 
@@ -1020,6 +1240,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner_port=args.runner_port,
             composer_port=args.composer_port,
             frontend_port=args.frontend_port,
+            ros2_control=args.ros2_control,
+            bootstrap_project_path=args.bootstrap_project,
         ).serve()
         return 0
     except (HeadlessClientError, OSError, ValueError, WorkbenchError) as error:

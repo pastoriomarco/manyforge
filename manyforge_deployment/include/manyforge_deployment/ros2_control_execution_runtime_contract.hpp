@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -63,6 +64,9 @@ struct Configuration final {
   std::string isaac_profile;
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
+  std::vector<
+      native_execution_runtime_contract::Configuration::MotionTargetLimit>
+      motion_target_limits;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};
   std::optional<double> runtime_collision_immediate_query_budget_ms;

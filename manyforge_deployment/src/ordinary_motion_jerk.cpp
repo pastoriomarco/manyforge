@@ -5,24 +5,25 @@
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <set>
+#include <string_view>
 
 namespace manyforge::deployment {
 namespace {
 namespace native = native_execution_runtime_contract;
 
 const core::JsonValueDTO &member(const core::JsonObjectDTO &object,
-                                 const std::string &key) {
+                                 std::string_view key) {
   const auto found = object.find(key);
   if (found == object.end())
-    throw RetainedBundleError("ordinary jerk settings missing " + key);
+    throw RetainedBundleError("ordinary jerk settings missing " + std::string(key));
   return found->second;
 }
 
 template <typename T>
-const T &value(const core::JsonObjectDTO &object, const std::string &key) {
+const T &value(const core::JsonObjectDTO &object, std::string_view key) {
   const auto *result = std::get_if<T>(&member(object, key).value);
   if (!result)
-    throw RetainedBundleError("ordinary jerk settings invalid " + key);
+    throw RetainedBundleError("ordinary jerk settings invalid " + std::string(key));
   return *result;
 }
 

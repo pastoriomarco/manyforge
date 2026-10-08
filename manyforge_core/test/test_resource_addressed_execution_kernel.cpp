@@ -14116,6 +14116,369 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kScopePromotion);
 }
 
+[[nodiscard]] std::vector<StopFaultRecoveryConfigurationExpectationDTO>
+registered_domain_configurations(const std::vector<RuntimeParticipantBinding>& bindings) {
+  std::vector<StopFaultRecoveryConfigurationExpectationDTO> rows;
+  for (const auto& binding : bindings) {
+    const auto& path = *binding.value().control_path;
+    rows.push_back({path.control_domain_id, path.active_control_configuration_id,
+                    path.active_control_configuration_generation});
+  }
+  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+    return left.control_domain_id < right.control_domain_id;
+  });
+  return rows;
+}
+
+/// Models the native recovery-facts owner for an idle cell-wide Stop: every
+/// captured resource is observed settled, an uncontained terminal also has
+/// exact external reconciliation, and the configuration rows come from the
+/// same shared owner the Kernel offer uses.
+[[nodiscard]] StopFaultRecoveryFactsResolver installed_domain_recovery_facts(
+    std::vector<RuntimeParticipantBinding> installed) {
+  return [installed = std::move(installed)](
+             const StopStatusDTO& status,
+             const std::int64_t assessed_at_ns) -> Result<StopFaultRecoveryFactsDTO> {
+    if (!status.fault_latch.has_value() || !status.stop_certificate.has_value()) {
+      return Result<StopFaultRecoveryFactsDTO>::Err(
+          ErrorDTO{"stop_recovery_test_truth_missing", "terminal truth is missing", {}});
+    }
+    std::vector<const RuntimeParticipantBinding*> pointers;
+    for (const auto& binding : installed) pointers.push_back(&binding);
+    auto expectations = StopFaultRecoveryConfigurationExpectations(status, pointers);
+    if (!expectations.ok()) {
+      return Result<StopFaultRecoveryFactsDTO>::Err(expectations.error());
+    }
+    std::vector<StopFaultRecoveryConfigurationFactDTO> configurations;
+    for (const auto& expectation : expectations.value()) {
+      configurations.push_back({expectation, true, ContentDigest(test_digest('3'))});
+    }
+    const auto& latch = *status.fault_latch;
+    std::vector<StopFaultRecoveryResourceFactDTO> resources;
+    std::vector<StopFaultRecoveryResourceFactDTO> external;
+    for (const auto& resource : latch.captured_resources) {
+      resources.push_back(
+          StopFaultRecoveryResourceFactDTO{resource, StopFaultRecoveryResourceStateDTO::kSettled,
+                                           RuntimeEpoch("observed-state.epoch"), 1U, 0, 1'000,
+                                           ContentDigest(test_digest('1')), std::nullopt});
+      if (latch.trigger == StopFaultTriggerDTO::kFailedUncontained) {
+        external.push_back(
+            StopFaultRecoveryResourceFactDTO{resource, StopFaultRecoveryResourceStateDTO::kSettled,
+                                             RuntimeEpoch("external-reconciliation.epoch"), 1U, 0,
+                                             1'000, ContentDigest(test_digest('2')), std::nullopt});
+      }
+    }
+    return Result<StopFaultRecoveryFactsDTO>::Ok(
+        StopFaultRecoveryFactsDTO{assessed_at_ns,
+                                  latch.cell_id,
+                                  latch.retained_bundle_id,
+                                  latch.graph_revision,
+                                  *status.stop_certificate,
+                                  latch.latch_id,
+                                  latch.latch_generation,
+                                  status.acceptance_projection,
+                                  status.terminal_projection,
+                                  status.surveillance_projection,
+                                  status.surveillance,
+                                  std::move(resources),
+                                  std::move(configurations),
+                                  {},
+                                  std::move(external),
+                                  {},
+                                  {},
+                                  {}});
+  };
+}
+
+[[nodiscard]] MalformedStopIngressDTO idle_malformed_stop(const std::string& request_id,
+                                                          const std::string& owner_epoch) {
+  return MalformedStopIngressDTO{
+      RequestId(request_id), RequestOwnerEpoch(owner_epoch),
+      RequestAttributionDTO{RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified,
+                            std::nullopt},
+      "/api/execution/stops", "recognized_stop_payload_invalid"};
+}
+
+[[nodiscard]] StopFaultRecoveryIntentDTO idle_stop_recovery_intent(
+    const std::string& request_id, const std::string& owner_epoch,
+    const StopFaultRecoveryOfferDTO& offer) {
+  const auto& latch = offer.latch;
+  return StopFaultRecoveryIntentDTO{
+      PublicRequestContextDTO{RequestId(request_id), RequestOwnerEpoch(owner_epoch), "test",
+                              std::nullopt},
+      latch.latch_id,
+      latch.latch_generation,
+      latch.recovery_assessment_revision,
+      latch.stop_certificate->stop_certificate_id,
+      latch.stop_certificate->stop_certificate_revision,
+      latch.cell_id,
+      latch.retained_bundle_id,
+      latch.graph_revision,
+      offer.configuration_expectations,
+      std::string("operator verified the idle cell")};
+}
+
+[[nodiscard]] bool stop_terminal_recorded(const ResourceAddressedExecutionKernel& kernel,
+                                          const StopId& stop_id) {
+  const auto status = kernel.get_stop_status(stop_id);
+  return status.ok() && status.value().stop_certificate.has_value() &&
+         status.value().acceptance_projection.state == StopDurableProjectionStateDTO::kRecorded &&
+         status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IdleCellWideStopOffersInstalledDomainConfigurationsAndRecoversToClear) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(100);
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeOperationJournal journal;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = second_same_type_occurrence(first);
+  const std::vector<RuntimeParticipantBinding> installed{first, second};
+  const auto expected_rows = registered_domain_configurations(installed);
+  ASSERT_EQ(expected_rows.size(), 2U);
+  ASSERT_NE(expected_rows.front().control_domain_id, expected_rows.back().control_domain_id);
+
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.stop_fault_recovery_facts_resolver = installed_domain_recovery_facts(installed);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
+      journal, std::move(config));
+
+  // An idle cell: a recognized-malformed Stop is promoted to Full and latches
+  // without any participant, operation or effect-uncertain resource.
+  const auto malformed = kernel.recognized_malformed_stop(
+      idle_malformed_stop("malformed-stop.idle.1", "kernel.epoch.1"));
+  ASSERT_TRUE(malformed.ok()) << malformed.error().message;
+  EXPECT_EQ(malformed.value().resolution_disposition,
+            StopResolutionDispositionDTO::kPromotedToFull);
+  EXPECT_TRUE(malformed.value().affected_operation_revisions.empty());
+  ASSERT_TRUE(
+      wait_until([&] { return stop_terminal_recorded(kernel, malformed.value().stop_id); }));
+
+  // A later explicit Full Stop with no work neither replaces nor clears it.
+  const auto full = kernel.full_stop(FullStopIntentDTO{
+      PublicRequestContextDTO{RequestId("request.idle.full"), RequestOwnerEpoch("kernel.epoch.1"),
+                              "test", std::nullopt},
+      StopGeneration(0U),
+      {}});
+  ASSERT_TRUE(full.ok()) << full.error().message;
+  EXPECT_EQ(full.value().resolution_reason, StopScopeResolutionReasonDTO::kExplicitFullStop);
+  ASSERT_TRUE(wait_until([&] { return stop_terminal_recorded(kernel, full.value().stop_id); }));
+
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kScopePromotion);
+  EXPECT_EQ(latch->stop_id, malformed.value().stop_id);
+  ASSERT_TRUE(latch->stop_certificate.has_value());
+  EXPECT_TRUE(latch->captured_operation_ids.empty());
+  EXPECT_TRUE(latch->captured_resources.empty());
+  const auto status = kernel.get_stop_status(malformed.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_TRUE(std::none_of(status.value().scope_entries.begin(), status.value().scope_entries.end(),
+                           [](const auto& scope) {
+                             return std::holds_alternative<StopParticipantScopeFactsDTO>(
+                                 scope.facts);
+                           }));
+
+  const auto offer = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  ASSERT_TRUE(offer.value().has_value());
+  EXPECT_EQ(offer.value()->latch, *latch);
+  EXPECT_EQ(offer.value()->configuration_expectations, expected_rows);
+  EXPECT_FALSE(offer.value()->recovery_unavailable_reason.has_value());
+  EXPECT_FALSE(stop_fault_recovery_offer_field_error(*offer.value()).has_value());
+  // Reading the offer does not change the Stop scope, certificate or capture.
+  EXPECT_EQ(kernel.get_stop_status(malformed.value().stop_id).value(), status.value());
+
+  // The shared owner fails closed instead of fabricating rows.
+  std::vector<const RuntimeParticipantBinding*> pointers{&first, &second};
+  const auto foreign = select_candidate_product(first);
+  std::vector<const RuntimeParticipantBinding*> foreign_pointers{&foreign};
+  const auto crossed = StopFaultRecoveryConfigurationExpectations(status.value(), foreign_pointers);
+  ASSERT_FALSE(crossed.ok());
+  EXPECT_EQ(crossed.error().code, kStopFaultRecoveryInstalledConfigurationInvalid);
+  auto scoped = status.value();
+  scoped.accepted.resolution_disposition = StopResolutionDispositionDTO::kExact;
+  scoped.accepted.resolution_reason = StopScopeResolutionReasonDTO::kExactCurrentScope;
+  const auto missing = StopFaultRecoveryConfigurationExpectations(scoped, pointers);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().code, kStopFaultRecoveryParticipantConfigurationMissing);
+
+  ASSERT_TRUE(kernel.refresh_stop_fault_recovery_assessment().ok());
+  const auto ready = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(ready.ok()) << ready.error().message;
+  ASSERT_TRUE(ready.value().has_value());
+  EXPECT_EQ(ready.value()->latch.recovery_status, StopFaultRecoveryStatusDTO::kReady);
+  EXPECT_EQ(ready.value()->configuration_expectations, expected_rows);
+  EXPECT_FALSE(kernel.execute(motion_operation("request.idle.blocked")).ok());
+
+  const auto cleared = kernel.recover_stop_fault(
+      idle_stop_recovery_intent("request.idle.clear", "kernel.epoch.1", *ready.value()));
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  EXPECT_TRUE(cleared.value().accepted);
+  EXPECT_EQ(cleared.value().latch.state, StopFaultLatchStateDTO::kCleared);
+  EXPECT_EQ(journal.stop_fault_clear_calls.load(), 1);
+  const auto after = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_FALSE(after.value().has_value());
+  // Clearing the latch authorizes no motion by itself; it only reopens
+  // ordinary admission for a new explicit request.
+  EXPECT_EQ(first_engine.execute_calls, 0);
+  EXPECT_EQ(second_engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IdleCellWideStopWithOnlyAnEffectUncertainResourceOffersInstalledDomainsAndClears) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(100);
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ResourceId uncertain("robot.joint_1");
+  journal.recovery = OperationJournalRecoveryDTO{{},
+                                                 {},
+                                                 RequestOwnerEpoch("kernel.epoch.old"),
+                                                 {uncertain},
+                                                 AdmissionGeneration(0U),
+                                                 CellAdmissionClaimGeneration(0U),
+                                                 {},
+                                                 {},
+                                                 {}};
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.new"),
+                                                CellId("cell.test"), 16U};
+  config.stop_fault_recovery_facts_resolver = installed_domain_recovery_facts({binding});
+  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+                                          journal, std::move(config));
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  ASSERT_EQ(kernel.resource_snapshot().front().state,
+            ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+
+  const auto malformed = kernel.recognized_malformed_stop(
+      idle_malformed_stop("malformed-stop.uncertain.1", "kernel.epoch.new"));
+  ASSERT_TRUE(malformed.ok()) << malformed.error().message;
+  EXPECT_EQ(malformed.value().resolution_disposition,
+            StopResolutionDispositionDTO::kPromotedToFull);
+  ASSERT_TRUE(
+      wait_until([&] { return stop_terminal_recorded(kernel, malformed.value().stop_id); }));
+
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  ASSERT_TRUE(latch->stop_certificate.has_value());
+  // The uncontained effect-uncertain resource is the stronger terminal
+  // trigger; the promotion still made this Stop cell-wide.
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kFailedUncontained);
+  EXPECT_TRUE(latch->captured_operation_ids.empty());
+  EXPECT_EQ(latch->captured_resources, std::vector<ResourceId>{uncertain});
+  const auto status = kernel.get_stop_status(malformed.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_TRUE(std::none_of(status.value().scope_entries.begin(), status.value().scope_entries.end(),
+                           [](const auto& scope) {
+                             return std::holds_alternative<StopParticipantScopeFactsDTO>(
+                                 scope.facts);
+                           }));
+
+  const auto offer = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  ASSERT_TRUE(offer.value().has_value());
+  EXPECT_EQ(offer.value()->latch, *latch);
+  EXPECT_EQ(offer.value()->configuration_expectations, registered_domain_configurations({binding}));
+  EXPECT_FALSE(offer.value()->recovery_unavailable_reason.has_value());
+  EXPECT_EQ(kernel.get_stop_status(malformed.value().stop_id).value(), status.value());
+
+  ASSERT_TRUE(kernel.refresh_stop_fault_recovery_assessment().ok());
+  const auto ready = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(ready.ok()) << ready.error().message;
+  ASSERT_TRUE(ready.value().has_value());
+  EXPECT_EQ(ready.value()->latch.recovery_status, StopFaultRecoveryStatusDTO::kReady);
+  EXPECT_EQ(ready.value()->latch.captured_resources, std::vector<ResourceId>{uncertain});
+
+  const auto cleared = kernel.recover_stop_fault(
+      idle_stop_recovery_intent("request.uncertain.clear", "kernel.epoch.new", *ready.value()));
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  EXPECT_TRUE(cleared.value().accepted);
+  EXPECT_EQ(cleared.value().latch.state, StopFaultLatchStateDTO::kCleared);
+  // The fault clear never reconciles the orphan resource itself.
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state,
+            ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.stop_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IdleCellWideStopWithoutInstalledDomainsPublishesTheLatchWithRecoveryUnavailable) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(100);
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto qualified = registration(binding, engine);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.graph_revision = binding.value().graph_revision;
+  config.empty_runtime_graph_revision = binding.value().graph_revision;
+  config.empty_runtime_retained_bundle_id = binding.value().retained_bundle_id;
+  config.cell_stop_deadline_budget =
+      qualified.stop_readiness->value().resolved_stop_base_plan.deadline_budget;
+  config.cell_stop_deadline_budget->phases.clear();
+  config.stop_fault_recovery_facts_resolver = installed_domain_recovery_facts({});
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+
+  const auto malformed = kernel.recognized_malformed_stop(
+      idle_malformed_stop("malformed-stop.empty.1", "kernel.epoch.1"));
+  ASSERT_TRUE(malformed.ok()) << malformed.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(malformed.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  ASSERT_TRUE(latch->stop_certificate.has_value());
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kScopePromotion);
+
+  const auto offer = kernel.get_stop_fault_recovery_offer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  ASSERT_TRUE(offer.value().has_value());
+  // The recovery assessment may advance between the two reads; the offer
+  // must name the same latch and Stop, not a byte-identical snapshot.
+  EXPECT_EQ(offer.value()->latch.latch_id, latch->latch_id);
+  EXPECT_EQ(offer.value()->latch.latch_generation, latch->latch_generation);
+  EXPECT_EQ(offer.value()->latch.stop_id, latch->stop_id);
+  EXPECT_EQ(offer.value()->latch.stop_certificate, latch->stop_certificate);
+  EXPECT_EQ(offer.value()->latch.trigger, latch->trigger);
+  EXPECT_TRUE(offer.value()->configuration_expectations.empty());
+  ASSERT_TRUE(offer.value()->recovery_unavailable_reason.has_value());
+  EXPECT_EQ(*offer.value()->recovery_unavailable_reason,
+            kStopFaultRecoveryInstalledConfigurationUnavailable);
+  EXPECT_FALSE(stop_fault_recovery_offer_field_error(*offer.value()).has_value());
+  // An empty table without the explicit unavailability is never a valid
+  // proof, and an unavailable offer cannot also carry rows.
+  auto empty_proof = *offer.value();
+  empty_proof.recovery_unavailable_reason.reset();
+  EXPECT_TRUE(stop_fault_recovery_offer_field_error(empty_proof).has_value());
+  auto fabricated = *offer.value();
+  fabricated.configuration_expectations = registered_domain_configurations({binding});
+  EXPECT_TRUE(stop_fault_recovery_offer_field_error(fabricated).has_value());
+
+  // The facts owner fails closed the same way; the latch stays latched.
+  const auto refreshed = kernel.refresh_stop_fault_recovery_assessment();
+  ASSERT_FALSE(refreshed.ok());
+  EXPECT_EQ(refreshed.error().code, kStopFaultRecoveryInstalledConfigurationUnavailable);
+  const auto still = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(still.has_value());
+  EXPECT_EQ(still->state, StopFaultLatchStateDTO::kLatched);
+  EXPECT_NE(still->recovery_status, StopFaultRecoveryStatusDTO::kReady);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      StaleExplicitFullAggregatesOneResidentStopAndFreshScopeWithoutRefenceOrRedispatch) {
   FakeClock clock;

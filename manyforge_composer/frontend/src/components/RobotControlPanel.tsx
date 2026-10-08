@@ -11,6 +11,7 @@ import {
   quaternionFromRpyDegrees,
   robotControlHasActiveOperation,
   robotControlHasLocalDraft,
+  robotControlPreviewApprovable,
   rpyDegreesFromQuaternion,
 } from '../state/robotControl';
 import type {
@@ -382,9 +383,8 @@ export function RobotControlPanelView({
   const previewNoticeKey = [status?.ownerEpoch, state.generation, state.error, state.previewIssue].join('\u0000');
   const expectedTargetRejection = state.previewIssue != null;
   const previewRejectionLabel = expectedTargetRejection ? 'Target not executable' : 'Preview unavailable';
-  const canApprove = controller.manualControlAllowed && !state.poseDragging && pendingInputs.size === 0 && state.phase === 'ready'
-    && state.preview !== null
-    && state.intent !== null;
+  const canApprove = controller.manualControlAllowed && !state.poseDragging && pendingInputs.size === 0
+    && robotControlPreviewApprovable(state);
   const canRevert = !active && (
     state.phase !== 'idle'
     || state.ghost !== null

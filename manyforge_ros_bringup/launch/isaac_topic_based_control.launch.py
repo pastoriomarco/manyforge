@@ -62,6 +62,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Exact GetCurrentWorld name required after LoadWorld.",
             ),
             DeclareLaunchArgument("scene_startup_timeout_s", default_value="180.0"),
+            DeclareLaunchArgument(
+                "require_existing_world",
+                default_value="false",
+                description="Require the exact already-loaded stopped world; never load another world.",
+            ),
             DeclareLaunchArgument("scene_service_timeout_s", default_value="120.0"),
             DeclareLaunchArgument(
                 "pose_observer_site_config",
@@ -403,6 +408,10 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "expected_world_name": LaunchConfiguration(
                     "expected_world_name"
                 ).perform(context),
+                "require_existing_world": _parse_bool_launch_value(
+                    LaunchConfiguration("require_existing_world").perform(context),
+                    name="require_existing_world",
+                ),
                 "startup_timeout_s": _bounded_float(
                     LaunchConfiguration("scene_startup_timeout_s").perform(context),
                     name="scene_startup_timeout_s",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 from types import SimpleNamespace
@@ -343,6 +344,232 @@ def test_workbench_parser_allows_empty_or_project_startup() -> None:
 
     assert empty.project is None
     assert selected.project == "examples/lite6_pick_and_place.scenario"
+    assert empty.ros2_control is False
+    assert dev_workbench._parser().parse_args(["serve", "--ros2-control"]).ros2_control
+
+
+def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
+    selected = dev_workbench._parser().parse_args([
+        "serve", "--ros2-control", "--bootstrap-project", "examples/first.scenario",
+    ])
+    assert selected.project is None
+    assert selected.bootstrap_project == "examples/first.scenario"
+    with pytest.raises(SystemExit):
+        dev_workbench._parser().parse_args([
+            "serve", "--project", "one", "--bootstrap-project", "two",
+        ])
+    workbench = dev_workbench.Workbench(
+        project_path=None, bootstrap_project_path=selected.bootstrap_project,
+        ros2_control=True, headless_port=1, runner_port=2,
+        composer_port=3, frontend_port=4,
+    )
+    assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
+
+
+@pytest.mark.parametrize("project,bootstrap,ros,error", [
+    (None, None, True, "requires --bootstrap-project or --project"),
+    (None, "first", False, "requires --ros2-control"),
+    ("first", "second", True, "excludes --project"),
+    (str(REPOSITORY_ROOT / "examples/lite6_pick_and_place.scenario"), None, True,
+     "only ros2_control execution components"),
+])
+def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
+    monkeypatch: Any, project: str | None, bootstrap: str | None, ros: bool, error: str
+) -> None:
+    def unexpected_build() -> None:
+        pytest.fail("invalid selection must fail before build")
+
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", unexpected_build)
+    workbench = dev_workbench.Workbench(
+        project_path=project, bootstrap_project_path=bootstrap,
+        artifact_root=REPOSITORY_ROOT / "examples", ros2_control=ros,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+    )
+    with pytest.raises(dev_workbench.WorkbenchError, match=error):
+        workbench.start()
+    assert workbench.processes == []
+
+
+def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
+    from manyforge_headless_api import activation_preparer
+
+    captured, source = dev_workbench._capture_ros_bootstrap_project(
+        str(REPOSITORY_ROOT / "examples/isaac-ur10e-light-scene.scenario"),
+        allowed_root=REPOSITORY_ROOT / "examples",
+    )
+    assert source.endswith("/examples/isaac-ur10e-light-scene.scenario")
+    assert captured["program"]["api_version"] == "manyforge.program.v2"
+    assert captured["model_source_closure"]["components"]
+    assert captured["deployment"]["components"][0]["configuration"]["runtime_kind"] == "ros2_control"
+    tool = tmp_path / "preparer"
+    tool.write_bytes(b"current preparer")
+    calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    class _Preparer:
+        def __init__(self, **options: Any) -> None:
+            self.options = options
+
+        def prepare(self, **input: Any) -> dict[str, Any]:
+            calls.append((self.options, input))
+            (self.options["activation_root"] / dev_workbench.BOOTSTRAP_ADMISSION).write_text("fixture")
+            return {}
+
+    monkeypatch.setattr(activation_preparer, "ActivationPreparer", _Preparer)
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", tmp_path / "bootstrap")
+    root = dev_workbench._ensure_ros_bootstrap_package(captured, activation_preparer=tool)
+    assert calls[0] == ({
+        "executable": tool, "capability_root": REPOSITORY_ROOT,
+        "activation_root": root, "runtime_cell_id": dev_workbench.WORKBENCH_CELL_ID,
+        "timeout_seconds": 180, "publish_canonical_empty": True,
+    }, {**captured, "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured))})
+    assert dev_workbench._ensure_ros_bootstrap_package(captured, activation_preparer=tool) == root
+    assert len(calls) == 2  # An existing admission still passes through its producer.
+    tool.write_bytes(b"updated preparer")
+    assert dev_workbench._ensure_ros_bootstrap_package(captured, activation_preparer=tool) != root
+
+
+def test_ros_source_change_during_frontend_preparation_never_starts_runtime(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    captured = {"scenario_id": "first"}
+    current_capture = captured
+
+    def frontend_preparation() -> None:
+        nonlocal current_capture
+        current_capture = {"scenario_id": "changed"}
+
+    monkeypatch.setattr(
+        dev_workbench, "_capture_ros_bootstrap_project",
+        lambda *_a, **_k: (current_capture, "/project"),
+    )
+    monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
+    manager = tmp_path / "manager"
+    manager.write_bytes(b"current Manager")
+    manager.chmod(0o755)
+    (tmp_path / "extension").write_bytes(b"current extension")
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager)
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", frontend_preparation)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: tmp_path / "extension")
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
+    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    monkeypatch.setattr(dev_workbench, "_ensure_ros_bootstrap_package", lambda *_a, **_k: tmp_path)
+    workbench = dev_workbench.Workbench(
+        project_path=None, bootstrap_project_path="/project", ros2_control=True,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+    )
+    with pytest.raises(dev_workbench.WorkbenchError, match="changed during startup preparation"):
+        workbench.start()
+    assert workbench.processes == []
+
+
+@pytest.mark.parametrize("ros2_control", [False, True])
+def test_runtime_capability_selection_keeps_one_build_closure(
+    monkeypatch: Any, tmp_path: Path, ros2_control: bool
+) -> None:
+    native = (tmp_path / "native", tmp_path / "worker")
+    ros = (*native, tmp_path / "ros")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        dev_workbench, "_ensure_current_native_backend",
+        lambda: calls.append("native") or native,
+    )
+    monkeypatch.setattr(
+        dev_workbench, "_ensure_current_ros_backend",
+        lambda: calls.append("ros") or ros,
+    )
+    workbench = dev_workbench.Workbench(
+        project_path=None, headless_port=1, runner_port=2,
+        composer_port=3, frontend_port=4, ros2_control=ros2_control,
+    )
+
+    assert workbench._runtime_targets() == (ros if ros2_control else native)
+    assert calls == (["ros"] if ros2_control else ["native"])
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    assert workbench._simulation_control_arguments() == (
+        ("--simulation-control-config", str(REPOSITORY_ROOT /
+         "manyforge_ros_bringup/config/isaac_program_simulation_site.json"))
+        if ros2_control else ()
+    )
+
+
+def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    build_root = tmp_path / "build"
+    ros_build = build_root / "isaac/roboplan"
+    overlay = build_root / "isaac/ros-overlay/install/setup.bash"
+    commands: list[tuple[str, ...]] = []
+    parent_environment = {**os.environ, "ROS_STATIC_PEERS": "orin;laptop",
+                          "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp"}
+    monkeypatch.setattr(dev_workbench.os, "environ", parent_environment)
+    monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build_root)
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "2")
+
+    def build(command: tuple[str, ...], *, env: dict[str, str]) -> None:
+        commands.append(command)
+        assert env["ROS_STATIC_PEERS"] == "orin;laptop"
+        assert env["MANYFORGE_ROBOPLAN_BUILD_DIR"] == str(ros_build)
+        assert env["MANYFORGE_ROS2_CONTROL_BUILD_TESTING"] == "OFF"
+        assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
+        assert env["CMAKE_GENERATOR"] == "Ninja"
+        ros_build.mkdir(parents=True, exist_ok=True)
+        targets = (
+            ("manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker")
+            if len(commands) == 1 else ("manyforge_native_execution_host",)
+        )
+        for name in targets:
+            source = ros_build / name
+            source.write_bytes(name.encode())
+            source.chmod(0o755)
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        overlay.write_text("overlay", encoding="utf-8")
+
+    def source_overlay(command: tuple[str, ...], **kwargs: Any) -> Any:
+        assert command[-1] == str(overlay)
+        assert kwargs["env"]["ROS_STATIC_PEERS"] == "orin;laptop"
+        return SimpleNamespace(
+            returncode=0, stdout=b"AMENT_PREFIX_PATH=/current/overlay\0PYTHONPATH=/current/messages\0"
+        )
+
+    monkeypatch.setattr(dev_workbench, "_run", build)
+    monkeypatch.setattr(dev_workbench.subprocess, "run", source_overlay)
+    targets = dev_workbench._ensure_current_ros_backend()
+    assert commands[0] == (str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),)
+    assert commands[1] == (
+        "cmake", "--build", str(ros_build), "--parallel", "2", "--target",
+        "manyforge_native_execution_host", "--", "-k", "0",
+    )
+    assert [target.name for target in targets] == [
+        "manyforge_native_execution_host", "manyforge_roboplan_candidate_worker",
+        "manyforge_ros2_control_execution_host",
+    ]
+    installed = tmp_path / "installed-targets"
+    installed.mkdir()
+    dev_workbench._stage_runtime_targets(targets, installed)
+    for target in targets:
+        assert (installed / target.name).read_bytes() == target.name.encode()
+        assert os.access(installed / target.name, os.X_OK)
+    assert parent_environment["AMENT_PREFIX_PATH"] == "/current/overlay"
+    assert parent_environment["ROS_STATIC_PEERS"] == "orin;laptop"
+
+    spawned: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        dev_workbench.subprocess, "Popen",
+        lambda _command, **kwargs: spawned.append(kwargs["env"]) or SimpleNamespace(),
+    )
+    workbench = dev_workbench.Workbench(
+        project_path=None, headless_port=1, runner_port=2,
+        composer_port=3, frontend_port=4, ros2_control=True,
+    )
+    workbench._spawn("Manager", ("manager",))
+    assert spawned[0]["AMENT_PREFIX_PATH"] == "/current/overlay"
+    assert spawned[0]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
 
 
 def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path) -> None:

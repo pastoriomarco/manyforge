@@ -1,3 +1,8 @@
+#include <fcntl.h>
+#include <openssl/evp.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <coal/BVH/BVH_model.h>
 #include <coal/mesh_loader/loader.h>
 #include <coal/shape/convex.h>
@@ -17,9 +22,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cerrno>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_collision/scene_asset_root.hpp>
 #include <map>
 #include <optional>
 #include <pinocchio/algorithm/frames.hpp>
@@ -445,8 +453,6 @@ std::optional<std::filesystem::path> resolve_mesh_resource_uri(
                          package_name / package_rel_path);
     candidates.push_back(std::filesystem::path("/usr/local/share") /
                          package_name / package_rel_path);
-    candidates.push_back(std::filesystem::path("/workspace") / package_name /
-                         package_rel_path);
     if (auto resolved = first_existing_path(candidates)) {
       return resolved;
     }
@@ -455,18 +461,16 @@ std::optional<std::filesystem::path> resolve_mesh_resource_uri(
   }
 
   const std::filesystem::path candidate(path_text);
-  std::vector<std::filesystem::path> candidates;
   if (candidate.is_relative()) {
-    for (const auto& prefix : package_paths) {
-      candidates.push_back(prefix / candidate);
-    }
-    candidates.push_back(candidate);
-    candidates.push_back(std::filesystem::current_path() / candidate);
-    candidates.push_back(std::filesystem::path("/workspace") / candidate);
-  } else {
-    candidates.push_back(candidate);
+    // Relative scene meshes resolve only below the approved scene-asset root
+    // descriptor (OpenedSceneMesh); never through the current directory, a
+    // package path, or a hard-coded workspace.
+    error = "relative mesh URI is not a plain path below the approved "
+            "scene-asset root: " +
+            source_uri;
+    return std::nullopt;
   }
-  if (auto resolved = first_existing_path(candidates)) {
+  if (auto resolved = first_existing_path({candidate})) {
     return resolved;
   }
   error = "mesh resource does not exist: " + source_uri;
@@ -707,14 +711,228 @@ core::CollisionGeometryDescriptor retained_native_geometry_descriptor(
 
 }  // namespace
 
+bool is_plain_relative_resource_path(const std::string_view path) noexcept {
+  try {
+    if (path.empty() || path.size() > 4096U ||
+        path.find("://") != std::string_view::npos ||
+        path.find('\0') != std::string_view::npos) {
+      return false;
+    }
+    const std::filesystem::path relative{std::string(path)};
+    if (relative.is_absolute() || relative != relative.lexically_normal()) {
+      return false;
+    }
+    return std::none_of(relative.begin(), relative.end(),
+                        [](const std::filesystem::path& part) {
+                          return part.empty() || part == "." || part == "..";
+                        });
+  } catch (...) {
+    return false;
+  }
+}
+
+OpenedSceneMesh::OpenedSceneMesh(const int descriptor,
+                                 std::string content_digest) noexcept
+    : descriptor_(descriptor), content_digest_(std::move(content_digest)) {}
+
+OpenedSceneMesh::OpenedSceneMesh(OpenedSceneMesh&& other) noexcept
+    : descriptor_(std::exchange(other.descriptor_, -1)),
+      content_digest_(std::move(other.content_digest_)) {}
+
+OpenedSceneMesh& OpenedSceneMesh::operator=(OpenedSceneMesh&& other) noexcept {
+  if (this != &other) {
+    if (descriptor_ >= 0) {
+      static_cast<void>(::close(descriptor_));
+    }
+    descriptor_ = std::exchange(other.descriptor_, -1);
+    content_digest_ = std::move(other.content_digest_);
+  }
+  return *this;
+}
+
+OpenedSceneMesh::~OpenedSceneMesh() {
+  if (descriptor_ >= 0) {
+    static_cast<void>(::close(descriptor_));
+  }
+}
+
+std::filesystem::path OpenedSceneMesh::loader_path() const {
+  return std::filesystem::path("/proc/self/fd") / std::to_string(descriptor_);
+}
+
+std::optional<OpenedSceneMesh> OpenedSceneMesh::open(
+    const int root_fd, const std::string_view relative_uri,
+    std::string& error) {
+  const std::string uri(relative_uri);
+  if (!is_plain_relative_resource_path(relative_uri)) {
+    error = "scene mesh URI is not a plain relative path: " + uri;
+    return std::nullopt;
+  }
+  struct stat root_status {};
+  if (root_fd < 0 || ::fstat(root_fd, &root_status) != 0 ||
+      !S_ISDIR(root_status.st_mode)) {
+    error = "scene-asset root descriptor is unavailable";
+    return std::nullopt;
+  }
+  struct Owned final {
+    int descriptor{-1};
+    ~Owned() {
+      if (descriptor >= 0) {
+        static_cast<void>(::close(descriptor));
+      }
+    }
+  } current;
+  const std::filesystem::path relative(uri);
+  for (auto part = relative.begin(); part != relative.end(); ++part) {
+    const bool last = std::next(part) == relative.end();
+    const int base = current.descriptor >= 0 ? current.descriptor : root_fd;
+    // O_NONBLOCK keeps a FIFO leaf from blocking the open; S_ISREG below
+    // rejects every non-regular leaf.
+    const int next =
+        ::openat(base, part->c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY |
+                     (last ? O_NONBLOCK : O_DIRECTORY));
+    if (next < 0) {
+      error = "scene mesh is unavailable below the scene-asset root "
+              "(missing, symlinked, or not a directory path): " +
+              uri;
+      return std::nullopt;
+    }
+    if (current.descriptor >= 0) {
+      static_cast<void>(::close(current.descriptor));
+    }
+    current.descriptor = next;
+  }
+  struct stat status {};
+  if (::fstat(current.descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
+    error = "scene mesh is not a regular file: " + uri;
+    return std::nullopt;
+  }
+  if (status.st_size < 0 ||
+      static_cast<std::uint64_t>(status.st_size) > kMaximumSceneMeshBytes) {
+    error = "scene mesh exceeds its byte bound: " + uri;
+    return std::nullopt;
+  }
+
+  struct DigestContext final {
+    EVP_MD_CTX* value{EVP_MD_CTX_new()};
+    ~DigestContext() { EVP_MD_CTX_free(value); }
+  } context;
+  if (context.value == nullptr ||
+      EVP_DigestInit_ex(context.value, EVP_sha256(), nullptr) != 1) {
+    error = "scene mesh digest could not be initialized";
+    return std::nullopt;
+  }
+  std::vector<unsigned char> buffer(64U * 1024U);
+  std::uint64_t total = 0U;
+  for (;;) {
+    const auto count = ::pread(current.descriptor, buffer.data(), buffer.size(),
+                               static_cast<off_t>(total));
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      error = "scene mesh could not be read: " + uri;
+      return std::nullopt;
+    }
+    if (count == 0) {
+      break;
+    }
+    total += static_cast<std::uint64_t>(count);
+    if (total > kMaximumSceneMeshBytes) {
+      error = "scene mesh exceeds its byte bound: " + uri;
+      return std::nullopt;
+    }
+    if (EVP_DigestUpdate(context.value, buffer.data(),
+                         static_cast<std::size_t>(count)) != 1) {
+      error = "scene mesh digest could not be updated";
+      return std::nullopt;
+    }
+  }
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_size = 0U;
+  if (EVP_DigestFinal_ex(context.value, digest, &digest_size) != 1 ||
+      digest_size != 32U) {
+    error = "scene mesh digest could not be finalized";
+    return std::nullopt;
+  }
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string text = "sha256:";
+  text.reserve(text.size() + 64U);
+  for (unsigned int index = 0U; index < digest_size; ++index) {
+    text.push_back(kHex[(digest[index] >> 4U) & 0x0fU]);
+    text.push_back(kHex[digest[index] & 0x0fU]);
+  }
+  const int descriptor = std::exchange(current.descriptor, -1);
+  return OpenedSceneMesh(descriptor, std::move(text));
+}
+
 struct ManyForgeCollisionEngine::SharedModel {
+  SharedModel() = default;
+  SharedModel(const SharedModel&) = delete;
+  SharedModel& operator=(const SharedModel&) = delete;
+  ~SharedModel() {
+    if (scene_asset_root_fd >= 0) {
+      static_cast<void>(::close(scene_asset_root_fd));
+    }
+  }
+
   std::string model_name;
   pinocchio::Model model;
   pinocchio::GeometryModel base_collision_model;
   std::vector<std::filesystem::path> package_paths;
   std::vector<std::string> group_joint_names;
   std::string group_name;
+  /// Model-owned duplicate of the approved scene-asset root, or -1.
+  int scene_asset_root_fd{-1};
+  /// First-read digest of each relative scene mesh URI, shared by every
+  /// collision context and by the planner-worker projection of this model.
+  mutable std::mutex scene_mesh_digest_mutex;
+  mutable std::map<std::string, std::string> scene_mesh_digests;
 };
+
+namespace {
+
+constexpr std::size_t kMaximumPinnedSceneMeshes = 4096U;
+
+/// Opens one relative scene mesh below the model's approved root and checks
+/// its bytes against (or pins) the model's first-read digest for that URI.
+std::optional<OpenedSceneMesh> open_pinned_scene_mesh(
+    const ManyForgeCollisionEngine::SharedModel& model,
+    const std::string& relative_uri, std::string& error,
+    std::string& reason) {
+  reason = "scene_mesh_unavailable";
+  if (model.scene_asset_root_fd < 0) {
+    error = "relative scene mesh URI has no approved scene-asset root: " +
+            relative_uri;
+    return std::nullopt;
+  }
+  auto opened =
+      OpenedSceneMesh::open(model.scene_asset_root_fd, relative_uri, error);
+  if (!opened.has_value()) {
+    return std::nullopt;
+  }
+  std::lock_guard lock(model.scene_mesh_digest_mutex);
+  const auto pinned = model.scene_mesh_digests.find(relative_uri);
+  if (pinned != model.scene_mesh_digests.end()) {
+    if (pinned->second != opened->content_digest()) {
+      reason = std::string(kSceneMeshContentChangedReason);
+      error = std::string(kSceneMeshContentChangedReason) +
+              ": scene mesh bytes differ from the bytes first loaded for " +
+              relative_uri;
+      return std::nullopt;
+    }
+    return opened;
+  }
+  if (model.scene_mesh_digests.size() >= kMaximumPinnedSceneMeshes) {
+    error = "pinned scene mesh inventory exceeds its bound";
+    return std::nullopt;
+  }
+  model.scene_mesh_digests.emplace(relative_uri, opened->content_digest());
+  return opened;
+}
+
+}  // namespace
 
 struct ManyForgeCollisionEngine::PreparedScene {
   struct RuntimePairBinding {
@@ -749,11 +967,26 @@ ManyForgeCollisionEngine::load_shared_model(
     const std::filesystem::path& urdf_path,
     const std::filesystem::path& srdf_path,
     const std::vector<std::filesystem::path>& package_paths,
-    std::string group_name) {
+    std::string group_name, const std::optional<int> scene_asset_root_fd) {
   auto shared = std::make_shared<SharedModel>();
   shared->model_name = model_name;
   shared->package_paths = package_paths;
   shared->group_name = std::move(group_name);
+  if (scene_asset_root_fd.has_value()) {
+    struct stat root_status {};
+    if (*scene_asset_root_fd < 0 ||
+        ::fstat(*scene_asset_root_fd, &root_status) != 0 ||
+        !S_ISDIR(root_status.st_mode)) {
+      throw std::invalid_argument(
+          "collision scene-asset root descriptor is not a directory");
+    }
+    shared->scene_asset_root_fd =
+        ::fcntl(*scene_asset_root_fd, F_DUPFD_CLOEXEC, 3);
+    if (shared->scene_asset_root_fd < 0) {
+      throw std::runtime_error(
+          "collision scene-asset root descriptor could not be duplicated");
+    }
+  }
   const auto urdf_bytes = read_text_file(urdf_path);
   const auto urdf_tree = ::urdf::parseURDF(urdf_bytes);
   if (!urdf_tree) {
@@ -791,6 +1024,35 @@ ManyForgeCollisionEngine::load_shared_model(
   shared->group_joint_names =
       group_joint_names_from_srdf(srdf_path, urdf_path, shared->group_name);
   return shared;
+}
+
+core::Result<std::string> ManyForgeCollisionEngine::scene_mesh_content_digest(
+    const SharedModelPtr& shared_model, const std::string& relative_uri) {
+  const auto refusal = [&](std::string message, std::string reason) {
+    return core::Result<std::string>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+        std::move(message),
+        {{"reason", std::move(reason)}}});
+  };
+  if (!shared_model) {
+    return refusal("scene mesh digest requires a loaded collision model",
+                   "scene_mesh_unavailable");
+  }
+  {
+    std::lock_guard lock(shared_model->scene_mesh_digest_mutex);
+    const auto pinned = shared_model->scene_mesh_digests.find(relative_uri);
+    if (pinned != shared_model->scene_mesh_digests.end()) {
+      return core::Result<std::string>::Ok(pinned->second);
+    }
+  }
+  std::string error;
+  std::string reason;
+  auto opened =
+      open_pinned_scene_mesh(*shared_model, relative_uri, error, reason);
+  if (!opened.has_value()) {
+    return refusal(std::move(error), std::move(reason));
+  }
+  return core::Result<std::string>::Ok(opened->content_digest());
 }
 
 ManyForgeCollisionEngine::SharedSceneCachePtr
@@ -2673,8 +2935,23 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                        "bound";
               }
               std::string mesh_error;
-              auto mesh_path = resolve_mesh_resource_uri(
-                  *geom.source_uri, shared_model_->package_paths, mesh_error);
+              // A relative scene mesh is read only through its validated
+              // descriptor below the approved root; the descriptor stays open
+              // until the loader returns and its digest is pinned per URI.
+              std::optional<OpenedSceneMesh> scene_mesh;
+              std::optional<std::filesystem::path> mesh_path;
+              if (is_plain_relative_resource_path(*geom.source_uri)) {
+                std::string reason;
+                scene_mesh = open_pinned_scene_mesh(
+                    *shared_model_, *geom.source_uri, mesh_error, reason);
+                if (scene_mesh.has_value()) {
+                  mesh_path = scene_mesh->loader_path();
+                }
+              } else {
+                mesh_path = resolve_mesh_resource_uri(
+                    *geom.source_uri, shared_model_->package_paths,
+                    mesh_error);
+              }
               if (!mesh_path) {
                 return "triangle mesh geometry could not resolve source_uri "
                        "for " +
@@ -2684,7 +2961,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
               auto mesh = loader.load(mesh_path->string(), scale);
               if (!mesh) {
                 return "triangle mesh loader returned null for " +
-                       body.body_id + ": " + mesh_path->string();
+                       body.body_id + ": " + *geom.source_uri;
               }
               shape = std::move(mesh);
               scene_cache_->mesh_geometry_cache[cache_key] = shape;

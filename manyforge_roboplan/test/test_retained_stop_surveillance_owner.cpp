@@ -75,6 +75,153 @@ Query(const RetainedStopSurveillanceObservationSource &source,
       source.evidence_requirement, source.resolved_source, evaluation_time_ns};
 }
 
+inline constexpr char kIdleDigestA[] =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+inline constexpr char kIdleDigestB[] =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// Exact terminal status of an idle explicit Full Stop: certified, latched,
+/// no participant scope and no captured resource.
+[[nodiscard]] core::StopStatusDTO
+IdleCellWideStatus(const core::RuntimeParticipantBinding &binding) {
+  auto reduced = core::ReduceStopTerminal(core::StopTerminalReductionInputDTO{
+      core::StopCertificateId("certificate.idle"),
+      core::StopCertificateRevision(1U),
+      core::StopId("stop.idle"),
+      core::StopGeneration(1U),
+      core::StopRequestedSelectorSnapshotDTO{
+          core::StopRequestedSelectorKindDTO::kExplicitFull,
+          core::ContentDigest(kIdleDigestA), std::nullopt, std::nullopt},
+      core::StopResolutionDispositionDTO::kExact,
+      core::StopScopeResolutionReasonDTO::kExplicitFullStop,
+      {},
+      {core::StopScopeCaptureHistoryDTO{
+          1U,
+          core::StopResolutionDispositionDTO::kExact,
+          core::StopScopeResolutionReasonDTO::kExplicitFullStop,
+          core::ContentDigest(kIdleDigestB),
+          {},
+          {},
+          {}}},
+      {},
+      {},
+      {},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      20,
+      std::nullopt});
+  if (!reduced.ok()) {
+    throw std::logic_error(reduced.error().message);
+  }
+  const auto &certificate = reduced.value();
+  const core::StopCertificateRefDTO certificate_ref{
+      certificate.stop_certificate_id, certificate.stop_certificate_revision,
+      certificate.stop_id, certificate.stop_generation};
+  const core::StopDurableProjectionStatusDTO recorded{
+      core::StopDurableProjectionStateDTO::kRecorded, std::nullopt,
+      std::nullopt};
+  const core::StopDurableProjectionStatusDTO not_applicable{
+      core::StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
+      std::nullopt};
+  return core::StopStatusDTO{
+      core::StopAcceptedDTO{core::RequestId("stop-request.idle"),
+                            core::RequestReplayStatusDTO::kAcceptedNew,
+                            core::StopId("stop.idle"),
+                            core::StopGeneration(1U),
+                            core::ContentDigest(kIdleDigestA),
+                            core::StopResolutionDispositionDTO::kExact,
+                            core::StopScopeResolutionReasonDTO::kExplicitFullStop,
+                            {},
+                            core::ContentDigest(kIdleDigestB),
+                            {},
+                            {},
+                            1'000,
+                            100,
+                            900,
+                            10,
+                            {}},
+      core::StopStatusStateDTO::kSucceeded,
+      certificate.scope_entries,
+      {},
+      certificate.attempted_stage_results,
+      certificate.evidence_items,
+      certificate.unsettled,
+      certificate.failed,
+      recorded,
+      recorded,
+      not_applicable,
+      certificate_ref,
+      core::StopFaultLatchDTO{
+          core::CellId("cell.test"),
+          certificate.stop_id,
+          certificate.stop_generation,
+          certificate_ref,
+          core::StopFaultLatchId("latch.idle"),
+          core::StopFaultLatchGeneration(1U),
+          core::StopFaultTriggerDTO::kScopePromotion,
+          false,
+          {},
+          {},
+          binding.value().retained_bundle_id,
+          binding.value().graph_revision,
+          recorded,
+          not_applicable,
+          core::StopFaultLatchStateDTO::kLatched,
+          1U,
+          core::StopFaultRecoveryStatusDTO::kWaitingForObservation,
+          "stop_scope_promoted",
+          {}},
+      std::nullopt};
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     IdleCellWideStopFactsUseTheSharedInstalledDomainConfigurations) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto goal_source = [](std::int64_t) {
+    return core::Result<core::ContentDigest>::Ok(
+        core::ContentDigest("sha256:" + std::string(64U, 'e')));
+  };
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {}, goal_source}});
+  const auto status = IdleCellWideStatus(binding);
+  ASSERT_EQ(core::stop_status_field_error(status), std::nullopt);
+
+  const std::vector<const core::RuntimeParticipantBinding *> installed{
+      &binding};
+  const auto expected =
+      core::StopFaultRecoveryConfigurationExpectations(status, installed);
+  ASSERT_TRUE(expected.ok()) << expected.error().message;
+  const auto &path = *binding.value().control_path;
+  ASSERT_EQ(expected.value(),
+            (std::vector<core::StopFaultRecoveryConfigurationExpectationDTO>{
+                {path.control_domain_id, path.active_control_configuration_id,
+                 path.active_control_configuration_generation}}));
+
+  const auto facts = owner.BuildRecoveryFacts(status, 105);
+  ASSERT_TRUE(facts.ok()) << facts.error().message;
+  EXPECT_TRUE(facts.value().resource_facts.empty());
+  ASSERT_EQ(facts.value().configuration_facts.size(), 1U);
+  EXPECT_EQ(facts.value().configuration_facts.front().configuration,
+            expected.value().front());
+  EXPECT_TRUE(facts.value().configuration_facts.front().reconciled);
+  const auto assessed = core::AssessStopFaultRecovery(status, facts.value());
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status,
+            core::StopFaultRecoveryStatusDTO::kReady);
+
+  // Installed sources from another retained product are not configuration
+  // evidence for this latch: fail closed instead of offering rows.
+  auto foreign = status;
+  foreign.fault_latch->retained_bundle_id =
+      core::RetainedBundleId("bundle.other");
+  const auto rejected = owner.BuildRecoveryFacts(foreign, 105);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code,
+            core::kStopFaultRecoveryInstalledConfigurationInvalid);
+}
+
 TEST(RetainedStopSurveillanceOwnerTest,
      ReadsExactAddressedRestAndReportsMotionAndStaleness) {
   const auto binding = make_binding();

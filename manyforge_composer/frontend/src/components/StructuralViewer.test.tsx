@@ -438,6 +438,27 @@ describe('viewer failure isolation', () => {
     expect(workspace).not.toContain('carried-object placement');
   });
 
+  it('creates the viewer Canvas once per context setting, never keyed on onCreated discoveries', () => {
+    const source = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url),
+      'utf8',
+    );
+    const canvasStart = source.indexOf('const ViewerCanvas = memo(function ViewerCanvas({');
+    const canvas = source.slice(canvasStart, source.indexOf('<ViewerQualificationProfiler', canvasStart));
+    const canvasElement = canvas.slice(canvas.indexOf('    <Canvas'), canvas.indexOf('frameloop='));
+    const keyLine = canvasElement.split('\n').find((line) => line.trim().startsWith('key=')) ?? '';
+    // The key is the context-creation setting only; the renderer kind found
+    // by onCreated (inspection.software/renderer) must not remount the Canvas.
+    expect(keyLine).toContain("key={renderer.antialias ? 'aa' : 'no-aa'}");
+    expect(keyLine).not.toMatch(/software|inspection|vendor/);
+    // Mounts are seeded from the page-level inspection, and onCreated only
+    // records into that cache.
+    expect(canvas).toContain('pageViewerRendererInspection()');
+    expect(canvas).toContain('rememberViewerRendererInspection(inspectViewerRenderer(gl))');
+    // DPR stays live (a prop, not part of the key).
+    expect(canvas).toContain('dpr={renderer.effectiveDpr}');
+  });
+
   it('retains wheel camera presentation without React state commits', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
@@ -484,14 +505,63 @@ describe('viewer failure isolation', () => {
       new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
       'utf8',
     );
+    // Only a verified (ready) or a retained, not-current model is presented.
     expect(workspace).toContain(
-      "modelPresentation.status === 'ready'\n    ? modelPresentation.manifest\n    : null",
+      "modelPresentation.status === 'ready'\n    || modelPresentation.status === 'retained'\n    ? modelPresentation.manifest\n    : null",
     );
+    expect(workspace).toContain('const readyManifest = presentedManifest;');
     expect(workspace).toContain('manifest={viewerManifest}');
     expect(workspace).toContain('modelPresentation={modelPresentation}');
     expect(workspace).toContain('if (readyManifest === null || motionDescriptor === null) return null;');
     expect(workspace).toContain('<RobotControlPanelView');
     expect(workspace).toContain('robotControlSurface={(');
+  });
+
+  it('resolves owner scene meshes by content identity, not by owner epoch or generation', () => {
+    const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    const mesh = source.slice(source.indexOf('function SceneObjectMesh({'), source.indexOf('export function clonePreviewMesh'));
+    const dependencies = mesh.slice(mesh.lastIndexOf('}, ['));
+    // Only the mesh source (URI, scale) or the Program Draft identity re-resolves.
+    expect(dependencies).toContain('shape.resource_uri,');
+    expect(dependencies).toContain('scaleX,');
+    expect(dependencies).toContain('draftId,');
+    expect(dependencies).toContain('draftRevision,');
+    expect(dependencies).toContain('ownerBound,');
+    expect(mesh).not.toMatch(/ownerEpoch|ownerGeneration|ownerIdentity\?\.generation/);
+    // The content-addressed URL is used as-is: no owner-generation filtering,
+    // no epoch-rotation retry, no parallel loaded-asset identity.
+    expect(mesh).toContain('.then((asset) => asset.mesh_asset_url)');
+    expect(source).not.toMatch(
+      /retryableSceneMeshFailure|SCENE_MESH_RERESOLVE_DELAY_MS|resolveAttempt|retriedEpoch|retryTimer|loadedAsset|sceneMeshMetadataMatchesOwner|SUPERSEDED_SCENE_MESH_MESSAGE/,
+    );
+  });
+
+  it('shows a failed scene mesh load and lets a later remount refetch the stable URL', () => {
+    const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    const mesh = source.slice(source.indexOf('function SceneObjectMesh({'), source.indexOf('export function clonePreviewMesh'));
+    expect(mesh).toContain('<AssetErrorBoundary resetKey={url} onError={isolateAssetError}>');
+    // A load failure is reported (error box), and the cached failure for the
+    // stable URL is dropped so a retry remount fetches it again.
+    expect(mesh).toContain('if (url !== null) forgetSceneMeshAsset(url);\n    isolateError(failure);');
+    expect(mesh).toContain('<meshBasicMaterial color={VIEWPORT_COLORS.error} wireframe />');
+    expect(source).toContain('.clear?.(resolveStructuralAssetUrl(url));');
+  });
+
+  it('reloads scene geometry explicitly without remounting it for each pose generation', () => {
+    const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    const resolution = source.slice(source.indexOf('function SceneObjectMesh({'), source.indexOf('export function clonePreviewMesh'));
+    const dependencies = resolution.slice(resolution.lastIndexOf('}, ['));
+    expect(dependencies).not.toContain('ownerGeneration,');
+    expect(dependencies).not.toContain('ownerEpoch,');
+    expect(dependencies).toContain('shape.resource_uri,');
+    const reloadKeys = [...source.matchAll(
+      /<(?:LogicalSceneObjects|ObservedLogicalSceneObjects)\s+key=(.+)/g,
+    )].map((match) => match[1]);
+    expect(reloadKeys).toHaveLength(2);
+    // Both layers are siblings: a shared reload counter must not give them
+    // the same React identity, or reconciliation can duplicate/remove meshes.
+    expect(new Set(reloadKeys).size).toBe(2);
+    expect(reloadKeys.every((key) => key.includes('retryGeneration'))).toBe(true);
   });
 
   it('isolates individual retained and logical-scene mesh failures', () => {
@@ -502,7 +572,7 @@ describe('viewer failure isolation', () => {
 
     expect(source).toContain('<AssetErrorBoundary resetKey={visual.mesh_url}');
     expect(source).toContain('<AssetErrorBoundary resetKey={collision.mesh_url}');
-    expect(source).toContain('<AssetErrorBoundary resetKey={url} onError={isolateError}>');
+    expect(source).toContain('<AssetErrorBoundary resetKey={url} onError={isolateAssetError}>');
     expect(source).toContain('onIsolatedAssetError={reportIsolatedAssetError}');
     expect(source).toContain('onPreviewAssetError={reportPreviewAssetError}');
   });

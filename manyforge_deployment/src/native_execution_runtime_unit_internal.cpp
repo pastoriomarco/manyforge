@@ -188,11 +188,13 @@ native_execution_runtime_infrastructure_projection(
       std::string(kNativeExecutionRuntimeProfileId)};
   const core::RuntimeProfileRevision runtime_profile_revision(
       native_execution_runtime_profile_revision());
+  const core::ProductContractId product_contract_id{
+      std::string(kNativeExecutionRuntimeProductContractId)};
+  const auto product_contract_revision =
+      native_execution_runtime_product_contract_revision();
   const auto &contract = require_runtime_contract(
-      runtime_profile_id, runtime_profile_revision,
-      core::ProductContractId(
-          std::string(kNativeExecutionRuntimeProductContractId)),
-      native_execution_runtime_product_contract_revision());
+      runtime_profile_id, runtime_profile_revision, product_contract_id,
+      product_contract_revision);
   const auto& liveness = manager_liveness_policy_value();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -690,6 +692,68 @@ void require_native_execution_runtime_product_matches_retained_bundle(
   }
 }
 
+std::vector<native_execution_runtime_contract::Configuration::MotionTargetLimit>
+decode_execution_motion_target_limits(
+    const core::JsonValueDTO::Array &motion_target_limits,
+    const bool include_ordinary_jerk) {
+  using native_execution_runtime_contract::Configuration;
+  std::vector<Configuration::MotionTargetLimit> result;
+  result.reserve(motion_target_limits.size());
+  for (const auto &entry : motion_target_limits) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+    if (object == nullptr ||
+        object->size() != (include_ordinary_jerk ? 4U : 3U)) {
+      throw RetainedBundleError(
+          "execution runtime configuration has an invalid motion target limit");
+    }
+    const auto component = object->find("controllable_component_id");
+    const auto target = object->find("command_target_id");
+    const auto limit = object->find("maximum_tcp_linear_speed_mps");
+    if (component == object->end() || target == object->end() ||
+        limit == object->end()) {
+      throw RetainedBundleError("execution runtime configuration has an "
+                                "incomplete motion target limit");
+    }
+    const auto *component_id =
+        std::get_if<std::string>(&component->second.value);
+    const auto *target_id = std::get_if<std::string>(&target->second.value);
+    const auto *maximum = std::get_if<double>(&limit->second.value);
+    if (component_id == nullptr || component_id->empty() ||
+        target_id == nullptr || target_id->empty() || maximum == nullptr ||
+        !std::isfinite(*maximum) || *maximum <= 0.0 || *maximum > 1000.0) {
+      throw RetainedBundleError(
+          "execution runtime configuration has an invalid "
+          "motion target limit value");
+    }
+    result.push_back(Configuration::MotionTargetLimit{
+        core::ControllableComponentId(*component_id),
+        core::CommandTargetId(*target_id), *maximum,
+        include_ordinary_jerk
+            ? detail::decode_ordinary_motion_jerk_settings(
+                  std::get<core::JsonObjectDTO>(
+                      object->at("ordinary_motion_jerk").value))
+            : native_execution_runtime_contract::OrdinaryMotionJerkSettings{}});
+  }
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.controllable_component_id,
+                              left.command_target_id) <
+                     std::tie(right.controllable_component_id,
+                              right.command_target_id);
+            });
+  if (std::adjacent_find(result.begin(), result.end(),
+                         [](const auto &left, const auto &right) {
+                           return left.controllable_component_id ==
+                                      right.controllable_component_id &&
+                                  left.command_target_id ==
+                                      right.command_target_id;
+                         }) != result.end()) {
+    throw RetainedBundleError(
+        "execution runtime configuration repeats a motion target limit");
+  }
+  return result;
+}
+
 native_execution_runtime_contract::Configuration
 decode_native_execution_runtime_configuration(
     const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
@@ -784,57 +848,8 @@ decode_native_execution_runtime_configuration(
     }
     result.initial_joint_positions_rad.push_back(*number);
   }
-  result.motion_target_limits.reserve(motion_target_limits->size());
-  for (const auto &entry : *motion_target_limits) {
-    const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
-    if (object == nullptr || object->size() != 4U) {
-      throw RetainedBundleError(
-          "native runtime configuration has an invalid motion target limit");
-    }
-    const auto component = object->find("controllable_component_id");
-    const auto target = object->find("command_target_id");
-    const auto limit = object->find("maximum_tcp_linear_speed_mps");
-    if (component == object->end() || target == object->end() ||
-        limit == object->end()) {
-      throw RetainedBundleError(
-          "native runtime configuration has an incomplete motion target limit");
-    }
-    const auto *component_id =
-        std::get_if<std::string>(&component->second.value);
-    const auto *target_id = std::get_if<std::string>(&target->second.value);
-    const auto *maximum = std::get_if<double>(&limit->second.value);
-    if (component_id == nullptr || component_id->empty() ||
-        target_id == nullptr || target_id->empty() || maximum == nullptr ||
-        !std::isfinite(*maximum) || *maximum <= 0.0 || *maximum > 1000.0) {
-      throw RetainedBundleError("native runtime configuration has an invalid "
-                                "motion target limit value");
-    }
-    result.motion_target_limits.push_back(Configuration::MotionTargetLimit{
-        core::ControllableComponentId(*component_id),
-        core::CommandTargetId(*target_id), *maximum,
-        detail::decode_ordinary_motion_jerk_settings(
-            std::get<core::JsonObjectDTO>(
-                object->at("ordinary_motion_jerk").value))});
-  }
-  std::sort(result.motion_target_limits.begin(),
-            result.motion_target_limits.end(),
-            [](const auto &left, const auto &right) {
-              return std::tie(left.controllable_component_id,
-                              left.command_target_id) <
-                     std::tie(right.controllable_component_id,
-                              right.command_target_id);
-            });
-  if (std::adjacent_find(
-          result.motion_target_limits.begin(),
-          result.motion_target_limits.end(),
-          [](const auto &left, const auto &right) {
-            return left.controllable_component_id ==
-                       right.controllable_component_id &&
-                   left.command_target_id == right.command_target_id;
-          }) != result.motion_target_limits.end()) {
-    throw RetainedBundleError(
-        "native runtime configuration repeats a motion target limit");
-  }
+  result.motion_target_limits =
+      decode_execution_motion_target_limits(*motion_target_limits, true);
   result.direct_control_joint_limits.reserve(
       direct_control_joint_limits->size());
   for (const auto &entry : *direct_control_joint_limits) {

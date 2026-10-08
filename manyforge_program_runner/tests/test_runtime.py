@@ -1723,7 +1723,12 @@ def test_applied_activation_prepares_scene_while_idle_without_run_claim(
     assert result["admission_generation"] == 1
     assert prepared and prepared[0].startswith("program-scene.")
     assert admission.claims == []
-    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    status = runtime.cycle_status()
+    assert status["state"] == "idle_after_reset"
+    availability = {row["command_kind"]: row for row in status["allowed_commands"]}
+    # An idle cell-wide Stop fault has no Program Reset to consume it.
+    assert availability["stop_recovery"]["allowed"] is True
+    assert availability["execution_recovery"]["allowed"] is False
     runtime.shutdown()
 
 

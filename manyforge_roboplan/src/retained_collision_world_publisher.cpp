@@ -1,10 +1,14 @@
 #include <algorithm>
 #include <limits>
 #include <manyforge_core/execution_collision_support.hpp>
+#include <map>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <set>
+#include <string>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -23,7 +27,141 @@ bool initial_mutation_source(
          source == core::CollisionWorldMutationSource::kDeploymentApply;
 }
 
+core::ErrorDTO freshness_refusal(std::string message, std::string reason) {
+  return core::ErrorDTO{
+      std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+      std::move(message),
+      {{"reason", std::move(reason)}},
+  };
+}
+
+bool same_evidence_origin(const core::SceneObjectProviderEvidenceDTO &lhs,
+                          const core::SceneObjectProviderEvidenceDTO &rhs) {
+  return lhs.provider_instance_id == rhs.provider_instance_id &&
+         lhs.provider_manifest_id == rhs.provider_manifest_id &&
+         lhs.provider_manifest_revision == rhs.provider_manifest_revision &&
+         lhs.provider_source_epoch == rhs.provider_source_epoch &&
+         lhs.source_freshness_budget_ns == rhs.source_freshness_budget_ns;
+}
+
+const core::SceneObjectSnapshotDTO *
+find_scene_object(const core::LogicalSceneSnapshotDTO &scene,
+                  const std::string &object_id) {
+  const auto found = std::find_if(
+      scene.objects.begin(), scene.objects.end(), [&](const auto &object) {
+        return object.scene_resource_id.value() == object_id;
+      });
+  return found == scene.objects.end() ? nullptr : &*found;
+}
+
+/// Replaces one object's freshness in a sidecar and live-object list using
+/// the same conventions as project_body_freshness/project_live_objects:
+/// body source_id is the provider instance, live source_id is
+/// "<instance>@<source epoch>", and the age origin is received_at_ns.
+/// The sidecar is left sorted and unique by body id. Returns false when the
+/// object has no projected collision bodies.
+bool apply_object_freshness(
+    std::vector<core::CollisionWorldBodyFreshness> &body_freshness,
+    std::vector<core::SceneSnapshotLiveObject> &live_objects,
+    const std::string &object_id,
+    const core::SceneObjectProviderEvidenceDTO &evidence) {
+  const auto live = std::find_if(
+      live_objects.begin(), live_objects.end(),
+      [&](const auto &value) { return value.object_id == object_id; });
+  if (live == live_objects.end() || live->collision_body_ids.empty()) {
+    return false;
+  }
+  for (const auto &body_id : live->collision_body_ids) {
+    const auto entry = std::find_if(
+        body_freshness.begin(), body_freshness.end(),
+        [&](const auto &value) { return value.body_id == body_id; });
+    core::CollisionWorldBodyFreshness replacement{
+        body_id, evidence.provider_instance_id.value(), evidence.received_at_ns,
+        evidence.source_freshness_budget_ns};
+    if (entry == body_freshness.end()) {
+      body_freshness.push_back(std::move(replacement));
+    } else {
+      *entry = std::move(replacement);
+    }
+  }
+  std::sort(body_freshness.begin(), body_freshness.end(),
+            [](const auto &lhs, const auto &rhs) {
+              return lhs.body_id < rhs.body_id;
+            });
+  body_freshness.erase(
+      std::unique(body_freshness.begin(), body_freshness.end(),
+                  [](const auto &lhs, const auto &rhs) {
+                    return lhs.body_id == rhs.body_id;
+                  }),
+      body_freshness.end());
+  live->source_id = evidence.provider_instance_id.value() + "@" +
+                    evidence.provider_source_epoch;
+  live->source_timestamp_ns = evidence.received_at_ns;
+  live->source_freshness_budget_ns = evidence.source_freshness_budget_ns;
+  return true;
+}
+
 } // namespace
+
+std::optional<core::ErrorDTO> ValidateProviderFreshnessAgainstCommittedScene(
+    const core::LogicalSceneSnapshotDTO &committed_scene,
+    const core::ProviderFreshnessConfirmationDTO &confirmation) {
+  if (!confirmation.valid()) {
+    return freshness_refusal("provider freshness confirmation is incomplete",
+                             "provider_freshness_invalid");
+  }
+  if (committed_scene.revision !=
+      confirmation.expected_projection_revision.scene_revision) {
+    return freshness_refusal(
+        "provider freshness confirmation names another scene revision",
+        "provider_freshness_revision_mismatch");
+  }
+  const auto *object = find_scene_object(
+      committed_scene, confirmation.scene_resource_id.value());
+  if (object == nullptr) {
+    return freshness_refusal(
+        "provider freshness confirmation names an absent scene object",
+        "provider_freshness_object_absent");
+  }
+  const auto *fixed =
+      std::get_if<core::CellFixedSceneObjectPlacementDTO>(&object->placement);
+  const bool attached = std::any_of(
+      committed_scene.carried_object_attachments.begin(),
+      committed_scene.carried_object_attachments.end(),
+      [&](const auto &attachment) {
+        return attachment.scene_resource_id == confirmation.scene_resource_id;
+      });
+  if (fixed == nullptr || attached ||
+      fixed->cell_id != committed_scene.cell_id) {
+    return freshness_refusal(
+        "provider freshness confirmation requires an unattached cell-fixed "
+        "object",
+        "provider_freshness_object_not_cell_fixed");
+  }
+  if (!(fixed->pose_in_cell == confirmation.pose_in_cell)) {
+    return freshness_refusal(
+        "provider freshness confirmation pose differs from the committed pose",
+        "provider_freshness_pose_mismatch");
+  }
+  if (!object->provider_evidence.has_value() ||
+      !same_evidence_origin(*object->provider_evidence,
+                            confirmation.evidence)) {
+    return freshness_refusal(
+        "provider freshness confirmation differs from the committed evidence "
+        "origin or freshness budget",
+        "provider_freshness_origin_mismatch");
+  }
+  if (confirmation.evidence.provider_source_sequence <=
+          object->provider_evidence->provider_source_sequence ||
+      confirmation.evidence.received_at_ns <
+          object->provider_evidence->received_at_ns) {
+    return freshness_refusal(
+        "provider freshness confirmation is not newer than the committed "
+        "evidence",
+        "provider_freshness_not_newer");
+  }
+  return std::nullopt;
+}
 
 RetainedCollisionWorldPublisher::RetainedCollisionWorldPublisher(
     RetainedCollisionWorldProjector projector, std::string publisher_id,
@@ -179,10 +317,35 @@ RetainedCollisionWorldPublisher::publish_locked(
       projector_.model_map().graph_revision, logical_scene.revision};
   auto logical_scene_ptr =
       std::make_shared<const core::LogicalSceneSnapshotDTO>(logical_scene);
+  // Freshness overrides are a derived cache of committed evidence: keep one
+  // only while its object's committed evidence and placement are exactly the
+  // ones it was confirmed against, and re-apply it over the projection.
+  auto body_freshness = projector_.project_body_freshness(*world_ptr);
+  auto live_objects = projector_.project_live_objects(logical_scene, *world_ptr);
+  std::map<std::string, FreshnessOverride> next_overrides;
+  for (const auto &[object_id, override_value] : freshness_overrides_) {
+    const auto *object = find_scene_object(logical_scene, object_id);
+    const bool attached = std::any_of(
+        logical_scene.carried_object_attachments.begin(),
+        logical_scene.carried_object_attachments.end(),
+        [&](const auto &attachment) {
+          return attachment.scene_resource_id.value() == object_id;
+        });
+    if (object == nullptr || attached ||
+        !object->provider_evidence.has_value() ||
+        !(*object->provider_evidence == override_value.committed_evidence) ||
+        !(object->placement == override_value.committed_placement)) {
+      continue;
+    }
+    if (apply_object_freshness(body_freshness, live_objects, object_id,
+                               override_value.confirmed_evidence)) {
+      next_overrides.emplace(object_id, override_value);
+    }
+  }
   core::CollisionWorldPolicySnapshotBundle coherent{
       world_ptr,
       std::move(policy.value()),
-      projector_.project_body_freshness(*world_ptr),
+      std::move(body_freshness),
   };
   auto runtime = core::build_runtime_collision_query_bundle(
       std::move(coherent), runtime_epoch_ + 1U, projection_revision);
@@ -226,8 +389,7 @@ RetainedCollisionWorldPublisher::publish_locked(
       runtime->world, *runtime->policy, runtime->body_freshness};
   next_inventory.topology_epoch = logical_scene.topology_epoch;
   next_inventory.policy_epoch = logical_scene.policy_epoch;
-  next_inventory.live_objects =
-      projector_.project_live_objects(logical_scene, *runtime->world);
+  next_inventory.live_objects = std::move(live_objects);
   auto next_scene_identity = logical_scene.identity();
   std::string next_policy_content_hash =
       policy_changed ? runtime->policy->revision.content_hash
@@ -263,9 +425,104 @@ RetainedCollisionWorldPublisher::publish_locked(
   owner_sequence_ = next_owner_sequence;
   last_scene_identity_ = std::move(next_scene_identity);
   current_inventory_ = std::move(next_inventory);
+  freshness_overrides_.swap(next_overrides);
   ledger_.swap(next_ledger);
   return core::Result<core::CollisionWorldRevision>::Ok(
       std::move(published_revision));
+}
+
+core::Result<std::uint64_t> RetainedCollisionWorldPublisher::publish_freshness(
+    const core::ProviderFreshnessConfirmationDTO &confirmation) {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  const auto refuse = [](core::ErrorDTO value) {
+    return core::Result<std::uint64_t>::Err(std::move(value));
+  };
+  auto current = runtime_bundle_.load(std::memory_order_acquire);
+  if (!current || !current->world || !current->policy ||
+      !current->policy_index || !current_inventory_.has_value() ||
+      !current_inventory_->logical_scene) {
+    return refuse(freshness_refusal(
+        "collision-world publisher has no current publication",
+        "provider_freshness_publication_unavailable"));
+  }
+  if (current_inventory_->projection_binding.projection_revision !=
+          confirmation.expected_projection_revision ||
+      current->projection_revision != confirmation.expected_projection_revision) {
+    return refuse(freshness_refusal(
+        "provider freshness confirmation names another projection revision",
+        "provider_freshness_revision_mismatch"));
+  }
+  const auto &committed_scene = *current_inventory_->logical_scene;
+  if (auto refusal = ValidateProviderFreshnessAgainstCommittedScene(
+          committed_scene, confirmation);
+      refusal.has_value()) {
+    return refuse(std::move(*refusal));
+  }
+  const auto &object_id = confirmation.scene_resource_id.value();
+  const auto *object = find_scene_object(committed_scene, object_id);
+  if (const auto existing = freshness_overrides_.find(object_id);
+      existing != freshness_overrides_.end() &&
+      existing->second.committed_evidence == *object->provider_evidence &&
+      (confirmation.evidence.provider_source_sequence <=
+           existing->second.confirmed_evidence.provider_source_sequence ||
+       confirmation.evidence.received_at_ns <
+           existing->second.confirmed_evidence.received_at_ns)) {
+    return refuse(freshness_refusal(
+        "provider freshness confirmation is not newer than the last accepted "
+        "confirmation",
+        "provider_freshness_not_newer"));
+  }
+  if (runtime_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
+    return refuse(freshness_refusal(
+        "collision runtime epoch is exhausted",
+        "provider_freshness_epoch_exhausted"));
+  }
+
+  auto next_inventory = *current_inventory_;
+  auto next_freshness = current->body_freshness;
+  if (!apply_object_freshness(next_freshness, next_inventory.live_objects,
+                              object_id, confirmation.evidence)) {
+    return refuse(freshness_refusal(
+        "provider freshness confirmation names an object without projected "
+        "collision bodies",
+        "provider_freshness_object_unprojected"));
+  }
+  auto next_bundle = std::make_shared<core::RuntimeCollisionQueryBundle>();
+  next_bundle->projection_revision = current->projection_revision;
+  next_bundle->world = current->world;
+  next_bundle->policy = current->policy;
+  next_bundle->policy_index = current->policy_index;
+  next_bundle->selected_distance_pairs = current->selected_distance_pairs;
+  next_bundle->contact_grasp_selected_distance_pairs =
+      current->contact_grasp_selected_distance_pairs;
+  next_bundle->distance_selection_order_valid =
+      current->distance_selection_order_valid;
+  next_bundle->body_freshness = next_freshness;
+  next_bundle->lookup_order_valid = core::runtime_collision_lookup_order_is_valid(
+      *next_bundle->world, next_bundle->body_freshness);
+  next_bundle->epoch = runtime_epoch_ + 1U;
+  if (!next_bundle->lookup_order_valid ||
+      !next_bundle->distance_selection_order_valid) {
+    return refuse(freshness_refusal(
+        "freshness-only runtime bundle preparation failed closed",
+        "provider_freshness_bundle_invalid"));
+  }
+  next_inventory.bundle.body_freshness = std::move(next_freshness);
+  auto next_overrides = freshness_overrides_;
+  next_overrides.insert_or_assign(
+      object_id, FreshnessOverride{*object->provider_evidence,
+                                   object->placement, confirmation.evidence});
+  const auto next_epoch = next_bundle->epoch;
+
+  if (!retire_and_swap_locked(std::move(next_bundle))) {
+    return refuse(freshness_refusal(
+        "collision runtime bundle retirement is backpressured",
+        "provider_freshness_backpressured"));
+  }
+  runtime_epoch_ = next_epoch;
+  current_inventory_ = std::move(next_inventory);
+  freshness_overrides_.swap(next_overrides);
+  return core::Result<std::uint64_t>::Ok(next_epoch);
 }
 
 bool RetainedCollisionWorldPublisher::retire_and_swap_locked(

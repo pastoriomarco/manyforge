@@ -26,6 +26,9 @@ struct ManagedProjectionRegistryConfig final {
   std::filesystem::path execution_run_root;
   std::string runtime_unit_id;
   std::string runtime_epoch;
+  /// Manager-opened scene-asset root descriptor, never the package root.
+  /// Absent: relative scene meshes fail closed in the collision model.
+  std::optional<int> scene_asset_root_fd{};
 };
 
 /// The exact candidate every provider Prepare names. Providers prepared for

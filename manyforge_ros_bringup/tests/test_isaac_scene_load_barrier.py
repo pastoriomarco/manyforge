@@ -257,12 +257,84 @@ def test_scene_barrier_stops_after_playing_readiness_timeout() -> None:
             rclpy.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("world_uri", "world_name", "initial_state", "required_topic", "play_result", "failure"),
+    [
+        (WORLD_PATH, "retained_world", SimulationState.STATE_STOPPED, "/clock", 1, None),
+        ("file:/other.usda", "retained_world", SimulationState.STATE_STOPPED, "/clock", 1, "required existing world"),
+        (WORLD_PATH, "another_world", SimulationState.STATE_STOPPED, "/clock", 1, "required existing world"),
+        (WORLD_PATH, "retained_world", SimulationState.STATE_PLAYING, "/clock", 1, "not stopped"),
+        (WORLD_PATH, "retained_world", SimulationState.STATE_STOPPED, "/never_materializes", 1, "missing topics"),
+        (WORLD_PATH, "retained_world", SimulationState.STATE_STOPPED, "/clock", 4, "playing readiness probe.*failed"),
+    ],
+)
+def test_existing_world_join_never_loads_and_contains_only_its_own_playback(
+    world_uri: str,
+    world_name: str,
+    initial_state: int,
+    required_topic: str,
+    play_result: int,
+    failure: str | None,
+) -> None:
+    rclpy.init()
+    simulator = Node("manyforge_fake_existing_world_owner")
+    executor = SingleThreadedExecutor()
+    load_requests: list[bool] = []
+    transitions: list[int] = []
+    publishers = []
+    _install_fake_simulator(
+        simulator,
+        on_load=lambda: load_requests.append(True),
+        on_play=lambda: publishers.append(simulator.create_publisher(Clock, "/clock", 1)),
+        state_transitions=transitions,
+        world_uri=world_uri,
+        world_name=world_name,
+        initial_state=initial_state,
+        play_result=play_result,
+    )
+    executor.add_node(simulator)
+    worker = threading.Thread(target=executor.spin, daemon=True)
+    worker.start()
+    barrier = IsaacSceneLoadBarrier(
+        parameter_overrides=[
+            Parameter("world_uri", value=WORLD_URI),
+            Parameter("expected_world_name", value="retained_world"),
+            Parameter("require_existing_world", value=True),
+            Parameter("startup_timeout_s", value=1.0),
+            Parameter("service_timeout_s", value=0.5),
+            Parameter("required_topics", value=[required_topic]),
+        ]
+    )
+    try:
+        if failure is None:
+            assert barrier.run()["simulation_state"] == "stopped"
+        else:
+            with pytest.raises((RuntimeError, TimeoutError), match=failure):
+                barrier.run()
+        assert load_requests == []
+        assert transitions == (
+            [int(SimulationState.STATE_PLAYING), int(SimulationState.STATE_STOPPED)]
+            if failure is None or required_topic == "/never_materializes" or play_result != 1
+            else []
+        )
+    finally:
+        barrier.destroy_node()
+        executor.shutdown()
+        worker.join(timeout=2.0)
+        simulator.destroy_node()
+        rclpy.shutdown()
+
+
 def _install_fake_simulator(
     node: Node,
     *,
     on_load: Callable[[], None] | None = None,
     on_play: Callable[[], None] | None = None,
     state_transitions: list[int] | None = None,
+    world_uri: str = "file:/opt/isaac/worlds/retained scene.usda",
+    world_name: str = "retained_world",
+    initial_state: int = SimulationState.STATE_STOPPED,
+    play_result: int = 1,
 ) -> None:
     feature_values = [
         int(SimulatorFeatures.WORLD_LOADING),
@@ -277,13 +349,11 @@ def _install_fake_simulator(
 
     def populate_world(response):
         response.result.result = response.result.RESULT_OK
-        response.world.name = "retained_world"
-        response.world.world_resource.uri = (
-            "file:/opt/isaac/worlds/retained scene.usda"
-        )
+        response.world.name = world_name
+        response.world.world_resource.uri = world_uri
         return response
 
-    current_state = {"value": int(SimulationState.STATE_STOPPED)}
+    current_state = {"value": int(initial_state)}
 
     def state(_request, response):
         response.result.result = response.result.RESULT_OK
@@ -298,6 +368,8 @@ def _install_fake_simulator(
         if target == int(SimulationState.STATE_PLAYING) and on_play is not None:
             on_play()
         response.result.result = response.result.RESULT_OK
+        if target == int(SimulationState.STATE_PLAYING):
+            response.result.result = play_result
         return response
 
     def load_world(_request, response):

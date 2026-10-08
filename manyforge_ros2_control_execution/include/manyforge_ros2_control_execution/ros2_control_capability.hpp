@@ -65,6 +65,9 @@ struct Ros2ControlExecutionBackendConfig {
   double execution_progress_projection_regression_tolerance_s = 0.005;
   double stop_completion_timeout_s = 0.5;
   double sim_reset_motion_duration_s = 2.0;
+  /// Legacy standalone profiles initialize the simulator when its controller
+  /// becomes ready. Managed installation observes readiness without motion.
+  bool initialize_commanded_sim_on_controller_ready{true};
   bool require_fresh_state_before_planning = true;
   bool disable_controller_path_tolerances = false;
   std::string execution_state_source_mode = "observed_robot";

@@ -735,21 +735,30 @@ describe('parseSceneUrdfManifest', () => {
 
 describe('scene mesh asset parser', () => {
   const asset = () => ({
-    schema_version: 'manyforge.scene_mesh_asset.v1',
+    schema_version: 'manyforge.scene_mesh_asset.v2',
     asset_hash: '0123456789abcdef',
-    mesh_asset_url: '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=7',
+    mesh_asset_url: '/api/scene/object-meshes/0123456789abcdef.glb',
     mesh_asset_status: 'pending',
-    source_owner_epoch: 'scene.epoch.1',
-    source_generation: 7,
-    cell_id: 'cell.1',
     last_error: null,
   });
 
-  it('requires the exact owner-generation-bound URL', () => {
-    expect(parseSceneMeshAssetMetadata(asset()).source_generation).toBe(7);
-    const stale = asset();
-    stale.mesh_asset_url = '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=6';
-    expect(() => parseSceneMeshAssetMetadata(stale)).toThrow(/owner-generation/);
+  it('requires the exact content-addressed URL without owner identity', () => {
+    expect(parseSceneMeshAssetMetadata(asset()).mesh_asset_url)
+      .toBe('/api/scene/object-meshes/0123456789abcdef.glb');
+    for (const url of [
+      '/api/scene/object-meshes/0123456789abcdef.glb?owner_epoch=scene.epoch.1&generation=7',
+      '/api/scene/object-meshes/fedcba9876543210.glb',
+    ]) {
+      expect(() => parseSceneMeshAssetMetadata({ ...asset(), mesh_asset_url: url }))
+        .toThrow(/content-addressed/);
+    }
+    // The removed owner-generation fields and the v1 schema are rejected.
+    expect(() => parseSceneMeshAssetMetadata({
+      ...asset(), source_owner_epoch: 'scene.epoch.1', source_generation: 7,
+    })).toThrow();
+    expect(() => parseSceneMeshAssetMetadata({
+      ...asset(), schema_version: 'manyforge.scene_mesh_asset.v1',
+    })).toThrow(/scene_mesh_asset\.v2/);
   });
 
   it('requires the exact Program Draft-revision-bound URL', () => {
@@ -1786,6 +1795,35 @@ describe('Deployment workspace parser', () => {
     (crossedApplied.managerApplied as Record<string, unknown>).deploymentRevision =
       `sha256:${'d'.repeat(64)}`;
     expect(() => parseDeploymentWorkspaceResponse(crossedApplied)).toThrow(
+      /exact Deployment Draft and Manager Applied comparison/,
+    );
+  });
+
+  it('accepts the truthful empty workspace where Run is blocked', () => {
+    // Backend response with no loaded Deployment and no Manager Applied.
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: null,
+      deploymentArtifactId: null,
+      deploymentRevision: null,
+      graphRevision: null,
+    });
+    fixture.saved = { path: null, deploymentRevision: null };
+    fixture.managerApplied = { deploymentRevision: null, scenarioId: null };
+    fixture.runAdmission = {
+      ready: false, reason: 'Deployment Draft differs from Manager Applied',
+    };
+    fixture.binding = null;
+    fixture.scenarioCandidates = [];
+    fixture.savedScenarioCandidates = [];
+    const parsed = parseDeploymentWorkspaceResponse(fixture);
+    expect(parsed.runAdmission).toEqual({
+      ready: false, reason: 'Deployment Draft differs from Manager Applied',
+    });
+
+    // A ready Run must still name a Manager Applied identity.
+    fixture.runAdmission = { ready: true, reason: null };
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
       /exact Deployment Draft and Manager Applied comparison/,
     );
   });
@@ -3434,6 +3472,44 @@ describe('addressed Robot Control parsers', () => {
     }]);
     // The direct-control binding is per target, never a runtime identity.
     expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
+
+    // Retained ROS targets can derive an SRDF group and presets without an
+    // optional authored tool configuration, in both snapshots and deltas.
+    const modelOnly = structuredClone(response);
+    Object.assign(modelOnly.status.direct_control_gripper.target_descriptor, {
+      description: null,
+      actuation_kind: null,
+      command_duration_s: null,
+      open_state_ref: null,
+      closed_state_ref: null,
+      mount_frame: null,
+      attach_frame: null,
+      tcp_frame: null,
+      touch_links: [],
+      auxiliary_frames: [],
+    });
+    const modelOnlyWire = composed(modelOnly);
+    const modelOnlyStatus = parseExecutionOwnerStatus(modelOnlyWire);
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.sourceGroupName)
+      .toBe('gripper');
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.namedPresets)
+      .toHaveLength(2);
+    expect(parseExecutionControlStatus(
+      { ...targetsResponse, targets: modelOnlyWire.status.targets },
+      { ...controlResponse, control_state: modelOnlyWire.status.control_state },
+    ).directControlGripper!.targetDescriptor.sourceGroupName).toBe('gripper');
+
+    const partialToolConfiguration = structuredClone(modelOnly);
+    partialToolConfiguration.status.direct_control_gripper.target_descriptor.description
+      = 'Incomplete authored tool';
+    expect(() => parseExecutionOwnerStatus(composed(partialToolConfiguration)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
+    const configuredWithoutGroup = structuredClone(response);
+    Object.assign(configuredWithoutGroup.status.direct_control_gripper.target_descriptor, {
+      source_group_name: null,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(configuredWithoutGroup)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
 
     // Arm-only: one motion row, no gripper row and no null gripper fields.
     const armOnly = parseExecutionControlStatus(

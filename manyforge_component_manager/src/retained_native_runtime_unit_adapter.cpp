@@ -73,7 +73,8 @@ constexpr int kChildExecErrorFd = 5;
 constexpr int kChildPackageRootFd = 6;
 constexpr int kChildExecutableFd = 7;
 constexpr int kChildProgramArtifactRootFd = 8;
-constexpr int kChildHighestReservedFd = kChildProgramArtifactRootFd;
+constexpr int kChildSceneAssetRootFd = 9;
+constexpr int kChildHighestReservedFd = kChildSceneAssetRootFd;
 constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumManagedRuntimeRpcPacketBytes;
 static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
@@ -90,10 +91,10 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 
 [[nodiscard]] std::string_view ProjectionOperationName(
     const detail::NativeProjectionRpcRequest &request) noexcept {
-  static constexpr std::array<std::string_view, 10U> names{
+  static constexpr std::array<std::string_view, 11U> names{
       "prepare", "health", "transaction", "rebuild", "bootstrap-rebuild",
       "bootstrap-status", "retain", "release", "scene-frame",
-      "effective-policy",
+      "effective-policy", "provider-freshness",
   };
   static_assert(names.size() ==
                 std::variant_size_v<detail::NativeProjectionRpcRequest>);
@@ -667,6 +668,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
                              const int liveness_channel_fd, const int error_fd,
                              const int executable_fd, const int package_root_fd,
                              const int program_artifact_root_fd,
+                             const int scene_asset_root_fd,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
@@ -686,16 +688,28 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
       ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int program_artifact_root_copy = ::fcntl(
       program_artifact_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
+  // Absent scene-asset root: FD 9 stays closed (close_range below).
+  const int scene_asset_root_copy =
+      scene_asset_root_fd < 0
+          ? -1
+          : ::fcntl(scene_asset_root_fd, F_DUPFD_CLOEXEC,
+                    kChildHighestReservedFd + 1);
   if (channel_copy < 0 || liveness_channel_copy < 0 || error_copy < 0 ||
       executable_copy < 0 || package_root_copy < 0 ||
       program_artifact_root_copy < 0 ||
+      (scene_asset_root_fd >= 0 && scene_asset_root_copy < 0) ||
       ::dup3(channel_copy, kChildChannelFd, 0) < 0 ||
       ::dup3(liveness_channel_copy, kChildLivenessChannelFd, 0) < 0 ||
       ::dup3(error_copy, kChildExecErrorFd, O_CLOEXEC) < 0 ||
       ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0 ||
       ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0 ||
-      ::dup3(program_artifact_root_copy, kChildProgramArtifactRootFd, 0) < 0) {
+      ::dup3(program_artifact_root_copy, kChildProgramArtifactRootFd, 0) < 0 ||
+      (scene_asset_root_copy >= 0 &&
+       ::dup3(scene_asset_root_copy, kChildSceneAssetRootFd, 0) < 0)) {
     ChildExit(error_fd, errno);
+  }
+  if (scene_asset_root_copy < 0) {
+    static_cast<void>(::close(kChildSceneAssetRootFd));
   }
 #ifdef SYS_close_range
   const long closed =
@@ -850,7 +864,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::vector<std::string> selected_launch_environment_contracts,
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
-       std::filesystem::path activation_root)
+       std::filesystem::path activation_root,
+       std::filesystem::path scene_asset_root)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
@@ -862,6 +877,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                 ? std::filesystem::path{}
                 : NormalizedPlainDirectory(std::move(activation_root),
                                            "candidate retained-package root")),
+        scene_asset_root_path(
+            scene_asset_root.empty()
+                ? std::filesystem::path{}
+                : NormalizedPlainDirectory(std::move(scene_asset_root),
+                                           "scene-asset root")),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
         manager_run_root_path(NormalizedPlainDirectory(
@@ -904,6 +924,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                                  activation_root_path);
       activation_root_fd =
           OpenPinnedPackageRoot(activation_root_path);
+    }
+    if (!scene_asset_root_path.empty()) {
+      // Opened once and fixed for this Manager's lifetime; children receive
+      // only this descriptor, never a path they could re-resolve.
+      for (const auto *typed_root : typed_roots) {
+        RequireDisjointDirectories(scene_asset_root_path, *typed_root);
+      }
+      scene_asset_root_fd = OpenPinnedPackageRoot(scene_asset_root_path);
     }
     const std::array<const std::filesystem::path *, 2U> durable_paths{
         &logical_scene_database_path, &program_cycle_journal_path};
@@ -1686,6 +1714,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       arguments.emplace_back("--manyforge-managed-program-cycle-journal");
       arguments.push_back(program_cycle_journal_path.string());
     }
+    if (scene_asset_root_fd) {
+      arguments.emplace_back("--manyforge-managed-scene-asset-root-fd");
+      arguments.push_back(std::to_string(kChildSceneAssetRootFd));
+    }
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -1713,7 +1745,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
                  exec_pipe[1].get(), target.get(), selected_package_root_fd,
-                 selected_program_artifact_root_fd, argv.data());
+                 selected_program_artifact_root_fd, scene_asset_root_fd.get(),
+                 argv.data());
     }
 
     channels[1].Reset();
@@ -1964,6 +1997,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   UniqueFd package_root_fd;
   std::filesystem::path activation_root_path;
   UniqueFd activation_root_fd;
+  std::filesystem::path scene_asset_root_path;
+  UniqueFd scene_asset_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path manager_run_root_path;
   std::filesystem::path execution_state_root_path;
@@ -2005,6 +2040,47 @@ public:
         binding_, detail::NativeProjectionTransactionRequest{binding_, transaction});
     RequireHealth(result.resulting_health);
     return result;
+  }
+
+  manyforge::core::Result<void> ApplyProviderFreshness(
+      const manyforge::core::ProviderFreshnessConfirmationDTO &confirmation)
+      override {
+    const auto failed = [](std::string message) {
+      return manyforge::core::Result<void>::Err(manyforge::core::ErrorDTO{
+          "projection_state_uncertain",
+          std::move(message),
+          {{"reason", "native_projection_provider_freshness_failed"}}});
+    };
+    if (!confirmation.valid()) {
+      return manyforge::core::Result<void>::Err(manyforge::core::ErrorDTO{
+          "invariant_violation",
+          "native projection provider freshness confirmation is invalid",
+          {{"reason", "provider_freshness_invalid"}}});
+    }
+    // The result contract is Result<void>: a transport, codec or child
+    // failure is reported as an error, never as an applied confirmation.
+    try {
+      auto result = adapter_->ProjectionResultCall<
+          detail::NativeProjectionProviderFreshnessResult>(
+          binding_, detail::NativeProjectionProviderFreshnessRequest{
+                        binding_, confirmation});
+      if (!result.ok()) {
+        return manyforge::core::Result<void>::Err(result.error());
+      }
+      const auto &applied = result.value();
+      if (applied.projection_revision !=
+              confirmation.expected_projection_revision ||
+          applied.scene_resource_id != confirmation.scene_resource_id ||
+          applied.provider_source_sequence !=
+              confirmation.evidence.provider_source_sequence) {
+        return failed("native projection acknowledged a different provider "
+                      "freshness confirmation");
+      }
+      return manyforge::core::Result<void>::Ok();
+    } catch (const std::exception &error) {
+      return failed("native projection provider freshness failed: " +
+                    std::string(error.what()));
+    }
   }
 
   manyforge::core::Result<manyforge::core::CollisionWorldLeaseInventory>
@@ -2182,7 +2258,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::string operating_system, std::string launch_environment_contract,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path activation_root)
+    std::filesystem::path activation_root,
+    std::filesystem::path scene_asset_root)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2191,7 +2268,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root)) {}
+          std::move(activation_root), std::move(scene_asset_root)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -2207,7 +2284,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::vector<std::string> launch_environment_contracts,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path activation_root)
+    std::filesystem::path activation_root,
+    std::filesystem::path scene_asset_root)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2215,7 +2293,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root))) {}
+          std::move(activation_root), std::move(scene_asset_root))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 

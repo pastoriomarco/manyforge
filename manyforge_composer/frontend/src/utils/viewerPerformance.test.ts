@@ -6,12 +6,15 @@ import {
   connectViewerQualification,
   inspectViewerRenderer,
   isSoftwareRenderer,
+  pageViewerRendererInspection,
   recordViewerModelBuild,
   recordViewerObservationApplied,
   recordViewerObservationReceived,
   recordViewerReactCommit,
   recordViewerRenderFrame,
   recordViewerRenderWork,
+  rememberViewerRendererInspection,
+  resetViewerRendererInspectionForTest,
   selectViewerPresentationProfile,
   startViewerPerformanceMonitoring,
   stopViewerPerformanceMonitoring,
@@ -64,6 +67,43 @@ describe('viewer presentation and performance', () => {
       renderer: 'llvmpipe, or similar',
       software: true,
     });
+  });
+
+  it('inspects the page renderer once, before any viewer Canvas exists', () => {
+    resetViewerRendererInspectionForTest();
+    const context = {
+      VENDOR: 3,
+      RENDERER: 4,
+      getExtension: vi.fn(() => null),
+      getParameter: vi.fn((parameter: number) => ({
+        3: 'Mesa',
+        4: 'llvmpipe (LLVM 15.0.7, 128 bits)',
+      })[parameter] ?? ''),
+    };
+    const getContext = vi.fn(() => context);
+    const createCanvas = vi.fn(() => ({ getContext }) as never);
+
+    const first = pageViewerRendererInspection(createCanvas);
+    expect(first).toEqual({
+      vendor: 'Mesa',
+      renderer: 'llvmpipe (LLVM 15.0.7, 128 bits)',
+      software: true,
+    });
+    // Later mounts reuse the page result: no second probe context.
+    expect(pageViewerRendererInspection(createCanvas)).toBe(first);
+    expect(createCanvas).toHaveBeenCalledTimes(1);
+    expect(getContext).toHaveBeenCalledWith('webgl2', expect.objectContaining({ alpha: false }));
+    // An equal Canvas inspection keeps the cached identity (no state flip).
+    expect(rememberViewerRendererInspection({ ...first! })).toBe(first);
+
+    resetViewerRendererInspectionForTest();
+    expect(pageViewerRendererInspection(() => ({ getContext: () => null }) as never)).toBeNull();
+    const created = rememberViewerRendererInspection({
+      vendor: 'NVIDIA', renderer: 'Tegra', software: false,
+    });
+    expect(pageViewerRendererInspection(createCanvas)).toBe(created);
+    expect(createCanvas).toHaveBeenCalledTimes(1);
+    resetViewerRendererInspectionForTest();
   });
 
   it('reports only local render work and resets the window', () => {

@@ -12,16 +12,24 @@
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
-WORKDIR /build
+WORKDIR /workspace/manyforge_composer/frontend
 COPY manyforge_composer/frontend/package.json manyforge_composer/frontend/package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY manyforge_composer/frontend/ ./
+# TypeScript also checks contract tests against owner-issued fixtures. Preserve
+# the same repository-relative layout as the native development image.
+COPY manyforge_deployment/resources/program_binding_lite6_native.fixture.json \
+     /workspace/manyforge_deployment/resources/program_binding_lite6_native.fixture.json
+COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
+     /workspace/manyforge_headless_api/tests/fixtures/control-v2-local-delta.json
 RUN npm run build
 
 # --- Stage 2: ROS + ManyForge runtime ---
 FROM ros:jazzy-ros-base-noble
 
 ARG ROBOPLAN_SOURCE_MODE=qualified
+# Bound source-build memory on Jetsons; callers may select another job budget.
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=jazzy
 ENV MANYFORGE_VENV=/opt/manyforge/venv
@@ -57,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libeigen3-dev \
         libexpat1-dev \
         libssl-dev \
+        libsqlite3-dev \
         libutf8proc-dev \
         libyaml-cpp-dev \
         liburdfdom-dev \
@@ -233,7 +242,7 @@ COPY --from=frontend-builder /usr/local/lib/node_modules/npm /usr/local/lib/node
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-COPY --from=frontend-builder --chown=1000:1000 /build/dist/ /opt/manyforge-frontend/dist/
+COPY --from=frontend-builder --chown=1000:1000 /workspace/manyforge_composer/frontend/dist/ /opt/manyforge-frontend/dist/
 
 COPY docker-entrypoint.ros-jazzy-full.sh /usr/local/bin/
 # ament_python console scripts use the ROS system interpreter even though

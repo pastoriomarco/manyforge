@@ -136,6 +136,7 @@ class IsaacSceneLoadBarrier(Node):
         )
         self.declare_parameter("world_uri", "")
         self.declare_parameter("expected_world_name", "")
+        self.declare_parameter("require_existing_world", False)
         self.declare_parameter("startup_timeout_s", 120.0)
         self.declare_parameter("service_timeout_s", 30.0)
         self.declare_parameter("required_topics", Parameter.Type.STRING_ARRAY)
@@ -144,6 +145,9 @@ class IsaacSceneLoadBarrier(Node):
         )
         self.expected_world_name = str(
             self.get_parameter("expected_world_name").value
+        )
+        self.require_existing_world = bool(
+            self.get_parameter("require_existing_world").value
         )
         self.startup_timeout_s = float(
             self.get_parameter("startup_timeout_s").value
@@ -180,6 +184,7 @@ class IsaacSceneLoadBarrier(Node):
         startup_error: Exception | None = None
         observed_features: set[int] = set()
         observed_topics: list[str] = []
+        playback_requested = False
         try:
             features = self._call(
                 services["features"],
@@ -201,26 +206,27 @@ class IsaacSceneLoadBarrier(Node):
                     + ",".join(str(value) for value in missing_features)
                 )
 
-            request = LoadWorld.Request()
-            request.uri = self.world_uri
-            request.resource_string = ""
-            request.fail_on_unsupported_element = True
-            request.ignore_missing_or_unsupported_assets = False
-            loaded = self._call(
-                services["load_world"],
-                LoadWorld,
-                request,
-                deadline=startup_deadline,
-            )
-            self._require_ok(loaded.result, operation="LoadWorld")
-            if not world_readback_matches(
-                loaded.world,
-                expected_uri=self.world_uri,
-                expected_name=self.expected_world_name,
-            ):
-                raise RuntimeError(
-                    "LoadWorld response differs from the selected world"
+            if not self.require_existing_world:
+                request = LoadWorld.Request()
+                request.uri = self.world_uri
+                request.resource_string = ""
+                request.fail_on_unsupported_element = True
+                request.ignore_missing_or_unsupported_assets = False
+                loaded = self._call(
+                    services["load_world"],
+                    LoadWorld,
+                    request,
+                    deadline=startup_deadline,
                 )
+                self._require_ok(loaded.result, operation="LoadWorld")
+                if not world_readback_matches(
+                    loaded.world,
+                    expected_uri=self.world_uri,
+                    expected_name=self.expected_world_name,
+                ):
+                    raise RuntimeError(
+                        "LoadWorld response differs from the selected world"
+                    )
 
             current = self._call(
                 services["current_world"],
@@ -235,13 +241,22 @@ class IsaacSceneLoadBarrier(Node):
                 expected_name=self.expected_world_name,
             ):
                 raise RuntimeError(
-                    "GetCurrentWorld readback differs from LoadWorld"
+                    "GetCurrentWorld readback differs from the required existing world"
+                    if self.require_existing_world
+                    else "GetCurrentWorld readback differs from LoadWorld"
                 )
+            if self.require_existing_world and self._read_state(
+                services["get_state"], deadline=startup_deadline
+            ) != int(SimulationState.STATE_STOPPED):
+                raise RuntimeError("required existing Isaac world is not stopped")
 
             # Retained Isaac graphs materialize their ROS publishers on the
             # first simulation tick. Probe while playing; command owners are
             # still held behind this process's successful exit.
             if self.required_topics:
+                # Record possible effects before dispatch; a lost response
+                # still requires stopped cleanup for our playback request.
+                playback_requested = True
                 self._set_state(
                     services["set_state"],
                     int(SimulationState.STATE_PLAYING),
@@ -262,9 +277,18 @@ class IsaacSceneLoadBarrier(Node):
         except Exception as error:
             startup_error = error
 
-        # Stopped convergence is unconditional after typed services have been
-        # found, including load/readback/readiness failures. These two bounded
-        # cleanup calls intentionally receive a fresh service timeout.
+        if (
+            self.require_existing_world
+            and startup_error is not None
+            and not playback_requested
+        ):
+            # Identity or stopped-state refusal never loads or changes the
+            # user's existing scene. Default load-mode cleanup is unchanged.
+            raise startup_error
+
+        # Default load mode always converges to stopped. Existing-world mode
+        # does so after our possible playback effect, including readiness
+        # failures. Cleanup receives a fresh bounded service timeout.
         try:
             self._set_state(
                 services["set_state"],

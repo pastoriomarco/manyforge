@@ -9,6 +9,8 @@ container_name=${MANYFORGE_DEV_CONTAINER_NAME:-manyforge-development-workbench}
 image=${MANYFORGE_DEV_IMAGE:-manyforge-dev:latest}
 cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
 project=
+bootstrap_project=
+ros2_control=false
 started_container=false
 
 frontend_ready() {
@@ -28,7 +30,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 start [--project <scenario-project-folder>] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] [--ros2-control] | status | stop [--keep-evidence]" >&2
 }
 
 stop_with_evidence() {
@@ -119,11 +121,38 @@ case "$command" in
           project=$2
           shift 2
           ;;
+        --ros2-control)
+          ros2_control=true
+          shift
+          ;;
+        --bootstrap-project)
+          [[ $# -ge 2 ]] || { usage; exit 64; }
+          bootstrap_project=$2
+          shift 2
+          ;;
         *) usage; exit 64 ;;
       esac
     done
+    if [[ -n "$bootstrap_project" && ( "$ros2_control" != true || -n "$project" ) ]]; then
+      echo "--bootstrap-project requires --ros2-control and excludes --project." >&2
+      exit 64
+    fi
+    if [[ "$ros2_control" == true && -z "$project" && -z "$bootstrap_project" ]]; then
+      echo "--ros2-control requires --bootstrap-project or --project selecting the intended first Scenario." >&2
+      exit 64
+    fi
     if docker inspect "$container_name" >/dev/null 2>&1; then
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_name") == true ]]; then
+        existing_ros=$(docker inspect -f '{{index .Config.Labels "manyforge.dev.ros2-control"}}' "$container_name")
+        if [[ "$existing_ros" == true && "$ros2_control" != true ]] ||
+            [[ "$existing_ros" != true && "$ros2_control" == true ]]; then
+          echo "A workbench with different runtime capabilities is already running; stop it before changing --ros2-control." >&2
+          exit 69
+        fi
+        if [[ -n "$bootstrap_project" ]]; then
+          echo "A workbench is already running; use status, or stop it before selecting an empty ROS bootstrap." >&2
+          exit 69
+        fi
         status_args=(status)
         if [[ -n "$project" ]]; then
           status_args+=(--project "$project")
@@ -155,17 +184,49 @@ case "$command" in
     runner_state="$cache_base/state/program-runner"
     mkdir -p "$composer_state" "$runner_state"
     serve_args=(serve)
+    ros_environment=()
+    ros_identity=()
+    if [[ "$ros2_control" == true ]]; then
+      serve_args+=(--ros2-control)
+      # The full ROS image has its own development UID. Keep all bind-mounted
+      # writes with the launching user's ownership, including npm/ROS caches.
+      mkdir -p "$cache_root/home"
+      for directory in "$repo_root" "$cache_root" "$cache_root/build" \
+          "$cache_root/home" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
+        if [[ ! -w "$directory" ]]; then
+          echo "ROS workbench requires a writable host-owned directory: $directory" >&2
+          exit 69
+        fi
+      done
+      ros_identity=(--user "$(id -u):$(id -g)" --env HOME=/runner/home \
+        --env MANYFORGE_BUILD_DIR=/runner/build)
+      # Preserve explicitly configured DDS inputs. The image entrypoint owns
+      # ROS/venv setup; this launcher neither sources a topology nor picks peers.
+      for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
+          ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
+          ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI; do
+        if [[ -v "$variable" ]]; then
+          ros_environment+=(--env "$variable")
+        fi
+      done
+    fi
     if [[ -n "$project" ]]; then
       serve_args+=(--project "$project")
     fi
+    if [[ -n "$bootstrap_project" ]]; then
+      serve_args+=(--bootstrap-project "$bootstrap_project")
+    fi
     docker run -d \
       --name "$container_name" \
+      --label "manyforge.dev.ros2-control=$ros2_control" \
       --network host \
       --init \
       --log-opt max-size=50m \
       --log-opt max-file=3 \
       -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \
       -e MANYFORGE_STATE_DIR=/var/lib/manyforge \
+      "${ros_identity[@]}" \
+      "${ros_environment[@]}" \
       -v "$repo_root:/workspace" \
       -v "$cache_root:/runner" \
       -v "$composer_state:/var/lib/manyforge/composer" \

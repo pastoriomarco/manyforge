@@ -39,6 +39,108 @@ the same command-closed native host before ordinary Load/Apply. Loading another
 Scenario changes its equipment, Scene and Program, not the runtime identity.
 Multiple instances competing for the same equipment are unsupported.
 
+### Development ROS control preparation
+
+`start --ros2-control` is an explicit development preparation option for a
+source-matched full ROS image selected through `MANYFORGE_DEV_IMAGE`. The
+ordinary default remains the native workbench. This option builds the native
+host, ROS execution host and shared candidate worker in one ROS-enabled build
+graph, stages them for the existing Manager installed-target protocol, and
+connects the Program Runner's existing simulation-control port using
+`manyforge_ros_bringup/config/isaac_program_simulation_site.json`.
+The authored compiler accepts the existing UR10 robot/gripper ROS profile
+through ordinary Scenario Load preparation, carries the required authored
+Deployment TCP speed maximum into ROS runtime creation, and corrects native-only
+configuration access in that host. The Deployment owner refreshed the affected
+artifacts. Focused Orin Docker checks passed all nine preparation cases, four
+retained-configuration cases and 32 workbench/launcher tests; both execution
+hosts and the shared candidate worker built, and the owner freshness check
+passed. The isolated [offline diagnostic receipt](../../../runner-evidence/orin/freeze-8/final-receipt.json)
+records those results and their frozen inputs. A later isolated diagnostic
+route used the existing preparer to derive the ROS canonical-empty predecessor
+from the intended first Scenario, preserving its exact runtime products and
+normal Manager fencing. The [successor receipt](../../../runner-evidence/orin/freeze-13/liveness-successor-receipt.json)
+records ROS predecessor-continuity and existing liveness-policy repairs with
+seven focused checks and the affected executable builds passing.
+
+The authorized live UR10 check passed typed playback/readback and the strict
+existing-world barrier without loading another world. Passive joint observations
+naturally aligned with the authored seed while the command gate remained closed.
+Normal authored Load was accepted, but Apply ended `unknown_effect` with its
+fence held and the previous empty deployment still active: the ROS host explicitly
+refuses a nonempty component delta until it can produce a qualified lifecycle
+provider receipt (`ros2_component_delta_not_qualified`). The
+[live receipt](../../../runner-evidence/live/attempt-2-receipt.json) records the
+paused simulator, closed gate and retained evidence. That candidate was shut down
+normally and its unknown-effect Apply was not retried. The reviewed first-install
+successor produced the existing owner receipts, and a fresh normal Load/Apply
+succeeded with the aggregate active, the Apply committed and its fence released.
+The [Step 1 receipt](../../../runner-evidence/live/attempt-3/step1-live-receipt.json)
+records advancing commanded idle observations and a closed command gate without
+automatic home motion. A bounded read-only arm preview was refused with
+`scene_changed_during_validation`; the logical Scene/collision projection join
+remains unresolved. No motion or Stop qualification is claimed. Gripper-first
+operation remains deferred to the planned arm/tool separation.
+The subsequent bounded mesh-resolver correction passed 21 focused Docker tests;
+all five active-scene meshes returned HTTP 200 metadata and valid GLB geometry
+after a fresh normal Load/Apply. The [mesh repair receipt](../../../runner-evidence/live/attempt-4/mesh-repair-receipt.json)
+records the unchanged access roots, healthy owners and preserved Isaac world.
+The ordinary ROS option now requires an explicit intended first Scenario and
+uses the production preparer to derive its exact ROS canonical-empty predecessor
+before Manager starts. `--bootstrap-project` selects that Scenario while opening
+an empty workspace; complete the separately operated simulator/controller
+prerequisites, then use ordinary Composer Load/Apply for that Scenario.
+`--project` selects the same derivation and also requests the existing startup
+Load/Apply, so the simulator/controller must already be ready. Managed ROS
+installation seeds the declared commanded state and checks controller readiness
+with the shared command gate closed; accepted tracked arm execution later opens
+that gate. These options are mutually exclusive. Native or
+mixed execution selections, incomplete/invalid artifacts, changes during
+preparation and missing ROS selection are refused. This startup route is
+development preparation; the diagnostic receipts are not installed-launcher or
+completed live qualification.
+Mixed native/ROS compositions and other ROS profiles remain unsupported.
+
+For an already prepared full ROS development image:
+
+```bash
+MANYFORGE_DEV_IMAGE=<source-matched-full-ros-image> \
+  ./scripts/compose-dev.sh start --ros2-control \
+    --bootstrap-project examples/isaac-ur10e-light-scene.scenario
+```
+
+The image entrypoint must supply its ROS and Python environment. Startup builds
+the mechanical ROS overlay and imports its setup into the service environment;
+Manager children inherit that environment. Explicitly exported standard DDS
+inputs, including `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE` and `ROS_STATIC_PEERS`, pass into this container
+unchanged. Configure the selected topology before starting it. Exported DDS
+profile-file paths are preserved too; each referenced XML or other
+configuration file must exist at that path inside the container. A host-only
+absolute path does not become container-visible by exporting it.
+
+The ROS option runs with the launching host user's UID/GID and uses the
+image-keyed `/runner/home` and `/runner/build` bind mounts for writable home
+and build caches. The repository, caches and persistent state directories must
+be writable by that user before startup. This supports hosts whose UID differs
+from the full ROS image's development user without changing the default native
+container identity.
+
+This option starts neither Isaac Sim nor its mechanical controller/bridge launch, and
+does not choose peers or load a simulator world. Those prerequisites remain
+separate, explicitly operated processes. A running native workbench cannot
+be silently reused for a ROS request; stop it before changing this option.
+
+The retained `examples/isaac-ur10e-light-scene.scenario` is an aggregate
+robot/gripper development input. Its explicit 0.25 m/s authored TCP ceiling is
+demo policy shared with the native UR10e example, never a default for a missing
+limit. Live Isaac qualification remains unavailable;
+this preparation option does not qualify Load, motion, Stop, Reset or repeated
+Runs. Arm-only profiles and installation-matched observation configuration
+remain additional integration work. The observer site's `cell_id` must match
+the workbench installation, `c1_build_authority_cell`, and its Manager run root
+must point at this workbench's runtime state.
+
 Existing v1 authored Deployment files must be migrated explicitly: change their
 intent version to v2 and remove the authored `cell_id`. Do not remove cell IDs
 from compiled Deployment artifacts or rename existing runtime journals.
@@ -289,6 +391,7 @@ or appropriate firewall/access controls; do not expose this workbench publicly.
 
 When a project is active, `status` reports its owner-issued current identity and
 convergence. It reports a `development_workbench` using repository source, while
-`physical_execution_authorized` remains false because this entrypoint accepts
-only a single simulated native runtime unit. Installed delivery and official
+`physical_execution_authorized` remains false. The default prepares simulated
+native execution; the explicit ROS option prepares development simulation
+adapters and does not authorize physical equipment. Installed delivery and official
 AMD64/ARM64 packages are separate release/distribution work.

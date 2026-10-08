@@ -254,3 +254,116 @@ def test_plain_stop_keeps_its_best_effort_behavior(tmp_path: Path) -> None:
     assert completed.stdout == (
         "Development workbench is stopped. Build and npm caches were retained.\n"
     )
+
+
+@pytest.mark.parametrize("ros2_control", [False, True])
+def test_start_preserves_explicit_ros_topology_only_when_requested(
+    tmp_path: Path, ros2_control: bool
+) -> None:
+    environment = _fake_docker_environment(tmp_path)
+    workspace = tmp_path / "workspace"
+    launcher = workspace / "scripts" / LAUNCHER.name
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(LAUNCHER.read_text(encoding="utf-8"), encoding="utf-8")
+    docker = tmp_path / "bin/docker"
+    docker.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_CALLS"
+case "$1" in
+  image) printf 'sha256:test\\n' ;;
+  run) : > "$FAKE_DOCKER_STARTED" ;;
+  inspect)
+    [[ -e "$FAKE_DOCKER_STARTED" ]] || exit 1
+    printf 'true\\n'
+    ;;
+  exec)
+    if [[ "$*" == *"scripts/dev-workbench.py"* ]]; then
+      printf '{"ready":true,"unavailable_reasons":[]}\\n'
+    fi
+    ;;
+  *) exit 98 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    environment.update(
+        FAKE_DOCKER_STARTED=str(tmp_path / "docker-started"),
+        ROS_STATIC_PEERS="orin;laptop",
+        ROS_DOMAIN_ID="17",
+        RMW_IMPLEMENTATION="rmw_fastrtps_cpp",
+        MANYFORGE_DEV_IMAGE="current-ros-image",
+    )
+    arguments = ["start", *([
+        "--ros2-control", "--bootstrap-project", "examples/first.scenario",
+    ] if ros2_control else [])]
+    completed = subprocess.run(
+        ["/bin/bash", str(launcher), *arguments], cwd=workspace,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    command = next(call for call in calls if call.startswith("run "))
+    assert os.access(workspace, os.W_OK)
+    assert f"-v {workspace}:/workspace" in command
+    assert "--network host" in command
+    assert f"--label manyforge.dev.ros2-control={str(ros2_control).lower()}" in command
+    assert command.endswith(
+        "sha256:test python3 scripts/dev-workbench.py serve" +
+        (" --ros2-control --bootstrap-project examples/first.scenario" if ros2_control else "")
+    )
+    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS"):
+        assert (f"--env {name}" in command) is ros2_control
+    if ros2_control:
+        assert f"--user {os.getuid()}:{os.getgid()}" in command
+        assert "--env HOME=/runner/home" in command
+        assert "--env MANYFORGE_BUILD_DIR=/runner/build" in command
+        cache_root = tmp_path / "cache/images/test"
+        for directory in ("home", "build", "node_modules"):
+            assert (cache_root / directory).is_dir()
+            assert (cache_root / directory).stat().st_uid == os.getuid()
+    else:
+        assert "--user " not in command
+        assert "--env HOME=" not in command
+        assert "--env MANYFORGE_BUILD_DIR=" not in command
+        assert not (tmp_path / "cache/images/test/home").exists()
+    assert "launch-isaac" not in command
+    assert "ROS_STATIC_PEERS=orin;laptop" not in command
+
+
+def test_ros_start_refuses_an_existing_native_workbench(tmp_path: Path) -> None:
+    environment = _fake_docker_environment(tmp_path)
+
+    # The existing fake container has no ROS capability label.
+    docker = tmp_path / "bin/docker"
+    docker.write_text(docker.read_text().replace(
+        "if [[ ${1:-} == -f ]]; then",
+        "if [[ ${1:-} == -f && ${2:-} == *Config.Labels* ]]; then\n"
+        "      printf 'false\\n'\n"
+        "    elif [[ ${1:-} == -f ]]; then",
+    ))
+    completed = subprocess.run(
+        ["/bin/bash", str(LAUNCHER), "start", "--ros2-control",
+         "--bootstrap-project", "examples/first.scenario"],
+        cwd=REPOSITORY_ROOT, env=environment, capture_output=True, text=True,
+        check=False,
+    )
+    assert completed.returncode == 69
+    assert "different runtime capabilities" in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text()
+    assert "run " not in calls
+
+
+@pytest.mark.parametrize("arguments,error", [
+    (["--ros2-control"], "requires --bootstrap-project or --project"),
+    (["--bootstrap-project", "first"], "requires --ros2-control"),
+    (["--ros2-control", "--bootstrap-project", "first", "--project", "second"],
+     "excludes --project"),
+])
+def test_invalid_ros_selection_is_refused_before_docker(
+    tmp_path: Path, arguments: list[str], error: str
+) -> None:
+    completed, environment = _run_launcher(tmp_path, "start", *arguments)
+    assert completed.returncode == 64
+    assert error in completed.stderr
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()

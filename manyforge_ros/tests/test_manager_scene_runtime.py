@@ -330,6 +330,87 @@ def test_client_parses_and_cross_checks_committed_scene_application(
     assert rejected.value.code == "manager_scene_runtime_response_invalid"
 
 
+def test_client_accepts_freshness_confirmation_with_unchanged_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ManagerSceneRuntimeClient(tmp_path)
+    binding = PoseObserverBinding(
+        object_id="ur10e",
+        policy_id="continuous_unattached",
+        eligible=True,
+    )
+    opened = _open_response()
+    opened["bindings"] = [binding.to_value()]
+    confirmed = _observe_response()
+    confirmed.update(
+        {
+            "disposition": "apply_now",
+            "policy_id": "continuous_unattached",
+            "scene_application_status": "freshness_confirmed",
+            "scene_projection_revision": _projection_revision(),
+            "scene_request_id": "scene-runtime-pose-" + "e" * 71,
+            "scene_update_status": None,
+            "source_sequence": 2,
+        }
+    )
+    responses = [_owner_response(), opened, confirmed]
+    monkeypatch.setattr(client, "_exchange", lambda _command: responses.pop(0))
+    owner = client.read_owner()
+    session = client.open_observer(
+        owner,
+        bindings=(binding,),
+        source_id="isaac.observer",
+        source_epoch="orin-observer.1",
+    )
+
+    def observe(policy_id: str) -> object:
+        return client.observe(
+            session,
+            source_sequence=2,
+            intent=PoseObservationIntent(
+                object_id="ur10e",
+                policy_id=policy_id,
+                lifetime_ns=1_000_000_000,
+                quality="good",
+                eligible=True,
+                payload={"kind": "simulation_entity_pose"},
+            ),
+        )
+
+    result = observe("continuous_unattached")
+    assert result.scene_application_status == "freshness_confirmed"
+    assert result.scene_update_status is None
+    assert result.scene_projection_revision is not None
+    assert result.scene_projection_revision.revision_id == 4
+
+    latched = dict(confirmed)
+    latched.update({"disposition": "observed_only", "policy_id": "before_planning"})
+    monkeypatch.setattr(client, "_exchange", lambda _command: latched)
+    assert observe("before_planning").scene_application_status == (
+        "freshness_confirmed"
+    )
+
+    for field, value in (
+        ("scene_update_status", "freshness_only"),
+        ("scene_projection_revision", None),
+        ("scene_request_id", None),
+    ):
+        invalid = dict(confirmed)
+        invalid[field] = value
+        monkeypatch.setattr(client, "_exchange", lambda _command, r=invalid: r)
+        with pytest.raises(SceneRuntimeManagerError) as rejected:
+            observe("continuous_unattached")
+        assert rejected.value.code == "manager_scene_runtime_response_invalid"
+
+    buffered = dict(confirmed)
+    buffered["disposition"] = "buffered"
+    monkeypatch.setattr(client, "_exchange", lambda _command: buffered)
+    with pytest.raises(SceneRuntimeManagerError) as contradicted:
+        observe("continuous_unattached")
+    assert contradicted.value.code == "manager_scene_runtime_response_invalid"
+
+
 def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> None:
     for index, response in enumerate(
         (

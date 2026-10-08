@@ -68,6 +68,18 @@ export function viewerNotices(input: ViewerNoticeInput): WorkbenchNotice[] {
         busy: true,
       });
     }
+  } else if (model.status === 'retained') {
+    // The retained model stays visible but is never presented as current. A
+    // transport delay is not a known controlled transition, so this follows
+    // the ordinary hold-then-error rule and is reported once it lasts.
+    notices.push({
+      id: 'viewer.model',
+      severity: 'error',
+      domain: 'viewer',
+      title: 'Applied robot model not verified',
+      message: model.message,
+      incidentKind: 'viewer_model_unavailable',
+    });
   } else if (model.status === 'unavailable') {
     notices.push({
       id: 'viewer.model',
@@ -105,7 +117,8 @@ export function viewerNotices(input: ViewerNoticeInput): WorkbenchNotice[] {
       expectedDuringTransition: stale,
       incidentKind: 'viewer_geometry_unavailable',
     });
-  } else if (input.robotMeshFailure !== null && model.status === 'ready') {
+  } else if (input.robotMeshFailure !== null
+      && (model.status === 'ready' || model.status === 'retained')) {
     notices.push({
       id: 'viewer.robot-mesh',
       severity: 'error',

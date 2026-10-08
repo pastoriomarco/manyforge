@@ -7,6 +7,7 @@
 
 #include "../src/ros2_control_stop_qualification_probe.hpp"
 #include "../src/scene_projection_worker.hpp"
+#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
@@ -61,14 +62,64 @@ public:
         detail::Ros2ControlStopQualificationEvent::kNominalProviderEntry) {
       nominal_entries_.fetch_add(1U, std::memory_order_relaxed);
     }
+    if (event ==
+        detail::Ros2ControlStopQualificationEvent::kSoftwareHardIssueAccepted) {
+      hard_issues_.fetch_add(1U, std::memory_order_relaxed);
+    }
   }
 
   [[nodiscard]] std::uint64_t nominal_entries() const noexcept {
     return nominal_entries_.load(std::memory_order_relaxed);
   }
+  [[nodiscard]] std::uint64_t hard_issues() const noexcept {
+    return hard_issues_.load(std::memory_order_relaxed);
+  }
 
 private:
   std::atomic<std::uint64_t> nominal_entries_{0U};
+  std::atomic<std::uint64_t> hard_issues_{0U};
+};
+
+// Drives producer samples and the existing manual scheduler at receiver-clock
+// reads. Nested publisher clock reads cannot advance time recursively. Tests
+// enable the hook only after the exact terminal/dispatch setup is complete.
+class StopEvidenceClock final : public core::IClock {
+public:
+  core::TimePoint now() const override {
+    if (on_read && !reading_) {
+      reading_ = true;
+      time_ns_ += 5'000'000;
+      on_read(time_ns_);
+      reading_ = false;
+    }
+    return time_ns_;
+  }
+  std::function<void(core::TimePoint)> on_read;
+
+private:
+  mutable core::TimePoint time_ns_ = 1'000'000'000;
+  mutable bool reading_ = false;
+};
+
+class QueuedCallbackScheduler final : public core::IScheduler {
+public:
+  core::ScheduleHandle schedule(core::TimePoint, std::function<void()> callback,
+                                core::SchedulerPriority priority) override {
+    EXPECT_EQ(priority, core::SchedulerPriority::ControllerCommand);
+    callbacks.push_back(std::move(callback));
+    return next_handle_++;
+  }
+  void cancel(core::ScheduleHandle) override {
+    // Deliberately retain already-queued work: lifecycle fences, rather than
+    // successful eager cancellation, must make these callbacks inert.
+  }
+  std::vector<std::function<void()>> take_callbacks() {
+    return std::exchange(callbacks, {});
+  }
+
+private:
+  core::ScheduleHandle next_handle_ = 1U;
+  std::vector<std::function<void()>> callbacks;
 };
 
 std::string unique_suffix() {
@@ -91,7 +142,10 @@ Ros2ControlExecutionBackendConfig base_config() {
   return config;
 }
 
-core::RuntimeParticipantBinding motion_binding(std::string program_id) {
+core::RuntimeParticipantBinding
+motion_binding(std::string program_id,
+               core::StateAuthorityClass authority =
+                   core::StateAuthorityClass::kCommanded) {
   core::RuntimeParticipantBindingDTO value{
       core::ProgramId(std::move(program_id)),
       core::ProgramRevision("program-revision"),
@@ -139,8 +193,11 @@ core::RuntimeParticipantBinding motion_binding(std::string program_id) {
           core::ProviderManifestRevision("provider-manifest-revision"),
           core::RuntimeUnitId("runtime.ros2_control"),
           core::RuntimeEpoch("runtime-epoch.1"),
-          core::StateAuthorityId("state.commanded"),
-          core::StateAuthorityClass::kCommanded,
+          core::StateAuthorityId(authority ==
+                                         core::StateAuthorityClass::kMeasured
+                                     ? "state.measured"
+                                     : "state.commanded"),
+          authority,
           core::StopEvidencePolicyId("stop.ros2_control"),
           core::StopEvidencePolicyRevision("stop-revision"),
           core::ContainmentGranularity::kResource,
@@ -172,11 +229,13 @@ program_alias(const core::RuntimeParticipantBinding &physical) {
   return std::move(sealed.value());
 }
 
-core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
+core::ResolvedParticipantStopStageDTO
+direct_stage_fixture(core::StateAuthorityClass authority =
+                         core::StateAuthorityClass::kCommanded) {
   const core::OperationId operation_id("operation.direct");
   const core::OperationRevision operation_revision(1U);
   const core::OperationParticipantId participant_id("participant.direct");
-  const auto binding = motion_binding("program.direct");
+  const auto binding = motion_binding("program.direct", authority);
   const auto &value = binding.value();
   const auto &path = *value.control_path;
   const std::vector<core::ResourceId> resources{
@@ -283,8 +342,10 @@ core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
       core::ContentDigest("scope.digest")};
 }
 
-core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
-  auto stage = direct_stage_fixture();
+core::ResolvedParticipantStopStageDTO
+software_hard_stage_fixture(core::StateAuthorityClass authority =
+                                core::StateAuthorityClass::kCommanded) {
+  auto stage = direct_stage_fixture(authority);
   auto &command =
       stage.participant_stop_plan.stage_commands.front().resolved_stage;
   command.stop_escalation_stage_id =
@@ -304,10 +365,10 @@ core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
           core::StopEvidenceSourceKind::kBindingStateAuthority,
           100'000'000,
           std::nullopt,
-          {core::StateAuthorityClass::kCommanded}};
+          {authority}};
   evidence.requirement.observation_semantics = core::StopEvidenceObservationDTO{
       core::StopEvidenceObservationKind::kPostCommandDwell, 10'000'000};
-  const auto binding = motion_binding("program.direct");
+  const auto binding = motion_binding("program.direct", authority);
   const auto &path = *binding.value().control_path;
   evidence.resolved_source.source_kind =
       core::StopEvidenceSourceKind::kBindingStateAuthority;
@@ -319,12 +380,14 @@ core::ResolvedParticipantStopStageDTO software_hard_stage_fixture() {
   return stage;
 }
 
-core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
-  auto stage = direct_stage_fixture();
+core::ResolvedParticipantStopStageDTO
+controlled_stage_fixture(core::StateAuthorityClass authority =
+                             core::StateAuthorityClass::kCommanded) {
+  auto stage = direct_stage_fixture(authority);
   auto &plan = stage.participant_stop_plan;
   auto &prepared = plan.stage_commands.front();
   auto &command = prepared.resolved_stage;
-  const auto binding = motion_binding("program.direct");
+  const auto binding = motion_binding("program.direct", authority);
   const auto &value = binding.value();
   const auto &path = *value.control_path;
   const core::ProviderContractRefDTO contract{
@@ -371,7 +434,7 @@ core::ResolvedParticipantStopStageDTO controlled_stage_fixture() {
               core::StopEvidenceSourceKind::kBindingStateAuthority,
               100'000'000,
               core::EndpointRoleId("state"),
-              {core::StateAuthorityClass::kCommanded}},
+              {authority}},
           core::StopEvidenceObservationDTO{
               core::StopEvidenceObservationKind::kPostCommandDwell,
               10'000'000}},
@@ -1228,6 +1291,548 @@ TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     ControlledStageAfterRacingNaturalCompletionSettlesForEachStateAuthority) {
+  for (const auto authority : {core::StateAuthorityClass::kCommanded,
+                               core::StateAuthorityClass::kMeasured}) {
+    for (const auto mode : {"soft_on_path", "spring_back_hold"}) {
+      SCOPED_TRACE(mode);
+      SCOPED_TRACE(static_cast<int>(authority));
+      auto config = base_config();
+      config.execution_state_source_mode =
+          authority == core::StateAuthorityClass::kMeasured ? "observed_ros2"
+                                                            : "commanded_sim";
+      config.initial_joint_positions_rad = {0.0};
+      config.prepared_participant_binding =
+          motion_binding("program.direct", authority);
+      config.transport_joint_names = {"source_joint_1"};
+      config.enable_soft_on_path_path_ramp = true;
+      core::ObservedRobotStatePublication publication(
+          config.required_joints, ros2_control_addressed_state_sources(config));
+      auto sink = std::make_shared<RecordingExecutionStateSink>();
+      StopEvidenceClock clock;
+      core::ManualScheduler scheduler;
+      Ros2ControlExecutionBackend backend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
+          sink, "arm", clock, scheduler, std::move(config));
+      auto stage = controlled_stage_fixture(authority);
+      auto &prepared = stage.participant_stop_plan.stage_commands.front();
+      prepared.validated_contract_parameters->at("stop_mode") =
+          core::JsonValueDTO{mode};
+      CountingStopProbe probe;
+      detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
+      backend.testing_set_running_state(true);
+      ASSERT_TRUE(backend.testing_publish_snapshot(
+          core::ExecutionState::kExecuting, {0.0}));
+      backend.testing_install_prepared_goal_membership(
+          stage, core::ContentDigest("prepared.natural"));
+      ASSERT_TRUE(backend.testing_publish_snapshot(
+          core::ExecutionState::kCompleted, 1.0, {0.4}, std::nullopt));
+      backend.testing_set_running_state(false);
+      const auto completed = backend.get_execution_snapshot();
+      clock.on_read = [&](const auto now_ns) {
+        if (authority == core::StateAuthorityClass::kMeasured) {
+          const std::vector<std::string> names{"joint_1"};
+          const std::vector<double> positions{0.4}, velocities{0.0};
+          EXPECT_TRUE(
+              publication
+                  .publish(core::ObservedRobotStateSourceKind::kJointState,
+                           names, positions, velocities, now_ns, now_ns)
+                  .published);
+        } else {
+          scheduler.advance_to(now_ns,
+                               core::SchedulerPriority::ControllerCommand);
+        }
+      };
+      const auto result =
+          backend.TranslateStopStage(stage, remaining_budget(stage), {});
+      clock.on_read = {};
+      ASSERT_EQ(result.outcome,
+                core::ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->message : "no diagnostic");
+      EXPECT_EQ(probe.nominal_entries(), 0U);
+      EXPECT_EQ(probe.hard_issues(), 0U);
+      EXPECT_EQ(result.actual_provider_contract_mode,
+                std::string_view(mode) == "soft_on_path"
+                    ? core::MotionControlledStopMode::kSoftOnPath
+                    : core::MotionControlledStopMode::kSpringBackHold);
+      ASSERT_EQ(result.evidence_items.size(), 1U);
+      ASSERT_TRUE(result.evidence_items.front().evidence);
+      const auto &evidence = std::get<core::JsonObjectDTO>(
+          result.evidence_items.front().evidence->value);
+      EXPECT_TRUE(
+          std::get<bool>(evidence.at("completed_by_natural_completion").value));
+      const auto &rest =
+          std::get<core::JsonObjectDTO>(evidence.at("post_command_rest").value);
+      EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
+      EXPECT_GT(
+          std::get<double>(rest.at("first_sample_after_acceptance_ns").value),
+          0.0);
+      const auto after = backend.get_execution_snapshot();
+      EXPECT_EQ(after.state, completed.state);
+      EXPECT_EQ(after.sequence_number, completed.sequence_number);
+      EXPECT_EQ(after.timestamp_ns, completed.timestamp_ns);
+      EXPECT_EQ(after.joint_positions_rad, completed.joint_positions_rad);
+    }
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ControlledStageRejectsOtherTerminalsDisabledPolicyReplacementAndReset) {
+  enum class End { kDisabled, kStopped, kFailed, kReplaced, kReset };
+  for (const auto end : {End::kDisabled, End::kStopped, End::kFailed,
+                         End::kReplaced, End::kReset}) {
+    SCOPED_TRACE(static_cast<int>(end));
+    auto config = base_config();
+    config.execution_state_source_mode = "commanded_sim";
+    config.initial_joint_positions_rad = {0.0};
+    config.prepared_participant_binding = motion_binding("program.direct");
+    config.transport_joint_names = {"source_joint_1"};
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    Ros2ControlExecutionBackend backend(
+        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+        clock, scheduler, std::move(config));
+    auto stage = controlled_stage_fixture();
+    if (end == End::kDisabled) {
+      stage.participant_stop_plan.stage_commands.front()
+          .validated_contract_parameters->at(
+              "allow_natural_completion_on_short_path") =
+          core::JsonValueDTO{false};
+    }
+    backend.testing_set_running_state(true);
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kExecuting, {0.0}));
+    backend.testing_install_prepared_goal_membership(
+        stage, core::ContentDigest("prepared.other-terminal"));
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        end == End::kStopped  ? core::ExecutionState::kStopped
+        : end == End::kFailed ? core::ExecutionState::kFailed
+                              : core::ExecutionState::kCompleted,
+        {0.4}));
+    backend.testing_set_running_state(false);
+    if (end == End::kReplaced) {
+      backend.testing_set_running_state(true);
+      ASSERT_TRUE(backend.testing_publish_snapshot(
+          core::ExecutionState::kExecuting, {0.5}));
+    } else if (end == End::kReset) {
+      (void)backend.reset();
+    }
+    const auto before = backend.get_execution_snapshot();
+    const auto result =
+        backend.TranslateStopStage(stage, remaining_budget(stage), {});
+    EXPECT_EQ(result.attempt_disposition,
+              core::StopStageAttemptDispositionDTO::kNotDispatched);
+    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->details.at("reason"), "prepared_goal_not_active");
+    EXPECT_EQ(backend.get_execution_snapshot().state, before.state);
+    EXPECT_EQ(backend.get_execution_snapshot().sequence_number,
+              before.sequence_number);
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     SoftwareHardObservesAnAlreadyTerminalGoalWithoutRewritingItsState) {
+  for (const auto authority : {core::StateAuthorityClass::kCommanded,
+                               core::StateAuthorityClass::kMeasured}) {
+    for (const auto state :
+         {core::ExecutionState::kCompleted, core::ExecutionState::kStopped,
+          core::ExecutionState::kFailed}) {
+      SCOPED_TRACE(static_cast<int>(authority));
+      SCOPED_TRACE(static_cast<int>(state));
+      auto config = base_config();
+      config.execution_state_source_mode =
+          authority == core::StateAuthorityClass::kMeasured ? "observed_ros2"
+                                                            : "commanded_sim";
+      config.initial_joint_positions_rad = {0.0};
+      config.prepared_participant_binding =
+          motion_binding("program.direct", authority);
+      config.transport_joint_names = {"source_joint_1"};
+      core::ObservedRobotStatePublication publication(
+          config.required_joints, ros2_control_addressed_state_sources(config));
+      auto sink = std::make_shared<RecordingExecutionStateSink>();
+      StopEvidenceClock clock;
+      core::ManualScheduler scheduler;
+      Ros2ControlExecutionBackend backend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
+          sink, "arm", clock, scheduler, std::move(config));
+      const auto stage = software_hard_stage_fixture(authority);
+      CountingStopProbe probe;
+      detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
+      backend.testing_set_running_state(true);
+      ASSERT_TRUE(backend.testing_publish_snapshot(
+          core::ExecutionState::kExecuting, {0.0}));
+      backend.testing_install_prepared_goal_membership(
+          stage, core::ContentDigest("prepared.terminal-hard"));
+      ASSERT_TRUE(backend.testing_publish_snapshot(state, {0.4}));
+      backend.testing_set_running_state(false);
+      const auto terminal = backend.get_execution_snapshot();
+      clock.on_read = [&](const auto now_ns) {
+        if (authority == core::StateAuthorityClass::kMeasured) {
+          const std::vector<std::string> names{"joint_1"};
+          const std::vector<double> positions{0.4}, velocities{0.0};
+          EXPECT_TRUE(
+              publication
+                  .publish(core::ObservedRobotStateSourceKind::kJointState,
+                           names, positions, velocities, now_ns, now_ns)
+                  .published);
+        } else {
+          scheduler.advance_to(now_ns,
+                               core::SchedulerPriority::ControllerCommand);
+        }
+      };
+      const auto result =
+          backend.TranslateStopStage(stage, remaining_budget(stage), {});
+      clock.on_read = {};
+      ASSERT_EQ(result.outcome,
+                core::ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->message : "no diagnostic");
+      EXPECT_EQ(probe.hard_issues(), 0U);
+      EXPECT_EQ(backend.get_execution_snapshot().state, terminal.state);
+      EXPECT_EQ(backend.get_execution_snapshot().sequence_number,
+                terminal.sequence_number);
+    }
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     StopRestRejectsSingleSamplesMovingIncompleteAndWrongAuthority) {
+  enum class Sample {
+    kNoneAfterObservation,
+    kSingleAfterObservation,
+    kMoving,
+    kNoVelocity,
+    kWrongAuthority
+  };
+  for (const auto sample :
+       {Sample::kNoneAfterObservation, Sample::kSingleAfterObservation,
+        Sample::kMoving, Sample::kNoVelocity, Sample::kWrongAuthority}) {
+    SCOPED_TRACE(static_cast<int>(sample));
+    const auto authority = sample == Sample::kWrongAuthority
+                               ? core::StateAuthorityClass::kCommanded
+                               : core::StateAuthorityClass::kMeasured;
+    auto config = base_config();
+    config.execution_state_source_mode = "observed_ros2";
+    config.prepared_participant_binding =
+        motion_binding("program.direct", authority);
+    config.transport_joint_names = {"source_joint_1"};
+    core::ObservedRobotStatePublication publication(
+        config.required_joints, ros2_control_addressed_state_sources(config));
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    StopEvidenceClock clock;
+    core::ManualScheduler scheduler;
+    Ros2ControlExecutionBackend backend(
+        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
+        sink, "arm", clock, scheduler, std::move(config));
+    auto stage = controlled_stage_fixture(authority);
+    if (sample == Sample::kMoving) {
+      auto &limits = std::get<core::JsonValueDTO::Array>(
+          stage.participant_stop_plan.stage_commands.front()
+              .validated_contract_parameters->at("per_resource_limits")
+              .value);
+      auto &row = std::get<core::JsonObjectDTO>(limits.front().value);
+      auto &settle = std::get<core::JsonObjectDTO>(
+          row.at("settle_velocity_threshold").value);
+      settle.at("value_rad_s") = core::JsonValueDTO{0.001};
+    }
+    backend.testing_set_running_state(true);
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kExecuting, {0.0}));
+    backend.testing_install_prepared_goal_membership(
+        stage, core::ContentDigest("prepared.invalid-rest"));
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kCompleted, {0.4}));
+    backend.testing_set_running_state(false);
+    const std::vector<std::string> names{"joint_1"};
+    const std::vector<double> positions{0.4}, resting{0.0};
+    ASSERT_TRUE(publication
+                    .publish(core::ObservedRobotStateSourceKind::kJointState,
+                             names, positions, resting, clock.now(),
+                             clock.now())
+                    .published);
+    unsigned observations = 0U;
+    clock.on_read = [&](const auto now_ns) {
+      // The first three reads are stage start, natural outcome, and the
+      // post-observation boundary. Start the source strictly after that edge.
+      if (++observations <= 3U || sample == Sample::kNoneAfterObservation ||
+          (sample == Sample::kSingleAfterObservation && observations != 4U)) {
+        return;
+      }
+      const std::vector<double> velocities =
+          sample == Sample::kNoVelocity
+              ? std::vector<double>{}
+              // This is below the default threshold but above this exact
+              // source-addressed profile's configured settle threshold.
+              : std::vector<double>{sample == Sample::kMoving ? 0.005 : 0.0};
+      EXPECT_TRUE(publication
+                      .publish(core::ObservedRobotStateSourceKind::kJointState,
+                               names, positions, velocities, now_ns, now_ns)
+                      .published);
+    };
+    auto budget = remaining_budget(stage);
+    budget.remaining_outer_duration_ns = 50'000'000;
+    for (auto &phase : budget.phases) {
+      phase.remaining_deadline_offset_ns =
+          phase.phase_id == core::StopBudgetPhaseId("command") ? 10'000'000
+                                                               : 20'000'000;
+    }
+    const auto result = backend.TranslateStopStage(stage, budget, {});
+    clock.on_read = {};
+    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_not_at_rest");
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     StopRestCannotCertifyAReplacementOrResetCrossingItsObservation) {
+  for (const bool reset : {false, true}) {
+    SCOPED_TRACE(reset);
+    auto config = base_config();
+    config.execution_state_source_mode = "observed_ros2";
+    config.prepared_participant_binding =
+        motion_binding("program.direct", core::StateAuthorityClass::kMeasured);
+    config.transport_joint_names = {"source_joint_1"};
+    core::ObservedRobotStatePublication publication(
+        config.required_joints, ros2_control_addressed_state_sources(config));
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    StopEvidenceClock clock;
+    core::ManualScheduler scheduler;
+    Ros2ControlExecutionBackend backend(
+        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
+        sink, "arm", clock, scheduler, std::move(config));
+    const auto stage =
+        controlled_stage_fixture(core::StateAuthorityClass::kMeasured);
+    backend.testing_set_running_state(true);
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kExecuting, {0.0}));
+    backend.testing_install_prepared_goal_membership(
+        stage, core::ContentDigest("prepared.crossing-rest"));
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kCompleted, {0.4}));
+    backend.testing_set_running_state(false);
+    unsigned observations = 0U;
+    bool crossed = false;
+    clock.on_read = [&](const auto now_ns) {
+      const std::vector<std::string> names{"joint_1"};
+      const std::vector<double> positions{0.4}, velocities{0.0};
+      EXPECT_TRUE(publication
+                      .publish(core::ObservedRobotStateSourceKind::kJointState,
+                               names, positions, velocities, now_ns, now_ns)
+                      .published);
+      // The fifth clock read is the first independent rest observation,
+      // outside the backend's execution and presentation locks.
+      if (++observations == 5U) {
+        crossed = true;
+        if (reset) {
+          EXPECT_TRUE(backend.reset().accepted);
+        } else {
+          backend.testing_set_running_state(true);
+          EXPECT_TRUE(backend.testing_publish_snapshot(
+              core::ExecutionState::kExecuting, {0.5}));
+        }
+      }
+    };
+    const auto result =
+        backend.TranslateStopStage(stage, remaining_budget(stage), {});
+    clock.on_read = {};
+    EXPECT_TRUE(crossed);
+    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->details.at("reason"),
+              "stop_evidence_execution_changed");
+    EXPECT_EQ(backend.get_execution_snapshot().state,
+              reset ? core::ExecutionState::kIdle
+                    : core::ExecutionState::kExecuting);
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     CommandedIdlePublisherFencesQueuedCallbacksAtDispatchResetAndDestruction) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  core::ObservedRobotStatePublication publication(
+      config.required_joints, ros2_control_addressed_state_sources(config));
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  QueuedCallbackScheduler scheduler;
+  auto backend = std::make_unique<Ros2ControlExecutionBackend>(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
+      "arm", clock, scheduler, std::move(config));
+  auto initial_callbacks = scheduler.take_callbacks();
+  ASSERT_FALSE(initial_callbacks.empty());
+  const auto initial_sequence = publication.acquire(clock.now()).sequence();
+  backend->testing_set_running_state(true);
+  clock.advance(20'000'000);
+  for (auto &callback : initial_callbacks)
+    callback();
+  EXPECT_EQ(publication.acquire(clock.now()).sequence(), initial_sequence);
+  ASSERT_TRUE(backend->testing_publish_snapshot(
+      core::ExecutionState::kCompleted, {0.4}));
+  backend->testing_set_running_state(false);
+  auto terminal_callbacks = scheduler.take_callbacks();
+  ASSERT_FALSE(terminal_callbacks.empty());
+  (void)backend->reset(); // No ROS startup: reset is correctly unavailable.
+  const auto reset_sequence = publication.acquire(clock.now()).sequence();
+  clock.advance(20'000'000);
+  for (auto &callback : terminal_callbacks)
+    callback();
+  EXPECT_EQ(publication.acquire(clock.now()).sequence(), reset_sequence);
+  auto reset_callbacks = scheduler.take_callbacks();
+  ASSERT_FALSE(reset_callbacks.empty());
+  backend.reset();
+  clock.advance(20'000'000);
+  for (auto &callback : reset_callbacks)
+    callback();
+  EXPECT_EQ(publication.acquire(clock.now()).sequence(), reset_sequence);
+  EXPECT_TRUE(scheduler.take_callbacks().empty());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     DelayedOldTerminalCannotArmAnIdlePublisherAcrossReplacementOrReset) {
+  for (const bool reset : {false, true}) {
+    SCOPED_TRACE(reset);
+    auto config = base_config();
+    config.execution_state_source_mode = "commanded_sim";
+    config.initial_joint_positions_rad = {0.0};
+    core::ObservedRobotStatePublication publication(
+        config.required_joints, ros2_control_addressed_state_sources(config));
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    core::FakeClock clock;
+    clock.set(1'000'000'000);
+    core::ManualScheduler scheduler;
+    Ros2ControlExecutionBackend backend(
+        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
+        sink, "arm", clock, scheduler, std::move(config));
+    backend.testing_set_running_state(true);
+    ASSERT_TRUE(backend.testing_publish_snapshot(
+        core::ExecutionState::kCompleted, {0.4}));
+    backend.testing_set_running_state(false);
+    const auto old_generation = backend.testing_running_generation();
+    if (reset) {
+      (void)backend.reset();
+    } else {
+      backend.testing_set_running_state(true);
+      ASSERT_TRUE(backend.testing_publish_snapshot(
+          core::ExecutionState::kCompleted, {0.7}));
+      backend.testing_set_running_state(false);
+    }
+    const auto successor = publication.snapshot(clock.now());
+    ASSERT_TRUE(successor);
+    // Resume the old terminal publisher only at its delayed arming edge.
+    backend.testing_arm_commanded_idle_heartbeat({9.0}, {0.0}, old_generation);
+    clock.advance(20'000'000);
+    scheduler.advance_to(clock.now(),
+                         core::SchedulerPriority::ControllerCommand);
+    const auto observed = publication.snapshot(clock.now());
+    ASSERT_TRUE(observed);
+    EXPECT_GT(observed->sequence, successor->sequence);
+    EXPECT_EQ(observed->positions_rad, successor->positions_rad);
+    EXPECT_EQ(
+        scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+        1U);
+  }
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     FailedTerminalPublicationCannotRefreshAnEarlierCommandedPose) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  core::ObservedRobotStatePublication publication(
+      config.required_joints, ros2_control_addressed_state_sources(config));
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
+      "arm", clock, scheduler, std::move(config));
+  backend.testing_set_running_state(true);
+  const std::vector<std::string> names{"joint_1"};
+  const std::vector<double> positions{0.2}, velocities{0.0};
+  ASSERT_TRUE(publication
+                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
+                           names, positions, velocities, clock.now(),
+                           clock.now())
+                  .published);
+  auto first = publication.acquire(clock.now());
+  ASSERT_TRUE(publication
+                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
+                           names, positions, velocities, clock.now(),
+                           clock.now())
+                  .published);
+  auto second = publication.acquire(clock.now());
+  ASSERT_TRUE(publication
+                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
+                           names, positions, velocities, clock.now(),
+                           clock.now())
+                  .published);
+  auto third = publication.acquire(clock.now());
+  const auto previous_sequence = third.sequence();
+  EXPECT_FALSE(backend.testing_publish_snapshot(
+      core::ExecutionState::kCompleted, {0.4}));
+  backend.testing_set_running_state(false);
+  first = {};
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
+  EXPECT_EQ(publication.acquire(clock.now()).sequence(), previous_sequence);
+  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+            0U);
+  ASSERT_NE(backend.authored_state_authority_epoch(), nullptr);
+  EXPECT_NE(backend.authored_state_authority_epoch()->load(
+                std::memory_order_acquire) &
+                1U,
+            0U);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     CommandedIdlePublisherRetriesBoundedPublicationContention) {
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  core::ObservedRobotStatePublication publication(
+      config.required_joints, ros2_control_addressed_state_sources(config));
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000'000);
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
+      "arm", clock, scheduler, std::move(config));
+  auto first = publication.acquire(clock.now());
+  const std::vector<std::string> names{"joint_1"};
+  const std::vector<double> positions{0.0}, velocities{0.0};
+  ASSERT_TRUE(publication
+                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
+                           names, positions, velocities, clock.now(),
+                           clock.now())
+                  .published);
+  auto second = publication.acquire(clock.now());
+  ASSERT_TRUE(publication
+                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
+                           names, positions, velocities, clock.now(),
+                           clock.now())
+                  .published);
+  auto third = publication.acquire(clock.now());
+  const auto blocked_sequence = third.sequence();
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
+  EXPECT_GT(publication.metrics().slot_exhausted_total, 0U);
+  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+            1U);
+  first = {};
+  clock.advance(10'000'000);
+  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
+  EXPECT_GT(publication.acquire(clock.now()).sequence(), blocked_sequence);
+  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+            1U);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      InjectedAddressedPublicationIsTheSoleCommandedStateChannel) {
   auto config = base_config();
   config.execution_state_source_mode = "commanded_sim";
@@ -1461,8 +2066,7 @@ TEST(Ros2ControlExecutionBackendTest,
   config.prepared_participant_binding = motion_binding("program.direct");
   config.transport_joint_names = {"source_joint_1"};
   auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
+  StopEvidenceClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
@@ -1474,8 +2078,12 @@ TEST(Ros2ControlExecutionBackendTest,
       backend.testing_publish_snapshot(core::ExecutionState::kStopping, {0.0}));
   backend.testing_install_prepared_goal_membership(
       stage, core::ContentDigest("prepared.software_hard"));
+  clock.on_read = [&scheduler](const auto now_ns) {
+    scheduler.advance_to(now_ns, core::SchedulerPriority::ControllerCommand);
+  };
   const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
                                                  std::stop_token{});
+  clock.on_read = {};
 
   EXPECT_EQ(result.attempt_disposition,
             core::StopStageAttemptDispositionDTO::kDispatched);
@@ -1489,6 +2097,11 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_TRUE(result.source_sequence.has_value());
   EXPECT_EQ(backend.get_execution_snapshot().state,
             core::ExecutionState::kStopped);
+  const auto &evidence = std::get<core::JsonObjectDTO>(
+      result.evidence_items.front().evidence->value);
+  const auto &rest =
+      std::get<core::JsonObjectDTO>(evidence.at("post_command_rest").value);
+  EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1964,6 +2577,61 @@ TEST(Ros2ControlExecutionBackendTest,
       });
   ASSERT_TRUE(recovered.has_value());
   EXPECT_TRUE(backend.command_gate_enabled());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ManagedCommandedSimControllerReadinessKeepsSeedAndGateClosedWithoutHome) {
+  const std::string suffix = unique_suffix();
+  const std::string root = "/manyforge_managed_no_home_" + suffix;
+  auto config = base_config();
+  config.action_name = root + "/follow_joint_trajectory";
+  config.joint_state_topic = root + "/joint_states";
+  config.controller_state_topic = root + "/controller_state";
+  config.command_gate_topic = root + "/command_gate";
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.25};
+  config.initialize_commanded_sim_on_controller_ready = false;
+  config.controller_binding =
+      binding_contract_for(config, root + "/controller_manager");
+  config.controller_binding_refresh_timeout_s = 1.0;
+  FakeFjtServer server(config.action_name);
+  FakeControllerManager manager(root + "/controller_manager",
+                                *config.controller_binding);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  const auto ready = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot &candidate) {
+        return candidate.valid;
+      });
+  ASSERT_TRUE(ready.has_value());
+  EXPECT_FALSE(backend.command_gate_enabled());
+  EXPECT_EQ(server.goal_count(), 0U);
+  const auto *publication = backend.observed_robot_state_publication();
+  ASSERT_NE(publication, nullptr);
+  const auto seeded = publication->snapshot(clock.now());
+  ASSERT_TRUE(seeded.has_value());
+  EXPECT_EQ(seeded->source_kind, core::ObservedRobotStateSourceKind::kCommandedState);
+  EXPECT_EQ(seeded->positions_rad, (std::vector<double>{0.25}));
+  manager.set_controller_active(false);
+  const auto inactive = wait_for_binding_snapshot(
+      backend, [ready](const ControllerBindingSnapshot &candidate) {
+        return candidate.activity_generation > ready->activity_generation &&
+               !candidate.valid;
+      });
+  ASSERT_TRUE(inactive.has_value());
+  manager.set_controller_active(true);
+  const auto recovered = wait_for_binding_snapshot(
+      backend, [inactive](const ControllerBindingSnapshot &candidate) {
+        return candidate.activity_generation > inactive->activity_generation &&
+               candidate.valid;
+      });
+  ASSERT_TRUE(recovered.has_value());
+  EXPECT_FALSE(backend.command_gate_enabled());
+  EXPECT_EQ(server.goal_count(), 0U);
 }
 
 TEST(Ros2ControlExecutionBackendTest,

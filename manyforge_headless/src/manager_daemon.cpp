@@ -403,6 +403,9 @@ struct DaemonConfig final {
   std::filesystem::path program_cycle_journal;
   std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
+  /// Optional approved root for relative Program scene meshes. The native
+  /// runtime adapter opens it once; empty means relative meshes fail closed.
+  std::filesystem::path scene_asset_root;
   std::chrono::milliseconds reconciliation_period{500};
 };
 
@@ -1669,6 +1672,9 @@ struct BeforePlanningLatchResult final {
   core::ProjectionRevisionDTO projection_revision;
   std::uint64_t latched_observation_count{};
   std::uint64_t committed_observation_count{};
+  /// Observations whose exact pose was already in the logical scene; this
+  /// includes freshness-only confirmations, which leave the projection
+  /// revision unchanged.
   std::uint64_t already_applied_observation_count{};
   std::uint64_t skipped_attached_observation_count{};
   std::uint64_t scene_runtime_source_generation{};
@@ -2589,7 +2595,7 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.activation_root),
+            config_.activation_root, config_.scene_asset_root),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
@@ -4078,10 +4084,13 @@ private:
       }
     };
     for (auto &candidate : candidates) {
+      // The retained application lets an already confirmed exact
+      // observation be reported again without a second confirmation.
       auto application = scene_runtime_pose_projector_.Apply(
           bundle->value().capability_provider_bindings,
           bundle->retained_bundle_id(),
-          bundle->value().cell_graph.graph_revision, candidate.observation);
+          bundle->value().cell_graph.graph_revision, candidate.observation,
+          candidate.replay->application);
       if (!application.ok()) {
         try {
           publish_results();
@@ -4097,6 +4106,9 @@ private:
         ++result.committed_observation_count;
         break;
       case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
+      case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
+        // A freshness confirmation keeps the exact current projection, so
+        // the planner synchronizes against the unchanged revision.
         ++result.already_applied_observation_count;
         break;
       case SceneRuntimePoseApplicationStatus::kSkippedAttached:
@@ -4844,6 +4856,8 @@ private:
           return false;
         }
         record->application = application.value();
+        // Only a committed transaction changes the logical scene; a
+        // freshness confirmation republishes the runtime source alone.
         if (record->application->status ==
             SceneRuntimePoseApplicationStatus::kCommitted) {
           TryPublishLogicalScene();
@@ -5022,6 +5036,7 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool projection = false;
   bool program_runner_liveness = false;
   bool period = false;
+  bool scene_asset = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
@@ -5060,6 +5075,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
                !program_runner_liveness) {
       config.program_runner_liveness_socket = value;
       program_runner_liveness = true;
+    } else if (option == "--scene-asset-root" && !scene_asset) {
+      config.scene_asset_root = value;
+      scene_asset = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));

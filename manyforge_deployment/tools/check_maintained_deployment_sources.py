@@ -231,6 +231,8 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "validation_collision_workers": (
         "orchestrator.config.validation_collision_workers"
     ),
+    # Explicit authored demo policy; not a recovered historical ROS default.
+    "motion_target_limits": "authored_example.target_settings.arm.maximum_tcp_linear_speed_mps",
 }
 _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
     {
@@ -264,19 +266,19 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
 ]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "lite6_isaac_commanded_v0": (
-        "5465175c487df3cc2cc34ef714b3372550bec75396cbb24809f3a5140dab9ed1"
+        "3dd34fd4bd509790d7c6c2468cf61906b760313d9de6891e8839df815021899c"
     ),
     "lite6_native_simulated_v0": (
         "de7787ba7631291e7701432b4f1a14d0296082af345c0a6197acc42dde2ec425"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "c334ba022f55d83199ef995747d778016d498753cbf28dec99d22bc9de6f7330"
+        "366f75e72576a463da26595e7167b202a9621e7c69c49f4bad403934d90f34b4"
     ),
     "ur10e_robotiq_assistant_native_simulated_v0": (
         "ebc4ae29cb59420a463895a8b2f43d7155f56c320e8bdcc0794f9f6deda10613"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
-        "8f1205f803354b32c887ee9db8ef98ab3a599e30cb5b22dbfb0aad4e83b7c3a8"
+        "418afdd6eb7d45dbcabce7ca686f1dee41c3099e2ca7770d2c7f469b219efb23"
     ),
     "ur10e_robotiq_native_simulated_v0": (
         "1bf900ab5269eadf578a5344bf87d974a02c3ac52131db5f2e3e9533f7822f0a"
@@ -1855,7 +1857,7 @@ def validate(source: Path, root: Path) -> None:
         ).hexdigest()
         if expected_digest is None or profile_digest != expected_digest:
             raise SourceDescriptionError(
-                f"{path} changes the exact historical runtime restoration input"
+                f"{path} changes the exact runtime restoration/example-policy input"
             )
         expected_source_fields = (
             _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS

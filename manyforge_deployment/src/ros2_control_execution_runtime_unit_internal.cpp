@@ -1,4 +1,5 @@
 #include "ros2_control_execution_runtime_unit_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -228,6 +229,8 @@ CanonicalValue ros2_control_execution_runtime_manifest_projection(
     const core::RuntimeUnitDTO &unit) {
   const CanonicalValue configuration =
       require_qualified_runtime_configuration(unit.configuration);
+  const auto &liveness =
+      native_execution_runtime_contract::manager_liveness_policy();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(
@@ -237,6 +240,21 @@ CanonicalValue ros2_control_execution_runtime_manifest_projection(
        CanonicalValue(
            ros2_control_execution_runtime_product_id(unit.runtime_unit_id))},
       {"configuration", configuration},
+      {"manager_liveness_policy",
+       CanonicalValue(CanonicalValue::Object{
+           {"runtime_policy_id",
+            CanonicalValue(liveness.runtime_policy_id.value())},
+           {"runtime_policy_revision",
+            CanonicalValue(liveness.runtime_policy_revision.value())},
+           {"heartbeat_period_ns",
+            CanonicalValue(static_cast<double>(liveness.heartbeat_period_ns))},
+           {"expiry_timeout_ns",
+            CanonicalValue(static_cast<double>(liveness.expiry_timeout_ns))},
+           {"local_safe_state_contract_id",
+            CanonicalValue(liveness.local_safe_state_contract_id.value())},
+           {"local_safe_state_contract_revision",
+            CanonicalValue(liveness.local_safe_state_contract_revision.value())},
+       })},
       {"runtime_profile",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_profile_id",
@@ -424,17 +442,20 @@ std::string ros2_control_execution_runtime_implementation_revision() {
       "ros2-control-execution-host;retained-addressed-kernel;external-"
       "controller-observation-only;commanded-simulation-authority;"
       "jtc-follow-joint-trajectory;topic-gripper-transport;"
+      "authored-target-tcp-linear-speed-maximum;"
       "planner-scene-projection-v1;logical-scene-services-v1;"
-      "build-owned-candidate-worker;runtime-contract-offer-correlation-v2");
+      "build-owned-candidate-worker;runtime-contract-offer-correlation-v2;"
+      "retained-manager-liveness-receiver-v2;isolated-manager-liveness-transport-v1;"
+      "fenced-initial-aggregate-installation-v1;managed-startup-without-home-motion-v1");
 }
 
 std::string ros2_control_execution_runtime_process_adapter_revision() {
   return contract_revision(
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
-      "inherited-seqpacket-channel;same-user-direct-parent;"
+      "dual-inherited-seqpacket-channels;same-user-direct-parent;"
       "command-fenced-readiness;runtime-contract-offer-digest-echo;"
-      "fixed-sibling-candidate-worker");
+      "fixed-sibling-candidate-worker;isolated-manager-liveness-rpc-v1");
 }
 
 std::string ros2_control_execution_runtime_retrieval_contract_revision() {
@@ -743,6 +764,35 @@ require_configuration(const RetainedBundle &retained_bundle,
 
   Configuration result;
   result.isaac_profile = *profile;
+  const auto *motion_limits = std::get_if<core::JsonValueDTO::Array>(
+      &require_member("motion_target_limits").value);
+  if (motion_limits == nullptr || motion_limits->empty()) {
+    throw RetainedBundleError(
+        "ros2_control runtime requires motion target limits");
+  }
+  result.motion_target_limits =
+      detail::decode_execution_motion_target_limits(*motion_limits, false);
+  std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+      expected;
+  for (const auto &binding :
+       retained_bundle.value().cell_graph.control_bindings) {
+    if (binding.provider_runtime_unit_id == runtime_unit_id &&
+        binding.capability_id.value() == "execution.trajectory.execute") {
+      expected.emplace(binding.controllable_component_id,
+                       binding.command_target_id);
+    }
+  }
+  std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+      configured;
+  for (const auto &limit : result.motion_target_limits) {
+    configured.emplace(limit.controllable_component_id,
+                       limit.command_target_id);
+  }
+  if (configured != expected) {
+    throw RetainedBundleError(
+        "ros2_control runtime must contain exactly one TCP-speed "
+        "maximum for every motion target and no unknown target");
+  }
   result.planner_rng_seed = require_uint32("planner_rng_seed");
   result.execution_tick_hz = require_uint32("execution_tick_hz");
   result.collision_monitor_period_ms =

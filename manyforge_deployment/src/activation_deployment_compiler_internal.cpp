@@ -15,11 +15,12 @@
 #include <variant>
 
 #include <manyforge_core/types/cell_graph.hpp>
-#include <manyforge_deployment/native_domain_topology.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
+#include <manyforge_deployment/native_domain_topology.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment::detail {
 namespace {
@@ -57,6 +58,31 @@ constexpr std::array<std::string_view, 4U> kGripperCapabilities{{
     "model.kinematics.fk", "model.limits.joint", "tool.gripper.command",
     "tool.gripper.feedback",
 }};
+constexpr auto kRosArmCapabilities = [] {
+  std::array<std::string_view, kNativeArmCapabilities.size() - 1U> result{};
+  std::size_t index = 0U;
+  for (const auto capability : kNativeArmCapabilities) {
+    if (capability != "execution.runtime_scale.operation_scoped") {
+      result[index++] = capability;
+    }
+  }
+  return result;
+}();
+
+[[nodiscard]] std::span<const std::string_view>
+arm_capabilities(const bool ros2_control) {
+  return ros2_control
+             ? std::span<const std::string_view>(kRosArmCapabilities)
+             : std::span<const std::string_view>(kNativeArmCapabilities);
+}
+
+[[nodiscard]] std::string
+component_type_id(const ActivationComponentProfile &profile) {
+  return profile.model_asset_id +
+         (profile.runtime_kind == ActivationRuntimeKind::kRos2Control
+              ? ".fixed_scale.component"
+              : ".component");
+}
 constexpr std::array<std::string_view, 14U> kCellCapabilities{{
     "collision.query.detailed",
     "collision.query.pre_execution",
@@ -271,11 +297,16 @@ source_joints(const ActivationComponentProfile &profile,
   return CanonicalValue(std::move(result));
 }
 
-[[nodiscard]] CanonicalValue motion_limits(
-    const ActivationDeploymentComponent &component) {
+[[nodiscard]] CanonicalValue
+motion_limits(const ActivationDeploymentComponent &component,
+              const bool include_ordinary_jerk = true) {
   Array result;
   for (const auto &[target, settings] : object(component.target_settings,
                                                 "target_settings")) {
+    if (!include_ordinary_jerk &&
+        settings.find_object_member("ordinary_motion_jerk") != nullptr) {
+      fail("authored ROS ordinary motion jerk is not yet supported");
+    }
     const auto *speed = settings.find_object_member("maximum_tcp_linear_speed_mps");
     if (speed == nullptr) continue;
     CanonicalValue jerk(Object{
@@ -287,12 +318,15 @@ source_joints(const ActivationComponentProfile &profile,
         authored != nullptr) {
       jerk = *authored;
     }
-    result.emplace_back(Object{
+    Object limit{
         {"command_target_id", CanonicalValue(target)},
         {"controllable_component_id", CanonicalValue(component.component_id)},
         {"maximum_tcp_linear_speed_mps", *speed},
-        {"ordinary_motion_jerk", std::move(jerk)},
-    });
+    };
+    if (include_ordinary_jerk) {
+      limit.emplace_back("ordinary_motion_jerk", std::move(jerk));
+    }
+    result.emplace_back(std::move(limit));
   }
   return CanonicalValue(std::move(result));
 }
@@ -310,19 +344,36 @@ struct ComponentProjection final {
     const ActivationComponentProfile &profile,
     const ActivationPreparedModel &model, CatalogSelection &catalog,
     std::string_view runtime_unit_id) {
-  if (profile.runtime_kind != ActivationRuntimeKind::kNative) {
-    fail("only the qualified native lane is supported by this cutover");
+  const bool ros2_control =
+      profile.runtime_kind == ActivationRuntimeKind::kRos2Control;
+  const std::string prefix = ros2_control ? "ros2_control" : "native";
+  // Authored portable identifiers permit punctuation that cannot name the
+  // existing Isaac controller namespace. Refuse it before runtime launch.
+  if (ros2_control &&
+      component.component_id.find_first_of(".-") != std::string::npos) {
+    fail(component.component_id + " must be one ROS name token");
   }
   const auto &component_ref = catalog.require(
-      core::CatalogRecordKind::kComponentType, profile.model_asset_id + ".component");
-  const auto &runtime_ref = catalog.require(
-      core::CatalogRecordKind::kRuntimeProfile,
-      "manyforge.native_execution_runtime");
+      core::CatalogRecordKind::kComponentType, component_type_id(profile));
+  const auto &runtime_ref =
+      catalog.require(core::CatalogRecordKind::kRuntimeProfile,
+                      ros2_control ? "manyforge.ros2_control_execution_runtime"
+                                   : "manyforge.native_execution_runtime");
   static_cast<void>(runtime_ref);
   static_cast<void>(catalog.require(core::CatalogRecordKind::kModelAsset,
                                     profile.model_asset_id));
   const auto &configuration = member(component.configuration,
                                      "runtime_configuration", "configuration");
+  if (ros2_control) {
+    const auto &profile_configuration =
+        member(profile.runtime_restoration_profile, "ros2_control_runtime",
+               "component profile");
+    if (member(configuration, "isaac_profile", "runtime configuration") !=
+        member(profile_configuration, "isaac_profile", "component profile")) {
+      fail(component.component_id +
+           " isaac_profile does not match its ROS component profile");
+    }
+  }
   const auto arm_resource_count =
       array(resource_bindings(component.component_id, "arm", profile),
             "arm resource bindings")
@@ -336,8 +387,22 @@ struct ComponentProjection final {
          " initial_joint_positions_rad count does not match its "
          "arm resource bindings");
   }
-  CanonicalValue runtime_configuration = object_with(
-      configuration, "motion_target_limits", motion_limits(component));
+  const auto limits = motion_limits(component, !ros2_control);
+  if (ros2_control) {
+    if (configuration.find_object_member("motion_target_limits") != nullptr) {
+      fail("runtime_configuration.motion_target_limits must be authored "
+           "through target_settings");
+    }
+    const auto &rows = array(limits, "motion limits");
+    if (rows.size() != 1U ||
+        text(member(rows.front(), "command_target_id", "motion limit"),
+             "target") != "arm") {
+      fail("authored ROS requires exactly one TCP-speed maximum for arm and no "
+           "unknown target");
+    }
+  }
+  CanonicalValue runtime_configuration =
+      object_with(configuration, "motion_target_limits", limits);
   if (component.configuration.find_object_member(
           "native_lifecycle_management") != nullptr) {
     fail("native_lifecycle_management is obsolete; native component lifecycle "
@@ -348,9 +413,9 @@ struct ComponentProjection final {
   Array bindings;
   for (const std::string_view target : {std::string_view("arm"),
                                         std::string_view("gripper")}) {
-    const std::string contract_id = std::string("manyforge.native_") +
+    const std::string contract_id = std::string("manyforge.") + prefix + "_" +
                                     std::string(target) + "_position";
-    const std::string topology_id = std::string("manyforge.native_") +
+    const std::string topology_id = std::string("manyforge.") + prefix + "_" +
                                     std::string(target) + "_direct";
     const auto &contract = catalog.require(
         core::CatalogRecordKind::kControlInterfaceContract, contract_id);
@@ -360,21 +425,27 @@ struct ComponentProjection final {
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
                         : "manyforge.native_controller_goal_terminal");
-    const std::string provider_id = "manyforge.provider.native_control";
+    const std::string provider_id = ros2_control
+                                        ? "manyforge.provider.ros2_control"
+                                        : "manyforge.provider.native_control";
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
-        {"control_domain_id", CanonicalValue(domain_id(component.component_id, target))},
+        {"control_domain_id",
+         CanonicalValue(domain_id(component.component_id, target))},
         {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-        {"runtime_unit_ids", CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
-        {"control_coordinator_endpoint_role", CanonicalValue("native_execution_status")},
+        {"runtime_unit_ids",
+         CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
+        {"control_coordinator_endpoint_role",
+         CanonicalValue(ros2_control ? "ros2_control_execution_status"
+                                     : "native_execution_status")},
         {"controller_topology_id", CanonicalValue(topology_id)},
         {"topology_revision", CanonicalValue(revision(topology))},
         {"containment_granularity", CanonicalValue("resource")},
     });
     const std::span<const std::string_view> capabilities =
         target == "arm"
-            ? std::span<const std::string_view>(kNativeArmCapabilities)
+            ? arm_capabilities(ros2_control)
             : std::span<const std::string_view>(kGripperCapabilities);
     for (const auto capability : capabilities) {
       const auto capability_selector = selector(catalog, capability);
@@ -399,32 +470,54 @@ struct ComponentProjection final {
       };
       for (const auto &row : object(capability_selector, "selector"))
         binding.push_back(row);
-      binding.insert(binding.end(), {
-          {"control_domain_id", CanonicalValue(domain_id(component.component_id, target))},
-          {"resource_bindings", resource_bindings(component.component_id, target, profile)},
-          {"control_interface_contract_id", CanonicalValue(contract_id)},
-          {"control_interface_revision", CanonicalValue(revision(contract))},
-          {"controller_topology_id", CanonicalValue(topology_id)},
-          {"topology_revision", CanonicalValue(revision(topology))},
-          {"legal_control_route_ids", CanonicalValue(Array{CanonicalValue(std::string(target) + "_position")})},
-          {"route_endpoint_projections", CanonicalValue(Array{CanonicalValue(Object{
-              {"control_route_id", CanonicalValue(std::string(target) + "_position")},
-              {"command_endpoint_role_ids", CanonicalValue(Array{CanonicalValue("command")})},
-              {"state_endpoint_role_ids", CanonicalValue(Array{CanonicalValue("state")})},
-          })})},
-          // One generic native provider serves every native domain.
-          {"provider_instance_id", CanonicalValue(component.component_id + ".native_control")},
-          {"provider_runtime_unit_id", CanonicalValue(std::string(runtime_unit_id))},
-          {"provider_manifest_id", CanonicalValue(provider_id)},
-          {"provider_manifest_revision", CanonicalValue(revision(provider))},
-          {"state_authority_id", CanonicalValue(component.component_id + "." +
-                                                   std::string(target) + ".predicted_state")},
-          {"state_authority_class", CanonicalValue("predicted")},
-          {"stop_evidence_policy_id", CanonicalValue(core::catalog_record_id_value(stop))},
-          {"stop_evidence_policy_revision", CanonicalValue(revision(stop))},
-          {"containment_granularity", CanonicalValue("resource")},
-      });
-      if (target == "arm" &&
+      binding.insert(
+          binding.end(),
+          {
+              {"control_domain_id",
+               CanonicalValue(domain_id(component.component_id, target))},
+              {"resource_bindings",
+               resource_bindings(component.component_id, target, profile)},
+              {"control_interface_contract_id", CanonicalValue(contract_id)},
+              {"control_interface_revision",
+               CanonicalValue(revision(contract))},
+              {"controller_topology_id", CanonicalValue(topology_id)},
+              {"topology_revision", CanonicalValue(revision(topology))},
+              {"legal_control_route_ids",
+               CanonicalValue(
+                   Array{CanonicalValue(std::string(target) + "_position")})},
+              {"route_endpoint_projections",
+               CanonicalValue(Array{CanonicalValue(Object{
+                   {"control_route_id",
+                    CanonicalValue(std::string(target) + "_position")},
+                   {"command_endpoint_role_ids",
+                    CanonicalValue(Array{CanonicalValue("command")})},
+                   {"state_endpoint_role_ids",
+                    CanonicalValue(Array{CanonicalValue("state")})},
+               })})},
+              // One selected execution provider serves this component's
+              // domains.
+              {"provider_instance_id",
+               CanonicalValue(
+                   component.component_id +
+                   (ros2_control ? ".ros2_control" : ".native_control"))},
+              {"provider_runtime_unit_id",
+               CanonicalValue(std::string(runtime_unit_id))},
+              {"provider_manifest_id", CanonicalValue(provider_id)},
+              {"provider_manifest_revision",
+               CanonicalValue(revision(provider))},
+              {"state_authority_id",
+               CanonicalValue(component.component_id + "." +
+                              std::string(target) +
+                              (ros2_control ? ".commanded_sim_state"
+                                            : ".predicted_state"))},
+              {"state_authority_class",
+               CanonicalValue(ros2_control ? "commanded" : "predicted")},
+              {"stop_evidence_policy_id",
+               CanonicalValue(core::catalog_record_id_value(stop))},
+              {"stop_evidence_policy_revision", CanonicalValue(revision(stop))},
+              {"containment_granularity", CanonicalValue("resource")},
+          });
+      if (!ros2_control && target == "arm" &&
           (capability == "execution.trajectory.execute" ||
            capability == "execution.runtime_scale.operation_scoped")) {
         binding.emplace_back("runtime_scale_route_qualifications",
@@ -448,19 +541,24 @@ struct ComponentProjection final {
   return ComponentProjection{
       std::move(runtime_configuration),
       CanonicalValue(Object{
-          {"model_instance_id", CanonicalValue(component.component_id + ".model")},
+          {"model_instance_id",
+           CanonicalValue(component.component_id + ".model")},
           {"model_asset_id", CanonicalValue(profile.model_asset_id)},
-          {"model_revision", CanonicalValue(model.catalog_reference.record_revision.value())},
+          {"model_revision",
+           CanonicalValue(model.catalog_reference.record_revision.value())},
       }),
       CanonicalValue(Object{
           {"controllable_component_id", CanonicalValue(component.component_id)},
-          {"component_type_id", CanonicalValue(profile.model_asset_id + ".component")},
+          {"component_type_id", CanonicalValue(component_type_id(profile))},
           {"component_type_revision", CanonicalValue(revision(component_ref))},
-          {"model_role_bindings", CanonicalValue(Array{CanonicalValue(Object{
-              {"model_role_id", CanonicalValue("arm_model")},
-              {"model_instance_id", CanonicalValue(component.component_id + ".model")},
-          })})},
-          {"runtime_unit_ids", CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
+          {"model_role_bindings",
+           CanonicalValue(Array{CanonicalValue(Object{
+               {"model_role_id", CanonicalValue("arm_model")},
+               {"model_instance_id",
+                CanonicalValue(component.component_id + ".model")},
+           })})},
+          {"runtime_unit_ids",
+           CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
           {"root_pose_in_cell", component.root_pose_in_cell},
       }),
       std::move(domains), std::move(bindings)};
@@ -515,17 +613,37 @@ CanonicalValue compile_activation_deployment(
     fail("component attachments are not yet supported by the authored compiler");
   }
   CatalogSelection catalog(catalog_records);
+  const bool ros2_control =
+      !component_profiles.empty() && component_profiles.front().runtime_kind ==
+                                         ActivationRuntimeKind::kRos2Control;
+  if (std::any_of(component_profiles.begin(), component_profiles.end(),
+                  [&](const auto &profile) {
+                    return (profile.runtime_kind ==
+                            ActivationRuntimeKind::kRos2Control) !=
+                           ros2_control;
+                  })) {
+    fail("mixed native and ROS runtime compositions are not yet supported");
+  }
+  if (ros2_control && (component_profiles.size() != 1U ||
+                       component_profiles.front().component_profile_id !=
+                           "ur10e_robotiq_isaac_commanded_v0")) {
+    fail("authored ROS composition requires one UR10e aggregate profile");
+  }
+  const std::string runtime_profile_id =
+      ros2_control
+          ? std::string(
+                ros2_control_execution_runtime_contract::kRuntimeProfileId)
+          : std::string(native_execution_runtime_contract::kRuntimeProfileId);
   const auto &runtime_ref = catalog.require(
-      core::CatalogRecordKind::kRuntimeProfile,
-      "manyforge.native_execution_runtime");
+      core::CatalogRecordKind::kRuntimeProfile, runtime_profile_id);
   std::vector<QualifiedRuntimeProfile> selected_profiles;
   for (const auto &profile : runtime_profiles) {
-    if (profile.value().runtime_profile_id.value() ==
-        native_execution_runtime_contract::kRuntimeProfileId) {
+    if (profile.value().runtime_profile_id.value() == runtime_profile_id) {
       selected_profiles.push_back(profile);
     }
   }
-  if (selected_profiles.size() != 1U) fail("native runtime profile selection is not exact");
+  if (selected_profiles.size() != 1U)
+    fail("execution runtime profile selection is not exact");
   if (intent.components.empty()) {
     if (!object(intent.policies, "policies").empty() || intent.assistant_profile_id.has_value()) {
       fail("empty Deployment has no component policies or assistant profile");
@@ -540,8 +658,11 @@ CanonicalValue compile_activation_deployment(
     return compute_deployment_artifact_revision(
         parse_strict_json_model_yaml(canonical_json(CanonicalValue(std::move(authored)))), selected_profiles).normalized_authored_root();
   }
-  const std::string runtime_id(
-      native_execution_runtime_contract::kCellHostRuntimeUnitId);
+  const std::string runtime_id =
+      ros2_control
+          ? intent.components.front().component_id + ".ros2_control_execution"
+          : std::string(
+                native_execution_runtime_contract::kCellHostRuntimeUnitId);
   std::vector<ComponentProjection> projections;
   projections.reserve(intent.components.size());
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
@@ -617,13 +738,14 @@ CanonicalValue compile_activation_deployment(
       {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
       {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
       {"cell_id", CanonicalValue(runtime_cell_id.value())},
-      {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
-          {"runtime_unit_id", CanonicalValue(runtime_id)},
-          {"runtime_profile_id", CanonicalValue("manyforge.native_execution_runtime")},
-          {"runtime_profile_revision", CanonicalValue(revision(runtime_ref))},
-          {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
-          {"configuration", std::move(runtime_configuration)},
-      })})},
+      {"runtime_units",
+       CanonicalValue(Array{CanonicalValue(Object{
+           {"runtime_unit_id", CanonicalValue(runtime_id)},
+           {"runtime_profile_id", CanonicalValue(runtime_profile_id)},
+           {"runtime_profile_revision", CanonicalValue(revision(runtime_ref))},
+           {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
+           {"configuration", std::move(runtime_configuration)},
+       })})},
       {"model_instances", CanonicalValue(std::move(models))},
       {"controllable_components", CanonicalValue(std::move(components))},
       {"control_domains", CanonicalValue(std::move(domains))},
@@ -635,9 +757,12 @@ CanonicalValue compile_activation_deployment(
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
   // The native provider composes one controllable component per domain;
   // explain that limitation at compile time rather than at activation.
-  if (const auto topology = VerifySupportedNativeDomainTopology(intrinsic.graph());
-      !topology.ok()) {
-    fail(topology.error().message);
+  if (!ros2_control) {
+    if (const auto topology =
+            VerifySupportedNativeDomainTopology(intrinsic.graph());
+        !topology.ok()) {
+      fail(topology.error().message);
+    }
   }
   const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
   const auto computed = compute_graph_revision(ready);
@@ -652,14 +777,16 @@ CanonicalValue compile_activation_deployment(
     const auto &profile = component_profiles[index];
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
-      const std::string topology_id = std::string("manyforge.native_") +
-                                      std::string(target) + "_direct";
+      const std::string topology_id =
+          std::string("manyforge.") +
+          (ros2_control ? "ros2_control_" : "native_") + std::string(target) +
+          "_direct";
       const auto &topology = catalog.require(
           core::CatalogRecordKind::kControllerTopology, topology_id);
       const std::string domain = domain_id(component.component_id, target);
       const std::span<const std::string_view> capabilities =
           target == "arm"
-              ? std::span<const std::string_view>(kNativeArmCapabilities)
+              ? arm_capabilities(ros2_control)
               : std::span<const std::string_view>(kGripperCapabilities);
       Array routes;
       for (const auto capability : capabilities) {
@@ -700,11 +827,11 @@ CanonicalValue compile_activation_deployment(
           computed_graph, "control_bindings", "control_binding_id", anchor,
           "control_binding_revision");
       const auto &component_ref = catalog.require(
-          core::CatalogRecordKind::kComponentType,
-          profile.model_asset_id + ".component");
-      const auto &planning = catalog.require(
-          core::CatalogRecordKind::kProviderManifest,
-          "manyforge.provider.native_planning");
+          core::CatalogRecordKind::kComponentType, component_type_id(profile));
+      const auto &planning =
+          catalog.require(core::CatalogRecordKind::kProviderManifest,
+                          ros2_control ? "manyforge.provider.ros2_control"
+                                       : "manyforge.provider.native_planning");
       for (const auto capability : capabilities) {
         const bool is_provider = capability.starts_with("model.") ||
                                  capability.starts_with("planning.") ||
@@ -723,25 +850,41 @@ CanonicalValue compile_activation_deployment(
              object(selected_capability, "selector")) {
           row.push_back(selected);
         }
-        row.insert(row.end(), {
-            {"scope", CanonicalValue("target_binding")},
-            {"target", CanonicalValue(Object{
-                {"controllable_component_id", CanonicalValue(component.component_id)},
-                {"component_type_revision", CanonicalValue(revision(component_ref))},
-                {"command_target_id", CanonicalValue(std::string(target))},
-                {"control_binding_id", CanonicalValue(anchor)},
-                {"control_binding_revision", CanonicalValue(anchor_revision)},
-            })},
-            {"provider_instance_id", CanonicalValue(component.component_id + ".native_planning")},
-            {"provider_manifest_id", CanonicalValue("manyforge.provider.native_planning")},
-            {"provider_manifest_revision", CanonicalValue(revision(planning))},
-            {"endpoint_bindings", CanonicalValue(Array{CanonicalValue(Object{
-                {"endpoint_role_id", CanonicalValue("planner_scene_projection")},
-                {"source_kind", CanonicalValue("runtime_unit")},
-                {"source_id", CanonicalValue(runtime_id)},
-                {"source_endpoint_role_id", CanonicalValue("planner_scene_projection")},
-            })})},
-        });
+        row.insert(
+            row.end(),
+            {
+                {"scope", CanonicalValue("target_binding")},
+                {"target",
+                 CanonicalValue(Object{
+                     {"controllable_component_id",
+                      CanonicalValue(component.component_id)},
+                     {"component_type_revision",
+                      CanonicalValue(revision(component_ref))},
+                     {"command_target_id", CanonicalValue(std::string(target))},
+                     {"control_binding_id", CanonicalValue(anchor)},
+                     {"control_binding_revision",
+                      CanonicalValue(anchor_revision)},
+                 })},
+                {"provider_instance_id",
+                 CanonicalValue(
+                     component.component_id +
+                     (ros2_control ? ".ros2_control" : ".native_planning"))},
+                {"provider_manifest_id",
+                 CanonicalValue(ros2_control
+                                    ? "manyforge.provider.ros2_control"
+                                    : "manyforge.provider.native_planning")},
+                {"provider_manifest_revision",
+                 CanonicalValue(revision(planning))},
+                {"endpoint_bindings",
+                 CanonicalValue(Array{CanonicalValue(Object{
+                     {"endpoint_role_id",
+                      CanonicalValue("planner_scene_projection")},
+                     {"source_kind", CanonicalValue("runtime_unit")},
+                     {"source_id", CanonicalValue(runtime_id)},
+                     {"source_endpoint_role_id",
+                      CanonicalValue("planner_scene_projection")},
+                 })})},
+            });
         providers.emplace_back(std::move(row));
       }
 
@@ -858,6 +1001,9 @@ CanonicalValue compile_activation_deployment(
     // Every native component uses the generic CCLC lifecycle provider.
     for (const auto capability : kLifecycleCapabilities) {
       static_cast<void>(selector(catalog, capability));
+    }
+    if (ros2_control) {
+      static_cast<void>(selector(catalog, "component.lifecycle.recover"));
     }
   }
   const auto &logical = catalog.require(core::CatalogRecordKind::kProviderManifest,

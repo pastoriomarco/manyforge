@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace manyforge::deployment {
@@ -17,35 +18,35 @@ namespace {
 }
 
 [[nodiscard]] const CanonicalValue::Object &Object(
-    const CanonicalValue &value, const std::string &path) {
+    const CanonicalValue &value, std::string_view path) {
   const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
   if (object == nullptr)
-    Fail(path + " must be a mapping");
+    Fail(std::string(path) + " must be a mapping");
   return *object;
 }
 
 [[nodiscard]] const CanonicalValue::Array &Array(
-    const CanonicalValue &value, const std::string &path) {
+    const CanonicalValue &value, std::string_view path) {
   const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr)
-    Fail(path + " must be an array");
+    Fail(std::string(path) + " must be an array");
   return *array;
 }
 
 [[nodiscard]] const std::string &Text(const CanonicalValue &value,
-                                      const std::string &path) {
+                                      std::string_view path) {
   const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr)
-    Fail(path + " must be text");
+    Fail(std::string(path) + " must be text");
   return *text;
 }
 
 [[nodiscard]] const CanonicalValue &Member(const CanonicalValue &value,
                                            std::string_view name,
-                                           const std::string &path) {
+                                           std::string_view path) {
   const auto *member = value.find_object_member(name);
   if (member == nullptr)
-    Fail(path + " is missing " + std::string(name));
+    Fail(std::string(path) + " is missing " + std::string(name));
   return *member;
 }
 

@@ -67,7 +67,7 @@ BuildVerifiedRuntimeConvergencePlan(
     std::string_view operating_system,
     std::vector<std::string> launch_environment_contracts);
 
-/// Effect-free continuity admission for a retained native execution host.
+/// Effect-free continuity admission for retained native and ROS execution hosts.
 /// Generic runtime units are intentionally outside this stable-host rule.
 [[nodiscard]] manyforge::core::Result<void>
 VerifyNativeExecutionHostContinuity(

@@ -451,6 +451,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
     manyforge_component_manager
     manyforge::deployment
+    manyforge_deployment_canonical_package_generator
     GTest::gtest_main)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

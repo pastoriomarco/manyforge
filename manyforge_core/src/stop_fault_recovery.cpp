@@ -2,8 +2,11 @@
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/stop_fault_recovery.hpp>
+#include <map>
+#include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace manyforge::core {
 namespace {
@@ -383,6 +386,99 @@ std::optional<std::string_view> stop_fault_recovery_evaluation_field_error(
     return "stop_fault_recovery_evaluation_presence_invalid";
   }
   return std::nullopt;
+}
+
+bool stop_status_cell_wide(const StopStatusDTO& status) noexcept {
+  return status.accepted.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull ||
+         status.accepted.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop;
+}
+
+Result<std::vector<StopFaultRecoveryConfigurationExpectationDTO>>
+InstalledControlDomainConfigurations(
+    const std::span<const RuntimeParticipantBinding* const> installed_bindings,
+    const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision) {
+  using Rows = std::vector<StopFaultRecoveryConfigurationExpectationDTO>;
+  std::map<ControlDomainId, StopFaultRecoveryConfigurationExpectationDTO> by_domain;
+  for (const auto* const installed : installed_bindings) {
+    if (installed == nullptr) {
+      return invalid<Rows>(std::string(kStopFaultRecoveryInstalledConfigurationInvalid),
+                           "installed control-domain binding is missing");
+    }
+    const auto& binding = installed->value();
+    if (!binding.control_path.has_value()) continue;
+    const auto& path = *binding.control_path;
+    const StopFaultRecoveryConfigurationExpectationDTO row{
+        path.control_domain_id, path.active_control_configuration_id,
+        path.active_control_configuration_generation};
+    if (binding.retained_bundle_id != retained_bundle_id ||
+        binding.graph_revision != graph_revision || !configuration_valid(row)) {
+      return invalid<Rows>(std::string(kStopFaultRecoveryInstalledConfigurationInvalid),
+                           "installed control-domain configuration is not current evidence for "
+                           "the latched retained product");
+    }
+    const auto [found, inserted] = by_domain.emplace(row.control_domain_id, row);
+    if (!inserted && found->second != row) {
+      return invalid<Rows>(std::string(kStopFaultRecoveryInstalledConfigurationConflict),
+                           "installed bindings disagree on one control domain's active "
+                           "configuration");
+    }
+  }
+  if (by_domain.empty()) {
+    return invalid<Rows>(std::string(kStopFaultRecoveryInstalledConfigurationUnavailable),
+                         "no installed control domain has an active configuration");
+  }
+  if (by_domain.size() > kMaximumStopTerminalScopeEntries) {
+    return invalid<Rows>(std::string(kStopFaultRecoveryInstalledConfigurationInvalid),
+                         "installed control-domain configuration table is oversized");
+  }
+  Rows rows;
+  rows.reserve(by_domain.size());
+  for (auto& [domain_id, row] : by_domain) {
+    static_cast<void>(domain_id);
+    rows.push_back(std::move(row));
+  }
+  return Result<Rows>::Ok(std::move(rows));
+}
+
+Result<std::vector<StopFaultRecoveryConfigurationExpectationDTO>>
+StopFaultRecoveryConfigurationExpectations(
+    const StopStatusDTO& terminal_status,
+    const std::span<const RuntimeParticipantBinding* const> installed_bindings) {
+  using Rows = std::vector<StopFaultRecoveryConfigurationExpectationDTO>;
+  if (!terminal_status.fault_latch.has_value()) {
+    return invalid<Rows>("stop_fault_recovery_assessment_invalid",
+                         "Stop recovery configuration requires a latched terminal status");
+  }
+  std::map<ControlDomainId, StopFaultRecoveryConfigurationExpectationDTO> by_domain;
+  for (const auto& scope : terminal_status.scope_entries) {
+    const auto* participant = std::get_if<StopParticipantScopeFactsDTO>(&scope.facts);
+    if (participant == nullptr) continue;
+    const StopFaultRecoveryConfigurationExpectationDTO row{
+        participant->control_domain_id, participant->active_control_configuration_id,
+        participant->active_control_configuration_generation};
+    const auto [found, inserted] = by_domain.emplace(row.control_domain_id, row);
+    if (!inserted && found->second != row) {
+      return invalid<Rows>(std::string(kStopFaultRecoveryTerminalConfigurationConflict),
+                           "Stop terminal status contains conflicting control-domain "
+                           "configuration truth");
+    }
+  }
+  if (by_domain.empty()) {
+    if (!stop_status_cell_wide(terminal_status)) {
+      return invalid<Rows>(std::string(kStopFaultRecoveryParticipantConfigurationMissing),
+                           "scoped Stop terminal captured no participant configuration");
+    }
+    const auto& latch = *terminal_status.fault_latch;
+    return InstalledControlDomainConfigurations(installed_bindings, latch.retained_bundle_id,
+                                                latch.graph_revision);
+  }
+  Rows rows;
+  rows.reserve(by_domain.size());
+  for (auto& [domain_id, row] : by_domain) {
+    static_cast<void>(domain_id);
+    rows.push_back(std::move(row));
+  }
+  return Result<Rows>::Ok(std::move(rows));
 }
 
 Result<StopFaultLatchDTO> AssessStopFaultRecovery(const StopStatusDTO& terminal_status,

@@ -385,6 +385,21 @@ export function createExecutionRobotPresentationReader(
   };
 }
 
+/**
+ * A reader frozen at one measured-robot presentation. A retained (not
+ * verified) robot model keeps its last coherent pose while the control
+ * transport is delayed or stale; it neither follows nor credits live samples.
+ */
+export function frozenMeasuredRobotPresentationReader(
+  presentation: MeasuredRobotPresentation | null,
+): MeasuredRobotPresentationReader {
+  return {
+    readMeasuredRobotPresentation: () => presentation,
+    subscribeMeasuredRobotPresentation: () => () => undefined,
+    markMeasuredRobotPresentationApplied: () => undefined,
+  };
+}
+
 const EMPTY_PRESENTATION: RuntimeScenePresentation = {
   measuredRobot: null,
   measuredTcp: null,

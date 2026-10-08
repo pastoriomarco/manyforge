@@ -33,6 +33,7 @@
 #include <tl/expected.hpp>
 
 #include "manyforge_roboplan/roboplan_scene_factory.hpp"
+#include <manyforge_collision/scene_asset_root.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -42,6 +43,15 @@ using worker_protocol::MessageType;
 
 constexpr std::size_t kHeaderBytes = 16U;
 constexpr std::size_t kMaximumFrameBytes = 256U * 1024U * 1024U;
+
+/// The loaded scene-mesh bytes differ from the collision model's pinned
+/// digest. Reported with the exact kSceneMeshContentChangedDetail.
+class SceneMeshContentChanged final : public std::runtime_error {
+ public:
+  SceneMeshContentChanged()
+      : std::runtime_error(
+            std::string(worker_protocol::kSceneMeshContentChangedDetail)) {}
+};
 
 [[noreturn]] void fail(std::string message) {
   throw std::runtime_error("RoboPlan candidate worker: " +
@@ -243,19 +253,41 @@ void add_geometry(roboplan::Scene& scene,
               !finite_positive(shape.scale.x_m) ||
               !finite_positive(shape.scale.y_m) ||
               !finite_positive(shape.scale.z_m) ||
-              !geometry.resolved_mesh_path.has_value() ||
-              !geometry.resolved_mesh_path->is_absolute() ||
-              !std::filesystem::is_regular_file(
-                  *geometry.resolved_mesh_path)) {
+              geometry.resolved_mesh_path.has_value() ==
+                  geometry.scene_mesh_content_digest.has_value()) {
             return tl::unexpected("mesh resource is invalid or unavailable");
+          }
+          const Eigen::Vector3d scale(shape.scale.x_m, shape.scale.y_m,
+                                      shape.scale.z_m);
+          if (geometry.resolved_mesh_path.has_value()) {
+            // Model-local asset:// mesh staged by the retained model stage.
+            if (!geometry.resolved_mesh_path->is_absolute() ||
+                !std::filesystem::is_regular_file(
+                    *geometry.resolved_mesh_path)) {
+              return tl::unexpected("mesh resource is invalid or unavailable");
+            }
+            return scene.addMeshGeometry(
+                geometry.native_geometry_name, parent_frame,
+                roboplan::Mesh(*geometry.resolved_mesh_path, scale), pose,
+                color);
+          }
+          // Relative Program scene mesh: open it below this worker's own
+          // scene-asset root descriptor, keep the validated file open, hash
+          // exactly those bytes, and load only through /proc/self/fd/<fd>.
+          std::string error;
+          const auto opened = collision::OpenedSceneMesh::open(
+              worker_protocol::kSceneAssetRootDescriptor, shape.resource_uri,
+              error);
+          if (!opened.has_value()) {
+            return tl::unexpected("scene mesh is unavailable: " + error);
+          }
+          if (opened->content_digest() !=
+              *geometry.scene_mesh_content_digest) {
+            throw SceneMeshContentChanged();
           }
           return scene.addMeshGeometry(
               geometry.native_geometry_name, parent_frame,
-              roboplan::Mesh(
-                  *geometry.resolved_mesh_path,
-                  Eigen::Vector3d(shape.scale.x_m, shape.scale.y_m,
-                                  shape.scale.z_m)),
-              pose, color);
+              roboplan::Mesh(opened->loader_path(), scale), pose, color);
         }
       },
       geometry.shape);
@@ -445,6 +477,15 @@ int main(int argc, char** argv) {
     const auto parent = parse_parent_pid(argc, argv);
     constrain_process(parent);
     return run_worker(descriptor);
+  } catch (const SceneMeshContentChanged& error) {
+    try {
+      send_frame(descriptor, worker_protocol::MessageType::kProtocolError,
+                 worker_protocol::encode_protocol_error(
+                     worker_protocol::kSceneMeshContentChangedDetail));
+    } catch (...) {
+    }
+    std::cerr << error.what() << '\n';
+    return 2;
   } catch (const std::exception& error) {
     try {
       send_frame(descriptor, worker_protocol::MessageType::kProtocolError,

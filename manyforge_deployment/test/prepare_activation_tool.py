@@ -18,6 +18,7 @@ MAX_ACTIVATION_PREPARATION_OUTPUT_BYTES = 1024 * 1024
 
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
+    compute_content_identity,
     load_strict_json_yaml,
     raw_sha256_digest,
 )
@@ -36,6 +37,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--source-closure-rejections", action="store_true")
     parser.add_argument("--runtime-identity", action="store_true")
     parser.add_argument("--no-program", action="store_true")
+    parser.add_argument("--ros2-control", action="store_true")
     return parser.parse_args()
 
 
@@ -173,7 +175,7 @@ def _native_host_products(prepared: dict[str, object]) -> object:
     return products[0]
 
 
-def _require_native_canonical_empty_configuration(
+def _require_canonical_empty_configuration(
     activation_root: Path, candidate_bundle: dict[str, object]
 ) -> None:
     candidate_graph = candidate_bundle.get("cell_graph")
@@ -186,6 +188,11 @@ def _require_native_canonical_empty_configuration(
     if not admission_path.is_file():
         raise AssertionError("preparer omitted its canonical-empty admission")
     admission = json.loads(admission_path.read_text(encoding="utf-8"))
+    assert admission_path.read_bytes() == canonical_json_bytes(admission)
+    assert admission["admission_digest"] == compute_content_identity(
+        admission, identity_domain="canonical-empty-admission",
+        api_version=admission["api_version"], own_field="admission_digest",
+    )
     retained_bundle_id = admission.get("retained_bundle_id")
     if (
         not isinstance(retained_bundle_id, str)
@@ -218,10 +225,17 @@ def _require_native_canonical_empty_configuration(
     if (
         not isinstance(candidate_host, dict)
         or not isinstance(empty_host, dict)
-        or candidate_host.get("runtime_profile_id")
-        != "manyforge.native_execution_runtime"
+        or candidate_host.get("runtime_profile_id") not in {
+            "manyforge.native_execution_runtime",
+            "manyforge.ros2_control_execution_runtime",
+        }
     ):
-        raise AssertionError("canonical-empty regression requires a native host")
+        raise AssertionError("canonical-empty regression requires a qualified execution host")
+    for field in ("model_instances", "controllable_components", "control_domains",
+                  "control_bindings", "component_attachments"):
+        assert empty_graph[field] == [], field
+    for field in ("desired_control_configurations", "capability_provider_bindings"):
+        assert empty_bundle[field] == [], field
     for field in (
         "runtime_unit_id",
         "runtime_profile_id",
@@ -248,6 +262,9 @@ def _require_native_canonical_empty_configuration(
         or not isinstance(empty_configuration, dict)
     ):
         raise AssertionError("native runtime configuration is not an object")
+    if candidate_host["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime":
+        assert empty_host == candidate_host
+        return
     for field in (
         "mode",
         "planner_rng_seed",
@@ -363,7 +380,7 @@ def _run(
     if not any(activation_root.iterdir()):
         raise AssertionError("preparer omitted the activation closure")
     if publish_canonical_empty:
-        _require_native_canonical_empty_configuration(activation_root, bundle)
+        _require_canonical_empty_configuration(activation_root, bundle)
     return value
 
 
@@ -612,12 +629,202 @@ def _rehash_request(request: dict[str, object]) -> None:
     )
 
 
+def _check_ros_preparation(
+    args: argparse.Namespace,
+    request: dict[str, object],
+    scenario_path: Path,
+    document: dict[str, object],
+    root: Path,
+) -> None:
+    prepared = _run(args, request, root / "ros-valid")
+    assert prepared is not None
+    bundle = prepared["activation_payload"]["retained_bundle"]
+    graph = bundle["cell_graph"]
+    component_id = "isaac_ur10e_light_robot"
+    runtime_id = f"{component_id}.ros2_control_execution"
+    assert graph["cell_id"] == request["runtime_cell_id"]
+    assert len(graph["runtime_units"]) == 1
+    runtime = graph["runtime_units"][0]
+    assert runtime["runtime_unit_id"] == runtime_id
+    assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
+    expected_configuration = copy.deepcopy(request["deployment"]["components"][0][
+        "configuration"
+    ]["runtime_configuration"])
+    assert request["deployment"]["components"][0]["target_settings"]["arm"][
+        "maximum_tcp_linear_speed_mps"
+    ] == 0.25
+    expected_configuration["motion_target_limits"] = [{
+        "controllable_component_id": component_id,
+        "command_target_id": "arm",
+        "maximum_tcp_linear_speed_mps": 0.25,
+    }]
+    assert runtime["configuration"] == expected_configuration
+    assert runtime["configuration"]["mode"] == "commanded_sim"
+    assert graph["controllable_components"][0]["component_type_id"] == (
+        "ur10e_robotiq_2f_140.fixed_scale.component"
+    )
+    assert {row["control_coordinator_endpoint_role"] for row in graph["control_domains"]} == {
+        "ros2_control_execution_status"
+    }
+    bindings = graph["control_bindings"]
+    assert {row["command_target_id"] for row in bindings} == {"arm", "gripper"}
+    for row in bindings:
+        target = row["command_target_id"]
+        assert row["provider_runtime_unit_id"] == runtime_id
+        assert row["provider_manifest_id"] == "manyforge.provider.ros2_control"
+        assert row["provider_instance_id"] == f"{component_id}.ros2_control"
+        assert row["state_authority_class"] == "commanded"
+        assert row["state_authority_id"] == f"{component_id}.{target}.commanded_sim_state"
+        assert row["control_interface_contract_id"] == f"manyforge.ros2_control_{target}_position"
+        assert row["controller_topology_id"] == f"manyforge.ros2_control_{target}_direct"
+        assert not row.get("runtime_scale_route_qualifications")
+        assert row["capability_id"] != "execution.runtime_scale.operation_scoped"
+    arm = next(row for row in bindings if row["capability_id"] == "execution.trajectory.execute")
+    gripper = next(row for row in bindings if row["capability_id"] == "tool.gripper.command")
+    assert len(arm["resource_bindings"]) == 6
+    assert gripper["resource_bindings"] == [{
+        "resource_role_id": "fingers",
+        "resource_id": f"{component_id}.gripper.coordinate.000000",
+    }]
+    desired = bundle["desired_control_configurations"]
+    assert len(desired) == 2
+    assert {row["controller_topology_id"] for row in desired} == {
+        "manyforge.ros2_control_arm_direct", "manyforge.ros2_control_gripper_direct"
+    }
+    assert {route["control_binding_id"] for row in desired for route in row["binding_routes"]} == {
+        row["control_binding_id"] for row in bindings
+    }
+    providers = [row for row in bundle["capability_provider_bindings"]
+                 if row["scope"] == "target_binding"]
+    assert providers
+    assert {row["target"]["command_target_id"] for row in providers} == {"arm", "gripper"}
+    for row in providers:
+        assert row["provider_instance_id"] == f"{component_id}.ros2_control"
+        assert row["provider_manifest_id"] == "manyforge.provider.ros2_control"
+        assert row["endpoint_bindings"] == [{
+            "endpoint_role_id": "planner_scene_projection",
+            "source_kind": "runtime_unit",
+            "source_id": runtime_id,
+            "source_endpoint_role_id": "planner_scene_projection",
+        }]
+    products = bundle["compiled_products"]["runtime_unit_products"]
+    assert len(products) == 1 and products[0]["runtime_unit_id"] == runtime_id
+    assert [row["product_contract_id"] for row in products[0]["products"]] == [
+        "manyforge.ros2_control_execution_runtime_unit"
+    ]
+    launches = []
+    for artifact in prepared["activation_payload"]["raw_artifacts"]:
+        try:
+            value = json.loads(base64.b64decode("".join(artifact["chunks"]), validate=True))
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("api_version") == "manyforge.installed_target_launch.v1":
+            launches.append(value)
+    assert len(launches) == 1
+    assert launches[0]["target_id"] == "manyforge_ros2_control_execution_host"
+    assert launches[0]["implementation_id"] == "manyforge.ros2_control_execution_host"
+
+    replay = _run(args, request, root / "ros-replay")
+    assert replay == prepared
+    assert _run(args, request, root / "ros-valid", reuse_root=True) == prepared
+    # Publishing the derived empty bundle adds its raw artifact closure to
+    # the prepared payload. Its prepared identity differs legitimately, while
+    # the populated candidate and its fence-host product remain exact.
+    published = _run(args, request, root / "ros-published", publish_canonical_empty=True)
+    assert published is not None
+    assert published["activation_payload"]["retained_bundle"] == bundle
+    assert _run(args, request, root / "ros-published", publish_canonical_empty=True,
+                reuse_root=True) == published
+    relocated = copy.deepcopy(request)
+    relocated["runtime_cell_id"] = "another_ros_runtime"
+    other = _run(args, relocated, root / "ros-relocated")
+    assert other is not None
+    assert other["captured_input_digest"] == prepared["captured_input_digest"]
+    for field in ("prepared_activation_id", "retained_bundle_id", "graph_revision"):
+        assert other[field] != prepared[field], field
+
+    invalid_kind = copy.deepcopy(request)
+    invalid_kind["deployment"]["components"][0]["configuration"]["runtime_kind"] = "native"
+    _rehash_request(invalid_kind)
+    _run(args, invalid_kind, root / "ros-kind-mismatch",
+         expect_error="native runtime configuration for ros2_control profile")
+    invalid_config = copy.deepcopy(request)
+    invalid_config["deployment"]["components"][0]["configuration"][
+        "runtime_configuration"
+    ]["motion_target_limits"] = []
+    _rehash_request(invalid_config)
+    _run(args, invalid_config, root / "ros-native-configuration",
+         expect_error="motion_target_limits")
+    invalid_profile = copy.deepcopy(request)
+    invalid_profile["deployment"]["components"][0]["configuration"][
+        "runtime_configuration"
+    ]["isaac_profile"] = "lite6"
+    _rehash_request(invalid_profile)
+    _run(args, invalid_profile, root / "ros-wrong-robot-profile",
+         expect_error="isaac_profile does not match its ROS component profile")
+    missing_limit = copy.deepcopy(request)
+    del missing_limit["deployment"]["components"][0]["target_settings"]["arm"][
+        "maximum_tcp_linear_speed_mps"
+    ]
+    _rehash_request(missing_limit)
+    _run(args, missing_limit, root / "ros-missing-motion-limit",
+         expect_error="requires exactly one TCP-speed maximum")
+    for name, value in (("zero", 0), ("negative", -0.1), ("text", "fast")):
+        invalid_limit = copy.deepcopy(request)
+        invalid_limit["deployment"]["components"][0]["target_settings"]["arm"][
+            "maximum_tcp_linear_speed_mps"
+        ] = value
+        _rehash_request(invalid_limit)
+        _run(args, invalid_limit, root / f"ros-invalid-limit-{name}",
+             expect_error="maximum_tcp_linear_speed_mps")
+    foreign_limit = copy.deepcopy(request)
+    foreign_limit["deployment"]["components"][0]["target_settings"]["gripper"] = {
+        "maximum_tcp_linear_speed_mps": 0.1
+    }
+    _rehash_request(foreign_limit)
+    _run(args, foreign_limit, root / "ros-foreign-motion-limit",
+         expect_error="requires exactly one TCP-speed maximum")
+    unsupported_jerk = copy.deepcopy(request)
+    unsupported_jerk["deployment"]["components"][0]["target_settings"]["arm"][
+        "ordinary_motion_jerk"
+    ] = {"enabled": True, "joint_limits": [], "preset_reference_time_s": 1}
+    _rehash_request(unsupported_jerk)
+    _run(args, unsupported_jerk, root / "ros-authored-jerk",
+         expect_error="authored ROS ordinary motion jerk is not yet supported")
+
+    for scenario, expected_error in (
+        ("examples/lite6_pick_and_place.scenario", "mixed native and ROS runtime compositions"),
+        ("examples/isaac-lite6-pick-place.scenario", "authored ROS composition requires one UR10e aggregate profile"),
+    ):
+        _, additional, _ = _scenario_request(args.workspace, scenario)
+        unsupported = copy.deepcopy(document)
+        unsupported["deployment_draft"]["components"].extend(
+            additional["deployment_draft"]["components"]
+        )
+        unsupported["deployment_draft"]["components"].sort(
+            key=lambda component: component["component_id"]
+        )
+        combined = _request(scenario_path, unsupported, request["program"])
+        _run(args, combined, root / Path(scenario).stem, expect_error=expected_error)
+    for separator in ("-", "."):
+        invalid_namespace = copy.deepcopy(document)
+        invalid_namespace["deployment_draft"]["components"][0]["component_id"] = (
+            f"isaac{separator}ur10e"
+        )
+        renamed = _request(scenario_path, invalid_namespace, request["program"])
+        _run(args, renamed, root / f"ros-invalid-namespace-{separator}",
+             expect_error="must be one ROS name token")
+
+
 def main() -> int:
     args = _arguments()
     workspace = args.workspace.resolve()
     scenario_path, document, request = _scenario_request(workspace, args.scenario)
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)
+        if args.ros2_control:
+            _check_ros_preparation(args, request, scenario_path, document, temporary)
+            return 0
         if args.no_program:
             request["program"] = None
             request["program_role_assignment"] = {

@@ -327,6 +327,28 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _motion_preview_scene_revision_matches(
+    observed: object, expected: dict[str, Any]
+) -> bool:
+    """Return whether a motion receipt names the intent's Scene or a later one.
+
+    The native owner may latch ``before_planning`` observations and compute the
+    preview on a newer owner-minted revision of the same Scene. The receipt is
+    explanatory evidence; approval still requires the current revision.
+    """
+    if observed == expected:
+        return True
+    try:
+        parsed = SceneRevisionRequest.model_validate(observed)
+    except ValueError:
+        return False
+    return (
+        parsed.model_dump(mode="json") == observed
+        and parsed.scene_id == expected["scene_id"]
+        and parsed.revision_id > expected["revision_id"]
+    )
+
+
 def _canonical_json(value: dict[str, Any]) -> bytes:
     try:
         return rfc8785.dumps(value)
@@ -1398,7 +1420,9 @@ class ExecutionCommandClient:
             or receipt.get("graph_revision") != operation["expected_graph_revision"]
             or receipt.get("retained_bundle_id")
             != operation["expected_retained_bundle_id"]
-            or receipt.get("scene_revision") != expected_scene
+            or not _motion_preview_scene_revision_matches(
+                receipt.get("scene_revision"), expected_scene
+            )
             or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
             or receipt.get("required_capability_id")
@@ -1940,7 +1964,13 @@ class ExecutionCommandClient:
         if not isinstance(offer, dict) or set(offer) != {
             "configuration_expectations",
             "latch",
+            "recovery_unavailable_reason",
         }:
+            return False
+        unavailable_reason = offer.get("recovery_unavailable_reason")
+        if unavailable_reason is not None and (
+            not isinstance(unavailable_reason, str) or not unavailable_reason
+        ):
             return False
         latch = offer.get("latch")
         expectations = offer.get("configuration_expectations")
@@ -2092,12 +2122,15 @@ class ExecutionCommandClient:
         if certificate is None:
             return (
                 not expectations
+                and unavailable_reason is None
                 and latch["state"] == "latched"
                 and latch["recovery_status"] == "waiting_for_observation"
                 and latch["terminal_projection"]["state"] == "pending"
                 and latch["clear_projection"]["state"] == "not_applicable"
             )
-        return bool(expectations)
+        # A certified latch carries either a non-empty configuration proof or
+        # a named reason why recovery is unavailable; never an empty proof.
+        return bool(expectations) != (unavailable_reason is not None)
 
     def stop_fault(self) -> dict[str, Any]:
         # An in-memory Stop-progression read: served on the control socket.

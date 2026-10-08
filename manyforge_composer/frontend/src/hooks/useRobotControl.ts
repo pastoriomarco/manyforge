@@ -19,6 +19,7 @@ import {
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlHasActiveOperation,
   robotControlHasLocalDraft,
+  robotControlPreviewApprovable,
   robotControlReducer,
   selectedStatusForState,
   motionTargetsForStatus,
@@ -882,9 +883,8 @@ export function useRobotControl(
       || state.poseDragging
       || pendingAuthoringInputs.current.size > 0
       || manualControlBlocked.current
-      || state.phase !== 'ready'
+      || !robotControlPreviewApprovable(state)
       || state.intent === null
-      || state.preview === null
       || state.status === null
     ) return;
     const pending = { ownerEpoch: state.status.ownerEpoch, generation: state.generation };
@@ -912,7 +912,7 @@ export function useRobotControl(
     } finally {
       if (approveInFlight.current === pending) approveInFlight.current = null;
     }
-  }, [controlSource, state.generation, state.intent, state.phase, state.preview, state.status, state.poseDragging]);
+  }, [controlSource, state]);
 
   const revert = useCallback(() => {
     if (manualControlBlocked.current) return;

@@ -145,6 +145,9 @@ describe('Composer shell continuity', () => {
     expect(appSource).toMatch(
       /refreshViewerModelsOnManagerChange\([\s\S]*?retrySourceModel,\s*retryManifest,/,
     );
+    expect(appSource).toMatch(
+      /refreshOnManagerActivationSettled\([\s\S]*?managerActivationSettlementKey\(headlessSnapshot\),\s*\[retryCatalog, refreshDeploymentWorkspace\],/,
+    );
     expect(appSource).toContain('runtimeStatusPresentation({');
     expect(appSource).toContain('className={`deployment-status-button readiness-');
     expect(appSource).not.toContain('<RuntimeStatusOverlay');

@@ -234,6 +234,8 @@ export interface StopFaultRecoveryOffer {
     activeControlConfigurationId: string;
     activeControlConfigurationGeneration: number;
   }>;
+  /** Why recovery is unavailable (certified latch without a proof); null otherwise. */
+  recoveryUnavailableReason: string | null;
 }
 
 export interface CellStopStageSummary {

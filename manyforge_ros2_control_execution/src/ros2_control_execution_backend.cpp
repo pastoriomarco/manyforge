@@ -28,6 +28,25 @@
 
 namespace manyforge::ros2_control_execution {
 
+struct detail::CommandedIdleHeartbeatState final {
+  std::mutex mutex;
+  core::IScheduler *scheduler{};
+  core::IClock *clock{};
+  core::Duration period_ns{};
+  bool closing = false;
+  bool enabled = false;
+  bool sample_valid = false;
+  std::uint64_t schedule_generation{};
+  std::uint64_t execution_generation{};
+  std::optional<core::ScheduleHandle> handle;
+  std::vector<double> positions;
+  std::vector<double> velocities;
+  unsigned consecutive_busy = 0U;
+  std::function<core::ObservedRobotStatePublishResult(
+      std::span<const double>, std::span<const double>, std::uint64_t)>
+      publish;
+};
+
 void detail::SceneProjectionWorkerDeleter::operator()(
     detail::SceneProjectionWorker *worker) const noexcept {
   delete worker;
@@ -38,6 +57,106 @@ namespace {
 constexpr double kRuntimeScaleSlewPerSecond = 4.0; // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
 constexpr auto kSceneProjectionBarrierTimeout = std::chrono::seconds(1);
+
+void schedule_commanded_idle_heartbeat(
+    const std::shared_ptr<detail::CommandedIdleHeartbeatState> &state,
+    core::TimePoint deadline_ns,
+    std::optional<std::uint64_t> expected_generation = std::nullopt) {
+  std::uint64_t generation;
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->closing || !state->enabled ||
+        (expected_generation &&
+         state->schedule_generation != *expected_generation)) {
+      return;
+    }
+    generation = ++state->schedule_generation;
+  }
+  const std::weak_ptr<detail::CommandedIdleHeartbeatState> weak = state;
+  auto admitted = std::make_shared<std::atomic<bool>>(false);
+  core::ScheduleHandle handle;
+  try {
+    handle = state->scheduler->schedule(
+        deadline_ns,
+        [weak, generation, deadline_ns, admitted] {
+          const auto retained = weak.lock();
+          if (!retained) {
+            return;
+          }
+          core::TimePoint now_ns;
+          {
+            // Closing waits for this bounded leaf publication, so the writer
+            // never outlives the backend. No execution/state lock is acquired.
+            std::lock_guard lock(retained->mutex);
+            if (retained->closing || !retained->enabled ||
+                retained->schedule_generation != generation) {
+              return;
+            }
+            admitted->store(true, std::memory_order_release);
+            retained->handle.reset();
+            now_ns = retained->clock->now();
+            if (now_ns < deadline_ns) {
+              retained->enabled = false;
+              return;
+            }
+            core::ObservedRobotStatePublishResult published;
+            try {
+              published =
+                  retained->publish(retained->positions, retained->velocities,
+                                    retained->execution_generation);
+            } catch (...) {
+              retained->enabled = false;
+              return;
+            }
+            if (published.published) {
+              retained->consecutive_busy = 0U;
+            } else {
+              const std::string_view reason =
+                  published.reason == nullptr ? "" : published.reason;
+              const bool busy = reason == "writer_busy" ||
+                                reason == "source_writer_busy" ||
+                                reason == "publication_slots_exhausted" ||
+                                reason == "addressed_state_writer_busy";
+              if (!busy || ++retained->consecutive_busy >= 10U) {
+                retained->enabled = false;
+                return;
+              }
+            }
+          }
+          if (now_ns <= std::numeric_limits<core::TimePoint>::max() -
+                            retained->period_ns) {
+            schedule_commanded_idle_heartbeat(
+                retained, now_ns + retained->period_ns, generation);
+          }
+        },
+        core::SchedulerPriority::ControllerCommand);
+  } catch (...) {
+    std::lock_guard lock(state->mutex);
+    if (state->schedule_generation == generation &&
+        !admitted->load(std::memory_order_acquire)) {
+      state->enabled = false;
+    }
+    return;
+  }
+  bool cancel = false;
+  {
+    std::lock_guard lock(state->mutex);
+    if (!state->closing && state->enabled &&
+        state->schedule_generation == generation &&
+        !admitted->load(std::memory_order_acquire)) {
+      state->handle = handle;
+    } else if (!admitted->load(std::memory_order_acquire)) {
+      cancel = true;
+    }
+  }
+  if (cancel) {
+    try {
+      state->scheduler->cancel(handle);
+    } catch (...) {
+      // Generation fencing makes a queued stale callback inert.
+    }
+  }
+}
 
 bool is_settled_execution_state(const core::ExecutionState state) noexcept {
   switch (state) {
@@ -639,6 +758,7 @@ void Ros2ControlExecutionBackend::initialize_prepared_participant_bindings() {
 }
 
 Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
+  disarm_commanded_idle_heartbeat(true);
   GoalHandleFJT::SharedPtr handle_to_cancel;
   GoalHandleFJT::SharedPtr managed_fjt_handle_to_cancel;
   {
@@ -1256,6 +1376,133 @@ void Ros2ControlExecutionBackend::initialize_execution_progress_publication() {
           commanded ? "ros2_control_commanded_progress_v1"
                     : "ros2_control_measured_progress_v1",
           freshness_budget_ns);
+  if (uses_authored_backend_state()) {
+    commanded_idle_heartbeat_ =
+        std::make_shared<detail::CommandedIdleHeartbeatState>();
+    auto &heartbeat = *commanded_idle_heartbeat_;
+    heartbeat.clock = &clock_;
+    heartbeat.scheduler = &scheduler_;
+    heartbeat.period_ns =
+        static_cast<core::Duration>(config_.monitor_period_s * 1'000'000'000.0);
+    heartbeat.publish = [this](std::span<const double> positions,
+                               std::span<const double> velocities,
+                               const std::uint64_t generation) {
+      if (running_flag_.load(std::memory_order_acquire) ||
+          running_generation_.load(std::memory_order_acquire) != generation) {
+        return core::ObservedRobotStatePublishResult{false, false, false, 0U,
+                                                     "execution_retired"};
+      }
+      return publish_authored_robot_state(positions, velocities, clock_.now(),
+                                          generation, false);
+    };
+  }
+}
+
+void Ros2ControlExecutionBackend::disarm_commanded_idle_heartbeat(
+    const bool closing) noexcept {
+  if (!commanded_idle_heartbeat_) {
+    return;
+  }
+  std::optional<core::ScheduleHandle> handle;
+  {
+    std::lock_guard lock(commanded_idle_heartbeat_->mutex);
+    commanded_idle_heartbeat_->closing |= closing;
+    commanded_idle_heartbeat_->enabled = false;
+    commanded_idle_heartbeat_->sample_valid = false;
+    ++commanded_idle_heartbeat_->schedule_generation;
+    handle = commanded_idle_heartbeat_->handle;
+    commanded_idle_heartbeat_->handle.reset();
+  }
+  if (handle) {
+    try {
+      scheduler_.cancel(*handle);
+    } catch (...) {
+      // The source generation has already retired the callback.
+    }
+  }
+}
+
+void Ros2ControlExecutionBackend::arm_commanded_idle_heartbeat(
+    const std::span<const double> positions,
+    const std::span<const double> velocities,
+    const std::uint64_t execution_generation) noexcept try {
+  if (!commanded_idle_heartbeat_ || positions.empty() ||
+      positions.size() != velocities.size()) {
+    return;
+  }
+  const auto now_ns = clock_.now();
+  std::uint64_t schedule_generation;
+  std::optional<core::ScheduleHandle> old_handle;
+  {
+    std::lock_guard lock(commanded_idle_heartbeat_->mutex);
+    if (commanded_idle_heartbeat_->closing ||
+        running_generation_.load(std::memory_order_acquire) !=
+            execution_generation) {
+      return;
+    }
+    old_handle = commanded_idle_heartbeat_->handle;
+    commanded_idle_heartbeat_->handle.reset();
+    ++commanded_idle_heartbeat_->schedule_generation;
+    commanded_idle_heartbeat_->positions.assign(positions.begin(),
+                                                positions.end());
+    commanded_idle_heartbeat_->velocities.assign(velocities.begin(),
+                                                 velocities.end());
+    commanded_idle_heartbeat_->execution_generation = execution_generation;
+    commanded_idle_heartbeat_->consecutive_busy = 0U;
+    commanded_idle_heartbeat_->sample_valid = true;
+    // A successful terminal publication may precede running-to-inactive.
+    // Retain its exact coordinates now; only that transition may activate it.
+    commanded_idle_heartbeat_->enabled =
+        !running_flag_.load(std::memory_order_acquire);
+    schedule_generation = commanded_idle_heartbeat_->schedule_generation;
+  }
+  if (old_handle) {
+    try {
+      scheduler_.cancel(*old_handle);
+    } catch (...) {
+      // A dequeued old publication is fenced by the new source generation.
+    }
+  }
+  if (now_ns <= std::numeric_limits<core::TimePoint>::max() -
+                    commanded_idle_heartbeat_->period_ns) {
+    schedule_commanded_idle_heartbeat(
+        commanded_idle_heartbeat_,
+        now_ns + commanded_idle_heartbeat_->period_ns, schedule_generation);
+  }
+} catch (...) {
+  disarm_commanded_idle_heartbeat();
+  authored_state_authority_epoch_.fetch_or(1U, std::memory_order_acq_rel);
+}
+
+void Ros2ControlExecutionBackend::activate_commanded_idle_heartbeat(
+    const std::uint64_t previous_generation) noexcept try {
+  if (!commanded_idle_heartbeat_) {
+    return;
+  }
+  std::uint64_t schedule_generation;
+  {
+    std::lock_guard lock(commanded_idle_heartbeat_->mutex);
+    if (commanded_idle_heartbeat_->closing ||
+        !commanded_idle_heartbeat_->sample_valid ||
+        commanded_idle_heartbeat_->execution_generation !=
+            previous_generation) {
+      return;
+    }
+    commanded_idle_heartbeat_->execution_generation =
+        running_generation_.load(std::memory_order_acquire);
+    commanded_idle_heartbeat_->enabled = true;
+    schedule_generation = ++commanded_idle_heartbeat_->schedule_generation;
+  }
+  const auto now_ns = clock_.now();
+  if (now_ns <= std::numeric_limits<core::TimePoint>::max() -
+                    commanded_idle_heartbeat_->period_ns) {
+    schedule_commanded_idle_heartbeat(
+        commanded_idle_heartbeat_,
+        now_ns + commanded_idle_heartbeat_->period_ns, schedule_generation);
+  }
+} catch (...) {
+  disarm_commanded_idle_heartbeat();
+  authored_state_authority_epoch_.fetch_or(1U, std::memory_order_acq_rel);
 }
 
 void Ros2ControlExecutionBackend::initialize_scene_projection_worker() {
@@ -1977,6 +2224,7 @@ void Ros2ControlExecutionBackend::controller_binding_monitor_worker(
     if (!snapshot.valid && is_commanded_sim_mode()) {
       set_command_gate(false);
     } else if (snapshot.valid && is_commanded_sim_mode() &&
+               config_.initialize_commanded_sim_on_controller_ready &&
                !config_.command_gate_topic.empty()) {
       auto initialization = command_sim_initial_state(
           "controller_binding_ready_commanded_sim_reset",
@@ -3030,13 +3278,20 @@ void Ros2ControlExecutionBackend::assign_joint_sample(
 void Ros2ControlExecutionBackend::set_running_locked(
     bool running, ProgressRetirement progress_retirement,
     ResumeAuthorityRetention resume_authority_retention) noexcept {
-  if (running_ != running) {
+  const auto previous_generation =
+      running_generation_.load(std::memory_order_acquire);
+  const bool activity_changed = running_ != running;
+  if (activity_changed) {
     // This generation fences goal callbacks, monitor snapshots, and authored
     // observed-state publication in both directions. In particular, terminal
     // completion must invalidate a monitor tick that began before completion.
     running_generation_.fetch_add(1, std::memory_order_acq_rel);
   }
   if (running) {
+    disarm_commanded_idle_heartbeat();
+    retained_execution_generation_.store(
+        running_generation_.load(std::memory_order_acquire),
+        std::memory_order_release);
     active_action_feedback_authority_generation_.store(
         0, std::memory_order_release);
     running_flag_.store(true, std::memory_order_release);
@@ -3054,6 +3309,10 @@ void Ros2ControlExecutionBackend::set_running_locked(
     if (progress_retirement == ProgressRetirement::kRetireImmediately &&
         execution_progress_publication_ != nullptr) {
       execution_progress_publication_->invalidate();
+    }
+    if (activity_changed &&
+        retained_execution_generation_.load(std::memory_order_acquire) != 0U) {
+      activate_commanded_idle_heartbeat(previous_generation);
     }
   }
 }
@@ -3780,6 +4039,8 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
     SnapshotPublicationAuthority authority,
     const std::vector<double> *authored_velocities) {
   const auto now_ns = clock_.now();
+  const auto heartbeat_generation = expected_running_generation.value_or(
+      running_generation_.load(std::memory_order_acquire));
   if (state_source.empty()) {
     if (is_commanded_sim_mode()) {
       state_source = "commanded_sim_predicted";
@@ -3840,6 +4101,10 @@ bool Ros2ControlExecutionBackend::publish_snapshot(
     const auto authored_publication = publish_authored_robot_state(
         joint_positions, velocities, now_ns, expected_running_generation,
         authority_boundary);
+    if (authored_publication.published && at_rest_state) {
+      arm_commanded_idle_heartbeat(joint_positions, velocities,
+                                   heartbeat_generation);
+    }
     if (!authored_publication.published &&
         (!expected_running_generation.has_value() ||
          running_generation_.load(std::memory_order_acquire) ==
@@ -6189,13 +6454,26 @@ core::StopResultDTO Ros2ControlExecutionBackend::stop_if_running_generation(
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     if (expected_running_generation.has_value() &&
-        running_generation_.load(std::memory_order_acquire) !=
-            *expected_running_generation) {
+        (retained_execution_generation_.load(std::memory_order_acquire) !=
+             *expected_running_generation ||
+         (running_ && running_generation_.load(std::memory_order_acquire) !=
+                          *expected_running_generation))) {
       return core::StopResultDTO{
           false,
           make_error(core::ErrorCode::kExecutionRejected,
                      "Prepared Stop no longer owns the active execution",
                      {{"reason", "prepared_goal_execution_generation_stale"}})};
+    }
+    if (expected_running_generation && observe_software_hard_issue &&
+        !running_ && terminal_) {
+      const auto state = get_execution_snapshot().state;
+      if (state == core::ExecutionState::kCompleted ||
+          state == core::ExecutionState::kStopped ||
+          state == core::ExecutionState::kFailed) {
+        // Idempotent containment of this exact already-finished goal. Rest is
+        // proved independently by the stage, without rewriting its terminal.
+        return core::StopResultDTO{true, std::nullopt};
+      }
     }
     resync_required = resync_required_;
     if (resync_required_) {
@@ -6494,11 +6772,26 @@ Ros2ControlExecutionBackend::TranslateStopStage(
   }
 
   const auto dispatch_generation = prepared_goal->handle.execution_generation;
-  const auto current_generation =
-      running_generation_.load(std::memory_order_acquire);
-  const bool execution_running = running_flag_.load(std::memory_order_acquire);
+  std::uint64_t current_generation;
+  bool execution_running;
+  bool completed_before_stage = false;
+  core::ExecutionState current_state;
+  {
+    std::lock_guard execution_lock(execution_mutex_);
+    std::lock_guard state_lock(state_mutex_);
+    current_generation =
+        retained_execution_generation_.load(std::memory_order_acquire);
+    execution_running = running_;
+    current_state = snapshot_.state;
+    completed_before_stage =
+        motion_controlled_stop && !execution_running && terminal_ &&
+        current_generation == dispatch_generation &&
+        snapshot_execution_generation_ == dispatch_generation &&
+        snapshot_.state == core::ExecutionState::kCompleted &&
+        controlled_profile->allow_natural_completion_on_short_path;
+  }
   if (dispatch_generation == 0U || current_generation != dispatch_generation ||
-      !execution_running) {
+      (!execution_running && !software_hard && !completed_before_stage)) {
     auto failure = failure_before_effect(
         "prepared_goal_not_active",
         "ros2_control prepared goal no longer owns the active execution");
@@ -6509,6 +6802,8 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           std::to_string(current_generation);
       failure.error->details["current_execution_activity"] =
           execution_running ? "running" : "terminal_or_inactive";
+      failure.error->details["current_execution_state"] =
+          std::string(core::to_string(current_state));
     }
     return failure;
   }
@@ -6556,8 +6851,28 @@ Ros2ControlExecutionBackend::TranslateStopStage(
 
   std::optional<core::ControlledStopResultDTO> controlled_outcome;
   if (motion_controlled_stop) {
-    controlled_outcome =
-        execute_controlled_stop(*controlled_profile, cancellation);
+    if (completed_before_stage) {
+      core::ControlledStopResultDTO natural;
+      natural.accepted = true;
+      natural.backend_stop_confirmed = true;
+      natural.completed_by_natural_completion = true;
+      natural.executed_stop_mode = controlled_profile->stop_mode;
+      natural.stop_command_source =
+          core::MotionInterruptStopCommandSource::kDiagnosticOther;
+      natural.confirmation_latency_ns =
+          std::max<std::int64_t>(0, clock_.now() - started_at);
+      natural.diagnostics["command_source"] =
+          core::interrupt_structured_string("ros2_control_natural_completion");
+      natural.diagnostics["natural_completion_basis"] =
+          core::interrupt_structured_string("goal_completed_before_stop_stage");
+      natural.diagnostics["requested_stop_mode"] =
+          core::interrupt_structured_string(
+              core::stop_mode_string(controlled_profile->stop_mode));
+      controlled_outcome = std::move(natural);
+    } else {
+      controlled_outcome =
+          execute_controlled_stop(*controlled_profile, cancellation);
+    }
     if (const auto invalid = core::controlled_stop_result_field_error(
             *controlled_profile, *controlled_outcome);
         invalid.has_value()) {
@@ -6625,6 +6940,18 @@ Ros2ControlExecutionBackend::TranslateStopStage(
         stage.stop_evidence_policy_revision.value(),
         core::to_string(*prepared_command.parameter_source));
   };
+  // Goal observation and the independent rest stream are anchored after the
+  // selected command returned acceptance (or exact natural completion was
+  // observed). A terminal publication made before this edge is insufficient.
+  const auto command_accepted_at_ns = clock_.now();
+  const auto same_execution = [&]() {
+    return retained_execution_generation_.load(std::memory_order_acquire) ==
+           dispatch_generation;
+  };
+  if (!same_execution()) {
+    return fail_after_dispatch("stop_evidence_execution_changed",
+                               "The Stop execution was replaced or reset");
+  }
 
   if (command.evidence_requirements.empty()) {
     return fail_after_dispatch(
@@ -6662,6 +6989,10 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       evidence_started_at + std::chrono::nanoseconds(evidence_remaining_ns);
   bool terminal = false;
   while (!terminal && std::chrono::steady_clock::now() < evidence_deadline) {
+    if (!same_execution()) {
+      return fail_after_dispatch("stop_evidence_execution_changed",
+                                 "The Stop execution was replaced or reset");
+    }
     if (cancellation.stop_requested()) {
       return fail_after_dispatch(
           "stop_stage_cancelled_after_dispatch",
@@ -6682,7 +7013,16 @@ Ros2ControlExecutionBackend::TranslateStopStage(
         "ros2_control execution did not reach a terminal state in budget");
   }
   const auto terminal_snapshot = prepared_goal->handle.get_snapshot();
-  if (terminal_snapshot.state != core::ExecutionState::kStopped) {
+  const bool expected_terminal =
+      software_hard
+          ? terminal_snapshot.state == core::ExecutionState::kStopped ||
+                terminal_snapshot.state == core::ExecutionState::kCompleted ||
+                terminal_snapshot.state == core::ExecutionState::kFailed
+      : controlled_outcome &&
+              controlled_outcome->completed_by_natural_completion
+          ? terminal_snapshot.state == core::ExecutionState::kCompleted
+          : terminal_snapshot.state == core::ExecutionState::kStopped;
+  if (!expected_terminal) {
     auto failure = fail_after_dispatch(
         "stop_goal_terminal_state_mismatch",
         "ros2_control goal did not terminate through the requested Stop");
@@ -6740,9 +7080,39 @@ Ros2ControlExecutionBackend::TranslateStopStage(
       std::int64_t received_timestamp_ns{};
     };
     std::optional<RestObservation> rest;
-    auto rest_started_at = std::chrono::steady_clock::time_point::min();
-    bool rest_tracking = false;
+    std::int64_t rest_started_at_ns = 0;
+    std::uint64_t rest_first_sequence = 0U;
+    std::string rest_source_id;
+    std::string rest_profile_id;
+    auto rest_source_kind = core::ObservedRobotStateSourceKind::kJointState;
+    const auto authored_epoch =
+        authored_state_authority_epoch_.load(std::memory_order_acquire);
+    if (uses_authored_backend_state() && (authored_epoch & 1U) != 0U) {
+      return fail_after_dispatch("stop_evidence_source_unavailable",
+                                 "Commanded state authority is invalidated");
+    }
+    const auto rest_freshness_ns =
+        std::min_element(
+            command.evidence_requirements.begin(),
+            command.evidence_requirements.end(),
+            [](const auto &left, const auto &right) {
+              return left.requirement.source_requirement.freshness_budget_ns <
+                     right.requirement.source_requirement.freshness_budget_ns;
+            })
+            ->requirement.source_requirement.freshness_budget_ns;
+    bool rest_complete = false;
     while (std::chrono::steady_clock::now() < evidence_deadline) {
+      if (!same_execution() || running_flag_.load(std::memory_order_acquire)) {
+        return fail_after_dispatch("stop_evidence_execution_changed",
+                                   "The Stop execution was replaced or reset");
+      }
+      if (uses_authored_backend_state() &&
+          authored_state_authority_epoch_.load(std::memory_order_acquire) !=
+              authored_epoch) {
+        return fail_after_dispatch(
+            "stop_evidence_source_changed",
+            "Rest authority changed during the Stop stage");
+      }
       if (cancellation.stop_requested()) {
         return fail_after_dispatch(
             "stop_stage_cancelled_after_dispatch",
@@ -6755,7 +7125,10 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           std::equal(
               observed.joint_names().begin(), observed.joint_names().end(),
               config_.required_joints.begin(), config_.required_joints.end()) &&
-          observed.received_timestamp_ns() <= now_ns) {
+          observed.sequence() != 0U &&
+          observed.received_timestamp_ns() > command_accepted_at_ns &&
+          observed.received_timestamp_ns() <= now_ns &&
+          now_ns - observed.received_timestamp_ns() <= rest_freshness_ns) {
         const auto expected_profile =
             path.state_authority_class == core::StateAuthorityClass::kMeasured
                 ? core::ObservedRobotStateAuthorityProfile::kMeasured
@@ -6775,7 +7148,9 @@ Ros2ControlExecutionBackend::TranslateStopStage(
             }
             const auto configured =
                 controlled_profile->per_joint_settle_velocity_threshold->find(
-                    config_.required_joints[index]);
+                    // Prepared profile keys retain portable source names;
+                    // the observed publication uses compiled joint order.
+                    transport_joint_names()[index]);
             const auto *angular =
                 configured == controlled_profile
                                   ->per_joint_settle_velocity_threshold->end()
@@ -6793,20 +7168,47 @@ Ros2ControlExecutionBackend::TranslateStopStage(
               std::isfinite(velocity) && std::abs(velocity) <= threshold;
         }
         if (exact_rest) {
-          if (!rest_tracking) {
-            rest_started_at = std::chrono::steady_clock::now();
-            rest_tracking = true;
+          if (rest && (observed.source_id() != rest_source_id ||
+                       observed.source_kind() != rest_source_kind ||
+                       observed.authority_profile_id() != rest_profile_id)) {
+            return fail_after_dispatch(
+                "stop_evidence_source_changed",
+                "Rest source changed during the Stop stage");
           }
-          rest = RestObservation{observed.sequence(),
-                                 observed.received_timestamp_ns()};
+          if (!rest || observed.sequence() > rest->sequence) {
+            if (rest && observed.received_timestamp_ns() <
+                            rest->received_timestamp_ns) {
+              return fail_after_dispatch(
+                  "stop_evidence_source_reordered",
+                  "Rest source ordering changed during Stop");
+            }
+            if (!rest ||
+                observed.received_timestamp_ns() - rest->received_timestamp_ns >
+                    rest_freshness_ns) {
+              rest_started_at_ns = observed.received_timestamp_ns();
+              rest_first_sequence = observed.sequence();
+            }
+            rest_source_id = observed.source_id();
+            rest_profile_id = observed.authority_profile_id();
+            rest_source_kind = observed.source_kind();
+            rest = RestObservation{observed.sequence(),
+                                   observed.received_timestamp_ns()};
+            rest_complete = rest->sequence > rest_first_sequence &&
+                            rest->received_timestamp_ns - rest_started_at_ns >=
+                                minimum_dwell_ns;
+          } else if (observed.sequence() != rest->sequence ||
+                     observed.received_timestamp_ns() !=
+                         rest->received_timestamp_ns) {
+            return fail_after_dispatch(
+                "stop_evidence_source_reordered",
+                "Rest source ordering changed during Stop");
+          }
         }
       }
       if (!exact_rest) {
-        rest_tracking = false;
+        rest_first_sequence = 0U;
         rest.reset();
-      } else if (rest_tracking &&
-                 std::chrono::steady_clock::now() - rest_started_at >=
-                     std::chrono::nanoseconds(minimum_dwell_ns)) {
+      } else if (rest_complete) {
         break;
       }
       const auto remaining =
@@ -6819,9 +7221,7 @@ Ros2ControlExecutionBackend::TranslateStopStage(
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
               std::chrono::milliseconds(2))));
     }
-    if (!rest.has_value() || rest->sequence == 0U || !rest_tracking ||
-        std::chrono::steady_clock::now() - rest_started_at <
-            std::chrono::nanoseconds(minimum_dwell_ns)) {
+    if (!rest_complete || !rest.has_value()) {
       return fail_after_dispatch(
           "stop_evidence_not_at_rest",
           "ros2_control addressed state did not prove bounded rest");
@@ -6849,20 +7249,56 @@ Ros2ControlExecutionBackend::TranslateStopStage(
             "ros2_control rest evidence differs from the retained state "
             "authority contract");
       }
+      auto evidence = stage_evidence();
+      if (!std::holds_alternative<core::JsonObjectDTO>(evidence.value)) {
+        evidence = core::JsonValueDTO{core::JsonObjectDTO{}};
+      }
+      std::get<core::JsonObjectDTO>(evidence.value)
+          .emplace(
+              "post_command_rest",
+              core::JsonValueDTO{core::JsonObjectDTO{
+                  {"first_sample_sequence",
+                   core::JsonValueDTO{std::to_string(rest_first_sequence)}},
+                  {"last_sample_sequence",
+                   core::JsonValueDTO{std::to_string(rest->sequence)}},
+                  {"first_sample_after_acceptance_ns",
+                   core::JsonValueDTO{static_cast<double>(
+                       rest_started_at_ns - command_accepted_at_ns)}},
+                  {"dwell_ns",
+                   core::JsonValueDTO{static_cast<double>(
+                       rest->received_timestamp_ns - rest_started_at_ns)}}}});
       result.evidence_items.push_back(core::StopEvidenceItemDTO{
           requirement.requirement.evidence_item_id,
           requirement.requirement.evidence_kind,
           core::StopEvidenceItemStateDTO::kSatisfied,
           requirement.resolved_source, path.provider_runtime_epoch,
-          rest->sequence, source_age_ns, stage_evidence(), std::nullopt});
+          rest->sequence, source_age_ns, std::move(evidence), std::nullopt});
     }
     result.source_epoch = path.provider_runtime_epoch;
     result.source_sequence = rest->sequence;
   }
 
-  result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
   result.receiver_elapsed_duration_ns =
       std::max<std::int64_t>(0, clock_.now() - started_at);
+  {
+    std::lock_guard prepared_lock(prepared_execution_mutex_);
+    std::lock_guard execution_lock(execution_mutex_);
+    std::lock_guard state_lock(state_mutex_);
+    if (cancellation.stop_requested()) {
+      return fail_after_dispatch("stop_stage_cancelled_after_dispatch",
+                                 "Stop evidence was superseded before handoff");
+    }
+    if (!same_execution() || running_ || !terminal_ || !prepared_goal_ ||
+        snapshot_.state != terminal_snapshot.state ||
+        prepared_goal_->goal_id != stage.controller_goal_id ||
+        prepared_goal_->generation != stage.controller_goal_generation ||
+        prepared_goal_->prepared_contract_digest !=
+            prepared_goal->prepared_contract_digest) {
+      return fail_after_dispatch("stop_evidence_execution_changed",
+                                 "The Stop execution was replaced or reset");
+    }
+    result.outcome = core::ParticipantStopStageOutcomeDTO::kSucceeded;
+  }
   return result;
 }
 
@@ -6904,6 +7340,8 @@ core::ControlledStopResultDTO
 Ros2ControlExecutionBackend::execute_controlled_stop_impl(
     const core::MotionInterruptStopProfileDTO &profile,
     std::stop_token stop_token) {
+  const auto controlled_execution_generation =
+      retained_execution_generation_.load(std::memory_order_acquire);
   observe_stop_qualification(
       detail::Ros2ControlStopQualificationEvent::kNominalProviderEntry,
       core::stop_mode_string(profile.stop_mode));
@@ -7193,9 +7631,14 @@ Ros2ControlExecutionBackend::execute_controlled_stop_impl(
     const auto terminal_snapshot = get_execution_snapshot();
     core::ControlledStopResultDTO terminal_result;
     terminal_result.accepted =
-        terminal_snapshot.state == core::ExecutionState::kCompleted;
+        controlled_execution_generation != 0U &&
+        retained_execution_generation_.load(std::memory_order_acquire) ==
+            controlled_execution_generation &&
+        terminal_snapshot.state == core::ExecutionState::kCompleted &&
+        profile.allow_natural_completion_on_short_path;
     terminal_result.executed_stop_mode = profile.stop_mode;
     terminal_result.backend_stop_confirmed = terminal_result.accepted;
+    terminal_result.completed_by_natural_completion = terminal_result.accepted;
     terminal_result.stop_command_source =
         core::MotionInterruptStopCommandSource::kDiagnosticOther;
     terminal_result.diagnostics["requested_stop_mode"] =
@@ -8588,6 +9031,7 @@ Ros2ControlExecutionBackend::resume(const core::TrajectoryDTO &trajectory) {
 }
 
 core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
+  disarm_commanded_idle_heartbeat();
   const auto publish_reset_transition =
       [this](core::ExecutionState state, const core::ExecutionSnapshot &current,
              std::optional<core::ErrorDTO> error) {
@@ -8624,6 +9068,10 @@ core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
   bool resync_required = false;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
+    retained_execution_generation_.store(0U, std::memory_order_release);
+    // Reset retires queued source publications even when the previous goal
+    // was already inactive and set_running_locked(false) is a no-op.
+    running_generation_.fetch_add(1U, std::memory_order_acq_rel);
     resync_required = resync_required_;
     if (!resync_required && active_goal_handle_) {
       active_goal_to_cancel = active_goal_handle_;

@@ -47,6 +47,18 @@ public:
 
   [[nodiscard]] virtual ProjectionHealthDTO ProjectionHealth() const = 0;
 
+  /// Publish a freshness-only runtime update for one unchanged committed
+  /// object at the exact expected projection: the collision world, policy
+  /// and SceneRevision are retained; only the freshness sidecar, lease
+  /// inventory freshness and runtime bundle epoch advance.
+  [[nodiscard]] virtual Result<void>
+  ApplyProviderFreshness(const ProviderFreshnessConfirmationDTO & /*confirmation*/) {
+    return Result<void>::Err(ErrorDTO{
+        "provider_freshness_unsupported",
+        "native projection does not support freshness-only publication",
+        {}});
+  }
+
   [[nodiscard]] virtual ProjectionCommitResultDTO
   RebuildProjection(const NativeProjectionRebuildDTO &request) = 0;
 

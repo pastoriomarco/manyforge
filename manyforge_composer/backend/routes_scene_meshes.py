@@ -12,9 +12,11 @@ it does not restore the former Composer scene owner.
 The service accepts a mesh URI only when that exact URI and scale are present
 either in the fresh logical-scene projection returned by Headless or in the
 explicitly identified current Program Draft. These two read scopes use
-separate revision-bound URLs and cache records. The service then captures one
-contained no-symlink local source snapshot and converts only those immutable
-bytes in a bounded subprocess. The worker receives no source path or external
+separate URLs and cache records: an owner URL is content-addressed and is
+served only while some current owner shape still references that exact
+content, while a Program Draft URL is bound to its Draft revision. The service
+then captures one contained no-symlink local source snapshot and converts only
+those immutable bytes in a bounded subprocess. The worker receives no source path or external
 resource resolver.
 OBJ materials and GLTF external buffers/images are not loaded; DAE remains
 unsupported because its XML/resource closure is not captured here. Worker
@@ -119,7 +121,7 @@ _MAX_GLB_JSON_BYTES: Final = 4 * 1024 * 1024
 
 _MAX_SERVICE_RECORDS: Final = 64
 _MAX_SERVICE_CACHE_BYTES: Final = 256 * 1024 * 1024
-_MESH_METADATA_SCHEMA: Final = "manyforge.scene_mesh_asset.v1"
+_MESH_METADATA_SCHEMA: Final = "manyforge.scene_mesh_asset.v2"
 
 logger = logging.getLogger(__name__)
 
@@ -1141,15 +1143,6 @@ def _convert_mesh_asset_subprocess(
 
 
 @dataclass(frozen=True, slots=True)
-class _OwnerMeshBinding:
-    source_owner_epoch: str
-    source_generation: int
-    cell_id: str
-    source_uri: str
-    mesh_scale: tuple[float, float, float]
-
-
-@dataclass(frozen=True, slots=True)
 class _DraftMeshBinding:
     draft_id: str
     draft_revision: int
@@ -1161,7 +1154,9 @@ class _DraftMeshBinding:
 class _MeshRecord:
     scope: Literal["owner", "draft"]
     descriptor: MeshAssetDescriptor
-    binding: _OwnerMeshBinding | _DraftMeshBinding
+    # Owner-scope records carry no binding: their content-addressed URL is
+    # reauthorized against the current owner projection on every read.
+    binding: _DraftMeshBinding | None
     mesh_input: AuthorizedMeshInput | None
     converted: bytes | None = None
     conversion_error: str | None = None
@@ -1180,11 +1175,10 @@ def _scene_mesh_error(
     )
 
 
-def _owner_mesh_binding(
+def _owner_mesh_references(
     state: "ComposerState",
-    source_uri: str,
-    mesh_scale: tuple[float, float, float],
-) -> _OwnerMeshBinding:
+) -> frozenset[tuple[str, tuple[float, float, float]]]:
+    """Return every mesh ``(resource_uri, scale)`` of the fresh owner projection."""
     client = getattr(state, "headless_client", None)
     if client is None or not callable(getattr(client, "scene", None)):
         raise _scene_mesh_error(
@@ -1253,7 +1247,7 @@ def _owner_mesh_binding(
             "scene_mesh_owner_projection_invalid",
             "the logical-scene object bound is exceeded",
         )
-    matches = 0
+    references: set[tuple[str, tuple[float, float, float]]] = set()
     for scene_object in snapshot["objects"]:
         shapes = (
             scene_object.get("collision_shapes")
@@ -1272,7 +1266,7 @@ def _owner_mesh_binding(
             if (
                 type(shape) is not dict
                 or shape.get("type") != "mesh"
-                or shape.get("resource_uri") != source_uri
+                or type(shape.get("resource_uri")) is not str
             ):
                 continue
             scale = shape.get("scale")
@@ -1284,21 +1278,21 @@ def _owner_mesh_binding(
                 )
             except SceneMeshInputError:
                 continue
-            if candidate_scale == mesh_scale:
-                matches += 1
-    if matches == 0:
+            references.add((shape["resource_uri"], candidate_scale))
+    return frozenset(references)
+
+
+def _require_owner_mesh_reference(
+    state: "ComposerState",
+    source_uri: str,
+    mesh_scale: tuple[float, float, float],
+) -> None:
+    if (source_uri, mesh_scale) not in _owner_mesh_references(state):
         raise _scene_mesh_error(
             409,
             "scene_mesh_not_owner_authorized",
             "the requested mesh URI and scale are absent from current owner truth",
         )
-    return _OwnerMeshBinding(
-        source_owner_epoch=section["source_owner_epoch"],
-        source_generation=section["source_generation"],
-        cell_id=snapshot["cell_id"],
-        source_uri=source_uri,
-        mesh_scale=mesh_scale,
-    )
 
 
 def _draft_mesh_binding(
@@ -1408,6 +1402,9 @@ def _resolved_mesh_source(
         program_source = getattr(state, "program_source_path", None)
         if type(program_source) is str and program_source:
             candidates.append(Path(program_source).parent / path)
+        # Authored Scene resources may be workspace-relative while filesystem
+        # access is restricted to a narrower subtree such as examples/.
+        candidates.append(Path.cwd() / path)
         candidates.extend(root / path for root in roots)
     for candidate in candidates:
         normalized = Path(os.path.normpath(str(candidate)))
@@ -1425,7 +1422,7 @@ def _resolved_mesh_source(
 
 
 class SceneMeshAssetService:
-    """Read-only, revision-bound mesh conversion and presentation cache."""
+    """Read-only, authorization-checked mesh conversion and presentation cache."""
 
     def __init__(self, *, limits: MeshConversionLimits | None = None) -> None:
         self._limits = limits or MeshConversionLimits.from_environment()
@@ -1462,12 +1459,9 @@ class SceneMeshAssetService:
             maximum=_MAX_URI_CHARS,
         )
         scale = _normalize_scale(mesh_scale)
+        binding: _DraftMeshBinding | None = None
         if scope == "owner":
-            binding: _OwnerMeshBinding | _DraftMeshBinding = _owner_mesh_binding(
-                state,
-                source_uri,
-                scale,
-            )
+            _require_owner_mesh_reference(state, source_uri, scale)
         else:
             if draft_id is None or draft_revision is None:
                 raise SceneMeshInputError("Program Draft mesh identity is required")
@@ -1493,7 +1487,8 @@ class SceneMeshAssetService:
         with self._lock:
             existing = self._records.get(record_identity)
             if existing is not None:
-                existing.binding = binding
+                if binding is not None:
+                    existing.binding = binding
                 self._records.move_to_end(record_identity)
                 return existing
             while len(self._records) >= _MAX_SERVICE_RECORDS:
@@ -1522,31 +1517,22 @@ class SceneMeshAssetService:
         return f"{record.scope}:{record.descriptor.asset_hash}"
 
     def _metadata(self, record: _MeshRecord) -> dict[str, str | int | None]:
-        with self._lock:
-            binding = record.binding
-        if not isinstance(binding, _OwnerMeshBinding):
-            raise RuntimeError("owner mesh record has a Draft binding")
+        if record.scope != "owner":
+            raise RuntimeError("owner mesh metadata requested for a Draft record")
         status = (
             "parse_failed"
             if record.conversion_error is not None
             else "ok" if record.converted is not None else "pending"
         )
-        query = urlencode(
-            {
-                "owner_epoch": binding.source_owner_epoch,
-                "generation": str(binding.source_generation),
-            }
-        )
+        # Content-addressed: the URL names only the asset. Owner epoch and
+        # generation are not part of it; every read reauthorizes the asset.
         return {
             "schema_version": _MESH_METADATA_SCHEMA,
             "asset_hash": record.descriptor.asset_hash,
             "mesh_asset_url": (
-                f"/api/scene/object-meshes/{record.descriptor.asset_hash}.glb?{query}"
+                f"/api/scene/object-meshes/{record.descriptor.asset_hash}.glb"
             ),
             "mesh_asset_status": status,
-            "source_owner_epoch": binding.source_owner_epoch,
-            "source_generation": binding.source_generation,
-            "cell_id": binding.cell_id,
             "last_error": record.conversion_error,
         }
 
@@ -1663,42 +1649,66 @@ class SceneMeshAssetService:
                 except Exception:
                     logger.debug("scene mesh prewarm admission failed", exc_info=True)
 
-    def _validate_binding(
+    def _authorize_owner_record(
         self,
         state: "ComposerState",
         record: _MeshRecord,
-        expected_owner_epoch: str,
-        expected_generation: int,
-    ) -> _OwnerMeshBinding:
+    ) -> None:
+        """Serve an owner asset only while current owner truth references it.
+
+        Authorized means at least one mesh shape of the fresh logical-scene
+        projection names a ``(resource_uri, scale)`` whose resolved source
+        still hashes to this asset. Owner epoch and generation are irrelevant.
+        """
+        record_identity = self._record_identity(record)
         with self._lock:
-            record_identity = self._record_identity(record)
             if self._records.get(record_identity) is not record:
                 raise _scene_mesh_error(
                     404,
                     "scene_mesh_asset_unknown",
                     "the scene mesh asset has left the bounded cache",
                 )
-            binding = record.binding
-        if not isinstance(binding, _OwnerMeshBinding):
+        if record.scope != "owner":
             raise _scene_mesh_error(
                 404,
                 "scene_mesh_asset_unknown",
                 "the requested asset is not owner-scoped",
             )
-        if (
-            binding.source_owner_epoch != expected_owner_epoch
-            or binding.source_generation != expected_generation
-        ):
+        descriptor = record.descriptor
+        source: tuple[Path, tuple[Path, ...]] | None = None
+        for source_uri, mesh_scale in _owner_mesh_references(state):
+            if mesh_scale != descriptor.mesh_scale:
+                continue
+            try:
+                path, roots = _resolved_mesh_source(state, source_uri)
+            except SceneMeshInputError:
+                continue
+            # The asset hash covers the resolved path, so only a reference
+            # resolving to this path can name this asset.
+            if str(path) == descriptor.resolved_realpath:
+                source = (path, roots)
+                break
+        if source is None:
             raise _scene_mesh_error(
                 409,
-                "scene_mesh_owner_generation_changed",
-                "the mesh URL belongs to a superseded logical-scene generation",
+                "scene_mesh_not_owner_authorized",
+                "no current logical-scene object references this mesh asset",
             )
-        current = _owner_mesh_binding(
-            state,
-            binding.source_uri,
-            binding.mesh_scale,
-        )
+        # Reauthorize the bounded source capture before serving cached bytes.
+        try:
+            mesh_input = _read_authorized_mesh_input(
+                source[0], list(source[1]), limits=self._limits,
+            )
+        except SceneMeshBoundsError:
+            raise
+        except SceneMeshInputError as error:
+            raise _scene_mesh_error(409, "scene_mesh_input_invalid", str(error)) from error
+        if _asset_hash(
+            mesh_input.resolved_realpath, mesh_input.content_sha256, descriptor.mesh_scale,
+        ) != descriptor.asset_hash:
+            raise _scene_mesh_error(
+                409, "scene_mesh_source_changed", "the mesh source content or path changed",
+            )
         with self._lock:
             if self._records.get(record_identity) is not record:
                 raise _scene_mesh_error(
@@ -1706,14 +1716,7 @@ class SceneMeshAssetService:
                     "scene_mesh_asset_unknown",
                     "the scene mesh asset has left the bounded cache",
                 )
-            if current != binding or record.binding != binding:
-                raise _scene_mesh_error(
-                    409,
-                    "scene_mesh_owner_generation_changed",
-                    "the mesh URL belongs to a superseded logical-scene generation",
-                )
             self._records.move_to_end(record_identity)
-        return binding
 
     def _validate_draft_binding(
         self,
@@ -1824,8 +1827,6 @@ class SceneMeshAssetService:
         self,
         state: "ComposerState",
         asset_hash: str,
-        expected_owner_epoch: str,
-        expected_generation: int,
     ) -> Response:
         try:
             identity = _validate_lower_hex(
@@ -1856,13 +1857,9 @@ class SceneMeshAssetService:
                 },
             )
         try:
-            binding = self._validate_binding(
-                state,
-                record,
-                expected_owner_epoch,
-                expected_generation,
-            )
+            self._authorize_owner_record(state, record)
             content = self._convert(record)
+            self._authorize_owner_record(state, record)
         except HTTPException as error:
             return JSONResponse(
                 status_code=error.status_code,
@@ -1904,8 +1901,6 @@ class SceneMeshAssetService:
             headers={
                 "Cache-Control": "private, no-cache",
                 "ETag": f'"{identity}"',
-                "X-ManyForge-Scene-Owner-Epoch": binding.source_owner_epoch,
-                "X-ManyForge-Scene-Generation": str(binding.source_generation),
             },
         )
 
@@ -2049,15 +2044,8 @@ def create_scene_meshes_router(state: "ComposerState") -> APIRouter:
     @router.get("/api/scene/object-meshes/{asset_hash}.glb")
     def get_scene_object_mesh(
         asset_hash: str = ApiPath(min_length=16, max_length=16),
-        owner_epoch: str = Query(min_length=1, max_length=256),
-        generation: int = Query(ge=0),
     ) -> Response:
-        return service.get_glb_response(
-            state,
-            asset_hash,
-            owner_epoch,
-            generation,
-        )
+        return service.get_glb_response(state, asset_hash)
 
     @router.get("/api/program/draft/scene-meshes/resolve")
     def resolve_program_draft_scene_mesh(

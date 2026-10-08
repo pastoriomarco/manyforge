@@ -1174,13 +1174,10 @@ export type LogicalSceneShape =
   | { type: 'mesh'; resource_uri: string; scale: { x: number; y: number; z: number } };
 
 export interface SceneMeshAssetMetadata {
-  schema_version: 'manyforge.scene_mesh_asset.v1';
+  schema_version: 'manyforge.scene_mesh_asset.v2';
   asset_hash: string;
   mesh_asset_url: string;
   mesh_asset_status: 'pending' | 'ok' | 'parse_failed';
-  source_owner_epoch: string;
-  source_generation: number;
-  cell_id: string;
   last_error: string | null;
 }
 

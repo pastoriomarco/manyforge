@@ -249,7 +249,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
               gripper_binding->value().command_target_id.value(),
               *selected.gripper);
         }
-        backend->complete_ros_configuration();
+        if (!selected.defer_ros_start)
+          backend->complete_ros_configuration();
         if (runtime_handle) {
           const auto bound = runtime_handle->BindBackend(
               backend, motion_binding, gripper_binding);

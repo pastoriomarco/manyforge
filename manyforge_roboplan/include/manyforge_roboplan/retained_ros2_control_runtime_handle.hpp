@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -11,13 +12,14 @@
 
 namespace manyforge::roboplan_backend {
 
-/// Weak, read-only product handle for the ROS adapter selected by one retained
+/// Weak product handle for the ROS adapter selected by one retained
 /// runtime composition.
 ///
 /// The backend factory binds this handle exactly once. Lifecycle/host NRT work
 /// may then read immutable binding/transport snapshots and publish CCLC-owned
-/// execution admission. The handle exposes no trajectory, gripper, command
-/// gate, controller-manager, or simulator mutation surface.
+/// execution admission. A managed host starts the deferred executor once after
+/// retaining fenced ownership. The handle exposes no trajectory, gripper,
+/// command gate, controller-manager, or simulator mutation surface.
 class RetainedRos2ControlRuntimeHandle final
     : public std::enable_shared_from_this<RetainedRos2ControlRuntimeHandle> {
 public:
@@ -33,6 +35,18 @@ public:
           backend,
       const core::RuntimeParticipantBinding &motion_binding,
       const std::optional<core::RuntimeParticipantBinding> &gripper_binding);
+
+  /// Verify the live factory-bound adapter and its immutable physical bindings.
+  [[nodiscard]] bool
+  OwnsBackend(const core::IExecutionBackend *backend,
+              const core::RuntimeParticipantBinding &motion_binding,
+              const std::optional<core::RuntimeParticipantBinding>
+                  &gripper_binding) const;
+
+  /// Nonwaiting, one-shot executor start after the host retains fenced
+  /// ownership. A partial-start exception is retained; observing it never
+  /// retries startup.
+  void StartBackend();
 
   [[nodiscard]] RetainedExternallyManagedDomainSnapshotSource
   lifecycle_snapshot_source();
@@ -65,6 +79,10 @@ private:
 
   mutable std::mutex mutex_;
   std::weak_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend_;
+  std::optional<core::RuntimeParticipantBinding> motion_binding_;
+  std::optional<core::RuntimeParticipantBinding> gripper_binding_;
+  bool start_attempted_{false};
+  std::exception_ptr start_failure_;
   std::optional<core::ControlDomainId> motion_domain_id_;
   std::optional<core::ControlDomainId> gripper_domain_id_;
   std::optional<std::string> gripper_id_;

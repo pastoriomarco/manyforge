@@ -13,6 +13,7 @@ import type {
   ObservedGripperTarget,
   ObservedMotionTarget,
   Pose3Value,
+  SceneRevisionValue,
 } from '../types/robotControl';
 import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
 import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
@@ -481,6 +482,71 @@ function gripperPositionIsValid(
       && position <= maxPosition;
 }
 
+function sameSceneRevision(
+  left: SceneRevisionValue,
+  right: SceneRevisionValue,
+): boolean {
+  return left.scene_id === right.scene_id
+    && left.revision_id === right.revision_id
+    && left.content_hash === right.content_hash;
+}
+
+/** A later owner-minted revision of the same Scene. */
+function laterSceneRevision(
+  candidate: SceneRevisionValue,
+  base: SceneRevisionValue,
+): boolean {
+  return candidate.scene_id === base.scene_id
+    && candidate.revision_id > base.revision_id;
+}
+
+/**
+ * Motion previews may be computed on a revision the owner latched before
+ * planning, so the receipt can name the intent's Scene revision or a later
+ * one. Capability-command previews do not latch and echo it exactly.
+ */
+function receiptSceneMatchesIntent(
+  intent: DirectControlOperationIntent,
+  receipt: DirectControlPreviewReceipt,
+): boolean {
+  return sameSceneRevision(receipt.sceneRevision, intent.expected_scene_revision)
+    || (!isCapabilityCommandReceipt(receipt)
+      && laterSceneRevision(receipt.sceneRevision, intent.expected_scene_revision));
+}
+
+/**
+ * Only evidence computed on the currently displayed Scene revision may be
+ * approved; a newer motion receipt waits for status to show its revision.
+ */
+export function robotControlPreviewApprovable(state: RobotControlState): boolean {
+  return state.phase === 'ready'
+    && state.preview !== null
+    && state.intent !== null
+    && state.status !== null
+    && sameSceneRevision(state.preview.sceneRevision, state.status.sceneRevision);
+}
+
+/** Whether a status Scene move is the one a pending motion preview awaits. */
+function sceneMoveAwaitedByMotionPreview(
+  state: RobotControlState,
+  next: SceneRevisionValue,
+): boolean {
+  if (state.phase === 'ready') {
+    // Status catching up to (or toward) the receipt's revision does not
+    // invalidate it; approval still requires an exact match.
+    return state.preview !== null
+      && !isCapabilityCommandReceipt(state.preview)
+      && (sameSceneRevision(state.preview.sceneRevision, next)
+        || laterSceneRevision(state.preview.sceneRevision, next));
+  }
+  // An in-flight motion preview may be latching this very revision; its
+  // receipt decides whether the draft must be previewed again.
+  return state.phase === 'planning'
+    && state.intent !== null
+    && state.intent.participants[0].payload.kind === 'motion'
+    && laterSceneRevision(next, state.intent.expected_scene_revision);
+}
+
 function commonReceiptMatches(
   status: ExecutionOwnerStatus,
   intent: DirectControlOperationIntent,
@@ -496,12 +562,7 @@ function commonReceiptMatches(
     && receipt.programRunId === intent.program_run_id
     && receipt.graphRevision === intent.expected_graph_revision
     && receipt.retainedBundleId === intent.expected_retained_bundle_id
-    && receipt.sceneRevision.scene_id
-      === intent.expected_scene_revision.scene_id
-    && receipt.sceneRevision.revision_id
-      === intent.expected_scene_revision.revision_id
-    && receipt.sceneRevision.content_hash
-      === intent.expected_scene_revision.content_hash
+    && receiptSceneMatchesIntent(intent, receipt)
     && receipt.componentRoleId === participant.component_role_id
     && receipt.targetRoleId === participant.target_role_id
     && receipt.requiredCapabilityId === participant.required_capability_id;
@@ -773,9 +834,8 @@ function resolveStatus(
   if ((resolvedOperation === null || alreadyPresentedTerminal)
     && (state.phase === 'ready' || state.phase === 'planning'
       || (state.phase === 'blocked' && state.intent === null))
-    && (state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id
-      || state.status.sceneRevision.revision_id !== status.sceneRevision.revision_id
-      || state.status.sceneRevision.content_hash !== status.sceneRevision.content_hash)) {
+    && !sameSceneRevision(state.status.sceneRevision, status.sceneRevision)
+    && !sceneMoveAwaitedByMotionPreview(state, status.sceneRevision)) {
     // Same owner/binding and authored target, new scene evidence. Reuse the
     // normal trailing preview debounce; never retry approval or an operation.
     return invalidateDraft(state, { status });
@@ -1200,6 +1260,14 @@ export function robotControlReducer(
           error: 'The preview evidence does not match the current draft.',
         };
       }
+      if (
+        state.status !== null
+        && !sameSceneRevision(action.receipt.sceneRevision, state.status.sceneRevision)
+        && !laterSceneRevision(action.receipt.sceneRevision, state.status.sceneRevision)
+      ) {
+        // Status already shows a newer Scene than this evidence: preview again.
+        return invalidateDraft(state, {});
+      }
       return {
         ...state,
         phase: 'ready',
@@ -1228,12 +1296,7 @@ export function robotControlReducer(
         error: action.targetRejection ? null : action.error,
       };
     case 'approve_started':
-      if (
-        state.phase !== 'ready'
-        || state.poseDragging
-        || state.preview === null
-        || state.intent === null
-      ) return state;
+      if (!robotControlPreviewApprovable(state) || state.poseDragging) return state;
       return { ...state, phase: 'approving', error: null };
     case 'approve_rejected':
       if (state.phase !== 'approving' || action.generation !== state.generation) return state;

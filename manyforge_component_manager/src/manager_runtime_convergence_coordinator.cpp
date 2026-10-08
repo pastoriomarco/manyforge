@@ -4,6 +4,7 @@
 #include <exception>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <map>
 #include <set>
@@ -492,26 +493,32 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
          {"reason", reason},
          {"verification_detail", bounded_detail}}});
   };
-  const auto is_native_host = [](const RuntimeUnitDTO &unit) {
-    return unit.runtime_profile_id.value() == kRuntimeProfileId;
+  const auto is_execution_host = [](const RuntimeUnitDTO &unit) {
+    return unit.runtime_profile_id.value() == kRuntimeProfileId ||
+           unit.runtime_profile_id.value() ==
+               manyforge::deployment::ros2_control_execution_runtime_contract::
+                   kRuntimeProfileId;
   };
   const auto &predecessor_units = predecessor.value().cell_graph.runtime_units;
   const auto &candidate_units = candidate.value().cell_graph.runtime_units;
   std::vector<const RuntimeUnitDTO *> predecessor_hosts;
   std::vector<const RuntimeUnitDTO *> candidate_hosts;
   for (const auto &unit : predecessor_units) {
-    if (is_native_host(unit)) {
+    if (is_execution_host(unit)) {
       predecessor_hosts.push_back(&unit);
     }
   }
   // Generic-runtime Apply paths retain their existing semantics. The stable
-  // host contract begins only after the current predecessor has one native
-  // execution host.
+  // host contract begins only after the current predecessor has one qualified
+  // command-fenced execution host. Both retained host profiles own that fence.
   if (predecessor_hosts.empty()) {
     return manyforge::core::Result<void>::Ok();
   }
   for (const auto &unit : candidate_units) {
-    if (is_native_host(unit)) {
+    // Keep native-to-native diagnostics and refuse cross-profile replacement:
+    // a first Apply must retain the host that owns its predecessor's fence.
+    if (unit.runtime_profile_id ==
+        predecessor_hosts.front()->runtime_profile_id) {
       candidate_hosts.push_back(&unit);
     }
   }

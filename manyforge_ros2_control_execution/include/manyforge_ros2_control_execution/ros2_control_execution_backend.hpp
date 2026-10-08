@@ -56,6 +56,7 @@ enum class Ros2ControlStopQualificationEvent : std::uint8_t;
 class IRos2ControlStopQualificationProbe;
 class Ros2ControlStopQualificationAccess;
 class SceneProjectionWorker;
+struct CommandedIdleHeartbeatState;
 struct SceneProjectionCompletion;
 struct SceneProjectionWorkerDeleter {
   void operator()(SceneProjectionWorker *worker) const noexcept;
@@ -512,6 +513,13 @@ public:
     terminal_ = !running;
   }
 
+  void
+  testing_arm_commanded_idle_heartbeat(const std::vector<double> &positions,
+                                       const std::vector<double> &velocities,
+                                       std::uint64_t execution_generation) {
+    arm_commanded_idle_heartbeat(positions, velocities, execution_generation);
+  }
+
   void testing_install_prepared_goal_membership(
       const core::ResolvedParticipantStopStageDTO &stage,
       core::ContentDigest prepared_contract_digest) {
@@ -885,6 +893,13 @@ private:
   void initialize_prepared_participant_bindings();
   void validate_injected_observed_state_publication();
   void initialize_execution_progress_publication();
+  void
+  arm_commanded_idle_heartbeat(std::span<const double> positions,
+                               std::span<const double> velocities,
+                               std::uint64_t execution_generation) noexcept;
+  void
+  activate_commanded_idle_heartbeat(std::uint64_t previous_generation) noexcept;
+  void disarm_commanded_idle_heartbeat(bool closing = false) noexcept;
   void initialize_scene_projection_worker();
   void initialize_dispatch_admission();
   void initialize_authored_state();
@@ -1283,6 +1298,11 @@ private:
   bool running_ = false;
   std::atomic<bool> running_flag_{false};
   std::atomic<std::uint64_t> running_generation_{0};
+  // Dispatch identity survives the separate terminal publication fence. Reset
+  // retires it even when there is no running-to-inactive transition.
+  std::atomic<std::uint64_t> retained_execution_generation_{0};
+  std::shared_ptr<detail::CommandedIdleHeartbeatState>
+      commanded_idle_heartbeat_;
   bool terminal_ = true;
   bool stop_requested_ = false;
   bool natural_completion_stop_requested_ = false;

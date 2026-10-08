@@ -66,6 +66,7 @@ endforeach()
 
 find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 if(NOT TARGET manyforge_core)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core
@@ -85,6 +86,7 @@ target_link_libraries(manyforge_collision
   manyforge_core
   Eigen3::Eigen
   pinocchio::pinocchio
+  OpenSSL::Crypto
 )
 
 target_compile_definitions(manyforge_collision PRIVATE

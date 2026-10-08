@@ -147,12 +147,26 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   static constexpr std::size_t kMaximumRetainedCollisionGeometries = 1024;
 
   /// Parse URDF/SRDF and load immutable Pinocchio model assets once.
+  ///
+  /// `scene_asset_root_fd` is the approved scene-asset root directory
+  /// descriptor. The model keeps its own duplicate for its lifetime. Relative
+  /// scene mesh URIs resolve only below it; without it they fail closed.
   static SharedModelPtr load_shared_model(
       const std::string& model_name,
       const std::filesystem::path& urdf_path,
       const std::filesystem::path& srdf_path,
       const std::vector<std::filesystem::path>& package_paths,
-      std::string group_name);
+      std::string group_name,
+      std::optional<int> scene_asset_root_fd = std::nullopt);
+
+  /// Content digest (`sha256:<hex>`) of the bytes this model's collision
+  /// contexts use for one relative scene mesh URI. The first read of a URI
+  /// below the approved root, by a collision load or by this query, pins its
+  /// digest for the model's lifetime; every later collision load of that URI
+  /// must read identical bytes or fails with reason
+  /// `scene_mesh_content_changed`. Errors carry details["reason"].
+  [[nodiscard]] static core::Result<std::string> scene_mesh_content_digest(
+      const SharedModelPtr& shared_model, const std::string& relative_uri);
 
   /// Create an independently-owned revision cache over a shared model.
   static SharedSceneCachePtr make_shared_scene_cache(
