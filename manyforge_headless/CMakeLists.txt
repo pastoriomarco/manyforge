@@ -415,7 +415,8 @@ if(BUILD_TESTING)
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(
     manyforge_generate_headless_alarm_registry_test_package PRIVATE
-    manyforge::deployment)
+    manyforge::deployment
+    manyforge_deployment_canonical_package_generator)
 
   set(
     MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_FIXTURE_ROOT

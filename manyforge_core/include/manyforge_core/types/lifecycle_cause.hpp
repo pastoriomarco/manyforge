@@ -12,9 +12,11 @@ namespace manyforge::core {
 /// Adapters report the class as the token value of the standard lifecycle fact
 /// `kLifecycleBlockingCauseFactId`. A class the adapter cannot establish from
 /// fresh controller status is `kUnknown`, which is never recovered
-/// automatically. Only `kAvailability` (startup before the component first
-/// reaches its target) proceeds without a person; every other class is an
-/// incident that needs the operator's Recover (maintainer, 2026-10-08).
+/// automatically. `kAvailability` means status or feedback is unreachable or
+/// stale before the component first reaches its target; fresh status that is
+/// simply not ready yet is `kNone`. Every other class requires intervention:
+/// CCLC retains it until the operator's Recover, and after the component
+/// first reached its target it is also an incident (maintainer, 2026-10-08).
 enum class LifecycleBlockingCauseClassDTO : std::uint8_t {
   kNone = 0,
   kAvailability,

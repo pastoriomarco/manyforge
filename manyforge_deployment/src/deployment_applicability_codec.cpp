@@ -2141,7 +2141,7 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
         parse_ordered_enum_set(require_member(policy, "affected_phases", path),
                                child_path(path, "affected_phases"),
                                {"planning", "validating", "dispatching",
-                                "executing", "paused", "stopping",
+                                "executing", "stopping",
                                 "intervention_required"},
                                parsed.affected_phases, true));
     parsed.preemption_action =

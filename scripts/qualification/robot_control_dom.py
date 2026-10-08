@@ -206,28 +206,24 @@ def run(endpoint: str, base_url: str) -> dict:
         wait("h.snapshot().operation?.operationId === 'A'")
         assert js("!h.snapshot().ghost && !h.snapshot().ghostStale")
         assert js("!document.querySelector('.robot-control-preview').textContent.includes('TCP predicted')")
-        js("h.command('pause'), true")
-        wait("h.snapshot().controlPending === 'pause'")
         js("h.command('stop'), true")
         wait("h.snapshot().controlPending === 'stop'")
-        js("h.finish(0, true), true")
-        wait("h.snapshot().controlPending === 'stop' && h.snapshot().error === null")
         js("h.operation('B'), true")
         wait("h.snapshot().operation?.operationId === 'B' && h.snapshot().controlPending === null")
-        js("h.finish(1, true), true")
+        js("h.finish(0, true), true")
         wait("h.snapshot().error === null")
-        passed.append('Stop overtakes Pause; delayed replies cannot affect a successor operation')
+        passed.append('a delayed Stop reply cannot affect a successor operation')
 
         js("h.command('fullStop'), h.command('fullStop'), true")
         wait("h.snapshot().fullStopPending")
-        assert js("h.snapshot().commands.length") == 3
+        assert js("h.snapshot().commands.length") == 2
         js("h.replaceOwner(), true")
         wait("!h.snapshot().fullStopPending && h.snapshot().operation === null")
         js("h.command('fullStop'), true")
-        wait("h.snapshot().commands.length === 4 && h.snapshot().fullStopPending")
-        js("h.finish(2, true), true")
+        wait("h.snapshot().commands.length === 3 && h.snapshot().fullStopPending")
+        js("h.finish(1, true), true")
         wait("h.snapshot().fullStopPending && h.snapshot().fullStopError === null")
-        js("h.finish(3), true")
+        js("h.finish(2), true")
         wait("!h.snapshot().fullStopPending")
         passed.append('Full Stop is single-flight per owner, independent of old-owner replies')
 
@@ -236,7 +232,7 @@ def run(endpoint: str, base_url: str) -> dict:
         js("h.revert(), true")
         wait("h.snapshot().operation?.resident && h.snapshot().error === 'retained owner fault'")
         assert js("document.querySelector('input[type=range]').disabled")
-        assert js("h.snapshot().commands.length") == 4
+        assert js("h.snapshot().commands.length") == 3
         assert js("document.querySelector('[data-testid=robot-control-candidate-footer] button').textContent === 'Reset operation'")
         passed.append('local Revert preserves resident fault; the pinned footer exposes explicit Reset instead of irrelevant preview actions')
 

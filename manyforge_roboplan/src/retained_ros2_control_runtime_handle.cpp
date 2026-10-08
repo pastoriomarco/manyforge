@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -77,39 +78,81 @@ only_reasons(const std::vector<std::string> &reasons,
 
 // Classifies one fresh controller-manager binding snapshot. ros2_control
 // reports no emergency/protective/safeguard stop status, so those classes are
-// never claimed here. A deactivated hardware component may be a hardware error
-// as well as a deliberate deactivation, so it stays `unknown`.
+// never claimed here.
+//
+// A starting controller is never a fault merely because it is not ready yet.
+// A trajectory controller that is missing or not yet active has claimed no
+// command interfaces, and inactive hardware exports no available interfaces,
+// so those interface reasons follow from the inactive owner. Only interfaces
+// that are unavailable although their owner is active are a `fault`, and a
+// type, claim or duplication mismatch is `configuration`, during startup as at
+// any other time. Status the controller manager could not deliver (services or
+// monitor unavailable, activity not yet observed) is `availability`.
+//
+// Before the exact configuration was first active (`startup`), fresh status
+// that is simply not ready is `none`: the plans' readiness facts keep the
+// component waiting. Afterwards a missing or inactive controller stays
+// `availability` (CCLC reports it as `provider_lost` at the reached target),
+// and deactivated hardware may be a hardware error as well as a deliberate
+// deactivation, so it is `unknown`.
 [[nodiscard]] core::LifecycleBlockingCauseClassDTO motion_binding_cause(
-    const ros2_control_execution::ControllerBindingSnapshot &snapshot) {
+    const ros2_control_execution::ControllerBindingSnapshot &snapshot,
+    const bool startup) {
   using Cause = core::LifecycleBlockingCauseClassDTO;
   const auto &reasons = snapshot.reason_codes;
   if (snapshot.valid && reasons.empty()) {
     return Cause::kNone;
   }
-  if (any_reason(reasons, {"hardware_command_interfaces_unavailable",
-                           "hardware_state_interfaces_unavailable"})) {
+  if ((snapshot.controller_active && snapshot.hardware_active &&
+       any_reason(reasons, {"hardware_command_interfaces_unavailable"})) ||
+      (snapshot.hardware_active &&
+       any_reason(reasons, {"hardware_state_interfaces_unavailable"}))) {
     return Cause::kFault;
   }
   if (any_reason(reasons, {"trajectory_controller_duplicated",
                            "trajectory_controller_type_mismatch",
-                           "trajectory_controller_claims_mismatch",
                            "trajectory_controller_claim_conflict",
-                           "hardware_component_duplicated"})) {
+                           "hardware_component_duplicated"}) ||
+      (snapshot.controller_active &&
+       any_reason(reasons, {"trajectory_controller_claims_mismatch"}))) {
     return Cause::kConfiguration;
   }
-  if (only_reasons(reasons, {"controller_activity_changed",
-                             "controller_activity_unobserved",
-                             "controller_binding_monitor_unavailable",
-                             "controller_list_service_unavailable",
-                             "controller_list_service_timeout",
-                             "hardware_list_service_unavailable",
-                             "hardware_list_service_timeout",
-                             "trajectory_controller_missing",
-                             "trajectory_controller_inactive",
-                             "hardware_component_missing"})) {
+  if (reasons.empty()) {
+    return Cause::kUnknown;
+  }
+  static constexpr std::string_view kStatusUnavailable[] = {
+      "controller_activity_changed",        "controller_activity_unobserved",
+      "controller_binding_monitor_unavailable",
+      "controller_list_service_unavailable", "controller_list_service_timeout",
+      "hardware_list_service_unavailable",   "hardware_list_service_timeout"};
+  static constexpr std::string_view kNotReady[] = {
+      "trajectory_controller_missing",
+      "trajectory_controller_inactive",
+      "hardware_component_missing",
+      // Explained by the inactive owner (checked above).
+      "trajectory_controller_claims_mismatch",
+      "hardware_command_interfaces_unavailable",
+      "hardware_state_interfaces_unavailable"};
+  bool status_unavailable = false;
+  bool hardware_inactive = false;
+  for (const auto &reason : reasons) {
+    if (std::find(std::begin(kStatusUnavailable), std::end(kStatusUnavailable),
+                  reason) != std::end(kStatusUnavailable)) {
+      status_unavailable = true;
+    } else if (reason == "hardware_component_inactive") {
+      hardware_inactive = true;
+    } else if (std::find(std::begin(kNotReady), std::end(kNotReady), reason) ==
+               std::end(kNotReady)) {
+      return Cause::kUnknown;
+    }
+  }
+  if (status_unavailable) {
     return Cause::kAvailability;
   }
-  return Cause::kUnknown;
+  if (startup) {
+    return Cause::kNone;
+  }
+  return hardware_inactive ? Cause::kUnknown : Cause::kAvailability;
 }
 
 [[nodiscard]] core::LifecycleBlockingCauseClassDTO gripper_transport_cause(
@@ -136,21 +179,6 @@ only_reasons(const std::vector<std::string> &reasons,
     return Cause::kAvailability;
   }
   return Cause::kUnknown;
-}
-
-[[nodiscard]] bool binding_fault(
-    const ros2_control_execution::ControllerBindingSnapshot &snapshot) {
-  return std::any_of(
-      snapshot.reason_codes.begin(), snapshot.reason_codes.end(),
-      [](const std::string &reason) {
-        return reason == "trajectory_controller_duplicated" ||
-               reason == "trajectory_controller_type_mismatch" ||
-               reason == "trajectory_controller_claims_mismatch" ||
-               reason == "trajectory_controller_claim_conflict" ||
-               reason == "hardware_component_duplicated" ||
-               reason == "hardware_command_interfaces_unavailable" ||
-               reason == "hardware_state_interfaces_unavailable";
-      });
 }
 
 [[nodiscard]] std::string binding_signature(
@@ -283,12 +311,18 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
   std::optional<core::ControlDomainId> motion_domain;
   std::optional<core::ControlDomainId> gripper_domain;
   std::optional<std::string> gripper_id;
+  // Startup: the exact configuration has not yet been active for this domain.
+  bool startup = true;
   {
     std::lock_guard lock(mutex_);
     backend = backend_.lock();
     motion_domain = motion_domain_id_;
     gripper_domain = gripper_domain_id_;
     gripper_id = gripper_id_;
+    if (const auto found = domain_generations_.find(control_domain_id);
+        found != domain_generations_.end()) {
+      startup = !found->second.exact_configuration_seen;
+    }
   }
   if (!backend || now_ns < 0 || control_domain_id.empty() ||
       (!motion_domain.has_value() && !gripper_domain.has_value())) {
@@ -316,10 +350,15 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
                          now_ns < snapshot->fresh_until_ns;
       transport_ready = fresh;
       exact_configuration_ready = fresh && snapshot->valid;
-      fault_present = fresh && binding_fault(*snapshot);
       if (fresh) {
-        observed_cause = motion_binding_cause(*snapshot);
+        observed_cause = motion_binding_cause(*snapshot, startup);
         controller_inactive = !snapshot->controller_active;
+        // Only an actual fault or mismatch is a fault fact; missing
+        // readiness during startup is not.
+        fault_present =
+            observed_cause == core::LifecycleBlockingCauseClassDTO::kFault ||
+            observed_cause ==
+                core::LifecycleBlockingCauseClassDTO::kConfiguration;
       }
       if (exact_configuration_ready) {
         state = core::ComponentLifecycleStateDTO::kActive;

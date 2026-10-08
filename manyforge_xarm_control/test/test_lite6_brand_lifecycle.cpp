@@ -18,10 +18,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -95,6 +98,67 @@ public:
   std::vector<std::uint64_t> expected_generations;
   std::vector<std::int64_t> remaining_durations;
   std::vector<bool> cancellations;
+};
+
+// The second call captures its report, then waits for explicit release.
+// Overlapping transport reads are recorded; barriers require no sleeps.
+class StagedSupervisedSession final : public ILite6BrandLifecycleTransport {
+public:
+  explicit StagedSupervisedSession(std::vector<XArmObservedState> reports)
+      : reports_(std::move(reports)) {}
+
+  [[nodiscard]] XArmObservedState observe(std::int64_t now_ns) const override {
+    XArmObservedState result;
+    std::size_t call;
+    {
+      std::lock_guard lock(mutex_);
+      call = observe_calls_++;
+      result = reports_.at(call);
+      ++active_observe_calls_;
+      concurrent_observe_detected_ = concurrent_observe_detected_ ||
+                                     active_observe_calls_ > 1U;
+    }
+    result.source_timestamp_ns = now_ns - 3;
+    result.transport_owner_received_timestamp_ns = now_ns - 2;
+    result.fresh_until_ns = now_ns + 1'000'000'000;
+    if (call == 1U) {
+      captured_.count_down();
+      release_.wait();
+    }
+    {
+      std::lock_guard lock(mutex_);
+      --active_observe_calls_;
+    }
+    return result;
+  }
+
+  XArmLifecycleCommandResult execute(XArmLifecycleCommand, std::string_view,
+                                     std::uint64_t expected_generation,
+                                     std::int64_t, std::stop_token) override {
+    return {XArmLifecycleResultState::kResponseReceived,
+            true,
+            true,
+            0,
+            "accepted",
+            expected_generation,
+            false};
+  }
+
+  void wait_until_captured() const { captured_.wait(); }
+  void release() const { release_.count_down(); }
+  [[nodiscard]] bool concurrent_observe_detected() const {
+    std::lock_guard lock(mutex_);
+    return concurrent_observe_detected_;
+  }
+
+private:
+  std::vector<XArmObservedState> reports_;
+  mutable std::mutex mutex_;
+  mutable std::size_t observe_calls_ = 0U;
+  mutable std::size_t active_observe_calls_ = 0U;
+  mutable bool concurrent_observe_detected_ = false;
+  mutable std::latch captured_{1};
+  mutable std::latch release_{1};
 };
 
 [[nodiscard]] Lite6BrandLifecyclePortConfig port_config() {
@@ -770,6 +834,222 @@ TEST(XArmBrandLifecyclePort, RefusesErrorClearingBeforeServoFaultPowerCycle) {
   EXPECT_EQ(cleared.known_result,
             core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
   ASSERT_EQ(fake->commands.size(), 1U);
+}
+
+TEST(XArmBrandLifecyclePort,
+     ConcurrentReadsPreserveOwnModeChangeAndAllowDispatchDuringCapture) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto baseline = disabled_observation();
+  baseline.mode = 0;
+  auto older = baseline;
+  ++older.generation;
+  ++older.transport_owner_progress_sequence;
+  auto newer = older;
+  ++newer.generation;
+  ++newer.transport_owner_progress_sequence;
+  newer.mode = 1;
+  newer.state = 5;
+  auto next = newer;
+  ++next.generation;
+  ++next.transport_owner_progress_sequence;
+  auto transport = std::make_unique<StagedSupervisedSession>(
+      std::vector{baseline, older, newer, next});
+  auto *fake = transport.get();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+
+  std::optional<core::Result<core::BrandLifecycleObservationDTO>> delayed;
+  std::jthread observer([&] { delayed = port.Observe(observation_query()); });
+  fake->wait_until_captured();
+  std::latch concurrent_started{1};
+  std::optional<core::Result<core::BrandLifecycleObservationDTO>> latest;
+  std::jthread concurrent_observer([&] {
+    concurrent_started.count_down();
+    latest = port.Observe(observation_query());
+  });
+  concurrent_started.wait();
+  // Dispatch must complete while the observation cache copy is held. The
+  // separate classification lock remains available to this own primitive.
+  const auto stopped = dispatch(port, kXArmSetStoppedStatePrimitiveId);
+  const auto requested = dispatch(port, kXArmSelectJointServoModePrimitiveId);
+  fake->release();
+  observer.join();
+  concurrent_observer.join();
+
+  ASSERT_EQ(stopped.known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(requested.known_result,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(latest.has_value());
+  ASSERT_TRUE(latest->ok()) << latest->error().message;
+  EXPECT_EQ(cause_class(latest->value()), "none");
+  ASSERT_TRUE(delayed.has_value());
+  ASSERT_TRUE(delayed->ok()) << delayed->error().message;
+  EXPECT_EQ(cause_class(delayed->value()), "none");
+  EXPECT_FALSE(fake->concurrent_observe_detected());
+  const auto following = port.Observe(observation_query());
+  ASSERT_TRUE(following.ok()) << following.error().message;
+  EXPECT_EQ(cause_class(following.value()), "none");
+}
+
+TEST(XArmBrandLifecyclePort,
+     ConcurrentReadsPreserveFaultAndPowerCycleRequirement) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto baseline = disabled_observation();
+  auto older = baseline;
+  ++older.generation;
+  ++older.transport_owner_progress_sequence;
+  auto fault = older;
+  ++fault.generation;
+  ++fault.transport_owner_progress_sequence;
+  fault.error_code = 14;
+  fault.fault_present = FactState::kTrue;
+  fault.recovery_required = FactState::kTrue;
+  auto unavailable = fault;
+  ++unavailable.generation;
+  ++unavailable.transport_owner_progress_sequence;
+  unavailable.blocking_reason_codes = {"xarm_report_unavailable"};
+  unavailable.error_code = -1;
+  unavailable.mode = -1;
+  unavailable.state = -1;
+  unavailable.motion_enabled = FactState::kUnknown;
+  unavailable.fault_present = FactState::kUnknown;
+  unavailable.recovery_required = FactState::kUnknown;
+  unavailable.vendor_control_ready = FactState::kUnknown;
+  auto transport = std::make_unique<StagedSupervisedSession>(
+      std::vector{baseline, older, fault, unavailable});
+  auto *fake = transport.get();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+
+  std::optional<core::Result<core::BrandLifecycleObservationDTO>> delayed;
+  std::jthread observer([&] { delayed = port.Observe(observation_query()); });
+  fake->wait_until_captured();
+  std::latch concurrent_started{1};
+  std::optional<core::Result<core::BrandLifecycleObservationDTO>> latest;
+  std::jthread concurrent_observer([&] {
+    concurrent_started.count_down();
+    latest = port.Observe(observation_query());
+  });
+  concurrent_started.wait();
+  fake->release();
+  observer.join();
+  concurrent_observer.join();
+
+  ASSERT_TRUE(latest.has_value());
+  ASSERT_TRUE(latest->ok()) << latest->error().message;
+  EXPECT_EQ(cause_class(latest->value()), "fault");
+  ASSERT_TRUE(delayed.has_value());
+  ASSERT_TRUE(delayed->ok()) << delayed->error().message;
+  EXPECT_EQ(cause_class(delayed->value()), "none");
+  EXPECT_FALSE(fake->concurrent_observe_detected());
+  const auto following = port.Observe(observation_query());
+  ASSERT_TRUE(following.ok()) << following.error().message;
+  EXPECT_EQ(cause_class(following.value()), "fault");
+  const auto refused = dispatch(port, kXArmClearErrorPrimitiveId);
+  EXPECT_EQ(refused.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->details.at("reason"), "power_cycle_required");
+}
+
+TEST(XArmBrandLifecyclePort,
+     RejectsRegressedOwnerPublicationWithoutRejectingSemanticRefreshes) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+  // Re-reading the same publication and a newer heartbeat are both valid;
+  // neither requires a new semantic generation.
+  clock.advance(100);
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+  ++fake->observation.transport_owner_progress_sequence;
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+  --fake->observation.transport_owner_progress_sequence;
+  const auto regressed = port.Observe(observation_query());
+  ASSERT_FALSE(regressed.ok());
+  EXPECT_EQ(regressed.error().details.at("reason"),
+            "owner_publication_sequence_regressed");
+  ++fake->observation.transport_owner_progress_sequence;
+  // An invalid future-epoch sample must not advance either watermark.
+  const auto valid = fake->observation;
+  fake->observation.transport_owner_component_epoch = "unselected.owner";
+  ++fake->observation.generation;
+  ++fake->observation.transport_owner_progress_sequence;
+  EXPECT_FALSE(port.Observe(observation_query()).ok());
+  fake->observation = valid;
+  EXPECT_TRUE(port.Observe(observation_query()).ok());
+}
+
+TEST(XArmBrandLifecyclePort,
+     RegressedSourceCannotClearVendorFaultHistory) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  auto fault = disabled_observation();
+  ++fault.generation;
+  fault.error_code = 14;
+  fault.fault_present = FactState::kTrue;
+  fault.recovery_required = FactState::kTrue;
+  fake->observation = fault;
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+
+  fake->observation = disabled_observation();
+  ++fake->observation.transport_owner_progress_sequence;
+  const auto regressed = port.Observe(observation_query());
+  EXPECT_FALSE(regressed.ok());
+  if (!regressed.ok()) {
+    EXPECT_EQ(regressed.error().details.at("reason"),
+              "observation_generation_regressed");
+  }
+
+  fake->observation.generation = fault.generation + 1U;
+  ++fake->observation.transport_owner_progress_sequence;
+  fake->observation.blocking_reason_codes = {"xarm_report_unavailable"};
+  fake->observation.error_code = -1;
+  fake->observation.fault_present = FactState::kUnknown;
+  fake->observation.recovery_required = FactState::kUnknown;
+  const auto unavailable = port.Observe(observation_query());
+  ASSERT_TRUE(unavailable.ok()) << unavailable.error().message;
+  EXPECT_EQ(cause_class(unavailable.value()), "fault");
+  const auto refused = dispatch(port, kXArmClearErrorPrimitiveId);
+  EXPECT_EQ(refused.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_TRUE(fake->commands.empty());
+}
+
+TEST(XArmBrandLifecyclePort,
+     InitialReportAvailabilityDoesNotMaskGenuineStartupFaults) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  fake->observation.blocking_reason_codes = {"xarm_report_unavailable"};
+  fake->observation.motion_enabled = FactState::kUnknown;
+  fake->observation.fault_present = FactState::kUnknown;
+  fake->observation.recovery_required = FactState::kUnknown;
+  fake->observation.vendor_control_ready = FactState::kUnknown;
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  auto initial = port.Observe(observation_query());
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  EXPECT_EQ(cause_class(initial.value()), "availability");
+
+  fake->observation = disabled_observation();
+  fake->observation.generation = initial.value().observation_generation + 1U;
+  fake->observation.error_code = 22;
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  auto fault = port.Observe(observation_query());
+  ASSERT_TRUE(fault.ok()) << fault.error().message;
+  EXPECT_EQ(cause_class(fault.value()), "fault");
 }
 
 TEST(XArmBrandLifecyclePort, OwnPrimitiveEffectsAreNeverExternalControl) {

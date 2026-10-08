@@ -608,7 +608,8 @@ if(BUILD_TESTING)
     add_executable(test_sqlite_cclc_journal
       test/test_sqlite_cclc_journal.cpp)
     target_link_libraries(test_sqlite_cclc_journal PRIVATE
-      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+      manyforge_core_sqlite_cclc_journal manyforge::content_identity
+      GTest::gtest_main)
     gtest_discover_tests(test_sqlite_cclc_journal
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

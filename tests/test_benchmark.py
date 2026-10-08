@@ -54,13 +54,11 @@ class _Transport:
     def read(self, operation_id):
         return {"ok": True, "operation": {"operation_id": operation_id}}
 
-    def pause(self, operation_id, body):
+    def reset(self, operation_id, body):
         return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
 
-    resume = pause
-    reset = pause
-    acknowledge_completed = pause
-    set_runtime_scale = pause
+    acknowledge_completed = reset
+    set_runtime_scale = reset
 
     def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]

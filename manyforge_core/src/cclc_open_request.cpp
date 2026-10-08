@@ -717,7 +717,7 @@ template <typename StrongCounter>
         "incident_recovery",
         CanonicalValue(CanonicalValue::Object{
             {"acknowledged_at_ns",
-             safe_unsigned(static_cast<std::uint64_t>(recovery.acknowledged_at_ns))},
+             content_identity::nonnegative_int64_value(recovery.acknowledged_at_ns)},
             {"acknowledged_by", CanonicalValue(recovery.acknowledged_by)},
             {"cause_class", CanonicalValue(std::string(to_string(recovery.cause_class)))},
             {"controllable_component_id",
@@ -799,7 +799,8 @@ template <typename StrongCounter>
 }
 
 // Contract item 2 (addendum 2): the open incident, null when none. Times are
-// owner-clock nanoseconds and must stay I-JSON safe integers.
+// full-width nonnegative owner-clock nanoseconds (spec 210 §1.1): a JSON
+// number up to 2^53-1, a canonical decimal string above.
 [[nodiscard]] CanonicalValue lifecycle_incident_value(
     const std::optional<ComponentLifecycleIncidentDTO>& value) {
   if (!value) return CanonicalValue(nullptr);
@@ -812,7 +813,7 @@ template <typename StrongCounter>
   return CanonicalValue(CanonicalValue::Object{
       {"acknowledged", CanonicalValue(false)},
       {"cause_class", CanonicalValue(std::string(to_string(value->cause_class)))},
-      {"detected_at_ns", safe_unsigned(static_cast<std::uint64_t>(value->detected_at_ns))},
+      {"detected_at_ns", content_identity::nonnegative_int64_value(value->detected_at_ns)},
       {"incident_id", CanonicalValue(value->incident_id)},
       {"summary", CanonicalValue(value->summary)},
       {"vendor_codes", CanonicalValue(std::move(codes))}});
@@ -838,7 +839,7 @@ template <typename StrongCounter>
       {"phase", CanonicalValue(std::string(to_string(value->phase)))},
       {"waiting_since_ns",
        value->waiting_since_ns
-           ? safe_unsigned(static_cast<std::uint64_t>(*value->waiting_since_ns))
+           ? content_identity::nonnegative_int64_value(*value->waiting_since_ns)
            : CanonicalValue(nullptr)}});
 }
 
@@ -1015,8 +1016,10 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
     const ComponentLifecycleIntentDTO& intent) {
   // The operator's Recover of an open incident is authorization-only: it is
   // recorded without a CCLC transaction, so a latched cell does not refuse it.
-  // Every other request (and a Recover without an open incident) goes through
-  // ordinary CCLC admission unchanged.
+  // It joins the ordinary request membership, so its exact replay, a
+  // conflicting reuse of its request id and a stale owner epoch are decided
+  // below by ordinary CCLC admission like any other request. Every other
+  // request (and a Recover without an open incident) is admitted unchanged.
   if (target_driver_ != nullptr) {
     auto recovered = target_driver_->RecoverIncident(intent);
     if (!recovered.ok()) return Result<CCLCLifecycleRequestResultDTO>::Err(recovered.error());
@@ -1025,12 +1028,12 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
     }
   }
   auto result = coordinator_.SubmitLifecycle(intent);
-  // An open (operator) Prepare/Enable/Disable sets the requested target only
-  // once CCLC accepted it as new; a rejection or replay records nothing.
+  // The journal records an operator Prepare/Enable/Disable target in the
+  // same commit as the acceptance; the driver only needs to look again.
   if (target_driver_ != nullptr && result.ok() &&
       result.value().replay_status == RequestReplayStatusDTO::kAcceptedNew &&
-      result.value().acceptance.has_value() && !result.value().rejection.has_value()) {
-    static_cast<void>(target_driver_->RecordOperatorRequest(intent));
+      result.value().acceptance.has_value()) {
+    target_driver_->Wake();
   }
   return result;
 }
@@ -1038,10 +1041,7 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
 Result<std::optional<CCLCLifecycleRequestResultDTO>>
 ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleRequestResult(
     const ComponentLifecycleIntentDTO& intent) {
-  if (target_driver_ != nullptr) {
-    auto recovered = target_driver_->ReadIncidentRecovery(intent);
-    if (!recovered.ok() || recovered.value()) return recovered;
-  }
+  // An incident Recover's result is retained in the ordinary request ledger.
   return coordinator_.ReadLifecycleRequestResult(intent);
 }
 
@@ -1150,12 +1150,16 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
       CanonicalValue::Array events;
       auto through = static_cast<std::uint64_t>(after);
       for (const auto& event : result.value()) {
+        // Owner-side shape: a negative time is an owner failure, not a
+        // caller error, and is never clamped.
+        if (event.occurred_at_ns < 0) {
+          throw std::invalid_argument("incident event is outside its closed shape");
+        }
         events.emplace_back(CanonicalValue::Object{
             {"event_kind", CanonicalValue(event.event_kind)},
             {"event_sequence", safe_unsigned(event.sequence)},
             {"incident_id", CanonicalValue(event.incident_id)},
-            {"occurred_at_ns", safe_unsigned(static_cast<std::uint64_t>(
-                                   std::max<std::int64_t>(0, event.occurred_at_ns)))},
+            {"occurred_at_ns", content_identity::nonnegative_int64_value(event.occurred_at_ns)},
             {"payload", content_identity::parse_canonical_json(event.payload_json)}});
         through = std::max(through, event.sequence);
       }

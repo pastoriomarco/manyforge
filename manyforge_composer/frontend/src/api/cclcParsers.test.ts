@@ -378,4 +378,82 @@ describe('CCLC closed response parsers', () => {
       acceptance: null, incident_recovery: extra, replay_status: 'accepted_new', status: null,
     }, 'lifecycle')).toThrow('closed fields');
   });
+
+  it('keeps full-width owner nanoseconds exact and refuses noncanonical spellings', () => {
+    // Owner clocks exceed 2^53 ns after ~104 days: larger values arrive as
+    // canonical decimal text and must stay text, never a rounded number.
+    const aboveSafe = '9007199254740993';
+    const maxInt64 = '9223372036854775807';
+    const incident = {
+      acknowledged: false,
+      cause_class: 'fault',
+      detected_at_ns: aboveSafe,
+      incident_id: 'incident.arm.2',
+      summary: 'Controller fault',
+      vendor_codes: [],
+    };
+    const snapshot = componentSnapshot();
+    Object.assign(snapshot.lifecycle_progress as Record<string, unknown>, {
+      blocking_cause_class: 'fault',
+      phase: 'blocked',
+      incident,
+      waiting_since_ns: maxInt64,
+    });
+    const progress = parseCCLCComponentSnapshot(snapshot).lifecycleProgress;
+    expect(progress?.waitingSinceNs).toBe(maxInt64);
+    expect(progress?.incident?.detectedAtNs).toBe(aboveSafe);
+
+    for (const [waiting, detected] of [
+      [Number.MAX_SAFE_INTEGER, 0], ['1000', '0'],
+    ] as const) {
+      const safe = componentSnapshot();
+      Object.assign(safe.lifecycle_progress as Record<string, unknown>, {
+        blocking_cause_class: 'fault',
+        phase: 'blocked',
+        incident: { ...incident, detected_at_ns: detected },
+        waiting_since_ns: waiting,
+      });
+      const parsed = parseCCLCComponentSnapshot(safe).lifecycleProgress;
+      expect(parsed?.waitingSinceNs).toBe(waiting);
+      expect(parsed?.incident?.detectedAtNs).toBe(detected);
+    }
+
+    const recovery = {
+      acknowledged_at_ns: aboveSafe,
+      acknowledged_by: 'manyforge_composer',
+      cause_class: 'fault',
+      controllable_component_id: 'component.arm',
+      incident_id: 'incident.arm.2',
+    };
+    expect(parseCCLCAdmission({
+      acceptance: null, incident_recovery: recovery, replay_status: 'accepted_new', status: null,
+    }, 'lifecycle').incidentRecovery?.acknowledgedAtNs).toBe(aboveSafe);
+
+    const acceptance = { ...lifecycleAcceptance(), accepted_at_ns: maxInt64 };
+    expect(parseCCLCAdmission({
+      acceptance, replay_status: 'accepted_new', status: null,
+    }, 'lifecycle').transactionId).toBe('lifecycle.2');
+
+    for (const invalid of [
+      -1, Number.MAX_SAFE_INTEGER + 1, 1.5, true, '', '01', '-1', '+1', '1e3', ' 1',
+      '9223372036854775808',
+    ]) {
+      const waiting = componentSnapshot();
+      (waiting.lifecycle_progress as Record<string, unknown>).waiting_since_ns = invalid;
+      expect(() => parseCCLCComponentSnapshot(waiting)).toThrow('nanoseconds');
+      const detected = componentSnapshot();
+      Object.assign(detected.lifecycle_progress as Record<string, unknown>, {
+        blocking_cause_class: 'fault',
+        phase: 'blocked',
+        incident: { ...incident, detected_at_ns: invalid },
+      });
+      expect(() => parseCCLCComponentSnapshot(detected)).toThrow('nanoseconds');
+      expect(() => parseCCLCAdmission({
+        acceptance: null,
+        incident_recovery: { ...recovery, acknowledged_at_ns: invalid },
+        replay_status: 'accepted_new',
+        status: null,
+      }, 'lifecycle')).toThrow('nanoseconds');
+    }
+  });
 });

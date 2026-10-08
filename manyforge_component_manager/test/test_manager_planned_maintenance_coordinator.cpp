@@ -383,10 +383,9 @@ TEST(ManagerPlannedMaintenanceCoordinator,
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
-     PausedStoppingAndResettingAreEachRefusedByName) {
+     NonIdleStatesAreEachRefusedByName) {
   const std::map<ManagementIdleState, std::string> expected{
       {ManagementIdleState::kStarting, "apply_refused_starting_execution"},
-      {ManagementIdleState::kPaused, "apply_refused_paused_execution"},
       {ManagementIdleState::kStopping, "apply_refused_stopping_execution"},
       {ManagementIdleState::kTerminalAwaitingReset,
        "apply_refused_terminal_awaiting_reset"},
@@ -623,7 +622,7 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   EXPECT_FALSE(succeeded.valid());
 
   EXPECT_EQ(std::string(ToString(ManagementIdleState::kIdle)), "idle");
-  EXPECT_EQ(std::string(ToString(ManagementIdleState::kPaused)), "paused");
+  EXPECT_EQ(std::string(ToString(ManagementIdleState::kStopping)), "stopping");
   EXPECT_EQ(std::string(ToString(ManagementIdleState::kResetting)),
             "resetting");
 }

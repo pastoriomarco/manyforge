@@ -2378,9 +2378,17 @@ class ExecutionEventPump:
         Spec 530 §3.3 (2026-10-08): the C++ adapter derives the safety-stop
         condition and submits only changed ones. This
         bounded read runs at most once per period and only while the active
-        configuration names components. CCLC being unreachable keeps every
-        raised condition at unknown quality; a component whose snapshot is
-        unavailable keeps its conditions unchanged.
+        configuration names components or the lifecycle source is registered.
+        A configuration without controlled components has no CCLC owner (an
+        Apply to it removes the CCLC service), so its empty scope is observed
+        by the core alone, fenced to that configuration: the removed
+        components' conditions return to normal and the source quality is
+        reconciled without contacting CCLC. With components in scope, CCLC
+        being unreachable keeps every raised condition at unknown quality; a
+        component whose snapshot is unavailable keeps its conditions
+        unchanged. The core judges each observation against the configuration
+        Manager publishes at that moment and fences each snapshot to its
+        retained bundle and graph revision.
 
         Unknown quality leaves the whole Alarm Lifecycle Owner unreconciled,
         which blocks motion admission. An Apply that replaces the CCLC owner
@@ -2400,17 +2408,41 @@ class ExecutionEventPump:
         try:
             scope = self._core.component_lifecycle_condition_scope()
             component_ids = scope.get("component_ids")
-            if not isinstance(component_ids, list) or not all(
-                isinstance(value, str) and value for value in component_ids
+            source_registered = scope.get("source_registered")
+            retained_bundle_id = scope.get("retained_bundle_id")
+            graph_revision = scope.get("graph_revision")
+            if (
+                not isinstance(component_ids, list)
+                or not all(isinstance(value, str) and value for value in component_ids)
+                or type(source_registered) is not bool
+                or (retained_bundle_id is None) != (graph_revision is None)
+                or not all(
+                    value is None or (isinstance(value, str) and value)
+                    for value in (retained_bundle_id, graph_revision)
+                )
             ):
                 raise HeadlessApiError(
                     "headless_component_lifecycle_invalid",
                     "component lifecycle condition scope is invalid",
                 )
-            if not component_ids:
+            if not component_ids and not source_registered:
                 self._next_component_condition_poll_at = (
                     now + self._component_condition_poll_seconds
                 )
+                return
+            if not component_ids:
+                # No controlled components: no CCLC owner to read. A scope read
+                # before any publication has nothing to fence to; retry.
+                if retained_bundle_id is None:
+                    return
+                result = self._core.observe_empty_component_lifecycle_configuration(
+                    retained_bundle_id=retained_bundle_id,
+                    graph_revision=graph_revision,
+                )
+                if result.get("status") in {"observed", "empty"}:
+                    self._next_component_condition_poll_at = (
+                        now + self._component_condition_poll_seconds
+                    )
                 return
             try:
                 identity = self._cclc.owner_identity()
@@ -2441,8 +2473,10 @@ class ExecutionEventPump:
                 unavailable_component_ids=unavailable,
             )
             # `scope_changed` (an Apply between the scope read and the
-            # observation) completed nothing; only an accepted observation
-            # waits the full period.
+            # observation, or a snapshot CCLC took under the superseded
+            # configuration) and `configuration_unavailable` (no fresh,
+            # verified Manager publication to judge against) completed
+            # nothing; only an accepted observation waits the full period.
             if result.get("status") in {"observed", "empty"}:
                 self._next_component_condition_poll_at = (
                     now + self._component_condition_poll_seconds

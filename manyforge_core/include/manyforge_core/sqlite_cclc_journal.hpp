@@ -14,7 +14,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 15;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 17;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -129,6 +129,12 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&, const ErrorDTO&,
       const std::optional<CellAdmissionClaimIntentDTO>&) override;
 
+  /// An accepted-new operator Prepare/Enable/Disable (any source label other
+  /// than `kLifecycleTargetSourceLabel`) of a component with a present target
+  /// also records its operator target in the same commit; a failure of
+  /// either leaves neither (ADR-0026 §7, spec 210). An accepted-new operator
+  /// Recover (no open incident) clears the component's retained
+  /// intervention-requiring causes in its acceptance commit (spec 220).
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayLifecycle(
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
@@ -250,29 +256,33 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<std::vector<ComponentLifecycleTargetDTO>> LoadLifecycleTargets() override;
   [[nodiscard]] Result<std::optional<ComponentLifecycleTargetDTO>> LoadLifecycleTarget(
       const ControllableComponentId& component) override;
+  [[nodiscard]] Result<ComponentLifecycleTargetFactsDTO> LoadLifecycleTargetFacts(
+      const ControllableComponentId& component) override;
   [[nodiscard]] Result<bool> RecordInterventionCause(
       const ControllableComponentId& component, const ControlDomainId& domain,
-      std::optional<LifecycleBlockingCauseClassDTO> cause_class,
-      std::int64_t observed_at_ns) override;
+      std::optional<LifecycleBlockingCauseClassDTO> cause_class, std::int64_t observed_at_ns,
+      std::uint64_t recovery_generation) override;
   [[nodiscard]] Result<std::vector<ComponentLifecycleInterventionCauseDTO>>
-  LoadInterventionCauses(const ControllableComponentId& component) override;
-  /// Component incidents and their bounded durable history events
-  /// (addendum 2, 2026-10-08); session-scoped like the targets.
+  LoadInterventionCauses(const ControllableComponentId& component);
   [[nodiscard]] Result<bool> RecordLifecycleTargetReached(
-      const ControllableComponentId& component, bool reached) override;
+      const ControllableComponentId& component, bool reached,
+      std::uint64_t recovery_generation) override;
+  /// True only for a component that an unadopted native Apply plan installs,
+  /// replaces or removes; a retained-unchanged component is false.
   [[nodiscard]] Result<bool> ComponentInUnadoptedApplyPlan(
       const ControllableComponentId& component) override;
+  /// Component incidents and their bounded durable history events
+  /// (addendum 2, 2026-10-08); session-scoped like the targets.
   [[nodiscard]] Result<ComponentIncidentRecordDTO> OpenComponentIncident(
-      const ComponentIncidentRecordDTO& record) override;
+      const ComponentIncidentRecordDTO& record, std::uint64_t recovery_generation) override;
   [[nodiscard]] Result<std::optional<ComponentIncidentRecordDTO>> LoadOpenComponentIncident(
       const ControllableComponentId& component) override;
   [[nodiscard]] Result<bool> RecordComponentIncidentContainment(
       const std::string& incident_id, ComponentIncidentContainmentStateDTO state,
       const std::string& record_json, std::int64_t occurred_at_ns) override;
-  [[nodiscard]] Result<bool> AcknowledgeComponentIncident(
-      const ComponentLifecycleIncidentDTO& acknowledged, const std::string& payload_json) override;
-  [[nodiscard]] Result<std::optional<ComponentIncidentRecoveryDTO>> LoadComponentIncidentRecovery(
-      const ControllableComponentId& component, const RequestId& request_id) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> RecoverComponentIncident(
+      const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
+      const std::string& acknowledged_by, std::int64_t acknowledged_at_ns) override;
   [[nodiscard]] Result<bool> UpdateOpenComponentIncident(
       const std::string& incident_id, LifecycleBlockingCauseClassDTO cause_class,
       const std::vector<std::string>& vendor_codes, const std::string& record_json) override;

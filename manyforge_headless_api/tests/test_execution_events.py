@@ -1976,15 +1976,31 @@ class _ComponentConditionCore(_RecordingCore):
     def __init__(self, component_ids: list[str]) -> None:
         super().__init__()
         self.component_ids = component_ids
+        self.source_registered = False
+        self.configuration: tuple[str, str] | None = ("bundle.1", "graph.1")
         self.observed: list[dict[str, Any]] = []
+        self.observed_empty: list[dict[str, Any]] = []
+        self.empty_status = "observed"
         self.marked_unknown = 0
 
     def component_lifecycle_condition_scope(self) -> dict[str, Any]:
-        return {"component_ids": list(self.component_ids)}
+        bundle, graph = self.configuration or (None, None)
+        return {
+            "component_ids": list(self.component_ids),
+            "graph_revision": graph,
+            "retained_bundle_id": bundle,
+            "source_registered": self.source_registered,
+        }
 
     def observe_component_lifecycle_conditions(self, **kwargs: Any) -> dict[str, Any]:
         self.observed.append(kwargs)
         return {"status": "observed"}
+
+    def observe_empty_component_lifecycle_configuration(
+        self, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.observed_empty.append(kwargs)
+        return {"status": self.empty_status}
 
     def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:
         self.marked_unknown += 1
@@ -2107,6 +2123,86 @@ def test_component_conditions_need_no_cclc_without_components() -> None:
     cclc = _FakeCCLC()
     _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
     _condition_pump(core, None)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert cclc.calls == []
+    assert core.observed == []
+    assert core.observed_empty == []
+    assert core.marked_unknown == 0
+
+
+def test_component_conditions_reconcile_a_scope_that_became_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: an Apply to a configuration without controlled components
+    # removes the CCLC service. Observing the empty scope through CCLC found
+    # the owner unavailable and marked the source unknown, so the removed
+    # components' conditions stayed active. The empty configuration is now
+    # observed by the core alone, fenced to its identity, without CCLC.
+    clock = [100.0]
+    monkeypatch.setattr(
+        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
+    )
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.snapshots = {"arm": _component_snapshot("arm", "emergency_stop")}
+    pump = _condition_pump(core, cclc)
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 1
+    core.source_registered = True
+
+    # Apply to the empty configuration: the CCLC owner is gone.
+    core.component_ids = []
+    core.configuration = ("bundle.empty", "graph.empty")
+    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
+    calls = list(cclc.calls)
+    clock[0] += 5.0
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.observed_empty == [
+        {"graph_revision": "graph.empty", "retained_bundle_id": "bundle.empty"}
+    ]
+    assert len(core.observed) == 1
+    assert core.marked_unknown == 0
+    assert cclc.calls == calls
+    assert not pump._component_conditions_failing  # noqa: SLF001
+    # An accepted observation waits the full period.
+    clock[0] += 0.2
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed_empty) == 1
+
+    # A configuration changed under the read (or no fresh publication)
+    # completed nothing: the read repeats at the pump cadence.
+    core.empty_status = "scope_changed"
+    clock[0] += 5.0
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    core.empty_status = "configuration_unavailable"
+    clock[0] += 0.11
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed_empty) == 3
+    assert core.marked_unknown == 0
+    assert cclc.calls == calls
+
+
+def test_registered_source_with_components_and_unreachable_cclc_stays_unknown() -> None:
+    # Only an empty configuration is observed without CCLC: with components in
+    # scope an unreachable owner keeps the conditions at unknown quality.
+    core = _ComponentConditionCore(["arm"])
+    core.source_registered = True
+    cclc = _FakeCCLC()
+    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert core.marked_unknown == 1
+    assert core.observed == []
+    assert core.observed_empty == []
+
+
+def test_component_condition_scope_without_registration_flag_is_refused() -> None:
+    core = _ComponentConditionCore([])
+    core.component_lifecycle_condition_scope = (  # type: ignore[method-assign]
+        lambda: {"component_ids": []}
+    )
+    cclc = _FakeCCLC()
+    pump = _condition_pump(core, cclc)
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert pump._component_conditions_failing  # noqa: SLF001
     assert cclc.calls == []
     assert core.observed == []
     assert core.marked_unknown == 0

@@ -649,6 +649,17 @@ public:
     });
   }
 
+  std::string
+  ObserveEmptyComponentLifecycleConfiguration(std::string retained_bundle_id,
+                                              std::string graph_revision) {
+    py::gil_scoped_release release;
+    return Invoke([this, retained_bundle_id = std::move(retained_bundle_id),
+                   graph_revision = std::move(graph_revision)]() mutable {
+      return core_->ObserveEmptyComponentLifecycleConfiguration(
+          std::move(retained_bundle_id), std::move(graph_revision));
+    });
+  }
+
   std::string MarkComponentLifecycleSourceUnknown() {
     py::gil_scoped_release release;
     return Invoke(
@@ -1182,6 +1193,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            &HeadlessApiBridge::ObserveComponentLifecycleConditions,
            py::arg("cclc_owner_epoch"), py::arg("snapshots_json"),
            py::arg("unavailable_component_ids"))
+      .def("observe_empty_component_lifecycle_configuration",
+           &HeadlessApiBridge::ObserveEmptyComponentLifecycleConfiguration,
+           py::arg("retained_bundle_id"), py::arg("graph_revision"))
       .def("mark_component_lifecycle_source_unknown",
            &HeadlessApiBridge::MarkComponentLifecycleSourceUnknown)
       .def("record_cclc_incident_event",

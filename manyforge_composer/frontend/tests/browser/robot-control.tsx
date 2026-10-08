@@ -226,7 +226,7 @@ const harness = {
     activeOperationId: null, activeOperationRevision: null, activeOperationScaleGeneration: null,
     effectiveScale: null, applicationState: null, reason: null,
   } }); },
-  command(kind: 'pause' | 'stop' | 'fullStop') { void controller[kind](); },
+  command(kind: 'stop' | 'fullStop') { void controller[kind](); },
   finish(index: number, reject = false) { if (reject) commands[index].reject(); else commands[index].resolve(); },
   retry() { controller.retry(); },
   revert() { controller.revert(); },

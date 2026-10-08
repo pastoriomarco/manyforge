@@ -17,6 +17,7 @@ from manyforge_headless_api.cclc import (
     CCLC_OPEN_RESPONSE_VERSION,
     CCLC_SOCKET_FILE,
     CCLCOpenRequestClient,
+    _validate_lifecycle_target_facts,
 )
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
@@ -301,6 +302,76 @@ def test_client_rejects_a_lifecycle_progress_with_a_missing_key(tmp_path: Path) 
     assert captured.value.code == "cclc_open_response_invalid"
 
 
+# Owner-clock times use the full-width nonnegative int64 contract: a JSON
+# number up to 2**53 - 1, canonical decimal text above (and accepted below).
+_ABOVE_SAFE_NS = "9007199254740993"
+_MAX_INT64_NS = "9223372036854775807"
+
+
+@pytest.mark.parametrize(
+    ("waiting_since_ns", "detected_at_ns"),
+    [
+        (_MAX_INT64_NS, _ABOVE_SAFE_NS),
+        (2**53 - 1, 0),
+        ("1000", "0"),
+    ],
+)
+def test_client_passes_full_width_progress_times_through_exactly(
+    tmp_path: Path, waiting_since_ns: int | str, detected_at_ns: int | str
+) -> None:
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["waiting_since_ns"] = waiting_since_ns
+    snapshot["lifecycle_progress"]["incident"]["detected_at_ns"] = detected_at_ns
+    forwarded = _snapshot_through_client(tmp_path, snapshot)
+    assert forwarded == snapshot
+    assert forwarded["lifecycle_progress"]["waiting_since_ns"] == waiting_since_ns
+    incident = forwarded["lifecycle_progress"]["incident"]
+    assert incident["detected_at_ns"] == detected_at_ns
+
+
+_NONCANONICAL_NS = [
+    -1,
+    True,
+    1.5,
+    "",
+    "01",
+    "-1",
+    "+1",
+    " 1",
+    "1e3",
+    "1.0",
+    "\u0661",
+    "9223372036854775808",
+    "18446744073709551616",
+]
+
+
+@pytest.mark.parametrize("invalid", _NONCANONICAL_NS)
+def test_client_rejects_noncanonical_progress_times(
+    tmp_path: Path, invalid: Any
+) -> None:
+    for place in ("waiting_since_ns", "detected_at_ns"):
+        snapshot = _incident_snapshot()
+        if place == "waiting_since_ns":
+            snapshot["lifecycle_progress"]["waiting_since_ns"] = invalid
+        else:
+            snapshot["lifecycle_progress"]["incident"]["detected_at_ns"] = invalid
+        with pytest.raises(HeadlessApiError, match="lifecycle_progress") as captured:
+            _snapshot_through_client(tmp_path, snapshot)
+        assert captured.value.code == "cclc_open_response_invalid"
+
+
+def test_progress_time_above_the_safe_range_must_be_decimal_text() -> None:
+    # A bare number above 2**53 - 1 is not the producer spelling and may
+    # already have been rounded by a JSON consumer.
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["waiting_since_ns"] = 2**53
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(snapshot)
+    snapshot["lifecycle_progress"]["waiting_since_ns"] = str(2**53)
+    _validate_lifecycle_target_facts(snapshot)
+
+
 def _lifecycle_request(*, confirmed: bool) -> dict[str, Any]:
     return {
         "request_context": {
@@ -570,6 +641,12 @@ def test_client_forwards_an_authorization_only_incident_recovery(tmp_path: Path)
         ),
         lambda result: result["incident_recovery"].update(cause_class="availability"),
         lambda result: result["incident_recovery"].update(acknowledged_at_ns=-1),
+        lambda result: result["incident_recovery"].update(acknowledged_at_ns="09000"),
+        lambda result: result["incident_recovery"].update(acknowledged_at_ns="-9000"),
+        lambda result: result["incident_recovery"].update(
+            acknowledged_at_ns="9223372036854775808"
+        ),
+        lambda result: result["incident_recovery"].update(acknowledged_at_ns=True),
         lambda result: result["incident_recovery"].update(summary="extra"),
         lambda result: result.update(replay_status="request_id_conflict"),
         lambda result: result.update(
@@ -656,6 +733,18 @@ def test_client_reads_ordered_incident_events(tmp_path: Path) -> None:
             "events": [{**_incident_event(3), "occurred_at_ns": -1}],
             "through_sequence": 3,
         },
+        {
+            "events": [{**_incident_event(3), "occurred_at_ns": "05003"}],
+            "through_sequence": 3,
+        },
+        {
+            "events": [{**_incident_event(3), "occurred_at_ns": "-5003"}],
+            "through_sequence": 3,
+        },
+        {
+            "events": [{**_incident_event(3), "occurred_at_ns": 5003.5}],
+            "through_sequence": 3,
+        },
         {"events": [{**_incident_event(3), "extra": 1}], "through_sequence": 3},
         {"events": [], "through_sequence": 2, "extra": None},
         {"events": [], "through_sequence": 3},
@@ -672,3 +761,56 @@ def test_client_rejects_malformed_incident_events(
             lambda client: client.incident_events(2, 64),
         )
     assert captured.value.code == "cclc_open_response_invalid"
+
+
+@pytest.mark.parametrize(
+    "acknowledged_at_ns", [_MAX_INT64_NS, _ABOVE_SAFE_NS, 2**53 - 1]
+)
+def test_client_forwards_a_full_width_incident_acknowledgement_time(
+    tmp_path: Path, acknowledged_at_ns: int | str
+) -> None:
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent["intent"] = "recover"
+    result = _incident_recovery_result()
+    result["incident_recovery"]["acknowledged_at_ns"] = acknowledged_at_ns
+    submitted = _through_client(
+        tmp_path,
+        "lifecycle_submit",
+        result,
+        lambda client: client.submit_lifecycle(intent),
+    )
+    assert submitted == result
+    recovery = submitted["incident_recovery"]
+    assert recovery["acknowledged_at_ns"] == acknowledged_at_ns
+
+
+def test_client_reads_incident_events_with_full_width_times(tmp_path: Path) -> None:
+    page = {
+        "events": [
+            {
+                **_incident_event(3),
+                "occurred_at_ns": _ABOVE_SAFE_NS,
+                "payload": {
+                    **_incident_event(3)["payload"],
+                    "detected_at_ns": _ABOVE_SAFE_NS,
+                },
+            },
+            {
+                **_incident_event(4, "component_incident_acknowledged"),
+                "occurred_at_ns": _MAX_INT64_NS,
+            },
+        ],
+        "through_sequence": 4,
+    }
+    result = _through_client(
+        tmp_path,
+        "incident_events",
+        page,
+        lambda client: client.incident_events(2, 64),
+    )
+    assert result == page
+    assert [event["occurred_at_ns"] for event in result["events"]] == [
+        _ABOVE_SAFE_NS,
+        _MAX_INT64_NS,
+    ]

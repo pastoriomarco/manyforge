@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/cclc_open_request.hpp>
 #include <optional>
@@ -10,6 +13,10 @@ namespace manyforge::core {
 namespace {
 
 using content_identity::CanonicalValue;
+
+/// 2^53 + 1: the first owner-clock value a JSON number cannot carry exactly.
+constexpr std::int64_t kBeyondSafeNs = 9'007'199'254'740'993LL;
+constexpr std::int64_t kMaximumClockNs = std::numeric_limits<std::int64_t>::max();
 
 [[nodiscard]] CanonicalValue ContextValue(const std::string& request_id) {
   return CanonicalValue(
@@ -387,11 +394,34 @@ TEST(CCLCOpenRequest, ComponentSnapshotAlwaysCarriesNullableTargetAndProgress) {
             "5000000000");
   EXPECT_TRUE(Member(progress, "incident").is_null());
   EXPECT_EQ(progress.as_object().size(), 7U);
+}
 
-  // Owner-clock times stay I-JSON safe integers; a larger value never reaches
-  // a response, because Headless rejects it.
-  port.view.progress->waiting_since_ns = 1'700'000'000'000'000'000LL;
-  EXPECT_ANY_THROW(static_cast<void>(SnapshotResult(port)));
+TEST(CCLCOpenRequest, WaitingSinceUsesTheFullWidthClockContract) {
+  TargetViewPort port;
+  port.view = {ComponentLifecycleTargetDTO{ControllableComponentId("component.arm"),
+                                           LifecycleTargetStateDTO::kActive,
+                                           LifecycleTargetOriginDTO::kStartup, 1U},
+               ComponentLifecycleProgressDTO{LifecycleProgressPhaseDTO::kWaitingForPrerequisites,
+                                             ComponentLifecycleIntentKindDTO::kPrepare,
+                                             LifecycleBlockingCauseClassDTO::kAvailability,
+                                             std::nullopt, kBeyondSafeNs, true}};
+  // Above 2^53-1 an owner-clock time is a canonical decimal string that
+  // decodes back exactly; it is never refused or rounded.
+  const auto wide = Member(SnapshotResult(port), "lifecycle_progress");
+  EXPECT_EQ(content_identity::canonical_json(Member(wide, "waiting_since_ns")),
+            "\"9007199254740993\"");
+  EXPECT_EQ(content_identity::parse_nonnegative_int64(Member(wide, "waiting_since_ns")),
+            kBeyondSafeNs);
+  port.view.progress->waiting_since_ns = kMaximumClockNs;
+  const auto maximum = Member(SnapshotResult(port), "lifecycle_progress");
+  EXPECT_EQ(content_identity::canonical_json(Member(maximum, "waiting_since_ns")),
+            "\"9223372036854775807\"");
+  EXPECT_EQ(content_identity::parse_nonnegative_int64(Member(maximum, "waiting_since_ns")),
+            kMaximumClockNs);
+
+  // A negative owner time is refused, never clamped into a response.
+  port.view.progress->waiting_since_ns = -1;
+  EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
 }
 
 [[nodiscard]] ComponentLifecycleIncidentDTO OpenIncident() {
@@ -432,10 +462,21 @@ TEST(CCLCOpenRequest, ComponentSnapshotShowsTheOpenIncidentInContractShape) {
             R"("incident_id":"incident.component.arm.5000","summary":"Component component.arm )"
             R"(reported an emergency stop.","vendor_codes":["C2","mode=0","state=4"]})");
 
-  // Incident times beyond an I-JSON safe integer never reach a response.
-  auto unsafe = OpenIncident();
-  unsafe.detected_at_ns = 1'700'000'000'000'000'000LL;
-  port.view.progress->incident = unsafe;
+  // Full-width clock: above 2^53-1 the time is a canonical decimal string.
+  auto wide = OpenIncident();
+  wide.detected_at_ns = kBeyondSafeNs;
+  port.view.progress->incident = wide;
+  const auto wide_incident =
+      Member(Member(SnapshotResult(port), "lifecycle_progress"), "incident");
+  EXPECT_EQ(content_identity::canonical_json(Member(wide_incident, "detected_at_ns")),
+            "\"9007199254740993\"");
+  EXPECT_EQ(content_identity::parse_nonnegative_int64(Member(wide_incident, "detected_at_ns")),
+            kBeyondSafeNs);
+
+  // A negative detection time is refused, never clamped.
+  auto negative = OpenIncident();
+  negative.detected_at_ns = -1;
+  port.view.progress->incident = negative;
   EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
 }
 
@@ -489,6 +530,55 @@ TEST(CCLCOpenRequest, IncidentRecoveryResultAndIncidentEventsAreExact) {
       port, {});
   ASSERT_TRUE(unbounded.ok());
   EXPECT_FALSE(Member(content_identity::parse_canonical_json(unbounded.value()), "ok").as_bool());
+}
+
+TEST(CCLCOpenRequest, IncidentRecoveryAndEventTimesUseTheFullWidthClockContract) {
+  TargetViewPort port;
+  CCLCLifecycleRequestResultDTO recovered{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
+                                          std::nullopt, std::nullopt};
+  recovered.incident_recovery = ComponentIncidentRecoveryDTO{
+      "incident.component.arm.5000", ControllableComponentId("component.arm"),
+      LifecycleBlockingCauseClassDTO::kEmergencyStop, "operator.ada", kMaximumClockNs};
+  port.submit_result = recovered;
+  const auto submitted = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_submit", LifecycleIntentValue()), port, {});
+  ASSERT_TRUE(submitted.ok()) << submitted.error().message;
+  const auto response = content_identity::parse_canonical_json(submitted.value());
+  ASSERT_TRUE(Member(response, "ok").as_bool()) << submitted.value();
+  const auto& acknowledged_at =
+      Member(Member(Member(response, "result"), "incident_recovery"), "acknowledged_at_ns");
+  EXPECT_EQ(content_identity::canonical_json(acknowledged_at), "\"9223372036854775807\"");
+  EXPECT_EQ(content_identity::parse_nonnegative_int64(acknowledged_at), kMaximumClockNs);
+
+  // A negative acknowledgement time is not a valid result.
+  recovered.incident_recovery->acknowledged_at_ns = -1;
+  port.submit_result = recovered;
+  const auto negative = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_submit", LifecycleIntentValue()), port, {});
+  ASSERT_TRUE(negative.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(negative.value()), "ok").as_bool());
+
+  port.events = {{1U, "component_incident_acknowledged", "incident.component.arm.5000",
+                  kBeyondSafeNs, R"({"event_kind":"component_incident_acknowledged"})"}};
+  const auto read = ExecuteCanonicalCCLCOpenRequest(
+      Request("incident_events", CanonicalValue(CanonicalValue::Object{
+                                     {"after_sequence", CanonicalValue(0.0)},
+                                     {"limit", CanonicalValue(16.0)}})),
+      port, {});
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  const auto events = Member(content_identity::parse_canonical_json(read.value()), "result");
+  const auto& occurred = Member(Member(events, "events").as_array().front(), "occurred_at_ns");
+  EXPECT_EQ(content_identity::canonical_json(occurred), "\"9007199254740993\"");
+  EXPECT_EQ(content_identity::parse_nonnegative_int64(occurred), kBeyondSafeNs);
+
+  // A negative event time is an owner failure, never clamped to zero.
+  port.events.front().occurred_at_ns = -1;
+  const auto refused = ExecuteCanonicalCCLCOpenRequest(
+      Request("incident_events", CanonicalValue(CanonicalValue::Object{
+                                     {"after_sequence", CanonicalValue(0.0)},
+                                     {"limit", CanonicalValue(16.0)}})),
+      port, {});
+  EXPECT_FALSE(refused.ok());
 }
 
 }  // namespace

@@ -26,8 +26,6 @@ const char *ToString(const ManagementIdleState state) noexcept {
     return "starting";
   case ManagementIdleState::kActive:
     return "active";
-  case ManagementIdleState::kPaused:
-    return "paused";
   case ManagementIdleState::kStopping:
     return "stopping";
   case ManagementIdleState::kTerminalAwaitingReset:
@@ -78,7 +76,7 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
 
   // Step 2: refuse before any Apply effect unless the affected surface is
   // exactly idle. A planned configuration transition must not overlap motion,
-  // a paused run, an in-progress stop or a reset.
+  // a held or failure-paused run, an in-progress stop or a reset.
   switch (gate_.ReadIdleState()) {
   case ManagementIdleState::kIdle:
     break;
@@ -90,10 +88,6 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
     return RefusedBeforeEffect(
         "apply_refused_active_execution",
         "planned reconfiguration refuses active execution");
-  case ManagementIdleState::kPaused:
-    return RefusedBeforeEffect(
-        "apply_refused_paused_execution",
-        "planned reconfiguration refuses a paused execution");
   case ManagementIdleState::kStopping:
     return RefusedBeforeEffect(
         "apply_refused_stopping_execution",

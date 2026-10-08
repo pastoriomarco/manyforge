@@ -297,7 +297,13 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
   /// Controllable components of the active configuration whose CCLC
-  /// snapshots the component-lifecycle alarm conditions are derived from.
+  /// snapshots the component-lifecycle alarm conditions are derived from,
+  /// that configuration's retained bundle and graph revision (null before
+  /// the first publication), and whether the lifecycle source is
+  /// registered. A registered source with an empty scope still needs an
+  /// observation (`ObserveEmptyComponentLifecycleConfiguration`), which
+  /// returns the conditions of the removed components and reconciles its
+  /// quality.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ComponentLifecycleConditionScope();
   /// Derive the safety-stop alarm condition (spec 530 §3.3, 2026-10-08)
@@ -306,13 +312,30 @@ public:
   /// (incident id in the details) until the acknowledged incident is gone
   /// from a fresh snapshot. `snapshots`
   /// and `unavailable_component_ids` together must name exactly the current
-  /// scope; an unavailable component keeps its conditions unchanged. Only a
-  /// changed condition is submitted.
+  /// scope, and every snapshot must name the active retained bundle and
+  /// graph revision; otherwise nothing is submitted (`scope_changed`). The
+  /// active configuration is the one Manager publishes now, reread under the
+  /// owner lock; a stale, unavailable or unverifiable publication submits
+  /// nothing (`configuration_unavailable`). An unavailable component keeps
+  /// its conditions unchanged and leaves the source quality as it was. Only
+  /// a changed condition is submitted.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ObserveComponentLifecycleConditions(
       std::string cclc_owner_epoch,
       manyforge::content_identity::CanonicalValue snapshots,
       std::vector<std::string> unavailable_component_ids);
+  /// The active configuration (`retained_bundle_id`, `graph_revision`) has
+  /// no controlled components, so it has no CCLC owner and no lifecycle
+  /// conditions: the conditions of the components that left the scope
+  /// return to normal and the lifecycle source's quality becomes good
+  /// (`observed`; `empty` when the source was never registered). Judged
+  /// against the configuration Manager publishes now, like
+  /// `ObserveComponentLifecycleConditions`: a different or non-empty
+  /// configuration is `scope_changed`, a stale, unavailable or unverifiable
+  /// publication `configuration_unavailable`; neither submits anything.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveEmptyComponentLifecycleConfiguration(std::string retained_bundle_id,
+                                              std::string graph_revision);
   /// CCLC is unreachable: its conditions keep their state at unknown quality.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkComponentLifecycleSourceUnknown();
@@ -404,6 +427,19 @@ private:
 
   void SynchronizeAlarmResourceRegistryLocked(
       const HeadlessRuntimeSnapshot &runtime);
+  /// Reread the current Manager publication and synchronize the alarm
+  /// resource registry from it. True only when that publication is fresh and
+  /// the registry now holds the exact configuration it names, so an
+  /// observation can be judged against the active configuration rather than
+  /// one a reader last happened to refresh.
+  [[nodiscard]] bool RefreshCurrentAlarmRegistryLocked();
+  /// Return the lifecycle conditions of components outside `in_scope` to
+  /// normal and forget them; `correlations` names the observation for one
+  /// removed component.
+  void ReturnRemovedComponentConditionsLocked(
+      const std::set<std::string> &in_scope,
+      const std::function<manyforge::content_identity::CanonicalValue(
+          const std::string &component_id)> &correlations);
   /// Submit one operation-derived condition. A scope the alarm owner refuses
   /// (stale or invalid resources) is recorded as a named, historian-visible
   /// rejection and returns no mutation; it never fails the operation feed.

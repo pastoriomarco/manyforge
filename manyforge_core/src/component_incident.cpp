@@ -10,8 +10,10 @@ namespace {
 
 using content_identity::CanonicalValue;
 
+/// Full-width owner-clock time. A negative value is refused (the codec
+/// throws), never clamped: validation must have rejected it before.
 [[nodiscard]] CanonicalValue NonNegative(const std::int64_t value) {
-  return content_identity::nonnegative_int64_value(std::max<std::int64_t>(0, value));
+  return content_identity::nonnegative_int64_value(value);
 }
 
 [[nodiscard]] CanonicalValue Unsigned(const std::uint64_t value) {
@@ -111,14 +113,13 @@ bool ComponentLifecycleIncidentDTO::locally_valid() const noexcept {
                      [](const auto& code) {
                        return !code.empty() && code.size() <= kMaxComponentIncidentVendorCodeBytes;
                      }) &&
-         detected_at_ns >= 0 && detected_at_ns <= kMaxComponentIncidentTimeNs &&
-         !summary.empty() &&
+         detected_at_ns >= 0 && !summary.empty() &&
          summary.size() <= kMaxComponentIncidentSummaryBytes &&
+         (!last_good_observation || last_good_observation->observed_at_ns >= 0) &&
          (containment_state != ComponentIncidentContainmentStateDTO::kRequested ||
           containment.has_value()) &&
          acknowledged == acknowledged_at_ns.has_value() &&
-         (!acknowledged_at_ns ||
-          (*acknowledged_at_ns >= 0 && *acknowledged_at_ns <= kMaxComponentIncidentTimeNs));
+         (!acknowledged_at_ns || *acknowledged_at_ns >= 0);
 }
 
 std::vector<LifecycleIncidentRecoveryPolicyDTO> DefaultLifecycleIncidentRecoveryPolicy() {

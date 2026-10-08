@@ -707,11 +707,13 @@ void PublishManagerApplyTransition(
                                         empty_predecessor)));
 }
 
-/// The two successive configurations of the alarm-registry fixture cell:
-/// one Lite6, then two same-type Lite6 instances.
+/// The successive configurations of the alarm-registry fixture cell: one
+/// Lite6, two same-type Lite6 instances, and the canonical-empty
+/// configuration without controlled components.
 struct RegistryConfigurations final {
   std::shared_ptr<const deployment::RetainedBundle> single;
   std::shared_ptr<const deployment::RetainedBundle> dual;
+  std::shared_ptr<const deployment::RetainedBundle> empty;
 };
 
 RegistryConfigurations LoadRegistryConfigurations() {
@@ -719,16 +721,20 @@ RegistryConfigurations LoadRegistryConfigurations() {
                        std::ios::binary);
   std::string single_id;
   std::string dual_id;
+  std::string empty_id;
   if (!stream || !std::getline(stream, single_id) ||
-      !std::getline(stream, dual_id)) {
+      !std::getline(stream, dual_id) || !std::getline(stream, empty_id)) {
     throw std::runtime_error("alarm registry fixture bundle IDs are missing");
   }
   const deployment::FilesystemVerifiedRetainedBundleSource source(
       MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT);
   RegistryConfigurations result{
       source.get_verified(core::RetainedBundleId(single_id)),
-      source.get_verified(core::RetainedBundleId(dual_id))};
-  if (result.single == nullptr || result.dual == nullptr) {
+      source.get_verified(core::RetainedBundleId(dual_id)),
+      source.get_verified(core::RetainedBundleId(empty_id))};
+  if (result.single == nullptr || result.dual == nullptr ||
+      result.empty == nullptr ||
+      !result.empty->value().cell_graph.controllable_components.empty()) {
     throw std::runtime_error("alarm registry fixture bundles are missing");
   }
   return result;
@@ -3383,36 +3389,67 @@ CanonicalValue ComponentConditionSnapshot(
   });
 }
 
+/// `snapshot` as CCLC captures it under `bundle` (retained bundle id and
+/// graph revision).
+CanonicalValue InConfiguration(const CanonicalValue &snapshot,
+                               const deployment::RetainedBundle &bundle) {
+  auto row = snapshot.as_object();
+  for (auto &[name, value] : row) {
+    if (name == "graph_revision") {
+      value = CanonicalValue(bundle.value().cell_graph.graph_revision.value());
+    } else if (name == "retained_bundle_id") {
+      value = CanonicalValue(bundle.retained_bundle_id().value());
+    }
+  }
+  return CanonicalValue(std::move(row));
+}
+
 /// The component-lifecycle fixture: the single-arm configuration is active
 /// and its controllable component and first resource are named.
 struct ComponentConditionFixture final {
   TemporaryDirectory directory;
+  std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::string component;
   std::string resource;
   std::unique_ptr<HeadlessApiCore> core;
 
   ComponentConditionFixture() {
     const auto configurations = LoadRegistryConfigurations();
-    const auto &components =
-        configurations.single->value().cell_graph.controllable_components;
+    bundle = configurations.single;
+    const auto &components = bundle->value().cell_graph.controllable_components;
     if (components.empty()) {
       throw std::runtime_error("registry fixture has no component");
     }
     component = components.front().controllable_component_id.value();
-    resource = ResourceIds(*configurations.single).front();
-    PublishActiveConfiguration(directory, *configurations.single, 1U);
+    resource = ResourceIds(*bundle).front();
+    PublishActiveConfiguration(directory, *bundle, 1U);
     core = std::make_unique<HeadlessApiCore>(
         RegistryConfig(directory, "api.epoch.1"), Clocks());
     // Observing the projection establishes the alarm resource registry.
     static_cast<void>(core->AlarmSnapshot());
   }
 
+  /// Observe `snapshot` as captured under the active configuration.
   CanonicalValue Observe(const CanonicalValue &snapshot,
                          const std::string &epoch = "cclc.epoch.1") {
     return core->ObserveComponentLifecycleConditions(
-        epoch, CanonicalValue(CanonicalValue::Array{snapshot}), {});
+        epoch,
+        CanonicalValue(CanonicalValue::Array{InConfiguration(snapshot, *bundle)}),
+        {});
   }
 };
+
+/// Sources of the `runtime_health` domain (which holds the component
+/// lifecycle source) whose current quality is unknown.
+std::uint64_t UnknownRuntimeHealthSources(HeadlessApiCore &core) {
+  const auto snapshot = core.AlarmSnapshot();
+  for (const auto &domain : Array(snapshot, "domains")) {
+    if (Text(domain, "domain") == "runtime_health") {
+      return Unsigned(domain, "unknown_source_count");
+    }
+  }
+  throw std::runtime_error("runtime_health domain is missing");
+}
 
 const CanonicalValue *AlarmFor(const CanonicalValue &snapshot,
                                const std::string_view definition) {
@@ -3683,24 +3720,23 @@ TEST(HeadlessApiCore,
   HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
   static_cast<void>(core.AlarmSnapshot());
   const auto unknown_runtime_sources = [&]() {
-    const auto snapshot = core.AlarmSnapshot();
-    for (const auto &domain : Array(snapshot, "domains")) {
-      if (Text(domain, "domain") == "runtime_health") {
-        return Unsigned(domain, "unknown_source_count");
-      }
-    }
-    throw std::runtime_error("runtime_health domain is missing");
+    return UnknownRuntimeHealthSources(core);
   };
   const auto baseline = unknown_runtime_sources();
 
   EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
                      "cclc.epoch.1",
                      CanonicalValue(CanonicalValue::Array{
-                         ComponentConditionSnapshot(kept, single_resources.front(),
-                                                    "active", "satisfied", "none"),
-                         ComponentConditionSnapshot(
-                             removed, removed_resources.front(), "active",
-                             "satisfied", "emergency_stop"),
+                         InConfiguration(
+                             ComponentConditionSnapshot(
+                                 kept, single_resources.front(), "active",
+                                 "satisfied", "none"),
+                             *configurations.dual),
+                         InConfiguration(
+                             ComponentConditionSnapshot(
+                                 removed, removed_resources.front(), "active",
+                                 "satisfied", "emergency_stop"),
+                             *configurations.dual),
                      }),
                      {}),
                  "status"),
@@ -3720,8 +3756,11 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
                      "cclc.epoch.2",
                      CanonicalValue(CanonicalValue::Array{
-                         ComponentConditionSnapshot(kept, single_resources.front(),
-                                                    "active", "satisfied", "none"),
+                         InConfiguration(
+                             ComponentConditionSnapshot(
+                                 kept, single_resources.front(), "active",
+                                 "satisfied", "none"),
+                             *configurations.single),
                      }),
                      {}),
                  "status"),
@@ -3732,6 +3771,282 @@ TEST(HeadlessApiCore,
   ASSERT_NE(alarm, nullptr);
   EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), removed);
   EXPECT_FALSE(std::get<bool>(Member(*alarm, "active").storage()));
+}
+
+TEST(HeadlessApiCore,
+     LifecycleObservationCapturedBeforeApplyRaisesKeepsAndClearsNothing) {
+  // Regression: matching component IDs alone admitted a CCLC snapshot taken
+  // under the configuration an Apply superseded. Each row is now fenced to
+  // the retained bundle and graph revision it was captured under; until a
+  // row of the active configuration arrives, the conditions held from the
+  // superseded one stay at unknown quality.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto &single = *configurations.single;
+  const auto &dual = *configurations.dual;
+  const auto kept =
+      single.value().cell_graph.controllable_components.front()
+          .controllable_component_id.value();
+  std::string added;
+  for (const auto &component : dual.value().cell_graph.controllable_components) {
+    if (component.controllable_component_id.value() != kept) {
+      added = component.controllable_component_id.value();
+    }
+  }
+  ASSERT_FALSE(added.empty());
+  // The kept component's condition keeps one subject across both
+  // configurations, so only the fence decides what is submitted.
+  const auto resource = ResourceIds(single).front();
+  const auto row = [&](const std::string &component, const std::string &cause,
+                       const deployment::RetainedBundle &captured_under) {
+    return InConfiguration(ComponentConditionSnapshot(component, resource,
+                                                      "active", "satisfied",
+                                                      cause),
+                           captured_under);
+  };
+  const auto observe = [&](HeadlessApiCore &core,
+                           CanonicalValue::Array rows,
+                           std::vector<std::string> unavailable = {}) {
+    return Text(core.ObserveComponentLifecycleConditions(
+                    "cclc.epoch.1", CanonicalValue(std::move(rows)),
+                    std::move(unavailable)),
+                "status");
+  };
+
+  PublishActiveConfiguration(directory, dual, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.AlarmSnapshot());
+  EXPECT_FALSE(std::get<bool>(
+      Member(core.ComponentLifecycleConditionScope(), "source_registered")
+          .storage()));
+  ASSERT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
+            "observed");
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.ComponentLifecycleConditionScope(), "source_registered")
+          .storage()));
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  const auto baseline = UnknownRuntimeHealthSources(core);
+
+  // Apply to the single-arm configuration: the scope still names `kept`.
+  PublishActiveConfiguration(directory, single, 2U);
+  static_cast<void>(core.AlarmSnapshot());
+  ASSERT_EQ(Array(core.ComponentLifecycleConditionScope(), "component_ids"),
+            (CanonicalValue::Array{CanonicalValue(kept)}));
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+
+  // A stale capture raises nothing.
+  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", dual)}),
+            "scope_changed");
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+  // An unread component does not reconcile the source either.
+  EXPECT_EQ(observe(core, {}, {kept}), "observed");
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+
+  // A capture under the active configuration raises and reconciles.
+  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single)}), "observed");
+  auto snapshot = core.AlarmSnapshot();
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  const auto activation = Text(*alarm, "activation_id");
+  const auto revision = Unsigned(*alarm, "record_revision");
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
+
+  // Apply back to the dual configuration with the same `kept` component.
+  PublishActiveConfiguration(directory, dual, 3U);
+  static_cast<void>(core.AlarmSnapshot());
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+
+  // A stale capture neither clears nor keeps the raised condition: the
+  // record is unchanged and its source stays at unknown quality.
+  EXPECT_EQ(observe(core, {row(kept, "none", single), row(added, "none", single)}),
+            "scope_changed");
+  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single),
+                           row(added, "none", single)}),
+            "scope_changed");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+
+  // Fresh normal status of the active configuration returns it.
+  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
+            "observed");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
+}
+
+TEST(HeadlessApiCore,
+     LifecycleObservationIsJudgedAgainstThePublicationNotTheCachedRegistry) {
+  // Regression: the fence compared rows with the cached registry identity,
+  // which only another reader's refresh updates. After an Apply that no
+  // reader had refreshed yet, a row captured under the superseded
+  // configuration still matched that cache and could raise or clear a
+  // condition. The observation now rereads the current Manager publication
+  // first; without a fresh one it is judged against nothing.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto &single = *configurations.single;
+  const auto &dual = *configurations.dual;
+  const auto kept =
+      single.value().cell_graph.controllable_components.front()
+          .controllable_component_id.value();
+  std::string added;
+  for (const auto &component : dual.value().cell_graph.controllable_components) {
+    if (component.controllable_component_id.value() != kept) {
+      added = component.controllable_component_id.value();
+    }
+  }
+  ASSERT_FALSE(added.empty());
+  const auto resource = ResourceIds(single).front();
+  const auto row = [&](const std::string &component, const std::string &cause,
+                       const deployment::RetainedBundle &captured_under) {
+    return InConfiguration(ComponentConditionSnapshot(component, resource,
+                                                      "active", "satisfied",
+                                                      cause),
+                           captured_under);
+  };
+  const auto observe = [&](HeadlessApiCore &core, CanonicalValue::Array rows) {
+    return Text(core.ObserveComponentLifecycleConditions(
+                    "cclc.epoch.1", CanonicalValue(std::move(rows)), {}),
+                "status");
+  };
+
+  PublishActiveConfiguration(directory, dual, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.AlarmSnapshot());
+  ASSERT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
+            "observed");
+
+  // Apply to the single-arm configuration; nothing has refreshed the
+  // registry since. A capture of the superseded configuration raises nothing.
+  PublishActiveConfiguration(directory, single, 2U);
+  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", dual),
+                           row(added, "emergency_stop", dual)}),
+            "scope_changed");
+  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  // A capture of the published configuration is accepted.
+  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single)}), "observed");
+  auto snapshot = core.AlarmSnapshot();
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  const auto revision = Unsigned(*alarm, "record_revision");
+
+  // Apply back to the dual configuration, again unrefreshed: a capture of the
+  // superseded single-arm configuration clears nothing.
+  PublishActiveConfiguration(directory, dual, 3U);
+  EXPECT_EQ(observe(core, {row(kept, "none", single)}), "scope_changed");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
+
+  // Without a current publication there is no active configuration to judge
+  // against, even for rows naming the last one.
+  std::filesystem::remove(directory.publications() / "manager-source.json");
+  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
+            "configuration_unavailable");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
+
+  PublishActiveConfiguration(directory, dual, 4U);
+  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
+            "observed");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
+}
+
+TEST(HeadlessApiCore,
+     EmptyConfigurationReturnsRemovedLifecycleConditionsWithoutCCLC) {
+  // Regression: an Apply to a configuration without controlled components
+  // removes the CCLC service, so an empty scope observed through CCLC only
+  // marked the source unknown and the removed components' conditions stayed
+  // active. The empty configuration is observed by Headless itself, fenced
+  // to the configuration Manager publishes now.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto &single = *configurations.single;
+  const auto &empty = *configurations.empty;
+  const auto component =
+      single.value().cell_graph.controllable_components.front()
+          .controllable_component_id.value();
+  const auto resource = ResourceIds(single).front();
+  const auto observe_empty = [](HeadlessApiCore &core,
+                                const deployment::RetainedBundle &bundle) {
+    return Text(core.ObserveEmptyComponentLifecycleConfiguration(
+                    bundle.retained_bundle_id().value(),
+                    bundle.value().cell_graph.graph_revision.value()),
+                "status");
+  };
+
+  PublishActiveConfiguration(directory, single, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.AlarmSnapshot());
+  const auto scope = core.ComponentLifecycleConditionScope();
+  EXPECT_EQ(Text(scope, "retained_bundle_id"),
+            single.retained_bundle_id().value());
+  // A configuration with components is never observed as empty.
+  EXPECT_EQ(observe_empty(core, single), "scope_changed");
+  ASSERT_EQ(Text(core.ObserveComponentLifecycleConditions(
+                     "cclc.epoch.1",
+                     CanonicalValue(CanonicalValue::Array{InConfiguration(
+                         ComponentConditionSnapshot(component, resource,
+                                                    "active", "satisfied",
+                                                    "emergency_stop"),
+                         single)}),
+                     {}),
+                 "status"),
+            "observed");
+  ASSERT_NE(AlarmFor(core.AlarmSnapshot(), kComponentLifecycleFault), nullptr);
+  const auto baseline = UnknownRuntimeHealthSources(core);
+
+  // Apply to the empty configuration: its CCLC owner is gone.
+  PublishActiveConfiguration(directory, empty, 2U);
+  static_cast<void>(core.AlarmSnapshot());
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+  const auto empty_scope = core.ComponentLifecycleConditionScope();
+  EXPECT_TRUE(Array(empty_scope, "component_ids").empty());
+  EXPECT_EQ(Text(empty_scope, "retained_bundle_id"),
+            empty.retained_bundle_id().value());
+  EXPECT_EQ(Text(empty_scope, "graph_revision"),
+            empty.value().cell_graph.graph_revision.value());
+  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
+            "marked_unknown");
+  // An observation fenced to the superseded configuration returns nothing.
+  EXPECT_EQ(observe_empty(core, single), "scope_changed");
+  auto snapshot = core.AlarmSnapshot();
+  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_TRUE(std::get<bool>(Member(*alarm, "active").storage()));
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+
+  EXPECT_EQ(observe_empty(core, empty), "observed");
+  snapshot = core.AlarmSnapshot();
+  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), component);
+  EXPECT_FALSE(std::get<bool>(Member(*alarm, "active").storage()));
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
+
+  // A source that was never registered has nothing to return.
+  TemporaryDirectory unregistered_directory;
+  PublishActiveConfiguration(unregistered_directory, empty, 1U);
+  HeadlessApiCore unregistered(
+      RegistryConfig(unregistered_directory, "api.epoch.2"), Clocks());
+  EXPECT_EQ(observe_empty(unregistered, empty), "empty");
 }
 
 TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {

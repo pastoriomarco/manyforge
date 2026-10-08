@@ -644,6 +644,10 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
         "provider_occurrence_mismatch"));
   }
 
+  // Concurrent target polls and coordinator reads must sample and classify in
+  // the same order. Rejecting their harmless reordering would report provider
+  // loss to CCLC. This lock covers only a bounded cached read, never execute.
+  std::lock_guard observation_lock(observation_mutex_);
   const auto now_ns = clock_.now();
   if (now_ns < 0) {
     return core::Result<BrandLifecycleObservationDTO>::Err(
@@ -687,27 +691,6 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
             : observed.transport_owner_progress_reason));
   }
 
-  // A connected observation without a vendor report is an availability loss
-  // only while no intervention-requiring cause was previously reported; any
-  // classification from a report replaces the retained cause.
-  auto cause = core::LifecycleBlockingCauseClassDTO::kUnknown;
-  {
-    std::lock_guard lock(cause_mutex_);
-    track_vendor_control(observed, now_ns);
-    cause = vendor_cause(observed, external_control_detected_);
-    if (cause == core::LifecycleBlockingCauseClassDTO::kAvailability) {
-      if (last_intervention_cause_ !=
-          core::LifecycleBlockingCauseClassDTO::kNone) {
-        cause = last_intervention_cause_;
-      }
-    } else {
-      last_intervention_cause_ =
-          core::lifecycle_cause_requires_intervention(cause)
-              ? cause
-              : core::LifecycleBlockingCauseClassDTO::kNone;
-    }
-  }
-
   BrandLifecycleObservationDTO result{
       query.lifecycle_transaction_id,
       query.lifecycle_transaction_generation,
@@ -725,13 +708,57 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
       observed.transport_owner_received_timestamp_ns,
       observed.fresh_until_ns,
       observed_state(observed),
-      normalized_facts(observed, cause)};
+      normalized_facts(observed,
+                       core::LifecycleBlockingCauseClassDTO::kUnknown)};
   if (!result.locally_valid() || !result.matches(query)) {
     return core::Result<BrandLifecycleObservationDTO>::Err(
         error("xarm_lifecycle_observation_invalid",
               "the normalized Lite6 observation violates the Core contract",
               "normalized_observation_invalid"));
   }
+
+  // Reject a genuine source regression before changing vendor history.
+  // The observation lock prevents concurrent callers from causing one here.
+  std::lock_guard lock(cause_mutex_);
+  if (observed.generation < last_observation_generation_ ||
+      observed.transport_owner_progress_sequence <
+          last_owner_publication_sequence_) {
+    return core::Result<BrandLifecycleObservationDTO>::Err(error(
+        "xarm_lifecycle_observation_unavailable",
+        "the restricted xArm observation regressed within its owner epoch",
+        observed.generation < last_observation_generation_
+            ? "observation_generation_regressed"
+            : "owner_publication_sequence_regressed"));
+  }
+
+  // A connected observation without a vendor report is an availability loss
+  // only while no intervention-requiring cause was previously reported; any
+  // classification from a report replaces the retained cause.
+  auto cause = core::LifecycleBlockingCauseClassDTO::kUnknown;
+  track_vendor_control(observed, now_ns);
+  cause = vendor_cause(observed, external_control_detected_);
+  if (cause == core::LifecycleBlockingCauseClassDTO::kAvailability) {
+    if (last_intervention_cause_ !=
+        core::LifecycleBlockingCauseClassDTO::kNone) {
+      cause = last_intervention_cause_;
+    }
+  } else {
+    last_intervention_cause_ =
+        core::lifecycle_cause_requires_intervention(cause)
+            ? cause
+            : core::LifecycleBlockingCauseClassDTO::kNone;
+  }
+
+  // The DTO is validated before history changes. Only its canonical cause
+  // token depends on ordered classification; the remaining facts stay intact.
+  for (auto &fact : result.facts) {
+    if (fact.lifecycle_fact_id.value() == core::kLifecycleBlockingCauseFactId) {
+      fact.value = token_value(std::string(core::to_string(cause)));
+      break;
+    }
+  }
+  last_observation_generation_ = observed.generation;
+  last_owner_publication_sequence_ = observed.transport_owner_progress_sequence;
   return core::Result<BrandLifecycleObservationDTO>::Ok(std::move(result));
 }
 

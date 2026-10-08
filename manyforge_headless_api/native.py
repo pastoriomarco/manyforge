@@ -298,6 +298,10 @@ class HeadlessCorePort(Protocol):
         **kwargs: Any,
     ) -> dict[str, Any]: ...
 
+    def observe_empty_component_lifecycle_configuration(
+        self, *, retained_bundle_id: str, graph_revision: str
+    ) -> dict[str, Any]: ...
+
     def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]: ...
 
     def record_cclc_incident_event(
@@ -823,6 +827,18 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("observe_component_lifecycle_conditions", **kwargs),
             method="observe_component_lifecycle_conditions",
+        )
+
+    def observe_empty_component_lifecycle_configuration(
+        self, *, retained_bundle_id: str, graph_revision: str
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "observe_empty_component_lifecycle_configuration",
+                retained_bundle_id=retained_bundle_id,
+                graph_revision=graph_revision,
+            ),
+            method="observe_empty_component_lifecycle_configuration",
         )
 
     def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:

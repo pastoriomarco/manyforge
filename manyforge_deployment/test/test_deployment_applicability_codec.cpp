@@ -725,7 +725,8 @@ TEST(DeploymentApplicabilityCodec,
   const std::string sources = interrupt_source("source_z", "signal_z") + "," +
                               interrupt_source("source_a", "signal_a");
   const std::string policies =
-      interrupt_policy("policy_z", "source_z", "[\"paused\",\"executing\"]",
+      interrupt_policy("policy_z", "source_z",
+                       "[\"intervention_required\",\"executing\"]",
                        "latch_faulted", "fault_terminal", "static",
                        "[\"domain_z\",\"domain_a\"]",
                        "[\"resource_z\",\"resource_a\"]") +
@@ -748,6 +749,9 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_LT(normalized.find("\"source_a\""), normalized.find("\"source_z\""));
   EXPECT_LT(normalized.find("\"policy_a\""), normalized.find("\"policy_z\""));
   EXPECT_NE(normalized.find("\"affected_phases\":[\"executing\",\"stopping\"]"),
+            std::string::npos);
+  EXPECT_NE(normalized.find("\"affected_phases\":[\"executing\","
+                            "\"intervention_required\"]"),
             std::string::npos);
   EXPECT_NE(normalized.find("\"allowed_stop_modes\":[\"soft_on_path\","
                             "\"hard_deceleration\"]"),
@@ -853,6 +857,13 @@ TEST(DeploymentApplicabilityCodec,
                                     "preempt_trajectory",
                                     "await_recovery_action", "operation")),
       "operation policy must include executing");
+  // Operation-level Pause was removed; its former phase is refused, not
+  // aliased.
+  expect_decode_error_containing(
+      document_for(interrupt_source("source", "signal"),
+                   interrupt_policy("policy", "source",
+                                    "[\"executing\",\"paused\"]")),
+      "value is outside the closed enum");
   expect_decode_error_containing(
       document_for(interrupt_source("source", "signal"),
                    interrupt_policy("policy_a", "source", "[\"executing\"]",

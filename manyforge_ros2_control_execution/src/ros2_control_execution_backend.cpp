@@ -5124,7 +5124,7 @@ void Ros2ControlExecutionBackend::process_completion_gate(
     }
 
     // State callbacks wake this wait immediately. The bounded slice also
-    // observes Stop/Pause/Reset promptly without making those paths depend on
+    // observes Stop/Reset promptly without making those paths depend on
     // the state callback group.
     std::unique_lock<std::mutex> state_lock(state_mutex_);
     state_cv_.wait_for(state_lock, std::min(wait_slice, deadline - now));

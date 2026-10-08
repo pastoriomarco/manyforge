@@ -2526,11 +2526,62 @@ CanonicalValue NullableText(const CanonicalValue *root,
 CanonicalValue HeadlessApiCore::ComponentLifecycleConditionScope() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto identity = [this](const bool bundle) {
+    return alarm_registry_identity_.has_value()
+               ? CanonicalValue(bundle ? alarm_registry_identity_->first
+                                       : alarm_registry_identity_->second)
+               : CanonicalValue(nullptr);
+  };
   return CanonicalValue(CanonicalValue::Object{
       {"component_ids", StringArrayValue(alarm_component_ids_)},
+      {"graph_revision", identity(false)},
+      {"retained_bundle_id", identity(true)},
       {"schema_version",
        CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
+      {"source_registered",
+       CanonicalValue(!component_lifecycle_adapter_.source_epoch.empty())},
   });
+}
+
+bool HeadlessApiCore::RefreshCurrentAlarmRegistryLocked() {
+  // Spec 530 §7.1: judged against the configuration Manager publishes now.
+  // The refresh replaces the registry (and marks lifecycle quality unknown)
+  // when the publication names a new configuration. A stale or absent
+  // publication still names its last configuration, which an Apply may
+  // already have superseded, and an unverifiable one leaves the registry on
+  // the previous configuration: neither can judge an observation.
+  const auto runtime = RefreshLocked();
+  const auto bundle_id =
+      OptionalStringMember(runtime.root, "active_retained_bundle_id");
+  const auto graph_revision =
+      OptionalStringMember(runtime.root, "active_graph_revision");
+  return SectionFresh(RequiredSection(runtime.root, "manager")) &&
+         bundle_id.has_value() && graph_revision.has_value() &&
+         alarm_registry_identity_ ==
+             std::make_pair(*bundle_id, *graph_revision);
+}
+
+void HeadlessApiCore::ReturnRemovedComponentConditionsLocked(
+    const std::set<std::string> &in_scope,
+    const std::function<CanonicalValue(const std::string &component_id)>
+        &correlations) {
+  std::vector<std::pair<std::string, std::string>> removed;
+  for (const auto &[key, state] : component_conditions_) {
+    static_cast<void>(state);
+    if (!in_scope.contains(key.second)) {
+      removed.push_back(key);
+    }
+  }
+  for (const auto &key : removed) {
+    const auto state = component_conditions_.at(key);
+    SynchronizeComponentConditionLocked(
+        component_lifecycle_adapter_, key.first, key.second, state.subject,
+        false,
+        CanonicalValue(CanonicalValue::Object{
+            {"reason", CanonicalValue("component_removed")}}),
+        correlations(key.second));
+    component_conditions_.erase(key);
+  }
 }
 
 CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
@@ -2552,6 +2603,8 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
     bool lifecycle_fault{};
     CanonicalValue details;
     CanonicalValue correlations;
+    /// (retained bundle, graph revision) CCLC captured the row under.
+    std::pair<std::string, std::string> configuration;
   };
   std::set<std::string> named;
   for (const auto &component : unavailable_component_ids) {
@@ -2638,6 +2691,8 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
             ? CanonicalValue(nullptr)
             : Number(RequiredCounter(*target, "target_generation", 1U),
                      "target_generation"));
+    auto configuration = std::make_pair(RequiredString(row, "retained_bundle_id"),
+                                        RequiredString(row, "graph_revision"));
     Observed value{
         AlarmSubject{"component", component,
                      std::vector<std::string>(resources.begin(),
@@ -2648,14 +2703,13 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
             {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
             {"control_domain_ids", CanonicalValue(std::move(domain_ids))},
             {"controllable_component_id", CanonicalValue(component)},
-            {"graph_revision", RequiredMember(row, "graph_revision")},
-            {"retained_bundle_id", RequiredMember(row, "retained_bundle_id")},
+            {"graph_revision", CanonicalValue(configuration.second)},
+            {"retained_bundle_id", CanonicalValue(configuration.first)},
         }),
+        std::move(configuration),
     };
     observed.insert_or_assign(std::move(component), std::move(value));
   }
-  const std::set<std::string> scope(alarm_component_ids_.begin(),
-                                    alarm_component_ids_.end());
   const auto response = [&](const std::string_view status) {
     return CanonicalValue(CanonicalValue::Object{
         {"schema_version",
@@ -2664,10 +2718,26 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
         {"status", CanonicalValue(std::string(status))},
     });
   };
+  if (!RefreshCurrentAlarmRegistryLocked()) {
+    return response("configuration_unavailable");
+  }
+  const std::set<std::string> scope(alarm_component_ids_.begin(),
+                                    alarm_component_ids_.end());
   if (named != scope) {
     // The active configuration changed between the scope read and this
     // observation; the next observation names the new scope.
     return response("scope_changed");
+  }
+  for (const auto &[component, value] : observed) {
+    static_cast<void>(component);
+    if (value.configuration != alarm_registry_identity_) {
+      // Fenced to the active configuration: a row CCLC captured under a
+      // superseded retained bundle or graph revision is no observation of
+      // the active one, even when it names the same components. It raises,
+      // keeps and clears nothing; CCLC restates the row once it has adopted
+      // the active configuration.
+      return response("scope_changed");
+    }
   }
   if (scope.empty() && component_lifecycle_adapter_.source_epoch.empty()) {
     return response("empty");
@@ -2691,27 +2761,71 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
   }
   // A component that left the active configuration has no lifecycle row:
   // its raised conditions return to normal and are forgotten.
-  std::vector<std::pair<std::string, std::string>> removed;
-  for (const auto &[key, state] : component_conditions_) {
-    if (!named.contains(key.second)) {
-      removed.push_back(key);
-    }
-  }
-  for (const auto &key : removed) {
-    const auto state = component_conditions_.at(key);
-    SynchronizeComponentConditionLocked(
-        component_lifecycle_adapter_, key.first, key.second, state.subject, false,
-        CanonicalValue(CanonicalValue::Object{
-            {"reason", CanonicalValue("component_removed")}}),
-        CanonicalValue(CanonicalValue::Object{
+  ReturnRemovedComponentConditionsLocked(
+      named, [&cclc_owner_epoch](const std::string &component_id) {
+        return CanonicalValue(CanonicalValue::Object{
             {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
-            {"controllable_component_id", CanonicalValue(key.second)},
-        }));
-    component_conditions_.erase(key);
+            {"controllable_component_id", CanonicalValue(component_id)},
+        });
+      });
+  if (unavailable_component_ids.empty()) {
+    // Only a complete observation of the active configuration establishes
+    // current quality. An unread component leaves it as it was, so a read
+    // after an Apply cannot confirm conditions of the superseded one.
+    alarm_owner_.CompleteSourceSnapshot(
+        component_lifecycle_adapter_.source_id,
+        component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
   }
-  alarm_owner_.CompleteSourceSnapshot(component_lifecycle_adapter_.source_id,
-                                      component_lifecycle_adapter_.source_epoch,
-                                      AlarmConditionQuality::kGood);
+  return response("observed");
+}
+
+CanonicalValue HeadlessApiCore::ObserveEmptyComponentLifecycleConfiguration(
+    std::string retained_bundle_id, std::string graph_revision) {
+  Require(!retained_bundle_id.empty() && retained_bundle_id.size() <= 256U &&
+              content_identity::is_utf8_nfc(retained_bundle_id) &&
+              !graph_revision.empty() && graph_revision.size() <= 256U &&
+              content_identity::is_utf8_nfc(graph_revision),
+          "headless_component_lifecycle_invalid",
+          "empty-configuration lifecycle observation identity is malformed");
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto response = [&](const std::string_view status) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"graph_revision", CanonicalValue(graph_revision)},
+        {"retained_bundle_id", CanonicalValue(retained_bundle_id)},
+        {"schema_version",
+         CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
+        {"status", CanonicalValue(std::string(status))},
+    });
+  };
+  if (!RefreshCurrentAlarmRegistryLocked()) {
+    return response("configuration_unavailable");
+  }
+  if (alarm_registry_identity_ !=
+          std::make_pair(retained_bundle_id, graph_revision) ||
+      !alarm_component_ids_.empty()) {
+    // An Apply since the scope read: the next read names the new scope.
+    return response("scope_changed");
+  }
+  if (component_lifecycle_adapter_.source_epoch.empty()) {
+    // Never registered: no condition was ever raised.
+    return response("empty");
+  }
+  // A configuration without controlled components has no CCLC owner and no
+  // lifecycle conditions. This is Headless's own observation of the active
+  // configuration, not a CCLC statement, so it continues the source's
+  // current epoch and is correlated to the configuration, not to an owner.
+  ReturnRemovedComponentConditionsLocked(
+      {}, [&](const std::string &component_id) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(component_id)},
+            {"graph_revision", CanonicalValue(graph_revision)},
+            {"retained_bundle_id", CanonicalValue(retained_bundle_id)},
+        });
+      });
+  alarm_owner_.CompleteSourceSnapshot(
+      component_lifecycle_adapter_.source_id,
+      component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
   return response("observed");
 }
 
@@ -3983,6 +4097,7 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
   if (alarm_registry_identity_ == identity) {
     return;
   }
+  bool replaced = false;
   try {
     const auto bundle = VerifiedActiveBundleLocked(
         *bundle_id, *graph_revision,
@@ -4003,6 +4118,7 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         AlarmResourceRegistry{*bundle_id, *graph_revision, std::move(resources)});
     alarm_registry_identity_ = std::move(identity);
     alarm_component_ids_.assign(components.begin(), components.end());
+    replaced = true;
     alarm_owner_.ReconcileHealth(kAlarmResourceRegistryHealthCode);
     ReconsiderRefusedOperationConditionsLocked();
   } catch (const std::exception &error) {
@@ -4018,6 +4134,15 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         std::string(kAlarmResourceRegistryHealthCode),
         "active configuration " + *bundle_id +
             " has no verified alarm resource inventory: " + detail);
+  }
+  if (replaced && !component_lifecycle_adapter_.source_epoch.empty()) {
+    // Lifecycle conditions observed under the superseded configuration are
+    // not observations of this one. They keep their state at unknown quality
+    // (which cannot clear them) until an observation fenced to this
+    // configuration, possibly of an empty scope, restates or returns them.
+    alarm_owner_.MarkSourceQualityUnknown(
+        component_lifecycle_adapter_.source_id,
+        component_lifecycle_adapter_.source_epoch);
   }
 }
 

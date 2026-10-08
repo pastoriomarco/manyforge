@@ -45,8 +45,8 @@ external-agent, and real-robot product lanes are not yet available.
 > unchanged-source repeated-instance isolation through the Component Manager,
 > Headless API, Program runner, and thin Composer clients. I7/L0 adds the sole
 > generic lifecycle/controller-route owner and verified readiness publication.
-> I8 adds prepared multi-participant dispatch and Resume, asynchronous
-> Pause/Reset/Acknowledge, public scoped Stop and Full Stop, collision
+> I8 adds prepared multi-participant dispatch, asynchronous
+> Reset/Acknowledge, public scoped Stop and Full Stop, collision
 > containment, immutable terminal/fault truth, durable surveillance/recovery,
 > and scoped orphan reconciliation. Isaac and real operation remain I9/I10
 > work, and the historical aggregate launcher and packaged installation remain

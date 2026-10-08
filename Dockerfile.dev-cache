@@ -1,0 +1,19 @@
+# ROS-free diagnostic tooling only. Build via scripts/build-dev-cache-image.sh
+# to pin the existing dev image without rebuilding its dependency stack.
+ARG MANYFORGE_DEV_BASE=manyforge-dev:latest
+FROM ${MANYFORGE_DEV_BASE}
+ARG MANYFORGE_DEV_BASE_ID
+LABEL manyforge.dev-cache.base-image-id="${MANYFORGE_DEV_BASE_ID}"
+
+USER root
+# Debian Bookworm package pin; do not use this layer for ROS/Jazzy images.
+RUN test -n "${MANYFORGE_DEV_BASE_ID}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ccache=4.8+really4.7.5-1 \
+    && ccache --version \
+    && rm -rf /var/lib/apt/lists/*
+
+# Qualification remains cache-off even when a command explicitly uses ccache.
+# Only diagnostic-build.sh opts in by unsetting this variable.
+ENV CCACHE_DISABLE=1
+USER manyforge

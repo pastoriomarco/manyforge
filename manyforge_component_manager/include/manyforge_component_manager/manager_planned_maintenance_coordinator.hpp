@@ -14,13 +14,13 @@ namespace manyforge::component_manager {
 /// reconfiguration.
 ///
 /// This is deliberately a closed enumeration rather than a boolean: an
-/// operator-facing refusal must name the exact reason, and `paused`, `stopping`
-/// and `resetting` are each distinct from ordinary active execution.
+/// operator-facing refusal must name the exact reason, and `stopping`,
+/// `intervention_or_recovery` and `resetting` are each distinct from ordinary
+/// active execution.
 enum class ManagementIdleState {
   kIdle,
   kStarting,
   kActive,
-  kPaused,
   kStopping,
   kTerminalAwaitingReset,
   kInterventionOrRecovery,
@@ -97,7 +97,7 @@ struct ManagerPlannedMaintenanceResult final {
 ///      prepared Program binding, holds the configuration fence, and has the
 ///      durable intent;
 ///   2. this method refuses unless the affected surface is exactly idle, with a
-///      distinct typed refusal for active, paused, stopping and resetting;
+///      distinct typed refusal for each non-idle state;
 ///   3. the active plan is rechecked against the exact expected predecessor, so
 ///      a stale revision or identity is never destroyed;
 ///   4. admission is closed and proven closed.

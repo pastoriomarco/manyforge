@@ -71,6 +71,8 @@ class ILite6BrandLifecycleTransport {
 public:
   virtual ~ILite6BrandLifecycleTransport() = default;
 
+  // Bounded copy of the supervised observation cache; no service wait or
+  // controller effect. Production reads may be serialized by the adapter.
   [[nodiscard]] virtual XArmObservedState
   observe(std::int64_t now_ns) const = 0;
   [[nodiscard]] virtual XArmLifecycleCommandResult
@@ -150,9 +152,18 @@ private:
   Lite6BrandLifecyclePortConfig config_;
   core::IClock &clock_;
   std::unique_ptr<ILite6BrandLifecycleTransport> transport_;
+  // Serialize the bounded cache read with its classification. Dispatch never
+  // takes this mutex, so observation capture cannot wait for a command effect
+  // or prevent a Stop-direction primitive from reaching the transport.
+  std::mutex observation_mutex_;
   // Last intervention-requiring cause established from a vendor report. A
   // connected observation without a report cannot clear it.
   std::mutex cause_mutex_;
+  // Semantic generation and owner publication sequence are independently
+  // nondecreasing within the fenced transport occurrence. Repeated samples
+  // and heartbeat publications with unchanged semantic generation are valid.
+  std::uint64_t last_observation_generation_ = 0U;
+  std::uint64_t last_owner_publication_sequence_ = 0U;
   core::LifecycleBlockingCauseClassDTO last_intervention_cause_{
       core::LifecycleBlockingCauseClassDTO::kNone};
   // Unrequested mode/state change detection (guarded by cause_mutex_).

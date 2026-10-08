@@ -797,6 +797,143 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
+     StartingControllerIsNotAFaultButAReportedFaultDuringStartupIs) {
+  auto config = ros2_control_execution::Ros2ControlExecutionBackendConfig{};
+  config.node_name = "manyforge_runtime_handle_startup_test";
+  config.action_name =
+      "/manyforge_runtime_handle_startup_test/follow_joint_trajectory";
+  config.joint_state_topic = "/manyforge_runtime_handle_startup_test/joint_states";
+  config.required_joints = {"joint_1"};
+  config.transport_joint_names = {"source_joint_1"};
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  config.enable_jtc_speed_scaling_input = false;
+
+  core::FakeClock clock;
+  clock.set(1'000);
+  core::ManualScheduler scheduler;
+  auto sink = std::make_shared<NullExecutionStateSink>();
+  auto backend =
+      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, config);
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+
+  std::uint64_t activity = 0U;
+  const auto publish = [&](const bool controller_active,
+                           const bool hardware_active,
+                           std::vector<std::string> reasons) {
+    ros2_control_execution::ControllerBindingSnapshot snapshot;
+    snapshot.activity_generation = ++activity;
+    snapshot.contract_generation_id = "binding.generation";
+    snapshot.observed_timestamp_ns = clock.now();
+    snapshot.received_timestamp_ns = clock.now();
+    snapshot.fresh_until_ns = clock.now() + 1'000;
+    snapshot.controller_active = controller_active;
+    snapshot.hardware_active = hardware_active;
+    snapshot.controller_type_matches = true;
+    snapshot.claimed_interfaces_match = reasons.empty();
+    snapshot.state_interfaces_available = reasons.empty();
+    snapshot.conflicting_claims_absent = true;
+    snapshot.valid = reasons.empty();
+    snapshot.reason_codes = std::move(reasons);
+    backend->testing_publish_controller_binding_snapshot(std::move(snapshot));
+    const auto read = handle->ReadLifecycleSnapshot(
+        core::ControlDomainId("domain.arm"), clock.now());
+    EXPECT_TRUE(read.ok());
+    return read.value();
+  };
+  const auto fact = [](const RetainedExternallyManagedDomainSnapshot &snapshot,
+                       const std::string &id) {
+    for (const auto &value : snapshot.facts) {
+      if (value.lifecycle_fact_id.value() == id) {
+        return std::optional<core::LifecycleFactValueDTO>(value.value);
+      }
+    }
+    ADD_FAILURE() << "missing fact " << id;
+    return std::optional<core::LifecycleFactValueDTO>{};
+  };
+  const auto cause = [&](const RetainedExternallyManagedDomainSnapshot &snapshot) {
+    const auto value =
+        fact(snapshot, std::string(core::kLifecycleBlockingCauseFactId));
+    return value ? value->token_value.value_or("") : std::string();
+  };
+  const auto boolean = [&](const RetainedExternallyManagedDomainSnapshot &snapshot,
+                           const std::string &id) {
+    const auto value = fact(snapshot, id);
+    return value ? value->boolean_value : std::optional<bool>{};
+  };
+  const auto fault_present =
+      [&](const RetainedExternallyManagedDomainSnapshot &snapshot) {
+        return boolean(snapshot, "external.fault_present").value_or(true);
+      };
+
+  // Status the controller manager cannot deliver yet is availability.
+  auto snapshot = publish(false, false, {"controller_list_service_unavailable"});
+  EXPECT_EQ(cause(snapshot), "availability");
+  EXPECT_FALSE(fault_present(snapshot));
+
+  // Hardware not yet active and no controller spawned: fresh status that is
+  // simply not ready yet is no cause at all; readiness facts keep it waiting.
+  snapshot =
+      publish(false, false,
+              {"trajectory_controller_missing", "hardware_component_inactive",
+               "hardware_command_interfaces_unavailable",
+               "hardware_state_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "none");
+  EXPECT_FALSE(fault_present(snapshot));
+  EXPECT_NE(snapshot.component_state, core::ComponentLifecycleStateDTO::kFaulted);
+
+  // Hardware active, trajectory controller loaded but not yet active: its
+  // command interfaces are unclaimed. Still not ready, not a fault.
+  snapshot = publish(false, true,
+                     {"trajectory_controller_inactive",
+                      "trajectory_controller_claims_mismatch",
+                      "hardware_command_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "none");
+  EXPECT_FALSE(boolean(snapshot, "external.controller_configuration_ready")
+                   .value_or(true));
+  EXPECT_FALSE(fault_present(snapshot));
+  EXPECT_NE(snapshot.component_state, core::ComponentLifecycleStateDTO::kFaulted);
+
+  // An actual fault during startup still reports the fault: active hardware
+  // whose state interfaces are unavailable.
+  snapshot = publish(false, true,
+                     {"trajectory_controller_inactive",
+                      "hardware_state_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "fault");
+  EXPECT_TRUE(fault_present(snapshot));
+  EXPECT_EQ(snapshot.component_state, core::ComponentLifecycleStateDTO::kFaulted);
+  // Active controller and hardware without available command interfaces.
+  snapshot = publish(true, true, {"hardware_command_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "fault");
+  // A mismatched controller is a configuration fault even while starting.
+  snapshot = publish(false, true,
+                     {"trajectory_controller_inactive",
+                      "trajectory_controller_type_mismatch"});
+  EXPECT_EQ(cause(snapshot), "configuration");
+  EXPECT_TRUE(fault_present(snapshot));
+
+  // After the exact configuration was active, deactivated hardware stays
+  // ambiguous (`unknown`), while an inactive controller is availability that
+  // CCLC turns into `provider_lost` at the reached target.
+  snapshot = publish(true, true, {});
+  EXPECT_EQ(cause(snapshot), "none");
+  EXPECT_TRUE(snapshot.exact_controller_configuration_active);
+  snapshot = publish(true, false,
+                     {"hardware_component_inactive",
+                      "hardware_command_interfaces_unavailable",
+                      "hardware_state_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "unknown");
+  snapshot = publish(false, true,
+                     {"trajectory_controller_inactive",
+                      "hardware_command_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "availability");
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
      AdmissionOwnerFailsClosedWhenLifecycleReadbackIsUnavailable) {
   const auto runtime = isaac_runtime_configuration("lite6");
   auto selected = make_retained_isaac_ros2_control_backend_config(

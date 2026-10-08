@@ -26,8 +26,10 @@ inline constexpr std::size_t kMaxComponentIncidentVendorCodeBytes = 64U;
 inline constexpr std::size_t kMaxComponentIncidentSummaryBytes = 1024U;
 inline constexpr std::size_t kMaxComponentIncidentTimelineEntries = 32U;
 /// Every incident time is in the CCLC owner clock domain (the one of
-/// `accepted_at_ns`) and must stay an I-JSON safe integer.
-inline constexpr std::int64_t kMaxComponentIncidentTimeNs = 9'007'199'254'740'991LL;
+/// `accepted_at_ns`): a full-width nonnegative int64 (spec 210 §1.1). JSON
+/// carries it through `content_identity::nonnegative_int64_value` (a number
+/// up to 2^53-1, a canonical decimal string above); a negative time is
+/// invalid, never clamped.
 
 /// Durable history event kinds of the incident record (contract item 5).
 inline constexpr std::string_view kComponentIncidentEventKind = "component_incident";
@@ -153,7 +155,7 @@ struct ComponentIncidentRecoveryDTO final {
     return !incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
            !controllable_component_id.empty() &&
            lifecycle_cause_requires_intervention(cause_class) && !acknowledged_by.empty() &&
-           acknowledged_at_ns >= 0 && acknowledged_at_ns <= kMaxComponentIncidentTimeNs;
+           acknowledged_at_ns >= 0;
   }
 
   friend bool operator==(const ComponentIncidentRecoveryDTO&,

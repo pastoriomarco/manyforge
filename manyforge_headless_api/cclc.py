@@ -10,6 +10,8 @@ from typing import Any, Protocol
 
 import rfc8785
 
+from manyforge_behavior.json_scalars import MAXIMUM_SAFE_INTEGER, nonnegative_int64
+
 from .native import HeadlessApiError, strict_json_object
 from .private_transport import (
     PinnedRunRoot,
@@ -97,8 +99,6 @@ _MAX_INCIDENT_ID_BYTES = 128
 _MAX_INCIDENT_SUMMARY_BYTES = 1024
 _MAX_VENDOR_CODES = 16
 _MAX_VENDOR_CODE_BYTES = 64
-_MAX_INT64 = 2**63 - 1
-_MAX_SAFE_INTEGER = 2**53 - 1
 INCIDENT_EVENT_KINDS = frozenset(
     {"component_incident", "component_incident_acknowledged"}
 )
@@ -107,6 +107,21 @@ MAX_INCIDENT_EVENT_PAGE = 64
 
 def _is_int(value: Any) -> bool:
     return type(value) is int
+
+
+def _is_owner_ns(value: Any) -> bool:
+    """Owner-clock nanoseconds: full-width nonnegative int64 scalar.
+
+    A JSON number up to 2**53 - 1 or canonical decimal text up to 2**63 - 1
+    (the producer spells larger values as text). The value is forwarded
+    unchanged; only its spelling is checked.
+    """
+
+    try:
+        nonnegative_int64(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _member(value: Any, allowed: frozenset[str]) -> bool:
@@ -143,8 +158,7 @@ def _valid_incident(incident: Any) -> bool:
         and isinstance(codes, list)
         and len(codes) <= _MAX_VENDOR_CODES
         and all(_bounded_text(code, _MAX_VENDOR_CODE_BYTES) for code in codes)
-        and _is_int(incident["detected_at_ns"])
-        and 0 <= incident["detected_at_ns"] <= _MAX_INT64
+        and _is_owner_ns(incident["detected_at_ns"])
         and _bounded_text(summary, _MAX_INCIDENT_SUMMARY_BYTES)
         and unicodedata.is_normalized("NFC", summary)
         and incident["acknowledged"] is False
@@ -174,7 +188,7 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
             or not _member(target["requested_state"], _TARGET_STATES)
             or not _member(target["origin"], _TARGET_ORIGINS)
             or not _is_int(target["target_generation"])
-            or not 1 <= target["target_generation"] <= _MAX_INT64
+            or not 1 <= target["target_generation"] <= MAXIMUM_SAFE_INTEGER
         ):
             raise _invalid_lifecycle_fact("lifecycle_target")
     if "lifecycle_progress" in snapshot:
@@ -209,10 +223,7 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
             )
             or (
                 progress["waiting_since_ns"] is not None
-                and (
-                    not _is_int(progress["waiting_since_ns"])
-                    or not 0 <= progress["waiting_since_ns"] <= _MAX_INT64
-                )
+                and not _is_owner_ns(progress["waiting_since_ns"])
             )
             or type(progress["delayed"]) is not bool
             or not _valid_incident(progress["incident"])
@@ -248,8 +259,7 @@ def _validate_incident_recovery(
         or not _bounded_text(recovery["incident_id"], _MAX_INCIDENT_ID_BYTES)
         or not _member(recovery["cause_class"], _INCIDENT_CAUSE_CLASSES)
         or not _bounded_text(recovery["acknowledged_by"], 1024)
-        or not _is_int(recovery["acknowledged_at_ns"])
-        or not 0 <= recovery["acknowledged_at_ns"] <= _MAX_SAFE_INTEGER
+        or not _is_owner_ns(recovery["acknowledged_at_ns"])
         or recovery["controllable_component_id"] != component_id
         or result.get("acceptance") is not None
         or result.get("status") is not None
@@ -296,11 +306,10 @@ def _validate_incident_events(
         payload = event["payload"]
         if (
             not _is_int(sequence)
-            or not previous < sequence <= _MAX_SAFE_INTEGER
+            or not previous < sequence <= MAXIMUM_SAFE_INTEGER
             or not _member(event["event_kind"], INCIDENT_EVENT_KINDS)
             or not _bounded_text(event["incident_id"], _MAX_INCIDENT_ID_BYTES)
-            or not _is_int(event["occurred_at_ns"])
-            or not 0 <= event["occurred_at_ns"] <= _MAX_SAFE_INTEGER
+            or not _is_owner_ns(event["occurred_at_ns"])
             or not isinstance(payload, dict)
             or payload.get("incident_id") != event["incident_id"]
             or payload.get("event_kind") != event["event_kind"]
@@ -550,7 +559,7 @@ class CCLCOpenRequestClient:
 
         if (
             not _is_int(after_sequence)
-            or not 0 <= after_sequence <= _MAX_SAFE_INTEGER
+            or not 0 <= after_sequence <= MAXIMUM_SAFE_INTEGER
             or not _is_int(limit)
             or not 1 <= limit <= MAX_INCIDENT_EVENT_PAGE
         ):

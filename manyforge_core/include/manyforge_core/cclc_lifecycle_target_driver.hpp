@@ -15,7 +15,6 @@
 #include <manyforge_core/types/lifecycle_target.hpp>
 #include <map>
 #include <memory>
-#include <set>
 #include <string>
 #include <mutex>
 #include <optional>
@@ -134,12 +133,34 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
 /// CCLC-owned requested-target follower (ADR-0026 §7, 2026-10-08).
 ///
 /// Incidents (addendum 2): once a component reached its target on fresh
-/// status in the session, a lost/stale observation or `availability` becomes
-/// a `provider_lost` incident and any intervention class an incident of that
-/// class. The driver opens it once (durably), requests the Kernel's cell
-/// containment once, blocks all progress and, while it is open, appends any
-/// further unrequested change (the most recent cause becomes its cause). Only
-/// the operator's Recover closes it; then the policy-permitted steps run.
+/// status in the session (the durable `reached` marker, which survives an
+/// in-session owner replacement and a retaining Apply), a lost/stale
+/// observation or `availability` becomes a `provider_lost` incident and any
+/// intervention class an incident of that class. The driver requests the
+/// Kernel's cell containment once per incident before and independently of
+/// recording it, records it durably (retrying a failed record on later passes
+/// while progress stays blocked), and, while it is open, appends any further
+/// unrequested change (the most recent cause becomes its cause). Only the
+/// operator's Recover closes it; then the policy-permitted steps run.
+///
+/// Storage fails closed. Each pass reads its facts (target, retained causes,
+/// open incident, recovery generation) in one snapshot; unreadable facts
+/// block the component. A cause, reached marker or incident whose record
+/// fails is kept in memory and retried every pass: the cause keeps blocking,
+/// the unrecorded marker classifies the component as reached. Every such
+/// write names the recovery generation it was based on, and the journal
+/// refuses it once an operator Recover (or cancellation) advanced it, so a
+/// pass never re-retains, reopens or re-marks what a concurrent Recover
+/// cleared; the next pass re-evaluates on the Recover's facts.
+///
+/// Requested replacement: while a recorded, not yet adopted Apply plan
+/// replaces or removes the component, the component is starting over and
+/// opens no incident: its loss is `availability` waiting and a reported
+/// intervention class stays retained and blocking until the operator's
+/// Recover. Adoption resets the durable `reached` marker of a replaced
+/// component (a fresh startup phase); a component the Apply retains unchanged
+/// keeps it, and with it the incident rules. Only the Apply facts end the
+/// window, never a timer or an observation.
 ///
 /// From the achieved CCLC state and the brand plan catalog it computes the
 /// next intent toward each component's requested target, waits until that
@@ -177,12 +198,6 @@ class CCLCLifecycleTargetDriver final {
   /// Event-driven wakeup; never evaluates on the caller's thread.
   void Wake() noexcept;
 
-  /// Operator Prepare/Enable/Disable set the target (origin operator); a
-  /// Disable also cancels outstanding progression. Recover and
-  /// system-attributed requests change nothing and return `nullopt`.
-  [[nodiscard]] Result<std::optional<ComponentLifecycleTargetDTO>> RecordOperatorRequest(
-      const ComponentLifecycleIntentDTO& intent);
-
   /// Durable target plus owner-local progress for one component.
   [[nodiscard]] Result<ComponentLifecycleTargetViewDTO> ReadTargetView(
       const ControllableComponentId& component);
@@ -190,14 +205,11 @@ class CCLCLifecycleTargetDriver final {
   /// The operator's Recover of an open incident (contract item 3): an
   /// accepted, authorization-only result that closes the incident, clears the
   /// retained cause and wakes the driver; admissible while the cell is
-  /// latched because it dispatches nothing. An exact retransmission replays
-  /// the recorded result. `nullopt` when the intent is not an operator
-  /// Recover of an open (or this request's recovered) incident, so the
-  /// ordinary CCLC admission decides it.
+  /// latched because it dispatches nothing. The journal applies the ordinary
+  /// request identity, owner-epoch and replay checks. `nullopt` when the
+  /// intent is not an operator Recover of an open (or this request's
+  /// recovered) incident, so the ordinary CCLC admission decides it.
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> RecoverIncident(
-      const ComponentLifecycleIntentDTO& intent);
-  /// Read-only form of RecoverIncident for request-result reads.
-  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadIncidentRecovery(
       const ComponentLifecycleIntentDTO& intent);
   /// Durable incident history events for the historian pipe.
   [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> LoadIncidentEvents(
@@ -220,6 +232,15 @@ class CCLCLifecycleTargetDriver final {
 
     friend bool operator==(const AttemptBasis&, const AttemptBasis&) = default;
   };
+  /// A freshly observed intervention class whose durable record failed. It
+  /// blocks from memory as if retained and is re-recorded with the recovery
+  /// generation it was observed under until that succeeds, or until a stale
+  /// refusal shows the operator's Recover (or a cancellation) covers it.
+  struct UnrecordedCause final {
+    LifecycleBlockingCauseClassDTO cause_class{LifecycleBlockingCauseClassDTO::kUnknown};
+    std::int64_t observed_at_ns{};
+    std::uint64_t recovery_generation{};
+  };
   struct ComponentState final {
     std::uint64_t target_generation{};
     std::uint32_t step{};
@@ -240,11 +261,27 @@ class CCLCLifecycleTargetDriver final {
     std::optional<ComponentLifecycleProgressDTO> progress;
     /// Last fresh observation without a cause, per domain (incident record).
     std::map<ControlDomainId, ComponentIncidentObservationDTO> last_good;
-    /// This driver instance has itself observed the component fresh and
-    /// cause-free. Until then (startup, in-session host replacement, driver
-    /// restart with an inherited `reached`) missing status is re-establishment
-    /// waiting, never `provider_lost`.
-    bool observed_fresh{};
+    /// A detected incident whose containment was requested but whose durable
+    /// record failed; recording is retried with the same identity and the
+    /// recovery generation of the facts it was detected on.
+    std::optional<ComponentLifecycleIncidentDTO> unrecorded_incident;
+    std::uint64_t unrecorded_incident_generation{};
+    /// Recovery generation of the facts the current pass evaluates; every
+    /// durable write of the pass is conditional on it.
+    std::uint64_t recovery_generation{};
+    /// Intervention classes held only in memory (their record failed), per
+    /// domain, and the latest record failure that explains the block.
+    std::map<ControlDomainId, UnrecordedCause> unrecorded_causes;
+    std::optional<std::string> cause_record_error;
+    /// The component reached its present target but the durable marker
+    /// failed: the recovery generation it was reached under. Until it is
+    /// durable the component is classified as reached (fail closed).
+    std::optional<std::uint64_t> unrecorded_reached;
+  };
+  /// The Kernel's answer to one incident's containment request.
+  struct ContainmentOutcome final {
+    std::optional<ComponentIncidentContainmentReceiptDTO> receipt;
+    std::optional<std::string> error;
   };
   struct DomainCondition;
   /// What this pass may open a new incident for.
@@ -257,7 +294,9 @@ class CCLCLifecycleTargetDriver final {
     kAny,
   };
 
-  void EvaluateComponent(const ComponentLifecycleTargetDTO& target, ComponentState& state,
+  /// One component's pass. False when its target was cancelled since the
+  /// target list was read (it is no longer followed).
+  bool EvaluateComponent(const ComponentLifecycleTargetDTO& listed, ComponentState& state,
                          std::int64_t now_ns);
   /// Follows a pending or open request. True when this pass must stop.
   bool FollowInFlight(const ComponentLifecycleTargetDTO& target, ComponentState& state,
@@ -269,22 +308,49 @@ class CCLCLifecycleTargetDriver final {
                LifecycleBlockingCauseClassDTO cause, std::optional<std::string> reason,
                std::int64_t now_ns) const;
   /// Opens, extends or follows the component's incident from this pass's
-  /// observations. True when an incident is open (progress was published).
+  /// observations. True when this pass published progress and must stop: an
+  /// incident is open or detected, or a replaced component's loss is waiting.
   bool EvaluateIncident(const ComponentLifecycleTargetDTO& target, ComponentState& state,
                         const ComponentLifecycleCurrentSnapshotDTO& current,
                         const std::vector<DomainCondition>& conditions,
                         std::optional<ComponentIncidentRecordDTO> open,
-                        IncidentDetection detection, std::int64_t now_ns,
+                        IncidentDetection detection,
+                        std::optional<ComponentLifecycleIntentKindDTO> next_intent,
+                        std::int64_t now_ns,
                         LifecycleBlockingCauseClassDTO unexplained =
                             LifecycleBlockingCauseClassDTO::kNone);
+  /// Requests containment of `state.unrecorded_incident` (once) and records
+  /// it; a failed record keeps it for the next pass.
+  void ContainAndRecordIncident(ComponentState& state, std::int64_t now_ns);
   void PublishIncident(ComponentState& state, const ComponentLifecycleIncidentDTO& incident,
                        std::int64_t now_ns) const;
-  void RequestContainment(const ComponentIncidentRecordDTO& record, std::int64_t now_ns);
+  /// The Kernel's containment of one incident, requested at most once per
+  /// incident by this driver; a later call returns the remembered outcome.
+  const ContainmentOutcome& Contain(const ComponentLifecycleIncidentDTO& incident);
+  /// Writes the containment outcome into a still-pending incident record.
+  void RecordContainment(const ComponentIncidentRecordDTO& record, std::int64_t now_ns);
+  /// The current unadopted Apply replaces or removes the component, so it is
+  /// starting over. An unreadable fact explains nothing.
+  [[nodiscard]] bool ApplyReplacesComponent(const ControllableComponentId& component);
   [[nodiscard]] std::vector<DomainCondition> ObserveAllDomains(
       const ComponentLifecycleTargetDTO& target, ComponentState& state,
       const ComponentLifecycleCurrentSnapshotDTO& current,
       const std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained,
-      std::int64_t now_ns);
+      bool record_causes);
+  [[nodiscard]] Result<bool> WriteInterventionCause(const ControllableComponentId& component,
+                                                    const ControlDomainId& domain,
+                                                    const UnrecordedCause& cause);
+  /// Records a freshly observed intervention class under this pass's
+  /// recovery generation; a failed record keeps it in `unrecorded_causes`.
+  void RetainCause(ComponentState& state, const ControllableComponentId& component,
+                   const ControlDomainId& domain, LifecycleBlockingCauseClassDTO cause,
+                   std::int64_t observed_at_ns);
+  /// Re-records every unrecorded cause and adds each one not covered by a
+  /// Recover to `retained` for this pass.
+  void RetryUnrecordedCauses(ComponentState& state, const ControllableComponentId& component,
+                             std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained);
+  [[nodiscard]] Result<bool> WriteReached(const ControllableComponentId& component,
+                                          std::uint64_t recovery_generation);
   void ScheduleFallback(std::int64_t delay_ns);
   void WorkerLoop();
 
@@ -305,8 +371,9 @@ class CCLCLifecycleTargetDriver final {
   mutable std::mutex state_mutex_;
   std::map<ControllableComponentId, ComponentState> components_;
   bool any_in_flight_{};
-  /// Incidents whose containment this driver already requested (run lane).
-  std::set<std::string> containment_requested_;
+  /// Containment outcomes of incidents this driver already contained (run
+  /// lane), so neither a retried record nor a later pass requests it again.
+  std::map<std::string, ContainmentOutcome> containments_;
 
   std::shared_ptr<WakeState> wake_;
   std::mutex fallback_mutex_;
