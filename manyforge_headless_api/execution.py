@@ -2294,6 +2294,14 @@ class ExecutionEventPump:
         self._cclc = cclc
         self._component_condition_poll_seconds = component_condition_poll_seconds
         self._next_component_condition_poll_at = float("-inf")
+        # The short retry floor: no lifecycle read starts before it, even
+        # while a read is pending.
+        self._next_component_condition_retry_at = float("-inf")
+        # The core's `component_lifecycle_observation_pending`, as last
+        # reported by the alarm-source refresh this pump offers each
+        # iteration: the lifecycle source needs an observation of the active
+        # configuration, so the next read does not wait the ordinary period.
+        self._component_lifecycle_observation_pending = False
         self._component_conditions_failing = False
         # CCLC incident history (addendum 2 contract item 5): cursor per CCLC
         # owner epoch; the core deduplicates by (incident id, event kind).
@@ -2360,7 +2368,16 @@ class ExecutionEventPump:
         """
 
         try:
-            self._core.refresh_alarm_sources()
+            result = self._core.refresh_alarm_sources()
+            # Spec 530 §7.1: a configuration change is respected without
+            # polling. The core reports, without its lock, that the lifecycle
+            # source's quality became unknown (a registry replacement by any
+            # reader's refresh, or an unreachable CCLC) and no complete
+            # observation of the active configuration has been accepted since.
+            self._component_lifecycle_observation_pending = (
+                isinstance(result, dict)
+                and result.get("component_lifecycle_observation_pending") is True
+            )
         except Exception:
             if not self._alarm_refresh_failing:
                 self._alarm_refresh_failing = True
@@ -2392,18 +2409,32 @@ class ExecutionEventPump:
 
         Unknown quality leaves the whole Alarm Lifecycle Owner unreconciled,
         which blocks motion admission. An Apply that replaces the CCLC owner
-        makes it briefly unreachable, so until an observation of the current
-        scope is accepted the read repeats at the pump cadence (bounded below
-        by 0.1 s) instead of waiting a whole period after the owner returns.
+        makes it briefly unreachable, so until a complete observation of the
+        current scope is accepted the read repeats at the pump cadence
+        (bounded below by 0.1 s) instead of waiting a whole period after the
+        owner returns. The same short cadence applies from the moment the
+        core reports a pending lifecycle observation (a registry replacement
+        after an Apply, seen by any reader's refresh), so the read of the new
+        configuration does not wait out a period started under the old one.
+        An observation with an unread component (`incomplete`) is not
+        accepted either and is repeated at the same short cadence.
         """
 
         if self._cclc is None:
             return
         now = time.monotonic()
-        if now < self._next_component_condition_poll_at:
+        if now < self._next_component_condition_retry_at:
             return
-        self._next_component_condition_poll_at = now + min(
+        if (
+            not self._component_lifecycle_observation_pending
+            and now < self._next_component_condition_poll_at
+        ):
+            return
+        self._next_component_condition_retry_at = now + min(
             self._component_condition_poll_seconds, max(self._poll_seconds, 0.1)
+        )
+        self._next_component_condition_poll_at = (
+            self._next_component_condition_retry_at
         )
         try:
             scope = self._core.component_lifecycle_condition_scope()
@@ -2426,6 +2457,8 @@ class ExecutionEventPump:
                     "component lifecycle condition scope is invalid",
                 )
             if not component_ids and not source_registered:
+                # Nothing in scope and no source to reconcile.
+                self._component_lifecycle_observation_pending = False
                 self._next_component_condition_poll_at = (
                     now + self._component_condition_poll_seconds
                 )
@@ -2440,6 +2473,7 @@ class ExecutionEventPump:
                     graph_revision=graph_revision,
                 )
                 if result.get("status") in {"observed", "empty"}:
+                    self._component_lifecycle_observation_pending = False
                     self._next_component_condition_poll_at = (
                         now + self._component_condition_poll_seconds
                     )
@@ -2474,10 +2508,13 @@ class ExecutionEventPump:
             )
             # `scope_changed` (an Apply between the scope read and the
             # observation, or a snapshot CCLC took under the superseded
-            # configuration) and `configuration_unavailable` (no fresh,
-            # verified Manager publication to judge against) completed
-            # nothing; only an accepted observation waits the full period.
+            # configuration), `incomplete` (a component's snapshot could not
+            # be read, so quality is unchanged) and `configuration_unavailable`
+            # (no fresh, verified Manager publication to judge against)
+            # completed nothing; only an accepted observation waits the full
+            # period.
             if result.get("status") in {"observed", "empty"}:
+                self._component_lifecycle_observation_pending = False
                 self._next_component_condition_poll_at = (
                     now + self._component_condition_poll_seconds
                 )

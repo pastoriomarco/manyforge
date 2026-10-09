@@ -360,6 +360,7 @@ def _error_status(code: str) -> int:
             "cclc_request_namespace_refreshed",
             "cclc_request_admission_deferred",
             "persistent_key_request_replayed",
+            "unacknowledged_operator_alarms",
         }
     ):
         return 409
@@ -541,6 +542,12 @@ def create_app(
         ),
         incident_recorder=getattr(service, "record_client_incident", None),
     )
+    if alarm_attention is not None:
+        # Alarm projections carry the Kernel-held attention copy; a change of
+        # it republishes them (Composer enables Run only once the Kernel
+        # holds a reconciled projection of the active configuration).
+        service.kernel_attention_source = alarm_attention.kernel_held_attention
+        alarm_attention.set_kernel_held_observer(control_state_source.notify_cold)
     if event_pump is not None:
         event_pump.set_change_observer(control_state_source.notify_cold)
         event_pump.set_settled_observer(control_state_source.notify_motion_settled)

@@ -72,6 +72,7 @@ function snapshot(overrides: {
         },
       },
       schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      activeConfiguration: null,
       projectionGeneration: 4,
       projectionOwnerEpoch: 'headless.1',
       projectionOwnerId: 'headless-api',

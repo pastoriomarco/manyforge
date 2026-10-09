@@ -1,0 +1,11 @@
+[package]
+version = "0.1.0"
+category = "Robotics"
+title = "ManyForge Isaac Command Guard Foundation"
+description = "Pure bounded command-frame validation and final-boundary decision foundation."
+
+[[python.module]]
+name = "manyforge.isaac.command_guard"
+
+[settings]
+exts."manyforge.isaac.command_guard".enabled = false

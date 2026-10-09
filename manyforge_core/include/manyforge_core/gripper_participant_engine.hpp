@@ -63,12 +63,9 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
       const OperationId&, const ControlBindingId&) const override {
     return unsupported<ResolvedRuntimeScaleStatusDTO>();
   }
-  ExecutionStatus get_status() const override {
-    ExecutionStatus status;
-    status.state = ExecutionState::kFailed;
-    status.last_error = ErrorCode::kUnsupportedCapability;
-    return status;
-  }
+  /// A command participant has no motion phase; its command state is read
+  /// through get_gripper_status. Always Idle with no motion fact.
+  ExecutionStatus get_status() const override { return {}; }
   Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO) override {
     return unsupported<std::uint64_t>();
   }

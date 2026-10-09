@@ -518,10 +518,10 @@ GripperParticipantEngine::settle_addressed_participant_stop(
     assessment.evidence_refs = {stop.stop_certificate_id.value(), stop.stop_id.value()};
     command_session->stop_recovery_consumed = false;
     command_session->stop_settlement = AddressedParticipantStopSettlementDTO{
-        request.execution_id,     stop,
-        stage.operation_id,       stage.participant_id,
-        stage.controller_goal_id, stage.controller_goal_generation,
-        ExecutionState::kStopped, std::move(assessment)};
+        request.execution_id,       stop,
+        stage.operation_id,         stage.participant_id,
+        stage.controller_goal_id,   stage.controller_goal_generation,
+        std::move(assessment)};
     return Result<AddressedParticipantStopSettlementDTO>::Ok(*command_session->stop_settlement);
   }
   if (request.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {

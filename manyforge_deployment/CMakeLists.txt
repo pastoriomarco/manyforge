@@ -886,6 +886,7 @@ add_library(manyforge_deployment
   src/retention_qualified_deployment.cpp
   src/scenario_program_admission.cpp
   src/site_overlay_resolution.cpp
+  src/stop_deceleration_coherence_internal.cpp
   src/structural_model_preparation.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
@@ -1929,6 +1930,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_contract_registry PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_runtime_contract_registry
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_deceleration_coherence
+    test/test_stop_deceleration_coherence.cpp)
+  target_include_directories(test_stop_deceleration_coherence PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_stop_deceleration_coherence PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_stop_deceleration_coherence
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_ordinary_motion_jerk test/test_ordinary_motion_jerk.cpp)

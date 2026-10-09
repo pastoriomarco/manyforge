@@ -35,11 +35,6 @@ Result Submitted() noexcept
 {
   return {core::StopStageAttemptDispositionDTO::kDispatched, Refusal::kNone};
 }
-bool Within(double actual, double next, double tolerance) noexcept
-{
-  return std::isfinite(tolerance) && tolerance >= 0.0 &&
-         std::isfinite(actual) && std::isfinite(next) && std::abs(actual - next) <= tolerance;
-}
 }  // namespace
 
 ControllerMechanism::ControllerMechanism(ReceiverProfile profile)
@@ -111,7 +106,7 @@ bool ControllerMechanism::Dequeue(Event & event) noexcept
 }
 
 Result ControllerMechanism::Register(
-  const core::ExecutionGoalKey & key, const core::PreparedMotion & slot,
+  const core::ExecutionGoalKey & key, const core::PreparedMotionSlot & slot,
   EventKind kind, std::size_t previous, std::uint64_t previous_version) noexcept
 {
   // ordinary_mutex_ serializes ordinary producers. Allocate metadata before
@@ -119,13 +114,16 @@ Result ControllerMechanism::Register(
   if (!(key.binding == profile_.binding)) {
     return Refused(Refusal::kStaleKey);
   }
-  if (!(slot.key == key)) {
+  const auto & motion = slot.motion;
+  if (!(motion.key == key) ||
+    slot.sealed.participant_digest != motion.prepared_contract_digest)
+  {
     return Refused(Refusal::kSlotKeyMismatch);
   }
   if (!key.fence().nonzero() || key.operation_id.empty() || key.controller_goal_id.empty() ||
-    slot.joint_count != profile_.joints.size() ||
-    slot.trajectory.joint_names != profile_.joints ||
-    !(slot.command_realization == profile_.realization))
+    motion.joint_count != profile_.joints.size() ||
+    motion.trajectory.joint_names != profile_.joints ||
+    !(motion.command_realization == profile_.realization))
   {
     return Refused(Refusal::kInvalidInput);
   }
@@ -159,7 +157,7 @@ Result ControllerMechanism::Register(
       }
       // Retired strings/shared storage are destroyed outside the Stop lock.
       static_cast<void>(Enqueue(
-        {kind, i, metadata->version, &slot, key.fence(), previous, previous_version}));
+        {kind, i, metadata->version, &motion, key.fence(), previous, previous_version}));
       return Submitted();
     }
   } catch (...) {
@@ -169,7 +167,7 @@ Result ControllerMechanism::Register(
 }
 
 Result ControllerMechanism::Submit(
-  const core::ExecutionGoalKey & key, const core::PreparedMotion & slot) noexcept
+  const core::ExecutionGoalKey & key, const core::PreparedMotionSlot & slot) noexcept
 {
   std::lock_guard<std::mutex> lock(ordinary_mutex_);
   return Register(key, slot, EventKind::kSubmit, kCapacity, 0U);
@@ -177,7 +175,7 @@ Result ControllerMechanism::Submit(
 
 Result ControllerMechanism::Replace(
   const core::ExecutionGoalKey & key, const core::ExecutionGoalKey & next,
-  const core::PreparedMotion & slot) noexcept
+  const core::PreparedMotionSlot & slot) noexcept
 {
   std::lock_guard<std::mutex> lock(ordinary_mutex_);
   std::size_t index{};
@@ -315,34 +313,38 @@ bool ControllerMechanism::Install(const Event & event, std::int64_t now, bool re
   facts.version = event.version;
   facts.dispatch = {Phase::kConsumed, Effect::kKnownNoEffect};
   facts.goal_generation = event.goal.controller_goal_generation;
-  core::MotionStepState candidate;
-  core::MotionStepOutput initial;
-  if (!core::InstallMotionStep(
-      *event.slot, now, profile_.initial_scale, profile_.initial_scale_generation, candidate) ||
-    core::StepMotion(*event.slot, candidate, {now, nullptr, nullptr, {}}, initial) ==
-    core::MotionStepStatus::kCannotProceed)
-  {
-    Unreference(index, event.version);
-    return false;
-  }
   if (replacement) {
-    const auto & tolerance = event.slot->continuity_tolerance;
-    for (std::size_t j = 0; j < profile_.joints.size(); ++j) {
-      if (!Within(output_.command.position_rad[j], initial.command.position_rad[j],
-          tolerance.position_rad) ||
-        !Within(output_.command.velocity_rad_s[j], initial.command.velocity_rad_s[j],
-          tolerance.velocity_rad_s) ||
-        !Within(output_.command.acceleration_rad_s2[j], initial.command.acceleration_rad_s2[j],
-          tolerance.acceleration_rad_s2))
-      {
-        Unreference(index, event.version);
-        return false;
-      }
+    // The old goal has already consumed Stop and stepped at this exact tick.
+    // Core owns continuity, the replacement's time law and the retained Stop.
+    // Its alias-safe refusal leaves both authoritative values unchanged.
+    const auto result = core::InstallReplacementMotionStep(
+      *active_slot_, step_, output_, *event.slot, now, step_, output_);
+    if (!result.installed()) {
+      Unreference(index, event.version);
+      return false;
     }
     Unreference(active_, active_version_);
+  } else {
+    core::MotionStepState candidate;
+    core::MotionStepOutput initial;
+    if (!core::InstallMotionStep(
+        *event.slot, now, profile_.initial_scale, profile_.initial_scale_generation, candidate) ||
+      core::StepMotion(*event.slot, candidate, {now, nullptr, nullptr, {}}, initial) ==
+      core::MotionStepStatus::kCannotProceed)
+    {
+      Unreference(index, event.version);
+      return false;
+    }
+    step_ = candidate;
+    output_ = initial;
   }
-  step_ = candidate;
-  output_ = initial;
+  facts.step = output_.status;
+  facts.scale_generation = output_.consumed_scale_generation;
+  facts.stop_generation = output_.consumed_stop_generation;
+  if (step_.active_stop) {
+    facts.stop = {Phase::kConsumed, Effect::kNone};
+    facts.stop_command_active = true;
+  }
   active_ = index;
   active_version_ = event.version;
   active_slot_ = event.slot;
@@ -455,10 +457,16 @@ bool ControllerMechanism::Tick(
       const bool eligible = health_.host_lease_valid && !lease_containment_ &&
         records_[event.index].fence_version.load(std::memory_order_acquire) != event.version &&
         (replacing ? (active_ == event.previous && active_version_ == event.previous_version &&
-        facts_[active_].downstream == core::DownstreamFenceState::kOpen && !step_.active_stop) :
+        facts_[active_].downstream == core::DownstreamFenceState::kOpen) :
         active_ == kCapacity);
       if (eligible && Install(event, now, replacing)) {
-        Advance(now, pending_stops_[active_], pending_scales_[active_]);
+        // Installation already produced this tick's command. Only a pending
+        // input for the new key needs a zero-elapsed step before the one write.
+        if (pending_stops_[active_].version == active_version_ ||
+          pending_scales_[active_].version == active_version_)
+        {
+          Advance(now, pending_stops_[active_], pending_scales_[active_]);
+        }
       } else {
         // Installation refusal is consumption with known no command effect.
         // Preserve any more specific continuity/step diagnostic from Install.
@@ -532,8 +540,10 @@ bool ControllerMechanism::Tick(
         records_[active_].fence_version.store(active_version_, std::memory_order_release);
       } else if (loop_write) {
         current.realization.last_realized_sequence = current.realization.last_computed_sequence;
+        // Core clamps path time at the endpoint. A Stop replacement reports
+        // kStopped there; ordinary braking can stop before that endpoint.
         current.realization.final_command_realized =
-          output_.status == core::MotionStepStatus::kComputedEnd;
+          output_.path_time_s >= active_slot_->trajectory.waypoints.back().time_from_start_s;
         current.dispatch = {Phase::kRealized, Effect::kEffectObserved};
       } else {
         // Local handles changed, but their declared transport/session

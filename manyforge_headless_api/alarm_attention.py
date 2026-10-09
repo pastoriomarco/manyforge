@@ -34,11 +34,18 @@ publication, i.e. at most ``D``. The real-path qualification
 (process_tests/test_operator_alarm_motion_attention.py) prints the measured
 receipt intervals under core-lock contention, delayed Kernel responses and
 shutdown during an outstanding exchange.
+
+Kernel-held copy. The Kernel answers each accepted publication with the owner
+epoch and generation it now retains. The publisher keeps that acknowledged
+projection's identity (``kernel_held_attention``), and Headless names it as
+``kernel_attention`` in its alarm snapshots, so a client can wait for the
+Kernel's own admission state (reconciled, for the active configuration)
+instead of retrying refused motion during the ``P + D`` lag.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import logging
 import threading
@@ -75,6 +82,71 @@ class AttentionPublicationCounts:
     failed: int
 
 
+@dataclass(frozen=True)
+class KernelHeldAttention:
+    """The motion-attention projection the Kernel acknowledged retaining.
+
+    The Kernel answers each accepted publication with the owner epoch and
+    generation it now retains, and one generation of one epoch names exactly
+    one content, so the acknowledged projection is the Kernel's held copy.
+    Only its admission-relevant identity is kept: whether it is reconciled
+    and which active configuration it was judged against. Clients use it to
+    anticipate admission (spec 530 §11) without polling the Kernel: a Run is
+    admitted only once the Kernel holds a reconciled projection of the active
+    configuration, which lags the owner by up to ``P + D``.
+    """
+
+    owner_epoch: str
+    generation: int
+    reconciled: bool
+    #: ``{"retained_bundle_id", "graph_revision"}``, or None before the owner
+    #: observed a configuration.
+    active_configuration: dict[str, str] | None
+    #: Monotonic time the Kernel's acknowledgement was received.
+    acknowledged_at: float
+
+    def projection(self) -> dict[str, Any]:
+        """The public ``kernel_attention`` member (no receipt time)."""
+        return {
+            "active_configuration": (
+                None
+                if self.active_configuration is None
+                else dict(self.active_configuration)
+            ),
+            "generation": self.generation,
+            "owner_epoch": self.owner_epoch,
+            "reconciled": self.reconciled,
+        }
+
+
+def _held_from(projection: Mapping[str, Any], at: float) -> KernelHeldAttention | None:
+    configuration = projection.get("active_configuration")
+    if configuration is not None:
+        if not isinstance(configuration, Mapping):
+            return None
+        bundle = configuration.get("retained_bundle_id")
+        graph = configuration.get("graph_revision")
+        if not isinstance(bundle, str) or not isinstance(graph, str):
+            return None
+        configuration = {"graph_revision": graph, "retained_bundle_id": bundle}
+    owner_epoch = projection.get("owner_epoch")
+    generation = projection.get("generation")
+    reconciled = projection.get("reconciled")
+    if (
+        not isinstance(owner_epoch, str)
+        or type(generation) is not int
+        or type(reconciled) is not bool
+    ):
+        return None
+    return KernelHeldAttention(
+        owner_epoch=owner_epoch,
+        generation=generation,
+        reconciled=reconciled,
+        active_configuration=configuration,
+        acknowledged_at=at,
+    )
+
+
 class OperatorAlarmAttentionPublisher:
     """Dedicated periodic publisher of the owner's motion-attention view."""
 
@@ -106,6 +178,51 @@ class OperatorAlarmAttentionPublisher:
         self._published = 0
         self._abandoned = 0
         self._failed = 0
+        self._held: KernelHeldAttention | None = None
+        self._held_observer: Callable[[], None] | None = None
+
+    def set_kernel_held_observer(self, observer: Callable[[], None] | None) -> None:
+        """Observe a change of the Kernel-held projection's identity.
+
+        Called on the publisher thread when the acknowledged owner epoch,
+        generation, reconciliation or active configuration changes, or when
+        the held copy is no longer known to be current; never for an
+        unchanged heartbeat. The observer must not block.
+        """
+        if observer is not None and not callable(observer):
+            raise TypeError("kernel-held attention observer must be callable")
+        self._held_observer = observer
+
+    def kernel_held_attention(self) -> dict[str, Any] | None:
+        """The projection the Kernel last acknowledged, while still current.
+
+        None before the first acknowledgement, or once no acknowledgement has
+        arrived within the Kernel's freshness bound ``F``, after which the
+        Kernel itself treats its copy as stale.
+        """
+        with self._counts_lock:
+            held = self._held
+        if held is None or time.monotonic() - held.acknowledged_at > KERNEL_FRESHNESS_SECONDS:
+            return None
+        return held.projection()
+
+    def _record_held(self, held: KernelHeldAttention | None) -> None:
+        with self._counts_lock:
+            previous = self._held
+            self._held = held
+        before = None if previous is None else previous.projection()
+        after = None if held is None else held.projection()
+        if before == after:
+            return
+        observer = self._held_observer
+        if observer is None:
+            return
+        try:
+            observer()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "kernel-held attention observer failed"
+            )
 
     @property
     def counts(self) -> AttentionPublicationCounts:
@@ -129,12 +246,20 @@ class OperatorAlarmAttentionPublisher:
         except Exception:
             # The Kernel fails closed once the last publication ages out; a
             # transient owner or transport failure is retried next period.
-            abandoned = time.monotonic() >= deadline
+            now = time.monotonic()
+            abandoned = now >= deadline
             with self._counts_lock:
                 if abandoned:
                     self._abandoned += 1
                 else:
                     self._failed += 1
+                held = self._held
+            if (
+                held is not None
+                and now - held.acknowledged_at > KERNEL_FRESHNESS_SECONDS
+            ):
+                # The Kernel's copy is stale by now: no longer report it.
+                self._record_held(None)
             if not self._failing:
                 self._failing = True
                 logging.getLogger(__name__).warning(
@@ -145,6 +270,9 @@ class OperatorAlarmAttentionPublisher:
             return False
         with self._counts_lock:
             self._published += 1
+        # The Kernel acknowledged retaining exactly this epoch and generation
+        # (the transport verifies the acknowledgement names them).
+        self._record_held(_held_from(projection, time.monotonic()))
         if self._failing:
             self._failing = False
             logging.getLogger(__name__).info(
@@ -187,6 +315,7 @@ class OperatorAlarmAttentionPublisher:
 __all__ = [
     "AttentionPublicationCounts",
     "KERNEL_FRESHNESS_SECONDS",
+    "KernelHeldAttention",
     "OperatorAlarmAttentionPublisher",
     "PUBLICATION_DEADLINE_SECONDS",
     "PUBLICATION_PERIOD_SECONDS",

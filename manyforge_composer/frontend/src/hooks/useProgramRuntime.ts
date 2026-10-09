@@ -1682,14 +1682,16 @@ export function useProgramRuntime(
   ), [draftUnappliedReason, snapshot]);
 
   const alarms = snapshot?.alarms ?? null;
+  const activeConfiguration = snapshot?.runtime?.activeConfiguration ?? null;
   /** Operator-alarm attention that refuses Program motion on the exact
    * resources an operation reserves (spec 450 §5.2), from the owner's
-   * control-state alarm projection. Never applied to manual Robot Control. */
+   * control-state alarm projection and the Kernel's held copy of it for the
+   * active configuration. Never applied to manual Robot Control. */
   const motionAttentionBlock = useCallback(
     (resourceIds: readonly string[]): MotionAttentionBlock | null => (
-      evaluateMotionAttention(alarms, resourceIds)
+      evaluateMotionAttention(alarms, resourceIds, activeConfiguration)
     ),
-    [alarms],
+    [alarms, activeConfiguration],
   );
 
   return useMemo(() => ({

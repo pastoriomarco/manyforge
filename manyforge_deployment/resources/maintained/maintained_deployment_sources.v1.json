@@ -68,12 +68,12 @@
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
           "per_joint_max_deceleration_rad_s2": {
-            "joint1": 4.0,
-            "joint2": 4.0,
-            "joint3": 4.0,
-            "joint4": 4.0,
-            "joint5": 4.0,
-            "joint6": 4.0
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
           },
           "profile_id": "fault_spring_back_hold",
           "require_backend_confirmation": true,
@@ -83,12 +83,12 @@
           "allow_natural_completion_on_short_path": true,
           "deceleration_time_s": 1.0,
           "per_joint_max_deceleration_rad_s2": {
-            "joint1": 4.0,
-            "joint2": 4.0,
-            "joint3": 4.0,
-            "joint4": 4.0,
-            "joint5": 4.0,
-            "joint6": 4.0
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
           },
           "profile_id": "operator_soft_on_path",
           "require_backend_confirmation": true,
@@ -155,12 +155,12 @@
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
           "per_joint_max_deceleration_rad_s2": {
-            "joint1": 4.0,
-            "joint2": 4.0,
-            "joint3": 4.0,
-            "joint4": 4.0,
-            "joint5": 4.0,
-            "joint6": 4.0
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
           },
           "profile_id": "fault_spring_back_hold",
           "require_backend_confirmation": true,
@@ -170,12 +170,12 @@
           "allow_natural_completion_on_short_path": true,
           "deceleration_time_s": 1.0,
           "per_joint_max_deceleration_rad_s2": {
-            "joint1": 4.0,
-            "joint2": 4.0,
-            "joint3": 4.0,
-            "joint4": 4.0,
-            "joint5": 4.0,
-            "joint6": 4.0
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
           },
           "profile_id": "operator_soft_on_path",
           "require_backend_confirmation": true,

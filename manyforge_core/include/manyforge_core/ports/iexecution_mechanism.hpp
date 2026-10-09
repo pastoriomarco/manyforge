@@ -5,6 +5,7 @@
 #include <manyforge_core/execution/execution_knowledge.hpp>
 #include <manyforge_core/execution/motion_step.hpp>
 #include <manyforge_core/execution/prepared_motion.hpp>
+#include <manyforge_core/execution/prepared_motion_slot.hpp>
 #include <manyforge_core/types/participant_stop_stage.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -45,6 +46,32 @@ struct ExecutionMechanismFactStamp final {
   std::uint64_t source_sequence{};
   std::int64_t source_timestamp_ns{};
   std::int64_t received_local_ns{};
+};
+
+/// Boundary at which an adapter's computed commands count as realized.
+/// Mechanism-neutral: native = the actuator loop wrote them; Isaac = the
+/// bridge published them unsuppressed; xArm = the supervised session
+/// submitted them. A successful return that suppressed or coalesced a command
+/// is reported as such and never counts as realized. Realization is not
+/// downstream delivery, position reached or rest.
+enum class CommandRealizationBoundary : std::uint8_t {
+  kLoopInterfaceWrite = 0,
+  kTransportPublication,
+  kDeviceSessionSubmission,
+};
+
+/// Command-realization contract an adapter declares in its own code for its
+/// mechanism; completion and "scale applied" use exactly this rule.
+struct CommandRealizationContract final {
+  CommandRealizationBoundary boundary{CommandRealizationBoundary::kLoopInterfaceWrite};
+  /// The mechanism may suppress a write while returning success.
+  bool may_suppress{};
+  /// The mechanism may replace an unsent command by a newer one; skipped
+  /// sequences are reported separately from the submitted one.
+  bool may_coalesce{};
+
+  friend constexpr bool operator==(const CommandRealizationContract&,
+                                   const CommandRealizationContract&) = default;
 };
 
 /// Command-realization facts under the adapter's declared contract.
@@ -134,15 +161,24 @@ class IExecutionMechanism {
  public:
   virtual ~IExecutionMechanism() = default;
 
-  /// Hand a stable prepared slot to the loop. `slot.key` must equal `key`.
-  /// The caller keeps the slot alive until status reports it unreferenced.
-  [[nodiscard]] virtual ExecutionMechanismCallResult Submit(const ExecutionGoalKey& key,
-                                                            const PreparedMotion& slot) noexcept = 0;
-  /// Install a continuity-checked replacement under `next_key` (a newer goal
-  /// generation) in place of `key`.
+  /// Hand a stable prepared slot to the loop. `slot.motion.key` must equal
+  /// `key` and `slot.sealed.participant_digest` its
+  /// `prepared_contract_digest` (else kSlotKeyMismatch). The caller keeps the
+  /// slot alive and unmodified until status reports it unreferenced. The loop
+  /// reads only `slot.motion`; a transport adapter transmits only
+  /// `slot.sealed` (outside RT) and the receiver rebuilds the motion with the
+  /// shared Core builder.
+  [[nodiscard]] virtual ExecutionMechanismCallResult Submit(
+      const ExecutionGoalKey& key, const PreparedMotionSlot& slot) noexcept = 0;
+  /// Install a replacement under `next_key` (a newer goal generation) in
+  /// place of `key`, through `InstallReplacementMotionStep` at the loop's
+  /// installation tick: Stop and trip cursor preserved, continuity checked
+  /// against the actual emitted command, slider never applied twice. A
+  /// refused installation leaves `key` authoritative with its authorized
+  /// braking. Same slot rules and lifetime as `Submit`.
   [[nodiscard]] virtual ExecutionMechanismCallResult Replace(
       const ExecutionGoalKey& key, const ExecutionGoalKey& next_key,
-      const PreparedMotion& slot) noexcept = 0;
+      const PreparedMotionSlot& slot) noexcept = 0;
   /// Ask the loop to stop referencing the key's slot (retirement fact one).
   [[nodiscard]] virtual ExecutionMechanismCallResult Release(const ExecutionGoalKey& key) noexcept = 0;
 

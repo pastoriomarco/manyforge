@@ -1073,7 +1073,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:e35c5e277545738a7dd87bfa93d99acd4b554651f5d40d6e10551c67edd27bb0",
+  "deployment_revision": "sha256:c25f56ae3bbe75c85ec000b7b92864bc62da5a13f6e08038a39228d98f7c9e72",
   "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
   "desired_control_configurations": [
     {
@@ -1848,7 +1848,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -1859,7 +1859,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -1870,7 +1870,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -1881,7 +1881,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -1892,7 +1892,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -1903,7 +1903,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -1957,7 +1957,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -1968,7 +1968,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -1979,7 +1979,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -1990,7 +1990,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2001,7 +2001,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2012,7 +2012,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2066,7 +2066,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2077,7 +2077,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2088,7 +2088,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2099,7 +2099,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2110,7 +2110,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2121,7 +2121,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2175,7 +2175,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2186,7 +2186,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2197,7 +2197,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2208,7 +2208,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2219,7 +2219,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2230,7 +2230,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2284,7 +2284,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2295,7 +2295,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2306,7 +2306,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2317,7 +2317,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2328,7 +2328,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2339,7 +2339,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2393,7 +2393,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2404,7 +2404,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2415,7 +2415,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2426,7 +2426,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2437,7 +2437,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2448,7 +2448,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2502,7 +2502,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2513,7 +2513,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2524,7 +2524,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2535,7 +2535,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2546,7 +2546,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2557,7 +2557,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2611,7 +2611,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2622,7 +2622,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2633,7 +2633,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2644,7 +2644,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2655,7 +2655,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2666,7 +2666,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {

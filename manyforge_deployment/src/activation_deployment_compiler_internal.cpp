@@ -1,4 +1,5 @@
 #include "activation_deployment_compiler_internal.hpp"
+#include "stop_deceleration_coherence_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -772,6 +773,8 @@ CanonicalValue compile_activation_deployment(
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
     const auto &component = intent.components[index];
     const auto &profile = component_profiles[index];
+    const auto &model_urdf =
+        prepared_models[index].verified_asset.source_ir().urdf();
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
       const std::string topology_id =
@@ -948,6 +951,22 @@ CanonicalValue compile_activation_deployment(
               fail("controlled Stop limits miss joint " + joints[index]);
             }
             const auto &limit = *found->second;
+            // The one Stop deceleration limit per joint (the runtime derives
+            // both the operator and the fault Stop from it) must not be lower
+            // than the acceleration ordinary planning may use for that joint.
+            if (const auto *deceleration = std::get_if<double>(
+                    &member(limit, "max_deceleration_rad_s2", "limit").storage());
+                deceleration != nullptr) {
+              if (const auto error = stop_deceleration_coherence_error(
+                      component.component_id + "." + std::string(target) +
+                          ".controlled_stop",
+                      joints[index], *deceleration,
+                      planning_joint_acceleration_limit_rad_s2(model_urdf,
+                                                               joints[index]));
+                  error.has_value()) {
+                fail(*error);
+              }
+            }
             Object resource_limit{
                 {"resource_id", CanonicalValue(resource_id)},
                 {"max_deceleration", CanonicalValue(Object{

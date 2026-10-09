@@ -89,6 +89,53 @@ class HeldSettlementCall final {
   std::shared_ptr<State> state_{std::make_shared<State>()};
 };
 
+// Test scripts name a participant's ended execution with the former
+// ExecutionState terminal names. The engine reports them as the real
+// participant does: its working phase plus a fact; the addressed Kernel
+// derives the operation outcome.
+[[nodiscard]] bool scripted_ending(ExecutionState state) noexcept {
+  return state == ExecutionState::kCompleted || state == ExecutionState::kFailed ||
+         state == ExecutionState::kStopped || state == ExecutionState::kInterventionRequired ||
+         state == ExecutionState::kInterrupted;
+}
+
+[[nodiscard]] ParticipantExecutionFact scripted_fact(ExecutionState ending, ExecutionState phase,
+                                                     std::optional<ErrorDTO> error) {
+  const bool dispatched =
+      phase == ExecutionState::kExecuting || phase == ExecutionState::kStopping;
+  switch (ending) {
+    case ExecutionState::kCompleted:
+      return {ParticipantExecutionFactKind::kComputedCompletion,
+              ParticipantEffectKnowledge::kEffectSettled, std::move(error)};
+    case ExecutionState::kStopped:
+      return dispatched ? ParticipantExecutionFact{ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+                                                   ParticipantEffectKnowledge::kEffectSettled,
+                                                   std::move(error)}
+                        : ParticipantExecutionFact{ParticipantExecutionFactKind::kCancelledBeforeDispatch,
+                                                   ParticipantEffectKnowledge::kNoEffect,
+                                                   std::move(error)};
+    case ExecutionState::kInterventionRequired:
+    case ExecutionState::kInterrupted:
+      return {ParticipantExecutionFactKind::kLocalFailure,
+              ParticipantEffectKnowledge::kEffectUncertain, std::move(error)};
+    default:
+      return {ParticipantExecutionFactKind::kLocalFailure,
+              dispatched ? ParticipantEffectKnowledge::kEffectSettled
+                         : ParticipantEffectKnowledge::kNoEffect,
+              std::move(error)};
+  }
+}
+
+[[nodiscard]] ExecutionStatus participant_status(ExecutionStatus scripted, ExecutionState phase,
+                                                 std::optional<ErrorDTO> error) {
+  if (!scripted_ending(scripted.state)) return scripted;
+  scripted.fact = scripted_fact(scripted.state, phase, std::move(error));
+  scripted.state = phase == ExecutionState::kStopping ? ExecutionState::kExecuting : phase;
+  if (scripted.state == ExecutionState::kIdle || scripted_ending(scripted.state))
+    scripted.state = ExecutionState::kValidating;
+  return scripted;
+}
+
 class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                     public IResolvedPreparedParticipantExecutionEngine,
                                     public IMotionPreview,
@@ -137,6 +184,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     Trace("engine:fence_addressed_stop");
     if (status_at_stop_fence.has_value()) {
       std::lock_guard lock(status_mutex_);
+      if (!scripted_ending(status.state)) ended_phase = status.state;
       status = *status_at_stop_fence;
     }
     if (defer_prepared_dispatch_effect) {
@@ -175,6 +223,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     {
       std::lock_guard lock(status_mutex_);
+      if (!scripted_ending(status.state)) ended_phase = status.state;
       status.state = ExecutionState::kStopped;
       status.execution_id = request.execution_id;
     }
@@ -195,7 +244,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         request.execution_id,     certificate,
         stage.operation_id,       stage.participant_id,
         stage.controller_goal_id, stage.controller_goal_generation,
-        ExecutionState::kStopped, recovery_assessment};
+        recovery_assessment};
     if (return_mismatched_participant_stop_settlement) {
       settlement.controller_goal_generation =
           ControllerGoalGeneration(stage.controller_goal_generation.value() + 1U);
@@ -292,7 +341,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     ++cancel_prepared_motion_calls;
     Trace("engine:cancel_prepared_motion");
     if (cancel_prepared_motion_hook) cancel_prepared_motion_hook();
-    const auto prior = get_status().state;
+    const auto prior = get_status();
     {
       std::lock_guard lock(prepared_motion_mutex_);
       if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
@@ -315,8 +364,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     // Like the real engine, cancelling an already terminal preparation does
     // not publish its terminal a second time.
-    if (prior != ExecutionState::kStopped && prior != ExecutionState::kFailed) {
-      emit_transition(prior, prepared_cancel_terminal_state);
+    if (!prior.fact.has_value()) {
+      emit_transition(prior.state, prepared_cancel_terminal_state);
     }
     return Result<void>::Ok();
   }
@@ -363,6 +412,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
       std::uint64_t preparation_id) const override {
     ++observe_prepared_command_calls;
+    if (observe_prepared_command_hook) observe_prepared_command_hook();
+    if (observe_prepared_command_failure.has_value()) {
+      return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
+          *observe_prepared_command_failure);
+    }
     std::lock_guard lock(prepared_command_mutex_);
     if (!prepared_command_snapshot.has_value() ||
         prepared_command_snapshot->preparation_id != preparation_id) {
@@ -713,8 +767,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   ExecutionStatus get_status() const override {
     ++status_read_calls;
     std::lock_guard lock(status_mutex_);
-    return status;
+    return participant_status(status, ended_phase, ended_error);
   }
+
 
   KernelRecoveryAssessmentDTO get_recovery_assessment() const override {
     ++recovery_assessment_calls;
@@ -766,8 +821,15 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   void emit_transition(ExecutionState from, ExecutionState to,
                        std::optional<ErrorDTO> error = std::nullopt) {
+    deliver_event(record_transition(from, to, std::move(error)));
+  }
+
+  KernelEvent record_transition(ExecutionState from, ExecutionState to,
+                                std::optional<ErrorDTO> error) {
     {
       std::lock_guard lock(status_mutex_);
+      if (scripted_ending(to) && !scripted_ending(from)) ended_phase = from;
+      if (scripted_ending(to)) ended_error = error;
       status.state = to;
       status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
       if (error.has_value()) {
@@ -775,9 +837,20 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       }
     }
     runtime_scale.active = to == ExecutionState::kExecuting;
-    const KernelEvent event{
-        KernelEventType::kStateTransition, next_execution_id, 0, from, to, std::move(error), {}};
-    deliver_event(event);
+    if (!scripted_ending(to)) {
+      return KernelEvent{
+          KernelEventType::kStateTransition, next_execution_id, 0, from, to, std::move(error), {}};
+    }
+    const auto reported = get_status();
+    KernelEvent event{KernelEventType::kParticipantSettled,
+                      next_execution_id,
+                      0,
+                      reported.state,
+                      reported.state,
+                      std::move(error),
+                      {}};
+    event.participant_fact = reported.fact;
+    return event;
   }
 
   // Models KernelEventPublisher dispatch exactly: copy the callback set first,
@@ -787,22 +860,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       ExecutionState from, ExecutionState to,
       const std::function<void()>& captured_boundary,
       std::optional<ErrorDTO> error = std::nullopt) {
-    {
-      std::lock_guard lock(status_mutex_);
-      status.state = to;
-      status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
-      if (error.has_value()) {
-        status.last_error = ErrorCode::kExecutionAborted;
-      }
-    }
-    runtime_scale.active = to == ExecutionState::kExecuting;
-    const KernelEvent event{KernelEventType::kStateTransition,
-                            next_execution_id,
-                            0,
-                            from,
-                            to,
-                            std::move(error),
-                            {}};
+    const auto event = record_transition(from, to, std::move(error));
     const auto snapshot = CallbackSnapshot();
     captured_boundary();
     for (const auto& [id, callback] : snapshot) {
@@ -824,8 +882,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     {
       std::lock_guard lock(status_mutex_);
       status.last_error = ErrorCode::kExecutionAborted;
-      current = status.state;
     }
+    current = get_status().state;
     const KernelEvent event{KernelEventType::kErrorRaised,
                             next_execution_id,
                             0,
@@ -842,6 +900,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   void emit_collision(std::map<std::string, std::string> details = {}) {
     details.try_emplace("reason", "runtime_collision_detected");
+    details.try_emplace("in_collision", "true");
     const auto current = get_status().state;
     const KernelEvent event{KernelEventType::kCollisionDetected,
                             next_execution_id,
@@ -906,6 +965,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<void> next_runtime_scale_result = Result<void>::Ok();
   RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
   ExecutionStatus status{};
+  ExecutionState ended_phase{ExecutionState::kIdle};
+  std::optional<ErrorDTO> ended_error;
   std::optional<ExecutionStatus> status_at_stop_fence;
   mutable std::mutex status_mutex_;
   mutable std::mutex prepared_motion_mutex_;
@@ -929,6 +990,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::function<void()> cancel_prepared_motion_hook;
   std::function<void()> cancel_prepared_command_hook;
   mutable std::function<void()> observe_prepared_motion_hook;
+  mutable std::function<void()> observe_prepared_command_hook;
+  std::optional<ErrorDTO> observe_prepared_command_failure;
   std::function<void()> dispatch_prepared_command_hook;
   std::function<void()> translate_stop_stage_hook;
   std::function<void()> participant_stop_settlement_hook;
@@ -7921,6 +7984,22 @@ TEST(ResourceAddressedExecutionKernelTest, HeldManualAdmissionRetainsParentAndSt
     } else {
       ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() == 1; }));
     }
+    // The owner lets the Stop that won terminalize before retiring the Kernel:
+    // retirement first disconnects participant events, so a Stop still waiting
+    // on the cancelled preparation's terminal could never settle.
+    std::optional<StopStatusDTO> settled;
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = kernel.get_operation_state(admitted.value().operation_id);
+      if (!state.ok() || !state.value().active_stop_id.has_value()) return false;
+      const auto status = kernel.get_stop_status(*state.value().active_stop_id);
+      if (!status.ok() || !status.value().stop_certificate.has_value()) return false;
+      settled = status.value();
+      return true;
+    }));
+    EXPECT_EQ(settled->state, StopStatusStateDTO::kSucceeded);
+    const auto stopped_state = kernel.get_operation_state(admitted.value().operation_id);
+    ASSERT_TRUE(stopped_state.ok());
+    EXPECT_EQ(stopped_state.value().state, OperationStateKind::kStopped);
     EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
   }
 }
@@ -10186,6 +10265,83 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto status = kernel.get_stop_status(stopped.value().stop_id);
   ASSERT_TRUE(status.ok()) << status.error().message;
   ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+  EXPECT_EQ(certificate.value().scope_entries.front().dispatch_state,
+            StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+  EXPECT_TRUE(certificate.value().attempted_stage_results.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopWaitingOnCommandPreparationIsWokenWhenThePreparationBorrowEnds) {
+  // A Stop accepted during the Prepare call has no product to cancel yet; it
+  // waits for that call and the following prepared read to end. Ending the
+  // last borrow is that Stop's only remaining wakeup: here the read fails, so
+  // no dispatch barrier runs, and the manual clock never expires the Stop.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  engine.observe_prepared_command_failure =
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+               "injected prepared command read failure",
+               {{"reason", "injected_prepared_command_read_failure"}}};
+  std::promise<void> prepare_entered;
+  std::promise<void> release_prepare;
+  auto release_future = release_prepare.get_future().share();
+  engine.prepare_command_hook = [&] {
+    prepare_entered.set_value();
+    release_future.wait();
+  };
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                 CoordinateKind::kLinear, schema),
+                    engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  auto executing =
+      std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+  ASSERT_EQ(prepare_entered.get_future().wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  const OperationAcceptedDTO expected{RequestId("request.command.1"),
+                                      RequestReplayStatusDTO::kAcceptedNew,
+                                      OperationId("operation.kernel.epoch.1.1"),
+                                      OperationRevision(1U),
+                                      {},
+                                      0};
+  const auto stopped = kernel.stop(stop_request("request.command.prepare.stop", expected, 1U));
+  if (!stopped.ok()) release_prepare.set_value();
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  // The first Stop pass publishes its scope in the same lock hold in which it
+  // found the Prepare call in flight and chose to wait for it.
+  const bool stop_waits_on_prepare = wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && !status.value().scope_entries.empty();
+  });
+  release_prepare.set_value();
+  ASSERT_TRUE(stop_waits_on_prepare);
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(engine.observe_prepared_command_calls.load(), 1);
+
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  EXPECT_EQ(engine.cancel_prepared_command_calls.load(), 1);
+  EXPECT_EQ(engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(engine.command_calls, 0);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  // The injected read failure is retained as participant evidence only when it
+  // is recorded before the Stop's settling pass, so the certificate result is
+  // not asserted here; settlement without any effect is.
   const auto certificate =
       kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
   ASSERT_TRUE(certificate.ok()) << certificate.error().message;
@@ -18285,6 +18441,252 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, CompositionWithoutAlarmO
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
   ASSERT_TRUE(kernel.execute(motion_operation("alarm.unconfigured")).ok());
+}
+
+
+// --- Track 1 step 3: participant facts, Stop-path collisions -----------------
+
+[[nodiscard]] ExecutionStatus fact_status(std::uint64_t execution_id, ExecutionState phase,
+                                          ParticipantExecutionFact fact) {
+  ExecutionStatus status;
+  status.state = phase;
+  status.execution_id = execution_id;
+  status.fact = std::move(fact);
+  return status;
+}
+
+// The addressed Kernel, not the participant, commits operation outcomes from
+// the reported facts. The planning-deadline fact keeps today's Stopped outcome.
+TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromParticipantFacts) {
+  struct Case {
+    const char* name;
+    ExecutionState phase;
+    ParticipantExecutionFact fact;
+    OperationStateKind expected;
+  };
+  const ErrorDTO timeout{"planning_timeout", "Planning timed out", {}};
+  const ErrorDTO failure{"validation_collision", "collision", {{"reason", "validation_failed"}}};
+  const std::vector<Case> cases{
+      {"completion", ExecutionState::kExecuting,
+       {ParticipantExecutionFactKind::kComputedCompletion,
+        ParticipantEffectKnowledge::kEffectSettled, std::nullopt},
+       OperationStateKind::kCompleted},
+      {"planning_deadline", ExecutionState::kPlanning,
+       {ParticipantExecutionFactKind::kPlanningDeadlineExpired, ParticipantEffectKnowledge::kNoEffect,
+        timeout},
+       OperationStateKind::kStopped},
+      {"local_failure", ExecutionState::kValidating,
+       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect, failure},
+       OperationStateKind::kFailed},
+      {"uncertain_effect", ExecutionState::kExecuting,
+       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kEffectUncertain,
+        failure},
+       OperationStateKind::kInterventionRequired},
+      {"preempted_without_stop", ExecutionState::kExecuting,
+       {ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+        ParticipantEffectKnowledge::kEffectSettled, std::nullopt},
+       OperationStateKind::kInterventionRequired},
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.name);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation(std::string("request.fact.") + item.name));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    {
+      std::lock_guard lock(engine.status_mutex_);
+      engine.status = fact_status(engine.next_execution_id, item.phase, item.fact);
+    }
+    KernelEvent settled{KernelEventType::kParticipantSettled,
+                        engine.next_execution_id,
+                        0,
+                        item.phase,
+                        item.phase,
+                        item.fact.error,
+                        {}};
+    settled.participant_fact = item.fact;
+    engine.deliver_event(settled);
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    EXPECT_EQ(state.value().participants.front().state, item.expected);
+    // The existing operation aggregate keeps its rule: a failed participant
+    // makes the operation InterventionRequired.
+    EXPECT_EQ(state.value().state, item.expected == OperationStateKind::kFailed
+                                       ? OperationStateKind::kInterventionRequired
+                                       : item.expected);
+    if (item.fact.error.has_value()) {
+      ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+      EXPECT_EQ(*state.value().participants.front().terminal_error, *item.fact.error);
+    }
+  }
+}
+
+// Parity with the former participant Stop workers: a collision observed while
+// a Stop is braking on-path aborts that stage at once (no stage deadline),
+// engages the strongest authorized stage and ends InterventionRequired with
+// the collision as the participant's cause.
+TEST(ResourceAddressedExecutionKernelTest,
+     CollisionDuringOnPathStopEscalatesToStrongestStageAndEndsInterventionRequired) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  HeldSettlementCall on_path;
+  engine.translate_stop_stage_hook = [hold = on_path.Blocker(),
+                                      calls = std::make_shared<std::atomic<unsigned>>(0)] {
+    if (calls->fetch_add(1U) == 0U) hold();
+  };
+  const auto operation = kernel.execute(motion_operation("request.stop-path-collision"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto stopped =
+      kernel.stop(stop_request("request.stop-path-collision.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(on_path.Entered());
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.participant_stop_profile->stop_mode,
+            MotionInterruptStopMode::kSoftOnPath);
+
+  // No owner-clock advance: escalation is immediate, not the stage deadline.
+  engine.emit_collision({{"contact_a", "component/robot/body/tool/collision/0"},
+                         {"contact_b", "scene/fixture/shape/0"}});
+  ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 2; },
+                         std::chrono::seconds(4)));
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.stage_commands
+                .at(engine.last_stop_stage->stage_index)
+                .resolved_stage.stage_kind,
+            StopEscalationStageKind::kSoftwareHard);
+  on_path.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id).value();
+  const auto certificate =
+      kernel.get_stop_certificate(status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  const auto latch = kernel.get_stop_fault_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+  const auto state = kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  const auto& participant = state.value().participants.front();
+  EXPECT_EQ(participant.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(participant.terminal_error.has_value());
+  EXPECT_EQ(participant.terminal_error->details.at("reason"), "stop_path_collision");
+  EXPECT_EQ(participant.terminal_error->details.at("contact_a"),
+            "component/robot/body/tool/collision/0");
+  EXPECT_EQ(participant.terminal_error->details.at("contact_b"), "scene/fixture/shape/0");
+}
+
+// The same applies while the runtime-collision containment brakes through
+// its spring-back replacement: a further collision on that path engages the
+// strongest stage at once and the operation ends InterventionRequired.
+TEST(ResourceAddressedExecutionKernelTest,
+     CollisionDuringSpringBackReplacementEscalatesToStrongestStageAndEndsInterventionRequired) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  HeldSettlementCall spring_back;
+  engine.translate_stop_stage_hook = [hold = spring_back.Blocker(),
+                                      calls = std::make_shared<std::atomic<unsigned>>(0)] {
+    if (calls->fetch_add(1U) == 0U) hold();
+  };
+  const auto operation = kernel.execute(motion_operation("request.spring-back-collision"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  engine.emit_collision({{"contact_a", "component/robot/body/link4/collision/0"},
+                         {"contact_b", "scene/wall/shape/0"}});
+  ASSERT_TRUE(spring_back.Entered());
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.participant_stop_profile->stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  const auto stop_id = kernel.get_operation_state(operation.value().operation_id)
+                           .value()
+                           .active_stop_id;
+  ASSERT_TRUE(stop_id.has_value());
+
+  engine.emit_collision({{"contact_a", "component/robot/body/link5/collision/0"},
+                         {"contact_b", "scene/wall/shape/0"}});
+  ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 2; },
+                         std::chrono::seconds(4)));
+  EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.stage_commands
+                .at(engine.last_stop_stage->stage_index)
+                .resolved_stage.stage_kind,
+            StopEscalationStageKind::kSoftwareHard);
+  spring_back.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(*stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto state = kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+            "stop_path_collision");
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("contact_a"),
+            "component/robot/body/link5/collision/0");
+}
+
+// A collision fact after the Stop has committed its terminal is evidence only:
+// it neither reopens that Stop nor opens another one.
+TEST(ResourceAddressedExecutionKernelTest, CollisionAfterTerminalStopDoesNotReopenIt) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.late-collision"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto stopped =
+      kernel.stop(stop_request("request.late-collision.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto before = kernel.get_operation_state(operation.value().operation_id).value();
+  ASSERT_EQ(before.state, OperationStateKind::kStopped);
+  const auto stage_calls = engine.translate_stop_stage_calls.load();
+
+  engine.emit_collision({{"contact_a", "component/robot/body/tool/collision/0"},
+                         {"contact_b", "scene/workpiece/shape/0"}});
+  scheduler.advance_to(clock.now());
+  const auto after = kernel.get_operation_state(operation.value().operation_id).value();
+  EXPECT_EQ(after.state, OperationStateKind::kStopped);
+  EXPECT_EQ(after.operation_revision, before.operation_revision);
+  EXPECT_EQ(after.active_stop_id, before.active_stop_id);
+  EXPECT_EQ(after.participants.front().terminal_error, before.participants.front().terminal_error);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), stage_calls);
+  EXPECT_EQ(kernel.get_stop_status(stopped.value().stop_id).value().state,
+            StopStatusStateDTO::kSucceeded);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
 }
 
 }  // namespace

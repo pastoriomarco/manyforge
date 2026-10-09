@@ -274,6 +274,10 @@ class HeadlessService:
         self.cell_admission = cell_admission
         self.cclc = cclc
         self.activation_preparer = activation_preparer
+        # The motion-attention projection the Kernel acknowledged holding
+        # (OperatorAlarmAttentionPublisher.kernel_held_attention); None in a
+        # composition without the publisher.
+        self.kernel_attention_source: Callable[[], dict[str, Any] | None] | None = None
         # Admission bound only: exact node attempts whose advisory native
         # preview is in flight (see program_node_correction_preview).
         self._node_previews_lock = Lock()
@@ -2227,11 +2231,31 @@ class HeadlessService:
         states: Sequence[str] = (),
         ordering: str = "default",
     ) -> dict[str, Any]:
-        return self.core.alarm_snapshot(
+        snapshot = self.core.alarm_snapshot(
             limit=limit,
             states=states,
             ordering=ordering,
         )
+        return self._with_kernel_attention(snapshot)
+
+    def _with_kernel_attention(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Add the Kernel-held attention copy to an owner snapshot.
+
+        The owner's `reconciled` reaches the Kernel only up to `P + D` later
+        (spec 530 §11), and the Kernel admits by its held copy alone. The
+        `kernel_attention` member names that copy (owner epoch, generation,
+        `reconciled`, `active_configuration`) as the Kernel last acknowledged
+        it, or null when none is known to be current, so a client can wait
+        for the Kernel's admission state instead of retrying refusals.
+        """
+        source = self.kernel_attention_source
+        held = None
+        if source is not None:
+            try:
+                held = source()
+            except Exception:  # noqa: BLE001 - presentation only; fail closed
+                held = None
+        return {**snapshot, "kernel_attention": held}
 
     def acknowledge_alarm(
         self,

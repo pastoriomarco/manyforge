@@ -7,7 +7,11 @@
  */
 
 import type { CycleRecoveryActionId, CycleRecoveryOffer } from '../types/api';
-import type { AlarmMotionAttentionMember, OperatorAlarmSnapshot } from '../types/headless';
+import type {
+  ActiveConfigurationIdentity,
+  AlarmMotionAttentionMember,
+  OperatorAlarmSnapshot,
+} from '../types/headless';
 import {
   type OperatorAlarmRefusalCode,
   operatorAlarmRefusalMessage,
@@ -37,14 +41,42 @@ function gates(member: AlarmMotionAttentionMember, resources: ReadonlySet<string
 }
 
 /**
+ * Whether the Kernel holds a reconciled projection of the owner's epoch for
+ * `activeConfiguration`. The Kernel admits by its held copy alone, which
+ * lags the owner snapshot by up to one publication period plus its deadline
+ * (spec 530 §11): after an Apply, or when the owner reconciles, the owner
+ * snapshot may already read reconciled while the Kernel still refuses.
+ */
+export function kernelAttentionAvailable(
+  alarms: OperatorAlarmSnapshot,
+  activeConfiguration: ActiveConfigurationIdentity | null,
+): boolean {
+  const held = alarms.kernelAttention;
+  return held !== null
+    && held.reconciled
+    && held.ownerEpoch === alarms.ownerEpoch
+    && activeConfiguration !== null
+    && held.activeConfiguration !== null
+    && held.activeConfiguration.retainedBundleId === activeConfiguration.retainedBundleId
+    && held.activeConfiguration.graphRevision === activeConfiguration.graphRevision;
+}
+
+/**
  * Why the owner's attention projection refuses motion on `resourceIds` (the
  * exact resources the operation reserves), or null when it admits it.
+ * `activeConfiguration` is the configuration Manager publishes as active;
+ * motion is anticipated only once the Kernel holds a reconciled projection
+ * of it.
  */
 export function motionAttentionBlock(
   alarms: OperatorAlarmSnapshot | null | undefined,
   resourceIds: readonly string[],
+  activeConfiguration: ActiveConfigurationIdentity | null,
 ): MotionAttentionBlock | null {
-  if (alarms === null || alarms === undefined || !alarms.reconciled) {
+  if (
+    alarms === null || alarms === undefined || !alarms.reconciled
+    || !kernelAttentionAvailable(alarms, activeConfiguration)
+  ) {
     const code = 'operator_alarm_state_unavailable';
     return { code, message: operatorAlarmRefusalMessage(code) ?? code, members: [] };
   }

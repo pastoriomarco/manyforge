@@ -6,6 +6,7 @@
 #include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/execution/execution_goal_key.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
@@ -19,47 +20,20 @@ namespace manyforge::core {
 /// 600 bytes. Preparation refuses a participant with more resources.
 inline constexpr std::size_t kMaxMotionJoints = 16U;
 
-/// Exact interpolation selected at Prepare for every segment. Preparation
-/// refuses a trajectory whose derivative data cannot support it; the step
-/// never downgrades on missing derivatives (unlike the legacy sampler's
-/// success-side fallback).
+/// Exact interpolation of every segment. The builder always selects quintic:
+/// a sealed trajectory with runtime scale bounds carries complete P/V/A knots
+/// (prepared trajectory codec). The step never downgrades per segment
+/// (unlike the legacy sampler's success-side fallback).
 enum class MotionInterpolation : std::uint8_t {
   kLinear = 1,
   kCubicHermite = 3,
   kQuintic = 5,
 };
 
-/// Boundary at which an adapter's computed commands count as realized.
-/// Mechanism-neutral: native = the actuator loop wrote them; Isaac = the
-/// bridge published them unsuppressed; xArm = the supervised session
-/// submitted them. A successful return that suppressed or coalesced a command
-/// is reported as such and never counts as realized. Realization is not
-/// downstream delivery, position reached or rest.
-enum class CommandRealizationBoundary : std::uint8_t {
-  kLoopInterfaceWrite = 0,
-  kTransportPublication,
-  kDeviceSessionSubmission,
-};
-
-/// Adapter-declared command-realization contract, sealed into the prepared
-/// motion so completion and "scale applied" use exactly this rule.
-struct CommandRealizationContract final {
-  CommandRealizationBoundary boundary{CommandRealizationBoundary::kLoopInterfaceWrite};
-  /// The mechanism may suppress a write while returning success.
-  bool may_suppress{};
-  /// The mechanism may replace an unsent command by a newer one; skipped
-  /// sequences are reported separately from the submitted one.
-  bool may_coalesce{};
-
-  friend constexpr bool operator==(const CommandRealizationContract&,
-                                   const CommandRealizationContract&) = default;
-};
-
-/// Permissible tick-delay envelope. Within it the step advances normally;
-/// beyond it the step reports the delay. The late-tick response (bounded
-/// advance, hold or containment through Stop) is not fixed yet and is
-/// qualified in the experiment. Stop deadlines always use actual monotonic
-/// elapsed time, never a capped advance.
+/// Tick-delay envelope read by `StepMotion` (within it the step advances
+/// normally; beyond it the step reports the delay and caps the advance). Not
+/// derived by `BuildPreparedMotionSlot`: it exists only for the step's
+/// in-loop braking path, removed with the native loop step.
 struct MotionTickEnvelope final {
   std::int64_t nominal_period_ns{};
   std::int64_t max_delay_ns{};
@@ -68,22 +42,23 @@ struct MotionTickEnvelope final {
                                    const MotionTickEnvelope&) = default;
 };
 
-/// Tolerance for installing an off-tick replacement plan (spring-back or a
-/// braking profile the governor cannot express): its initial state must
-/// match the actual loop state within these bounds, otherwise installation is
-/// refused and the Kernel escalates.
+/// Continuity tolerance for installing a replacement motion
+/// (`InstallReplacementMotionStep`): the replacement's initial command must
+/// match the command the loop emitted at the installation tick, and under a
+/// Stop its last waypoint must be at rest. Both sides come from the same
+/// in-process computation, so this absorbs floating-point rounding only.
 struct MotionContinuityTolerance final {
   double position_rad{};
   double velocity_rad_s{};
   double acceleration_rad_s2{};
-
-  friend constexpr bool operator==(const MotionContinuityTolerance&,
-                                   const MotionContinuityTolerance&) = default;
 };
+inline constexpr MotionContinuityTolerance kMotionContinuityTolerance{1e-9, 1e-9, 1e-9};
 
 /// Cold, immutable, NRT-owned product of Prepare, built once from the sealed
-/// `PreparedOperationParticipantDTO` (identified by its digest). Never
-/// modified after construction; no slider update rescans or replans it.
+/// `PreparedOperationParticipantDTO` (identified by its digest) by the one
+/// shared builder `BuildPreparedMotionSlot` (prepared_motion_builder.hpp), in
+/// the host and in every receiver alike. Never modified after construction;
+/// no slider update rescans or replans it.
 ///
 /// Lifetime: NRT allocates and reclaims. The loop borrows it through a stable
 /// slot (`IExecutionMechanism::Submit`) and NRT reclaims only after the loop
@@ -99,36 +74,30 @@ struct PreparedMotion final {
   MotionInterpolation interpolation{MotionInterpolation::kQuintic};
   std::uint8_t joint_count{};
 
-  /// The trajectory's sealed time-law bounds, including the Stop path-rate
-  /// certificate (`max_stop_path_rate`).
+  /// The trajectory's sealed time-law bounds, unchanged.
   TrajectoryRuntimeScaleBoundsDTO runtime_scale_bounds{};
   /// Ordinary governor bounds derived from `runtime_scale_bounds`.
   detail::RuntimeScaleBounds governor_bounds{};
-  /// Governor bounds for on-path braking under the selected Stop policy.
+  /// Ceiling `StepMotion` applies to a `StopTransition`'s braking bounds. Not
+  /// derived by `BuildPreparedMotionSlot`: it exists only for the step's
+  /// in-loop braking path, removed with the native loop step.
   detail::RuntimeScaleBounds stop_braking_bounds{};
-  /// Worst-case on-path braking duration under `stop_braking_bounds` from any
-  /// reachable scale/rate. Preparation refuses when it does not fit the
-  /// selected policy's Stop budget.
-  std::int64_t worst_case_on_path_braking_ns{};
 
-  /// Effective per-joint limits (index < joint_count); missing jerk means
-  /// jerk is not qualified, never an invented cap.
-  std::array<detail::TrajectoryDerivativeLimits, kMaxMotionJoints> effective_limits{};
+  /// The participant's resolved per-resource dynamics caps (index <
+  /// joint_count), as planned; an absent value means no cap from any source.
+  std::array<JointDynamicsLimitDTO, kMaxMotionJoints> effective_limits{};
 
   StateAuthorityClass state_authority{StateAuthorityClass::kMeasured};
-  CommandRealizationContract command_realization{};
   MotionTickEnvelope tick_envelope{};
-  MotionContinuityTolerance continuity_tolerance{};
 
-  /// Authority-specific final-position check (completion).
+  /// Final-position check (completion): the motion request's joint position
+  /// tolerance.
   std::array<double, kMaxMotionJoints> final_position_tolerance_rad{};
-  /// Rest evidence needs position convergence as well as velocity.
-  std::array<double, kMaxMotionJoints> rest_position_tolerance_rad{};
+  /// Rest proof for measured authority: the executing loop reports rest at
+  /// the first cycle where every joint's measured velocity is at or below
+  /// this threshold (no dwell, no position check). Predicted/commanded
+  /// authority rests when the Stop finishes at commanded rest.
   std::array<double, kMaxMotionJoints> rest_velocity_threshold_rad_s{};
-  /// Minimum local monotonic duration over which fresh samples of the
-  /// binding's authority must stay within both rest tolerances before Stop
-  /// rest evidence may report stationary. A single sample never does.
-  std::int64_t rest_dwell_ns{};
 };
 
 }  // namespace manyforge::core

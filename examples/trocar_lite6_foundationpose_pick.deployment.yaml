@@ -1075,7 +1075,7 @@
     ]
   },
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
-  "deployment_revision": "sha256:bf9ae6f5f33599ffba2fb98bc2336dab81e2bc2437c2fecdcc4465166ecdcf93",
+  "deployment_revision": "sha256:e72462bcaa940b46769dc35d45f8413527136cf3f85f5c94e3961e12356ca99b",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "desired_control_configurations": [
     {
@@ -1850,7 +1850,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -1861,7 +1861,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -1872,7 +1872,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -1883,7 +1883,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -1894,7 +1894,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -1905,7 +1905,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -1959,7 +1959,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -1970,7 +1970,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -1981,7 +1981,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -1992,7 +1992,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2003,7 +2003,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2014,7 +2014,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2068,7 +2068,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2079,7 +2079,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2090,7 +2090,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2101,7 +2101,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2112,7 +2112,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2123,7 +2123,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2177,7 +2177,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2188,7 +2188,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2199,7 +2199,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2210,7 +2210,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2221,7 +2221,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2232,7 +2232,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2286,7 +2286,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2297,7 +2297,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2308,7 +2308,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2319,7 +2319,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2330,7 +2330,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2341,7 +2341,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2395,7 +2395,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2406,7 +2406,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2417,7 +2417,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2428,7 +2428,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2439,7 +2439,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2450,7 +2450,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2504,7 +2504,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2515,7 +2515,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2526,7 +2526,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2537,7 +2537,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2548,7 +2548,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2559,7 +2559,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {
@@ -2613,7 +2613,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000000",
               "settle_velocity_threshold": {
@@ -2624,7 +2624,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000001",
               "settle_velocity_threshold": {
@@ -2635,7 +2635,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000002",
               "settle_velocity_threshold": {
@@ -2646,7 +2646,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000003",
               "settle_velocity_threshold": {
@@ -2657,7 +2657,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000004",
               "settle_velocity_threshold": {
@@ -2668,7 +2668,7 @@
             {
               "max_deceleration": {
                 "coordinate_kind": "angular_rad_s2",
-                "value_rad_s2": 4
+                "value_rad_s2": 10
               },
               "resource_id": "isaac_lite6_trocar_robot.arm.coordinate.000005",
               "settle_velocity_threshold": {

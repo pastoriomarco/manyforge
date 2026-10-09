@@ -235,7 +235,13 @@ public:
   /// Re-evaluate the alarm sources (runtime health, scene, active resource
   /// registry) when the last completed refresh is at least
   /// `kAlarmSourceRefreshPeriodNs` old; otherwise return without the core
-  /// lock. Reports whether it refreshed and the current refresh time.
+  /// lock. Reports whether it refreshed, the current refresh time, and
+  /// `component_lifecycle_observation_pending`: true from the moment the
+  /// lifecycle source's quality became unknown because the active
+  /// configuration changed or CCLC was unreachable, until a complete
+  /// observation of the active configuration is accepted. The event pump
+  /// then repeats the lifecycle read at its short retry floor instead of
+  /// waiting its ordinary period (spec 530 §7.1, respected without polling).
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RefreshAlarmSources();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -553,6 +559,13 @@ private:
   /// Monotonic observation time of the last completed `RefreshLocked`;
   /// negative before the first. Read without `mutex_` by the attention read.
   std::atomic<std::int64_t> alarm_sources_refreshed_at_ns_{-1};
+  /// Set (under `mutex_`) when the component-lifecycle source needs an
+  /// observation of the active configuration: a registry replacement or an
+  /// unreachable CCLC made its quality unknown. Cleared (under `mutex_`) when
+  /// a complete observation of the active configuration completes the
+  /// source snapshot with good quality, or when nothing is in scope. Read
+  /// without `mutex_` by `RefreshAlarmSources`.
+  std::atomic<bool> component_lifecycle_observation_pending_{};
   std::atomic<bool> shutdown_{};
 };
 

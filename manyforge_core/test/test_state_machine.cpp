@@ -1,465 +1,167 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/state_machine.hpp>
-#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+
 #include <thread>
-#include <utility>
 #include <vector>
 
 namespace manyforge::core {
 namespace {
 
+ParticipantExecutionFact local_failure() {
+  return ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure,
+                                  ParticipantEffectKnowledge::kNoEffect,
+                                  ErrorDTO{"planning_failed", "no path", {}}};
+}
+
 class StateMachineTest : public ::testing::Test {
  protected:
   FakeClock clock;
-  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
-  ExecutionStateMachine sm{clock, [this](ExecutionState from, ExecutionState to) {
-                             transitions.emplace_back(from, to);
-                           }};
+  ExecutionStateMachine sm{clock};
 };
 
-// --- Initial state ---
-TEST_F(StateMachineTest, InitialStateIsIdle) {
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-  EXPECT_EQ(sm.status().last_error, ErrorCode::kSuccess);
-  EXPECT_EQ(sm.status().progress, 0.0);
-  EXPECT_EQ(sm.status().execution_id, 0u);
+TEST_F(StateMachineTest, InitialStateIsIdleWithoutFact) {
+  const auto status = sm.status();
+  EXPECT_EQ(status.state, ExecutionState::kIdle);
+  EXPECT_EQ(status.last_error, ErrorCode::kSuccess);
+  EXPECT_EQ(status.progress, 0.0);
+  EXPECT_EQ(status.execution_id, 0u);
+  EXPECT_FALSE(status.fact.has_value());
+  EXPECT_FALSE(sm.settled());
 }
 
-// --- Valid transitions (one test per row of spec 230 §6.3) ---
-TEST_F(StateMachineTest, IdleToPlanning) {
+TEST_F(StateMachineTest, WorkingPhaseEdges) {
   EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kPlanning);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());  // replan
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kExecuting);
 }
 
-TEST_F(StateMachineTest, IdleToValidating) {
+TEST_F(StateMachineTest, CacheHitEntersValidatingFromIdle) {
   EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kValidating);
 }
 
-TEST_F(StateMachineTest, PlanningToValidating) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
-}
-
-TEST_F(StateMachineTest, PlanningToFailed) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
-}
-
-TEST_F(StateMachineTest, PlanningToStopped) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, ValidatingToExecuting) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-}
-
-TEST_F(StateMachineTest, ValidatingToFailed) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
-}
-
-TEST_F(StateMachineTest, ValidatingToStopped) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, ExecutingToStopping) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
-}
-
-TEST_F(StateMachineTest, ExecutingToCompleted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kCompleted).ok());
-}
-
-TEST_F(StateMachineTest, ExecutingToFailed) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
-}
-
-TEST_F(StateMachineTest, StoppingToStopped) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, PlanningToInterrupted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
-}
-
-TEST_F(StateMachineTest, ValidatingToInterrupted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
-}
-
-TEST_F(StateMachineTest, ExecutingToInterrupted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
-}
-
-TEST_F(StateMachineTest, InterruptedToInterventionRequired) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kInterrupted);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
-}
-
-// --- Invalid transitions (at least one per state) ---
-TEST_F(StateMachineTest, IdleToExecutingInvalid) {
+TEST_F(StateMachineTest, InvalidWorkingEdgesAreRejected) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
-}
-
-TEST_F(StateMachineTest, IdleToStoppedInvalid) {
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, PlanningToExecutingInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
-}
-
-TEST_F(StateMachineTest, ValidatingToPlanningForAuthoritativeReplan) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kPlanning);
-}
-
-TEST_F(StateMachineTest, ExecutingToPlanningInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
-}
-
-TEST_F(StateMachineTest, StoppingToExecutingInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
-}
-
-TEST_F(StateMachineTest, StoppedToAnyInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kStopped);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
-}
-
-TEST_F(StateMachineTest, CompletedAdmitsOnlyLateWinningStopOrIntervention) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kCompleted);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST(StateMachineTerminalAuthority, ContainedStopSerializesExecutingThroughStoppingToStopped) {
-  FakeClock clock;
-  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
-  ExecutionStateMachine sm{
-      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
   ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
   ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
   ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-  transitions.clear();
-  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
-
-  const auto outcome = committer.commit(
-      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
-
-  EXPECT_TRUE(outcome.ok());
-  EXPECT_EQ(outcome.previous, ExecutionState::kExecuting);
-  EXPECT_EQ(outcome.committed, ExecutionState::kStopped);
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
-                             {ExecutionState::kExecuting, ExecutionState::kStopping},
-                             {ExecutionState::kStopping, ExecutionState::kStopped}}));
+  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
+  EXPECT_FALSE(sm.try_transition(ExecutionState::kValidating).ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kExecuting);
 }
 
-TEST(StateMachineTerminalAuthority, ContainedStopWinsAfterConcurrentNaturalCompletion) {
-  FakeClock clock;
-  std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
-  ExecutionStateMachine sm{
-      clock, [&](ExecutionState from, ExecutionState to) { transitions.emplace_back(from, to); }};
+// The participant machine has no operation terminals: none of them is a
+// reachable state, from any phase.
+TEST_F(StateMachineTest, OperationTerminalsAreNeverParticipantStates) {
+  const std::vector<ExecutionState> terminals{
+      ExecutionState::kInterrupted, ExecutionState::kStopping,  ExecutionState::kStopped,
+      ExecutionState::kCompleted,   ExecutionState::kFailed,    ExecutionState::kInterventionRequired,
+      ExecutionState::kIdle};
+  for (const auto phase : {ExecutionState::kIdle, ExecutionState::kPlanning,
+                           ExecutionState::kValidating, ExecutionState::kExecuting}) {
+    ExecutionStateMachine machine{clock};
+    if (phase != ExecutionState::kIdle) {
+      ASSERT_TRUE(machine.try_transition(ExecutionState::kValidating).ok());
+      if (phase == ExecutionState::kPlanning) {
+        ASSERT_TRUE(machine.try_transition(ExecutionState::kPlanning).ok());
+      }
+      if (phase == ExecutionState::kExecuting) {
+        ASSERT_TRUE(machine.try_transition(ExecutionState::kExecuting).ok());
+      }
+    }
+    for (const auto terminal : terminals) {
+      if (terminal == phase) continue;
+      EXPECT_FALSE(machine.try_transition(terminal).ok())
+          << to_string(phase) << " -> " << to_string(terminal);
+    }
+    EXPECT_EQ(machine.status().state, phase);
+  }
+}
+
+TEST_F(StateMachineTest, SettleRecordsFactAndKeepsPhase) {
   ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  ASSERT_TRUE(sm.settle(local_failure()).ok());
+  const auto status = sm.status();
+  EXPECT_EQ(status.state, ExecutionState::kPlanning);
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->kind, ParticipantExecutionFactKind::kLocalFailure);
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_TRUE(sm.settled());
+}
+
+TEST_F(StateMachineTest, FirstFactWinsAndBlocksFurtherPhases) {
   ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
   ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-  TerminalCommitter committer{sm, [] { return false; }, [] { return false; }, [] { return false; }};
-
-  const auto completed = committer.commit(
-      {ExecutionState::kCompleted, "natural_completion", TerminalCommitter::Origin::kGeneric});
-  ASSERT_TRUE(completed.ok());
-  ASSERT_EQ(completed.committed, ExecutionState::kCompleted);
-  transitions.clear();
-
-  const auto stopped = committer.commit(
-      {ExecutionState::kStopped, "contained_stop", TerminalCommitter::Origin::kStopAuthority});
-
-  EXPECT_TRUE(stopped.ok());
-  EXPECT_EQ(stopped.previous, ExecutionState::kCompleted);
-  EXPECT_EQ(stopped.committed, ExecutionState::kStopped);
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-  EXPECT_EQ(transitions, (std::vector<std::pair<ExecutionState, ExecutionState>>{
-                             {ExecutionState::kCompleted, ExecutionState::kStopped}}));
-
-  const auto stale_completion = committer.commit(
-      {ExecutionState::kCompleted, "late_natural_completion", TerminalCommitter::Origin::kGeneric});
-  EXPECT_FALSE(stale_completion.ok());
-  EXPECT_EQ(stale_completion.previous, ExecutionState::kStopped);
-  EXPECT_EQ(stale_completion.committed, ExecutionState::kStopped);
-  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
-}
-
-TEST_F(StateMachineTest, FailedToAnyInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kFailed);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
-}
-
-TEST_F(StateMachineTest, IdleToInterruptedInvalid) {
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kInterrupted).ok());
-}
-
-TEST_F(StateMachineTest, InterruptedToExecutingInvalid) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kInterrupted);
+  ASSERT_TRUE(sm.settle(ParticipantExecutionFact{
+                            ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+                            ParticipantEffectKnowledge::kEffectSettled, std::nullopt})
+                  .ok());
+  EXPECT_FALSE(sm.settle(ParticipantExecutionFact{
+                             ParticipantExecutionFactKind::kComputedCompletion,
+                             ParticipantEffectKnowledge::kEffectSettled, std::nullopt})
+                   .ok());
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
+  EXPECT_EQ(sm.status().fact->kind, ParticipantExecutionFactKind::kPreemptedByAddressedStop);
 }
 
-// --- Reset ---
-TEST_F(StateMachineTest, ResetFromIdle_Fails) {
-  EXPECT_FALSE(sm.reset().ok());
-}
-
-TEST_F(StateMachineTest, ResetFromPlanning) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromValidating) {
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromExecuting) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromStopping) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kStopping);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromStopped) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kStopped);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromCompleted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  (void)sm.try_transition(ExecutionState::kCompleted);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromFailed) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kFailed);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetFromInterrupted) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kInterrupted);
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
-}
-
-TEST_F(StateMachineTest, ResetClearsProgressAndError) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  sm.set_progress(0.5);
-  sm.set_last_error(ErrorCode::kExecutionAborted);
-  (void)sm.try_transition(ExecutionState::kFailed);
-  sm.reset();
-  EXPECT_EQ(sm.status().progress, 0.0);
+TEST_F(StateMachineTest, CompletionFactSetsFullProgress) {
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  sm.set_progress(0.4);
+  ASSERT_TRUE(sm.settle(ParticipantExecutionFact{
+                            ParticipantExecutionFactKind::kComputedCompletion,
+                            ParticipantEffectKnowledge::kEffectSettled, std::nullopt})
+                  .ok());
+  EXPECT_EQ(sm.status().progress, 1.0);
   EXPECT_EQ(sm.status().last_error, ErrorCode::kSuccess);
 }
 
-// --- Happy paths ---
-TEST_F(StateMachineTest, FullHappyPath) {
+TEST_F(StateMachineTest, IdleCannotSettle) {
+  EXPECT_FALSE(sm.settle(local_failure()).ok());
+  EXPECT_FALSE(sm.status().fact.has_value());
+}
+
+TEST_F(StateMachineTest, RetireReturnsToIdleAndClearsFact) {
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  sm.set_progress(0.5);
+  ASSERT_TRUE(sm.settle(local_failure()).ok());
+  sm.retire();
+  const auto status = sm.status();
+  EXPECT_EQ(status.state, ExecutionState::kIdle);
+  EXPECT_FALSE(status.fact.has_value());
+  EXPECT_EQ(status.last_error, ErrorCode::kSuccess);
+  EXPECT_EQ(status.progress, 0.0);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kCompleted).ok());
-  EXPECT_TRUE(sm.reset().ok());
-  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
-TEST_F(StateMachineTest, CacheHitPath) {
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kCompleted).ok());
-}
-
-TEST_F(StateMachineTest, StopFromPlanningPath) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, StopFromValidatingPath) {
-  (void)sm.try_transition(ExecutionState::kValidating);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-TEST_F(StateMachineTest, StopFromExecutingPath) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  (void)sm.try_transition(ExecutionState::kValidating);
-  (void)sm.try_transition(ExecutionState::kExecuting);
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
-  EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-}
-
-// --- Callbacks ---
-TEST_F(StateMachineTest, TransitionCallbackFiresWithCorrectStates) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  ASSERT_EQ(transitions.size(), 1u);
-  EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
-  EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
-}
-
-TEST_F(StateMachineTest, CallbackDoesNotFireOnInvalidTransition) {
-  (void)sm.try_transition(ExecutionState::kExecuting);  // invalid from Idle
-  EXPECT_TRUE(transitions.empty());
-}
-
-TEST_F(StateMachineTest, ResetFiresCallback) {
-  (void)sm.try_transition(ExecutionState::kPlanning);
-  transitions.clear();
-  sm.reset();
-  ASSERT_EQ(transitions.size(), 1u);
-  EXPECT_EQ(transitions[0].first, ExecutionState::kPlanning);
-  EXPECT_EQ(transitions[0].second, ExecutionState::kIdle);
-}
-
-// --- Setters ---
-TEST_F(StateMachineTest, SetProgress) {
-  sm.set_progress(0.75);
-  EXPECT_EQ(sm.status().progress, 0.75);
-}
-
-TEST_F(StateMachineTest, SetLastError) {
-  sm.set_last_error(ErrorCode::kPlanningFailed);
-  EXPECT_EQ(sm.status().last_error, ErrorCode::kPlanningFailed);
-}
-
-TEST_F(StateMachineTest, SetExecutionId) {
-  sm.set_execution_id(42);
-  EXPECT_EQ(sm.status().execution_id, 42u);
-}
-
-// --- Timestamp ---
-TEST_F(StateMachineTest, TransitionUpdatesTimestamp) {
+TEST_F(StateMachineTest, TransitionTimestampsUseInjectedClock) {
   clock.set(1000);
-  (void)sm.try_transition(ExecutionState::kPlanning);
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
   EXPECT_EQ(sm.status().last_transition_ns, 1000);
   clock.set(2000);
-  (void)sm.try_transition(ExecutionState::kValidating);
+  ASSERT_TRUE(sm.settle(local_failure()).ok());
   EXPECT_EQ(sm.status().last_transition_ns, 2000);
 }
 
-// --- Thread safety ---
-TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
-  FakeClock shared_clock;
-  ExecutionStateMachine shared_sm(shared_clock);
-
-  (void)shared_sm.try_transition(ExecutionState::kPlanning);
-  (void)shared_sm.try_transition(ExecutionState::kValidating);
-  (void)shared_sm.try_transition(ExecutionState::kExecuting);
-
-  std::vector<std::jthread> threads;
-  for (int i = 0; i < 10; ++i) {
-    threads.emplace_back(
-        [&shared_sm]() { (void)shared_sm.try_transition(ExecutionState::kCompleted); });
+TEST_F(StateMachineTest, ConcurrentSettleRecordsExactlyOneFact) {
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
+  ASSERT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
+  std::atomic<int> accepted{0};
+  std::vector<std::thread> threads;
+  for (int index = 0; index < 8; ++index) {
+    threads.emplace_back([&] {
+      if (sm.settle(local_failure()).ok()) accepted.fetch_add(1);
+    });
   }
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  auto state = shared_sm.status().state;
-  EXPECT_EQ(state, ExecutionState::kCompleted);
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(accepted.load(), 1);
 }
 
 }  // namespace
 }  // namespace manyforge::core
-
-// K1 characterization: normal terminals must be unrepresentable from safety
-// terminals at the transition-table level. A laundering bug therefore has to
-// happen BEFORE the safety terminal commits — which is exactly the window the
-// TerminalCommitter closes; these pins guarantee the table half stays true.
-TEST(StateMachineTerminalAuthority, NormalTerminalCannotOverwriteSafetyTerminal) {
-  using manyforge::core::ExecutionState;
-  manyforge::core::FakeClock clock;
-  {
-    manyforge::core::ExecutionStateMachine sm{clock};
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kFailed).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
-  }
-  {
-    manyforge::core::ExecutionStateMachine sm{clock};
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
-  }
-  {
-    manyforge::core::ExecutionStateMachine sm{clock};
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
-    ASSERT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kFailed).ok());
-    EXPECT_FALSE(sm.try_transition(ExecutionState::kInterrupted).ok());
-  }
-}

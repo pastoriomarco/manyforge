@@ -93,7 +93,6 @@ HYGIENE_CHECKS = (
     ),
     ("version_sync", "bash scripts/ci/verify-version-sync.sh"),
     ("private_spec_boundary", "bash scripts/ci/check-private-spec-boundary.sh"),
-    ("terminal_commit_boundary", "bash scripts/ci/check-terminal-commit-boundary.sh"),
     ("authority_port_alignment", "python3 scripts/ci/check-authority-port-alignment.py"),
     ("planner_portability", "python3 scripts/ci/check-planner-portability.py"),
     ("roboplan_dependency_stack", "python3 scripts/ci/check-roboplan-dependency-stack.py"),

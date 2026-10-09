@@ -1,8 +1,16 @@
 import type {
+  ActiveConfigurationIdentity,
   AlarmLifecycleState,
   AlarmMotionAttentionMember,
+  KernelAlarmAttention,
   OperatorAlarmSnapshot,
 } from '../types/headless';
+
+/** The active configuration the fixtures' Kernel-held copy names. */
+export const ACTIVE_CONFIGURATION: ActiveConfigurationIdentity = {
+  retainedBundleId: 'bundle.test',
+  graphRevision: 'graph.test',
+};
 
 /** One gating member; empty `resourceIds` names the cell-global subject. */
 export function gatingMember(
@@ -24,9 +32,19 @@ export function gatingMember(
   };
 }
 
+/**
+ * By default the Kernel holds the owner's reconciled projection of
+ * `ACTIVE_CONFIGURATION`; pass `null` for no held copy.
+ */
 export function alarmSnapshot(
   members: AlarmMotionAttentionMember[],
   reconciled = true,
+  kernelAttention: KernelAlarmAttention | null = {
+    ownerEpoch: 'alarm.epoch.1',
+    generation: 3,
+    reconciled,
+    activeConfiguration: ACTIVE_CONFIGURATION,
+  },
 ): OperatorAlarmSnapshot {
   return {
     schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
@@ -47,5 +65,6 @@ export function alarmSnapshot(
     unacknowledgedMembership: [],
     alarms: [],
     truncated: false,
+    kernelAttention,
   };
 }

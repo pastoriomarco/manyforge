@@ -302,6 +302,7 @@ describe('headless Composer presentation adapters', () => {
       snapshotSequence: 1,
       runtime: {
         schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+        activeConfiguration: null,
         complete: true,
         projectionGeneration: 7,
         projectionOwnerEpoch: 'projection-epoch',
@@ -335,6 +336,7 @@ describe('headless Composer presentation adapters', () => {
         }],
         alarms: [attentionAlarm, standingAlarm],
         truncated: false,
+        kernelAttention: null,
       },
     };
     const reconnect = vi.fn();

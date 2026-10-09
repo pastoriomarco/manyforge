@@ -13,7 +13,7 @@ import time
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
@@ -88,6 +88,7 @@ def _load_scenario(
     *,
     scenario_path: Path | None = None,
     executable: bool = True,
+    on_apply_succeeded: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
     # Each deliberate Load is a new Manager request, even when it loads the
     # same Scenario again. Retries within this one Load keep their own distinct
@@ -190,6 +191,8 @@ def _load_scenario(
                     assert status["state"] == "succeeded", (
                         f"{scenario_id}: terminal Apply status {status!r}"
                     )
+                    if on_apply_succeeded is not None:
+                        on_apply_succeeded()
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(
@@ -732,6 +735,9 @@ def test_retained_robot_plans_after_apply_retires_its_first_composition() -> Non
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            # Motion right after an Apply: wait for the Kernel's attention
+            # state of the new configuration, not for a refusal to clear.
+            _wait_kernel_attention_reconciled(stack)
             _start_motion(client, started, request_id="ui6i.retained.motion-start")
             accepted = _operation_acceptances(stack, program_run_id)
             assert {
@@ -778,6 +784,7 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
             _start_motion(client, started, request_id="ui6i.moved.motion-start")
             terminal = _wait_run_state(
                 client,
@@ -799,15 +806,54 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         assert "validation_collision" not in evidence, evidence
 
 
-def _wait_alarm_owner_reconciled(stack: ProcessStack, seconds: float = 10.0) -> None:
+def _kernel_attention_reconciled(
+    headless: HeadlessHttpClient, *, minimum_generation: int = 0
+) -> bool:
+    """Whether the Kernel holds a reconciled attention projection of the
+    active configuration (spec 530 §11), at least `minimum_generation` of the
+    owner's current epoch.
+
+    The Kernel admits Program motion by its held copy alone, which lags the
+    owner by up to one publication period plus its deadline; the alarm
+    snapshot's `kernel_attention` names the copy the Kernel acknowledged.
+    """
+    runtime = headless.runtime()
+    snapshot = headless.alarms(limit=0)
+    held = snapshot.get("kernel_attention")
+    bundle = runtime.get("active_retained_bundle_id")
+    graph = runtime.get("active_graph_revision")
+    return (
+        isinstance(held, dict)
+        and isinstance(bundle, str)
+        and isinstance(graph, str)
+        and held.get("reconciled") is True
+        and held.get("owner_epoch") == snapshot.get("owner_epoch")
+        and held.get("generation", -1) >= minimum_generation
+        and held.get("active_configuration")
+        == {"graph_revision": graph, "retained_bundle_id": bundle}
+    )
+
+
+def _wait_kernel_attention_reconciled(
+    stack: ProcessStack,
+    seconds: float = 10.0,
+    *,
+    minimum_generation: int = 0,
+) -> float:
+    """Wait until the Kernel would admit by attention; return when it did."""
     deadline = time.monotonic() + seconds
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         while True:
-            snapshot = headless.alarms()
-            if snapshot.get("reconciled") is True:
-                return
-            assert time.monotonic() < deadline, snapshot
-            time.sleep(0.05)
+            if _kernel_attention_reconciled(
+                headless, minimum_generation=minimum_generation
+            ):
+                return time.monotonic()
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "the Kernel holds no reconciled attention projection of the "
+                    f"active configuration: {headless.alarms(limit=0)!r}"
+                )
+            time.sleep(0.02)
 
 
 def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
@@ -836,8 +882,9 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
             )
             program_run_id = started["capture"]["program_run_id"]
             # The Apply restarts the alarm owner's lifecycle source: motion is
-            # admitted once it has observed the new configuration.
-            _wait_alarm_owner_reconciled(stack)
+            # admitted once the Kernel holds the owner's reconciled projection
+            # of the new configuration.
+            _wait_kernel_attention_reconciled(stack)
             _start_motion(client, started, request_id="ui6i.solo.motion-start")
             accepted = _operation_acceptances(stack, program_run_id, minimum=1)
             assert {
@@ -1077,6 +1124,7 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
             _start_motion(
                 client,
                 started,
@@ -1152,6 +1200,7 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
             _start_motion(
                 client,
                 started,

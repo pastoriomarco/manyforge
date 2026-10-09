@@ -26,8 +26,9 @@ enum class MotionStepStatus : std::uint8_t {
   /// The numerical cursor reached the path end. Not "commanded", not
   /// completion and never proof of rest.
   kComputedEnd,
-  /// Braking under a Stop transition reached zero scale and zero rate. A
-  /// computed fact, not stationary evidence.
+  /// Braking under a Stop transition reached zero scale and zero rate, or a
+  /// replacement installed under that Stop reached its path end (its own
+  /// rest point). A computed fact, not stationary evidence.
   kStopped,
   /// Reversed clock, non-finite state or invalid prepared data. `state` is
   /// unchanged; the adapter applies the containment primitive already
@@ -107,8 +108,9 @@ struct MotionStepInputs final {
 };
 
 /// Fixed-size step state owned by the loop. Initialized at installation from
-/// the prepared motion by `InstallMotionStep`; `std::nullopt` governor means
-/// not installed.
+/// the prepared motion by `InstallMotionStep` (first submission) or
+/// `InstallReplacementMotionStep`; `std::nullopt` governor means not
+/// installed.
 struct MotionStepState final {
   std::optional<detail::RuntimeScaleGovernor> governor;
   double path_time_s{};
@@ -118,6 +120,16 @@ struct MotionStepState final {
   RuntimeScaleGeneration scale_generation{0U};
   MotionStepStatus mode{MotionStepStatus::kRunning};
   std::optional<StopTransition> active_stop;
+  /// Trip cursor: the path time of the goal that was executing when the
+  /// first Stop transition was accepted, in that goal's path time. Set once
+  /// per Stop by `StepMotion`, unchanged by stronger stages, and carried
+  /// verbatim through replacements as the spring-back return target.
+  /// Meaningful only while `active_stop` holds a value.
+  double stop_trip_path_time_s{};
+  /// The installed goal is a replacement installed under `active_stop`: it
+  /// is that Stop's braking or spring-back plan, so reaching its path end is
+  /// `kStopped`, not `kComputedEnd`.
+  bool replacement_under_stop{};
 };
 
 /// Fixed-capacity joint command (index < joint_count).
@@ -178,7 +190,9 @@ struct MotionStepOutput final {
 ///    Stop whose values are invalid or that cannot be realized from the
 ///    current state (rate above its bound, overshoot above the
 ///    `max_stop_path_rate` ceiling) is reported kInvalid and yields
-///    kCannotProceed; it is never silently ignored.
+///    kCannotProceed; it is never silently ignored. The first accepted Stop
+///    records the trip cursor (`stop_trip_path_time_s`, this tick's path
+///    time); stronger stages keep it.
 /// 7. kComputedEnd is not completion and never proof of rest.
 ///
 /// On kCannotProceed the output command has `joint_count == 0`.
@@ -190,10 +204,104 @@ struct MotionStepOutput final {
 /// the trajectory start, governor at `initial_scale` (the latest accepted
 /// target, generation `scale_generation`) under `governor_bounds`, no Stop.
 /// Returns false and leaves `state` unchanged for invalid prepared data or
-/// scale. Non-throwing and allocation-free.
+/// scale. Non-throwing and allocation-free. Only for a first submission (no
+/// goal installed); a replacement uses `InstallReplacementMotionStep`, which
+/// preserves Stop and the time law.
 [[nodiscard]] bool InstallMotionStep(const PreparedMotion& prepared, std::int64_t now_ns,
                                      double initial_scale,
                                      RuntimeScaleGeneration scale_generation,
                                      MotionStepState& state) noexcept;
+
+/// Why `InstallReplacementMotionStep` refused. Every refusal leaves the
+/// outputs untouched; the current goal stays authoritative and keeps stepping
+/// (an active Stop keeps braking exactly as before). The Kernel escalates.
+enum class ReplacementInstallRefusal : std::uint8_t {
+  kNone = 0,
+  /// `current` is not a valid installed state of `current_prepared` (no
+  /// governor, wrong goal, kCannotProceed, invalid prepared data).
+  kInvalidCurrent,
+  /// `last_output` is not the command `current` emitted at `now_ns`: the
+  /// current goal was not stepped at this tick (or its step failed), so the
+  /// actual installation-tick command is unknown.
+  kNotInstallationTick,
+  /// Invalid replacement prepared data or continuity tolerance (non-finite or
+  /// negative), or its initial command cannot be computed.
+  kInvalidReplacement,
+  /// Different operation or binding identity (Apply/provider replacement).
+  kIdentityMismatch,
+  /// Replacement goal generation not newer than the current goal's.
+  kStaleGoal,
+  /// Different joint count or joint names.
+  kJointMismatch,
+  /// An active Stop's local braking deadline is reached at `now_ns`.
+  kStopDeadlinePassed,
+  /// Under an active Stop the replacement is the Stop's plan and must end at
+  /// rest: its final waypoint velocity (and acceleration, when present)
+  /// exceeds `kMotionContinuityTolerance`.
+  kReplacementDoesNotEndAtRest,
+  /// Initial position / velocity / acceleration of `joint_index` differs from
+  /// the actual installation-tick command by more than
+  /// `kMotionContinuityTolerance` (or is non-finite).
+  kPositionDiscontinuity,
+  kVelocityDiscontinuity,
+  kAccelerationDiscontinuity,
+};
+
+struct ReplacementInstallResult final {
+  ReplacementInstallRefusal refusal{ReplacementInstallRefusal::kNone};
+  /// First offending joint for the three discontinuity refusals; else 0.
+  std::uint8_t joint_index{};
+
+  [[nodiscard]] constexpr bool installed() const noexcept {
+    return refusal == ReplacementInstallRefusal::kNone;
+  }
+};
+
+/// Installs an off-tick replacement plan (`IExecutionMechanism::Replace`) at
+/// the installation tick `now_ns`, from the actual current step state. The
+/// one shared installation for every lane (G4, SX-031). Non-throwing,
+/// allocation-free; compares strings only, never copies them.
+///
+/// Preconditions: at this tick the adapter has already stepped the current
+/// goal (consuming any pending Stop first), producing `last_output` with
+/// `current.last_tick_ns == now_ns`. That emitted command is the continuity
+/// authority: no measured feedback is involved and nothing is rebased.
+///
+/// Rules:
+/// 1. Identity: same operation id and binding as `current_prepared`; the
+///    replacement's goal generation is strictly newer (`ExecutionGoalFence`
+///    semantics); its fence is nonzero; same joints.
+/// 2. Own time law, slider applied once: a replacement is prepared off-tick
+///    and already retimed (any runtime scale in effect at capture is part of
+///    its timing). It is installed at scale 1 with zero scale rate under its
+///    own `governor_bounds`; the current scale is never composed onto it.
+/// 3. Stop is preserved: an active `StopTransition` (generation, stage,
+///    bounds, local braking deadline and the goal fence it was issued for)
+///    and the trip cursor `stop_trip_path_time_s` are copied verbatim.
+///    Installation never clears a Stop and never resumes nominal motion: the
+///    replacement is that Stop's plan and runs under it (scale targets stay
+///    ignored, the deadline stays enforced by the realizer/adapter, a newer
+///    stage brakes it on-path, its path end is `kStopped`). It must end at
+///    rest and the braking deadline must not have been reached. Later stages
+///    for the replacement carry a newer Stop generation and its goal fence.
+/// 4. Without a Stop the replacement starts at scale 1 under its own law with
+///    the current scale generation (later targets must be newer).
+/// 5. Continuity: the replacement's initial command at its path start under
+///    that law (q, q', q'') must match `last_output` per joint within
+///    `kMotionContinuityTolerance` for position, velocity and
+///    acceleration. The replacement is never shifted, retimed or rebased.
+/// 6. On success `installed` is the new state (path start, segment 0,
+///    `last_tick_ns == now_ns`, goal = replacement fence) and
+///    `initial_output` the replacement's command for this same tick, to be
+///    emitted instead of `last_output`. On refusal neither output is written:
+///    the current goal stays authoritative and keeps its authorized braking
+///    (or the caller applies its authorized containment); refusal is never
+///    uncontrolled continuation and the Kernel escalates.
+/// `installed` may alias `current` and `initial_output` may alias
+/// `last_output`; all reads complete before any write.
+[[nodiscard]] ReplacementInstallResult InstallReplacementMotionStep(
+    const PreparedMotion& current_prepared, const MotionStepState& current,
+    const MotionStepOutput& last_output, const PreparedMotion& replacement, std::int64_t now_ns,
+    MotionStepState& installed, MotionStepOutput& initial_output) noexcept;
 
 }  // namespace manyforge::core

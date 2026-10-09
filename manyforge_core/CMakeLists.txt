@@ -55,12 +55,10 @@ add_library(manyforge_core
   src/component_lifecycle_plan_evaluator.cpp
   src/fixed_cclc_port_registry.cpp
   src/runtime_contract_manifest_codec.cpp
-  src/controller_lifecycle.cpp
   src/controller_lifecycle_evaluator.cpp
   src/cclc_domain_reservation_table.cpp
   src/coordinate_state.cpp
   src/state_machine.cpp
-  src/terminal_committer.cpp
   src/error_code_mapping.cpp
   src/emergency_stop_acceptance_reserve.cpp
   src/bounded_operation_control_executor.cpp
@@ -93,20 +91,12 @@ add_library(manyforge_core
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/resource_addressed_execution_kernel.cpp
-  src/resolved_stop_base_plan_codec.cpp
-  src/resolved_stop_base_plan_decoder.cpp
-  src/prepared_participant_stop_plan_codec.cpp
-  src/prepared_planning_codec.cpp
-  src/prepared_motion_evidence_codec.cpp
-  src/prepared_operation_participant_codec.cpp
   src/prepared_execution.cpp
   src/route_selection.cpp
   src/route_selection_owner.cpp
   src/resource_slot_table.cpp
   src/runtime_collision_monitor.cpp
-  src/runtime_participant_binding.cpp
   src/runtime_participant_policy.cpp
-  src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
   src/coordinated_motion_preparation.cpp
   src/coordinated_execution_clock.cpp
@@ -133,11 +123,8 @@ add_library(manyforge_core
   src/collision_world_snapshot_builder.cpp
   src/logical_scene_identity_internal.cpp
   src/logical_scene_projection.cpp
-  src/interrupt_manager.cpp
   src/soft_on_path_stop_planner.cpp
   src/affine_path_stop.cpp
-  src/stop_profile_mapper.cpp
-  src/stop_timing.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -154,6 +141,15 @@ if(NOT TARGET manyforge_motion_numerics)
     "${CMAKE_CURRENT_BINARY_DIR}/manyforge_motion_numerics")
 endif()
 target_link_libraries(manyforge_core PUBLIC manyforge::motion_numerics)
+
+# The shared PreparedMotion builder with the sealed participant/trajectory
+# codecs is one separately consumable target, compiled once; Core links it.
+if(NOT TARGET manyforge_prepared_motion)
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/prepared_motion"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_prepared_motion")
+endif()
+target_link_libraries(manyforge_core PUBLIC manyforge::prepared_motion)
 
 # The static library is linked into both standalone test executables AND
 # the pybind11 shared module (manyforge_core_py). Shared modules require
@@ -332,6 +328,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_execution_interfaces_compile PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_execution_interfaces_compile
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_prepared_motion_builder test/test_prepared_motion_builder.cpp)
+  target_link_libraries(test_prepared_motion_builder PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_prepared_motion_builder
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_motion_step test/test_motion_step.cpp)
@@ -930,13 +931,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_snapshot_lease PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_scene_snapshot_lease
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_interrupt_manager
-    test/test_interrupt_manager.cpp)
-  target_link_libraries(test_interrupt_manager PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_interrupt_manager
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_soft_on_path_stop_planner

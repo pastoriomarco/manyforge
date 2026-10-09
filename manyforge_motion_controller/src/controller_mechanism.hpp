@@ -90,10 +90,10 @@ public:
   static constexpr std::size_t kCapacity = 4U;
   explicit ControllerMechanism(ReceiverProfile profile);
   core::ExecutionMechanismCallResult Submit(
-    const core::ExecutionGoalKey &, const core::PreparedMotion &) noexcept override;
+    const core::ExecutionGoalKey &, const core::PreparedMotionSlot &) noexcept override;
   core::ExecutionMechanismCallResult Replace(
     const core::ExecutionGoalKey &, const core::ExecutionGoalKey &,
-    const core::PreparedMotion &) noexcept override;
+    const core::PreparedMotionSlot &) noexcept override;
   core::ExecutionMechanismCallResult Release(const core::ExecutionGoalKey &) noexcept override;
   core::ExecutionMechanismCallResult PostScale(
     const core::ExecutionGoalKey &, const core::ScaleTarget &) noexcept override;
@@ -168,7 +168,7 @@ private:
     core::ExecutionLoopHealth health;
   };
   core::ExecutionMechanismCallResult Register(
-    const core::ExecutionGoalKey &, const core::PreparedMotion &, EventKind,
+    const core::ExecutionGoalKey &, const core::PreparedMotionSlot &, EventKind,
     std::size_t previous, std::uint64_t previous_version) noexcept;
   core::ExecutionMechanismCallResult RequestFence(const core::ExecutionGoalKey &) noexcept;
   core::ExecutionMechanismRefusal Find(

@@ -10,7 +10,7 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
-import { alarmSnapshot, gatingMember } from '../testFixtures/operatorAlarms';
+import { ACTIVE_CONFIGURATION, alarmSnapshot, gatingMember } from '../testFixtures/operatorAlarms';
 import { motionAttentionBlock } from '../state/operatorAlarmMotionAttention';
 import type { AlarmMotionAttentionMember } from '../types/headless';
 import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
@@ -657,7 +657,9 @@ describe('Program runtime projection', () => {
       members: AlarmMotionAttentionMember[],
     ): ProgramRuntimeController => ({
       ...program,
-      motionAttentionBlock: (resourceIds) => motionAttentionBlock(alarmSnapshot(members), resourceIds),
+      motionAttentionBlock: (resourceIds) => motionAttentionBlock(
+        alarmSnapshot(members), resourceIds, ACTIVE_CONFIGURATION,
+      ),
     });
     const stopped = controller('intervention_required');
     const controls = ordinaryMotionStopControls();

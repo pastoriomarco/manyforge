@@ -2,33 +2,6 @@
 
 namespace manyforge::core {
 
-const char* stop_mode_string(MotionInterruptStopMode mode) {
-  switch (mode) {
-    using enum MotionInterruptStopMode;
-    case kSpringBackHold: return "spring_back_hold";
-    case kSoftOnPath: return "soft_on_path";
-    case kHardDeceleration: return "hard_deceleration";
-  }
-  return "unknown";
-}
-
-const char* stop_command_source_string(
-    MotionInterruptStopCommandSource source) {
-  switch (source) {
-    using enum MotionInterruptStopCommandSource;
-    case kFjtPreemptHold: return "fjt_preempt_hold";
-    case kFjtPreemptPathRamp: return "fjt_preempt_path_ramp";
-    case kJtcSpeedScalingRamp: return "jtc_speed_scaling_ramp";
-    case kJtcCancelDecelerateOnCancel: return "jtc_cancel_decelerate_on_cancel";
-    case kJtcCancelUnprofiledHold: return "jtc_cancel_unprofiled_hold";
-    case kNativeSimulatedStop: return "native_simulated_stop";
-    case kNativeSimulatedPathRamp: return "native_simulated_path_ramp";
-    case kRobotNativeStop: return "robot_native_stop";
-    case kDiagnosticOther: return "diagnostic_other";
-  }
-  return "unknown";
-}
-
 bool is_classified_stop_intervention(
     const std::map<std::string, std::string>& details) {
   const auto reason_it = details.find("reason");

@@ -298,6 +298,7 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   return parsed;
 }
 import type {
+  ActiveConfigurationIdentity,
   AlarmLifecycleState,
   AlarmMembership,
   AlarmMotionAttentionMember,
@@ -317,6 +318,7 @@ import type {
   HistorianRetention,
   HistorianCapture,
   HistorianCapturePage,
+  KernelAlarmAttention,
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
   SourceFreshness,
@@ -7121,6 +7123,11 @@ export function parseHeadlessRuntimeSnapshot(
   const sections = objectAt(record.sections, 'runtime.sections');
   return {
     schemaVersion,
+    activeConfiguration: parseActiveConfigurationPair(
+      record.active_retained_bundle_id,
+      record.active_graph_revision,
+      'runtime.active_retained_bundle_id',
+    ),
     complete: booleanAt(record.complete, 'runtime.complete'),
     projectionGeneration: integerAt(
       record.projection_generation,
@@ -7153,6 +7160,44 @@ export function parseHeadlessRuntimeSnapshot(
         'runtime.sections.scene_runtime',
       ),
     },
+  };
+}
+
+function parseActiveConfigurationPair(
+  retainedBundleId: unknown,
+  graphRevision: unknown,
+  path: string,
+): ActiveConfigurationIdentity | null {
+  const bundle = retainedBundleId === undefined ? null : nullableStringAt(retainedBundleId, path);
+  const graph = graphRevision === undefined ? null : nullableStringAt(graphRevision, path);
+  if (bundle === null && graph === null) return null;
+  if (bundle === null || graph === null) {
+    return fail(path, 'both a retained bundle id and a graph revision, or neither');
+  }
+  return { retainedBundleId: bundle, graphRevision: graph };
+}
+
+function parseKernelAlarmAttention(value: unknown): KernelAlarmAttention | null {
+  // Absent from a composition without the Kernel publisher: no held copy.
+  if (value === undefined || value === null) return null;
+  const record = objectAt(value, 'alarms.kernel_attention');
+  const configuration = record.active_configuration;
+  return {
+    ownerEpoch: stringAt(record.owner_epoch, 'alarms.kernel_attention.owner_epoch'),
+    generation: integerAt(record.generation, 'alarms.kernel_attention.generation'),
+    reconciled: booleanAt(record.reconciled, 'alarms.kernel_attention.reconciled'),
+    activeConfiguration: configuration === null
+      ? null
+      : kernelAttentionConfiguration(configuration),
+  };
+}
+
+function kernelAttentionConfiguration(value: unknown): ActiveConfigurationIdentity {
+  const path = 'alarms.kernel_attention.active_configuration';
+  const record = objectAt(value, path);
+  return {
+    retainedBundleId: stringAt(record.retained_bundle_id, `${path}.retained_bundle_id`),
+    graphRevision: stringAt(record.graph_revision, `${path}.graph_revision`),
   };
 }
 
@@ -7307,6 +7352,7 @@ export function parseOperatorAlarmSnapshot(
     alarms: arrayAt(record.alarms, 'alarms.alarms').map((item, index) =>
       parseOperatorAlarmRecord(item, `alarms.alarms[${index}]`)),
     truncated: booleanAt(record.truncated, 'alarms.truncated'),
+    kernelAttention: parseKernelAlarmAttention(record.kernel_attention),
   };
 }
 

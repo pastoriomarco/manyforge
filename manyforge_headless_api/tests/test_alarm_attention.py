@@ -238,3 +238,78 @@ def test_publications_keep_their_period_while_the_event_pump_is_blocked(
     # Each receipt follows the previous one by about P, far inside F.
     assert max(intervals) < PUBLICATION_PERIOD_SECONDS + 0.25
     assert max(intervals) < KERNEL_FRESHNESS_SECONDS / 4
+
+
+class _ReconcilingCore(_Core):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconciled = False
+        self.configuration: dict[str, str] | None = {
+            "graph_revision": "graph.1",
+            "retained_bundle_id": "bundle.1",
+        }
+
+    def operator_alarm_motion_attention(self) -> dict[str, Any]:
+        return {
+            **super().operator_alarm_motion_attention(),
+            "active_configuration": self.configuration,
+            "reconciled": self.reconciled,
+        }
+
+
+def test_the_kernel_held_copy_is_the_last_acknowledged_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Clients wait for the Kernel's admission state instead of retrying
+    # refusals: the held copy is what the Kernel acknowledged, never the
+    # owner's newer projection that has not reached it yet.
+    core, kernel = _ReconcilingCore(), _Kernel()
+    publisher = OperatorAlarmAttentionPublisher(core, kernel)
+    changes: list[int] = []
+    publisher.set_kernel_held_observer(lambda: changes.append(1))
+    assert publisher.kernel_held_attention() is None
+
+    assert publisher.publish_once()
+    assert publisher.kernel_held_attention() == {
+        "active_configuration": {"graph_revision": "graph.1", "retained_bundle_id": "bundle.1"},
+        "generation": 1,
+        "owner_epoch": "alarm.owner.1",
+        "reconciled": False,
+    }
+    assert len(changes) == 1
+
+    # The owner reconciles; until the Kernel acknowledges it the held copy
+    # still reads unreconciled.
+    core.generation, core.reconciled = 2, True
+    kernel.failure = OSError("execution host unavailable")
+    assert not publisher.publish_once()
+    held = publisher.kernel_held_attention()
+    assert held is not None and held["reconciled"] is False
+    kernel.failure = None
+    assert publisher.publish_once()
+    held = publisher.kernel_held_attention()
+    assert held is not None and held["reconciled"] is True and held["generation"] == 2
+    assert len(changes) == 2
+    # An unchanged heartbeat is no change.
+    assert publisher.publish_once()
+    assert len(changes) == 2
+
+    # An Apply: the owner names the new configuration once it observed it.
+    core.generation = 3
+    core.configuration = {"graph_revision": "graph.2", "retained_bundle_id": "bundle.2"}
+    assert publisher.publish_once()
+    held = publisher.kernel_held_attention()
+    assert held is not None and held["active_configuration"] == core.configuration
+    assert len(changes) == 3
+
+    # Without an acknowledgement within the Kernel freshness bound the
+    # Kernel's copy is stale: none is reported.
+    now = time.monotonic()
+    monkeypatch.setattr(
+        "manyforge_headless_api.alarm_attention.time.monotonic",
+        lambda: now + KERNEL_FRESHNESS_SECONDS + 0.1,
+    )
+    assert publisher.kernel_held_attention() is None
+    kernel.failure = OSError("execution host unavailable")
+    assert not publisher.publish_once()
+    assert len(changes) == 4

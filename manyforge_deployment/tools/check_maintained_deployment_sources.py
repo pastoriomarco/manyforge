@@ -266,10 +266,10 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
 ]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "lite6_isaac_commanded_v0": (
-        "3dd34fd4bd509790d7c6c2468cf61906b760313d9de6891e8839df815021899c"
+        "6f98cdd29116ce939ad35a0b8aaa1b66c8d839c1bddb9eeddd6b98b4ffb000a7"
     ),
     "lite6_native_simulated_v0": (
-        "de7787ba7631291e7701432b4f1a14d0296082af345c0a6197acc42dde2ec425"
+        "8db5dc901743548637f0f6371da30afe1692f01f9e76b5eca3c2278f5e0451e5"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
         "366f75e72576a463da26595e7167b202a9621e7c69c49f4bad403934d90f34b4"

@@ -164,6 +164,16 @@ RetainedNativeRuntime::~RetainedNativeRuntime() {
 }
 namespace {
 
+/// Working motion, or an ended execution whose effect settlement is
+/// uncertain (an unresolved intervention), blocks generation changes.
+[[nodiscard]] bool
+motion_participant_unresolved(const core::ExecutionStatus &status) noexcept {
+  if (!status.fact.has_value())
+    return status.state != core::ExecutionState::kIdle;
+  return status.fact->effect ==
+         core::ParticipantEffectKnowledge::kEffectUncertain;
+}
+
 using manyforge::content_identity::CanonicalValue;
 
 inline constexpr std::string_view kNoActiveGoalEvidenceDomain =
@@ -818,12 +828,9 @@ motion_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
           binding = std::move(binding)](const std::int64_t observed_at_ns)
              -> core::Result<core::ContentDigest> {
     const auto status = engine->get_status();
+    // Idle, or an ended execution (any participant fact): no goal is active.
     const bool no_active_goal =
-        status.state == core::ExecutionState::kIdle ||
-        status.state == core::ExecutionState::kStopped ||
-        status.state == core::ExecutionState::kCompleted ||
-        status.state == core::ExecutionState::kFailed ||
-        status.state == core::ExecutionState::kInterventionRequired;
+        status.state == core::ExecutionState::kIdle || status.fact.has_value();
     if (!no_active_goal) {
       return route_publication_error<core::ContentDigest>(
           "native_motion_goal_still_active",
@@ -2109,12 +2116,7 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
   }
 
   const auto motion_status = runtime.participant_engine->get_status();
-  if (motion_status.state == core::ExecutionState::kPlanning ||
-      motion_status.state == core::ExecutionState::kValidating ||
-      motion_status.state == core::ExecutionState::kExecuting ||
-      motion_status.state == core::ExecutionState::kInterrupted ||
-      motion_status.state == core::ExecutionState::kStopping ||
-      motion_status.state == core::ExecutionState::kInterventionRequired) {
+  if (motion_participant_unresolved(motion_status)) {
     return fail("native_product_reseal_motion_not_idle",
                 "retained native controller has active or unresolved motion work");
   }
@@ -2421,12 +2423,7 @@ core::Result<void> refresh_retained_native_runtime_model_for_apply(
   // Drain: no planning, validation, execution or gripper command may span
   // the generation change. Admission is already closed by the fence.
   const auto motion_status = runtime.participant_engine->get_status();
-  if (motion_status.state == core::ExecutionState::kPlanning ||
-      motion_status.state == core::ExecutionState::kValidating ||
-      motion_status.state == core::ExecutionState::kExecuting ||
-      motion_status.state == core::ExecutionState::kInterrupted ||
-      motion_status.state == core::ExecutionState::kStopping ||
-      motion_status.state == core::ExecutionState::kInterventionRequired) {
+  if (motion_participant_unresolved(motion_status)) {
     return fail("native_model_refresh_motion_not_idle",
                 "retained controller has active or unresolved motion work");
   }

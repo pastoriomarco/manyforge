@@ -788,6 +788,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
                                        OperationControlEffectHandle handle) noexcept override;
   void settle_completed_control_locked(const OperationId& operation_id);
+  void wake_stop_after_preparation_borrow_locked(const OperationId& operation_id) noexcept;
   OperationStateDTO capture_control_failure_locked(ActiveOperation& operation);
   void ProjectStop(StopControlWorkToken token) noexcept;
   void RunStopSurveillance(StopCertificateId certificate_id,

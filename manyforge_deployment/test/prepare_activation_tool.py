@@ -529,10 +529,13 @@ def _require_stop_limits_by_joint_name(
         return changed
 
     # Distinct, exactly representable limits per joint, authored in reverse.
+    # They start at the Lite6 model acceleration limit (10 rad/s^2) so the
+    # Stop/planning coherence check accepts them: the first joint is equal,
+    # the others are higher.
     rows = [
         {
             "source_joint_name": joint,
-            "max_deceleration_rad_s2": 2.0 + index,
+            "max_deceleration_rad_s2": 10.0 + index,
             "settle_velocity_threshold_rad_s": (index + 1) / 64,
         }
         for index, joint in enumerate(joints)
@@ -550,7 +553,7 @@ def _require_stop_limits_by_joint_name(
 
     expected = {
         f"{component_id}.arm.coordinate.{index:06d}": (
-            2.0 + index,
+            10.0 + index,
             (index + 1) / 64,
             None,
         )
@@ -568,7 +571,7 @@ def _require_stop_limits_by_joint_name(
     with_jerk[1]["max_jerk_rad_s3"] = 12.5
     compiled = compiled_arm_limits(with_jerk[::-1], "authored-jerk")
     expected_with_jerk = dict(expected)
-    expected_with_jerk[f"{component_id}.arm.coordinate.000001"] = (3.0, 2 / 64, 12.5)
+    expected_with_jerk[f"{component_id}.arm.coordinate.000001"] = (11.0, 2 / 64, 12.5)
     if compiled != expected_with_jerk:
         raise AssertionError(
             f"authored controlled Stop jerk was not compiled for {joints[1]}: "
@@ -577,6 +580,10 @@ def _require_stop_limits_by_joint_name(
 
     unnamed = copy.deepcopy(rows)
     del unnamed[1]["source_joint_name"]
+    # A Stop deceleration below the joint's planning acceleration is refused
+    # with the operator-readable diagnostic the GUI shows as preparer_detail.
+    below_planning = copy.deepcopy(rows)
+    below_planning[1]["max_deceleration_rad_s2"] = 0.5
     rejections = {
         "missing": (
             rows[:2] + rows[3:],
@@ -595,6 +602,13 @@ def _require_stop_limits_by_joint_name(
             f"controlled Stop limits repeat joint {joints[1]}",
         ),
         "unnamed": (unnamed, "controlled Stop limit row lacks source_joint_name"),
+        "below-planning-acceleration": (
+            below_planning,
+            f"Stop profile {component_id}.arm.controlled_stop, joint "
+            f"{joints[1]}: Stop deceleration limit 0.5 rad/s^2 "
+            "(max_deceleration_rad_s2) is lower than the normal-motion "
+            "planning acceleration limit 10 rad/s^2",
+        ),
     }
     jerk_message = (
         f"controlled Stop max_jerk_rad_s3 for joint {joints[2]} "

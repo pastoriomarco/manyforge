@@ -36,7 +36,6 @@ jobs:
               echo "All shell scripts pass bash -n"
               ./scripts/ci/verify-version-sync.sh
               ./scripts/ci/check-private-spec-boundary.sh
-              ./scripts/ci/check-terminal-commit-boundary.sh
               python3 scripts/ci/check-authority-port-alignment.py
               python3 scripts/ci/check-planner-portability.py
               # Runs inside the dev image already (this whole command executes

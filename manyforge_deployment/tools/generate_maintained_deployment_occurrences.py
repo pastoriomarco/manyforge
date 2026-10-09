@@ -2459,7 +2459,7 @@ def operator_stop_contract_parameters(
     resources = binding["resource_bindings"]
     acceleration = profile["per_joint_max_deceleration_rad_s2"]
     if family["model_family_id"] == LITE6_NATIVE_MODEL_FAMILY_ID:
-        expected_acceleration = {joint: 4.0 for joint in source_joints}
+        expected_acceleration = {joint: 10.0 for joint in source_joints}
         fault_profile = runtime_restoration_profile["stop_profiles"][
             "default_fault_stop_profile"
         ]

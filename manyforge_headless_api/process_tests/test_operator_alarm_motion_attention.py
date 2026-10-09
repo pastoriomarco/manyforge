@@ -50,18 +50,13 @@ from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
     CELL_ID,
     GROUPED_SCENARIO,
     _dual_robot_stack,
+    _kernel_attention_reconciled,
     _load_scenario,
     _reset_cycle,
+    _wait_kernel_attention_reconciled,
     _wait_run_state,
     _write_mixed_variants,
 )
-
-_ALARM_REFUSALS = {
-    "operator_alarm_interlock_active",
-    "unacknowledged_operator_alarms",
-    "operator_alarm_state_unavailable",
-}
-
 
 def _motion_start(
     client: HeadlessHttpClient, started: dict[str, Any], request_id: str
@@ -140,13 +135,15 @@ def _gating_alarms(stack: ProcessStack) -> dict[str, Any]:
         return headless.alarms()
 
 
-def _acknowledge_all(stack: ProcessStack) -> None:
+def _acknowledge_all(stack: ProcessStack) -> int:
+    """Acknowledge every unacknowledged alarm; return the owner generation
+    that names the acknowledgement."""
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         for attempt in range(8):
             snapshot = headless.alarms()
             members = snapshot["unacknowledged_membership"]
             if not members:
-                return
+                return snapshot["generation"]
             try:
                 headless.acknowledge_all(
                     {
@@ -158,12 +155,63 @@ def _acknowledge_all(stack: ProcessStack) -> None:
                         "confirmed": True,
                     }
                 )
-                return
+                return headless.alarms(limit=0)["generation"]
             except HeadlessClientError as error:
                 # A concurrent activation changed the exact membership.
                 if attempt == 7 or error.status_code != 409:
                     raise
     raise AssertionError("unreachable")
+
+
+#: Spec 530 §11 source currency R: Headless refreshes its alarm sources at
+#: most once per R, so the registry swap an Apply causes is seen within R.
+_SOURCE_REFRESH_PERIOD_SECONDS = 0.25
+#: One component-lifecycle read: the event pump's CCLC client is bounded to
+#: one short exchange (manyforge_headless_api.app: min(timeout, 1 s)).
+_CCLC_READ_SECONDS = 1.0
+#: The pump picks up a pending lifecycle observation on its next iteration
+#: (execution_event_poll_milliseconds, 100 ms by default).
+_PUMP_ITERATION_SECONDS = 0.1
+
+
+class _KernelAttentionWatch:
+    """Record when the Kernel first holds a reconciled projection of the
+    active configuration, polling from the moment the Apply succeeded."""
+
+    def __init__(self, stack: ProcessStack) -> None:
+        self._stack = stack
+        self.apply_succeeded_at: float | None = None
+        self.held_at: float | None = None
+        self.error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+
+    def apply_succeeded(self) -> None:
+        self.apply_succeeded_at = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name="kernel-attention-watch")
+        self._thread.start()
+
+    def _run(self) -> None:
+        deadline = time.monotonic() + 10.0
+        try:
+            with HeadlessHttpClient(self._stack.base_url, timeout_seconds=10.0) as headless:
+                while time.monotonic() < deadline:
+                    if _kernel_attention_reconciled(headless):
+                        self.held_at = time.monotonic()
+                        return
+                    time.sleep(0.01)
+        except BaseException as error:  # noqa: BLE001 - reported by join()
+            self.error = error
+
+    def join(self) -> float:
+        assert self._thread is not None, "the Apply never succeeded"
+        self._thread.join(timeout=15.0)
+        assert not self._thread.is_alive()
+        if self.error is not None:
+            raise self.error
+        assert self.held_at is not None and self.apply_succeeded_at is not None, (
+            "the Kernel never held a reconciled projection of the new configuration"
+        )
+        return self.held_at - self.apply_succeeded_at
 
 
 def test_program_run_is_refused_by_an_unacknowledged_alarm_until_acknowledged() -> None:
@@ -173,32 +221,39 @@ def test_program_run_is_refused_by_an_unacknowledged_alarm_until_acknowledged() 
         # operation fails and raises an acknowledgement-gated execution alarm
         # scoped to the UR5e's exact resources.
         paths = _write_mixed_variants(stack, ("move",))
-        applied, digest = _load_scenario(stack, "mixed_move", scenario_path=paths["move"])
+        watch = _KernelAttentionWatch(stack)
+        applied, digest = _load_scenario(
+            stack,
+            "mixed_move",
+            scenario_path=paths["move"],
+            on_apply_succeeded=watch.apply_succeeded,
+        )
+        # Spec 530 §7.1/§11: the Apply is respected without polling. Its
+        # registry swap is seen by the next source refresh (R), the event pump
+        # reads the new configuration's lifecycle at once (one CCLC read on
+        # its next iteration) and the publisher delivers the reconciled
+        # projection within P + D.
+        apply_to_kernel = watch.join()
+        bound = (
+            _SOURCE_REFRESH_PERIOD_SECONDS
+            + PUBLICATION_PERIOD_SECONDS
+            + PUBLICATION_DEADLINE_SECONDS
+            + _CCLC_READ_SECONDS
+            + _PUMP_ITERATION_SECONDS
+        )
+        print(
+            f"\nApply succeeded -> Kernel holds reconciled attention: "
+            f"{apply_to_kernel * 1_000:.0f} ms (bound {bound * 1_000:.0f} ms)",
+            file=sys.stderr,
+        )
+        assert apply_to_kernel <= bound, apply_to_kernel
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             first = _start_run_once(stack, applied, digest, "first")
             first_run = first["capture"]["program_run_id"]
-            # Attention is unavailable until the alarm owner has observed the
-            # Kernel's newly applied configuration (spec 530 §11); that
-            # converges within one source refresh and publication.
-            deadline = time.monotonic() + 10.0
-            attempt = 0
-            while True:
-                attempt += 1
-                initial = _motion_start(
-                    client, first, f"alarm.attention.first.run.{attempt}"
-                )
-                if "refused" not in initial:
-                    break
-                assert initial["refused"] == "operator_alarm_state_unavailable", initial
-                # Until then the owner either still names the previous
-                # configuration or has not yet accepted a lifecycle
-                # observation of the new one (spec 530 §3.3).
-                assert initial["details"].get("availability") in {
-                    "configuration_mismatch",
-                    "unreconciled",
-                }, initial
-                assert time.monotonic() < deadline, initial
-                time.sleep(0.1)
+            # The Kernel holds the reconciled projection of the active
+            # configuration: it admits the first Run, with no refusal loop.
+            initial = _motion_start(client, first, "alarm.attention.first.run")
+            assert "refused" not in initial, initial
             terminal = _wait_run_state(
                 client, first_run,
                 {"succeeded", "failed", "intervention_required", "stopped"},
@@ -226,21 +281,15 @@ def test_program_run_is_refused_by_an_unacknowledged_alarm_until_acknowledged() 
             assert refused["details"]["interlock_alarms"] == "[]", refused
             assert '"condition_id"' in refused["details"]["unacknowledged_alarms"], refused
 
-            _acknowledge_all(stack)
-            # Headless republishes within its read period; the Kernel then
-            # admits the same Run with no other change.
-            deadline = time.monotonic() + 10.0
-            attempt = 0
-            while True:
-                attempt += 1
-                admitted = _motion_start(
-                    client, second, f"alarm.attention.acknowledged.run.{attempt}"
-                )
-                if "refused" not in admitted:
-                    break
-                assert admitted["refused"] in _ALARM_REFUSALS, admitted
-                assert time.monotonic() < deadline, admitted
-                time.sleep(0.1)
+            acknowledged_generation = _acknowledge_all(stack)
+            # Headless republishes within P + D; once the Kernel holds the
+            # acknowledged generation it admits the same Run with no other
+            # change.
+            _wait_kernel_attention_reconciled(
+                stack, minimum_generation=acknowledged_generation
+            )
+            admitted = _motion_start(client, second, "alarm.attention.acknowledged.run")
+            assert "refused" not in admitted, admitted
             assert not _gating_alarms(stack)["unacknowledged_membership"]
 
 

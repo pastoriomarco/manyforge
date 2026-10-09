@@ -1015,7 +1015,11 @@ class MockExecution : public IExecutionBackend {
   /// the explicit acknowledgement paths.
   std::optional<ExecutionState> next_terminal_state;
 
-  Result<void> RetirePreparedExecution(std::uint64_t) override { return Result<void>::Ok(); }
+  std::atomic<int> retire_count{0};
+  Result<void> RetirePreparedExecution(std::uint64_t) override {
+    ++retire_count;
+    return Result<void>::Ok();
+  }
   PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
                                       std::uint64_t) override {
     const auto result = MakePrepareParticipantResult(
@@ -1179,7 +1183,11 @@ class ControlledExecution : public IExecutionBackend {
   bool block_sync_observed_state = false;
   bool release_blocked_sync_observed_state = false;
 
-  Result<void> RetirePreparedExecution(std::uint64_t) override { return Result<void>::Ok(); }
+  std::atomic<int> retire_count{0};
+  Result<void> RetirePreparedExecution(std::uint64_t) override {
+    ++retire_count;
+    return Result<void>::Ok();
+  }
   PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
                                       std::uint64_t) override {
     const auto result = MakePrepareParticipantResult(
@@ -2099,7 +2107,40 @@ CollisionPolicySnapshot make_contact_grasp_policy_snapshot(
 // early; only genuine failures pay the longer bound.
 bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state, int max_attempts = 2000) {
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
-    if (kernel.get_status().state == target_state) {
+    if (kernel.get_status().state == target_state && !kernel.get_status().fact.has_value()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
+/// The participant's reported ending of its current execution, named for
+/// assertions. The participant reports facts; it never holds an outcome.
+std::string ended_as(const ExecutionStatus& status) {
+  if (!status.fact.has_value()) return std::string("working:") + to_string(status.state);
+  switch (status.fact->kind) {
+    case ParticipantExecutionFactKind::kComputedCompletion:
+      return "completed";
+    case ParticipantExecutionFactKind::kLocalFailure:
+      return status.fact->effect == ParticipantEffectKnowledge::kEffectUncertain
+                 ? "failed_effect_uncertain"
+                 : "failed";
+    case ParticipantExecutionFactKind::kCancelledBeforeDispatch:
+      return "cancelled_before_dispatch";
+    case ParticipantExecutionFactKind::kPlanningDeadlineExpired:
+      return "planning_deadline_expired";
+    case ParticipantExecutionFactKind::kPreemptedByAddressedStop:
+      return "preempted_by_addressed_stop";
+  }
+  return "unknown";
+}
+
+std::string ended_as(const ExecutionKernel& kernel) { return ended_as(kernel.get_status()); }
+
+bool wait_for_ended(ExecutionKernel& kernel, const std::string& expected, int max_attempts = 2000) {
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    if (ended_as(kernel) == expected) {
       return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2302,11 +2343,7 @@ class ExecutionKernelTest : public ::testing::Test {
     auto result = prepare_and_dispatch(kernel, std::move(prepared));
     if (result.ok()) {
       const bool completed = kernel.wait_for_completion(2'000'000'000);
-      const auto state = kernel.get_status().state;
-      const bool already_terminal =
-          state == ExecutionState::kCompleted || state == ExecutionState::kFailed ||
-          state == ExecutionState::kStopped || state == ExecutionState::kInterrupted ||
-          state == ExecutionState::kInterventionRequired;
+      const bool already_terminal = kernel.get_status().fact.has_value();
       EXPECT_TRUE(completed || already_terminal)
           << "execute_sync timed out waiting for " << req.move_id;
     }
@@ -2869,7 +2906,7 @@ TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureIsRetryableWithoutBack
   const auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request("ik")));
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
   ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
   const auto observed = kernel.ObservePreparedMotion(prepared.value());
   ASSERT_TRUE(observed.ok()) << observed.error().message;
   EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed);
@@ -2907,7 +2944,7 @@ TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureRetryDeadlineFollowsMe
       kernel.PrepareMotion(prepared_motion_request(make_test_request("ik_fresh")));
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
   ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
 
   constexpr std::int64_t kStepNs = 20'000'000;  // the default observation poll period
   const auto publish_and_poll = [&] {
@@ -2965,7 +3002,7 @@ TEST_F(ExecutionKernelTest, DispatchedNonValidationFailureStaysResetRequired) {
   execution.next_terminal_state = ExecutionState::kFailed;
   execution.snapshot.error = ErrorDTO{kErrorExecutionRejected, "Controller aborted", {}};
   execute_sync(make_test_request("failed_dispatched_assessment"));
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
   scheduler.advance_to(clock.now());
 
   const auto assessment = kernel.get_recovery_assessment();
@@ -2982,7 +3019,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewAfterDispatchedFailureStillRequiresIdle
   execution.next_terminal_state = ExecutionState::kFailed;
   execution.snapshot.error = ErrorDTO{kErrorExecutionRejected, "Controller aborted", {}};
   execute_sync(make_test_request("failed_dispatched"));
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
   auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(inventory.has_value());
   RobotStateDTO explicit_start{{"j1", "j2"}, {0.0, 0.0}, {}};
@@ -2992,7 +3029,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewAfterDispatchedFailureStillRequiresIdle
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "motion_preview_participant_not_idle");
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
 }
 
 TEST_F(ExecutionKernelTest, Execute_RejectsNonPositiveExecutionTimeout) {
@@ -3012,7 +3049,7 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_ReturnsExecutionId) {
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(result.value(), 1u);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 }
 
 TEST_F(ExecutionKernelTest, Execute_BackendRejectedDispatchPreservesExactBackendCause) {
@@ -3025,7 +3062,7 @@ TEST_F(ExecutionKernelTest, Execute_BackendRejectedDispatchPreservesExactBackend
   auto result = execute_sync(make_test_request("backend_dispatch_rejected"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorExecutionRejected);
@@ -3040,8 +3077,7 @@ TEST_F(ExecutionKernelTest, Execute_FromTerminalWorkerCallbackRejectedWithoutRep
   auto nested_result_future = nested_result.get_future();
   std::atomic<bool> attempted{false};
   kernel.subscribe_events([&](const KernelEvent& event) {
-    if (event.type != KernelEventType::kStateTransition ||
-        event.to_state != ExecutionState::kCompleted || attempted.exchange(true)) {
+    if (event.type != KernelEventType::kParticipantSettled || attempted.exchange(true)) {
       return;
     }
     auto nested = prepare_and_dispatch(kernel, make_test_request("nested_from_callback"));
@@ -3084,7 +3120,7 @@ TEST_F(ExecutionKernelTest, Execute_PlannerResultResourceMismatchFailsClosedBefo
   const auto result = execute_sync(make_test_request("wrong_resources"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -3096,7 +3132,7 @@ TEST_F(ExecutionKernelTest, Execute_PlannerResultOrderingMismatchFailsClosedBefo
   const auto result = execute_sync(make_test_request("wrong_order"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -3295,7 +3331,7 @@ TEST_F(ExecutionKernelTest,
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(peek_cache("move_scene_changed").has_value());
   EXPECT_EQ(collision_engine->check_count.load(), 2);
@@ -3323,7 +3359,7 @@ TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationFai
   auto result = execute_sync(make_test_request("move_same_content_revision"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(peek_cache("move_same_content_revision").has_value());
   const auto snapshot = kernel.get_execution_snapshot();
@@ -3351,7 +3387,7 @@ TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValida
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(peek_cache("move_scene_changed").has_value());
   const auto snapshot = kernel.get_execution_snapshot();
@@ -3375,7 +3411,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsBoundedTargetPoseDr
   auto result = execute_sync(make_relative_object_request("move_lease_drift", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
   EXPECT_TRUE(peek_cache("move_lease_drift").has_value());
   EXPECT_EQ(collision_world_publisher.lease_retain_call_count.load(), 1);
@@ -3410,7 +3446,7 @@ TEST_F(ExecutionKernelTest, Execute_RetainsOneExactProjectionThroughPlanValidati
   const auto result = execute_sync(make_test_request("move_exact_projection_lifetime"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_TRUE(planning_observed.load());
   EXPECT_TRUE(validation_observed.load());
   EXPECT_TRUE(dispatch_observed.load());
@@ -3442,7 +3478,7 @@ TEST_F(ExecutionKernelTest,
   auto result = execute_sync(make_relative_object_request("move_lease_target", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(peek_cache("move_lease_target").has_value());
   const auto snapshot = kernel.get_execution_snapshot();
@@ -3470,7 +3506,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsTargetShapeChangeBe
   auto result = execute_sync(make_relative_object_request("move_lease_shape", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
@@ -3489,7 +3525,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsMissingTargetInvent
   auto result = execute_sync(make_relative_object_request("move_lease_missing_target", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
@@ -3517,7 +3553,7 @@ TEST_F(ExecutionKernelTest,
   auto result = execute_sync(make_test_request("move_lease_obstacle"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_FALSE(snapshot.error.has_value());
@@ -3538,7 +3574,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsExplicitDynamicObst
   auto result = execute_sync(make_test_request("move_lease_dynamic_obstacle"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
@@ -3564,7 +3600,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsDefaultSnapshotObst
 
   ASSERT_TRUE(result.ok());
   EXPECT_TRUE(mutated_once);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_FALSE(snapshot.error.has_value());
@@ -3585,7 +3621,7 @@ TEST_F(ExecutionKernelTest, Execute_CachedTrajectoryMissesAfterLeaseWorldRevisio
   auto result = execute_sync(make_relative_object_request("move_lease_cache", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(planner.plan_count, 1)
       << "cache lookup must miss when the live authoritative revision changed";
   EXPECT_EQ(execution.execute_count, 1);
@@ -3992,7 +4028,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_EQ(context.validate_count, 1);
   EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_FALSE(peek_cache("move_cached_invalid").has_value());
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
@@ -4013,7 +4049,7 @@ TEST_F(ExecutionKernelTest,
 
   execute_sync(make_test_request("move_cached_invalid_ack"));
 
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
   const auto reset_count_before_ack = execution.reset_count;
   auto ack =
       apply_recovery_action_after_projection(kernel, RecoveryAction::kRetryAfterSceneRepair,
@@ -4051,7 +4087,7 @@ TEST_F(ExecutionKernelTest,
                        {"contact_policy_violation", "contact_penetration_exceeds_policy"}}}};
 
   execute_sync(make_test_request("move_contact_policy_ack"));
-  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  ASSERT_EQ(ended_as(kernel), "failed");
 
   const auto ack = apply_recovery_action_after_projection(
       kernel, RecoveryAction::kRetryAfterSceneRepair, "operator_alice",
@@ -4210,7 +4246,7 @@ TEST_F(ExecutionKernelTest, Execute_PlanningFails_TransitionsToFailed) {
   planner.next_result = plan_err;
 
   execute_sync(make_test_request());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -4221,7 +4257,7 @@ TEST_F(ExecutionKernelTest, Execute_ValidationFails_TransitionsToFailed) {
       ValidationResultDTO{false, ErrorDTO{kErrorValidationCollision, "Collision in path", {}}};
 
   execute_sync(make_test_request());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(context.last_validation_options.run_collision_checks);
 }
@@ -4244,7 +4280,7 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMismatch_Fails) {
   context.current_state_value = bad_state;
 
   execute_sync(make_test_request());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
 }
 
 TEST_F(ExecutionKernelTest, Execute_StartStateValidationComparesByJointName) {
@@ -4254,7 +4290,7 @@ TEST_F(ExecutionKernelTest, Execute_StartStateValidationComparesByJointName) {
   context.current_state_value = reordered_state;
 
   execute_sync(make_test_request("move_start_named"));
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
 }
 
@@ -4265,7 +4301,7 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMissingJointName_FailsClosed) {
   context.current_state_value = ambiguous_state;
 
   execute_sync(make_test_request("move_start_missing_joint"));
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -4314,7 +4350,7 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
   collision_engine->default_result = make_authoritative_collision_result();
 
   execute_sync(make_test_request());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_FALSE(context.last_validation_options.run_collision_checks);
 }
@@ -4325,7 +4361,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionPipelineRejectsCollisi
   collision_engine->default_result = make_authoritative_collision_result();
 
   execute_sync(make_test_request());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_GE(collision_engine->check_count.load(), 1);
   const auto snapshot = kernel.get_execution_snapshot();
@@ -4360,7 +4396,7 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
   });
 
   execute_sync(make_test_request("bounded-predispatch-later-contact"));
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
 
   const auto snapshot = kernel.get_execution_snapshot();
@@ -4578,7 +4614,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   controlled_execution.complete();
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(local_kernel), "completed");
   EXPECT_EQ(local_planner.plan_count, 2);
   EXPECT_EQ(local_planner.planning_attempt_indices, (std::vector<std::uint32_t>{0, 1}));
   EXPECT_EQ(controlled_execution.execute_count, 1);
@@ -4636,7 +4672,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(local_kernel), "failed");
   EXPECT_EQ(local_planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.execute_count, 0);
   auto snapshot = local_kernel.get_execution_snapshot();
@@ -4683,7 +4719,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsRe
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(local_kernel), "failed");
   EXPECT_EQ(local_planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.execute_count, 0);
   const auto snapshot = local_kernel.get_execution_snapshot();
@@ -4759,7 +4795,7 @@ TEST_F(ExecutionKernelTest,
            (reason == terminal_snapshot.error->details.end() ? std::string{}
                                                              : " (" + reason->second + ")");
   }();
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted) << terminal_diagnostic;
+  EXPECT_EQ(ended_as(local_kernel), "completed") << terminal_diagnostic;
   EXPECT_EQ(local_execution.execute_count, 1);
   EXPECT_EQ(local_planner.plan_count, 1);
   EXPECT_GE(local_engine->check_count.load(), 3);
@@ -4822,7 +4858,7 @@ TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidin
       prepare_and_dispatch(local_kernel, make_test_request("reject-noncarried-start-contact"));
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(local_kernel), "failed");
   EXPECT_EQ(local_execution.execute_count, 0);
   EXPECT_EQ(local_planner.plan_count, 1);
   const auto snapshot = local_kernel.get_execution_snapshot();
@@ -4857,7 +4893,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionDoesNot
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
-  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(local_kernel), "failed");
   EXPECT_EQ(local_planner.plan_count, 1);
   EXPECT_EQ(controlled_execution.execute_count, 0);
   auto snapshot = local_kernel.get_execution_snapshot();
@@ -4870,17 +4906,17 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionDoesNot
 TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 
   auto rejected = prepare_and_dispatch(kernel, make_test_request());
   EXPECT_FALSE(rejected.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 
   auto stale_ack = kernel.acknowledge_completed(first.value() + 1);
   EXPECT_FALSE(stale_ack.accepted);
   ASSERT_TRUE(stale_ack.error.has_value());
   EXPECT_EQ(stale_ack.error->details.at("reason_code"), "mismatched_execution_id");
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 
   auto ack = kernel.acknowledge_completed(first.value());
   ASSERT_TRUE(ack.accepted);
@@ -4893,7 +4929,7 @@ TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
 
   auto result = execute_sync(make_test_request());
   EXPECT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 }
 
 TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
@@ -4902,13 +4938,13 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
   planner.next_result = plan_err;
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
 
   auto ack = kernel.acknowledge_completed(result.value());
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason_code"), "wrong_state");
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
 }
 
 // --- Version-bound recovery action API ---
@@ -4917,11 +4953,11 @@ TEST_F(ExecutionKernelTest, Execute_FromInterventionRequired_Rejected) {
   execution.next_terminal_state = ExecutionState::kInterventionRequired;
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
 
   auto rejected = prepare_and_dispatch(kernel, make_test_request());
   EXPECT_FALSE(rejected.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
   ASSERT_TRUE(rejected.error().details.contains("reason_code"));
   EXPECT_EQ(rejected.error().details.at("reason_code"), "intervention_required");
 }
@@ -4936,7 +4972,7 @@ TEST_F(ExecutionKernelTest, ApplyRecoveryAction_AcknowledgeAndContinueDoesNotRes
                                        {"executed_stop_mode", "hard_deceleration"}}};
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
   EXPECT_EQ(execution.reset_count, 0);
   install_at_rest_recovery_observation();
 
@@ -4984,7 +5020,7 @@ TEST_F(ExecutionKernelTest, ApplyRecoveryAction_AcknowledgeAndContinueRejectsWhi
                                        {"settle_velocity_threshold_rad_s", "0.01"}}};
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
   execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.2, 0.0});
 
   auto ack =
@@ -4993,7 +5029,7 @@ TEST_F(ExecutionKernelTest, ApplyRecoveryAction_AcknowledgeAndContinueRejectsWhi
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason"), reason_codes::kRecoveryObservedStateNotAtRest);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
   EXPECT_EQ(execution.reset_count, 0);
 }
 
@@ -5004,7 +5040,7 @@ TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBacke
 
   auto first = execute_sync(make_test_request("first_fails"));
   ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_EQ(execution.reset_count, 0);
 
@@ -5014,7 +5050,7 @@ TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBacke
 
   auto retry = execute_sync(make_test_request("retry_after_failure"));
   ASSERT_TRUE(retry.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
   EXPECT_EQ(execution.reset_count, 0);
   EXPECT_EQ(execution.sync_count, 2);
@@ -5168,7 +5204,12 @@ TEST_F(ExecutionKernelTest, CollisionCheckTick_NotExecuting_NoOp) {
   EXPECT_EQ(context.collision_count.load(), 0);
 }
 
-TEST_F(ExecutionKernelTest, RuntimeCollisionLatchesForAddressedStopWithoutCallingBackendStop) {
+// Step 3 regression: the participant reports a runtime collision as a fact
+// only. It keeps no local fault latch, commits no terminal and issues no
+// backend command; the addressed Kernel owns containment. Retirement after the
+// owner's certified containment is motion-free: it retires the prepared
+// membership and never resets the backend, so positions are preserved.
+TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotionFree) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
@@ -5215,32 +5256,37 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionLatchesForAddressedStopWithoutCallin
       });
     }));
   }
-  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kInterrupted));
   {
     std::lock_guard<std::mutex> lock(events_mu);
-    const auto latched = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-      return event.type == KernelEventType::kInterruptLatched;
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const KernelEvent& event) {
+      return event.type == KernelEventType::kInterruptLatched ||
+             event.type == KernelEventType::kParticipantSettled;
+    }));
+    const auto collision = std::find_if(events.begin(), events.end(), [](const auto& event) {
+      return event.type == KernelEventType::kCollisionDetected;
     });
-    ASSERT_NE(latched, events.end());
-    EXPECT_EQ(latched->details.at("source_id"), "manyforge.kernel.runtime_collision_fault");
-    EXPECT_EQ(latched->details.at("preemption_result"), "pending");
+    ASSERT_NE(collision, events.end());
+    EXPECT_EQ(collision->details.at("in_collision"), "true");
   }
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
   EXPECT_EQ(controlled_execution.controlled_stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
-  {
-    std::lock_guard<std::mutex> lock(events_mu);
-    EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
-      return event.type == KernelEventType::kInterruptPreemptApplied;
-    }));
-  }
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
 
+  // The owner fences and certifies containment; the backend then ends.
+  ASSERT_EQ(controlled_kernel.fence_addressed_participant_stop(result.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   controlled_execution.release();
   EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(ended_as(controlled_kernel), "preempted_by_addressed_stop");
+  const auto positions_before = controlled_execution.get_execution_snapshot().joint_positions_rad;
+  const auto retired_before = controlled_execution.retire_count.load();
   const auto reset = controlled_kernel.reset_after_certified_containment(result.value());
   ASSERT_TRUE(reset.accepted) << reset.error->message;
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(controlled_execution.reset_count, 0);
+  EXPECT_EQ(controlled_execution.retire_count.load(), retired_before + 1);
+  EXPECT_EQ(controlled_execution.get_execution_snapshot().joint_positions_rad, positions_before);
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Idle");
   EXPECT_TRUE(controlled_kernel.get_recovery_assessment().latch_id.empty());
 }
 
@@ -5416,19 +5462,26 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   EXPECT_EQ(lookahead_event->details.at("lookahead_checked_samples"), "8");
   EXPECT_FALSE(lookahead_event->details.at("lookahead_sample_times_ns").empty());
   EXPECT_TRUE(lookahead_event->details.contains("collision_result_first_failure_time_ns"));
-  const auto interrupt_event =
+  // The addressed-owner handoff fact precedes telemetry; the participant
+  // latches nothing locally.
+  const auto handoff_event =
       std::find_if(captured_events.begin(), captured_events.end(), [&](const KernelEvent& event) {
-        return event.type == KernelEventType::kInterruptLatched &&
-               event.execution_id == result.value();
+        const auto surface = event.details.find("surface");
+        return event.type == KernelEventType::kCollisionDetected &&
+               event.execution_id == result.value() && surface != event.details.end() &&
+               surface->second == "addressed_runtime_collision_authority";
       });
-  ASSERT_NE(interrupt_event, captured_events.end());
-  EXPECT_GT(interrupt_event->sequence, 0u);
-  EXPECT_LT(interrupt_event->sequence, lookahead_event->sequence);
-  EXPECT_EQ(interrupt_event->details.at("source_id"), "manyforge.kernel.runtime_collision_fault");
+  ASSERT_NE(handoff_event, captured_events.end());
+  EXPECT_GT(handoff_event->sequence, 0u);
+  EXPECT_LT(handoff_event->sequence, lookahead_event->sequence);
+  EXPECT_EQ(handoff_event->details.at("in_collision"), "true");
+  EXPECT_TRUE(std::none_of(captured_events.begin(), captured_events.end(), [](const auto& event) {
+    return event.type == KernelEventType::kInterruptLatched;
+  }));
 
   // Lookahead has atomically claimed this dispatch; a late natural-completion
-  // callback must not publish a terminal marker or replace the already-latched
-  // collision authority, even though the backend handle itself completes.
+  // callback must not publish a terminal progress marker, even though the
+  // backend handle itself completes.
   const auto* progress = controlled_execution.execution_progress_publication();
   ASSERT_NE(progress, nullptr);
   controlled_execution.complete();
@@ -5456,7 +5509,7 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   }
 
   ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
   EXPECT_GE(local_runtime_engine->check_count.load(), 1);
   EXPECT_GE(local_lookahead_engine->check_count.load(), 1);
 }
@@ -5509,7 +5562,7 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
       << permit.metrics.runtime_collision_lookahead_clear_permit_try_lock_misses;
   ASSERT_TRUE(controlled_kernel.wait_for_completion(5'000'000'000));
 
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
   EXPECT_GT(local_lookahead_engine->check_count.load(), 0);
   const auto* progress = controlled_execution.execution_progress_publication();
   ASSERT_NE(progress, nullptr);
@@ -5594,7 +5647,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ExpandsObservedStateBeforeEngine
   EXPECT_DOUBLE_EQ(queried_positions[0], 0.0);
   EXPECT_DOUBLE_EQ(queried_positions[1], 0.0);
   EXPECT_DOUBLE_EQ(queried_positions[2], 0.0081);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesBackendObservedStateForRuntimeQuery) {
@@ -5715,7 +5768,8 @@ TEST_F(ExecutionKernelTest,
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(local_runtime_engine->check_count.load(), baseline_engine_checks);
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "observed_state_incomplete");
@@ -5751,7 +5805,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_StaleObservedStateFailsClosedBef
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(local_runtime_engine->check_count.load(), baseline_engine_checks);
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "stale_observed_robot_state");
@@ -5830,7 +5885,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_StaleDynamicBodyFailsClosedBefor
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(local_runtime_engine->check_count.load(), baseline_engine_checks);
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "stale_dynamic_collision_body");
@@ -5999,7 +6055,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
   ASSERT_TRUE(tick.ok());
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "runtime_contact_release_penetration_increased");
@@ -6082,7 +6139,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLater
   controlled_execution.set_progress(0.50, {0.50, 0.90}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   local_scheduler.advance_to(local_clock.now());
-  EXPECT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kInterrupted));
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
@@ -6155,7 +6212,7 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   local_scheduler.advance_to(local_clock.now());
-  EXPECT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kInterrupted));
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
@@ -6208,7 +6265,7 @@ TEST_F(ExecutionKernelTest, Execute_ResolvedContactGraspInstallsExactEphemeralPo
 
   const auto result = execute_sync(request);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
   ASSERT_TRUE(planner.last_request.contact_policy_id.has_value());
   EXPECT_EQ(planner.last_request.contact_policy_id->rfind("contact_grasp.bound.", 0), 0U);
   ASSERT_TRUE(planner.last_request.retained_collision_policy);
@@ -6329,7 +6386,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
   ASSERT_TRUE(tick.ok());
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "runtime_collision_detected");
@@ -6419,7 +6477,8 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(tick.ok());
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
@@ -6487,7 +6546,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
   ASSERT_TRUE(tick.ok());
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
@@ -6574,7 +6634,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
   ASSERT_TRUE(tick.ok());
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  // The collision is a reported fact only: no local latch, no ending.
+  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "runtime_collision_monitor_inconclusive");
@@ -6632,7 +6693,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
 }
 
 // --- Full cycle test ---
@@ -6733,7 +6794,9 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_AfterExecute_ContainsIdsAndFina
   auto snapshot = kernel.get_execution_snapshot();
   EXPECT_EQ(snapshot.execution_id, 1u);
   EXPECT_EQ(snapshot.move_id, "snapshot_move");
-  EXPECT_EQ(snapshot.state, ExecutionState::kCompleted);
+  // The participant's final snapshot keeps the phase it ended in.
+  EXPECT_EQ(snapshot.state, ExecutionState::kExecuting);
+  EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_DOUBLE_EQ(snapshot.progress, 1.0);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
   EXPECT_EQ(snapshot.joint_positions_rad[0], 1.0);
@@ -6804,7 +6867,7 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_DuringExecuting_ServesLiveBacke
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
 }
 
 // ============================================================================
@@ -6823,7 +6886,7 @@ TEST_F(ExecutionKernelTest, WaitForCompletion_BlocksUntilDone) {
   ASSERT_TRUE(prepare_and_dispatch(kernel, make_test_request()).ok());
   bool done = kernel.wait_for_completion();
   EXPECT_TRUE(done);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(ended_as(kernel), "completed");
 }
 
 // ============================================================================
@@ -6844,7 +6907,7 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
   // Spec 230 §6.1: state_transition -> cache_miss -> plan_started ->
   //   plan_completed -> state_transition -> validation_started ->
   //   validation_passed -> participant_prepared -> state_transition ->
-  //   execute_started -> execute_completed -> state_transition
+  //   execute_started -> execute_completed -> participant_settled (fact)
   ASSERT_GE(events.size(), 12u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
   EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
@@ -6857,7 +6920,7 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
   EXPECT_EQ(events[8], KernelEventType::kStateTransition);
   EXPECT_EQ(events[9], KernelEventType::kExecuteStarted);
   EXPECT_EQ(events[10], KernelEventType::kExecuteCompleted);
-  EXPECT_EQ(events[11], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[11], KernelEventType::kParticipantSettled);
 }
 
 TEST_F(ExecutionKernelTest, AcknowledgeCompleted_CannotOvertakeTerminalPublication) {
@@ -6924,8 +6987,9 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_CannotOvertakeTerminalPublicati
       [](const KernelEvent& event) { return event.type == KernelEventType::kExecuteCompleted; });
   const auto completed_transition =
       std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-        return event.type == KernelEventType::kStateTransition &&
-               event.to_state == ExecutionState::kCompleted;
+        return event.type == KernelEventType::kParticipantSettled &&
+               event.participant_fact.has_value() &&
+               event.participant_fact->kind == ParticipantExecutionFactKind::kComputedCompletion;
       });
   const auto acknowledged =
       std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
@@ -6934,7 +6998,7 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_CannotOvertakeTerminalPublicati
   const auto idle_transition =
       std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
         return event.type == KernelEventType::kStateTransition &&
-               event.from_state == ExecutionState::kCompleted &&
+               event.from_state == ExecutionState::kExecuting &&
                event.to_state == ExecutionState::kIdle;
       });
   ASSERT_NE(execute_completed, events.end());
@@ -7005,7 +7069,7 @@ TEST_F(ExecutionKernelTest, Events_CacheHit) {
   EXPECT_EQ(events[6], KernelEventType::kStateTransition);
   EXPECT_EQ(events[7], KernelEventType::kExecuteStarted);
   EXPECT_EQ(events[8], KernelEventType::kExecuteCompleted);
-  EXPECT_EQ(events[9], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[9], KernelEventType::kParticipantSettled);
 }
 
 TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
@@ -7024,13 +7088,13 @@ TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
 
   std::lock_guard<std::mutex> lock(events_mutex);
   // Spec 230 §6.1 (failure): state_transition -> cache_miss -> plan_started ->
-  //   error_raised -> state_transition
+  //   error_raised -> participant_settled (local-failure fact)
   ASSERT_GE(events.size(), 5u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
   EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
   EXPECT_EQ(events[2], KernelEventType::kPlanStarted);
   EXPECT_EQ(events[3], KernelEventType::kErrorRaised);
-  EXPECT_EQ(events[4], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[4], KernelEventType::kParticipantSettled);
 }
 
 TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
@@ -7049,7 +7113,7 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
   std::lock_guard<std::mutex> lock(events_mutex);
   // state_transition -> cache_miss -> plan_started -> plan_completed ->
   //   state_transition -> validation_started -> validation_failed ->
-  //   error_raised -> state_transition
+  //   error_raised -> participant_settled (local-failure fact)
   ASSERT_GE(events.size(), 9u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
   EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
@@ -7059,7 +7123,7 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
   EXPECT_EQ(events[5], KernelEventType::kValidationStarted);
   EXPECT_EQ(events[6], KernelEventType::kValidationFailed);
   EXPECT_EQ(events[7], KernelEventType::kErrorRaised);
-  EXPECT_EQ(events[8], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[8], KernelEventType::kParticipantSettled);
 }
 
 TEST_F(ExecutionKernelTest, Events_SubscribeUnsubscribe) {
@@ -7144,23 +7208,28 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_HappyPath) {
   std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  std::vector<std::pair<ExecutionState, ParticipantExecutionFactKind>> endings;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kStateTransition) {
       transitions.emplace_back(e.from_state, e.to_state);
+    } else if (e.type == KernelEventType::kParticipantSettled) {
+      ASSERT_TRUE(e.participant_fact.has_value());
+      endings.emplace_back(e.to_state, e.participant_fact->kind);
     }
   }
 
-  // Expected transitions:
-  // Idle -> Planning -> Validating -> Executing -> Completed
-  EXPECT_EQ(transitions.size(), 4u);
+  // Expected working phases Idle -> Planning -> Validating -> Executing,
+  // then the completion fact reported from Executing (never a terminal).
+  EXPECT_EQ(transitions.size(), 3u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
   EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].first, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].second, ExecutionState::kValidating);
   EXPECT_EQ(transitions[2].first, ExecutionState::kValidating);
   EXPECT_EQ(transitions[2].second, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[3].first, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[3].second, ExecutionState::kCompleted);
+  ASSERT_EQ(endings.size(), 1u);
+  EXPECT_EQ(endings[0].first, ExecutionState::kExecuting);
+  EXPECT_EQ(endings[0].second, ParticipantExecutionFactKind::kComputedCompletion);
 }
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_CacheHit) {
@@ -7178,24 +7247,29 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_CacheHit) {
   std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  std::vector<std::pair<ExecutionState, ParticipantExecutionFactKind>> endings;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kStateTransition) {
       transitions.emplace_back(e.from_state, e.to_state);
+    } else if (e.type == KernelEventType::kParticipantSettled) {
+      ASSERT_TRUE(e.participant_fact.has_value());
+      endings.emplace_back(e.to_state, e.participant_fact->kind);
     }
   }
 
   // Expected transitions (cache hit): admission enters Planning first so
   // stop/reset can interrupt slow preparation before the worker starts.
-  // Idle -> Planning -> Validating -> Executing -> Completed
-  EXPECT_EQ(transitions.size(), 4u);
+  // Idle -> Planning -> Validating -> Executing, then the completion fact.
+  EXPECT_EQ(transitions.size(), 3u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
   EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].first, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].second, ExecutionState::kValidating);
   EXPECT_EQ(transitions[2].first, ExecutionState::kValidating);
   EXPECT_EQ(transitions[2].second, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[3].first, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[3].second, ExecutionState::kCompleted);
+  ASSERT_EQ(endings.size(), 1u);
+  EXPECT_EQ(endings[0].first, ExecutionState::kExecuting);
+  EXPECT_EQ(endings[0].second, ParticipantExecutionFactKind::kComputedCompletion);
 }
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_PlanFailure) {
@@ -7215,19 +7289,24 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_PlanFailure) {
   std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  std::vector<std::pair<ExecutionState, ParticipantExecutionFactKind>> endings;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kStateTransition) {
       transitions.emplace_back(e.from_state, e.to_state);
+    } else if (e.type == KernelEventType::kParticipantSettled) {
+      ASSERT_TRUE(e.participant_fact.has_value());
+      endings.emplace_back(e.to_state, e.participant_fact->kind);
     }
   }
 
   // Expected transitions (plan failure):
-  // Idle -> Planning -> Failed
-  EXPECT_EQ(transitions.size(), 2u);
+  // Idle -> Planning, then the local-failure fact reported from Planning.
+  EXPECT_EQ(transitions.size(), 1u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
   EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
-  EXPECT_EQ(transitions[1].first, ExecutionState::kPlanning);
-  EXPECT_EQ(transitions[1].second, ExecutionState::kFailed);
+  ASSERT_EQ(endings.size(), 1u);
+  EXPECT_EQ(endings[0].first, ExecutionState::kPlanning);
+  EXPECT_EQ(endings[0].second, ParticipantExecutionFactKind::kLocalFailure);
 }
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_ValidationFailure) {
@@ -7246,21 +7325,26 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_ValidationFailure) {
   std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
+  std::vector<std::pair<ExecutionState, ParticipantExecutionFactKind>> endings;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kStateTransition) {
       transitions.emplace_back(e.from_state, e.to_state);
+    } else if (e.type == KernelEventType::kParticipantSettled) {
+      ASSERT_TRUE(e.participant_fact.has_value());
+      endings.emplace_back(e.to_state, e.participant_fact->kind);
     }
   }
 
   // Expected transitions (validation failure):
-  // Idle -> Planning -> Validating -> Failed
-  EXPECT_EQ(transitions.size(), 3u);
+  // Idle -> Planning -> Validating, then the local-failure fact.
+  EXPECT_EQ(transitions.size(), 2u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
   EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].first, ExecutionState::kPlanning);
   EXPECT_EQ(transitions[1].second, ExecutionState::kValidating);
-  EXPECT_EQ(transitions[2].first, ExecutionState::kValidating);
-  EXPECT_EQ(transitions[2].second, ExecutionState::kFailed);
+  ASSERT_EQ(endings.size(), 1u);
+  EXPECT_EQ(endings[0].first, ExecutionState::kValidating);
+  EXPECT_EQ(endings[0].second, ParticipantExecutionFactKind::kLocalFailure);
 }
 
 // ============================================================================
@@ -7720,10 +7804,10 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
     ASSERT_TRUE(timed_kernel.wait_for_completion(2'000'000'000));
     EXPECT_EQ(ticks, test.expected_ticks);
     if (test.complete_at == test.expected_ticks) {
-      EXPECT_EQ(timed_kernel.get_status().state, ExecutionState::kCompleted);
+      EXPECT_EQ(ended_as(timed_kernel), "completed");
       EXPECT_EQ(timed.stop_count_value(), 0);
     } else {
-      EXPECT_EQ(timed_kernel.get_status().state, ExecutionState::kFailed);
+      EXPECT_EQ(ended_as(timed_kernel), "failed");
       ASSERT_TRUE(timed_kernel.get_execution_snapshot().error.has_value());
       EXPECT_EQ(timed_kernel.get_execution_snapshot().error->code,
                 std::isfinite(test.scale) && test.failure == FeedbackFailure::kNone
@@ -7827,7 +7911,7 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
 
   // The timeout check happens in the polling loop — need a brief real-time wait
   // for the worker thread to process
-  const bool timed_out = wait_for_state(timeout_kernel, ExecutionState::kFailed, 5000);
+  const bool timed_out = wait_for_ended(timeout_kernel, "failed", 5000);
   if (!timed_out) {
     controlled_execution.release();
     (void)timeout_kernel.wait_for_completion(1'000'000'000);
@@ -7835,7 +7919,9 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   ASSERT_TRUE(timed_out);
 
   auto status = timeout_kernel.get_status();
-  EXPECT_EQ(status.state, ExecutionState::kFailed);
+  EXPECT_EQ(status.state, ExecutionState::kExecuting);
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kEffectSettled);
 
   auto snapshot = timeout_kernel.get_execution_snapshot();
   EXPECT_TRUE(snapshot.error.has_value());
@@ -7877,8 +7963,25 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
   // Wait for kernel to settle
   timeout_kernel.wait_for_completion();
 
+  // Step 3 regression: the participant reports the expired deadline as a
+  // fact with its planning-timeout error and nothing dispatched; the addressed
+  // Kernel derives the (unchanged) Stopped outcome from it. The participant
+  // still publishes the succeeded no-dispatch Stop certificate.
   auto status = timeout_kernel.get_status();
-  EXPECT_EQ(status.state, ExecutionState::kStopped);
+  EXPECT_EQ(ended_as(status), "planning_deadline_expired");
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  ASSERT_TRUE(status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->code, kErrorPlanningTimeout);
+  EXPECT_EQ(execution.execute_count, 0);
+  const auto certificates = timeout_kernel.stop_certificate_evidence();
+  ASSERT_FALSE(certificates.empty());
+  EXPECT_EQ(certificates.back().completion_result, StopCertificateOutcome::kSucceeded);
+  EXPECT_EQ(certificates.back().command_source, "planning_deadline_expired_before_dispatch");
+  ts_scheduler.advance_to(ts_clock.now());
+  const auto assessment = timeout_kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.execution_state, ExecutionState::kStopped);
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
 }
 
 TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcrossRuns) {
@@ -8008,7 +8111,7 @@ TEST_F(ExecutionKernelTest, Execute_ContactPolicyStampsEventsAndFailedSnapshot) 
 
   auto result = execute_sync(request);
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(ended_as(kernel), "failed");
 
   auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.action_span.has_value());
@@ -8061,6 +8164,83 @@ TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
     EXPECT_EQ(sequences[i], static_cast<std::uint64_t>(i + 1))
         << "dispatch sequence must be contiguous from 1; index " << i;
   }
+}
+
+// Track 1 step 3: the participant reports facts, never operation terminals.
+TEST_F(ExecutionKernelTest, ParticipantPublishesOnlyWorkingPhasesAndFacts) {
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+  const auto completed = execute_sync(make_test_request("phases_complete"));
+  ASSERT_TRUE(completed.ok());
+  EXPECT_EQ(ended_as(kernel), "completed");
+  ASSERT_TRUE(kernel.acknowledge_completed(completed.value()).accepted);
+  PlanResultDTO plan_error;
+  plan_error.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  planner.next_result = plan_error;
+  ASSERT_TRUE(execute_sync(make_test_request("phases_fail")).ok());
+  EXPECT_EQ(ended_as(kernel), "failed");
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  std::size_t facts = 0;
+  for (const auto& event : events) {
+    if (event.type == KernelEventType::kStateTransition) {
+      EXPECT_TRUE(event.to_state == ExecutionState::kIdle ||
+                  event.to_state == ExecutionState::kPlanning ||
+                  event.to_state == ExecutionState::kValidating ||
+                  event.to_state == ExecutionState::kExecuting)
+          << to_string(event.to_state);
+    }
+    if (event.type == KernelEventType::kParticipantSettled) {
+      ASSERT_TRUE(event.participant_fact.has_value());
+      EXPECT_EQ(event.from_state, event.to_state);
+      ++facts;
+    }
+  }
+  EXPECT_EQ(facts, 2u);
+}
+
+// Track 1 step 3: an exact cancellation before dispatch is reported as the
+// cancelled-before-dispatch fact, with nothing dispatched; the addressed
+// Kernel owns the outcome.
+TEST_F(ExecutionKernelTest, CancelBeforeDispatchIsReportedAsItsOwnFact) {
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+  const auto prepared =
+      kernel.PrepareMotion(prepared_motion_request(make_test_request("cancel_before_dispatch")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  bool ready = false;
+  for (int attempt = 0; attempt < 2000 && !ready; ++attempt) {
+    const auto observed = kernel.ObservePreparedMotion(prepared.value());
+    ready = observed.ok() &&
+            observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+    if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(ready);
+  ASSERT_TRUE(kernel.CancelPreparedMotion(prepared.value()).ok());
+  ASSERT_TRUE(wait_for_ended(kernel, "cancelled_before_dispatch"));
+  const auto status = kernel.get_status();
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_FALSE(status.fact->error.has_value());
+  EXPECT_NE(status.state, ExecutionState::kExecuting);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(execution.reset_count, 0);
+  ASSERT_TRUE(kernel.wait_for_completion(1'000'000'000));
+  std::lock_guard<std::mutex> lock(events_mutex);
+  const auto settled = std::find_if(events.begin(), events.end(), [](const auto& event) {
+    return event.type == KernelEventType::kParticipantSettled;
+  });
+  ASSERT_NE(settled, events.end());
+  EXPECT_EQ(settled->participant_fact->kind, ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(settled->execution_id, prepared.value());
 }
 
 }  // namespace

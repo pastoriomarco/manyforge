@@ -1468,4 +1468,29 @@ Result<PreparedOperationParticipantDTO> DecodePreparedOperationParticipant(
   }
 }
 
+Result<SealedPreparedMotionInputs> MakeSealedPreparedMotionInputs(
+    const PreparedOperationParticipantDTO& value, const RuntimeParticipantBinding& binding,
+    const RuntimeParticipantStopReadiness& readiness,
+    std::span<const HardStopResourceLimitDTO> retained_default_limits,
+    MotionInterruptNodeCategory node_category) {
+  const auto* motion = std::get_if<PreparedMotionExecutionDTO>(&value.payload);
+  if (motion == nullptr) {
+    return rejected<SealedPreparedMotionInputs>("sealed_motion_inputs_require_motion_payload");
+  }
+  // Same verification as every canonical encoding: only an exact sealed
+  // participant (digest included) yields bytes.
+  auto participant = EncodePreparedOperationParticipant(value, binding, readiness,
+                                                        retained_default_limits, node_category);
+  if (!participant.ok()) return Result<SealedPreparedMotionInputs>::Err(participant.error());
+  auto trajectory = EncodePreparedTrajectory(motion->trajectory);
+  if (!trajectory.ok()) return Result<SealedPreparedMotionInputs>::Err(trajectory.error());
+  try {
+    return Result<SealedPreparedMotionInputs>::Ok(SealedPreparedMotionInputs{
+        value.prepared_contract_digest, std::move(participant.value()),
+        std::move(trajectory.value())});
+  } catch (const std::exception& error) {
+    return rejected<SealedPreparedMotionInputs>(error.what());
+  }
+}
+
 }  // namespace manyforge::core

@@ -65,7 +65,9 @@ bool valid_state(const PreparedMotion& prepared, const MotionStepState& state) n
   const auto& waypoints = prepared.trajectory.waypoints;
   const std::size_t hint = state.segment_hint;
   if (!std::isfinite(governor.scale()) || !std::isfinite(governor.rate_per_s()) ||
-      !std::isfinite(state.path_time_s) || hint + 1U >= waypoints.size()) {
+      !std::isfinite(state.path_time_s) || hint + 1U >= waypoints.size() ||
+      (state.active_stop && !std::isfinite(state.stop_trip_path_time_s)) ||
+      (state.replacement_under_stop && !state.active_stop)) {
     return false;
   }
   const double end = waypoints.back().time_from_start_s;
@@ -215,6 +217,7 @@ MotionStepStatus StepMotion(const PreparedMotion& prepared, MotionStepState& sta
   if (path_time_s > end_s) path_time_s = end_s;
 
   std::optional<StopTransition> active_stop = state.active_stop;
+  double trip_path_time_s = state.stop_trip_path_time_s;
   RuntimeScaleGeneration scale_generation = state.scale_generation;
   if (stop_accepted) {
     // Rule 6: brake on-path from this tick's actual scale and rate, under the
@@ -229,6 +232,9 @@ MotionStepStatus StepMotion(const PreparedMotion& prepared, MotionStepState& sta
       return cannot_proceed(output);
     }
     governor = *braking;
+    // The first Stop records the trip cursor (this tick's actual path time);
+    // stronger stages and replacements keep it as the spring-back target.
+    if (!active_stop) trip_path_time_s = path_time_s;
     active_stop = *inputs.stop;
   } else if (output.scale_validation == MotionInputValidation::kAccepted) {
     if (governor.retarget(inputs.scale->target_scale)) {
@@ -301,8 +307,11 @@ MotionStepStatus StepMotion(const PreparedMotion& prepared, MotionStepState& sta
 
   MotionStepStatus status = MotionStepStatus::kRunning;
   const bool scale_at_rest = governor.scale() == 0.0 && governor.rate_per_s() == 0.0;
-  if (active_stop && scale_at_rest && !governor.transitioning()) {
-    status = MotionStepStatus::kStopped;  // Computed fact, not rest evidence.
+  // A replacement installed under the Stop is that Stop's plan: its path end
+  // is its own rest point. Both are computed facts, not rest evidence.
+  if (active_stop && ((scale_at_rest && !governor.transitioning()) ||
+                      (state.replacement_under_stop && at_end))) {
+    status = MotionStepStatus::kStopped;
   } else if (at_end) {
     status = MotionStepStatus::kComputedEnd;  // Rule 7: not completion.
   } else if (active_stop) {
@@ -318,6 +327,7 @@ MotionStepStatus StepMotion(const PreparedMotion& prepared, MotionStepState& sta
   state.scale_generation = scale_generation;
   state.mode = status;
   state.active_stop = active_stop;
+  state.stop_trip_path_time_s = trip_path_time_s;
 
   output.path_time_s = path_time_s;
   output.applied_scale = governor.scale();
@@ -327,6 +337,126 @@ MotionStepStatus StepMotion(const PreparedMotion& prepared, MotionStepState& sta
   output.consumed_stop_generation =
       active_stop ? active_stop->stop_generation : StopGeneration{0U};
   return status;
+}
+
+namespace {
+
+bool within(double actual, double expected, double tolerance) noexcept {
+  // NaN anywhere fails the comparison and so refuses.
+  return std::abs(actual - expected) <= tolerance;
+}
+
+// The replacement's last waypoint must be at rest within the continuity
+// tolerance: at the path end the step holds the cursor (zero path rate).
+bool ends_at_rest(const PreparedMotion& replacement) noexcept {
+  const auto& last = replacement.trajectory.waypoints.back();
+  const auto& tolerance = kMotionContinuityTolerance;
+  const std::size_t joints = replacement.joint_count;
+  if (last.velocities_rad_s.size() != joints) return false;
+  if (!last.accelerations_rad_s2.empty() && last.accelerations_rad_s2.size() != joints) {
+    return false;
+  }
+  for (std::size_t j = 0U; j < joints; ++j) {
+    if (!within(last.velocities_rad_s[j], 0.0, tolerance.velocity_rad_s)) return false;
+    if (!last.accelerations_rad_s2.empty() &&
+        !within(last.accelerations_rad_s2[j], 0.0, tolerance.acceleration_rad_s2)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+ReplacementInstallResult install_result(ReplacementInstallRefusal refusal,
+                                        std::size_t joint = 0U) noexcept {
+  return ReplacementInstallResult{refusal, static_cast<std::uint8_t>(joint)};
+}
+
+}  // namespace
+
+ReplacementInstallResult InstallReplacementMotionStep(
+    const PreparedMotion& current_prepared, const MotionStepState& current,
+    const MotionStepOutput& last_output, const PreparedMotion& replacement, std::int64_t now_ns,
+    MotionStepState& installed, MotionStepOutput& initial_output) noexcept {
+  using Refusal = ReplacementInstallRefusal;
+  if (!valid_prepared(current_prepared) || !valid_state(current_prepared, current)) {
+    return install_result(Refusal::kInvalidCurrent);
+  }
+  // The continuity authority is the command the current goal emitted at this
+  // very tick; anything else (an older tick, a failed step) is not it.
+  const auto& governor = *current.governor;
+  const StopGeneration current_stop_generation =
+      current.active_stop ? current.active_stop->stop_generation : StopGeneration{0U};
+  if (current.last_tick_ns != now_ns || last_output.status == MotionStepStatus::kCannotProceed ||
+      !(last_output.goal == current.goal) || last_output.path_time_s != current.path_time_s ||
+      last_output.applied_scale != governor.scale() ||
+      last_output.scale_rate_per_s != governor.rate_per_s() ||
+      !(last_output.consumed_stop_generation == current_stop_generation) ||
+      last_output.command.joint_count != current_prepared.joint_count) {
+    return install_result(Refusal::kNotInstallationTick);
+  }
+  if (!valid_prepared(replacement) || !replacement.key.fence().nonzero()) {
+    return install_result(Refusal::kInvalidReplacement);
+  }
+  if (replacement.key.operation_id != current_prepared.key.operation_id ||
+      !(replacement.key.binding == current_prepared.key.binding)) {
+    return install_result(Refusal::kIdentityMismatch);
+  }
+  if (!(replacement.key.controller_goal_generation > current.goal.controller_goal_generation)) {
+    return install_result(Refusal::kStaleGoal);
+  }
+  if (replacement.joint_count != current_prepared.joint_count ||
+      replacement.trajectory.joint_names != current_prepared.trajectory.joint_names) {
+    return install_result(Refusal::kJointMismatch);
+  }
+  const bool under_stop = current.active_stop.has_value();
+  if (under_stop) {
+    if (now_ns >= current.active_stop->braking_deadline_ns) {
+      return install_result(Refusal::kStopDeadlinePassed);
+    }
+    if (!ends_at_rest(replacement)) return install_result(Refusal::kReplacementDoesNotEndAtRest);
+  }
+
+  // The replacement is already retimed: it runs at scale 1 under its own law
+  // and the current scale is never composed onto it. Stop and trip cursor are
+  // carried verbatim; installation never clears them.
+  const auto own_law = RuntimeScaleGovernor::create(1.0, replacement.governor_bounds);
+  if (!own_law) return install_result(Refusal::kInvalidReplacement);
+  MotionStepState candidate{};
+  candidate.governor = own_law;
+  candidate.path_time_s = replacement.trajectory.waypoints.front().time_from_start_s;
+  candidate.segment_hint = 0U;
+  candidate.last_tick_ns = now_ns;
+  candidate.goal = replacement.key.fence();
+  candidate.scale_generation = current.scale_generation;
+  candidate.mode = under_stop ? MotionStepStatus::kBraking : MotionStepStatus::kRunning;
+  candidate.active_stop = current.active_stop;
+  candidate.stop_trip_path_time_s = current.stop_trip_path_time_s;
+  candidate.replacement_under_stop = under_stop;
+
+  // Zero-elapsed step: the replacement's command for this same tick.
+  MotionStepOutput initial;
+  if (StepMotion(replacement, candidate, MotionStepInputs{now_ns, nullptr, nullptr, {}},
+                 initial) == MotionStepStatus::kCannotProceed) {
+    return install_result(Refusal::kInvalidReplacement);
+  }
+  const auto& tolerance = kMotionContinuityTolerance;
+  const auto& actual = last_output.command;
+  for (std::size_t j = 0U; j < replacement.joint_count; ++j) {
+    if (!within(initial.command.position_rad[j], actual.position_rad[j], tolerance.position_rad)) {
+      return install_result(Refusal::kPositionDiscontinuity, j);
+    }
+    if (!within(initial.command.velocity_rad_s[j], actual.velocity_rad_s[j],
+                tolerance.velocity_rad_s)) {
+      return install_result(Refusal::kVelocityDiscontinuity, j);
+    }
+    if (!within(initial.command.acceleration_rad_s2[j], actual.acceleration_rad_s2[j],
+                tolerance.acceleration_rad_s2)) {
+      return install_result(Refusal::kAccelerationDiscontinuity, j);
+    }
+  }
+  installed = candidate;
+  initial_output = initial;
+  return install_result(Refusal::kNone);
 }
 
 }  // namespace manyforge::core

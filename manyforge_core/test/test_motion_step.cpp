@@ -8,6 +8,7 @@
 #include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/execution/motion_step.hpp>
 #include <manyforge_core/execution/prepared_motion.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <new>
 #include <optional>
@@ -179,7 +180,10 @@ void ExpectSameState(const MotionStepState& a, const MotionStepState& b) {
   ASSERT_EQ(a.active_stop.has_value(), b.active_stop.has_value());
   if (a.active_stop) {
     EXPECT_EQ(a.active_stop->stop_generation, b.active_stop->stop_generation);
+    EXPECT_EQ(a.active_stop->braking_deadline_ns, b.active_stop->braking_deadline_ns);
+    EXPECT_EQ(a.stop_trip_path_time_s, b.stop_trip_path_time_s);
   }
+  EXPECT_EQ(a.replacement_under_stop, b.replacement_under_stop);
 }
 
 TEST(MotionStep, SameInputsProduceIdenticalOutputs) {
@@ -649,6 +653,291 @@ TEST(MotionStep, TickCrossingManyKnotsUsesBoundedLookupAndSamplesTheRightSegment
   for (std::size_t j = 0; j < 2; ++j) {
     EXPECT_NEAR(output.command.position_rad[j], reference.positions_rad[j], 1e-12);
   }
+}
+
+// ---- Stop-preserving replacement installation (G4, SX-031). ----
+
+constexpr double kContinuityTolerance = kMotionContinuityTolerance.position_rad;
+
+// A pre-retimed replacement whose initial q, q', q'' at scale 1 equal `from`
+// (plus `offset`) and that comes to rest after `duration_s`.
+PreparedMotion MakeReplacement(const MotionJointCommand& from, std::uint64_t goal_generation,
+                               double duration_s = 0.8, std::array<double, 3> offset = {},
+                               double final_velocity = 0.0) {
+  PreparedMotion replacement = MakePrepared();
+  replacement.key.controller_goal_generation = ControllerGoalGeneration{goal_generation};
+  TrajectoryWaypointDTO start{0.0, {}, {}, {}};
+  TrajectoryWaypointDTO end{duration_s, {}, {}, {}};
+  for (std::size_t j = 0; j < 2; ++j) {
+    const double p = from.position_rad[j] + (j == 0 ? offset[0] : 0.0);
+    const double v = from.velocity_rad_s[j] + (j == 1 ? offset[1] : 0.0);
+    const double a = from.acceleration_rad_s2[j] + (j == 0 ? offset[2] : 0.0);
+    start.positions_rad.push_back(p);
+    start.velocities_rad_s.push_back(v);
+    start.accelerations_rad_s2.push_back(a);
+    end.positions_rad.push_back(p + 0.5 * v * duration_s);
+    end.velocities_rad_s.push_back(final_velocity);
+    end.accelerations_rad_s2.push_back(0.0);
+  }
+  replacement.trajectory.waypoints = {start, end};
+  return replacement;
+}
+
+struct Installation {
+  ReplacementInstallResult result;
+  MotionStepState state;
+  MotionStepOutput output;
+};
+
+Installation Install(const Loop& loop, const MotionStepOutput& last, const PreparedMotion& next,
+                     std::int64_t now_ns) {
+  Installation installation{};
+  installation.result = InstallReplacementMotionStep(loop.prepared, loop.state, last, next,
+                                                     now_ns, installation.state,
+                                                     installation.output);
+  return installation;
+}
+
+// Brake on-path for a while; returns the command emitted at the last tick.
+MotionStepOutput BrakeFor(Loop& loop, const StopTransition& stop, int ticks) {
+  MotionStepOutput out;
+  for (int tick = 0; tick < 200; ++tick) out = loop.Tick();
+  for (int tick = 0; tick < ticks; ++tick) out = loop.Tick(&stop);
+  EXPECT_EQ(out.status, MotionStepStatus::kBraking);
+  return out;
+}
+
+TEST(MotionStepReplacement, FirstStopRecordsTripCursorAndStrongerStageKeepsIt) {
+  Loop loop;
+  for (int tick = 0; tick < 300; ++tick) loop.Tick();
+  const auto soft = loop.Stop(1U, {4.0, 1.0});
+  const auto first = loop.Tick(&soft);
+  ASSERT_EQ(first.status, MotionStepStatus::kBraking);
+  EXPECT_EQ(loop.state.stop_trip_path_time_s, first.path_time_s);
+  for (int tick = 0; tick < 50; ++tick) loop.Tick(&soft);
+  const auto hard = loop.Stop(2U, kStopCeiling);
+  const auto stronger = loop.Tick(&hard);
+  EXPECT_EQ(stronger.consumed_stop_generation, StopGeneration{2U});
+  EXPECT_GT(stronger.path_time_s, first.path_time_s);
+  EXPECT_EQ(loop.state.stop_trip_path_time_s, first.path_time_s);
+}
+
+TEST(MotionStepReplacement, InstallWhileBrakingPreservesStopAndNeverReturnsToNominal) {
+  Loop loop;
+  const auto stop = loop.Stop(1U, {4.0, 1.0});
+  const auto last = BrakeFor(loop, stop, 40);
+  ASSERT_LT(last.applied_scale, 1.0);
+  const double trip = loop.state.stop_trip_path_time_s;
+  const PreparedMotion next = MakeReplacement(last.command, 2U);
+  const auto installed = Install(loop, last, next, loop.now_ns);
+  ASSERT_TRUE(installed.result.installed())
+      << static_cast<int>(installed.result.refusal) << " joint "
+      << static_cast<int>(installed.result.joint_index);
+
+  // Stop identity, bounds and local deadline are preserved verbatim.
+  const auto& kept = installed.state.active_stop;
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(kept->goal, stop.goal);
+  EXPECT_EQ(kept->stop_generation, stop.stop_generation);
+  EXPECT_EQ(kept->stage_index, stop.stage_index);
+  EXPECT_EQ(kept->braking_bounds.max_rate_per_s, stop.braking_bounds.max_rate_per_s);
+  EXPECT_EQ(kept->braking_bounds.max_rate_change_per_s2,
+            stop.braking_bounds.max_rate_change_per_s2);
+  EXPECT_EQ(kept->braking_deadline_ns, stop.braking_deadline_ns);
+  EXPECT_EQ(installed.state.stop_trip_path_time_s, trip);
+  EXPECT_TRUE(installed.state.replacement_under_stop);
+  EXPECT_EQ(installed.state.goal, next.key.fence());
+  EXPECT_EQ(installed.state.last_tick_ns, loop.now_ns);
+
+  // Same-tick command continuity; the replacement's own law (scale 1) is
+  // used, the braking scale is not composed onto it a second time.
+  EXPECT_EQ(installed.output.status, MotionStepStatus::kBraking);
+  EXPECT_EQ(installed.output.applied_scale, 1.0);
+  EXPECT_EQ(installed.output.consumed_stop_generation, stop.stop_generation);
+  for (std::size_t j = 0; j < 2; ++j) {
+    EXPECT_NEAR(installed.output.command.position_rad[j], last.command.position_rad[j],
+                kContinuityTolerance);
+    EXPECT_NEAR(installed.output.command.velocity_rad_s[j], last.command.velocity_rad_s[j],
+                kContinuityTolerance);
+    EXPECT_NEAR(installed.output.command.acceleration_rad_s2[j],
+                last.command.acceleration_rad_s2[j], kContinuityTolerance);
+  }
+
+  // Continue under the Stop: scale is ignored, the mode never returns to
+  // nominal, and the plan's path end is the Stop's rest point.
+  Loop replaced(1.0, next);
+  replaced.state = installed.state;
+  replaced.now_ns = loop.now_ns;
+  const auto resume = replaced.Scale(5U, 1.0);
+  MotionStepOutput out = installed.output;
+  for (int tick = 0; tick < 2000 && out.status != MotionStepStatus::kStopped; ++tick) {
+    out = replaced.Tick(nullptr, &resume);
+    ASSERT_TRUE(out.status == MotionStepStatus::kBraking || out.status == MotionStepStatus::kStopped)
+        << static_cast<int>(out.status);
+    EXPECT_EQ(out.scale_validation, MotionInputValidation::kIgnoredForStop);
+    EXPECT_EQ(out.consumed_stop_generation, stop.stop_generation);
+  }
+  EXPECT_EQ(out.status, MotionStepStatus::kStopped);
+  EXPECT_EQ(out.command.velocity_rad_s[0], 0.0);
+  EXPECT_EQ(replaced.state.stop_trip_path_time_s, trip);
+  EXPECT_EQ(replaced.Tick(nullptr, &resume).status, MotionStepStatus::kStopped);
+}
+
+TEST(MotionStepReplacement, NewerStageBrakesTheInstalledReplacementOnPath) {
+  Loop loop;
+  const auto stop = loop.Stop(1U, {4.0, 1.0});
+  const auto last = BrakeFor(loop, stop, 40);
+  const PreparedMotion next = MakeReplacement(last.command, 2U, 3.0);
+  const auto installed = Install(loop, last, next, loop.now_ns);
+  ASSERT_TRUE(installed.result.installed());
+  Loop replaced(1.0, next);
+  replaced.state = installed.state;
+  replaced.now_ns = loop.now_ns;
+  // A stage issued for the old goal is stale for the replacement.
+  const auto old_goal_stage = loop.Stop(2U, kStopCeiling);
+  EXPECT_EQ(replaced.Tick(&old_goal_stage).stop_validation, MotionInputValidation::kStale);
+  const auto hard = replaced.Stop(2U, kStopCeiling);
+  auto out = replaced.Tick(&hard);
+  EXPECT_EQ(out.stop_validation, MotionInputValidation::kAccepted);
+  for (int tick = 0; tick < 2000 && out.status == MotionStepStatus::kBraking; ++tick) {
+    out = replaced.Tick();
+  }
+  EXPECT_EQ(out.status, MotionStepStatus::kStopped);
+  EXPECT_EQ(out.applied_scale, 0.0);
+  EXPECT_LT(out.path_time_s, 3.0);
+}
+
+TEST(MotionStepReplacement, MismatchIsRefusedAndBrakingContinuesBitIdentical) {
+  Loop loop;
+  Loop reference;
+  const auto stop = loop.Stop(1U, {4.0, 1.0});
+  const auto last = BrakeFor(loop, stop, 40);
+  const auto ref_last = BrakeFor(reference, stop, 40);
+  ExpectSameOutput(last, ref_last);
+
+  struct Case {
+    std::array<double, 3> offset;
+    ReplacementInstallRefusal refusal;
+    std::uint8_t joint;
+  };
+  for (const Case& mismatch :
+       {Case{{1e-6, 0.0, 0.0}, ReplacementInstallRefusal::kPositionDiscontinuity, 0U},
+        Case{{0.0, 1e-6, 0.0}, ReplacementInstallRefusal::kVelocityDiscontinuity, 1U},
+        Case{{0.0, 0.0, 1e-6}, ReplacementInstallRefusal::kAccelerationDiscontinuity, 0U}}) {
+    const PreparedMotion next = MakeReplacement(last.command, 2U, 0.8, mismatch.offset);
+    // Outputs alias the loop's own state: a refusal must not write them.
+    MotionStepOutput emitted = last;
+    const auto result = InstallReplacementMotionStep(loop.prepared, loop.state, emitted, next,
+                                                     loop.now_ns, loop.state, emitted);
+    EXPECT_EQ(result.refusal, mismatch.refusal);
+    EXPECT_EQ(result.joint_index, mismatch.joint);
+    ExpectSameOutput(emitted, last);
+    ExpectSameState(loop.state, reference.state);
+  }
+  MotionStepOutput out;
+  for (int tick = 0; tick < 3000; ++tick) {
+    out = loop.Tick();
+    ExpectSameOutput(out, reference.Tick());
+    if (out.status == MotionStepStatus::kStopped) break;
+  }
+  EXPECT_EQ(out.status, MotionStepStatus::kStopped);
+  ExpectSameState(loop.state, reference.state);
+}
+
+TEST(MotionStepReplacement, StaleLateOrForeignReplacementsAreRefused) {
+  Loop loop;
+  const auto stop = loop.Stop(1U, {4.0, 1.0});
+  const auto last = BrakeFor(loop, stop, 40);
+  const auto refusal = [&](const PreparedMotion& next, std::int64_t now_ns,
+                           const MotionStepOutput& emitted) {
+    return Install(loop, emitted, next, now_ns).result.refusal;
+  };
+  using R = ReplacementInstallRefusal;
+  EXPECT_EQ(refusal(MakeReplacement(last.command, 1U), loop.now_ns, last), R::kStaleGoal);
+  EXPECT_EQ(refusal(MakeReplacement(last.command, 0U), loop.now_ns, last),
+            R::kInvalidReplacement);
+
+  PreparedMotion other_epoch = MakeReplacement(last.command, 2U);
+  other_epoch.key.binding.provider_runtime_epoch = RuntimeEpoch{"epoch-b"};
+  EXPECT_EQ(refusal(other_epoch, loop.now_ns, last), R::kIdentityMismatch);
+  PreparedMotion other_operation = MakeReplacement(last.command, 2U);
+  other_operation.key.operation_id = OperationId{"other"};
+  EXPECT_EQ(refusal(other_operation, loop.now_ns, last), R::kIdentityMismatch);
+  PreparedMotion other_joints = MakeReplacement(last.command, 2U);
+  other_joints.trajectory.joint_names = {"j1", "j3"};
+  EXPECT_EQ(refusal(other_joints, loop.now_ns, last), R::kJointMismatch);
+
+  // Not the command emitted by the current goal at this tick.
+  EXPECT_EQ(refusal(MakeReplacement(last.command, 2U), loop.now_ns + kPeriodNs, last),
+            R::kNotInstallationTick);
+  MotionStepOutput older = last;
+  older.path_time_s -= 1e-3;
+  EXPECT_EQ(refusal(MakeReplacement(last.command, 2U), loop.now_ns, older),
+            R::kNotInstallationTick);
+
+  // Under Stop the replacement is the Stop's plan and must end at rest.
+  EXPECT_EQ(refusal(MakeReplacement(last.command, 2U, 0.8, {}, 0.1), loop.now_ns, last),
+            R::kReplacementDoesNotEndAtRest);
+
+  // Braking deadline reached at the installation tick.
+  Loop late;
+  StopTransition expiring = late.Stop(1U, {4.0, 1.0});
+  expiring.braking_deadline_ns = late.now_ns + 240 * kPeriodNs;
+  const auto late_last = BrakeFor(late, expiring, 40);
+  EXPECT_EQ(Install(late, late_last, MakeReplacement(late_last.command, 2U), late.now_ns)
+                .result.refusal,
+            R::kStopDeadlinePassed);
+}
+
+TEST(MotionStepReplacement, InstallWithoutStopKeepsOwnLawAndScaleGeneration) {
+  Loop loop;
+  const auto slow = loop.Scale(3U, 0.5);
+  MotionStepOutput last;
+  for (int tick = 0; tick < 600; ++tick) last = loop.Tick(nullptr, &slow);
+  ASSERT_EQ(last.status, MotionStepStatus::kRunning);
+  ASSERT_DOUBLE_EQ(last.applied_scale, 0.5);
+  // Pre-retimed for the slider in effect: its own law already includes 0.5.
+  const PreparedMotion next = MakeReplacement(last.command, 2U, 1.5, {}, 0.0);
+  const auto installed = Install(loop, last, next, loop.now_ns);
+  ASSERT_TRUE(installed.result.installed()) << static_cast<int>(installed.result.refusal);
+  EXPECT_FALSE(installed.state.active_stop.has_value());
+  EXPECT_FALSE(installed.state.replacement_under_stop);
+  EXPECT_EQ(installed.output.status, MotionStepStatus::kRunning);
+  EXPECT_EQ(installed.output.applied_scale, 1.0);
+  EXPECT_EQ(installed.state.scale_generation, RuntimeScaleGeneration{3U});
+
+  Loop replaced(1.0, next);
+  replaced.state = installed.state;
+  replaced.now_ns = loop.now_ns;
+  const auto replayed = replaced.Scale(3U, 0.5);
+  EXPECT_EQ(replaced.Tick(nullptr, &replayed).scale_validation, MotionInputValidation::kStale);
+  const auto newer = replaced.Scale(4U, 0.8);
+  EXPECT_EQ(replaced.Tick(nullptr, &newer).scale_validation, MotionInputValidation::kAccepted);
+}
+
+TEST(MotionStepReplacement, InstallationDoesNotAllocate) {
+  Loop loop;
+  const auto stop = loop.Stop(1U, {4.0, 1.0});
+  const auto last = BrakeFor(loop, stop, 40);
+  const PreparedMotion good = MakeReplacement(last.command, 2U);
+  const PreparedMotion bad = MakeReplacement(last.command, 2U, 0.8, {1e-6, 0.0, 0.0});
+  PreparedMotion other_operation = MakeReplacement(last.command, 2U);
+  other_operation.key.operation_id = OperationId{"another-operation-with-a-long-identifier"};
+  MotionStepState state{};
+  MotionStepOutput output{};
+  tracked_allocations = 0U;
+  track_allocations = true;
+  const auto refused = InstallReplacementMotionStep(loop.prepared, loop.state, last, bad,
+                                                    loop.now_ns, state, output);
+  const auto foreign = InstallReplacementMotionStep(loop.prepared, loop.state, last,
+                                                    other_operation, loop.now_ns, state, output);
+  const auto accepted = InstallReplacementMotionStep(loop.prepared, loop.state, last, good,
+                                                     loop.now_ns, state, output);
+  track_allocations = false;
+  EXPECT_EQ(tracked_allocations.load(), 0U);
+  EXPECT_FALSE(refused.installed());
+  EXPECT_EQ(foreign.refusal, ReplacementInstallRefusal::kIdentityMismatch);
+  EXPECT_TRUE(accepted.installed());
 }
 
 TEST(RuntimeScaleGovernorExtensions, FactoriesMatchConstructorsWithoutThrowing) {

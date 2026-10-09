@@ -15,7 +15,6 @@
 #include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/execution_snapshot_publisher.hpp>
 #include <manyforge_core/execution_worker_signals.hpp>
-#include <manyforge_core/interrupt/interrupt_manager.hpp>
 #include <manyforge_core/kernel_event_publisher.hpp>
 #include <manyforge_core/kernel_flight_recorder.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
@@ -34,7 +33,6 @@
 #include <manyforge_core/runtime_collision_monitor.hpp>
 #include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/state_machine.hpp>
-#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/collision.hpp>
@@ -225,12 +223,13 @@ struct ExecutionKernelPorts {
   IPlanningSceneSynchronizer* planning_scene_synchronizer = nullptr;
 };
 
-/// Execution Kernel — single authority for motion execution governance.
-/// Ties together: state machine, stop/collision policies, trajectory cache,
-/// planner backend, observed-state provider, and execution backend.
+/// Per-participant motion execution: planning, validation, preview,
+/// collision look-ahead, prepared-command lifetime, execution realization and
+/// participant evidence. It keeps working phases only and reports facts about
+/// how each execution ended (`ExecutionStatus::fact`, kParticipantSettled);
+/// the addressed Kernel owns operation identity, outcomes and Stop.
 ///
-/// Spec 230: all operations are ROS-free. This is an async v0.1
-/// implementation with event subscription.
+/// Spec 230: all operations are ROS-free.
 class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                         public IResolvedPreparedParticipantExecutionEngine,
                         public IMotionPreview {
@@ -286,6 +285,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                 std::uint32_t planning_attempt_index = 0U,
                                                 std::stop_token stop_token = {}) override;
 
+  /// Motion-free retirement after the addressed owner certified containment:
+  /// retires the prepared membership and local bookkeeping; never resets the
+  /// backend or commands motion, so positions are preserved.
   ResetResultDTO reset_after_certified_containment(
       std::uint64_t execution_id,
       std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
@@ -300,10 +302,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                      std::uint64_t expected_generation) override;
   Result<void> reset_gripper(const std::string& gripper_id, std::uint64_t expected_command_id,
                              std::uint64_t expected_generation) override;
-  /// Acknowledge a successful terminal execution and return to Idle.
+  /// Motion-free retirement of a computed-completion fact; returns to Idle.
   ///
-  /// Valid only when the kernel is currently Completed for exactly the supplied
-  /// execution_id. Failed and Stopped executions require Reset/recovery instead.
+  /// Valid only when the current execution is exactly `execution_id` and its
+  /// fact is computed completion. Other facts retire through Reset/recovery.
   AcknowledgeCompletedResultDTO acknowledge_completed(
       uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
@@ -397,7 +399,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Unsubscribe from kernel events.
   void unsubscribe_events(SubscriptionHandle handle) override;
 
-  /// Block until the current execution completes (reaches terminal state).
+  /// Block until the current execution worker has finished (its fact is reported).
   /// Useful for tests and synchronous callers.
   /// @param timeout_ns Maximum time to wait (0 = wait forever).
   /// @return true if execution completed, false if timed out.
@@ -422,8 +424,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   [[nodiscard]] bool failed_preparation_settled_locked();
   [[nodiscard]] std::optional<ErrorDTO>
   collision_resource_replacement_refusal_locked();
+  /// Motion-free retirement of the prepared membership through the backend's
+  /// RetirePreparedExecution; never moves the robot or resets the backend.
   [[nodiscard]] Result<void> retire_prepared_motion_membership();
-  [[nodiscard]] ResetResultDTO reset_execution_backend();
+  /// Recovery classification input derived from the participant facts and
+  /// the addressed Stop evidence. Recovery moves to the addressed Kernel next.
+  [[nodiscard]] ExecutionState recovery_execution_state_locked(const ExecutionStatus& status) const;
   struct PlanningSuccess;
   struct ExecuteWorkerPlanPhaseResult;
   struct ExecuteWorkerValidationPhaseResult;
@@ -519,12 +525,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void stamp_active_request_correlation(std::map<std::string, std::string>& details) const;
   void stamp_active_request_correlation(ExecutionSnapshot& snapshot) const;
 
-  /// K3: route a terminal decision through the TerminalCommitter.
-  /// Returns the outcome; `outcome.committed` is the state that must
-  /// appear in any snapshot/event published for this commit.
-  TerminalCommitter::CommitOutcome commit_terminal(
-      ExecutionState proposed, const char* reason,
-      TerminalCommitter::Origin origin = TerminalCommitter::Origin::kGeneric);
+  /// Record the participant fact of the current execution (first fact wins),
+  /// publish its final snapshot and emit kParticipantSettled. Returns false
+  /// when the execution already carries a fact.
+  bool settle_execution(std::uint64_t exec_id, const std::string& move_id,
+                        ParticipantExecutionFact fact, const char* reason,
+                        std::optional<ExecutionSnapshot> final_snapshot = std::nullopt);
 
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
@@ -570,17 +576,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void request_active_validation_cancel(std::string reason);
   void request_active_planning_cancel();
   /// Planning-deadline watchdog: records the expiry and cancels planning. The
-  /// execute worker alone commits the resulting terminal.
+  /// execute worker alone reports the resulting fact.
   void expire_planning_deadline();
-  void record_terminal_fault_authority(const InterruptIngestResult& result);
-  bool active_trajectory_preempt_pending() const;
-  void apply_interrupt_ingest_effects(const InterruptIngestResult& result);
-  void install_builtin_interrupt_sources();
-  InterruptIngestResult publish_runtime_collision_fault_interrupt(
-      const CollisionCheckResultDTO& check,
-      const std::map<std::string, std::string>& metadata = {});
-  InterruptIngestResult publish_fast_interrupt_signals(
-      const std::vector<InterruptSignalUpdate>& updates);
 
   // RT-8B internals.
   RecoveryAuthorityCapture capture_recovery_authority_locked();
@@ -608,9 +605,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void schedule_recovery_observation_poll_locked(const KernelRecoveryAssessmentDTO& assessment);
   KernelRecoveryActionResultDTO apply_recovery_action_impl(KernelRecoveryActionRequestDTO request);
   bool control_command_epoch_matches(std::optional<std::uint64_t> expected_epoch) const;
-  InterruptRuntimeContext current_interrupt_context() const;
-  void stamp_interrupt_latch_collision_world_revision(InterruptIngestResult& result);
-  void emit_interrupt_events(const InterruptIngestResult& result);
 
   // Worker-local terminal record. Every worker terminal exit records exactly
   // once (first record wins); a recorded error is the exact cause handed to
@@ -665,31 +659,26 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
                              bool containment_already_certified = false);
 
-  bool finalize_overridden_terminal_authority(const ExecuteRequestDTO& request,
-                                              std::uint64_t exec_id,
-                                              ActiveMotionExecution& motion_state,
-                                              ExecutionState committed, const char* reason,
-                                              std::optional<ErrorDTO> error = std::nullopt);
-
-  /// Convert an exact pre-dispatch cancellation into the participant's local
-  /// Stopped terminal before a cancelled planner/validator can be mistaken for
-  /// an execution failure. Returns true only after terminal outcome ownership
-  /// has been completed by this cancellation or a stronger terminal authority.
+  /// Report an exact pre-dispatch cancellation as the participant's
+  /// cancelled-before-dispatch fact before a cancelled planner/validator can
+  /// be mistaken for a local failure. Returns true when cancellation was
+  /// requested; the execution then has ended.
   bool finalize_prepared_motion_cancellation_if_requested(
       const std::shared_ptr<PreparedMotionSession>& prepared_session,
       const ExecuteRequestDTO& request, std::uint64_t exec_id, ActiveMotionExecution& motion_state,
       const char* reason);
 
-  bool finalize_competing_terminal_authority(const ExecuteRequestDTO& request,
-                                             std::uint64_t exec_id,
-                                             ActiveMotionExecution& motion_state,
-                                             const char* reason);
+  /// Report a local failure fact for the current execution.
+  void settle_local_failure(const ExecuteRequestDTO& request, std::uint64_t exec_id,
+                            ActiveMotionExecution& motion_state, ErrorDTO error,
+                            ParticipantEffectKnowledge effect, const char* reason,
+                            std::optional<ExecutionSnapshot> final_snapshot = std::nullopt);
 
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st, ExecuteRequestDTO& request,
       const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-      ExecutionState worker_entry_state, ActiveMotionExecution& motion_state,
+      ActiveMotionExecution& motion_state,
       const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
@@ -738,11 +727,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ExecutionKernelConfig config_;
 
   ExecutionStateMachine sm_;
-  InterruptManager interrupt_manager_;
-  /// K3: the only path to terminal states. Declared after the objects its
-  /// probes read so construction order matches the authority dependency.
-  TerminalCommitter terminal_committer_;
-  std::atomic<std::int64_t> runtime_collision_fault_sequence_{0};
 
   // Authoritative collision validation pipeline. Missing policy,
   // publisher, snapshot, or engines are configuration errors and fail closed;
@@ -763,7 +747,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::uint64_t runtime_collision_protection_next_generation_ = 0;
 
   // RT-8B recovery authority state. Lock order (documented at the admission
-  // site): lifecycle_mutex_ -> interrupt-manager leaf -> exactly one of
+  // site): lifecycle_mutex_ -> exactly one of
   // {recovery_certificate_mutex_, recovery_assessment_mutex_,
   //  recovery_refresh_mutex_, operator_stop_identity_mutex_}; the leaf
   // locks are never nested and no
@@ -859,14 +843,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::jthread worker_thread_;
   std::uint64_t execute_worker_generation_ = 0;  // guarded by lifecycle_mutex_
   ExecutionWorkerSignals worker_signals_;
-  // Linearizes Reset's ownership claim against the execute worker's first
-  // post-plan state decision. Lifecycle commands take lifecycle_mutex_ first
-  // and then this leaf; the worker takes only this leaf. Never wait for a
-  // planner, backend stop, or worker while holding it.
-  std::mutex planning_result_mutex_;
-  // Reset cancellation of an admitted planner is owned by Reset, not by the
-  // worker's generic planning-failure path. It remains asserted until the old
-  // worker is retired before a later execute admission.
+  // Retirement's cancellation of an admitted planner is owned by retirement,
+  // not by the worker's local planning-failure fact. It remains asserted until
+  // the old worker is retired.
   std::atomic<bool> planning_reset_requested_{false};
   // Set by the planning-deadline watchdog for the current planning attempt.
   std::atomic<bool> planning_deadline_expired_{false};
@@ -875,11 +854,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // committed its immutable Stop certificate. The retiring worker must then
   // release local state without issuing a duplicate backend Stop.
   std::atomic<bool> certified_containment_retirement_{false};
-  // Monotonic per-execution fault authority. The interrupt latch can be
-  // cleared before the backend finalizer runs; this flag preserves the fact
-  // that fault authority existed so a later normal completion cannot launder
-  // it.
-  std::atomic<bool> terminal_fault_authority_asserted_{false};
   // Metrics. `metrics_` covers low-rate counters. Runtime-monitor cadence
   // counters stay atomic so telemetry reads cannot block the safety lane.
   mutable std::mutex metrics_mutex_;

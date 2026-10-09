@@ -3840,7 +3840,7 @@ TEST(HeadlessApiCore,
   EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
   EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
   // An unread component does not reconcile the source either.
-  EXPECT_EQ(observe(core, {}, {kept}), "observed");
+  EXPECT_EQ(observe(core, {}, {kept}), "incomplete");
   EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
 
   // A capture under the active configuration raises and reconciles.
@@ -3881,6 +3881,82 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
   EXPECT_EQ(Text(*alarm, "activation_id"), activation);
   EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
+}
+
+TEST(HeadlessApiCore,
+     ConfigurationChangeReportsAPendingLifecycleObservationUntilOneIsAccepted) {
+  // Spec 530 §7.1: an Apply is respected without polling. The registry swap
+  // that marks the lifecycle source unknown is reported through the refresh
+  // the event pump offers each iteration, so the pump reads the new
+  // configuration at once; only a complete observation of the active
+  // configuration clears it.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto &single = *configurations.single;
+  const auto &dual = *configurations.dual;
+  const auto kept =
+      single.value().cell_graph.controllable_components.front()
+          .controllable_component_id.value();
+  std::string added;
+  for (const auto &component : dual.value().cell_graph.controllable_components) {
+    if (component.controllable_component_id.value() != kept) {
+      added = component.controllable_component_id.value();
+    }
+  }
+  ASSERT_FALSE(added.empty());
+  const auto resource = ResourceIds(single).front();
+  const auto row = [&](const std::string &component,
+                       const deployment::RetainedBundle &captured_under) {
+    return InConfiguration(ComponentConditionSnapshot(component, resource,
+                                                      "active", "satisfied",
+                                                      "none"),
+                           captured_under);
+  };
+  const auto observe = [&](HeadlessApiCore &core, CanonicalValue::Array rows,
+                           std::vector<std::string> unavailable = {}) {
+    return Text(core.ObserveComponentLifecycleConditions(
+                    "cclc.epoch.1", CanonicalValue(std::move(rows)),
+                    std::move(unavailable)),
+                "status");
+  };
+  const auto pending = [](HeadlessApiCore &core) {
+    return std::get<bool>(Member(core.RefreshAlarmSources(),
+                                 "component_lifecycle_observation_pending")
+                              .storage());
+  };
+
+  PublishActiveConfiguration(directory, dual, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.AlarmSnapshot());
+  // The first configuration names components the source has not observed.
+  EXPECT_TRUE(pending(core));
+  ASSERT_EQ(observe(core, {row(kept, dual), row(added, dual)}), "observed");
+  EXPECT_FALSE(pending(core));
+  const auto baseline = UnknownRuntimeHealthSources(core);
+
+  // The registry swap marks the source unknown and the observation pending.
+  PublishActiveConfiguration(directory, single, 2U);
+  static_cast<void>(core.AlarmSnapshot());
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+  EXPECT_TRUE(pending(core));
+  // A row CCLC captured under the superseded configuration is no observation.
+  EXPECT_EQ(observe(core, {row(kept, dual)}), "scope_changed");
+  EXPECT_TRUE(pending(core));
+  // A partial observation leaves quality unknown and is distinct.
+  EXPECT_EQ(observe(core, {}, {kept}), "incomplete");
+  EXPECT_TRUE(pending(core));
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+  // A complete observation of the new configuration clears it.
+  EXPECT_EQ(observe(core, {row(kept, single)}), "observed");
+  EXPECT_FALSE(pending(core));
+  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
+
+  // An unreachable CCLC is the same pending observation.
+  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
+            "marked_unknown");
+  EXPECT_TRUE(pending(core));
+  EXPECT_EQ(observe(core, {row(kept, single)}), "observed");
+  EXPECT_FALSE(pending(core));
 }
 
 TEST(HeadlessApiCore,
@@ -4013,10 +4089,19 @@ TEST(HeadlessApiCore,
   ASSERT_NE(AlarmFor(core.AlarmSnapshot(), kComponentLifecycleFault), nullptr);
   const auto baseline = UnknownRuntimeHealthSources(core);
 
+  const auto pending = [](HeadlessApiCore &value) {
+    return std::get<bool>(Member(value.RefreshAlarmSources(),
+                                 "component_lifecycle_observation_pending")
+                              .storage());
+  };
+  EXPECT_FALSE(pending(core));
+
   // Apply to the empty configuration: its CCLC owner is gone.
   PublishActiveConfiguration(directory, empty, 2U);
   static_cast<void>(core.AlarmSnapshot());
   EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
+  // The registered source must observe the empty scope too.
+  EXPECT_TRUE(pending(core));
   const auto empty_scope = core.ComponentLifecycleConditionScope();
   EXPECT_TRUE(Array(empty_scope, "component_ids").empty());
   EXPECT_EQ(Text(empty_scope, "retained_bundle_id"),
@@ -4033,7 +4118,9 @@ TEST(HeadlessApiCore,
   EXPECT_TRUE(std::get<bool>(Member(*alarm, "active").storage()));
   EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
 
+  EXPECT_TRUE(pending(core));
   EXPECT_EQ(observe_empty(core, empty), "observed");
+  EXPECT_FALSE(pending(core));
   snapshot = core.AlarmSnapshot();
   alarm = AlarmFor(snapshot, kComponentLifecycleFault);
   ASSERT_NE(alarm, nullptr);
@@ -4046,7 +4133,10 @@ TEST(HeadlessApiCore,
   PublishActiveConfiguration(unregistered_directory, empty, 1U);
   HeadlessApiCore unregistered(
       RegistryConfig(unregistered_directory, "api.epoch.2"), Clocks());
+  // Nothing in scope and nothing registered: no observation is pending.
+  EXPECT_FALSE(pending(unregistered));
   EXPECT_EQ(observe_empty(unregistered, empty), "empty");
+  EXPECT_FALSE(pending(unregistered));
 }
 
 TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {

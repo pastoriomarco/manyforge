@@ -100,6 +100,7 @@ function state(
     snapshotSequence: Math.max(1, runtimeGeneration),
     runtime: {
       schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      activeConfiguration: null,
       complete: true,
       projectionGeneration: runtimeGeneration,
       projectionOwnerEpoch: runtimeEpoch,
@@ -156,6 +157,7 @@ function state(
       unacknowledgedMembership: [],
       alarms: [],
       truncated: false,
+      kernelAttention: null,
     },
   };
 }

@@ -5,7 +5,6 @@ on:
     paths:
       - "manyforge_core/src/execution_kernel.cpp"
       - "manyforge_core/src/execution_worker_signals.cpp"
-      - "manyforge_core/src/interrupt_manager.cpp"
       - "manyforge_core/tools/stability_gate.sh"
       - ".github/workflows/cpp-stability-gate.yml"
   push:
@@ -13,7 +12,6 @@ on:
     paths:
       - "manyforge_core/src/execution_kernel.cpp"
       - "manyforge_core/src/execution_worker_signals.cpp"
-      - "manyforge_core/src/interrupt_manager.cpp"
       - "manyforge_core/tools/stability_gate.sh"
       - ".github/workflows/cpp-stability-gate.yml"
   workflow_dispatch:

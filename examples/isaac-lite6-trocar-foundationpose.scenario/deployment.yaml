@@ -24,12 +24,12 @@
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
           "per_joint_max_deceleration_rad_s2": {
-            "joint1": 4.0,
-            "joint2": 4.0,
-            "joint3": 4.0,
-            "joint4": 4.0,
-            "joint5": 4.0,
-            "joint6": 4.0
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
           },
           "profile_id": "fault_spring_back_hold",
           "require_backend_confirmation": true,
@@ -86,32 +86,32 @@
             "jerk_limits_enabled": true,
             "per_joint_limits": [
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint1"
               },
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint2"
               },
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint3"
               },
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint4"
               },
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint5"
               },
               {
-                "max_deceleration_rad_s2": 4.0,
+                "max_deceleration_rad_s2": 10.0,
                 "settle_velocity_threshold_rad_s": 0.01,
                 "source_joint_name": "joint6"
               }

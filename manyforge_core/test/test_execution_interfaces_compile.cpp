@@ -9,6 +9,7 @@
 #include <manyforge_core/execution/execution_knowledge.hpp>
 #include <manyforge_core/execution/motion_step.hpp>
 #include <manyforge_core/execution/prepared_motion.hpp>
+#include <manyforge_core/execution/prepared_motion_slot.hpp>
 #include <manyforge_core/ports/iexecution_mechanism.hpp>
 #include <optional>
 #include <type_traits>
@@ -46,6 +47,12 @@ static_assert(kMaxMotionJoints == 16U);
 static_assert(sizeof(MotionJointCommand::position_rad) == kMaxMotionJoints * sizeof(double));
 static_assert(sizeof(MotionStepOutput) < 640U);
 static_assert(sizeof(MotionStepState) <= 320U);
+
+// Sealed transport inputs and the retained slot are NRT values owned with
+// the motion; the port borrows the slot by reference.
+static_assert(!std::is_trivially_copyable_v<SealedPreparedMotionInputs>);
+static_assert(std::is_same_v<decltype(PreparedMotionSlot::motion), PreparedMotion>);
+static_assert(std::is_same_v<decltype(PreparedMotionSlot::sealed), SealedPreparedMotionInputs>);
 static_assert(sizeof(ExecutionGoalFence) == 2U * sizeof(std::uint64_t));
 
 // Prepared motion is cold and immutable, NRT-owned: copyable for building,
@@ -58,6 +65,13 @@ static_assert(std::tuple_size_v<decltype(PreparedMotion::final_position_toleranc
 using StepMotionFn = MotionStepStatus (*)(const PreparedMotion&, MotionStepState&,
                                           const MotionStepInputs&, MotionStepOutput&) noexcept;
 static_assert(std::is_same_v<decltype(&StepMotion), StepMotionFn>);
+
+// ---- Replacement installation: exact signature, noexcept, fixed result. ----
+using InstallReplacementFn = ReplacementInstallResult (*)(
+    const PreparedMotion&, const MotionStepState&, const MotionStepOutput&, const PreparedMotion&,
+    std::int64_t, MotionStepState&, MotionStepOutput&) noexcept;
+static_assert(std::is_same_v<decltype(&InstallReplacementMotionStep), InstallReplacementFn>);
+static_assert(kRtValue<ReplacementInstallResult>);
 static_assert(noexcept(StepMotion(std::declval<const PreparedMotion&>(),
                                   std::declval<MotionStepState&>(),
                                   std::declval<const MotionStepInputs&>(),
@@ -67,7 +81,10 @@ static_assert(noexcept(StepMotion(std::declval<const PreparedMotion&>(),
 static_assert(noexcept(std::declval<IExecutionMechanism&>().PostStop(
     std::declval<const ExecutionGoalKey&>(), std::declval<const StopTransition&>())));
 static_assert(noexcept(std::declval<IExecutionMechanism&>().Submit(
-    std::declval<const ExecutionGoalKey&>(), std::declval<const PreparedMotion&>())));
+    std::declval<const ExecutionGoalKey&>(), std::declval<const PreparedMotionSlot&>())));
+static_assert(noexcept(std::declval<IExecutionMechanism&>().Replace(
+    std::declval<const ExecutionGoalKey&>(), std::declval<const ExecutionGoalKey&>(),
+    std::declval<const PreparedMotionSlot&>())));
 static_assert(noexcept(std::declval<IExecutionMechanism&>().Fence(
     std::declval<const ExecutionGoalKey&>())));
 static_assert(noexcept(std::declval<IExecutionMechanism&>().RenewHostLease(std::int64_t{})));
@@ -77,8 +94,8 @@ static_assert(std::has_virtual_destructor_v<IExecutionMechanism>);
 class FakeExecutionMechanism final : public IExecutionMechanism {
  public:
   ExecutionMechanismCallResult Submit(const ExecutionGoalKey& key,
-                                      const PreparedMotion& slot) noexcept override {
-    if (!(slot.key == key)) {
+                                      const PreparedMotionSlot& slot) noexcept override {
+    if (!SlotMatches(slot, key)) {
       return Refuse(ExecutionMechanismRefusal::kSlotKeyMismatch);
     }
     if (active_.has_value()) {
@@ -93,12 +110,14 @@ class FakeExecutionMechanism final : public IExecutionMechanism {
 
   ExecutionMechanismCallResult Replace(const ExecutionGoalKey& key,
                                        const ExecutionGoalKey& next_key,
-                                       const PreparedMotion& slot) noexcept override {
+                                       const PreparedMotionSlot& slot) noexcept override {
     if (!Matches(key)) {
       return Refuse(ExecutionMechanismRefusal::kStaleKey);
     }
-    if (!(slot.key == next_key) ||
-        !(next_key.controller_goal_generation > key.controller_goal_generation)) {
+    if (!SlotMatches(slot, next_key)) {
+      return Refuse(ExecutionMechanismRefusal::kSlotKeyMismatch);
+    }
+    if (!(next_key.controller_goal_generation > key.controller_goal_generation)) {
       return Refuse(ExecutionMechanismRefusal::kInvalidInput);
     }
     active_->key = next_key;
@@ -180,6 +199,12 @@ class FakeExecutionMechanism final : public IExecutionMechanism {
   }
 
  private:
+  // The borrowed slot must carry the key and the digest it was sealed under.
+  [[nodiscard]] static bool SlotMatches(const PreparedMotionSlot& slot,
+                                        const ExecutionGoalKey& key) noexcept {
+    return slot.motion.key == key &&
+           slot.sealed.participant_digest == slot.motion.prepared_contract_digest;
+  }
   [[nodiscard]] bool Matches(const ExecutionGoalKey& key) const noexcept {
     return active_.has_value() && active_->key == key;
   }
@@ -207,12 +232,19 @@ ExecutionGoalKey MakeKey(std::uint64_t goal_generation) {
   return key;
 }
 
+PreparedMotionSlot MakeSlot(std::uint64_t goal_generation) {
+  PreparedMotionSlot slot;
+  slot.motion.key = MakeKey(goal_generation);
+  slot.motion.prepared_contract_digest = ContentDigest{"sha256:participant"};
+  slot.sealed.participant_digest = slot.motion.prepared_contract_digest;
+  return slot;
+}
+
 TEST(ExecutionInterfacesCompile, FakeMechanismHonorsKeyFencingAndSeparateFacts) {
   FakeExecutionMechanism mechanism;
   IExecutionMechanism& port = mechanism;
 
-  PreparedMotion slot;
-  slot.key = MakeKey(1U);
+  const PreparedMotionSlot slot = MakeSlot(1U);
 
   EXPECT_EQ(port.Submit(MakeKey(1U), slot).disposition,
             StopStageAttemptDispositionDTO::kDispatched);
@@ -225,16 +257,16 @@ TEST(ExecutionInterfacesCompile, FakeMechanismHonorsKeyFencingAndSeparateFacts) 
   EXPECT_EQ(stale.refusal, ExecutionMechanismRefusal::kStaleKey);
 
   StopTransition stop;
-  stop.goal = slot.key.fence();
+  stop.goal = slot.motion.key.fence();
   stop.stop_generation = StopGeneration{1U};
-  EXPECT_EQ(port.PostStop(slot.key, stop).disposition,
+  EXPECT_EQ(port.PostStop(slot.motion.key, stop).disposition,
             StopStageAttemptDispositionDTO::kDispatched);
   ASSERT_TRUE(mechanism.pending_stop().has_value());
 
-  EXPECT_EQ(port.Cancel(slot.key).disposition, StopStageAttemptDispositionDTO::kEffectUncertain);
+  EXPECT_EQ(port.Cancel(slot.motion.key).disposition, StopStageAttemptDispositionDTO::kEffectUncertain);
 
   // Retirement: slot release and downstream fence are separate facts.
-  EXPECT_EQ(port.Release(slot.key).disposition, StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(port.Release(slot.motion.key).disposition, StopStageAttemptDispositionDTO::kDispatched);
   auto status = port.ReadMechanismStatus();
   ASSERT_EQ(status.keys.size(), 1U);
   EXPECT_FALSE(status.keys.front().slot_referenced);
@@ -242,7 +274,7 @@ TEST(ExecutionInterfacesCompile, FakeMechanismHonorsKeyFencingAndSeparateFacts) 
   EXPECT_EQ(status.keys.front().stop.phase, ExecutionCommandPhase::kSubmitted);
   EXPECT_EQ(status.keys.front().stop.effect, ComponentLifecycleDomainEffectDTO::kEffectUncertain);
 
-  EXPECT_EQ(port.Fence(slot.key).disposition, StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(port.Fence(slot.motion.key).disposition, StopStageAttemptDispositionDTO::kDispatched);
   status = port.ReadMechanismStatus();
   EXPECT_EQ(status.keys.front().downstream, DownstreamFenceState::kFenced);
 
@@ -255,21 +287,26 @@ TEST(ExecutionInterfacesCompile, FakeMechanismHonorsKeyFencingAndSeparateFacts) 
 
 TEST(ExecutionInterfacesCompile, ReplacementRequiresNewerGoalGeneration) {
   FakeExecutionMechanism mechanism;
-  PreparedMotion first;
-  first.key = MakeKey(1U);
-  ASSERT_EQ(mechanism.Submit(first.key, first).disposition,
+  const PreparedMotionSlot first = MakeSlot(1U);
+  ASSERT_EQ(mechanism.Submit(first.motion.key, first).disposition,
             StopStageAttemptDispositionDTO::kDispatched);
 
-  PreparedMotion same_generation;
-  same_generation.key = MakeKey(1U);
-  EXPECT_EQ(mechanism.Replace(first.key, same_generation.key, same_generation).refusal,
+  const PreparedMotionSlot same_generation = MakeSlot(1U);
+  EXPECT_EQ(
+      mechanism.Replace(first.motion.key, same_generation.motion.key, same_generation).refusal,
             ExecutionMechanismRefusal::kInvalidInput);
 
-  PreparedMotion replacement;
-  replacement.key = MakeKey(2U);
-  EXPECT_EQ(mechanism.Replace(first.key, replacement.key, replacement).disposition,
+  // A slot whose sealed inputs name another participant is refused.
+  PreparedMotionSlot foreign = MakeSlot(2U);
+  foreign.sealed.participant_digest = ContentDigest{"sha256:other"};
+  EXPECT_EQ(mechanism.Replace(first.motion.key, foreign.motion.key, foreign).refusal,
+            ExecutionMechanismRefusal::kSlotKeyMismatch);
+
+  const PreparedMotionSlot replacement = MakeSlot(2U);
+  EXPECT_EQ(mechanism.Replace(first.motion.key, replacement.motion.key, replacement).disposition,
             StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(mechanism.ReadMechanismStatus().keys.front().key.fence(), replacement.key.fence());
+  EXPECT_EQ(mechanism.ReadMechanismStatus().keys.front().key.fence(),
+            replacement.motion.key.fence());
 }
 
 }  // namespace

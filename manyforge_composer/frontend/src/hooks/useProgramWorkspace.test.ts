@@ -392,6 +392,7 @@ function authoringSnapshot(
     snapshotSequence: 11,
     runtime: {
       schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      activeConfiguration: null,
       complete: true,
       projectionGeneration: 1,
       projectionOwnerEpoch: 'runtime.epoch.1',
@@ -433,6 +434,7 @@ function authoringSnapshot(
       unacknowledgedMembership: [],
       alarms: [],
       truncated: false,
+      kernelAttention: null,
     },
   };
 }

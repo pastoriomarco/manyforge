@@ -26,6 +26,9 @@ enum class KernelEventType {
   kValidationPassed,   // validation passed
   kValidationFailed,   // validation failed
   kParticipantPrepared,  // immutable participant prepared; no effect dispatched
+  // The participant's execution ended; `participant_fact` says how. A fact for
+  // the addressed owner, which commits the operation outcome.
+  kParticipantSettled,
   kExecuteStarted,     // execution phase started
   kExecuteCompleted,   // execution phase completed
   kStopRequested,      // stop requested
@@ -108,6 +111,9 @@ struct KernelEvent {
   /// detect event loss anywhere in the pipeline (spec 520 §2.2). Declared
   /// last so the ubiquitous positional aggregate initializers stay valid.
   uint64_t sequence = 0;
+
+  /// For kParticipantSettled: the participant's fact about the ended execution.
+  std::optional<ParticipantExecutionFact> participant_fact = std::nullopt;
 };
 
 /// Event callback type. Must be thread-safe.

@@ -213,6 +213,7 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
+    assert _error_status("unacknowledged_operator_alarms") == 409
     # Preparation refuses the input before any claim or effect.
     assert _error_status("activation_preparation_failed") == 409
     assert _error_status("manual_handover_required") == 409
@@ -1858,6 +1859,8 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         ).json()
         assert alarms["requested_states"] == ["active_unacknowledged"]
         assert alarms["requested_ordering"] == "attention_newest"
+        # Without the Kernel publisher no Kernel-held copy is known.
+        assert alarms["kernel_attention"] is None
         assert client.get("/api/execution/history?limit=3").status_code == 200
         health = client.get("/api/health").json()
         assert health["status_scope"] == "headless_projection"
@@ -1874,6 +1877,31 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             )["status"]
             == "healthy"
         )
+
+
+def test_alarm_snapshot_names_the_kernel_held_attention_copy() -> None:
+    # Spec 530 §11: the Kernel admits by its held copy, which lags the owner.
+    service = _service(FakeCore(), FakeManager())
+    held = {
+        "active_configuration": {
+            "graph_revision": "graph.1",
+            "retained_bundle_id": "bundle.1",
+        },
+        "generation": 2,
+        "owner_epoch": "alarm.epoch.1",
+        "reconciled": True,
+    }
+    service.kernel_attention_source = lambda: held
+    snapshot = service.alarms()
+    assert snapshot["kernel_attention"] == held
+    assert snapshot["reconciled"] is True
+
+    def unavailable() -> dict[str, object] | None:
+        raise RuntimeError("publisher closed")
+
+    # A failing source names no held copy rather than failing the read.
+    service.kernel_attention_source = unavailable
+    assert service.alarms()["kernel_attention"] is None
 
 
 def test_component_overview_fact_capture_reads_each_source_once() -> None:

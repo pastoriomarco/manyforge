@@ -33,9 +33,11 @@ struct AddressedParticipantStopSettlementRequestDTO final {
   bool effect_prevented_before_dispatch{};
 };
 
-/// Participant-owned terminal fact returned synchronously to the addressed
-/// reducer.  Repeating the exact request returns the same fact; a conflicting
-/// Stop identity is rejected without changing the participant terminal.
+/// Participant recovery evidence returned synchronously to the addressed
+/// reducer after it recorded the owner's containment. The participant commits
+/// no outcome; the addressed Kernel owns the Stopped terminal. Repeating the
+/// exact request returns the same evidence; a conflicting Stop identity is
+/// rejected without changing the participant.
 struct AddressedParticipantStopSettlementDTO final {
   std::uint64_t execution_id{};
   StopCertificateRefDTO aggregate_stop_certificate;
@@ -43,7 +45,6 @@ struct AddressedParticipantStopSettlementDTO final {
   OperationParticipantId participant_id;
   ControllerGoalId controller_goal_id;
   ControllerGoalGeneration controller_goal_generation;
-  ExecutionState terminal_state{ExecutionState::kIdle};
   KernelRecoveryAssessmentDTO recovery_assessment;
 };
 
@@ -74,9 +75,10 @@ class IResolvedParticipantExecutionEngine {
     (void)execution_id;
     return AddressedParticipantStopFenceDisposition::kUnknown;
   }
-  /// Commit and return the local terminal/recovery fact for one exact
-  /// participant after the addressed owner has already contained its exact
-  /// dispatched goal or proved that dispatch never occurred. This
+  /// Record the addressed owner's containment for one exact participant
+  /// execution after the owner has already contained its dispatched goal or
+  /// proved that dispatch never occurred, and return the participant's
+  /// recovery evidence. The participant commits no outcome. This
   /// process-local handoff MUST NOT issue another backend Stop command or
   /// publish another Stop certificate.
   virtual Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
@@ -88,8 +90,9 @@ class IResolvedParticipantExecutionEngine {
                  {{"reason", "addressed_participant_stop_settlement_unavailable"}}});
   }
   /// Retires one exact subordinate execution after the addressed Kernel has
-  /// already committed an immutable containment certificate. This bounded
-  /// process-local/backend-reset seam MUST NOT issue another Stop command.
+  /// already committed an immutable containment certificate. Retirement is
+  /// motion-free: it retires the prepared membership and local bookkeeping and
+  /// MUST NOT reset the backend, command motion or issue another Stop.
   virtual ResetResultDTO reset_after_certified_containment(
       std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
   /// Retires one exact Completed subordinate execution in process-local state.
@@ -121,6 +124,9 @@ class IResolvedParticipantExecutionEngine {
                                      std::uint64_t expected_command_id,
                                      std::uint64_t expected_generation) = 0;
 
+  /// Working phase plus, once the current execution has ended, the
+  /// participant fact about how it ended (`ExecutionStatus::fact`). Engines
+  /// report facts; the addressed Kernel derives the operation outcome.
   virtual ExecutionStatus get_status() const = 0;
   virtual KernelRecoveryAssessmentDTO get_recovery_assessment() const { return {}; }
   virtual KernelRecoveryActionResultDTO apply_recovery_action(

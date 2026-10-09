@@ -1981,7 +1981,9 @@ class _ComponentConditionCore(_RecordingCore):
         self.observed: list[dict[str, Any]] = []
         self.observed_empty: list[dict[str, Any]] = []
         self.empty_status = "observed"
+        self.observe_status: str | None = None
         self.marked_unknown = 0
+        self.observation_pending = False
 
     def component_lifecycle_condition_scope(self) -> dict[str, Any]:
         bundle, graph = self.configuration or (None, None)
@@ -1992,8 +1994,21 @@ class _ComponentConditionCore(_RecordingCore):
             "source_registered": self.source_registered,
         }
 
+    def refresh_alarm_sources(self) -> dict[str, Any]:
+        self.alarm_refreshes += 1
+        return {
+            "component_lifecycle_observation_pending": self.observation_pending,
+            "refreshed": True,
+        }
+
     def observe_component_lifecycle_conditions(self, **kwargs: Any) -> dict[str, Any]:
         self.observed.append(kwargs)
+        if self.observe_status is not None:
+            return {"status": self.observe_status}
+        # Like the core: an unread component leaves quality unknown.
+        if kwargs.get("unavailable_component_ids"):
+            return {"status": "incomplete"}
+        self.observation_pending = False
         return {"status": "observed"}
 
     def observe_empty_component_lifecycle_configuration(
@@ -2265,6 +2280,120 @@ def test_component_conditions_reconcile_promptly_after_an_apply_replaced_cclc(
     clock[0] += 0.11
     pump._observe_component_lifecycle_conditions()  # noqa: SLF001
     assert len(core.observed) == 3
+
+
+def _clocked_condition_pump(
+    monkeypatch: pytest.MonkeyPatch, core: _ComponentConditionCore, cclc: _FakeCCLC
+) -> tuple[ExecutionEventPump, list[float]]:
+    clock = [100.0]
+    monkeypatch.setattr(
+        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
+    )
+    return (
+        ExecutionEventPump(  # type: ignore[arg-type]
+            core, _PagedExecution(), cclc=cclc, component_condition_poll_seconds=1.0
+        ),
+        clock,
+    )
+
+
+def _pump_iteration(pump: ExecutionEventPump) -> None:
+    # The order of one pump iteration: refresh, then the lifecycle read.
+    pump._refresh_alarm_sources()  # noqa: SLF001
+    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
+
+
+def test_a_pending_lifecycle_observation_is_read_on_the_next_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Spec 530 §7.1: an Apply is respected without polling. The registry swap
+    # marks the lifecycle source unknown and the core reports the pending
+    # observation through the refresh the pump offers each iteration; the
+    # next read does not wait out the period started under the old
+    # configuration.
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
+    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
+    _pump_iteration(pump)
+    assert len(core.observed) == 1
+
+    # A complete observation was accepted: the ordinary period applies.
+    clock[0] += 0.3
+    _pump_iteration(pump)
+    assert len(core.observed) == 1
+
+    # The registry swap (by any reader's refresh) sets the flag.
+    core.observation_pending = True
+    clock[0] += 0.05
+    _pump_iteration(pump)
+    assert len(core.observed) == 2
+    # Accepted (the fake clears the flag like the core): the period applies
+    # again from this read.
+    clock[0] += 0.5
+    _pump_iteration(pump)
+    assert len(core.observed) == 2
+    clock[0] += 0.51
+    _pump_iteration(pump)
+    assert len(core.observed) == 3
+
+
+def test_a_pending_lifecycle_observation_still_respects_the_retry_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _ComponentConditionCore(["arm"])
+    cclc = _FakeCCLC()
+    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
+    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
+    core.observation_pending = True
+    core.observe_status = "scope_changed"
+    _pump_iteration(pump)
+    assert len(core.observed) == 1
+    clock[0] += 0.05
+    _pump_iteration(pump)
+    assert len(core.observed) == 1
+    clock[0] += 0.06
+    _pump_iteration(pump)
+    assert len(core.observed) == 2
+
+
+def test_an_incomplete_lifecycle_observation_is_retried_at_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An observation with an unread component leaves quality unknown, so it
+    # is not the period's accepted observation: retried at 0.1 s until a
+    # complete one is accepted, which then waits the full period.
+    core = _ComponentConditionCore(["arm", "gripper"])
+    cclc = _FakeCCLC()
+    cclc.snapshots = {
+        "arm": _component_snapshot("arm", "none"),
+        "gripper": HeadlessApiError("component_lifecycle_snapshot_unavailable", "no row"),
+    }
+    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
+    _pump_iteration(pump)
+    assert [value["unavailable_component_ids"] for value in core.observed] == [
+        ["gripper"]
+    ]
+    clock[0] += 0.05
+    _pump_iteration(pump)
+    assert len(core.observed) == 1
+    clock[0] += 0.06
+    _pump_iteration(pump)
+    assert len(core.observed) == 2
+
+    cclc.snapshots["gripper"] = _component_snapshot("gripper", "none")
+    clock[0] += 0.11
+    _pump_iteration(pump)
+    assert len(core.observed) == 3
+    assert core.observed[-1]["unavailable_component_ids"] == []
+    clock[0] += 0.11
+    _pump_iteration(pump)
+    clock[0] += 0.5
+    _pump_iteration(pump)
+    assert len(core.observed) == 3
+    clock[0] += 0.4
+    _pump_iteration(pump)
+    assert len(core.observed) == 4
 
 
 def test_component_conditions_skip_a_read_that_spans_two_cclc_owners() -> None:

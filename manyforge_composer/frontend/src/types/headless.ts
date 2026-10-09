@@ -15,8 +15,16 @@ export interface HeadlessSourceSection {
   receiverAgeNs: number | null;
 }
 
+/** One active configuration: retained bundle and graph revision. */
+export interface ActiveConfigurationIdentity {
+  retainedBundleId: string;
+  graphRevision: string;
+}
+
 export interface HeadlessRuntimeSnapshot {
   schemaVersion: 'manyforge.headless_runtime_snapshot.v1';
+  /** The configuration Manager publishes as active; null before one. */
+  activeConfiguration: ActiveConfigurationIdentity | null;
   complete: boolean;
   projectionGeneration: number;
   projectionOwnerEpoch: string;
@@ -80,6 +88,18 @@ export interface OperatorAlarmRecord extends AlarmMembership {
   details: Record<string, unknown>;
 }
 
+/**
+ * The motion-attention projection the Kernel acknowledged holding (spec 530
+ * §11). The Kernel admits Program motion by this copy alone, which lags the
+ * owner snapshot by up to one publication period plus its deadline.
+ */
+export interface KernelAlarmAttention {
+  ownerEpoch: string;
+  generation: number;
+  reconciled: boolean;
+  activeConfiguration: ActiveConfigurationIdentity | null;
+}
+
 export interface OperatorAlarmSnapshot {
   schemaVersion: 'manyforge.operator_alarm_snapshot.v2';
   ownerId: string;
@@ -97,6 +117,8 @@ export interface OperatorAlarmSnapshot {
   unacknowledgedMembership: AlarmMembership[];
   alarms: OperatorAlarmRecord[];
   truncated: boolean;
+  /** The Kernel-held copy; null when none is known to be current. */
+  kernelAttention: KernelAlarmAttention | null;
 }
 
 export type ComponentOverviewReadiness =

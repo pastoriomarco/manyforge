@@ -1265,6 +1265,9 @@ CanonicalValue HeadlessApiCore::RefreshAlarmSources() {
   }
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return CanonicalValue(CanonicalValue::Object{
+      {"component_lifecycle_observation_pending",
+       CanonicalValue(component_lifecycle_observation_pending_.load(
+           std::memory_order_acquire))},
       {"refreshed", CanonicalValue(refreshed)},
       {"refreshed_at_ns",
        Number(static_cast<std::uint64_t>(alarm_sources_refreshed_at_ns_.load(
@@ -2740,6 +2743,9 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
     }
   }
   if (scope.empty() && component_lifecycle_adapter_.source_epoch.empty()) {
+    // Nothing in scope and no source to reconcile.
+    component_lifecycle_observation_pending_.store(false,
+                                                   std::memory_order_release);
     return response("empty");
   }
 
@@ -2768,14 +2774,19 @@ CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
             {"controllable_component_id", CanonicalValue(component_id)},
         });
       });
-  if (unavailable_component_ids.empty()) {
+  if (!unavailable_component_ids.empty()) {
     // Only a complete observation of the active configuration establishes
     // current quality. An unread component leaves it as it was, so a read
-    // after an Apply cannot confirm conditions of the superseded one.
-    alarm_owner_.CompleteSourceSnapshot(
-        component_lifecycle_adapter_.source_id,
-        component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
+    // after an Apply cannot confirm conditions of the superseded one. The
+    // read components were applied; the caller repeats the read soon rather
+    // than treating this as the period's accepted observation.
+    return response("incomplete");
   }
+  alarm_owner_.CompleteSourceSnapshot(
+      component_lifecycle_adapter_.source_id,
+      component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
+  component_lifecycle_observation_pending_.store(false,
+                                                 std::memory_order_release);
   return response("observed");
 }
 
@@ -2809,6 +2820,8 @@ CanonicalValue HeadlessApiCore::ObserveEmptyComponentLifecycleConfiguration(
   }
   if (component_lifecycle_adapter_.source_epoch.empty()) {
     // Never registered: no condition was ever raised.
+    component_lifecycle_observation_pending_.store(false,
+                                                   std::memory_order_release);
     return response("empty");
   }
   // A configuration without controlled components has no CCLC owner and no
@@ -2826,6 +2839,8 @@ CanonicalValue HeadlessApiCore::ObserveEmptyComponentLifecycleConfiguration(
   alarm_owner_.CompleteSourceSnapshot(
       component_lifecycle_adapter_.source_id,
       component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
+  component_lifecycle_observation_pending_.store(false,
+                                                 std::memory_order_release);
   return response("observed");
 }
 
@@ -2838,6 +2853,8 @@ CanonicalValue HeadlessApiCore::MarkComponentLifecycleSourceUnknown() {
     alarm_owner_.MarkSourceQualityUnknown(
         component_lifecycle_adapter_.source_id,
         component_lifecycle_adapter_.source_epoch);
+    component_lifecycle_observation_pending_.store(true,
+                                                   std::memory_order_release);
   }
   return CanonicalValue(CanonicalValue::Object{
       {"schema_version",
@@ -4135,7 +4152,9 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         "active configuration " + *bundle_id +
             " has no verified alarm resource inventory: " + detail);
   }
-  if (replaced && !component_lifecycle_adapter_.source_epoch.empty()) {
+  const bool lifecycle_registered =
+      !component_lifecycle_adapter_.source_epoch.empty();
+  if (replaced && lifecycle_registered) {
     // Lifecycle conditions observed under the superseded configuration are
     // not observations of this one. They keep their state at unknown quality
     // (which cannot clear them) until an observation fenced to this
@@ -4143,6 +4162,12 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
     alarm_owner_.MarkSourceQualityUnknown(
         component_lifecycle_adapter_.source_id,
         component_lifecycle_adapter_.source_epoch);
+  }
+  if (replaced && (lifecycle_registered || !alarm_component_ids_.empty())) {
+    // The new configuration needs its own lifecycle observation: the event
+    // pump reads it at once instead of at its next ordinary period.
+    component_lifecycle_observation_pending_.store(true,
+                                                   std::memory_order_release);
   }
 }
 
