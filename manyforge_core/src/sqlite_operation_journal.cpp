@@ -917,10 +917,18 @@ template <typename StrongId>
       {"target_mode", CanonicalValue(target_mode)},
       {"target_reference", ReferenceValue(motion.target_reference)},
       {"tcp_frame_role_id", CanonicalValue(motion.tcp_frame_role_id.value())},
-      {"timeouts", CanonicalValue(CanonicalValue::Object{
-                       {"execution_timeout_s", CanonicalValue(motion.timeouts.execution_timeout_s)},
-                       {"planning_timeout_s", CanonicalValue(motion.timeouts.planning_timeout_s)},
-                   })},
+      {"timeouts", [&] {
+         CanonicalValue::Object timeouts{
+             {"execution_timeout_s", CanonicalValue(motion.timeouts.execution_timeout_s)},
+             {"planning_timeout_s", CanonicalValue(motion.timeouts.planning_timeout_s)},
+         };
+         // Emitted only when set so existing intents keep their digest.
+         if (motion.timeouts.zero_speed_hold_timeout_s.has_value()) {
+           timeouts.emplace_back("zero_speed_hold_timeout_s",
+                                 CanonicalValue(*motion.timeouts.zero_speed_hold_timeout_s));
+         }
+         return CanonicalValue(std::move(timeouts));
+       }()},
       {"tolerances",
        CanonicalValue(CanonicalValue::Object{
            {"joint_position_tol_rad", CanonicalValue(motion.tolerances.joint_position_tol_rad)},

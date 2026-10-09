@@ -12,6 +12,7 @@
 #include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_recovery_support.hpp>
+#include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
@@ -1224,11 +1225,9 @@ struct StopStaticFacts final {
       return OperationStateKind::kCompleted;
     case ParticipantExecutionFactKind::kCancelledBeforeDispatch:
       return OperationStateKind::kStopped;
-    case ParticipantExecutionFactKind::kPlanningDeadlineExpired:
-      // Nothing was dispatched; the expired deadline is contained by never
-      // dispatching. Maintainer-owned policy: the outcome is Stopped.
-      return OperationStateKind::kStopped;
     case ParticipantExecutionFactKind::kLocalFailure:
+      // Includes planning failures; an expired planning deadline is the
+      // planning failure `planning_timeout`, never Stopped.
       return fact.effect == ParticipantEffectKnowledge::kEffectUncertain
                  ? OperationStateKind::kInterventionRequired
                  : OperationStateKind::kFailed;
@@ -1515,6 +1514,9 @@ struct ActiveOperationParticipant final {
   std::optional<ExecuteRequestDTO> motion_request;
   std::shared_ptr<const detail::MotionResumeIntent> continuation{};
   std::size_t continuation_node_index{};
+  /// Runtime collision observed outside an active Stop; its containment Stop
+  /// ends this participant InterventionRequired with this cause (item 19).
+  std::optional<ErrorDTO> runtime_collision_error{};
 };
 
 /// Exact reserved resource set of one operation: the union over its
@@ -1855,6 +1857,85 @@ Result<bool> ResourceAddressedExecutionKernel::record_operation_state_locked(
   return Result<std::vector<ResourceSlotReservationOwnerDTO>>::Ok(std::move(rows));
 }
 
+constexpr std::string_view kOperationControlStopSource = "kernel.operation_control";
+constexpr std::string_view kOperationResetStopReason = "operation_reset";
+constexpr std::string_view kZeroSpeedHoldStopSource = "kernel.zero_speed_hold";
+constexpr std::string_view kZeroSpeedHoldStopReason = "zero_speed_hold_timeout";
+
+enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
+
+/// Internal Stops with their own Stop choice: Reset while busy runs the
+/// deployment's operator Stop profile and issues the lane's hard stop only
+/// on its timeout or when no profile is configured (Q27, as `main`
+/// EK:8082-8221); the zero-speed hold timeout issues the lane's hard stop
+/// directly (Q31). Neither is a degraded Stop.
+[[nodiscard]] InternalStopKind internal_stop_kind(const StopIntentDTO* intent) noexcept {
+  if (intent == nullptr || !intent->reason.has_value()) return InternalStopKind::kNone;
+  const auto& source = intent->request_context.source_label;
+  if (source == kOperationControlStopSource && *intent->reason == kOperationResetStopReason)
+    return InternalStopKind::kReset;
+  if (source == kZeroSpeedHoldStopSource && *intent->reason == kZeroSpeedHoldStopReason)
+    return InternalStopKind::kZeroSpeedHold;
+  return InternalStopKind::kNone;
+}
+
+/// `main`'s degraded-Stop error: the controlled Stop did not contain the
+/// motion and the fallback hard stop did (item 25). The operation still ends
+/// Stopped; this error explains the downgrade.
+[[nodiscard]] ErrorDTO degraded_stop_error(const ErrorDTO& cause,
+                                           const PreparedParticipantStopPlanDTO& plan,
+                                           const std::size_t containing_stage_index) {
+  const auto cause_reason = cause.details.find("reason");
+  const bool deadline = cause_reason != cause.details.end() &&
+                        (cause_reason->second == "participant_stop_stage_deadline_expired" ||
+                         cause_reason->second == "participant_stop_stage_command_phase_expired");
+  ErrorDTO degraded{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      deadline ? "Controlled Stop exceeded the effective Stop deadline; the hard-stop floor "
+                 "stopped the motion"
+               : "Controlled Stop failed; the hard-stop floor stopped the motion",
+      {{"reason", deadline ? "in_stop_completion_timeout" : "operator_stop_profile_failed"},
+       {"controlled_stop_error_code", cause.code},
+       {"emergency_fallback", "legacy_stop_succeeded"},
+       {"hard_stop_transitioned", "true"}}};
+  if (cause_reason != cause.details.end()) {
+    degraded.details.emplace("controlled_stop_error_reason", cause_reason->second);
+  }
+  if (plan.participant_stop_profile.has_value()) {
+    degraded.details.emplace(
+        "requested_stop_mode",
+        std::string(stop_mode_string(plan.participant_stop_profile->stop_mode)));
+  }
+  if (containing_stage_index < plan.stage_commands.size()) {
+    degraded.details.emplace(
+        "hard_stop_floor", plan.stage_commands[containing_stage_index]
+                               .resolved_stage.stop_escalation_stage_id.value());
+  }
+  return degraded;
+}
+
+/// Q33: the Stop planner chose the hard stop as the right Stop (the provider
+/// reports the planner's own disposition). Its hard stop ends Stopped with no
+/// error, as `main`'s ros2_control operator path; a hard stop used as a
+/// fallback after a failed soft Stop or spring-back keeps the degraded error.
+[[nodiscard]] bool planner_selected_hard_stop(const ErrorDTO& cause) {
+  const auto disposition = cause.details.find("stop_disposition");
+  return disposition != cause.details.end() &&
+         disposition->second == "planner_selected_hard_stop";
+}
+
+/// Q18: a Stop ramp that ended with the robot outside the controller's goal
+/// tolerance is `main`'s confirmed-but-not-settled case.
+[[nodiscard]] bool controlled_stop_unsettled_result(const ParticipantStopStageResultDTO& result) {
+  if (result.attempt_disposition == StopStageAttemptDispositionDTO::kNotDispatched ||
+      result.outcome != ParticipantStopStageOutcomeDTO::kFailed || !result.error.has_value()) {
+    return false;
+  }
+  const auto reason = result.error->details.find("reason");
+  return reason != result.error->details.end() &&
+         reason->second == "stop_goal_tolerance_violated";
+}
+
 [[nodiscard]] Result<std::vector<OperationControlEffectRequest>> reset_effect_requests(
     const OperationId& operation_id, const std::vector<ActiveOperationParticipant>& participants,
     const OperationRevision operation_revision) {
@@ -1956,6 +2037,19 @@ struct StopParticipantWork final {
   /// First collision observed on this participant's Stop path. Containment
   /// with a collision on the Stop path ends InterventionRequired carrying it.
   std::optional<ErrorDTO> stop_path_collision;
+  /// Why a weaker stage did not contain this participant before a stronger
+  /// (fallback hard) stage did. A contained participant with this cause ends
+  /// Stopped with a degraded-Stop error (item 25, as `main`).
+  std::optional<ErrorDTO> escalation_cause{};
+  /// The Stop ramp ended but the controller reported the robot outside its
+  /// goal tolerance (Q18, `main`'s confirmed-but-not-settled case): the
+  /// participant ends InterventionRequired and no further Stop command is
+  /// issued.
+  bool controlled_stop_unsettled{};
+  /// The hard stop is this participant's intended Stop: requested directly
+  /// (Q27, Q31; it then starts at the strongest stage) or chosen by the Stop
+  /// planner (Q33). Its strongest stage is then not an escalation.
+  bool lane_hard_stop_requested{};
 
   /// No subordinate terminal handoff exists for a never-dispatched participant
   /// that either never received an execution identity or whose preparation
@@ -2255,11 +2349,6 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
                                           std::nullopt, malformed_reason};
 }
 
-[[nodiscard]] StopEscalationStageKind stage_kind(const PreparedParticipantStopPlanDTO& plan,
-                                                 const std::size_t index) noexcept {
-  return plan.stage_commands[index].resolved_stage.stage_kind;
-}
-
 [[nodiscard]] StopParticipantScopeFactsDTO participant_scope_facts(
     const StopParticipantWork& item) {
   const auto& binding = item.binding.value();
@@ -2395,9 +2484,11 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] bool stop_requires_surveillance(const StopCertificateDTO& certificate,
                                               const StopFaultLatchDTO& latch) noexcept {
+  // Q32: a component-incident containment no longer waits for observed
+  // measured rest after its Stop finished.
+  static_cast<void>(latch);
   return certificate.result == StopCertificateResultDTO::kPartial ||
-         certificate.result == StopCertificateResultDTO::kFailedUncontained ||
-         latch.trigger == StopFaultTriggerDTO::kPhysicalRestUnproven;
+         certificate.result == StopCertificateResultDTO::kFailedUncontained;
 }
 
 [[nodiscard]] StopFaultTriggerDTO primary_fault_trigger(const StopCertificateDTO& certificate,
@@ -2490,9 +2581,10 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] bool terminal_fault_required(const StopCertificateDTO& certificate,
                                            const bool persistence_degraded) noexcept {
+  // Items 25 and Q29: no Stop outcome (escalated, partial or uncontained)
+  // latches the cell by itself; `main` had no cell-wide Stop-fault latch.
   return persistence_degraded ||
-         certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull ||
-         certificate.result != StopCertificateResultDTO::kSucceededNominal;
+         certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
 }
 
 [[nodiscard]] StopFaultLatchDTO persistence_fault_latch(
@@ -8189,14 +8281,10 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
           defer_effects_to_stop = true;
         } else if (!terminal_stop_result.has_value()) {
           defer_effects_to_stop = true;
-        } else if (*terminal_stop_result != StopCertificateResultDTO::kSucceededNominal &&
-                   *terminal_stop_result != StopCertificateResultDTO::kSucceededEscalated) {
-          active_operation->state.state = OperationStateKind::kInterventionRequired;
-          active_operation->state.updated_at_ns = clock_.now();
-          active_operation->pending_control.reset();
-          motion_admission_closed_ = true;
-          defer_effects_to_stop = true;
         } else {
+          // Q29: whatever the Stop's outcome, Reset issues the lane's hard
+          // stop if the motion is still winding down and then completes (as
+          // `main`); an uncontained Stop no longer holds a cell latch.
           active_operation->pending_control->superseded_by_stop = false;
           settle_without_effect = targets.empty();
         }
@@ -8245,18 +8333,9 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       }
       if (control == OperationControlKind::kReset) {
         if (reset_already_terminal || terminal_stop_result.has_value()) {
-          if (terminal_stop_result.has_value() &&
-              *terminal_stop_result != StopCertificateResultDTO::kSucceededNominal &&
-              *terminal_stop_result != StopCertificateResultDTO::kSucceededEscalated) {
-            active_operation->state.state = OperationStateKind::kInterventionRequired;
-            active_operation->state.updated_at_ns = clock_.now();
-            active_operation->pending_control.reset();
-            motion_admission_closed_ = true;
-            defer_effects_to_stop = true;
-          } else {
-            active_operation->pending_control->superseded_by_stop = false;
-            settle_without_effect = targets.empty();
-          }
+          // Q29: any terminal Stop outcome is reset the same way (as `main`).
+          active_operation->pending_control->superseded_by_stop = false;
+          settle_without_effect = targets.empty();
         } else if (active_operation->state.active_stop_id.has_value()) {
           active_operation->pending_control->superseded_by_stop = true;
           defer_effects_to_stop = true;
@@ -8446,7 +8525,10 @@ Result<void> ResourceAddressedExecutionKernel::settle_control_operation_locked(
       return Result<void>::Ok();
     }
     const auto outcome = *terminal_stop;
-    if (outcome != StopCertificateResultDTO::kSucceededNominal &&
+    // Q29: a Reset completes after any terminal Stop outcome (its effect has
+    // hard-stopped and retired the execution, as `main`).
+    if (control != OperationControlKind::kReset &&
+        outcome != StopCertificateResultDTO::kSucceededNominal &&
         outcome != StopCertificateResultDTO::kSucceededEscalated) {
       // Consume the exact cleanup result, but never use it to release a
       // resource whose newer Stop still requires containment/reconciliation.
@@ -12076,18 +12158,15 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         break;
       }
     }
+    // Escalated, partial or uncontained Stops end their operations
+    // Stopped/InterventionRequired without a cell-wide Stop-fault latch
+    // (items 25, Q29; `main` had none). Only scope promotion, persistence
+    // degradation, newly captured idle resources and a containment that
+    // requested its latch at acceptance keep one.
     const bool known_latch_required =
         transaction.fault_latch.has_value() || transaction.persistence_degraded ||
         transaction.accepted->resolution_disposition ==
             StopResolutionDispositionDTO::kPromotedToFull ||
-        std::any_of(attempts.begin(), attempts.end(),
-                    [](const auto& attempt) {
-                      return attempt.authority == StopStageResultAuthorityDTO::kAuthoritative &&
-                             (stage_kind(attempt.result.request.participant_stop_plan,
-                                         attempt.result.request.stage_index) !=
-                                  StopEscalationStageKind::kNominal ||
-                              attempt.result.outcome != ParticipantStopStageOutcomeDTO::kSucceeded);
-                    }) ||
         !transaction.newly_captured_resources.empty();
     std::optional<StopFaultLatchId> latch_id =
         transaction.fault_latch.has_value() ? std::optional(transaction.fault_latch->latch_id)
@@ -12135,6 +12214,20 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         latch_generation,
         completed_at_ns,
         terminal_error};
+    for (const auto& participant : transaction.participants) {
+      if (participant.lane_hard_stop_requested) {
+        reduction.lane_hard_stop_requested.push_back(StopScopeEntryKeyDTO{
+            *transaction.stop_id, transaction.stop_generation,
+            StopParticipantScopeKeyDTO{participant.operation_id, participant.plan.participant_id}});
+      }
+    }
+    std::sort(reduction.lane_hard_stop_requested.begin(), reduction.lane_hard_stop_requested.end(),
+              [](const auto& left, const auto& right) {
+                const auto& l = std::get<StopParticipantScopeKeyDTO>(left.subject);
+                const auto& r = std::get<StopParticipantScopeKeyDTO>(right.subject);
+                return std::tie(l.operation_id, l.participant_id) <
+                       std::tie(r.operation_id, r.participant_id);
+              });
     auto reduced = ReduceStopTerminal(reduction);
     // The reducer owns the authoritative nominal/escalated/partial outcome.
     // Pre-classification above avoids a second reduction in the common case,
@@ -12457,6 +12550,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           ordinary_stop != nullptr &&
           ordinary_stop->reason == std::optional<std::string>{"runtime_collision_fault"} &&
           ordinary_stop->request_context.source_label == "kernel.runtime_collision";
+      const auto internal_stop = internal_stop_kind(ordinary_stop);
+      // Neither a Reset nor a hold-timeout Stop is a degraded Stop.
+      const bool internal_control_stop = internal_stop != InternalStopKind::kNone;
 
       if (!transaction.participant_work_initialized) {
         transaction.participants.reserve(transaction.operations.size());
@@ -12535,6 +12631,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      std::nullopt,
                                      std::nullopt};
             work.retained_results.reserve(kMaxStopEscalationStages * 2U);
+            work.lane_hard_stop_requested =
+                !work.plan.stage_commands.empty() &&
+                (internal_stop == InternalStopKind::kZeroSpeedHold ||
+                 (internal_stop == InternalStopKind::kReset &&
+                  !active_participant.default_operator_stop_profile.has_value()));
+            if (work.lane_hard_stop_requested) {
+              work.current_stage_index = work.plan.stage_commands.size() - 1U;
+            }
             for (auto& [pending_operation, pending_participant, pending_error] :
                  transaction.pending_stop_path_collisions) {
               if (pending_operation == operation_id &&
@@ -12576,7 +12680,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           item.collision_escalation_error.reset();
           if (!item.terminal && !item.cancelled_pre_dispatch && collision_error.has_value()) {
             if (!item.stop_path_collision.has_value()) item.stop_path_collision = collision_error;
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
+            // Q29: the participant ends InterventionRequired with the
+            // collision; no cell-wide Stop-fault latch (as `main`).
             const auto strongest = item.plan.stage_commands.empty()
                                        ? std::size_t{0}
                                        : item.plan.stage_commands.size() - 1U;
@@ -12643,7 +12748,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 item, error(std::string(to_string(ErrorCode::kExecutionTimeout)),
                             "Prepared cancellation did not settle before the Stop deadline",
                             "prepared_cancellation_deadline_expired"));
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kPartial);
           } else if (waiting) {
             next_deadline = !next_deadline.has_value()
                                 ? transaction.outer_deadline_ns
@@ -12684,7 +12788,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
                                    "Stop stage did not prove containment before its phase deadline",
                                    "participant_stop_stage_deadline_expired"));
-          latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
+          // The deadline watchdog issues the hard floor (as `main`). A
+          // contained fallback is a degraded Stop, never a cell-wide latch
+          // (item 25); an uncontained cascade still latches below.
           advance_to_strongest();
           return true;
         };
@@ -12727,35 +12833,55 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 if (retained.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
                   item.contained = true;
                   item.terminal = true;
+                  if (retained.request.stage_index > 0U && item.terminal_error.has_value()) {
+                    item.escalation_cause = std::move(item.terminal_error);
+                    // Q33: a hard stop the Stop planner chose is the intended
+                    // Stop, so its certificate is nominal, not escalated.
+                    if (planner_selected_hard_stop(*item.escalation_cause)) {
+                      item.lane_hard_stop_requested = true;
+                    }
+                  }
                   item.terminal_error.reset();
+                } else if (retained.request.stage_index == 0U &&
+                           controlled_stop_unsettled_result(retained)) {
+                  // Q18: the controller finished the Stop ramp outside its
+                  // goal tolerance. As `main`'s confirmed-but-not-settled
+                  // case: InterventionRequired, no second Stop command.
+                  item.controlled_stop_unsettled = true;
+                  item.terminal = true;
+                  item.contained = false;
+                  // `main`'s disposition details, within the bounded error
+                  // shape the certificate accepts.
+                  if (item.terminal_error.has_value() &&
+                      item.terminal_error->details.size() <= 6U) {
+                    item.terminal_error->details.insert_or_assign(
+                        "emergency_fallback", "not_attempted_controlled_stop_already_confirmed");
+                    item.terminal_error->details.insert_or_assign("hard_stop_transitioned",
+                                                                  "false");
+                  }
                 } else {
-                  latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
+                  // No cell-wide latch for an escalation (items 25, Q29).
                   advance_to_strongest();
                 }
               }
-            } else {
-              motion_admission_closed_ = true;
-              if (!attempt.superseded) {
-                retain_first_error(valid.error());
-                latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
-                advance_to_strongest();
-              }
-            }
-          } else {
-            motion_admission_closed_ = true;
-            if (!attempt.superseded) {
-              retain_first_error(error(std::string(to_string(ErrorCode::kInternalError)),
-                                       "Stop-stage execution lane failed without a result",
-                                       "stop_stage_attempt_infrastructure_failure"));
-              latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
+            } else if (!attempt.superseded) {
+              // Q29: an invalid provider result escalates; the participant's
+              // outcome carries it, no cell-wide latch or admission closure.
+              retain_first_error(valid.error());
               advance_to_strongest();
             }
+          } else if (!attempt.superseded) {
+            retain_first_error(error(std::string(to_string(ErrorCode::kInternalError)),
+                                     "Stop-stage execution lane failed without a result",
+                                     "stop_stage_attempt_infrastructure_failure"));
+            advance_to_strongest();
           }
         }
 
         while (!item.terminal) {
           if (item.current_stage_index >= item.plan.stage_commands.size()) {
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kFailedUncontained);
+            // Q29: an exhausted cascade ends the participant
+            // InterventionRequired without a cell-wide latch (as `main`).
             item.terminal = true;
             item.contained = false;
             if (!item.terminal_error.has_value()) {
@@ -12786,25 +12912,20 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
                                      "Stop stage command phase expired before dispatch",
                                      "participant_stop_stage_command_phase_expired"));
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
             advance_to_strongest();
             continue;
           }
           if (item.port == nullptr) {
-            motion_admission_closed_ = true;
             retain_first_error(error(std::string(to_string(ErrorCode::kInvariantViolation)),
                                      "prepared Stop participant has no execution port",
                                      "participant_stop_execution_port_missing"));
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
             advance_to_strongest();
             continue;
           }
           auto stage = resolve_participant_stop_stage(item, stop_id, stop_generation,
                                                       item.current_stage_index, budget);
           if (!stage.ok()) {
-            motion_admission_closed_ = true;
             retain_first_error(stage.error());
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kEscalated);
             advance_to_strongest();
             continue;
           }
@@ -12815,8 +12936,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               StopStageAttemptRequest{item.port, attempt.stage, attempt.budget});
           if (started.status != StopStageAttemptStartStatus::kStarted ||
               !started.handle.has_value()) {
-            latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kFailedUncontained);
-            motion_admission_closed_ = true;
             item.terminal = true;
             item.contained = false;
             item.terminal_error =
@@ -12957,8 +13076,15 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             item.contained && !item.preparation_failed && !item.stop_path_collision.has_value() &&
             (!participant_settlement_required || (item.participant_settlement_complete &&
                                                   !item.participant_settlement_error.has_value()));
-        participant_state->state = participant_settled ? OperationStateKind::kStopped
-                                                       : OperationStateKind::kInterventionRequired;
+        // A runtime collision outside an operator Stop ends the colliding
+        // participant InterventionRequired once contained, through the
+        // ordinary outcome path (item 19); its siblings end Stopped.
+        const bool runtime_collision_participant =
+            runtime_collision_containment &&
+            active_participant->runtime_collision_error.has_value();
+        participant_state->state = participant_settled && !runtime_collision_participant
+                                       ? OperationStateKind::kStopped
+                                       : OperationStateKind::kInterventionRequired;
         if (item.stop_path_collision.has_value()) {
           // The collision on the Stop path is the participant's cause.
           participant_state->terminal_error = item.stop_path_collision;
@@ -12966,9 +13092,26 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           participant_state->terminal_error = item.participant_settlement_error.has_value()
                                                   ? item.participant_settlement_error
                                                   : item.terminal_error;
+        } else if (runtime_collision_participant) {
+          participant_state->terminal_error = active_participant->runtime_collision_error;
         } else if (runtime_collision_containment &&
                    !participant_state->terminal_error.has_value()) {
           participant_state->terminal_error = active_participant->last_subordinate_error;
+        } else if (participant_settled && item.escalation_cause.has_value() &&
+                   !internal_control_stop && !planner_selected_hard_stop(*item.escalation_cause) &&
+                   !participant_state->terminal_error.has_value()) {
+          // A successful fallback hard stop ends Stopped with `main`'s
+          // degraded-Stop error (item 25).
+          const auto containing = std::find_if(
+              item.retained_results.rbegin(), item.retained_results.rend(),
+              [](const auto& candidate) {
+                return candidate.authority == StopStageResultAuthorityDTO::kAuthoritative &&
+                       candidate.result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded;
+              });
+          participant_state->terminal_error = degraded_stop_error(
+              *item.escalation_cause, item.plan,
+              containing != item.retained_results.rend() ? containing->result.request.stage_index
+                                                         : item.plan.stage_commands.size());
         }
         const bool all_participants_terminal =
             std::all_of(operation->state.participants.begin(), operation->state.participants.end(),
@@ -13070,9 +13213,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             });
             if (row != states.end()) *row = capture;
           };
-          const bool containment_succeeded =
-              transaction.certificate->result == StopCertificateResultDTO::kSucceededNominal ||
-              transaction.certificate->result == StopCertificateResultDTO::kSucceededEscalated;
           for (const auto& operation_id : transaction.operations) {
             auto* operation = find_active_operation_locked(operation_id);
             if (operation == nullptr || !operation->pending_control.has_value() ||
@@ -13108,13 +13248,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   motion_admission_closed_ = true;
                 }
               }
-              continue;
-            }
-            if (!containment_succeeded) {
-              operation->state.state = OperationStateKind::kInterventionRequired;
-              operation->state.updated_at_ns = now;
-              operation->pending_control.reset();
-              motion_admission_closed_ = true;
               continue;
             }
             auto requests =
@@ -13312,7 +13445,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         item->prepared_cancel_complete = true;
         if (!cancelled.ok()) {
           fail_prepared_cancellation(*item, cancelled.error());
-          latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kPartial);
         } else if (item->payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
           // Capability preparation has no asynchronous worker terminal: the
           // successful cancellation call is its complete local no-effect
@@ -16499,6 +16631,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
         }
         if (!stop_owns_collision) {
           participant->last_subordinate_error = collision_error;
+          participant->runtime_collision_error = collision_error;
           const auto material =
               config_.request_owner_epoch.value() + "\nruntime-collision\n" +
               operation->state.operation_id.value() + "\n" +
@@ -16523,6 +16656,50 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     }
     if (containment.has_value()) {
       auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)});
+      if (!stopped.ok()) {
+        std::lock_guard state_lock(state_mutex_);
+        motion_admission_closed_ = true;
+      }
+    }
+    return;
+  }
+  if (event.type == KernelEventType::kStopRequested) {
+    // The participant held its motion at zero speed for the user-set hold
+    // timeout (item 40). Like an operator Stop, the Kernel ends the operation
+    // Stopped (no error) through its own Stop, which issues the lane's hard
+    // stop; an operation already owned by a Stop or ended is left alone.
+    const auto reason = event.details.find("reason");
+    if (reason == event.details.end() || reason->second != kZeroSpeedHoldStopReason) {
+      return;
+    }
+    std::optional<StopIntentDTO> hold_stop;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto operation_id = find_event_operation_locked(engine, event.execution_id);
+      auto* operation =
+          operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
+      auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
+      if (operation != nullptr && participant != nullptr && !terminal(operation->state.state) &&
+          !operation->state.active_stop_id.has_value()) {
+        const auto material = config_.request_owner_epoch.value() + "\nzero-speed-hold\n" +
+                              operation->state.operation_id.value() + "\n" +
+                              std::to_string(operation->state.operation_revision.value()) + "\n" +
+                              participant->slot_owner.participant_id.value();
+        hold_stop = StopIntentDTO{
+            PublicRequestContextDTO{
+                RequestId(manyforge::content_identity::sha256_digest(material)),
+                config_.request_owner_epoch, std::string(kZeroSpeedHoldStopSource),
+                participant->slot_owner.participant_id.value()},
+            std::vector<StopOperationTargetDTO>{StopOperationTargetDTO{
+                operation->state.operation_id, operation->state.operation_revision,
+                operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
+            std::string(kZeroSpeedHoldStopReason),
+            RequestAttributionDTO{RequestTransportDTO::kInternal,
+                                  RequestAssuranceDTO::kUnverified, std::nullopt}};
+      }
+    }
+    if (hold_stop.has_value()) {
+      auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*hold_stop)});
       if (!stopped.ok()) {
         std::lock_guard state_lock(state_mutex_);
         motion_admission_closed_ = true;

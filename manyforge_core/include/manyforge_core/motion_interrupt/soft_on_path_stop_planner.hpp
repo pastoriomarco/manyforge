@@ -34,11 +34,6 @@ struct SoftOnPathInitialStateDTO {
   /// trip time. Used only for model-derived velocity and diagnostics.
   double runtime_velocity_scale_at_trip = 1.0;
   std::int64_t sample_age_ns = 0;
-  /// Actual scale derivative, not a difference between requested percentages.
-  double runtime_scale_rate_per_s_at_trip = 0.0;
-  /// With the accepted trajectory's bounds, reproduces its frozen lead-in.
-  /// Absent is the constant-scale legacy/provider contract, never guessed.
-  std::optional<double> runtime_scale_target_at_trip{};
 };
 
 /// Planner options that are deployment/runtime facts rather than node policy.
@@ -58,14 +53,22 @@ struct SoftOnPathPlannerConfig {
   /// velocity is preserved in the anchor waypoint and measured in diagnostics
   /// but does not reject the plan.
   std::optional<double> max_initial_velocity_deviation_rad_s;
-  /// Optional deployment jerk limits. Missing joints default from
-  /// acceleration limit and effective ramp time.
+  /// Authored (deployment) jerk limits, used verbatim. While
+  /// `jerk_limits_enabled`, a joint without one gets main's default from its
+  /// acceleration limit and the phase duration: deceleration time minus
+  /// `stop_traj_delta_s` for a soft ramp (and a spring-back forward half),
+  /// half the deceleration time for a spring-back return.
   std::map<std::string, double> per_joint_max_jerk_rad_s3;
   /// Internal legacy callers preserve their prior shaping until the owning
   /// Deployment is migrated. Runtime wiring must pass the saved activation.
   /// Off uses the same smooth ramp and acceleration/path checks, but neither
   /// jerk rejection nor the jerk-only alternative solver.
   bool jerk_limits_enabled = true;
+  /// Stop deadline on the replacement's own clock (time 0 is the trip sample
+  /// the plan starts from). Spring-back may start its return after a late
+  /// forward braking end only while the whole Stop still ends by this time.
+  /// Absent: the requested deceleration time is the deadline.
+  std::optional<double> stop_deadline_s;
 };
 
 struct SoftOnPathStopPlanDTO {
@@ -80,7 +83,7 @@ struct SoftOnPathStopPlanDTO {
   bool used_model_velocity = false;
   std::string position_source;
   std::string velocity_source;
-  /// `deployment`, `default`, or `mixed`.
+  /// `deployment`, `default`, `mixed`, or `disabled`.
   std::string jerk_limit_source;
   InterruptStructuredValue diagnostics;
   /// Exact scalar interval of the forward plan, retained only between these
@@ -90,29 +93,14 @@ struct SoftOnPathStopPlanDTO {
   double forward_stop_path_time_s = 0.0;
 };
 
-struct SoftOnPathFeasibilityEnvelopeDTO {
-  std::size_t checked_samples = 0;
-  std::size_t natural_completion_samples = 0;
-  double first_sample_time_from_start_s = 0.0;
-  double last_sample_time_from_start_s = 0.0;
-  double max_path_deviation_rad = 0.0;
-  double max_initial_velocity_deviation_rad_s = 0.0;
-  std::string jerk_limit_source;
-  InterruptStructuredValue diagnostics;
-};
-
-/// Pure early decision over an already-validated accepted curve and its exact
-/// frozen scalar law. Optional drift guards inspect only the known cursor.
-/// No path search, sampling loop, clock or effect. This is ordinary completion,
-/// not a replacement claiming the controlled Stop's acceleration/jerk caps.
-/// False is not Stop failure: the caller tries its controlled replacement.
-bool natural_completion_fits_stop_window(const TrajectoryDTO& accepted_trajectory,
-                                         const MotionInterruptStopProfileDTO& stop_profile,
-                                         const SoftOnPathInitialStateDTO& initial_state,
-                                         const SoftOnPathPlannerConfig& config);
-
 /// Build a wall-time, best-effort path-preserving replacement trajectory for
-/// `MotionInterruptStopMode::kSoftOnPath`.
+/// `MotionInterruptStopMode::kSoftOnPath`. The command-frame lead-in
+/// (`stop_traj_delta_s`) sits inside `deceleration_time_s`; the ramp lasts the
+/// remainder. The trajectory must carry its `runtime_scale_bounds`. When the
+/// ramp would overrun the accepted path end the planner returns
+/// `soft_on_path_remaining_time_short`, recommending natural completion when
+/// the profile allows it, else the spring-back fallback. Initial path or
+/// velocity deviation beyond its configured limit recommends the hard stop.
 ///
 /// The planner is intentionally side-effect free. Backends use the returned
 /// trajectory as the command shape; kernel/backend code remains responsible for
@@ -126,7 +114,15 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
 /// path-preserving trajectory:
 ///   1. a normal soft-on-path deceleration over half of `deceleration_time_s`;
 ///   2. a rest-to-rest return on the same accepted path back to the trip cursor
-///      over the remaining half.
+///      over the remaining half: main's quintic when its peak path rate
+///      (1.875 * distance / half) is within the trajectory's
+///      `max_stop_path_rate`, otherwise a ramp-cruise-ramp return capped at it.
+///
+/// Forward braking must end at rest; if it ends after the half boundary, the
+/// return starts after it while the whole Stop still fits
+/// `SoftOnPathPlannerConfig::stop_deadline_s`, otherwise the hard stop is
+/// recommended. Natural completion is not re-checked here (it is decided once,
+/// before spring-back).
 ///
 /// This is intentionally a replacement/preemption trajectory, not a JTC cancel
 /// path. The first phase reuses `plan_soft_on_path_stop`, so it inherits the
@@ -135,14 +131,6 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
 Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
     const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
     const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config = {});
-
-/// Validate, before backend dispatch, that model-derived trip samples along the
-/// accepted trajectory can produce a `soft_on_path` ramp under the same planner
-/// limits. This is the plan-time feasibility envelope; it is
-/// conservative because it assumes runtime scale 1.0 for the original motion.
-Result<SoftOnPathFeasibilityEnvelopeDTO> validate_soft_on_path_feasibility_envelope(
-    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
-    const SoftOnPathPlannerConfig& config = {});
 
 /// True when a planner rejection means the accepted trajectory is already too
 /// close to its natural endpoint for a useful wall-time `soft_on_path` ramp and
@@ -258,9 +246,7 @@ struct JerkLimitedStopProfileDTO {
   TrajectoryDTO emitted_trajectory;
 };
 
-/// Jerk-limited exact-time re-timing of the soft stop's ramp. A qualified affine
-/// path first uses a closed-form physical-state brake, with a continuous
-/// same-path speed certificate and explicit jerk-switch knots. Otherwise it forward-integrates
+/// Jerk-limited exact-time re-timing of the soft stop's ramp. Forward-integrates
 /// the path-rate phase plane `(s, u̇, ü)` from the C2 seam `(u̇0, ü0)`, slewing ü
 /// within a path-rate jerk budget derived from the per-joint jerk limits and
 /// clamping it to the per-joint acceleration budget (riding corners at the

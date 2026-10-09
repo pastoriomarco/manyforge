@@ -59,13 +59,12 @@ enum class ParticipantExecutionFactKind : std::uint8_t {
   /// The execution reached the computed end of its command and the adapter
   /// reported natural completion; evidence is the published final snapshot.
   kComputedCompletion,
-  /// Planning, validation, preparation, dispatch rejection or an adapter
-  /// fault ended the execution; the fact carries the exact error.
+  /// Planning (including an expired planning deadline, `planning_timeout`),
+  /// validation, preparation, dispatch rejection or an adapter fault ended
+  /// the execution; the fact carries the exact error.
   kLocalFailure,
   /// Cancelled before dispatch: nothing crossed the dispatch barrier.
   kCancelledBeforeDispatch,
-  /// The planning deadline elapsed before dispatch: nothing was dispatched.
-  kPlanningDeadlineExpired,
   /// The addressed owner's Stop ended the dispatched execution; the owner
   /// holds the containment evidence and certificate.
   kPreemptedByAddressedStop,
@@ -98,7 +97,6 @@ inline const char* to_string(ParticipantExecutionFactKind kind) {
     case kComputedCompletion: return "computed_completion";
     case kLocalFailure: return "local_failure";
     case kCancelledBeforeDispatch: return "cancelled_before_dispatch";
-    case kPlanningDeadlineExpired: return "planning_deadline_expired";
     case kPreemptedByAddressedStop: return "preempted_by_addressed_stop";
   }
   return "unknown";

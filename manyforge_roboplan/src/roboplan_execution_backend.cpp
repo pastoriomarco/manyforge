@@ -335,6 +335,7 @@ stop_stage_error_details(const std::map<std::string, std::string> &details,
   constexpr std::array preferred{
       std::string_view("reason"),
       std::string_view("recommended_disposition"),
+      std::string_view("stop_disposition"),
       std::string_view("trigger_reason"),
       std::string_view("validation_failure_reason"),
       std::string_view("retimer_validation_failure_reason"),
@@ -2022,13 +2023,6 @@ RoboPlanExecutionBackend::TranslateStopStage(
                                "native Stop evidence phase is already expired");
   }
   const auto evidence_deadline = started_at + *evidence_remaining;
-  const auto minimum_dwell_ns = std::accumulate(
-      command.evidence_requirements.begin(),
-      command.evidence_requirements.end(), std::int64_t{0},
-      [](const std::int64_t current, const auto &requirement) {
-        return std::max(current, requirement.requirement.observation_semantics
-                                     .minimum_dwell_ns.value_or(0));
-      });
   const auto same_execution = [&] {
     return last_execution_generation_.load(std::memory_order_acquire) ==
            dispatch_generation;
@@ -2069,96 +2063,46 @@ RoboPlanExecutionBackend::TranslateStopStage(
                          row.requirement.source_requirement.freshness_budget_ns)
                    : bound;
       });
-  const auto exact_rest = [&](const core::ObservedStateSnapshotDTO &observed) {
-    const auto now = clock_.now();
-    if (!same_execution() || state_.running.load(std::memory_order_acquire) ||
-        !observed.velocities.has_value() ||
-        observed.resources != stage.resources ||
-        observed.velocities->size() != observed.resources.size() ||
-        observed.source_epoch != path.provider_runtime_epoch ||
-        observed.sequence == 0U || observed.authority_generation == 0U ||
-        now >= evidence_deadline ||
-        observed.received_timestamp_ns <= command_accepted_at_ns ||
-        observed.received_timestamp_ns > now ||
-        now - observed.received_timestamp_ns > rest_freshness_ns ||
-        observed.controllable_component_id != stage.controllable_component_id ||
-        observed.command_target_id != stage.command_target_id ||
-        observed.control_domain_id != stage.control_domain_id ||
-        observed.control_domain_revision != stage.control_domain_revision ||
-        observed.control_binding_id != stage.control_binding_id ||
-        observed.control_binding_revision != stage.control_binding_revision ||
-        observed.controller_topology_id != stage.controller_topology_id ||
-        observed.topology_revision != stage.topology_revision ||
-        observed.control_route_id != stage.control_route_id ||
-        observed.active_control_configuration_id !=
-            stage.active_control_configuration_id ||
-        observed.active_control_configuration_generation !=
-            stage.active_control_configuration_generation ||
-        observed.provider_instance_id != path.provider_instance_id ||
-        observed.provider_manifest_id != path.provider_manifest_id ||
-        observed.provider_manifest_revision !=
-            path.provider_manifest_revision ||
-        observed.state_authority_id != path.state_authority_id ||
-        observed.state_authority_class != path.state_authority_class) {
-      return false;
-    }
-    for (std::size_t index = 0U; index < observed.resources.size(); ++index) {
-      double threshold = 0.0;
-      if (controlled_profile.has_value()) {
-        const auto resource = std::find_if(
-            binding.resources.begin(), binding.resources.end(),
-            [&](const auto &candidate) {
-              return candidate.resource_id == observed.resources[index];
-            });
-        if (resource == binding.resources.end() ||
-            !resource->source_joint_name.has_value() ||
-            !controlled_profile->per_joint_settle_velocity_threshold
-                 .has_value()) {
-          return false;
-        }
-        const auto configured =
-            controlled_profile->per_joint_settle_velocity_threshold->find(
-                *resource->source_joint_name);
-        if (configured ==
-            controlled_profile->per_joint_settle_velocity_threshold->end()) {
-          return false;
-        }
-        const auto same_coordinate_kind =
-            (*observed.velocities)[index].index() == configured->second.index();
-        if (!same_coordinate_kind) {
-          return false;
-        }
-        threshold = std::visit(
-            [](const auto &value) {
-              if constexpr (requires { value.value_rad_s; }) {
-                return value.value_rad_s;
-              } else {
-                return value.value_m_s;
-              }
-            },
-            configured->second);
-      }
-      const auto velocity = std::visit(
-          [](const auto &value) {
-            if constexpr (requires { value.value_rad_s; }) {
-              return value.value_rad_s;
-            } else {
-              return value.value_m_s;
-            }
-          },
-          (*observed.velocities)[index]);
-      if (!std::isfinite(velocity) || std::abs(velocity) > threshold) {
-        return false;
-      }
-    }
-    return true;
-  };
-  std::int64_t rest_started_at = 0;
-  std::int64_t rest_last_received_at = 0;
-  std::uint64_t rest_first_sequence = 0U;
-  std::uint64_t rest_last_sequence = 0U;
-  std::uint64_t rest_authority_generation = 0U;
-  bool rest_complete = false;
+  // Items 1/26: the Stop is finished when this adapter reports its braking
+  // finished (the execution above is no longer running). There is no
+  // measured-rest check or dwell; one post-command sample of the exact state
+  // authority records the provenance of the motion-rest evidence item.
+  const auto post_command_sample =
+      [&](const core::ObservedStateSnapshotDTO &observed) {
+        const auto now = clock_.now();
+        return same_execution() &&
+               !state_.running.load(std::memory_order_acquire) &&
+               observed.resources == stage.resources &&
+               observed.source_epoch == path.provider_runtime_epoch &&
+               observed.sequence != 0U && observed.authority_generation != 0U &&
+               now < evidence_deadline &&
+               observed.received_timestamp_ns > command_accepted_at_ns &&
+               observed.received_timestamp_ns <= now &&
+               now - observed.received_timestamp_ns <= rest_freshness_ns &&
+               observed.controllable_component_id ==
+                   stage.controllable_component_id &&
+               observed.command_target_id == stage.command_target_id &&
+               observed.control_domain_id == stage.control_domain_id &&
+               observed.control_domain_revision ==
+                   stage.control_domain_revision &&
+               observed.control_binding_id == stage.control_binding_id &&
+               observed.control_binding_revision ==
+                   stage.control_binding_revision &&
+               observed.controller_topology_id ==
+                   stage.controller_topology_id &&
+               observed.topology_revision == stage.topology_revision &&
+               observed.control_route_id == stage.control_route_id &&
+               observed.active_control_configuration_id ==
+                   stage.active_control_configuration_id &&
+               observed.active_control_configuration_generation ==
+                   stage.active_control_configuration_generation &&
+               observed.provider_instance_id == path.provider_instance_id &&
+               observed.provider_manifest_id == path.provider_manifest_id &&
+               observed.provider_manifest_revision ==
+                   path.provider_manifest_revision &&
+               observed.state_authority_id == path.state_authority_id &&
+               observed.state_authority_class == path.state_authority_class;
+      };
   if (std::any_of(command.evidence_requirements.begin(),
                   command.evidence_requirements.end(), [](const auto &row) {
                     return row.requirement.evidence_kind ==
@@ -2174,40 +2118,9 @@ RoboPlanExecutionBackend::TranslateStopStage(
         return fail_after_dispatch("stop_evidence_source_unavailable",
                                    observed.error().message);
       }
-      if (exact_rest(observed.value())) {
-        const auto &sample = observed.value();
-        if (rest_authority_generation != 0U &&
-            sample.authority_generation != rest_authority_generation) {
-          return fail_after_dispatch(
-              "stop_evidence_source_changed",
-              "Rest source generation changed during the Stop stage");
-        }
-        rest_authority_generation = sample.authority_generation;
-        if (sample.sequence > rest_last_sequence &&
-            sample.received_timestamp_ns >= rest_last_received_at) {
-          if (rest_first_sequence == 0U ||
-              sample.received_timestamp_ns - rest_last_received_at >
-                  rest_freshness_ns) {
-            rest_started_at = sample.received_timestamp_ns;
-            rest_first_sequence = sample.sequence;
-          }
-          rest_last_received_at = sample.received_timestamp_ns;
-          rest_last_sequence = sample.sequence;
-          rest_snapshot = std::move(observed.value());
-          if (rest_last_sequence > rest_first_sequence &&
-              rest_last_received_at - rest_started_at >= minimum_dwell_ns) {
-            rest_complete = true;
-            break;
-          }
-        } else if (sample.sequence != rest_last_sequence ||
-                   sample.received_timestamp_ns != rest_last_received_at) {
-          return fail_after_dispatch(
-              "stop_evidence_source_reordered",
-              "Rest source ordering changed during the Stop stage");
-        }
-      } else {
-        rest_first_sequence = 0U;
-        rest_snapshot.reset();
+      if (post_command_sample(observed.value())) {
+        rest_snapshot = std::move(observed.value());
+        break;
       }
       std::unique_lock lock(execution_mutex_);
       execution_cv_.wait_for(
@@ -2216,12 +2129,12 @@ RoboPlanExecutionBackend::TranslateStopStage(
     if (cancellation.stop_requested()) {
       return fail_after_dispatch(
           "stop_stage_cancelled_after_dispatch",
-          "native Stop rest-evidence wait was superseded");
+          "native Stop evidence wait was superseded");
     }
-    if (!rest_complete || !rest_snapshot.has_value()) {
+    if (!rest_snapshot.has_value()) {
       return fail_after_dispatch(
-          "stop_evidence_not_at_rest",
-          "native addressed state did not prove bounded exact rest");
+          "stop_evidence_source_unavailable",
+          "native addressed state published no post-Stop sample in budget");
     }
   }
   for (const auto &requirement : command.evidence_requirements) {
@@ -2282,11 +2195,6 @@ RoboPlanExecutionBackend::TranslateStopStage(
                                    "native rest observation is absent");
       }
       const auto now_ns = clock_.now();
-      if (!exact_rest(*rest_snapshot)) {
-        return fail_after_dispatch(
-            "stop_evidence_not_at_rest",
-            "native addressed state does not prove exact rest");
-      }
       if (requirement.resolved_source.source_kind !=
               core::StopEvidenceSourceKind::kBindingStateAuthority ||
           requirement.resolved_source.runtime_target.provider_runtime_epoch !=
@@ -2327,17 +2235,16 @@ RoboPlanExecutionBackend::TranslateStopStage(
         evidence = core::JsonValueDTO{core::JsonObjectDTO{}};
       std::get<core::JsonObjectDTO>(evidence.value)
           .emplace(
-              "post_command_rest",
+              "post_command_sample",
               core::JsonValueDTO{core::JsonObjectDTO{
-                  {"first_sample_sequence",
-                   core::JsonValueDTO{std::to_string(rest_first_sequence)}},
-                  {"last_sample_sequence",
-                   core::JsonValueDTO{std::to_string(rest_last_sequence)}},
-                  {"first_sample_after_acceptance_ns",
+                  {"finish_authority",
+                   core::JsonValueDTO{std::string("controller_reported")}},
+                  {"sample_sequence",
+                   core::JsonValueDTO{std::to_string(rest_snapshot->sequence)}},
+                  {"sample_after_acceptance_ns",
                    core::JsonValueDTO{static_cast<double>(
-                       rest_started_at - command_accepted_at_ns)}},
-                  {"dwell_ns", core::JsonValueDTO{static_cast<double>(
-                                   rest_last_received_at - rest_started_at)}},
+                       rest_snapshot->received_timestamp_ns -
+                       command_accepted_at_ns)}},
               }});
     } else if (requirement.requirement.evidence_kind ==
                core::StopEvidenceRequirementKind::kControllerGoalTerminal) {
@@ -2418,7 +2325,9 @@ RoboPlanExecutionBackend::execute_controlled_stop_until(
   if (profile.stop_mode != core::MotionInterruptStopMode::kHardDeceleration &&
       (!profile.jerk_limits_enabled.has_value() ||
        (profile.jerk_limits_enabled == true &&
-        (profile.per_joint_max_jerk.size() !=
+        // Q36: only authored jerk limits are frozen; missing ones are
+        // derived per Stop phase by the planner (main's default).
+        (profile.per_joint_max_jerk.size() >
              retained_binding->value().resources.size() ||
          std::any_of(profile.per_joint_max_jerk.begin(),
                      profile.per_joint_max_jerk.end(), [](const auto &row) {
@@ -2429,7 +2338,7 @@ RoboPlanExecutionBackend::execute_controlled_stop_until(
     rejected.executed_stop_mode = profile.stop_mode;
     rejected.error = core::ErrorDTO{
         std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "Controlled Stop requires an explicit, fully prepared jerk profile",
+        "Controlled Stop requires an explicit jerk choice and angular jerk limits",
         {{"reason", "controlled_stop_jerk_profile_not_prepared"}}};
     return rejected;
   }
@@ -2682,8 +2591,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     core::ExecutionSnapshot active_snapshot;
     double active_time_s = 0.0;
     double active_runtime_scale = 1.0;
-    double active_scale_rate = 0.0;
-    double active_scale_target = 1.0;
     observe_stop_qualification(
         detail::NativeStopQualificationEvent::kNominalAdapterLockAttempt);
     {
@@ -2692,8 +2599,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
       active_trajectory = state_.active_trajectory;
       active_time_s = state_.active_trajectory_time_s;
       active_runtime_scale = state_.active_runtime_velocity_scale;
-      active_scale_rate = state_.active_runtime_scale_rate_per_s;
-      active_scale_target = state_.active_runtime_scale_target;
     }
 
     if (!active_trajectory || active_trajectory->waypoints.empty() ||
@@ -2717,8 +2622,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
     initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
     initial.runtime_velocity_scale_at_trip = active_runtime_scale;
-    initial.runtime_scale_rate_per_s_at_trip = active_scale_rate;
-    initial.runtime_scale_target_at_trip = active_scale_target;
     initial.sample_age_ns =
         std::max<std::int64_t>(0, clock_.now() - active_snapshot.timestamp_ns);
     const auto stop_timeline_origin =
@@ -2739,11 +2642,7 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         planner_config.per_joint_max_jerk_rad_s3.emplace(
             joint, std::get<core::AngularJerkDTO>(jerk).value_rad_s3);
 
-    // The active curve was validated at dispatch. A short eligible tail needs
-    // no Stop-time trajectory validation/projection scan or replacement build.
-    if (core::natural_completion_fits_stop_window(*active_trajectory, profile,
-                                                  initial, planner_config))
-      return await_natural_completion(stop_timeline_origin);
+    // Natural completion is decided by the planner's predicate (as main).
     auto planned = core::plan_soft_on_path_stop(*active_trajectory, profile,
                                                 initial, planner_config);
     if (!planned.ok()) {
@@ -2766,6 +2665,12 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
         result.accepted = false;
         result.backend_stop_confirmed = false;
         result.error = planned.error();
+        // Q33: the Stop planner chose the hard stop as the right Stop. The
+        // Kernel's hard stop then ends Stopped with no degraded-Stop error
+        // (main's ros2_control operator path); a hard stop used as a
+        // fallback after a failed soft Stop keeps that error.
+        result.error->details.insert_or_assign("stop_disposition",
+                                               "planner_selected_hard_stop");
         return result;
       }
       const bool may_fallback = profile.recoverable_substitution_mode ==
@@ -2967,8 +2872,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   core::ExecutionSnapshot active_snapshot;
   double active_time_s = 0.0;
   double active_runtime_scale = 1.0;
-  double active_scale_rate = 0.0;
-  double active_scale_target = 1.0;
   observe_stop_qualification(
       detail::NativeStopQualificationEvent::kNominalAdapterLockAttempt);
   {
@@ -2977,8 +2880,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     active_trajectory = state_.active_trajectory;
     active_time_s = state_.active_trajectory_time_s;
     active_runtime_scale = state_.active_runtime_velocity_scale;
-    active_scale_rate = state_.active_runtime_scale_rate_per_s;
-    active_scale_target = state_.active_runtime_scale_target;
   }
 
   // If no execution is in flight, there's nothing to preempt. The kernel never
@@ -3030,8 +2931,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
   initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
   initial.runtime_velocity_scale_at_trip = active_runtime_scale;
-  initial.runtime_scale_rate_per_s_at_trip = active_scale_rate;
-  initial.runtime_scale_target_at_trip = active_scale_target;
   initial.sample_age_ns =
       std::max<std::int64_t>(0, clock_.now() - active_snapshot.timestamp_ns);
   const auto stop_timeline_origin =
@@ -3055,9 +2954,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   core::MotionInterruptStopProfileDTO spring_profile = profile;
   spring_profile.deceleration_time_s =
       core::motion_interrupt_deceleration_time_or_default(profile);
-  if (core::natural_completion_fits_stop_window(
-          *active_trajectory, spring_profile, initial, planner_config))
-    return await_natural_completion(stop_timeline_origin);
   auto planned = core::plan_spring_back_on_path_stop(
       *active_trajectory, spring_profile, initial, planner_config);
   if (!planned.ok()) {

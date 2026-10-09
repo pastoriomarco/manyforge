@@ -9,9 +9,10 @@
 
 namespace manyforge::core {
 
-/// Cold-only preset resolution. Explicit limits win; missing enabled limits
-/// use the declared profile's ramp (Soft) or half-duration (Spring). A single
-/// frozen ceiling covers both Spring phases; no candidate-dependent inflation.
+/// Cold profile resolution at load: requires the explicit jerk choice, fills
+/// the default deceleration time (as main), and freezes only authored jerk
+/// limits. Missing jerk limits are derived per Stop phase at Stop time with
+/// main's formula (decision Q36), where the lane's lead-in is known.
 [[nodiscard]] Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
     const MotionInterruptStopProfileDTO& profile);
 

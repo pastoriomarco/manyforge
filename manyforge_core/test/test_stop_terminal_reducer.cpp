@@ -410,7 +410,7 @@ TEST(StopTerminalReducerTest, PreDispatchCancellationCannotOutrunParticipantSett
   EXPECT_TRUE(reduced.value().attempted_stage_results.empty());
 }
 
-TEST(StopTerminalReducerTest, StrongerStageRequiresLatchAndProducesEscalatedTruth) {
+TEST(StopTerminalReducerTest, StrongerStageProducesEscalatedTruthWithoutRequiringALatch) {
   auto input = Input();
   auto hard = SuccessfulStage(1U);
   input.newly_completed_stage_results.push_back(
@@ -420,10 +420,15 @@ TEST(StopTerminalReducerTest, StrongerStageRequiresLatchAndProducesEscalatedTrut
             [](const auto& left, const auto& right) {
               return left.result.request.stage_index < right.result.request.stage_index;
             });
-  auto missing_latch = ReduceStopTerminal(input);
-  ASSERT_FALSE(missing_latch.ok());
-  EXPECT_EQ(missing_latch.error().code, "stop_terminal_fault_latch_required");
+  // A successful fallback hard stop is a degraded Stop, not a cell-wide
+  // containment fault (item 25): no latch is required.
+  const auto without_latch = ReduceStopTerminal(input);
+  ASSERT_TRUE(without_latch.ok()) << without_latch.error().message;
+  EXPECT_EQ(without_latch.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_FALSE(without_latch.value().fault_latch_id.has_value());
 
+  // A latch held for another reason (for example a collision on the Stop
+  // path) is still recorded on the escalated certificate.
   input.fault_latch_id = StopFaultLatchId("stop-fault.1");
   input.fault_latch_generation = StopFaultLatchGeneration(1U);
   const auto reduced = ReduceStopTerminal(input);

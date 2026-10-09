@@ -55,6 +55,7 @@ add_library(manyforge_core
   src/component_lifecycle_plan_evaluator.cpp
   src/fixed_cclc_port_registry.cpp
   src/runtime_contract_manifest_codec.cpp
+  src/controller_lifecycle.cpp
   src/controller_lifecycle_evaluator.cpp
   src/cclc_domain_reservation_table.cpp
   src/coordinate_state.cpp
@@ -91,13 +92,22 @@ add_library(manyforge_core
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/resource_addressed_execution_kernel.cpp
+  src/resolved_stop_base_plan_codec.cpp
+  src/resolved_stop_base_plan_decoder.cpp
+  src/prepared_participant_stop_plan_codec.cpp
+  src/prepared_planning_codec.cpp
+  src/prepared_motion_evidence_codec.cpp
+  src/prepared_operation_participant_codec.cpp
   src/prepared_execution.cpp
   src/route_selection.cpp
   src/route_selection_owner.cpp
   src/resource_slot_table.cpp
   src/runtime_collision_monitor.cpp
+  src/runtime_participant_binding.cpp
   src/runtime_participant_policy.cpp
+  src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
+  src/runtime_scale_governor.cpp
   src/coordinated_motion_preparation.cpp
   src/coordinated_execution_clock.cpp
   src/runtime_collision_query_session.cpp
@@ -116,6 +126,7 @@ add_library(manyforge_core
   src/trajectory_cache.cpp
   src/trajectory_cache_intent.cpp
   src/trajectory_cache_compatibility.cpp
+  src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/ordered_contact_validation.cpp
@@ -123,8 +134,10 @@ add_library(manyforge_core
   src/collision_world_snapshot_builder.cpp
   src/logical_scene_identity_internal.cpp
   src/logical_scene_projection.cpp
+  src/interrupt_structured_value.cpp
   src/soft_on_path_stop_planner.cpp
-  src/affine_path_stop.cpp
+  src/stop_profile_mapper.cpp
+  src/stop_timing.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -132,24 +145,6 @@ target_include_directories(manyforge_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
-
-# The shared motion numerics (motion step, runtime-scale governor, trajectory
-# sampler) are one separately consumable target, compiled once; Core links it.
-if(NOT TARGET manyforge_motion_numerics)
-  add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/motion_numerics"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_motion_numerics")
-endif()
-target_link_libraries(manyforge_core PUBLIC manyforge::motion_numerics)
-
-# The shared PreparedMotion builder with the sealed participant/trajectory
-# codecs is one separately consumable target, compiled once; Core links it.
-if(NOT TARGET manyforge_prepared_motion)
-  add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/prepared_motion"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_prepared_motion")
-endif()
-target_link_libraries(manyforge_core PUBLIC manyforge::prepared_motion)
 
 # The static library is linked into both standalone test executables AND
 # the pybind11 shared module (manyforge_core_py). Shared modules require
@@ -288,6 +283,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_contracts_compile
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_port test/test_execution_port.cpp)
+  target_link_libraries(test_execution_port PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_port
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_composable_cell_contracts
     test/test_composable_cell_contracts.cpp)
   target_link_libraries(test_composable_cell_contracts PRIVATE
@@ -321,23 +321,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_cclc_open_request PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
   gtest_discover_tests(test_cclc_open_request
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_execution_interfaces_compile
-    test/test_execution_interfaces_compile.cpp)
-  target_link_libraries(test_execution_interfaces_compile PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_execution_interfaces_compile
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_prepared_motion_builder test/test_prepared_motion_builder.cpp)
-  target_link_libraries(test_prepared_motion_builder PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_prepared_motion_builder
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_motion_step test/test_motion_step.cpp)
-  target_link_libraries(test_motion_step PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_motion_step
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_component_lifecycle_plan_evaluator

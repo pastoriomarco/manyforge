@@ -1299,8 +1299,13 @@ TEST(DeploymentApplicabilityCodec,
             parsed.value().stop_timing_parameters);
   expect_decode_error_containing(source(row("a") + "," + row("a")),
                                  "duplicate control binding timing");
-  expect_decode_error_containing(source(row("a", "1000000000")),
-                                 "shorter than the complete profile");
+  // Item 24: a timeout shorter than the profile plus allowances is not an
+  // Apply-time refusal; the Stop deadline watchdog bounds it at run time.
+  EXPECT_EQ(decode(source(row("a", "1000000000")))
+                .value()
+                .stop_timing_parameters.front()
+                .timing.operational_timeout_ns,
+            1'000'000'000);
   expect_decode_error_containing(source(row("a", "3000000000.5")),
                                  "I-JSON-safe integer");
   auto unknown = row("a");

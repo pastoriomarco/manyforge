@@ -6,7 +6,7 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
-#include "../src/affine_path_stop_internal.hpp"
+#include "../src/soft_on_path_stop_planner_internal.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -16,6 +16,7 @@ TrajectoryDTO linear_trajectory_1d() {
   trajectory.joint_names = {"joint_1"};
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{0.0, {0.0}, {1.0}, {0.0}});
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{1.0, {1.0}, {1.0}, {0.0}});
+  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
   return trajectory;
 }
 
@@ -24,6 +25,7 @@ TrajectoryDTO linear_trajectory_2d() {
   trajectory.joint_names = {"joint_1", "joint_2"};
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{1.0, {1.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
   return trajectory;
 }
 
@@ -32,6 +34,7 @@ TrajectoryDTO zero_tangent_curved_1d() {
   trajectory.joint_names = {"joint_1"};
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{0.0, {0.0}, {0.0}, {}});
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{1.0, {1.0}, {0.0}, {}});
+  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
   return trajectory;
 }
 
@@ -42,6 +45,7 @@ TrajectoryDTO curved_corner_2d() {
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{0.3, {0.3, 0.0}, {1.0, 0.0}, {}});
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{0.6, {0.45, 0.2}, {0.0, 1.1}, {}});
   trajectory.waypoints.push_back(TrajectoryWaypointDTO{1.0, {0.45, 0.7}, {0.0, 0.0}, {}});
+  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
   return trajectory;
 }
 
@@ -192,20 +196,177 @@ TrajectoryDTO prepared_cruise_trajectory() {
           TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
 }
 
-TEST(SpringBackOnPathStopPlannerTest, ReverseCannotExceedTheAcceptedVelocityEnvelope) {
+// Item 6: main's quintic return peaks at 1.875 * d / T. Here d = 0.06 and
+// T = 0.1, so the quintic would peak at path rate 1.125.
+SoftOnPathInitialStateDTO cruise_trip_state() {
   auto state = measured_state_1d(1.2, 1.0);
   state.trajectory_time_from_start_s = 1.7;
   state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_target_at_trip = 1.0;
+  return state;
+}
+
+SoftOnPathPlannerConfig cruise_trip_config() {
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.02;
   config.allow_model_velocity_fallback = true;
   config.jerk_limits_enabled = false;
-  const auto result = plan_spring_back_on_path_stop(prepared_cruise_trajectory(),
-                                                    spring_back_profile(0.2), state, config);
+  return config;
+}
+
+TEST(SpringBackOnPathStopPlannerTest, ReturnWithinStopPathRateKeepsTheQuintic) {
+  auto trajectory = prepared_cruise_trajectory();
+  trajectory.runtime_scale_bounds->max_stop_path_rate = 1.125 + 1e-6;
+  const auto result = plan_spring_back_on_path_stop(trajectory, spring_back_profile(0.2),
+                                                    cruise_trip_state(), cruise_trip_config());
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto& diagnostics = result.value().diagnostics;
+  EXPECT_EQ(interrupt_structured_scalar_text(diagnostics.at("spring_back_return_profile")),
+            "quintic_rest_to_rest");
+  EXPECT_NEAR(std::stod(interrupt_structured_scalar_text(
+                  diagnostics.at("spring_back_return_peak_path_rate"))),
+              1.125, 1e-9);
+  const auto& points = result.value().replacement_trajectory.waypoints;
+  EXPECT_NEAR(points.back().time_from_start_s, 0.2, 1e-12);
+  EXPECT_NEAR(points.back().positions_rad.front(), points.front().positions_rad.front(), 1e-12);
+}
+
+TEST(SpringBackOnPathStopPlannerTest, ReturnAboveStopPathRateIsCappedWithSameTargetAndTime) {
+  // Over the cap the return ramps up to the certified Stop path rate, cruises
+  // and ramps down; it reaches the same trip point at the same time (no
+  // refusal and no cap at 1.0 when the certificate allows more).
+  for (const double cap : {1.0, 1.1}) {
+    SCOPED_TRACE(cap);
+    auto trajectory = prepared_cruise_trajectory();
+    trajectory.runtime_scale_bounds->max_stop_path_rate = cap;
+    const auto result = plan_spring_back_on_path_stop(trajectory, spring_back_profile(0.2),
+                                                      cruise_trip_state(), cruise_trip_config());
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    const auto& diagnostics = result.value().diagnostics;
+    EXPECT_EQ(interrupt_structured_scalar_text(diagnostics.at("spring_back_return_profile")),
+              "ramp_cruise_ramp_rate_capped");
+    const auto& points = result.value().replacement_trajectory.waypoints;
+    EXPECT_NEAR(points.back().time_from_start_s, 0.2, 1e-12);
+    EXPECT_NEAR(points.back().positions_rad.front(), points.front().positions_rad.front(), 1e-12);
+    EXPECT_DOUBLE_EQ(points.back().velocities_rad_s.front(), 0.0);
+    EXPECT_NEAR(points.back().accelerations_rad_s2.front(), 0.0, 1e-9);
+    double peak = 0.0;
+    for (const auto& point : points) {
+      if (point.time_from_start_s <= 0.1) continue;
+      // Unit path tangent on the cruise section: joint speed is path rate.
+      peak = std::max(peak, std::abs(point.velocities_rad_s.front()));
+    }
+    EXPECT_LE(peak, cap + 1e-9);
+    EXPECT_NEAR(peak, cap, 1e-9);
+    // The emitted interpolation between knots respects the cap too.
+    for (double t = 0.1; t <= 0.2; t += 1e-4) {
+      const auto sampled = sample_trajectory(result.value().replacement_trajectory, t);
+      ASSERT_TRUE(sampled.ok());
+      EXPECT_LE(std::abs(sampled.value().velocities_rad_s.front()), cap + 1e-6);
+    }
+  }
+}
+
+TEST(SpringBackOnPathStopPlannerTest, CappedReturnStillEscalatesJointLimitFailureToHardStop) {
+  auto trajectory = prepared_cruise_trajectory();
+  auto profile = spring_back_profile(0.2);
+  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{30.0}}};
+  const auto result =
+      plan_spring_back_on_path_stop(trajectory, profile, cruise_trip_state(), cruise_trip_config());
   ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "spring_back_return_velocity_envelope_exceeded");
+  EXPECT_EQ(result.error().details.at("reason"), "spring_back_return_acceleration_limit_exceeded");
+  EXPECT_EQ(result.error().details.at("spring_back_phase"), "reverse_return");
   EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
+}
+
+// The spring-back return must stay on the original path: every return knot is
+// the accepted path's own point (position and tangent) at a path time inside
+// [trip cursor, forward stop], visited in decreasing path time, ending exactly
+// at the trip cursor. Joint 0 must be increasing in path time on that interval
+// (used to recover the path time of each knot).
+void ExpectReturnRetracesTheOriginalPath(const TrajectoryDTO& accepted,
+                                         const SoftOnPathStopPlanDTO& plan) {
+  const double trip = plan.command_path_time_s;
+  const double stop = plan.forward_stop_path_time_s;
+  ASSERT_LT(trip, stop);
+  const double return_start = std::stod(
+      interrupt_structured_scalar_text(plan.diagnostics.at("spring_back_return_start_s")));
+  const auto path_at = [&](double u) {
+    const auto sampled = sample_trajectory(accepted, u);
+    EXPECT_TRUE(sampled.ok());
+    return sampled.value();
+  };
+  const auto& points = plan.replacement_trajectory.waypoints;
+  const auto forward_end = std::find_if(points.begin(), points.end(), [&](const auto& point) {
+    return point.time_from_start_s >= return_start - 1e-12;
+  });
+  ASSERT_NE(forward_end, points.end());
+  for (size_t j = 0; j < accepted.joint_names.size(); ++j)
+    EXPECT_NEAR(forward_end->positions_rad[j], path_at(stop).positions_rad[j], 1e-9);
+  double previous_u = stop;
+  size_t return_knots = 0;
+  for (auto it = std::next(forward_end); it != points.end(); ++it) {
+    ++return_knots;
+    double lo = trip;
+    double hi = stop;
+    for (int i = 0; i < 200; ++i) {
+      const double mid = 0.5 * (lo + hi);
+      (path_at(mid).positions_rad[0] < it->positions_rad[0] ? lo : hi) = mid;
+    }
+    const double u = 0.5 * (lo + hi);
+    EXPECT_LE(u, previous_u + 1e-9);
+    previous_u = u;
+    const auto on_path = path_at(u);
+    for (size_t j = 0; j < accepted.joint_names.size(); ++j) {
+      EXPECT_NEAR(it->positions_rad[j], on_path.positions_rad[j], 1e-9) << "joint " << j;
+      // Reversed along this occurrence: velocity opposes the path tangent.
+      EXPECT_LE(it->velocities_rad_s[j] * on_path.velocities_rad_s[j], 1e-12) << "joint " << j;
+    }
+  }
+  EXPECT_GT(return_knots, 1U);
+  const auto at_trip = path_at(trip);
+  for (size_t j = 0; j < accepted.joint_names.size(); ++j) {
+    EXPECT_DOUBLE_EQ(points.back().positions_rad[j], at_trip.positions_rad[j]);
+    EXPECT_DOUBLE_EQ(points.back().velocities_rad_s[j], 0.0);
+  }
+}
+
+TEST(SpringBackOnPathStopPlannerTest, ReturnStaysOnTheOriginalPathAtTheTripOccurrence) {
+  // The path passes the trip pose three times (u = 0.5, 1.5, 2.5). The trip
+  // is the third occurrence; the return must retrace that one.
+  const TrajectoryDTO retracing{{ResourceId("joint.1"), ResourceId("joint.2")},
+                                {"joint_1", "joint_2"},
+                                {{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {1.0, {1.0, 0.5}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {2.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {3.0, {1.0, 0.5}, {0.0, 0.0}, {0.0, 0.0}}},
+                                TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1", "joint_2"};
+  state.state.positions_rad = {0.5, 0.25};
+  state.trajectory_time_from_start_s = 2.5;
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.runtime_velocity_scale_at_trip = 0.6;
+  SoftOnPathPlannerConfig config;
+  config.allow_model_velocity_fallback = true;
+  config.jerk_limits_enabled = false;
+  const auto quintic =
+      plan_spring_back_on_path_stop(retracing, spring_back_profile(1.0), state, config);
+  ASSERT_TRUE(quintic.ok()) << quintic.error().message;
+  EXPECT_EQ(interrupt_structured_scalar_text(
+                quintic.value().diagnostics.at("spring_back_return_profile")),
+            "quintic_rest_to_rest");
+  EXPECT_DOUBLE_EQ(quintic.value().command_path_time_s, 2.5);
+  ExpectReturnRetracesTheOriginalPath(retracing, quintic.value());
+
+  // The rate-capped return samples the same path the same way.
+  const auto capped =
+      plan_spring_back_on_path_stop(prepared_cruise_trajectory(), spring_back_profile(0.2),
+                                    cruise_trip_state(), cruise_trip_config());
+  ASSERT_TRUE(capped.ok()) << capped.error().message;
+  EXPECT_EQ(
+      interrupt_structured_scalar_text(capped.value().diagnostics.at("spring_back_return_profile")),
+      "ramp_cruise_ramp_rate_capped");
+  ExpectReturnRetracesTheOriginalPath(prepared_cruise_trajectory(), capped.value());
 }
 
 TEST(SpringBackOnPathStopPlannerTest, ReturnUsesTheExactOccurrenceOnARetracingPath) {
@@ -220,7 +381,6 @@ TEST(SpringBackOnPathStopPlannerTest, ReturnUsesTheExactOccurrenceOnARetracingPa
   state.state.velocities_rad_s.clear();
   state.trajectory_time_from_start_s = 2.5;
   state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_target_at_trip = 0.2;
   SoftOnPathPlannerConfig config;
   config.allow_model_velocity_fallback = true;
   config.jerk_limits_enabled = false;
@@ -234,103 +394,14 @@ TEST(SpringBackOnPathStopPlannerTest, ReturnUsesTheExactOccurrenceOnARetracingPa
               1e-12);
 }
 
-TEST(SoftOnPathStopPlannerTest, ChangingScalePreservesLeadInAndRampAcceleration) {
-  auto accepted = prepared_cruise_trajectory();
-  auto state = measured_state_1d(1.2, 0.5);
-  state.trajectory_time_from_start_s = 1.7;
-  state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_rate_per_s_at_trip = 0.1;
-  state.runtime_scale_target_at_trip = 0.8;
-  auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{100.0}}};
-  SoftOnPathPlannerConfig config;
-  config.allow_model_velocity_fallback = true;
-  config.stop_traj_delta_s = 0.02;
-  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1000.0}};
-  const auto result = plan_soft_on_path_stop(accepted, profile, state, config);
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  const auto& points = result.value().replacement_trajectory.waypoints;
-  ASSERT_GT(points.size(), 2U);
-  EXPECT_NEAR(points.front().velocities_rad_s[0], 0.5, 1e-8);
-  EXPECT_NEAR(points.front().accelerations_rad_s2[0], 0.1, 1e-8);
-  const auto seam = std::find_if(points.begin(), points.end(), [](const auto& point) {
-    return std::abs(point.time_from_start_s - 0.02) < 1e-9;
-  });
-  ASSERT_NE(seam, points.end());
-  EXPECT_NEAR(seam->velocities_rad_s[0], 0.5052, 1e-8);
-  EXPECT_NEAR(seam->accelerations_rad_s2[0], 0.42, 1e-8);
-  EXPECT_NEAR(points.back().velocities_rad_s[0], 0.0, 1e-8);
-  EXPECT_NEAR(points.back().accelerations_rad_s2[0], 0.0, 1e-8);
-}
-
-TEST(SoftOnPathStopPlannerTest, ChangingScaleCannotOverspeedTheAcceptedVelocityEnvelope) {
-  auto accepted = prepared_cruise_trajectory();
-  auto state = measured_state_1d(1.2, 0.9);
-  state.trajectory_time_from_start_s = 1.7;
-  state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_rate_per_s_at_trip = 1.6;
-  state.runtime_scale_target_at_trip = 1.0;
-  SoftOnPathPlannerConfig config;
-  config.allow_model_velocity_fallback = true;
-  config.stop_traj_delta_s = 0.0;
-  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1000.0}};
-  auto profile = soft_profile(1.0);
-  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{100.0}}};
-  const auto result = plan_soft_on_path_stop(accepted, profile, state, config);
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "soft_on_path_retimer_not_dispatchable");
-  EXPECT_EQ(result.error().details.at("trigger_reason"), "soft_on_path_scale_ramp_infeasible");
-  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
-  const auto fallback = compute_jerk_limited_stop_profile(
-      accepted, 1.7, 0.9, 1.6, 1.0, {{"joint_1", 100.0}}, {{"joint_1", 2.0}}, 0.01);
+TEST(JerkLimitedStopProfileTest, RisingSeamAccelerationCannotOverspeedTheEnvelope) {
+  // The public retimer still accepts a seam path acceleration; a rising one
+  // that would push the path rate above 1 is never dispatchable.
+  const auto fallback =
+      compute_jerk_limited_stop_profile(prepared_cruise_trajectory(), 1.7, 0.9, 1.6, 1.0,
+                                        {{"joint_1", 100.0}}, {{"joint_1", 2.0}}, 0.01);
   ASSERT_TRUE(fallback.ok()) << fallback.error().message;
   EXPECT_FALSE(fallback.value().dispatchable);
-}
-
-TEST(SoftOnPathStopPlannerTest, DecreasingScaleUsesValidatedRetimerInsteadOfReversing) {
-  const auto accepted = prepared_cruise_trajectory();
-  auto state = measured_state_1d(1.2, 0.8);
-  state.trajectory_time_from_start_s = 1.7;
-  state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_rate_per_s_at_trip = -3.0;
-  state.runtime_scale_target_at_trip = 0.4;
-  auto profile = soft_profile(1.0);
-  SoftOnPathPlannerConfig config;
-  config.allow_model_velocity_fallback = true;
-  config.stop_traj_delta_s = 0.0;
-  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1000.0}};
-
-  const auto result = plan_soft_on_path_stop(accepted, profile, state, config);
-  ASSERT_TRUE(result.ok()) << result.error().message << " "
-                          << testing::PrintToString(result.error().details);
-  const auto& points = result.value().replacement_trajectory.waypoints;
-  ASSERT_EQ(points.size(), 4U);  // exact constant-jerk phases, including both switches
-  EXPECT_NEAR(points.front().velocities_rad_s[0], 0.8, 1e-9);
-  EXPECT_NEAR(points.front().accelerations_rad_s2[0], -3.0, 1e-9);
-  EXPECT_NEAR(points.back().time_from_start_s, 1.0, 1e-9);
-  EXPECT_NEAR(points.back().velocities_rad_s[0], 0.0, 1e-9);
-  EXPECT_NEAR(points.back().accelerations_rad_s2[0], 0.0, 1e-9);
-  for (size_t i = 1; i < points.size(); ++i) {
-    EXPECT_GE(points[i].positions_rad[0], points[i - 1].positions_rad[0] - 1e-9);
-    EXPECT_GE(points[i].velocities_rad_s[0], -1e-9);
-    EXPECT_LE(points[i].velocities_rad_s[0], 1.0 + 1e-9);
-    const auto& previous = points[i - 1];
-    const double dt = points[i].time_from_start_s - previous.time_from_start_s;
-    const double jerk = (points[i].accelerations_rad_s2[0] - previous.accelerations_rad_s2[0]) / dt;
-    EXPECT_LE(std::abs(jerk), 1000.0 + 1e-8);
-    EXPECT_NEAR(points[i].positions_rad[0],
-                previous.positions_rad[0] + previous.velocities_rad_s[0] * dt +
-                    previous.accelerations_rad_s2[0] * dt * dt / 2.0 +
-                    jerk * dt * dt * dt / 6.0,
-                1e-9);
-  }
-  // Do not reverse while removing acceleration or accept an over-limit seam.
-  EXPECT_FALSE(detail::affine_path_stop_candidate(accepted, 1.7, 0.8, -3.0, 1.0, {100.0}, {5.0}));
-  EXPECT_FALSE(detail::affine_path_stop_candidate(accepted, 1.7, 0.8, -3.0, 1.0, {2.0}, {1000.0}));
-  config.jerk_limits_enabled = false;
-  const auto off = plan_soft_on_path_stop(accepted, profile, state, config);
-  ASSERT_FALSE(off.ok());
-  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(off.error()));
 }
 
 TEST(SoftOnPathStopPlannerTest, BuildsDerivativeCompleteWallTimeRampFromMeasuredScaledVelocity) {
@@ -346,20 +417,21 @@ TEST(SoftOnPathStopPlannerTest, BuildsDerivativeCompleteWallTimeRampFromMeasured
   const auto& plan = planned.value();
   EXPECT_FALSE(plan.used_model_velocity);
   EXPECT_EQ(plan.velocity_source, "measured_feedback");
-  EXPECT_NEAR(plan.effective_ramp_s, 0.5, 1e-9);
+  EXPECT_NEAR(plan.effective_ramp_s, 0.45, 1e-9);
   ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 3u);
   const auto& anchor = plan.replacement_trajectory.waypoints.front();
   EXPECT_NEAR(anchor.velocities_rad_s.at(0), 0.5, 1e-9);
   const auto& first_future = plan.replacement_trajectory.waypoints[1];
   EXPECT_NEAR(first_future.time_from_start_s, 0.05, 1e-9);
   const auto& final_wp = plan.replacement_trajectory.waypoints.back();
-  EXPECT_NEAR(final_wp.time_from_start_s, 0.55, 1e-9);
+  EXPECT_NEAR(final_wp.time_from_start_s, 0.5, 1e-9);
   EXPECT_NEAR(final_wp.velocities_rad_s.at(0), 0.0, 1e-9);
   EXPECT_NEAR(final_wp.accelerations_rad_s2.at(0), 0.0, 1e-9);
 
-  // 50 ms handoff at 0.5 rad/s, then a smooth decel whose average
-  // path-time speed is 0.25 rad/s for the full configured 500 ms.
-  EXPECT_NEAR(final_wp.positions_rad.at(0), 0.35, 1e-9);
+  // As main (item 24): 50 ms handoff at 0.5 rad/s inside the 500 ms
+  // deceleration time, then a smooth decel whose average path-time speed is
+  // 0.25 rad/s for the remaining 450 ms.
+  EXPECT_NEAR(final_wp.positions_rad.at(0), 0.3375, 1e-9);
 }
 
 TEST(SoftOnPathStopPlannerTest, OneSecondOperatorCurveHasExactMidpointAndEndpointDerivatives) {
@@ -373,7 +445,7 @@ TEST(SoftOnPathStopPlannerTest, OneSecondOperatorCurveHasExactMidpointAndEndpoin
 
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
-  EXPECT_NEAR(plan.effective_ramp_s, 1.0, 1e-9);
+  EXPECT_NEAR(plan.effective_ramp_s, 0.95, 1e-9);
 
   const auto midpoint_it = std::find_if(plan.replacement_trajectory.waypoints.begin(),
                                         plan.replacement_trajectory.waypoints.end(),
@@ -382,9 +454,11 @@ TEST(SoftOnPathStopPlannerTest, OneSecondOperatorCurveHasExactMidpointAndEndpoin
                                         });
   ASSERT_NE(midpoint_it, plan.replacement_trajectory.waypoints.end());
 
-  // The first 50 ms continues the accepted command. At 500 ms wall time,
-  // the full 1 s ramp has advanced 450 ms; the handoff did not shorten it.
-  const double r = 0.45;
+  // The first 50 ms continues the accepted command inside the 1 s
+  // deceleration time (item 24). At 500 ms wall time the 950 ms ramp has
+  // advanced 450 ms.
+  const double ramp_s = 0.95;
+  const double r = 0.45 / ramp_s;
   const double r2 = r * r;
   const double r3 = r2 * r;
   const double r4 = r2 * r2;
@@ -395,13 +469,14 @@ TEST(SoftOnPathStopPlannerTest, OneSecondOperatorCurveHasExactMidpointAndEndpoin
   const double acceleration_factor = -30.0 * r2 + 60.0 * r3 - 30.0 * r4;
   const double handoff_position = 0.2 + 0.5 * 0.05;
 
-  EXPECT_NEAR(midpoint_it->positions_rad.at(0), handoff_position + 0.5 * position_factor, 1e-9);
+  EXPECT_NEAR(midpoint_it->positions_rad.at(0), handoff_position + 0.5 * ramp_s * position_factor,
+              1e-9);
   EXPECT_NEAR(midpoint_it->velocities_rad_s.at(0), 0.5 * velocity_factor, 1e-9);
-  EXPECT_NEAR(midpoint_it->accelerations_rad_s2.at(0), 0.5 * acceleration_factor, 1e-9);
+  EXPECT_NEAR(midpoint_it->accelerations_rad_s2.at(0), 0.5 / ramp_s * acceleration_factor, 1e-9);
 
   const auto& endpoint = plan.replacement_trajectory.waypoints.back();
-  EXPECT_NEAR(endpoint.time_from_start_s, 1.05, 1e-9);
-  EXPECT_NEAR(endpoint.positions_rad.at(0), handoff_position + 0.5 * 0.5, 1e-9);
+  EXPECT_NEAR(endpoint.time_from_start_s, 1.0, 1e-9);
+  EXPECT_NEAR(endpoint.positions_rad.at(0), handoff_position + 0.5 * ramp_s * 0.5, 1e-9);
   EXPECT_NEAR(endpoint.velocities_rad_s.at(0), 0.0, 1e-9);
   EXPECT_NEAR(endpoint.accelerations_rad_s2.at(0), 0.0, 1e-9);
 }
@@ -463,6 +538,45 @@ TEST(SpringBackOnPathStopPlannerTest, BuildsTwoPhaseOnPathReturnToTripCursor) {
   const auto next_it = std::next(seam_it);
   ASSERT_NE(next_it, plan.replacement_trajectory.waypoints.end());
   EXPECT_LT(next_it->velocities_rad_s.at(0), 0.0);
+}
+
+TEST(SpringBackJoinTest, LateForwardBrakingShiftsTheReturnWhileTheStopFitsItsDeadline) {
+  // Item 6 at-rest join: early or on-time braking joins at the half boundary.
+  EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.5, 0.5, 0.5, 1.0), 0.5);
+  EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.47, 0.5, 0.5, 1.0), 0.5);
+  // Late braking: the return starts after it, never overlapping it ...
+  EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.52, 0.5, 0.5, 1.05), 0.52);
+  EXPECT_DOUBLE_EQ(*detail::spring_back_return_start_s(0.52, 0.5, 0.5, 1.02), 0.52);
+  // ... as long as the whole Stop still fits its deadline; otherwise hard stop.
+  EXPECT_FALSE(detail::spring_back_return_start_s(0.52, 0.5, 0.5, 1.019).has_value());
+  EXPECT_FALSE(detail::spring_back_return_start_s(0.52, 0.5, 0.5, 1.0).has_value());
+  EXPECT_FALSE(detail::spring_back_return_start_s(0.5, 0.5, 0.5, 0.99).has_value());
+  EXPECT_FALSE(
+      detail::spring_back_return_start_s(std::numeric_limits<double>::quiet_NaN(), 0.5, 0.5, 1.0)
+          .has_value());
+}
+
+TEST(SpringBackOnPathStopPlannerTest, WholeStopMustFitItsDeadline) {
+  auto profile = spring_back_profile(1.0);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.stop_deadline_s = 1.0;  // exactly the requested deceleration time
+  auto fits = plan_spring_back_on_path_stop(linear_trajectory_1d(), profile, state, config);
+  ASSERT_TRUE(fits.ok()) << fits.error().message;
+  EXPECT_NEAR(fits.value().replacement_trajectory.waypoints.back().time_from_start_s, 1.0, 1e-12);
+
+  config.stop_deadline_s = 0.99;
+  auto late = plan_spring_back_on_path_stop(linear_trajectory_1d(), profile, state, config);
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "spring_back_stop_deadline_exceeded");
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(late.error()));
+
+  config.stop_deadline_s = std::numeric_limits<double>::infinity();
+  auto invalid = plan_spring_back_on_path_stop(linear_trajectory_1d(), profile, state, config);
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.error().details.at("reason"), "invalid_stop_deadline_s");
 }
 
 TEST(SpringBackOnPathStopPlannerTest, RejectsWhenForwardHalfCannotContainLeadIn) {
@@ -587,6 +701,9 @@ TEST(SoftOnPathStopPlannerTest, CanRejectMeasuredVelocityThatIsNotPathCoherent) 
 
   ASSERT_FALSE(planned.ok());
   EXPECT_EQ(planned.error().details.at("reason"), "initial_velocity_deviation_exceeds_limit");
+  // Item 6: a deviation trigger goes straight to the hard stop.
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(planned.error()));
+  EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
 }
 
 TEST(SoftOnPathStopPlannerTest, UsesModelDerivedVelocityOnlyWhenExplicitlyAuthorized) {
@@ -611,7 +728,7 @@ TEST(SoftOnPathStopPlannerTest, UsesModelDerivedVelocityOnlyWhenExplicitlyAuthor
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   EXPECT_TRUE(planned.value().used_model_velocity);
   EXPECT_EQ(planned.value().velocity_source, "model_derived");
-  EXPECT_NEAR(planned.value().replacement_trajectory.waypoints.back().positions_rad.at(0), 0.275,
+  EXPECT_NEAR(planned.value().replacement_trajectory.waypoints.back().positions_rad.at(0), 0.26875,
               1e-9);
 }
 
@@ -674,7 +791,20 @@ TEST(SoftOnPathStopPlannerTest, SeamAnchorsAtCommandCursorNotLaggingMeasured) {
   EXPECT_NEAR(plan.initial_path_deviation_rad, 0.0, 1e-9);  // measured is on-path
 }
 
-TEST(SoftOnPathStopPlannerTest, HandoffDoesNotConsumeTheConfiguredDecelerationRamp) {
+TEST(SoftOnPathStopPlannerTest, LeadInConsumesTheDecelerationTime) {
+  // As main (item 24): the lead-in sits inside the deceleration time.
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+
+  auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), soft_profile(0.5), state, config);
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  EXPECT_DOUBLE_EQ(planned.value().effective_ramp_s, 0.45);
+  EXPECT_NEAR(planned.value().replacement_trajectory.waypoints.back().time_from_start_s, 0.5,
+              1e-12);
+}
+
+TEST(SoftOnPathStopPlannerTest, RejectsWhenHandoffConsumesDecelerationWindow) {
   auto profile = soft_profile(0.05);
   auto state = measured_state_1d(0.2, 0.5);
   SoftOnPathPlannerConfig config;
@@ -682,9 +812,10 @@ TEST(SoftOnPathStopPlannerTest, HandoffDoesNotConsumeTheConfiguredDecelerationRa
 
   auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
 
-  ASSERT_TRUE(planned.ok()) << planned.error().message;
-  EXPECT_DOUBLE_EQ(planned.value().effective_ramp_s, 0.05);
-  EXPECT_DOUBLE_EQ(planned.value().replacement_trajectory.waypoints.back().time_from_start_s, 0.1);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "deceleration_time_not_larger_than_handoff");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"), "hard_stop");
+  EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
 }
 
 TEST(SoftOnPathStopPlannerTest, UsesJerkLimitedRetimerWhenQuinticJerkWouldExceedLimit) {
@@ -808,6 +939,33 @@ TEST(SoftOnPathStopPlannerTest, MeasuresInitialPathDriftAndCanEnforceDeploymentL
   auto rejected = plan_soft_on_path_stop(linear_trajectory_2d(), profile, state, config);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "initial_path_deviation_exceeds_limit");
+  // Item 6: a deviation trigger goes straight to the hard stop, never to the
+  // spring-back fallback, even though this profile allows that fallback.
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(rejected.error()));
+  EXPECT_FALSE(rejected.error().details.contains("recommended_fallback"));
+}
+
+TEST(SpringBackOnPathStopPlannerTest, DeviationTriggersEscalateToHardStop) {
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1", "joint_2"};
+  state.state.positions_rad = {0.2, 0.1};
+  state.state.velocities_rad_s = {0.5, 1.0};
+  SoftOnPathPlannerConfig path_config;
+  path_config.max_initial_path_deviation_rad = 0.05;
+  SoftOnPathPlannerConfig velocity_config;
+  velocity_config.max_initial_velocity_deviation_rad_s = 0.1;
+  for (const auto& [config, reason] :
+       {std::pair{path_config, "initial_path_deviation_exceeds_limit"},
+        std::pair{velocity_config, "initial_velocity_deviation_exceeds_limit"}}) {
+    SCOPED_TRACE(reason);
+    auto profile = spring_back_profile(1.0);
+    const auto result =
+        plan_spring_back_on_path_stop(linear_trajectory_2d(), profile, state, config);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
+    EXPECT_FALSE(result.error().details.contains("recommended_fallback"));
+  }
 }
 
 TEST(SoftOnPathStopPlannerTest, MeasuresFeedbackPathDeviationWithJointNameOrdering) {
@@ -821,21 +979,67 @@ TEST(SoftOnPathStopPlannerTest, MeasuresFeedbackPathDeviationWithJointNameOrderi
   EXPECT_NEAR(measured.value(), 0.25, 1e-9);
 }
 
-TEST(SoftOnPathStopPlannerTest, RecordsDeploymentAndDefaultJerkLimitSources) {
-  auto profile = soft_profile(0.5);
+TEST(StopPhaseJerkLimitsTest, AuthoredJerkIsVerbatimAndMissingJerkUsesMainsDefault) {
+  // Decision Q36, as main (soft 1073-1086, spring-back 1491-1499).
+  const auto trajectory = linear_trajectory_2d();
+  const std::map<std::string, double> accel{{"joint_1", 4.0}, {"joint_2", 6.0}};
+  SoftOnPathPlannerConfig config;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 12.5}};
+  for (const double reference_s : {0.45, 0.5, 0.08}) {
+    SCOPED_TRACE(reference_s);
+    const auto mixed = detail::stop_phase_jerk_limits(trajectory, accel, config, reference_s);
+    EXPECT_EQ(mixed.source, "mixed");
+    EXPECT_DOUBLE_EQ(mixed.limits.at("joint_1"), 12.5);
+    // main's default_jerk_limit: accel / min(max(0.15 T, 0.02), T / 3).
+    const double ramp = std::min(std::max(0.15 * reference_s, 0.02), reference_s / 3.0);
+    EXPECT_DOUBLE_EQ(mixed.limits.at("joint_2"), 6.0 / ramp);
+  }
+  config.per_joint_max_jerk_rad_s3.clear();
+  EXPECT_EQ(detail::stop_phase_jerk_limits(trajectory, accel, config, 0.45).source, "default");
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1.0}, {"joint_2", 2.0}};
+  EXPECT_EQ(detail::stop_phase_jerk_limits(trajectory, accel, config, 0.45).source, "deployment");
+  config.jerk_limits_enabled = false;
+  const auto off = detail::stop_phase_jerk_limits(trajectory, accel, config, 0.45);
+  EXPECT_EQ(off.source, "disabled");
+  EXPECT_TRUE(off.limits.empty());
+}
+
+TEST(SoftOnPathStopPlannerTest, MissingJerkIsDerivedPerPhaseFromTheLanesLeadIn) {
   auto state = measured_state_1d(0.2, 0.1);
   SoftOnPathPlannerConfig config;
-  config.stop_traj_delta_s = 0.05;
   config.sample_period_s = 0.05;
-
-  auto default_jerk = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
-  ASSERT_TRUE(default_jerk.ok()) << default_jerk.error().message;
-  EXPECT_EQ(default_jerk.value().jerk_limit_source, "default");
-
+  for (const double lead_in_s : {0.02, 0.05, 0.1}) {
+    SCOPED_TRACE(lead_in_s);
+    config.stop_traj_delta_s = lead_in_s;
+    // Soft ramp: deceleration time minus this lane's lead-in.
+    const auto soft =
+        plan_soft_on_path_stop(linear_trajectory_1d(), soft_profile(0.5), state, config);
+    ASSERT_TRUE(soft.ok()) << soft.error().message;
+    EXPECT_EQ(soft.value().jerk_limit_source, "default");
+    EXPECT_DOUBLE_EQ(std::stod(interrupt_structured_scalar_text(
+                         soft.value().diagnostics.at("jerk_reference_s"))),
+                     0.5 - lead_in_s);
+    // Spring-back: forward half minus the lead-in, return half on its own.
+    const auto spring = plan_spring_back_on_path_stop(linear_trajectory_1d(),
+                                                      spring_back_profile(1.0), state, config);
+    ASSERT_TRUE(spring.ok()) << spring.error().message;
+    EXPECT_DOUBLE_EQ(std::stod(interrupt_structured_scalar_text(
+                         spring.value().diagnostics.at("jerk_reference_s"))),
+                     0.5 - lead_in_s);
+    EXPECT_DOUBLE_EQ(std::stod(interrupt_structured_scalar_text(
+                         spring.value().diagnostics.at("spring_back_return_jerk_reference_s"))),
+                     0.5);
+  }
+  config.stop_traj_delta_s = 0.05;
   config.per_joint_max_jerk_rad_s3 = {{"joint_1", 100.0}};
-  auto deployment_jerk = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
-  ASSERT_TRUE(deployment_jerk.ok()) << deployment_jerk.error().message;
-  EXPECT_EQ(deployment_jerk.value().jerk_limit_source, "deployment");
+  const auto authored =
+      plan_soft_on_path_stop(linear_trajectory_1d(), soft_profile(0.5), state, config);
+  ASSERT_TRUE(authored.ok()) << authored.error().message;
+  EXPECT_EQ(authored.value().jerk_limit_source, "deployment");
+  config.jerk_limits_enabled = false;
+  const auto off = plan_soft_on_path_stop(linear_trajectory_1d(), soft_profile(0.5), state, config);
+  ASSERT_TRUE(off.ok()) << off.error().message;
+  EXPECT_EQ(off.value().jerk_limit_source, "disabled");
 }
 
 TEST(SoftOnPathStopPlannerTest, RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
@@ -855,142 +1059,83 @@ TEST(SoftOnPathStopPlannerTest, RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
 }
 
 TEST(SoftOnPathStopPlannerTest, RecommendsNaturalCompletionWhenShortPathPolicyAllowsIt) {
+  // main's predicate (item 2): the ramp overruns the accepted path end.
   auto profile = soft_profile(0.5);
   profile.recoverable_substitution_mode.reset();
   profile.allow_natural_completion_on_short_path = true;
-  auto state = measured_state_1d(2.999, 0.8);
-  state.trajectory_time_from_start_s = 3.9;
-  state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.runtime_scale_target_at_trip = 0.8;
+  auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
   config.sample_period_s = 0.05;
-  config.allow_model_velocity_fallback = true;
 
-  auto planned = plan_soft_on_path_stop(prepared_cruise_trajectory(), profile, state, config);
+  auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
 
   ASSERT_FALSE(planned.ok());
   EXPECT_EQ(planned.error().details.at("reason"), "soft_on_path_remaining_time_short");
   EXPECT_EQ(planned.error().details.at("recommended_disposition"), "natural_completion");
   EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
 
-  // Spring preserves its return unless the user explicitly enables completion.
-  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  EXPECT_TRUE(
-      natural_completion_fits_stop_window(prepared_cruise_trajectory(), profile, state, config));
-  const auto spring =
-      plan_spring_back_on_path_stop(prepared_cruise_trajectory(), profile, state, config);
+  // A ramp that ends on the path is not natural completion, flag or not.
+  auto stoppable =
+      plan_soft_on_path_stop(linear_trajectory_1d(), profile, measured_state_1d(0.5, 0.8), config);
+  ASSERT_TRUE(stoppable.ok()) << stoppable.error().message;
+}
+
+TEST(SpringBackOnPathStopPlannerTest, NaturalCompletionIsNotReCheckedInsideSpringBack) {
+  // Item 2: natural completion is decided once, before spring-back. A
+  // spring-back whose forward half would overrun the path end is a hard stop,
+  // whatever the profile's natural-completion flag says.
+  for (const bool allow : {false, true}) {
+    SCOPED_TRACE(allow);
+    auto profile = spring_back_profile(1.0);
+    profile.allow_natural_completion_on_short_path = allow;
+    SoftOnPathPlannerConfig config;
+    config.stop_traj_delta_s = 0.05;
+    config.sample_period_s = 0.05;
+    const auto result = plan_spring_back_on_path_stop(linear_trajectory_1d(), profile,
+                                                      measured_state_1d(0.9, 0.8), config);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("spring_back_phase"), "forward_deceleration");
+    EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
+    EXPECT_FALSE(soft_on_path_error_recommends_natural_completion(result.error()));
+    EXPECT_FALSE(result.error().details.contains("recommended_fallback"));
+  }
+}
+
+TEST(SoftOnPathStopPlannerTest, MissingRuntimeScaleBoundsIsRefused) {
+  auto trajectory = linear_trajectory_1d();
+  trajectory.runtime_scale_bounds.reset();
+  SoftOnPathPlannerConfig config;
+  config.jerk_limits_enabled = false;
+  const auto soft =
+      plan_soft_on_path_stop(trajectory, soft_profile(0.5), measured_state_1d(0.2, 0.5), config);
+  ASSERT_FALSE(soft.ok());
+  EXPECT_EQ(soft.error().details.at("reason"), "runtime_scale_bounds_required");
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(soft.error()));
+  const auto spring = plan_spring_back_on_path_stop(trajectory, spring_back_profile(1.0),
+                                                    measured_state_1d(0.2, 0.5), config);
   ASSERT_FALSE(spring.ok());
-  EXPECT_TRUE(soft_on_path_error_recommends_natural_completion(spring.error()));
-  profile.allow_natural_completion_on_short_path = false;
-  EXPECT_FALSE(
-      natural_completion_fits_stop_window(prepared_cruise_trajectory(), profile, state, config));
-  const auto precision =
-      plan_spring_back_on_path_stop(prepared_cruise_trajectory(), profile, state, config);
-  if (!precision.ok()) {
-    EXPECT_FALSE(soft_on_path_error_recommends_natural_completion(precision.error()));
-  }
-  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  profile.allow_natural_completion_on_short_path = true;
-  state.runtime_velocity_scale_at_trip = 0.01;
-  state.runtime_scale_target_at_trip = 0.0;
-  EXPECT_FALSE(
-      natural_completion_fits_stop_window(prepared_cruise_trajectory(), profile, state, config));
+  EXPECT_EQ(spring.error().details.at("reason"), "runtime_scale_bounds_required");
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(spring.error()));
+
+  trajectory = linear_trajectory_1d();
+  trajectory.runtime_scale_bounds->max_stop_path_rate = 0.9;
+  const auto invalid =
+      plan_soft_on_path_stop(trajectory, soft_profile(0.5), measured_state_1d(0.2, 0.5), config);
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.error().details.at("reason"), "runtime_scale_bounds_invalid");
 }
 
-TEST(SoftOnPathStopPlannerTest, NaturalCompletionUsesOrdinaryLimitsAndKnownCursorGuards) {
-  const auto trajectory = prepared_cruise_trajectory();
-  TrajectorySampleResult sample;
-  ASSERT_TRUE(sample_trajectory_prevalidated(trajectory, 3.9, sample).ok());
-  auto state = measured_state_1d(sample.positions_rad.front(), 0.9);
-  state.trajectory_time_from_start_s = 3.9;
-  state.velocity_source = SoftOnPathStateSource::kModelDerived;
-  state.state.velocities_rad_s.clear();
-  state.runtime_scale_rate_per_s_at_trip = 1.6;
-  state.runtime_scale_target_at_trip = 1.0;
-  auto profile = soft_profile(1.0);
-  profile.recoverable_substitution_mode.reset();
-  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{0.0001}}};
+TEST(SpringBackOnPathStopPlannerTest, DecelerationTimeIsRequiredNotDefaultedByThePlanner) {
+  auto profile = spring_back_profile(1.0);
+  profile.deceleration_time_s.reset();
   SoftOnPathPlannerConfig config;
-  config.allow_model_velocity_fallback = true;
-  config.max_initial_path_deviation_rad = 0.001;
-  config.max_initial_velocity_deviation_rad_s = 0.001;
-  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 0.0001}};
-  // No replacement is dispatched: the already-admitted rest-to-rest curve
-  // continues, even when a hypothetical replacement could not meet its caps.
-  for (const auto mode :
-       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
-    profile.stop_mode = mode;
-    for (bool jerk_on : {false, true}) {
-      config.jerk_limits_enabled = jerk_on;
-      EXPECT_TRUE(natural_completion_fits_stop_window(trajectory, profile, state, config));
-    }
-  }
-  state.state.positions_rad.front() += 0.01;
-  EXPECT_FALSE(natural_completion_fits_stop_window(trajectory, profile, state, config));
-  state.state.positions_rad = sample.positions_rad;
-  state.state.velocities_rad_s = {0.5};
-  EXPECT_FALSE(natural_completion_fits_stop_window(trajectory, profile, state, config));
-  state.state.velocities_rad_s.clear();
-  auto incomplete = trajectory;
-  incomplete.runtime_scale_bounds.reset();
-  EXPECT_FALSE(natural_completion_fits_stop_window(incomplete, profile, state, config));
-  incomplete = trajectory;
-  incomplete.waypoints.back().velocities_rad_s.front() = 0.01;
-  EXPECT_FALSE(natural_completion_fits_stop_window(incomplete, profile, state, config));
-}
-
-TEST(SoftOnPathStopPlannerTest, FeasibilityEnvelopeRejectsLateTripPointsBeforeDispatch) {
-  auto profile = soft_profile(0.5);
-  profile.recoverable_substitution_mode.reset();
-  profile.allow_natural_completion_on_short_path = false;
-  SoftOnPathPlannerConfig config;
-  config.stop_traj_delta_s = 0.05;
-  config.sample_period_s = 0.05;
-
-  auto envelope =
-      validate_soft_on_path_feasibility_envelope(linear_trajectory_1d(), profile, config);
-
-  ASSERT_FALSE(envelope.ok());
-  EXPECT_EQ(envelope.error().code, kErrorMotionInterruptArmFailed);
-  EXPECT_EQ(envelope.error().details.at("reason"), "soft_on_path_feasibility_envelope_infeasible");
-  EXPECT_EQ(envelope.error().details.at("planner_reason"), "soft_on_path_remaining_time_short");
-  EXPECT_EQ(envelope.error().details.at("recommended_fallback"), "spring_back_hold");
-}
-
-TEST(SoftOnPathStopPlannerTest, FeasibilityEnvelopeAllowsShortPathNaturalCompletionPolicy) {
-  auto profile = soft_profile(0.5);
-  profile.recoverable_substitution_mode.reset();
-  profile.allow_natural_completion_on_short_path = true;
-  SoftOnPathPlannerConfig config;
-  config.stop_traj_delta_s = 0.05;
-  config.sample_period_s = 0.05;
-
-  auto envelope =
-      validate_soft_on_path_feasibility_envelope(prepared_cruise_trajectory(), profile, config);
-
-  ASSERT_TRUE(envelope.ok()) << envelope.error().message;
-  EXPECT_GT(envelope.value().checked_samples, 0u);
-  EXPECT_GT(envelope.value().natural_completion_samples, 0u);
-  EXPECT_EQ(interrupt_structured_scalar_text(
-                envelope.value().diagnostics.at("natural_completion_samples")),
-            std::to_string(envelope.value().natural_completion_samples));
-}
-
-TEST(SoftOnPathStopPlannerTest, FeasibilityEnvelopeDoesNotRecommendFallbackForMalformedProfile) {
-  auto profile = soft_profile(0.5);
-  profile.per_joint_max_deceleration.erase("joint_2");
-  SoftOnPathPlannerConfig config;
-  config.stop_traj_delta_s = 0.05;
-  config.sample_period_s = 0.05;
-
-  auto envelope =
-      validate_soft_on_path_feasibility_envelope(linear_trajectory_2d(), profile, config);
-
-  ASSERT_FALSE(envelope.ok());
-  EXPECT_EQ(envelope.error().details.at("reason"), "soft_on_path_feasibility_envelope_infeasible");
-  EXPECT_EQ(envelope.error().details.at("planner_reason"), "missing_joint_deceleration_limit");
-  EXPECT_FALSE(envelope.error().details.contains("recommended_fallback"));
+  config.jerk_limits_enabled = false;
+  const auto result = plan_spring_back_on_path_stop(linear_trajectory_1d(), profile,
+                                                    measured_state_1d(0.2, 0.5), config);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "spring_back_deceleration_time_required");
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
 }
 
 // --- Jerk-continuity of the stop ramp ---
@@ -1209,9 +1354,9 @@ TEST(SoftOnPathStopPlannerTest, CannotStopOnPathWithinBudgetEscalatesToHardStop)
   EXPECT_EQ(planned.error().details.at("recommended_disposition"), "hard_stop");
 }
 
-TEST(SoftOnPathStopPlannerTest, NaturalCompletionFlagDoesNotCertifyANonRestingEndpoint) {
-  // A policy flag is not a rest certificate. This original linear fixture
-  // reaches its endpoint moving and cannot promise safe natural completion.
+TEST(SoftOnPathStopPlannerTest, CannotStopOnPathButNaturalCompletionAllowed) {
+  // Same unstoppable-on-path case, but the policy permits natural completion,
+  // so the planner defers to letting the original motion finish (as main).
   auto profile = soft_profile(0.5);
   profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{0.5}}};
   profile.allow_natural_completion_on_short_path = true;
@@ -1222,7 +1367,7 @@ TEST(SoftOnPathStopPlannerTest, NaturalCompletionFlagDoesNotCertifyANonRestingEn
 
   auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
   ASSERT_FALSE(planned.ok());
-  EXPECT_EQ(planned.error().details.at("recommended_disposition"), "hard_stop");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"), "natural_completion");
 }
 
 // The backend routes a real hard deceleration on this helper, so pin it to the
@@ -1250,12 +1395,8 @@ TEST(SoftOnPathStopPlannerTest, HardStopDispositionHelperMatchesPlannerEscalatio
     SoftOnPathPlannerConfig config;
     config.stop_traj_delta_s = 0.05;
     config.sample_period_s = 0.05;
-    config.allow_model_velocity_fallback = true;
-    auto state = measured_state_1d(2.999, 0.8);
-    state.trajectory_time_from_start_s = 3.9;
-    state.velocity_source = SoftOnPathStateSource::kModelDerived;
-    state.runtime_scale_target_at_trip = 0.8;
-    auto planned = plan_soft_on_path_stop(prepared_cruise_trajectory(), profile, state, config);
+    auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile,
+                                          measured_state_1d(0.9, 0.8), config);
     ASSERT_FALSE(planned.ok());
     EXPECT_FALSE(soft_on_path_error_recommends_hard_stop(planned.error()));
     EXPECT_TRUE(soft_on_path_error_recommends_natural_completion(planned.error()));
@@ -1290,181 +1431,6 @@ TEST(JerkLimitedStopProfileTest, StraightPathExactTimeSmoothEndpointWithinBudget
   EXPECT_NEAR(p.samples.front().path_rate_accel, 0.0, 1e-9);
   EXPECT_NEAR(p.samples.back().path_rate, 0.0, 1e-6);
   EXPECT_NEAR(p.samples.back().path_rate_accel, 0.0, 1e-6);
-}
-
-TrajectoryDTO accelerating_affine_path(double sign = 1.0) {
-  // Straight geometry with an abrupt change of nominal acceleration. This is
-  // the small analogue of the captured TOPPRA early-Stop failure, not another
-  // geometric planner or a frozen aggregate digest.
-  const double corner_time = 0.18, corner_span = 0.01, accel = 2.5;
-  const double corner_position = accel * corner_time * corner_time / 2.0;
-  const double corner_velocity = accel * corner_time;
-  const double exit_position =
-      corner_position + corner_velocity * corner_span + accel * corner_span * corner_span / 3.0;
-  const double exit_velocity = corner_velocity + accel * corner_span / 2.0;
-  TrajectoryDTO trajectory;
-  trajectory.joint_names = {"joint_1", "joint_2", "joint_3"};
-  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
-  const auto append = [&](double t, double q, double v, double a) {
-    trajectory.waypoints.push_back({t,
-                                    {sign * q, 1.0 - 0.1 * sign * q, 2.0},
-                                    {sign * v, -0.1 * sign * v, 0.0},
-                                    {sign * a, -0.1 * sign * a, 0.0}});
-  };
-  append(0.0, 0.0, 0.0, accel);
-  append(corner_time, corner_position, corner_velocity, accel);
-  append(corner_time + corner_span, exit_position, exit_velocity, 0.0);
-  append(1.0, exit_position + exit_velocity * (1.0 - corner_time - corner_span), exit_velocity,
-         0.0);
-  return trajectory;
-}
-
-TEST(JerkLimitedStopProfileTest, EarlyAccelerationUsesPhysicalBrakingOnTheSharedPath) {
-  constexpr double jerk = 80.0 / 3.0;
-  for (double sign : {-1.0, 1.0}) {
-    const auto trajectory = accelerating_affine_path(sign);
-    for (const auto& [rate, rate_accel] : {std::pair{1.0, 0.0}, std::pair{0.6, 0.1}}) {
-      SCOPED_TRACE(sign);
-      SCOPED_TRACE(rate);
-      const auto result = compute_jerk_limited_stop_profile(
-          trajectory, 0.08, rate, rate_accel, 1.0,
-          {{"joint_1", 4.0}, {"joint_2", 4.0}, {"joint_3", 4.0}},
-          {{"joint_1", jerk}, {"joint_2", jerk}, {"joint_3", jerk}}, 0.01);
-      ASSERT_TRUE(result.ok()) << result.error().message;
-      const auto& profile = result.value();
-      ASSERT_TRUE(profile.dispatchable) << profile.validation_failure_reason;
-      EXPECT_DOUBLE_EQ(profile.achieved_stop_time_s, 1.0);
-      ASSERT_EQ(profile.samples.size(), 4U);  // both jerk-switch knots, no resampling
-      EXPECT_DOUBLE_EQ(profile.samples.front().path_rate, rate);
-      EXPECT_DOUBLE_EQ(profile.samples.front().path_rate_accel, rate_accel);
-      EXPECT_NEAR(profile.samples[1].time_from_ramp_start_s,
-                  (2.5 * rate * rate + 0.2 * rate_accel) / jerk, 1e-12);
-      for (size_t i = 0; i < profile.samples.size(); ++i) {
-        const auto& state = profile.samples[i];
-        const auto path = sample_trajectory(trajectory, state.path_time_s);
-        ASSERT_TRUE(path.ok());
-        EXPECT_GE(state.path_rate, 0.0);
-        EXPECT_LE(state.path_rate, 1.0 + 1e-12);
-        const auto& point = profile.emitted_trajectory.waypoints[i];
-        for (size_t j = 0; j < 3; ++j) {
-          EXPECT_NEAR(point.positions_rad[j], path.value().positions_rad[j], 1e-10);
-          EXPECT_NEAR(point.velocities_rad_s[j], path.value().velocities_rad_s[j] * state.path_rate,
-                      1e-10);
-          EXPECT_NEAR(point.accelerations_rad_s2[j],
-                      path.value().accelerations_rad_s2[j] * state.path_rate * state.path_rate +
-                          path.value().velocities_rad_s[j] * state.path_rate_accel,
-                      1e-9);
-        }
-      }
-      EXPECT_DOUBLE_EQ(profile.samples.back().path_rate, 0.0);
-      EXPECT_DOUBLE_EQ(profile.samples.back().path_rate_accel, 0.0);
-    }
-  }
-}
-
-TEST(JerkLimitedStopProfileTest, StraightCurveAlwaysIncludesTheJerkSwitch) {
-  // A coarse sampling request must not merge the -J/+J sections into a
-  // quintic with larger interior jerk. There are exactly three useful knots.
-  const auto result = compute_jerk_limited_stop_profile(
-      linear_trajectory_1d(), 0.0, 1.0, 0.0, 1.0, {{"joint_1", 4.0}}, {{"joint_1", 4.0}}, 0.34);
-  ASSERT_TRUE(result.ok());
-  ASSERT_TRUE(result.value().dispatchable) << result.value().validation_failure_reason;
-  ASSERT_EQ(result.value().samples.size(), 3U);
-  EXPECT_DOUBLE_EQ(result.value().samples[1].time_from_ramp_start_s, 0.5);
-}
-
-TEST(JerkLimitedStopProfileTest, AffineBrakeUsesOnlyPreparedVelocityHeadroom) {
-  auto trajectory = accelerating_affine_path();
-  const std::vector<double> acceleration(3, 4.0), jerk(3, 80.0 / 3.0);
-  // Just before the nominal acceleration corner, bounded jerk necessarily
-  // raises velocity above the original local speed. Legacy authority refuses it.
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.17, 1.0, 0.0, 1.0, acceleration, jerk));
-  trajectory.runtime_scale_bounds->max_stop_path_rate = 2.0;
-  const auto result = compute_jerk_limited_stop_profile(
-      trajectory, 0.17, 1.0, 0.0, 1.0, {{"joint_1", 4.0}, {"joint_2", 4.0}, {"joint_3", 4.0}},
-      {{"joint_1", jerk[0]}, {"joint_2", jerk[1]}, {"joint_3", jerk[2]}});
-  ASSERT_TRUE(result.ok());
-  ASSERT_TRUE(result.value().dispatchable) << result.value().validation_failure_reason;
-  EXPECT_DOUBLE_EQ(result.value().achieved_stop_time_s, 1.0);
-  ASSERT_EQ(result.value().samples.size(), 4U);
-  EXPECT_GT(result.value().samples[1].path_rate, 1.0);
-  for (const auto& sample : result.value().samples) EXPECT_LE(sample.path_rate, 2.0);
-  // Extra velocity headroom cannot rescue an infeasible ramp or acceleration.
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.17, 1.0, 0.0, 0.05, acceleration, jerk));
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.17, 1.0, 0.0, 1.0, {1.0, 1.0, 1.0}, jerk));
-  for (double invalid :
-       {0.9, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
-    trajectory.runtime_scale_bounds->max_stop_path_rate = invalid;
-    EXPECT_FALSE(
-        detail::affine_path_stop_candidate(trajectory, 0.17, 1.0, 0.0, 1.0, acceleration, jerk));
-  }
-}
-
-TEST(JerkLimitedStopProfileTest, AffineShortcutRequiresGeometryAndContinuousSpeedProof) {
-  auto trajectory = accelerating_affine_path();
-  const std::vector<double> acceleration(3, 4.0), jerk(3, 80.0 / 3.0);
-  ASSERT_TRUE(
-      detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 0.0, 1.0, acceleration, jerk));
-  // Collinear positions do not prove collinear Hermite geometry.
-  trajectory.waypoints[1].velocities_rad_s[1] += 0.1;
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 0.0, 1.0, acceleration, jerk));
-  trajectory = accelerating_affine_path();
-  // At full scale an additional positive scale derivative invalidates the
-  // initial acceleration-dominance condition; never waive the speed envelope.
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 1.0, 1.0, acceleration, jerk));
-  // An infeasible duration does not turn into an extended ramp.
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 0.0, 0.05, acceleration, jerk));
-}
-
-TEST(JerkLimitedStopProfileTest, TinyStationaryJointAccelerationIsNotAnAffineRoundoffAllowance) {
-  TrajectoryDTO trajectory;
-  trajectory.joint_names = {"driver", "stationary"};
-  trajectory.waypoints = {{0.0, {0.0, 0.0}, {1.0, 0.0}, {0.0, 1e-10}},
-                          {0.001, {0.001, 0.0}, {1.0, 0.0}, {0.0, 0.0}},
-                          {1.0, {1.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}}};
-  EXPECT_FALSE(
-      detail::affine_path_stop_candidate(trajectory, 0.0, 1.0, 0.0, 1.0, {4.0, 4.0}, {50.0, 50.0}));
-}
-
-TEST(JerkLimitedStopProfileTest, MovingJointNearZeroDerivativeUsesSegmentRoundoff) {
-  auto trajectory = accelerating_affine_path();
-  // A moving coordinate reaches nominally zero acceleration. Its independently
-  // evaluated derivative can retain roundoff from the neighboring nonzero one.
-  trajectory.waypoints[3].accelerations_rad_s2 = {-0.1, 0.01, 0.0};
-  trajectory.waypoints[2].accelerations_rad_s2[1] = 1e-17;
-  const auto result = compute_jerk_limited_stop_profile(
-      trajectory, 0.08, 1.0, 0.0, 1.0, {{"joint_1", 4.0}, {"joint_2", 4.0}, {"joint_3", 4.0}},
-      {{"joint_1", 80.0 / 3.0}, {"joint_2", 80.0 / 3.0}, {"joint_3", 80.0 / 3.0}});
-  ASSERT_TRUE(result.ok());
-  ASSERT_TRUE(result.value().dispatchable) << result.value().validation_failure_reason;
-  EXPECT_DOUBLE_EQ(result.value().achieved_stop_time_s, 1.0);
-  EXPECT_EQ(result.value().samples.size(), 4U);
-  trajectory.waypoints[2].accelerations_rad_s2[1] = 1e-9;
-  EXPECT_FALSE(detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 0.0, 1.0, {4.0, 4.0, 4.0},
-                                                  {80.0 / 3.0, 80.0 / 3.0, 80.0 / 3.0}));
-}
-
-TEST(JerkLimitedStopProfileTest, AffineSpeedProofCannotSkipALaterSlowSection) {
-  auto trajectory = accelerating_affine_path();
-  trajectory.waypoints.pop_back();
-  const auto append = [&](double t, double q, double v) {
-    trajectory.waypoints.push_back(
-        {t, {q, 1.0 - 0.1 * q, 2.0}, {v, -0.1 * v, 0.0}, {0.0, 0.0, 0.0}});
-  };
-  append(0.25, 0.07, 0.3);
-  append(0.6, 0.126, 0.02);
-  append(0.65, 0.127, 0.02);
-  append(1.0, 0.30, 0.4625);
-  // The source is affine and monotone, with a fast final suffix. The Stop
-  // crosses its intervening slow section, so that suffix alone proves nothing.
-  EXPECT_FALSE(detail::affine_path_stop_candidate(trajectory, 0.08, 1.0, 0.0, 1.0, {4.0, 4.0, 4.0},
-                                                  {80.0 / 3.0, 80.0 / 3.0, 80.0 / 3.0}));
 }
 
 TEST(JerkLimitedStopProfileTest, TightJerkCannotMeetAggressiveTimeWithinBudget) {

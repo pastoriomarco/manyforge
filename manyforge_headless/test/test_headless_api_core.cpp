@@ -2851,16 +2851,40 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(Member(active, "correlations"), "program_run_id"),
             "program-run.test");
 
+  // Items 19 and Q30: the contained collision ends the operation
+  // InterventionRequired; that outcome raises no second (execution-fault)
+  // alarm for the same event.
+  const auto intervention = OperationJournalPayload(
+      source_epoch, "state_observed", "intervention_required",
+      CanonicalValue(CanonicalValue::Object{
+          {"code", CanonicalValue("execution_aborted")},
+          {"details", CanonicalValue(CanonicalValue::Object{
+                          {"reason", CanonicalValue("runtime_collision_fault")}})},
+          {"message",
+           CanonicalValue("Runtime collision containment stopped the operation")},
+      }),
+      std::nullopt, resource);
+  const auto intervention_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(intervention));
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 2U, "state_observed", std::nullopt, "operation.test.1", 1U,
+      301U, "2026-08-07T10:00:00.000000008Z", false, intervention,
+      intervention_digest));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
+  const auto intervention_snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(intervention_snapshot), "definition_id"),
+            "manyforge.motion.runtime_collision");
+
   const auto reset = OperationJournalPayload(
       source_epoch, "control_accepted", "intervention_required",
       CanonicalValue(CanonicalValue::Object{}), "reset", resource);
   const auto reset_digest =
       content_identity::sha256_digest(content_identity::canonical_json(reset));
   static_cast<void>(core.IngestOperationEvent(
-      source_epoch, 2U, "control_accepted", "request.reset.collision.1",
-      "operation.test.1", 1U, 301U, "2026-08-07T10:00:00.000000008Z", true,
+      source_epoch, 3U, "control_accepted", "request.reset.collision.1",
+      "operation.test.1", 1U, 302U, "2026-08-07T10:00:00.000000009Z", true,
       reset, reset_digest));
-  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 3U));
 
   const auto returned_snapshot = core.AlarmSnapshot();
   const auto &returned = OnlyAlarm(returned_snapshot);

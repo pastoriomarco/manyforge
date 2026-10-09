@@ -116,7 +116,10 @@ namespace {
   if (!std::isfinite(motion.timeouts.planning_timeout_s) ||
       motion.timeouts.planning_timeout_s <= 0.0 ||
       !std::isfinite(motion.timeouts.execution_timeout_s) ||
-      motion.timeouts.execution_timeout_s <= 0.0) {
+      motion.timeouts.execution_timeout_s <= 0.0 ||
+      (motion.timeouts.zero_speed_hold_timeout_s.has_value() &&
+       (!std::isfinite(*motion.timeouts.zero_speed_hold_timeout_s) ||
+        *motion.timeouts.zero_speed_hold_timeout_s <= 0.0))) {
     return invalid("motion timeouts must be finite and positive", "motion_timeout_invalid");
   }
   if (!valid_motion(motion.motion)) {

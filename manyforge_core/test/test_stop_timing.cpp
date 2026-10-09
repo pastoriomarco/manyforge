@@ -66,18 +66,18 @@ TEST(StopTimingTest, OperationalCutoffPreservesPositivePostFaultWorkWithoutMutat
   EXPECT_TRUE(validate_controlled_stop_timing(saved, 1'000'000'000).ok());
 }
 
-TEST(StopTimingTest, MinimumIncludesFullProfileAndBothAllowancesWithExactBoundary) {
+TEST(StopTimingTest, NoApplyTimeRefusalComparesTimeoutWithProfileOrAllowances) {
+  // Item 24: as `main`, the Stop has one deadline and its watchdog issues the
+  // hard floor on overrun; a timeout shorter than the profile plus latency and
+  // settling allowances is not refused in advance.
   const StopTimingParametersDTO saved{250'000'000, 750'000'000, 2'000'000'000};
   EXPECT_TRUE(validate_controlled_stop_timing(saved, 1'000'000'000).ok());
-  const auto too_long = validate_controlled_stop_timing(saved, 1'000'000'001);
-  ASSERT_FALSE(too_long.ok());
-  EXPECT_EQ(too_long.error().details.at("minimum_timeout_ns"), "2000000001");
-  // The whole Spring brake+return is supplied, not half of that duration.
-  EXPECT_FALSE(validate_controlled_stop_timing(saved, 1'500'000'000).ok());
-  const auto too_short =
-      validate_controlled_stop_timing({250'000'000, 750'000'000, 1}, 1'000'000'000);
-  ASSERT_FALSE(too_short.ok());
-  EXPECT_EQ(too_short.error().details.at("minimum_timeout_ns"), "2000000000");
+  EXPECT_TRUE(validate_controlled_stop_timing(saved, 1'000'000'001).ok());
+  EXPECT_TRUE(validate_controlled_stop_timing(saved, 1'500'000'000).ok());
+  EXPECT_TRUE(validate_controlled_stop_timing({250'000'000, 750'000'000, 1}, 1'000'000'000).ok());
+  // Field shape and the supported range are still checked.
+  EXPECT_FALSE(validate_controlled_stop_timing(saved, 0).ok());
+  EXPECT_FALSE(validate_controlled_stop_timing({0, 0, 1}, 1'000'000'000).ok());
 }
 
 TEST(StopTimingTest, AuthoredDecimalDurationsUseOneNanosecondRoundingPolicy) {
@@ -87,11 +87,10 @@ TEST(StopTimingTest, AuthoredDecimalDurationsUseOneNanosecondRoundingPolicy) {
   EXPECT_TRUE(
       validate_controlled_stop_timing({250'000'000, 750'000'000, 2'100'000'000}, duration.value())
           .ok());
-  const auto short_timeout =
-      validate_controlled_stop_timing({250'000'000, 750'000'000, 2'099'999'999}, duration.value());
-  ASSERT_FALSE(short_timeout.ok());
-  EXPECT_EQ(short_timeout.error().details.at("minimum_timeout_ns"), "2100000000");
-  EXPECT_NE(short_timeout.error().message.find("minimum 2.100000000 s"), std::string::npos);
+  // No minimum-timeout refusal (item 24).
+  EXPECT_TRUE(
+      validate_controlled_stop_timing({250'000'000, 750'000'000, 2'099'999'999}, duration.value())
+          .ok());
   EXPECT_EQ(authored_stop_duration_ns(1.100000001).value(), 1'100'000'001);
   EXPECT_EQ(authored_stop_duration_ns(0.0000000015).value(), 2);
   for (const auto invalid : {0.0, -1.0, 0.0000000001, 2.1, std::numeric_limits<double>::infinity(),
@@ -99,18 +98,19 @@ TEST(StopTimingTest, AuthoredDecimalDurationsUseOneNanosecondRoundingPolicy) {
     EXPECT_FALSE(authored_stop_duration_ns(invalid).ok());
 }
 
-TEST(StopTimingTest, SettlingMustCoverLargestConcurrentDwellWithoutChangingIt) {
+TEST(StopTimingTest, SettlingIsNotComparedWithEvidenceDwell) {
+  // Items 1/26 and 24: a Stop is finished when the controller reports its
+  // braking finished; no rest dwell is reserved, so no settling rule exists.
   auto original = policy();
   auto extra = original.escalation_stages.front().evidence_requirements.front();
   extra.evidence_item_id = StopEvidenceItemId("another-rest");
   extra.observation_semantics.minimum_dwell_ns = 200'000'000;
   original.escalation_stages.front().evidence_requirements.push_back(extra);
-  auto result = resolve_stop_timing_budget(
-      original, StopTimingParametersDTO{100'000'000, 199'999'999, 2'000'000'000});
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("minimum_settling_allowance_ns"), "200000000");
   EXPECT_TRUE(resolve_stop_timing_budget(
-                  original, StopTimingParametersDTO{100'000'000, 200'000'000, 2'000'000'000})
+                  original, StopTimingParametersDTO{100'000'000, 0, 2'000'000'000})
+                  .ok());
+  EXPECT_TRUE(resolve_stop_timing_budget(
+                  original, StopTimingParametersDTO{100'000'000, 199'999'999, 2'000'000'000})
                   .ok());
   EXPECT_EQ(original.escalation_stages.front().evidence_requirements.back(), extra);
 }
@@ -123,7 +123,8 @@ TEST(StopTimingTest, RejectsInvalidShapeOverflowAndConflictingPhaseAnchors) {
                             {1, 1, kMaxStopEvidencePolicyDurationNs}}) {
     EXPECT_FALSE(resolve_stop_timing_budget(policy(), timing).ok());
   }
-  EXPECT_FALSE(validate_controlled_stop_timing({1, 1, 3}, kMaxStopEvidencePolicyDurationNs).ok());
+  EXPECT_FALSE(
+      validate_controlled_stop_timing({1, 1, 3}, kMaxStopEvidencePolicyDurationNs + 1).ok());
   auto malformed = policy();
   malformed.escalation_stages.front().evidence_requirements.front().phase_id =
       StopBudgetPhaseId("missing");
@@ -151,7 +152,7 @@ TEST(StopTimingTest, CommonEnvelopeDoesNotExtendIndependentTargetCutoffs) {
   EXPECT_EQ(budgets, invalid);
 }
 
-TEST(StopTimingTest, PreservedIntermediateEvidenceMustStillFitItsDwellAfterCommandLatency) {
+TEST(StopTimingTest, PreservedIntermediateEvidenceIsNotComparedWithItsDwell) {
   auto original = policy();
   original.deadline_budget->phases.front().deadline_offset_ns = 100'000'000;
   original.deadline_budget->phases.insert(original.deadline_budget->phases.begin() + 1,
@@ -161,12 +162,8 @@ TEST(StopTimingTest, PreservedIntermediateEvidenceMustStillFitItsDwellAfterComma
   intermediate.phase_id = StopBudgetPhaseId("intermediate");
   intermediate.observation_semantics.minimum_dwell_ns = 200'000'000;
   original.escalation_stages.front().evidence_requirements.push_back(intermediate);
-  auto result = resolve_stop_timing_budget(
+  const auto result = resolve_stop_timing_budget(
       original, StopTimingParametersDTO{300'000'000, 200'000'000, 2'000'000'000});
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "stop_timing_evidence_dwell_unreachable");
-  result = resolve_stop_timing_budget(
-      original, StopTimingParametersDTO{200'000'000, 200'000'000, 2'000'000'000});
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_EQ(result.value().phases[1], original.deadline_budget->phases[1]);
 }

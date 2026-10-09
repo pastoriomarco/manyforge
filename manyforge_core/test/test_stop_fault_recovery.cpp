@@ -209,6 +209,20 @@ TEST(StopFaultRecoveryTest, AssessmentUsesFailClosedPredicatePriority) {
   EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForConfiguration);
 }
 
+// Q32: a component-incident containment is released once its Stop finished
+// as the controller/backend reported; an unsettled or unavailable measured-rest
+// observation no longer holds it.
+TEST(StopFaultRecoveryTest, IncidentContainmentIsNotGatedOnMeasuredRest) {
+  auto status = Status();
+  status.fault_latch->trigger = StopFaultTriggerDTO::kPhysicalRestUnproven;
+  status.fault_latch->reason_code = "stop_physical_rest_unproven";
+  auto unsettled_facts = Facts(status);
+  unsettled_facts.resource_facts.front().state = StopFaultRecoveryResourceStateDTO::kUnsettled;
+  auto assessed = AssessStopFaultRecovery(status, unsettled_facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+}
+
 TEST(StopFaultRecoveryTest, ReadyAssessmentIsStableUntilSemanticFactsChange) {
   auto status = Status();
   const auto facts = Facts(status);

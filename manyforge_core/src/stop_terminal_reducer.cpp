@@ -463,7 +463,8 @@ struct DerivedTerminal final {
 
 [[nodiscard]] Result<DerivedTerminal> derive_terminal(
     const std::vector<StopScopeEntryDTO>& entries,
-    const std::vector<StopAttemptedStageResultDTO>& attempts) {
+    const std::vector<StopAttemptedStageResultDTO>& attempts,
+    const std::vector<StopScopeEntryKeyDTO>& lane_hard_stop_requested) {
   DerivedTerminal derived;
   bool used_stronger_stage = false;
 
@@ -584,7 +585,11 @@ struct DerivedTerminal final {
       explicit_failure = !physically_contained &&
                          (latest->result.outcome == ParticipantStopStageOutcomeDTO::kPartial ||
                           latest->result.outcome == ParticipantStopStageOutcomeDTO::kFailed);
-      if (physically_contained && latest->result.request.stage_index > 0U) {
+      // A Stop that asked for the lane's hard stop directly used the stage it
+      // requested; only a stronger stage after a weaker request escalates.
+      if (physically_contained && latest->result.request.stage_index > 0U &&
+          !std::binary_search(lane_hard_stop_requested.begin(), lane_hard_stop_requested.end(),
+                              entry.key, key_less)) {
         used_stronger_stage = true;
       }
     }
@@ -621,9 +626,10 @@ struct DerivedTerminal final {
   if (certificate.fault_latch_id.has_value() != certificate.fault_latch_generation.has_value()) {
     return false;
   }
+  // Items 25 and Q29: no Stop outcome requires a cell-wide latch; only a
+  // promotion to a full Stop does.
   const bool required =
-      certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull ||
-      certificate.result != StopCertificateResultDTO::kSucceededNominal;
+      certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
   return !required ||
          (certificate.fault_latch_id.has_value() && bounded_identity(*certificate.fault_latch_id) &&
           certificate.fault_latch_generation->nonzero());
@@ -697,11 +703,19 @@ struct DerivedTerminal final {
   if (!canonical_rows(certificate.pre_dispatch_cancelled, key_less) ||
       !canonical_rows(certificate.dispatched_stopped, key_less) ||
       !canonical_rows(certificate.unsettled, key_less) ||
-      !canonical_rows(certificate.failed, key_less)) {
+      !canonical_rows(certificate.failed, key_less) ||
+      !canonical_rows(certificate.lane_hard_stop_requested, key_less) ||
+      !std::all_of(certificate.lane_hard_stop_requested.begin(),
+                   certificate.lane_hard_stop_requested.end(), [&](const auto& key) {
+                     return std::any_of(certificate.scope_entries.begin(),
+                                        certificate.scope_entries.end(),
+                                        [&](const auto& entry) { return entry.key == key; });
+                   })) {
     return "stop_certificate_subsets_invalid";
   }
   if (compare_derived) {
-    auto derived = derive_terminal(certificate.scope_entries, certificate.attempted_stage_results);
+    auto derived = derive_terminal(certificate.scope_entries, certificate.attempted_stage_results,
+                                   certificate.lane_hard_stop_requested);
     if (!derived.ok() || certificate.result != derived.value().result ||
         certificate.pre_dispatch_cancelled != derived.value().pre_dispatch_cancelled ||
         certificate.dispatched_stopped != derived.value().dispatched_stopped ||
@@ -792,6 +806,7 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
   std::vector<StopCertificateRefDTO> predecessor_refs;
   std::vector<StopScopeEntryDTO> scope_entries;
   std::vector<StopAttemptedStageResultDTO> attempts;
+  std::vector<StopScopeEntryKeyDTO> lane_hard_stop_requested;
   for (const auto& predecessor : input.predecessor_certificates) {
     predecessor_refs.push_back(StopCertificateRefDTO{
         predecessor.stop_certificate_id, predecessor.stop_certificate_revision, predecessor.stop_id,
@@ -802,6 +817,9 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
                          predecessor.scope_entries.end());
     attempts.insert(attempts.end(), predecessor.attempted_stage_results.begin(),
                     predecessor.attempted_stage_results.end());
+    lane_hard_stop_requested.insert(lane_hard_stop_requested.end(),
+                                    predecessor.lane_hard_stop_requested.begin(),
+                                    predecessor.lane_hard_stop_requested.end());
   }
   predecessor_refs.erase(
       std::remove_if(predecessor_refs.begin(), predecessor_refs.end(),
@@ -853,13 +871,19 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
         "stop_terminal_scope_origin_invalid", "Merged Stop scope has an unlisted origin Stop"));
   }
 
-  auto derived = derive_terminal(scope_entries, attempts);
+  lane_hard_stop_requested.insert(lane_hard_stop_requested.end(),
+                                  input.lane_hard_stop_requested.begin(),
+                                  input.lane_hard_stop_requested.end());
+  std::sort(lane_hard_stop_requested.begin(), lane_hard_stop_requested.end(), key_less);
+  lane_hard_stop_requested.erase(
+      std::unique(lane_hard_stop_requested.begin(), lane_hard_stop_requested.end()),
+      lane_hard_stop_requested.end());
+  auto derived = derive_terminal(scope_entries, attempts, lane_hard_stop_requested);
   if (!derived.ok()) {
     return Result<StopCertificateDTO>::Err(derived.error());
   }
   const bool latch_required =
-      input.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull ||
-      derived.value().result != StopCertificateResultDTO::kSucceededNominal;
+      input.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
   if (latch_required && !input.fault_latch_id.has_value()) {
     return Result<StopCertificateDTO>::Err(
         terminal_input_error("stop_terminal_fault_latch_required",
@@ -888,7 +912,8 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
                                  input.fault_latch_id,
                                  input.fault_latch_generation,
                                  input.completed_at_ns,
-                                 input.terminal_error};
+                                 input.terminal_error,
+                                 std::move(lane_hard_stop_requested)};
   if (const auto field = stop_certificate_field_error(certificate); field.has_value()) {
     return Result<StopCertificateDTO>::Err(
         terminal_input_error(std::string(*field), "Reduced Stop certificate is invalid"));

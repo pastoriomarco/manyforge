@@ -739,7 +739,10 @@ TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndReje
                    .ok());
 }
 
-TEST(PreparedParticipantStopPlanCodec, ReadinessBoundsFullProfileAndRejectsPrebuiltTimingBypass) {
+// P3 / item 24: no Prepare-time Stop budget pre-check. A profile longer than
+// the saved timeout is prepared; the Stop deadline watchdog bounds it at run
+// time (as `main`).
+TEST(PreparedParticipantStopPlanCodec, ReadinessCeilingDoesNotRefuseALongerProfileAtPrepare) {
   const auto base = PreparedBasePlan();
   // This pure codec check uses the DTO projection. The deployment/registration
   // tests separately seal the complete current controller-domain referent.
@@ -784,10 +787,10 @@ TEST(PreparedParticipantStopPlanCodec, ReadinessBoundsFullProfileAndRejectsPrebu
     const auto prebuilt = MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
                                                           context, resources, defaults);
     ASSERT_TRUE(prebuilt.ok()) << prebuilt.error().message;
-    EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-    EXPECT_FALSE(VerifyPreparedParticipantStopPlan(readiness, prebuilt.value(), resources, defaults,
-                                                   context.node_category)
-                     .ok());
+    EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+    EXPECT_TRUE(VerifyPreparedParticipantStopPlan(readiness, prebuilt.value(), resources, defaults,
+                                                  context.node_category)
+                    .ok());
     // Historic bytes remain inspectable, not preparation authority.
     EXPECT_TRUE(EncodePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
                                                   prebuilt.value(), resources, defaults,
@@ -797,7 +800,7 @@ TEST(PreparedParticipantStopPlanCodec, ReadinessBoundsFullProfileAndRejectsPrebu
   context.participant_stop_profile.reset();
   context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kOrdinary;
   context.motion_interrupt_scope_id.reset();
-  EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
   readiness.maximum_controlled_stop_duration_ns.reset();
   EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
 
@@ -806,6 +809,9 @@ TEST(PreparedParticipantStopPlanCodec, ReadinessBoundsFullProfileAndRejectsPrebu
   readiness.maximum_controlled_stop_duration_ns = 1'100'000'000;
   EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
   readiness.maximum_controlled_stop_duration_ns = 1'099'999'999;
+  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
+  // Only the ceiling's own shape is still checked.
+  readiness.maximum_controlled_stop_duration_ns = 0;
   EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
 }
 
@@ -817,7 +823,8 @@ TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIden
   context.participant_stop_profile->jerk_limits_enabled = true;
   const auto on = MakePreparedParticipantStopPlan(base, context, resources, defaults);
   ASSERT_TRUE(on.ok()) << on.error().message;
-  EXPECT_EQ(on.value().participant_stop_profile->per_joint_max_jerk.size(), resources.size());
+  // Q36: only authored jerk is frozen; the default is derived per Stop phase.
+  EXPECT_TRUE(on.value().participant_stop_profile->per_joint_max_jerk.empty());
   const auto encoded = EncodePreparedParticipantStopPlan(base, on.value(), resources, defaults,
                                                          MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok());
@@ -833,7 +840,7 @@ TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIden
             off.value().participant_stop_invocation_plan_digest);
 }
 
-TEST(PreparedParticipantStopPlanCodec, FreezesDefaultJerkBeforeDispatchWithoutAnOverride) {
+TEST(PreparedParticipantStopPlanCodec, DeploymentDefaultFreezesTheJerkChoiceButNoDefaultJerk) {
   auto candidate = PreparedBasePlan();
   candidate.escalation_stages.front().default_contract_parameters->at("jerk_limits_enabled") =
       JsonValueDTO{true};
@@ -851,10 +858,10 @@ TEST(PreparedParticipantStopPlanCodec, FreezesDefaultJerkBeforeDispatchWithoutAn
   const auto decoded = map_motion_controlled_stop_contract_parameters_to_profile(
       *stage.validated_contract_parameters, Resources(), "default.profile");
   ASSERT_TRUE(decoded.ok());
-  EXPECT_EQ(decoded.value().per_joint_max_jerk.size(), 2U);
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularJerkDTO>(decoded.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
-      motion_jerk_preset_limit(2.0, 0.5));
+  EXPECT_EQ(decoded.value().jerk_limits_enabled, true);
+  // Q36: no default jerk is frozen before dispatch; the planner derives it
+  // per Stop phase from the lane's lead-in (main's formula).
+  EXPECT_TRUE(decoded.value().per_joint_max_jerk.empty());
   candidate.escalation_stages.front().default_contract_parameters->erase("jerk_limits_enabled");
   const auto legacy = MakeResolvedStopBasePlan(candidate);
   ASSERT_TRUE(legacy.ok());

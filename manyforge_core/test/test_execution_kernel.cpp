@@ -1184,8 +1184,16 @@ class ControlledExecution : public IExecutionBackend {
   bool release_blocked_sync_observed_state = false;
 
   std::atomic<int> retire_count{0};
+  // Number of retirements to refuse as still winding down (item 12).
+  std::atomic<int> retire_not_quiescent_refusals{0};
   Result<void> RetirePreparedExecution(std::uint64_t) override {
     ++retire_count;
+    if (retire_not_quiescent_refusals.load() > 0) {
+      --retire_not_quiescent_refusals;
+      return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+                                        "Prepared execution still has active motion or Stop work",
+                                        {{"reason", "prepared_execution_not_quiescent"}}});
+    }
     return Result<void>::Ok();
   }
   PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
@@ -1540,6 +1548,17 @@ class ControlledExecution : public IExecutionBackend {
     {
       std::lock_guard<std::mutex> lock(mu_);
       running_ = false;
+    }
+    cv_.notify_all();
+  }
+
+  // The backend ends the execution on its own with `state` and no error.
+  void end_without_completion(ExecutionState state) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      running_ = false;
+      snapshot.state = state;
+      snapshot.error.reset();
     }
     cv_.notify_all();
   }
@@ -2128,8 +2147,6 @@ std::string ended_as(const ExecutionStatus& status) {
                  : "failed";
     case ParticipantExecutionFactKind::kCancelledBeforeDispatch:
       return "cancelled_before_dispatch";
-    case ParticipantExecutionFactKind::kPlanningDeadlineExpired:
-      return "planning_deadline_expired";
     case ParticipantExecutionFactKind::kPreemptedByAddressedStop:
       return "preempted_by_addressed_stop";
   }
@@ -7737,10 +7754,14 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
            Case{true, 10.0, 1.0, 21, 21, true},     // Zero-scale hold consumes no budget.
            Case{false, 10.0, 1.0, 10, 10, false},   // Completion at the deadline wins.
            Case{true, 50.0, 1.0, 100, 50, false},   // Preserve a larger requested budget.
-           Case{true, 10.0, std::numeric_limits<double>::quiet_NaN(), 100, 1, false},
-           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kError},
-           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kThrow},
-           Case{true, 10.0, 1.0, 100, 1, false, FeedbackFailure::kLostSupport},
+           // Item 40: timing feedback is never itself a failure (the branch's
+           // `runtime_scale_timing_feedback_invalid` is removed). Without a
+           // valid applied factor the accepted slider value (1.0 here) times
+           // the motion, as `main` did, so the 32 s manual budget applies.
+           Case{true, 10.0, std::numeric_limits<double>::quiet_NaN(), 100, 32, false},
+           Case{true, 10.0, 1.0, 100, 32, false, FeedbackFailure::kError},
+           Case{true, 10.0, 1.0, 100, 32, false, FeedbackFailure::kThrow},
+           Case{true, 10.0, 1.0, 100, 32, false, FeedbackFailure::kLostSupport},
        }) {
     SCOPED_TRACE(test.expected_ticks);
     TimedExecution timed;
@@ -7809,13 +7830,177 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
     } else {
       EXPECT_EQ(ended_as(timed_kernel), "failed");
       ASSERT_TRUE(timed_kernel.get_execution_snapshot().error.has_value());
-      EXPECT_EQ(timed_kernel.get_execution_snapshot().error->code,
-                std::isfinite(test.scale) && test.failure == FeedbackFailure::kNone
-                    ? kErrorExecutionTimeout
-                    : kErrorInvariantViolation);
+      EXPECT_EQ(timed_kernel.get_execution_snapshot().error->code, kErrorExecutionTimeout);
+      EXPECT_FALSE(timed_kernel.get_execution_snapshot().error->details.contains("reason"));
       EXPECT_GE(timed.stop_count_value(), 1);
     }
   }
+}
+
+// Item 40: an optional user-set zero-speed hold timeout. A hold at zero never
+// trips the execution timeout (as `main`); when the hold lasts the user-set
+// time, the participant asks its addressed owner, once, to end the motion
+// Stopped like an operator Stop. Unset keeps `main`: nothing is requested.
+TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStopOnce) {
+  class HeldExecution final : public ControlledExecution {
+   public:
+    std::function<void()> tick;
+    std::atomic<double> applied_scale{0.0};
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t) {
+        if (wait(1)) return true;
+        tick();
+        return wait(1);
+      };
+      return handle;
+    }
+    RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override {
+      RuntimeScaleMechanismStatusDTO result;
+      result.supported = true;
+      result.active = true;
+      result.commanded_scale = applied_scale.load();
+      result.applied_scale = applied_scale.load();
+      return result;
+    }
+  };
+  for (const auto hold_timeout_s : {std::optional<double>{}, std::optional<double>{3.0}}) {
+    SCOPED_TRACE(hold_timeout_s.has_value() ? "hold timeout set" : "hold timeout unset");
+    HeldExecution held;
+    ThreadSafeFakeClock ts_clock;
+    ThreadSafeManualScheduler ts_scheduler;
+    TrajectoryCache local_cache{CacheConfig{10}};
+    ExecutionKernel held_kernel{planner, context, held, ts_clock, ts_scheduler, local_cache};
+    configure_authoritative_collision_validation(held_kernel, collision_world_publisher,
+                                                 collision_engine);
+    std::mutex events_mu;
+    std::vector<KernelEvent> stop_requests;
+    held_kernel.subscribe_events([&](const KernelEvent& event) {
+      if (event.type != KernelEventType::kStopRequested) return;
+      std::lock_guard lock(events_mu);
+      stop_requests.push_back(event);
+    });
+    int ticks = 0;
+    held.tick = [&] {
+      ++ticks;
+      ts_clock.advance(1'000'000'000);
+      if (ticks == 6) held.applied_scale = 1.0;
+      if (ticks >= 8) held.complete();
+    };
+    auto request = make_test_request("zero_speed_hold");
+    request.timeouts.execution_timeout_s = 5.0;
+    request.timeouts.zero_speed_hold_timeout_s = hold_timeout_s;
+    const auto accepted = prepare_and_dispatch(held_kernel, request);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(held_kernel.wait_for_completion(2'000'000'000));
+    // Five held seconds plus two moving seconds never reach the 5 s budget.
+    EXPECT_EQ(ended_as(held_kernel), "completed");
+    EXPECT_EQ(held.stop_count_value(), 0);
+    std::lock_guard lock(events_mu);
+    if (!hold_timeout_s.has_value()) {
+      EXPECT_TRUE(stop_requests.empty());
+    } else {
+      ASSERT_EQ(stop_requests.size(), 1U);
+      EXPECT_EQ(stop_requests.front().details.at("reason"), "zero_speed_hold_timeout");
+      EXPECT_EQ(stop_requests.front().execution_id, accepted.value());
+    }
+  }
+}
+
+TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutMustBePositiveWhenSet) {
+  auto request = make_test_request("zero_speed_hold_invalid");
+  request.timeouts.zero_speed_hold_timeout_s = 0.0;
+  const auto result = prepare_and_dispatch(kernel, request);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason_code"), "invalid_zero_speed_hold_timeout");
+}
+
+// Item 17: a worker exception after dispatch leaves the command's effect
+// uncertain (InterventionRequired at the addressed owner) and the Kernel
+// issues the lane's hard stop, the primitive Reset uses.
+TEST_F(ExecutionKernelTest, WorkerExceptionAfterDispatchIssuesTheLaneHardStop) {
+  class ThrowingExecution final : public ControlledExecution {
+   public:
+    std::atomic_bool throw_next{false};
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t timeout_ns) {
+        if (throw_next.exchange(false)) throw std::runtime_error("worker fault after dispatch");
+        return wait(timeout_ns);
+      };
+      return handle;
+    }
+  };
+  ThrowingExecution throwing;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel throwing_kernel{planner, context, throwing, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(throwing_kernel, collision_world_publisher,
+                                               collision_engine);
+  ASSERT_TRUE(prepare_and_dispatch(throwing_kernel, make_test_request("worker_exception")).ok());
+  ASSERT_TRUE(throwing.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(throwing_kernel, ExecutionState::kExecuting));
+  throwing.throw_next = true;
+  ASSERT_TRUE(wait_for_ended(throwing_kernel, "failed_effect_uncertain", 5000));
+  const auto status = throwing_kernel.get_status();
+  ASSERT_TRUE(status.fact.has_value());
+  ASSERT_TRUE(status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->details.at("reason"), "worker_exception");
+  EXPECT_EQ(throwing.stop_count_value(), 1);
+}
+
+// Item 18: a backend that ends the motion Stopped without an addressed Stop
+// is a failure with its own reason, never a silent Stopped outcome.
+TEST_F(ExecutionKernelTest, BackendStoppedWithoutAddressedStopFails) {
+  ControlledExecution stopping;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel stopping_kernel{planner, context, stopping, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(stopping_kernel, collision_world_publisher,
+                                               collision_engine);
+  ASSERT_TRUE(prepare_and_dispatch(stopping_kernel, make_test_request("backend_stopped")).ok());
+  ASSERT_TRUE(stopping.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(stopping_kernel, ExecutionState::kExecuting));
+  stopping.end_without_completion(ExecutionState::kStopped);
+  ASSERT_TRUE(wait_for_ended(stopping_kernel, "failed", 5000));
+  const auto status = stopping_kernel.get_status();
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+  ASSERT_TRUE(status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->details.at("reason"), "backend_stopped_without_addressed_stop");
+}
+
+// Item 12: Reset after certified containment issues the lane's hard stop
+// when the backend is still winding down and then completes; it never
+// leaves an unresolved retirement behind.
+TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenCompletes) {
+  ControlledExecution winding;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel winding_kernel{planner, context, winding, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(winding_kernel, collision_world_publisher,
+                                               collision_engine);
+  const auto result = prepare_and_dispatch(winding_kernel, make_test_request("reset_winding"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(winding.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(winding_kernel, ExecutionState::kExecuting));
+  ASSERT_EQ(winding_kernel.fence_addressed_participant_stop(result.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  winding.release();
+  ASSERT_TRUE(winding_kernel.wait_for_completion(1'000'000'000));
+  const auto stops_before = winding.stop_attempt_count_value();
+  const auto retired_before = winding.retire_count.load();
+  winding.retire_not_quiescent_refusals = 2;
+  const auto reset = winding_kernel.reset_after_certified_containment(result.value());
+  ASSERT_TRUE(reset.accepted) << reset.error->message;
+  EXPECT_EQ(winding.stop_attempt_count_value(), stops_before + 1);
+  EXPECT_EQ(winding.retire_count.load(), retired_before + 3);
+  EXPECT_EQ(ended_as(winding_kernel), "working:Idle");
 }
 
 TEST_F(ExecutionKernelTest, RuntimeScaleStatusUsesTheExactSharedCommandWithoutAnotherSetter) {
@@ -7933,7 +8118,7 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   EXPECT_GE(controlled_execution.stop_count_value(), 1);
 }
 
-TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
+TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
   SlowMockPlanner slow_planner;
   ThreadSafeFakeClock ts_clock;
   ThreadSafeManualScheduler ts_scheduler;
@@ -7963,25 +8148,43 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
   // Wait for kernel to settle
   timeout_kernel.wait_for_completion();
 
-  // Step 3 regression: the participant reports the expired deadline as a
-  // fact with its planning-timeout error and nothing dispatched; the addressed
-  // Kernel derives the (unchanged) Stopped outcome from it. The participant
-  // still publishes the succeeded no-dispatch Stop certificate.
+  // P2: an expired planning deadline is the planning failure
+  // `planning_timeout` with nothing dispatched, exactly as when the planner
+  // backend reports the timeout; it is never a Stop and publishes no Stop
+  // certificate.
   auto status = timeout_kernel.get_status();
-  EXPECT_EQ(ended_as(status), "planning_deadline_expired");
+  EXPECT_EQ(ended_as(status), "failed");
   ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->kind, ParticipantExecutionFactKind::kLocalFailure);
   EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
   ASSERT_TRUE(status.fact->error.has_value());
   EXPECT_EQ(status.fact->error->code, kErrorPlanningTimeout);
   EXPECT_EQ(execution.execute_count, 0);
-  const auto certificates = timeout_kernel.stop_certificate_evidence();
-  ASSERT_FALSE(certificates.empty());
-  EXPECT_EQ(certificates.back().completion_result, StopCertificateOutcome::kSucceeded);
-  EXPECT_EQ(certificates.back().command_source, "planning_deadline_expired_before_dispatch");
+  EXPECT_TRUE(timeout_kernel.stop_certificate_evidence().empty());
+  EXPECT_EQ(timeout_kernel.get_metrics().plans_failed, 1U);
   ts_scheduler.advance_to(ts_clock.now());
   const auto assessment = timeout_kernel.get_recovery_assessment();
-  EXPECT_EQ(assessment.execution_state, ExecutionState::kStopped);
-  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
+  EXPECT_EQ(assessment.execution_state, ExecutionState::kFailed);
+  EXPECT_NE(assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
+}
+
+TEST_F(ExecutionKernelTest, PlanningTimeout_BackendReportedMatchesKernelDeadline) {
+  // P2: whichever timer notices the timeout first, the participant reports
+  // the same planning failure fact.
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{kErrorPlanningTimeout, "Planning timed out", {}};
+  planner.next_result = plan_err;
+
+  execute_sync(make_test_request());
+  const auto status = kernel.get_status();
+  EXPECT_EQ(ended_as(status), "failed");
+  ASSERT_TRUE(status.fact.has_value());
+  EXPECT_EQ(status.fact->kind, ParticipantExecutionFactKind::kLocalFailure);
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  ASSERT_TRUE(status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->code, kErrorPlanningTimeout);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_TRUE(kernel.stop_certificate_evidence().empty());
 }
 
 TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcrossRuns) {

@@ -308,7 +308,6 @@ TEST(RoboPlanCandidateComputerTest,
                      current.value().velocities_rad_s};
     initial.trajectory_time_from_start_s = cursor;
     initial.velocity_source = SoftOnPathStateSource::kModelDerived;
-    initial.runtime_scale_target_at_trip = 1.0;
     const auto stopped =
         plan_soft_on_path_stop(trajectory, profile, initial, config);
     ASSERT_TRUE(stopped.ok())

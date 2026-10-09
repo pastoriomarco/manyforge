@@ -1304,9 +1304,9 @@ store_and_verify_runtime_participant_stop_readiness(
       return readiness_error<core::RuntimeParticipantStopReadiness>(
           "stop_readiness_retained_timing_mismatch",
           "Stop timing differs from the exact binding revision");
+    // Items 1/26 and 24: no settling dwell is reserved inside the timeout.
     maximum_duration = selected.timing.operational_timeout_ns -
-                       selected.timing.command_latency_allowance_ns -
-                       selected.timing.settling_allowance_ns;
+                       selected.timing.command_latency_allowance_ns;
   }
   const auto verified = core::VerifyResolvedStopBasePlan(plan);
   if (!verified.ok()) {

@@ -240,6 +240,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
            py::arg("execution_timeout_s"))
       .def_readwrite("planning_timeout_s", &manyforge::core::TimeoutsDTO::planning_timeout_s)
       .def_readwrite("execution_timeout_s", &manyforge::core::TimeoutsDTO::execution_timeout_s)
+      .def_readwrite("zero_speed_hold_timeout_s",
+                     &manyforge::core::TimeoutsDTO::zero_speed_hold_timeout_s)
       .def("__repr__", [](const manyforge::core::TimeoutsDTO& t) {
         return py::str("TimeoutsDTO(planning_timeout_s={}, execution_timeout_s={})")
             .format(t.planning_timeout_s, t.execution_timeout_s);

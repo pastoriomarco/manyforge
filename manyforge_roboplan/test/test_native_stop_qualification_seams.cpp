@@ -374,8 +374,11 @@ controlled_stage_with_goal_terminal(bool allow_natural_completion) {
   return stage;
 }
 
+// Items 1/26: the Stop is finished when the backend reports its braking
+// finished. Fresh rest, one sample and actual motion all succeed (no
+// measured-rest check, no dwell); a Reset or a newer execution still fails.
 TEST(NativeStopQualificationSeamTest,
-     TerminalGoalStillAcceptsExactHardStopButRequiresFreshRestDwell) {
+     TerminalGoalAcceptsExactHardStopWithOneFreshPostCommandSample) {
   // Fresh rest, one sample, actual motion, Reset, newer execution.
   for (const int source_case : {0, 1, 2, 3, 4}) {
     WallClock clock;
@@ -436,17 +439,20 @@ TEST(NativeStopQualificationSeamTest,
         requests + (source_case == 3 ? 2U : 1U));
     EXPECT_EQ(result.attempt_disposition,
               core::StopStageAttemptDispositionDTO::kDispatched);
-    if (source_case == 0) {
+    if (source_case <= 2) {
       ASSERT_EQ(result.outcome,
                 core::ParticipantStopStageOutcomeDTO::kSucceeded)
           << (result.error ? result.error->message : "no error");
       const auto &payload = std::get<core::JsonObjectDTO>(
           result.evidence_items.front().evidence->value);
-      const auto &rest =
-          std::get<core::JsonObjectDTO>(payload.at("post_command_rest").value);
-      EXPECT_NE(std::get<std::string>(rest.at("first_sample_sequence").value),
-                std::get<std::string>(rest.at("last_sample_sequence").value));
-      EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
+      const auto &sample = std::get<core::JsonObjectDTO>(
+          payload.at("post_command_sample").value);
+      EXPECT_EQ(std::get<std::string>(sample.at("finish_authority").value),
+                "controller_reported");
+      EXPECT_GT(std::get<double>(sample.at("sample_after_acceptance_ns").value),
+                0.0);
+    }
+    if (source_case == 0) {
       // An old exact goal must still reject after a newer goal has also ended.
       auto newer =
           backend->execute_trajectory(fixture::trajectory(binding, 0.02));
@@ -460,12 +466,11 @@ TEST(NativeStopQualificationSeamTest,
       EXPECT_EQ(
           detail::NativeStopQualificationAccess::hard_stop_requests(*backend),
           before_stale);
-    } else {
+    } else if (source_case >= 3) {
       ASSERT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
       ASSERT_TRUE(result.error);
       EXPECT_EQ(result.error->details.at("reason"),
-                source_case >= 3 ? "stop_evidence_execution_changed"
-                                 : "stop_evidence_not_at_rest");
+                "stop_evidence_execution_changed");
     }
   }
 }
@@ -595,11 +600,12 @@ TEST(NativeStopQualificationSeamTest,
                   diagnostics.at("natural_completion_basis").value),
               "goal_completed_before_stop_stage");
   }
-  const auto &rest = std::get<core::JsonObjectDTO>(
+  const auto &sample = std::get<core::JsonObjectDTO>(
       std::get<core::JsonObjectDTO>(result.evidence_items.front().evidence->value)
-          .at("post_command_rest")
+          .at("post_command_sample")
           .value);
-  EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
+  EXPECT_EQ(std::get<std::string>(sample.at("finish_authority").value),
+            "controller_reported");
   // Goal terminality names the exact Completed transition of this goal.
   EXPECT_EQ(result.evidence_items.back().source_sequence,
             completed.sequence_number);
@@ -992,6 +998,9 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_EQ(result.error->details.at("reason"),
             "soft_on_path_retimer_not_dispatchable");
   EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
+  // Q33: the planner chose the hard stop; the Kernel's hard stop then ends
+  // Stopped without the degraded-Stop error.
+  EXPECT_EQ(result.error->details.at("stop_disposition"), "planner_selected_hard_stop");
   EXPECT_EQ(result.error->details.at("details_truncated"), "true");
   EXPECT_GT(std::stod(result.error->details.at("handoff_path_time_s")), 0.0);
   EXPECT_LT(std::stod(result.error->details.at("handoff_path_time_s")), 5.0);
@@ -1029,7 +1038,11 @@ TEST(NativeStopQualificationSeamTest,
 
 TEST(NativeStopQualificationSeamTest,
      NearEndpointNaturalCompletionUsesTheOriginalGoalWithoutReplacement) {
-  for (bool spring_back : {false, true}) {
+  // Natural completion is main's soft-Stop predicate (decision item 2),
+  // decided once before any spring-back; a directly requested spring-back
+  // Stop is planned and dispatched, as on main (planner test
+  // NaturalCompletionIsNotReCheckedInsideSpringBack).
+  for (bool spring_back : {false}) {
     core::FakeClock clock;
     core::ManualScheduler scheduler;
     auto binding = fixture::make_binding();
@@ -1515,47 +1528,6 @@ TEST(NativeStopQualificationSeamTest,
   EXPECT_TRUE(execution.wait_for_completion(2'000'000'000));
   EXPECT_EQ(backend->get_execution_snapshot().state,
             core::ExecutionState::kStopped);
-}
-
-TEST(NativeStopQualificationSeamTest,
-     NonRestingAddressedStateFailsTheControlledStopEvidenceContract) {
-  WallClock clock;
-  auto binding = fixture::make_binding();
-  auto channel = std::make_shared<fixture::StateChannel>(binding);
-  channel->force_observed_velocities({0.5, -0.5});
-  RoboPlanExecutionBackendConfig config;
-  RecordingProbe probe;
-  auto backend = detail::NativeStopQualificationAccess::construct(
-      binding, channel, clock, config, probe);
-  auto stage = controlled_stage_fixture();
-  auto &plan = stage.participant_stop_plan;
-  auto &parameters = *plan.stage_commands.front().validated_contract_parameters;
-  parameters["deceleration_time_s"] = core::JsonValueDTO{0.05};
-  plan.stage_commands.front().resolved_stage.default_contract_parameters =
-      parameters;
-  plan.deadline_budget = core::StopDeadlineBudgetDTO{
-      500'000'000,
-      50'000'000,
-      {{core::StopBudgetPhaseId("command"), 100'000'000},
-       {core::StopBudgetPhaseId("terminal"), 250'000'000}}};
-
-  auto execution =
-      backend->execute_trajectory(fixture::trajectory(binding, 5.0));
-  ASSERT_TRUE(wait_until_executing(*backend));
-  detail::NativeStopQualificationAccess::install_prepared_goal_membership(
-      *backend, stage, core::ContentDigest("prepared.non-resting"), execution);
-
-  const auto result = backend->TranslateStopStage(
-      stage, remaining_budget(stage), std::stop_token{});
-
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_not_at_rest");
-  EXPECT_EQ(backend->get_execution_snapshot().state,
-            core::ExecutionState::kStopped);
-  EXPECT_TRUE(execution.wait_for_completion(2'000'000'000LL));
 }
 
 TEST(NativeStopQualificationSeamTest,

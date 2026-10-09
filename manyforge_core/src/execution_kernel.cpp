@@ -2093,31 +2093,19 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
     return result;
   }
 
-  if (planning_timed_out) {
-    const ErrorDTO timeout_error{kErrorPlanningTimeout, "Planning timed out", {}};
-    emit_event(make_error_raised_event(exec_id, clock_.now(), timeout_error));
-    // Nothing was dispatched: the expired deadline is contained by never
-    // dispatching this execution.
-    publish_operator_stop_certificate(exec_id, StopCertificateOutcome::kSucceeded,
-                                      /*backend_stop_confirmed=*/true,
-                                      "planning_deadline_expired_before_dispatch");
-    motion_state.record_terminal(std::nullopt);
-    (void)settle_execution(exec_id, request.move_id,
-                           ParticipantExecutionFact{
-                               ParticipantExecutionFactKind::kPlanningDeadlineExpired,
-                               ParticipantEffectKnowledge::kNoEffect, timeout_error},
-                           "planning_deadline_expired");
-    result.status = ExecuteWorkerPhaseStatus::kTerminal;
-    return result;
-  }
-
-  if (!plan_result.ok()) {
-    emit_event(make_error_raised_event(exec_id, clock_.now(), plan_result.error()));
+  if (planning_timed_out || !plan_result.ok()) {
+    // A planning deadline that expires before dispatch is a planning failure
+    // `planning_timeout`, whichever timer noticed it first (this Kernel's
+    // deadline or the planner backend); it is never a Stop.
+    const ErrorDTO planning_error =
+        planning_timed_out ? ErrorDTO{kErrorPlanningTimeout, "Planning timed out", {}}
+                           : plan_result.error();
+    emit_event(make_error_raised_event(exec_id, clock_.now(), planning_error));
     {
       std::lock_guard<std::mutex> lock(metrics_mutex_);
       metrics_.plans_failed++;
     }
-    settle_local_failure(request, exec_id, motion_state, plan_result.error(),
+    settle_local_failure(request, exec_id, motion_state, planning_error,
                          ParticipantEffectKnowledge::kNoEffect, "planning_failed");
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
@@ -2320,34 +2308,18 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
-    if (replan_timed_out) {
-      const ErrorDTO timeout_error{kErrorPlanningTimeout, "Planning timed out", {}};
-      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, timeout_error, {}});
-      publish_operator_stop_certificate(exec_id, StopCertificateOutcome::kSucceeded,
-                                        /*backend_stop_confirmed=*/true,
-                                        "planning_deadline_expired_before_dispatch");
-      motion_state.record_terminal(std::nullopt);
-      (void)settle_execution(exec_id, request.move_id,
-                             ParticipantExecutionFact{
-                                 ParticipantExecutionFactKind::kPlanningDeadlineExpired,
-                                 ParticipantEffectKnowledge::kNoEffect, timeout_error},
-                             "authoritative_validation_replan_deadline_expired");
-      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
-      return phase_result;
-    }
-    if (!replan_result.ok()) {
-      emit_event({KernelEventType::kErrorRaised,
-                  exec_id,
-                  clock_.now(),
-                  {},
-                  {},
-                  replan_result.error(),
-                  {}});
+    if (replan_timed_out || !replan_result.ok()) {
+      // An expired replan deadline is the same planning failure
+      // `planning_timeout` as one the planner reports; never a Stop.
+      const ErrorDTO replan_error =
+          replan_timed_out ? ErrorDTO{kErrorPlanningTimeout, "Planning timed out", {}}
+                           : replan_result.error();
+      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, replan_error, {}});
       {
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.plans_failed++;
       }
-      settle_local_failure(request, exec_id, motion_state, replan_result.error(),
+      settle_local_failure(request, exec_id, motion_state, replan_error,
                            ParticipantEffectKnowledge::kNoEffect,
                            "authoritative_validation_replan_failed");
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
@@ -3336,6 +3308,16 @@ void ExecutionKernel::async_execute_worker(
 
     int64_t last_runtime_scale_sample_ns = exec_start_ns;
     double runtime_scaled_execution_ns = 0.0;
+    // Optional user-set zero-speed hold timeout (item 40). Unset keeps
+    // `main`: a hold at zero speed never ends the motion.
+    const int64_t zero_speed_hold_timeout_ns =
+        request.timeouts.zero_speed_hold_timeout_s.has_value()
+            ? static_cast<int64_t>(*request.timeouts.zero_speed_hold_timeout_s * 1e9)
+            : 0;
+    // Start of the current continuous zero-speed hold, when holding.
+    bool zero_speed_holding = false;
+    int64_t zero_speed_hold_started_ns = 0;
+    bool zero_speed_hold_stop_requested = false;
     while (true) {
       if (st.stop_requested()) {
         // Retirement after certified containment (or Kernel teardown).
@@ -3369,27 +3351,39 @@ void ExecutionKernel::async_execute_worker(
       }
 
       const auto now_ns = clock_.now();
-      std::optional<ErrorDTO> execution_timing_error;
       if (!completed) {
+        // As `main` (item 40): the timeout clock is elapsed time x scale, so
+        // a zero-scale hold never trips it. The applied factor is used when
+        // the mechanism reports a valid one; otherwise the accepted slider
+        // value (`main`'s own quantity, 1.0 when none was set). Timing
+        // feedback is never itself a failure.
         const int64_t dt_ns = std::max<int64_t>(0, now_ns - last_runtime_scale_sample_ns);
+        double scale = 1.0;
+        {
+          std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+          if (accepted_resolved_runtime_scale_command_.has_value()) {
+            scale = accepted_resolved_runtime_scale_command_->requested_scale;
+          }
+        }
         try {
           const auto mechanism = execution_backend_.runtime_velocity_scale_status();
-          const double scale = mechanism.supported ? mechanism.applied_scale : 1.0;
-          if (mechanism.error || (!mechanism.supported && request.initial_runtime_scale) ||
-              !std::isfinite(scale) || scale < 0.0 || scale > 1.0) {
-            execution_timing_error = ErrorDTO{
-                kErrorInvariantViolation,
-                "Execution timing feedback is unavailable or invalid",
-                {{"reason", "runtime_scale_timing_feedback_invalid"},
-                 {"cause", mechanism.error ? mechanism.error->message : "invalid applied scale"}}};
-          } else {
-            runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
+          if (mechanism.supported && !mechanism.error && std::isfinite(mechanism.applied_scale) &&
+              mechanism.applied_scale >= 0.0 && mechanism.applied_scale <= 1.0) {
+            scale = mechanism.applied_scale;
           }
         } catch (...) {
-          execution_timing_error = ErrorDTO{kErrorInvariantViolation,
-                                            "Execution timing feedback read failed",
-                                            {{"reason", "runtime_scale_timing_feedback_failed"}}};
+          // Keep the accepted slider value.
         }
+        scale = std::isfinite(scale) ? std::clamp(scale, 0.0, 1.0) : 1.0;
+        runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
+        if (scale > 0.0) {
+          zero_speed_holding = false;
+        } else if (!zero_speed_holding) {
+          zero_speed_holding = true;
+          zero_speed_hold_started_ns = last_runtime_scale_sample_ns;
+        }
+      } else {
+        zero_speed_holding = false;
       }
       last_runtime_scale_sample_ns = now_ns;
 
@@ -3410,16 +3404,34 @@ void ExecutionKernel::async_execute_worker(
         continue;
       }
 
-      // Timing faults use the existing bounded failure path too; throwing out
-      // of an active worker must not leave motion unattended.
-      if (execution_timing_error ||
-          (!completed && exec_timeout_ns > 0 &&
-           runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns))) {
-        const auto execution_error = execution_timing_error.value_or(ErrorDTO{
+      if (!completed && zero_speed_hold_timeout_ns > 0 && !zero_speed_hold_stop_requested &&
+          zero_speed_holding && now_ns - zero_speed_hold_started_ns >= zero_speed_hold_timeout_ns) {
+        // The slider held the motion at zero for the user-set time: the
+        // addressed owner ends it Stopped (no error), resumable like an
+        // operator Stop, through its own Stop. This worker keeps observing
+        // until that Stop fences and ends the execution.
+        zero_speed_hold_stop_requested = true;
+        emit_event({KernelEventType::kStopRequested,
+                    exec_id,
+                    clock_.now(),
+                    {},
+                    {},
+                    std::nullopt,
+                    {{"reason", "zero_speed_hold_timeout"},
+                     {"zero_speed_hold_timeout_s",
+                      std::to_string(static_cast<double>(zero_speed_hold_timeout_ns) / 1e9)},
+                     {"held_s",
+                      std::to_string(static_cast<double>(now_ns - zero_speed_hold_started_ns) /
+                                     1e9)}}});
+      }
+
+      if (!completed && exec_timeout_ns > 0 &&
+          runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns)) {
+        const ErrorDTO execution_error{
             kErrorExecutionTimeout,
             "Execution timeout exceeded",
             {{"execution_budget_s", std::to_string(static_cast<double>(exec_timeout_ns) / 1e9)},
-             {"scaled_elapsed_s", std::to_string(runtime_scaled_execution_ns / 1e9)}}});
+             {"scaled_elapsed_s", std::to_string(runtime_scaled_execution_ns / 1e9)}}};
         stop_collision_monitoring(RuntimeCollisionMonitorRelease::kFailClosedTerminal,
                                   motion_state.runtime_collision_protection_generation);
         (void)execution_backend_.stop();
@@ -3460,7 +3472,21 @@ void ExecutionKernel::async_execute_worker(
       dispatched = prepared_session->dispatch_gate.load(std::memory_order_acquire) ==
                    PreparedMotionDispatchGate::kCommitted;
     }
-    // An exception after dispatch leaves the command's settlement unknown.
+    if (dispatched) {
+      // Item 17: an exception after dispatch leaves the command's settlement
+      // unknown. Issue the lane's hard stop (the primitive Reset uses) and
+      // end InterventionRequired, unless an addressed Stop already owns the
+      // execution.
+      const auto status = sm_.status();
+      if (!status.fact.has_value() &&
+          addressed_stop_fence_execution_id_.load(std::memory_order_acquire) != exec_id) {
+        try {
+          (void)execution_backend_.stop();
+        } catch (...) {
+          // The outcome stays InterventionRequired either way.
+        }
+      }
+    }
     settle_local_failure(request, exec_id, motion_state, exception_error,
                          dispatched ? ParticipantEffectKnowledge::kEffectUncertain
                                     : ParticipantEffectKnowledge::kNoEffect,
@@ -4090,6 +4116,16 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                  "execution_timeout_s must be finite and strictly positive",
                  {{"reason_code", "invalid_execution_timeout"},
                   {"execution_timeout_s", std::to_string(request.timeouts.execution_timeout_s)}}});
+  }
+  if (request.timeouts.zero_speed_hold_timeout_s.has_value() &&
+      (!std::isfinite(*request.timeouts.zero_speed_hold_timeout_s) ||
+       *request.timeouts.zero_speed_hold_timeout_s <= 0.0)) {
+    return Result<uint64_t>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "zero_speed_hold_timeout_s must be finite and strictly positive when set",
+                 {{"reason_code", "invalid_zero_speed_hold_timeout"},
+                  {"zero_speed_hold_timeout_s",
+                   std::to_string(*request.timeouts.zero_speed_hold_timeout_s)}}});
   }
 
   const uint64_t exec_id = next_execution_id_.load(std::memory_order_relaxed);
@@ -4744,7 +4780,24 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   if (!control_command_epoch_matches(expected_epoch)) {
     return ResetResultDTO{false, stale_control_command_error()};
   }
-  if (const auto retired = retire_prepared_motion_membership(); !retired.ok()) {
+  auto retired = retire_prepared_motion_membership();
+  if (!retired.ok() && retired.error().details.contains("reason") &&
+      retired.error().details.at("reason") == "prepared_execution_not_quiescent") {
+    // Item 12: Reset issues the lane's hard stop and then completes, as
+    // `main`'s Reset did; it never leaves an unresolved retirement behind
+    // while the backend is still winding down. The wait is `main`'s bounded
+    // software-stop drain.
+    try {
+      (void)execution_backend_.stop();
+    } catch (...) {
+      // Retirement below reports whether the backend became quiescent.
+    }
+    for (int poll = 0; poll < kExecutionDrainMaxPolls && !retired.ok(); ++poll) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(kExecutionPollNs));
+      retired = retire_prepared_motion_membership();
+    }
+  }
+  if (!retired.ok()) {
     return ResetResultDTO{false, retired.error()};
   }
   sm_.retire();
@@ -5032,92 +5085,15 @@ std::vector<KernelStopCertificateDTO> ExecutionKernel::stop_certificate_evidence
           recovery_certificates_.evidence_ring().end()};
 }
 
-bool ExecutionKernel::publish_stop_certificate(KernelStopCertificateDTO certificate,
-                                               bool coalesce_owner_session) {
-  apply_observed_state_to_stop_certificate(
-      execution_backend_.observed_robot_state_publication(),
-      certificate.completed_at_ns > 0 ? certificate.completed_at_ns : clock_.now(),
-      config_.recovery_at_rest_velocity_threshold_rad_s, certificate);
-  if (certificate.certificate_id.empty()) {
-    certificate.certificate_id = std::string("stopcert-") +
-                                 std::string(stop_owner_kind_name(certificate.stop_owner)) + "-g" +
-                                 std::to_string(certificate.stop_owner_generation) + "-x" +
-                                 std::to_string(certificate.execution_id) + "-o" +
-                                 stop_certificate_outcome_name(certificate.completion_result) +
-                                 "-t" + std::to_string(certificate.completed_at_ns);
-  }
-  {
-    std::lock_guard<std::mutex> lock(recovery_certificate_mutex_);
-    if (coalesce_owner_session) {
-      const auto revision = recovery_certificates_.publish_owner_session_progress(certificate);
-      if (!revision.has_value()) {
-        return false;
-      }
-      certificate.certificate_revision = *revision;
-    } else {
-      certificate.certificate_revision = recovery_certificates_.publish(certificate);
-    }
-  }
-  KernelEvent event;
-  event.type = KernelEventType::kStopCertificatePublished;
-  event.execution_id = certificate.execution_id;
-  event.timestamp_ns = certificate.completed_at_ns;
-  event.details = {
-      {"certificate_id", certificate.certificate_id},
-      {"certificate_revision", std::to_string(certificate.certificate_revision)},
-      {"completion_result", stop_certificate_outcome_name(certificate.completion_result)},
-      {"stop_owner", stop_owner_kind_name(certificate.stop_owner)},
-      {"stop_owner_generation", std::to_string(certificate.stop_owner_generation)},
-      {"latch_id", certificate.latch_id},
-      {"command_source", certificate.command_source},
-      {"backend_stop_confirmed", certificate.backend_stop_confirmed ? "true" : "false"},
-      {"observed_state_fresh", certificate.observed_state_fresh ? "true" : "false"},
-      {"observed_state_at_rest", certificate.observed_state_at_rest ? "true" : "false"},
-      {"at_rest_evidence", at_rest_evidence_name(certificate.at_rest_evidence)},
-      {"reason_code", "stop_certificate_published"},
-  };
-  // Evidence after the authority fact is durable (act-before-emit).
-  emit_event(std::move(event));
-  return true;
-}
-
 std::uint64_t ExecutionKernel::begin_operator_stop_owner_generation(std::uint64_t execution_id) {
   std::lock_guard<std::mutex> lock(operator_stop_identity_mutex_);
   return operator_stop_identity_.begin(execution_id);
-}
-
-std::uint64_t ExecutionKernel::ensure_operator_stop_owner_generation(std::uint64_t execution_id) {
-  std::lock_guard<std::mutex> lock(operator_stop_identity_mutex_);
-  return operator_stop_identity_.ensure(execution_id);
 }
 
 std::uint64_t ExecutionKernel::operator_stop_owner_generation_for_execution(
     std::uint64_t execution_id) const {
   std::lock_guard<std::mutex> lock(operator_stop_identity_mutex_);
   return operator_stop_identity_.generation_for_execution(execution_id);
-}
-
-void ExecutionKernel::publish_operator_stop_certificate(std::uint64_t execution_id,
-                                                        StopCertificateOutcome completion_result,
-                                                        bool backend_stop_confirmed,
-                                                        std::string command_source,
-                                                        std::string requested_stop_mode,
-                                                        std::string executed_stop_mode) {
-  KernelStopCertificateDTO certificate;
-  certificate.completion_result = completion_result;
-  certificate.stop_owner = StopOwnerKind::kOperatorStopWorker;
-  certificate.stop_owner_generation = ensure_operator_stop_owner_generation(execution_id);
-  certificate.execution_id = execution_id;
-  certificate.control_command_epoch = control_command_epoch_.load(std::memory_order_acquire);
-  certificate.requested_stop_mode = std::move(requested_stop_mode);
-  certificate.executed_stop_mode = std::move(executed_stop_mode);
-  certificate.command_source = std::move(command_source);
-  certificate.preemption_result = InterruptPreemptionResult::kNoneRequired;
-  certificate.backend_stop_confirmed = backend_stop_confirmed;
-  certificate.at_rest_evidence = AtRestEvidence::kUnavailable;
-  certificate.completed_at_ns = clock_.now();
-  (void)publish_stop_certificate(std::move(certificate),
-                                 /*coalesce_owner_session=*/true);
 }
 
 RecoveryReadinessPolicy ExecutionKernel::recovery_readiness_policy() const {
@@ -5197,7 +5173,6 @@ ExecutionState ExecutionKernel::recovery_execution_state_locked(
     case ParticipantExecutionFactKind::kComputedCompletion:
       return ExecutionState::kCompleted;
     case ParticipantExecutionFactKind::kCancelledBeforeDispatch:
-    case ParticipantExecutionFactKind::kPlanningDeadlineExpired:
     case ParticipantExecutionFactKind::kPreemptedByAddressedStop:
       return ExecutionState::kStopped;
     case ParticipantExecutionFactKind::kLocalFailure:

@@ -2413,11 +2413,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                     assert (
                         rest_evidence[0]["requested_stop_mode"] == args.stop_mode
                     ), arm_terminal
-                if args.scale_stop:
-                    handoff = rest_evidence[0]["provider_diagnostics"]
-                    assert (
-                        float(handoff["runtime_scale_rate_per_s_at_trip"]) < 0
-                    ), handoff
                 recovery_result = None
                 reset_result = None
                 manual_handover_result = None

@@ -137,35 +137,6 @@ struct ResolvedResource final {
 
 }  // namespace
 
-// Declared in execution_stop_support.hpp; defined with their only Core
-// caller so the prepared-motion library links without the legacy support.
-const char* stop_mode_string(MotionInterruptStopMode mode) {
-  switch (mode) {
-    using enum MotionInterruptStopMode;
-    case kSpringBackHold: return "spring_back_hold";
-    case kSoftOnPath: return "soft_on_path";
-    case kHardDeceleration: return "hard_deceleration";
-  }
-  return "unknown";
-}
-
-const char* stop_command_source_string(
-    MotionInterruptStopCommandSource source) {
-  switch (source) {
-    using enum MotionInterruptStopCommandSource;
-    case kFjtPreemptHold: return "fjt_preempt_hold";
-    case kFjtPreemptPathRamp: return "fjt_preempt_path_ramp";
-    case kJtcSpeedScalingRamp: return "jtc_speed_scaling_ramp";
-    case kJtcCancelDecelerateOnCancel: return "jtc_cancel_decelerate_on_cancel";
-    case kJtcCancelUnprofiledHold: return "jtc_cancel_unprofiled_hold";
-    case kNativeSimulatedStop: return "native_simulated_stop";
-    case kNativeSimulatedPathRamp: return "native_simulated_path_ramp";
-    case kRobotNativeStop: return "robot_native_stop";
-    case kDiagnosticOther: return "diagnostic_other";
-  }
-  return "unknown";
-}
-
 Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
     const MotionInterruptStopProfileDTO& source) {
   if (const auto error = motion_interrupt_stop_profile_field_error(source); !error.empty())
@@ -177,22 +148,15 @@ Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
                            "Review and save an explicit controlled-Stop jerk choice");
   if (profile.stop_mode == MotionInterruptStopMode::kHardDeceleration)
     profile.jerk_limits_enabled = false;
-  if (profile.jerk_limits_enabled != true)
-    return Result<MotionInterruptStopProfileDTO>::Ok(std::move(profile));
-  const double reference_s =
-      motion_interrupt_deceleration_time_or_default(profile) *
-      (profile.stop_mode == MotionInterruptStopMode::kSpringBackHold ? 0.5 : 1.0);
-  for (const auto& [joint, acceleration] : profile.per_joint_max_deceleration) {
-    if (profile.per_joint_max_jerk.contains(joint)) continue;
-    const double limit = motion_jerk_preset_limit(magnitude(acceleration), reference_s);
-    if (!std::isfinite(limit) || limit <= 0.0)
-      return invalid_profile("motion_interrupt_jerk_preset_invalid",
-                             "Jerk preset is not finite and positive");
-    profile.per_joint_max_jerk.emplace(joint,
-                                       coordinate_kind(acceleration) == CoordinateKind::kAngular
-                                           ? CoordinateJerkDTO{AngularJerkDTO{limit}}
-                                           : CoordinateJerkDTO{LinearJerkDTO{limit}});
-  }
+  // As main (item 24): an unset controlled-Stop deceleration time takes the
+  // 1.0 s default here, once, when the profile is loaded; the planner never
+  // substitutes it. The 2.0 s ceiling is the field check above.
+  if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration &&
+      !profile.deceleration_time_s.has_value())
+    profile.deceleration_time_s = kDefaultDecelerationTimeS;
+  // Q36: only authored jerk values are frozen here. A joint without one gets
+  // main's default at Stop time, where the lane's lead-in and the phase
+  // duration are known (soft_on_path_stop_planner).
   return Result<MotionInterruptStopProfileDTO>::Ok(std::move(profile));
 }
 

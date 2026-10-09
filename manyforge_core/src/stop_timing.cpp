@@ -67,29 +67,14 @@ Result<void> validate_controlled_stop_timing(const StopTimingParametersDTO& timi
                                              const std::int64_t full_profile_duration_ns) {
   if (const auto error = timing_error(timing)) return Result<void>::Err(*error);
   if (full_profile_duration_ns <= 0 ||
-      full_profile_duration_ns > kMaxStopEvidencePolicyDurationNs ||
-      full_profile_duration_ns >
-          kMaxStopEvidencePolicyDurationNs - timing.command_latency_allowance_ns ||
-      full_profile_duration_ns + timing.command_latency_allowance_ns >
-          kMaxStopEvidencePolicyDurationNs - timing.settling_allowance_ns) {
+      full_profile_duration_ns > kMaxStopEvidencePolicyDurationNs) {
     return Result<void>::Err(
         invalid("stop_profile_timing_out_of_range",
-                "Complete Stop profile and allowances exceed the supported timing range"));
+                "Complete Stop profile exceeds the supported timing range"));
   }
-  const auto minimum =
-      full_profile_duration_ns + timing.command_latency_allowance_ns + timing.settling_allowance_ns;
-  if (timing.operational_timeout_ns < minimum) {
-    const auto fraction = std::to_string(minimum % 1'000'000'000);
-    const auto minimum_seconds = std::to_string(minimum / 1'000'000'000) + "." +
-                                 std::string(9U - fraction.size(), '0') + fraction;
-    return Result<void>::Err(
-        invalid("stop_timeout_shorter_than_profile_and_allowances",
-                "Stop timeout is shorter than the complete profile plus latency and settling "
-                "allowances; minimum " +
-                    minimum_seconds + " s",
-                {{"minimum_timeout_ns", std::to_string(minimum)},
-                 {"operational_timeout_ns", std::to_string(timing.operational_timeout_ns)}}));
-  }
+  // Item 24: no Apply-time Stop timing refusal. As `main`, the Stop has one
+  // deadline and its watchdog issues the hard floor on overrun; a timeout
+  // shorter than the profile is not refused in advance.
   return Result<void>::Ok();
 }
 
@@ -104,12 +89,13 @@ Result<StopDeadlineBudgetDTO> resolve_stop_timing_budget(
   }
   if (!timing) return Result<StopDeadlineBudgetDTO>::Ok(*policy.deadline_budget);
   if (const auto error = timing_error(*timing)) return Result<StopDeadlineBudgetDTO>::Err(*error);
-  const auto minimum_timeout = timing->command_latency_allowance_ns +
-                               std::max<std::int64_t>(timing->settling_allowance_ns, 1);
+  // The terminal deadline must follow the command phase; no settling
+  // allowance is required (items 1/26: no rest dwell).
+  const auto minimum_timeout = timing->command_latency_allowance_ns + 1;
   if (timing->operational_timeout_ns < minimum_timeout) {
     return Result<StopDeadlineBudgetDTO>::Err(
         invalid("stop_timing_parameters_invalid",
-                "Stop timeout is shorter than the latency and settling allowances",
+                "Stop timeout must be longer than the command latency allowance",
                 {{"minimum_timeout_ns", std::to_string(minimum_timeout)}}));
   }
   const auto& nominal = policy.escalation_stages.front();
@@ -121,30 +107,19 @@ Result<StopDeadlineBudgetDTO> resolve_stop_timing_budget(
   };
   const auto command_index = phase_index(nominal.containment_command.command_phase_id);
   std::size_t terminal_index = command_index;
-  std::int64_t minimum_settling{};
   for (const auto& requirement : nominal.evidence_requirements) {
     const auto index = phase_index(requirement.phase_id);
-    if (index == budget.phases.size() || index < command_index ||
-        requirement.observation_semantics.minimum_dwell_ns.value_or(0) < 0) {
-      return Result<StopDeadlineBudgetDTO>::Err(
-          invalid("stop_timing_phase_reference_invalid",
-                  "Nominal Stop evidence has an invalid phase or dwell"));
+    if (index == budget.phases.size() || index < command_index) {
+      return Result<StopDeadlineBudgetDTO>::Err(invalid(
+          "stop_timing_phase_reference_invalid", "Nominal Stop evidence has an invalid phase"));
     }
     terminal_index = std::max(terminal_index, index);
-    minimum_settling =
-        std::max(minimum_settling, requirement.observation_semantics.minimum_dwell_ns.value_or(0));
   }
   if (command_index != 0 || terminal_index >= budget.phases.size() ||
       terminal_index == command_index) {
     return Result<StopDeadlineBudgetDTO>::Err(invalid(
         "stop_timing_nominal_phases_invalid",
         "Configurable Stop timing requires distinct initial command and terminal evidence phases"));
-  }
-  if (timing->settling_allowance_ns < minimum_settling) {
-    return Result<StopDeadlineBudgetDTO>::Err(
-        invalid("stop_settling_allowance_shorter_than_evidence_dwell",
-                "Settling allowance is shorter than the required nominal evidence dwell",
-                {{"minimum_settling_allowance_ns", std::to_string(minimum_settling)}}));
   }
   const auto old_terminal = budget.phases[terminal_index].deadline_offset_ns;
   const auto suffix = budget.outer_duration_ns - old_terminal;
@@ -162,19 +137,6 @@ Result<StopDeadlineBudgetDTO> resolve_stop_timing_budget(
     return Result<StopDeadlineBudgetDTO>::Err(
         invalid("configured_stop_phase_order_invalid",
                 "Stop timings conflict with the qualified intermediate phase deadlines"));
-  }
-  for (const auto& requirement : nominal.evidence_requirements) {
-    const auto available = budget.phases[phase_index(requirement.phase_id)].deadline_offset_ns -
-                           timing->command_latency_allowance_ns;
-    const auto dwell = requirement.observation_semantics.minimum_dwell_ns.value_or(0);
-    if (available < dwell) {
-      return Result<StopDeadlineBudgetDTO>::Err(
-          invalid("stop_timing_evidence_dwell_unreachable",
-                  "Command latency leaves insufficient time for a required nominal evidence dwell",
-                  {{"evidence_item_id", requirement.evidence_item_id.value()},
-                   {"available_evidence_duration_ns", std::to_string(available)},
-                   {"minimum_evidence_duration_ns", std::to_string(dwell)}}));
-    }
   }
   return Result<StopDeadlineBudgetDTO>::Ok(std::move(budget));
 }

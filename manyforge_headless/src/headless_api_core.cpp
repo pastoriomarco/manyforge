@@ -3808,7 +3808,25 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
           "manyforge.motion.runtime_collision", operation_id);
     }
   }
-  const bool active = IsOperationFaultState(state_name) && !reset_accepted;
+  // Q30: an operation that ended InterventionRequired because of a runtime
+  // collision outside a Stop raises one alarm only, the runtime-collision
+  // alarm; it is not also reported as an execution fault.
+  bool runtime_collision_outcome = active_runtime_collisions_.contains(operation_id);
+  for (const auto &participant : RequiredArray(state, "participants")) {
+    const auto *error = participant.find_object_member("terminal_error");
+    const auto *details =
+        error != nullptr && error->is_object() ? error->find_object_member("details")
+                                               : nullptr;
+    const auto *reason = details != nullptr && details->is_object()
+                             ? details->find_object_member("reason")
+                             : nullptr;
+    if (reason != nullptr && reason->is_string() &&
+        reason->as_string() == "runtime_collision_fault") {
+      runtime_collision_outcome = true;
+    }
+  }
+  const bool active = IsOperationFaultState(state_name) && !reset_accepted &&
+                      !runtime_collision_outcome;
   const bool clear = reset_accepted || IsNormalOperationTerminal(state_name);
   if (!active && !clear) {
     return;

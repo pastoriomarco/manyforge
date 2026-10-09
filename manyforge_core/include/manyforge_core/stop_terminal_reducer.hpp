@@ -218,6 +218,11 @@ struct StopCertificateDTO final {
   std::optional<StopFaultLatchGeneration> fault_latch_generation;
   std::int64_t completed_at_ns{};
   std::optional<ErrorDTO> terminal_error;
+  /// Scope entries whose hard stop was the intended Stop: requested directly
+  /// (a zero-speed hold timeout, or Reset without an operator Stop profile;
+  /// Q27, Q31) or chosen by the Stop planner (Q33). Their strongest stage is
+  /// then not an escalation. Canonically ordered; normally empty.
+  std::vector<StopScopeEntryKeyDTO> lane_hard_stop_requested{};
 
   friend bool operator==(const StopCertificateDTO&, const StopCertificateDTO&) = default;
 };
@@ -243,6 +248,8 @@ struct StopTerminalReductionInputDTO final {
   std::optional<StopFaultLatchGeneration> fault_latch_generation;
   std::int64_t completed_at_ns{};
   std::optional<ErrorDTO> terminal_error;
+  /// This Stop's own entries whose hard stop was the intended Stop.
+  std::vector<StopScopeEntryKeyDTO> lane_hard_stop_requested{};
 
   friend bool operator==(const StopTerminalReductionInputDTO&,
                          const StopTerminalReductionInputDTO&) = default;

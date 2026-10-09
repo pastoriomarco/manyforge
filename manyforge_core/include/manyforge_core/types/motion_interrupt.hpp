@@ -103,12 +103,12 @@ struct MotionInterruptStopProfileDTO {
   /// catalog selector or runtime lookup key.
   std::string profile_id;
   MotionInterruptStopMode stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  /// Soft-on-path ramp duration, excluding its bounded command lead-in.
-  /// Spring-back retains its whole replacement duration (lead-in included),
-  /// split equally between forward braking and return.
-  /// Required for `kSoftOnPath`; deployments MAY provide defaults for
-  /// `kSpringBackHold`. For on-path spring-back the value is split into equal
-  /// forward-deceleration and reverse-return halves.
+  /// Controlled-Stop deceleration time, including the bounded command lead-in
+  /// (`stop_traj_delta_s`); the soft ramp lasts the remainder (as main).
+  /// Required for `kSoftOnPath`; an unset `kSpringBackHold` value takes
+  /// `kDefaultDecelerationTimeS` once, when the profile is loaded. For on-path
+  /// spring-back the value is split into equal forward-deceleration (lead-in
+  /// included) and reverse-return halves.
   std::optional<double> deceleration_time_s;
   /// Typed source-URDF/SRDF-joint acceleration limits. Required with exact
   /// target-joint coverage for soft_on_path and spring_back_hold; forbidden

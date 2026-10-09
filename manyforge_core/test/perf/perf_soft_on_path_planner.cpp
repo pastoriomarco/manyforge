@@ -168,6 +168,7 @@ TrajectoryDTO make_reference_trajectory() {
     trajectory.waypoints.push_back(
         TrajectoryWaypointDTO{t, point.q, point.v, point.a});
   }
+  trajectory.runtime_scale_bounds = manyforge::core::TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
   return trajectory;
 }
 
@@ -450,12 +451,8 @@ int main() {
   const auto config = make_config(trajectory);
   const std::size_t plan_iterations =
       read_size_env("MANYFORGE_SOFT_ON_PATH_PLAN_ITERATIONS", 5000);
-  const std::size_t envelope_iterations =
-      read_size_env("MANYFORGE_SOFT_ON_PATH_ENVELOPE_ITERATIONS", 20);
   const auto plan_p999_budget_us =
       read_double_env("MANYFORGE_SOFT_ON_PATH_PLAN_P999_BUDGET_US");
-  const auto envelope_p99_budget_us =
-      read_double_env("MANYFORGE_SOFT_ON_PATH_ENVELOPE_P99_BUDGET_US");
   const std::size_t allocation_iterations =
       read_size_env("MANYFORGE_SOFT_ON_PATH_ALLOCATION_ITERATIONS", 1000);
   const auto prevalidated_allocation_budget =
@@ -481,51 +478,6 @@ int main() {
   }
   const auto plan_percentiles = summarize(std::move(plan_samples_us));
 
-  std::vector<double> envelope_samples_us;
-  envelope_samples_us.reserve(envelope_iterations);
-  std::size_t envelope_checked_samples = 0;
-  std::size_t envelope_natural_completion_samples = 0;
-  std::size_t envelope_rejections = 0;
-  for (std::size_t i = 0; i < envelope_iterations; ++i) {
-    const auto start = std::chrono::steady_clock::now();
-    const auto result =
-        manyforge::core::validate_soft_on_path_feasibility_envelope(
-            trajectory, profile, config);
-    const auto end = std::chrono::steady_clock::now();
-    if (result.ok()) {
-      envelope_checked_samples = result.value().checked_samples;
-      envelope_natural_completion_samples =
-          result.value().natural_completion_samples;
-    } else {
-      const auto& error = result.error();
-      const auto reason_it = error.details.find("reason");
-      const auto fallback_it = error.details.find("recommended_fallback");
-      const bool qualified_fallback_gap =
-          reason_it != error.details.end() &&
-          reason_it->second == "soft_on_path_feasibility_envelope_infeasible" &&
-          fallback_it != error.details.end() &&
-          fallback_it->second == "spring_back_hold";
-      if (!qualified_fallback_gap) {
-        std::cerr << "soft_on_path feasibility envelope rejected iteration "
-                  << i << ": " << error.message << "\n";
-        return 2;
-      }
-      ++envelope_rejections;
-      const auto checked_it = error.details.find("checked_samples");
-      if (checked_it != error.details.end()) {
-        try {
-          envelope_checked_samples = std::max(
-              envelope_checked_samples,
-              static_cast<std::size_t>(std::stoull(checked_it->second)));
-        } catch (...) {
-        }
-      }
-    }
-    envelope_samples_us.push_back(
-        std::chrono::duration<double, std::micro>(end - start).count());
-  }
-  const auto envelope_percentiles = summarize(std::move(envelope_samples_us));
-
   const auto prevalidated_sampler_allocations =
       measure_prevalidated_sampler_allocations(trajectory, allocation_iterations);
   const auto classic_sampler_allocations =
@@ -544,10 +496,6 @@ int main() {
       plan_percentiles.p999_us > *plan_p999_budget_us) {
     budget_pass = false;
   }
-  if (envelope_p99_budget_us.has_value() &&
-      envelope_percentiles.p99_us > *envelope_p99_budget_us) {
-    budget_pass = false;
-  }
   if (prevalidated_allocation_budget.has_value() &&
       prevalidated_sampler_allocations.allocations >
           *prevalidated_allocation_budget) {
@@ -560,42 +508,24 @@ int main() {
   }
 
   std::ostringstream out;
-  out << "{"
-      << "\"scenario\":\"phase_4_5g_soft_on_path_planner_latency\","
+  out << "{" << "\"scenario\":\"phase_4_5g_soft_on_path_planner_latency\","
       << "\"iterations\":" << plan_iterations << ","
-      << "\"envelope_iterations\":" << envelope_iterations << ","
       << "\"trajectory_waypoints\":" << trajectory.waypoints.size() << ","
       << "\"joint_count\":" << trajectory.joint_names.size() << ","
-      << "\"deceleration_time_s\":"
-      << format_double(*profile.deceleration_time_s) << ","
-      << "\"stop_traj_delta_s\":"
-      << format_double(config.stop_traj_delta_s) << ","
-      << "\"sample_period_s\":" << format_double(config.sample_period_s)
-      << ",\"trip_time_plan\":{" << percentiles_json(plan_percentiles) << "},"
-      << "\"arm_time_feasibility_envelope\":{\"checked_samples\":"
-      << envelope_checked_samples << ",\"natural_completion_samples\":"
-      << envelope_natural_completion_samples
-      << ",\"qualified_fallback_rejections\":"
-      << envelope_rejections << "," << percentiles_json(envelope_percentiles)
-      << "},\"allocation_counts\":{\"prevalidated_sampling\":{"
-      << allocation_probe_json(prevalidated_sampler_allocations)
-      << "},\"classic_sampling\":{"
+      << "\"deceleration_time_s\":" << format_double(*profile.deceleration_time_s) << ","
+      << "\"stop_traj_delta_s\":" << format_double(config.stop_traj_delta_s) << ","
+      << "\"sample_period_s\":" << format_double(config.sample_period_s) << ",\"trip_time_plan\":{"
+      << percentiles_json(plan_percentiles) << "},"
+      << "\"allocation_counts\":{\"prevalidated_sampling\":{"
+      << allocation_probe_json(prevalidated_sampler_allocations) << "},\"classic_sampling\":{"
       << allocation_probe_json(classic_sampler_allocations)
       << "},\"active_reference_snapshot_shared_ptr\":{"
       << allocation_probe_json(shared_reference_allocations)
       << "},\"legacy_deep_copy_snapshot_baseline\":{"
-      << allocation_probe_json(legacy_deep_copy_allocations)
-      << "},\"path_deviation_measurement\":{"
-      << allocation_probe_json(path_deviation_allocations)
-      << "}},\"budgets\":{\"plan_p999_us\":";
+      << allocation_probe_json(legacy_deep_copy_allocations) << "},\"path_deviation_measurement\":{"
+      << allocation_probe_json(path_deviation_allocations) << "}},\"budgets\":{\"plan_p999_us\":";
   if (plan_p999_budget_us.has_value()) {
     out << format_double(*plan_p999_budget_us);
-  } else {
-    out << "null";
-  }
-  out << ",\"envelope_p99_us\":";
-  if (envelope_p99_budget_us.has_value()) {
-    out << format_double(*envelope_p99_budget_us);
   } else {
     out << "null";
   }

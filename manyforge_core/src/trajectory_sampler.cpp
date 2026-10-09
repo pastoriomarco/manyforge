@@ -1,7 +1,6 @@
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -108,141 +107,18 @@ EndpointSamples classify_endpoints(const TrajectoryWaypointDTO& a,
   return out;
 }
 
-// One joint's value and first three time derivatives on one segment. The
-// third derivative is the segment polynomial's own; across knots it is only
-// as continuous as the interpolation (degree 1 and 3 are not C2).
-struct JointDerivatives {
-  double position;
-  double velocity;
-  double acceleration;
-  double jerk;
-};
-
-// Basis values shared by every joint of one segment sample.
-struct SegmentBasis {
-  double s;
-  double T;
-  double inv_T;
-  double inv_T2;
-  double inv_T3;
-  // Cubic: H10, H01, H11 and their first two derivatives (index = order).
-  std::array<double, 3> H10{};
-  std::array<double, 3> H01{};
-  std::array<double, 3> H11{};
-  // Quintic: N1..N5 (index 0 unused) and their first three derivatives.
-  std::array<std::array<double, 4>, 6> N{};
-};
-
-SegmentBasis make_basis(double s, double T, std::uint8_t degree) noexcept {
-  SegmentBasis basis{};
-  basis.s = s;
-  basis.T = T;
-  basis.inv_T = 1.0 / T;
-  basis.inv_T2 = basis.inv_T * basis.inv_T;
-  basis.inv_T3 = basis.inv_T2 * basis.inv_T;
-  const double s2 = s * s;
-  const double s3 = s2 * s;
-  if (degree == 3) {
-    basis.H10 = {s - 2.0 * s2 + s3, 1.0 - 4.0 * s + 3.0 * s2, -4.0 + 6.0 * s};
-    basis.H01 = {3.0 * s2 - 2.0 * s3, 6.0 * s - 6.0 * s2, 6.0 - 12.0 * s};
-    basis.H11 = {-s2 + s3, -2.0 * s + 3.0 * s2, -2.0 + 6.0 * s};
-  } else if (degree == 5) {
-    const double s4 = s3 * s;
-    const double s5 = s4 * s;
-    basis.N[1] = {s - 6.0 * s3 + 8.0 * s4 - 3.0 * s5, 1.0 - 18.0 * s2 + 32.0 * s3 - 15.0 * s4,
-                  -36.0 * s + 96.0 * s2 - 60.0 * s3, -36.0 + 192.0 * s - 180.0 * s2};
-    basis.N[2] = {0.5 * s2 - 1.5 * s3 + 1.5 * s4 - 0.5 * s5, s - 4.5 * s2 + 6.0 * s3 - 2.5 * s4,
-                  1.0 - 9.0 * s + 18.0 * s2 - 10.0 * s3, -9.0 + 36.0 * s - 30.0 * s2};
-    basis.N[3] = {10.0 * s3 - 15.0 * s4 + 6.0 * s5, 30.0 * s2 - 60.0 * s3 + 30.0 * s4,
-                  60.0 * s - 180.0 * s2 + 120.0 * s3, 60.0 - 360.0 * s + 360.0 * s2};
-    basis.N[4] = {-4.0 * s3 + 7.0 * s4 - 3.0 * s5, -12.0 * s2 + 28.0 * s3 - 15.0 * s4,
-                  -24.0 * s + 84.0 * s2 - 60.0 * s3, -24.0 + 168.0 * s - 180.0 * s2};
-    basis.N[5] = {0.5 * s3 - s4 + 0.5 * s5, 1.5 * s2 - 4.0 * s3 + 2.5 * s4,
-                  3.0 * s - 12.0 * s2 + 10.0 * s3, 3.0 - 24.0 * s + 30.0 * s2};
-  }
-  return basis;
-}
-
-JointDerivatives linear_joint(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
-                              const SegmentBasis& basis, std::size_t j) noexcept {
-  const double pa = a.positions_rad[j];
-  const double pb = b.positions_rad[j];
-  return {(1.0 - basis.s) * pa + basis.s * pb, (pb - pa) * basis.inv_T, 0.0, 0.0};
-}
-
-JointDerivatives cubic_joint(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
-                             const SegmentBasis& basis, std::size_t j) noexcept {
-  const double s = basis.s;
-  const double T = basis.T;
-  const double pa = a.positions_rad[j];
-  const double pb = b.positions_rad[j];
-  const double delta = pb - pa;
-  const double va = a.velocities_rad_s[j];
-  const double vb = b.velocities_rad_s[j];
-  const double Tva = T * va;
-  const double Tvb = T * vb;
-  if (pa == pb && va == 0.0 && vb == 0.0) return {pa, 0.0, 0.0, 0.0};
-  // H00 + H01 = 1, while their derivatives sum to zero. Work in
-  // displacement coordinates so a joint origin cannot pollute derivatives.
-  const auto& H10 = basis.H10;
-  const auto& H01 = basis.H01;
-  const auto& H11 = basis.H11;
-  return {s == 0.0   ? pa
-          : s == 1.0 ? pb
-                     : pa + (Tva * H10[0] + delta * H01[0] + Tvb * H11[0]),
-          s == 0.0   ? va
-          : s == 1.0 ? vb
-                     : (Tva * H10[1] + delta * H01[1] + Tvb * H11[1]) * basis.inv_T,
-          (Tva * H10[2] + delta * H01[2] + Tvb * H11[2]) * basis.inv_T2,
-          // Constant third derivatives: H10 -> 6, H01 -> -12, H11 -> 6.
-          (6.0 * Tva - 12.0 * delta + 6.0 * Tvb) * basis.inv_T3};
-}
-
-JointDerivatives quintic_joint(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
-                               const SegmentBasis& basis, std::size_t j) noexcept {
-  const double s = basis.s;
-  const double T = basis.T;
-  const double T2 = T * T;
-  const double pa = a.positions_rad[j];
-  const double pb = b.positions_rad[j];
-  const double delta = pb - pa;
-  const double va = a.velocities_rad_s[j];
-  const double vb = b.velocities_rad_s[j];
-  const double aa = a.accelerations_rad_s2[j];
-  const double ab = b.accelerations_rad_s2[j];
-  const double Tva = T * va;
-  const double Tvb = T * vb;
-  const double T2aa = T2 * aa;
-  const double T2ab = T2 * ab;
-  if (pa == pb && va == 0.0 && vb == 0.0 && aa == 0.0 && ab == 0.0) return {pa, 0.0, 0.0, 0.0};
-  const auto& N = basis.N;
-  const auto combine = [&](std::size_t order) {
-    return Tva * N[1][order] + T2aa * N[2][order] + delta * N[3][order] + Tvb * N[4][order] +
-           T2ab * N[5][order];
-  };
-  const double jerk = combine(3) * basis.inv_T3;
-  // Endpoint P/V/A is authoritative even when the displacement of extreme
-  // finite endpoints is not representable (avoid infinity multiplied by zero).
-  if (s == 0.0 || s == 1.0) {
-    const auto& point = s == 0.0 ? a : b;
-    return {point.positions_rad[j], point.velocities_rad_s[j], point.accelerations_rad_s2[j],
-            jerk};
-  }
-  // N0 + N3 = 1; differentiate only the local displacement.
-  return {pa + combine(0), combine(1) * basis.inv_T, combine(2) * basis.inv_T2, jerk};
-}
-
 void emit_linear(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
                  double s, double T, std::size_t joint_count,
                  TrajectorySampleResult& out) {
   out.positions_rad.resize(joint_count);
   out.velocities_rad_s.assign(joint_count, 0.0);
   out.accelerations_rad_s2.assign(joint_count, 0.0);
-  const SegmentBasis basis = make_basis(s, T, 1);
+  const double inv_T = 1.0 / T;
   for (std::size_t j = 0; j < joint_count; ++j) {
-    const auto value = linear_joint(a, b, basis, j);
-    out.positions_rad[j] = value.position;
-    out.velocities_rad_s[j] = value.velocity;
+    const double pa = a.positions_rad[j];
+    const double pb = b.positions_rad[j];
+    out.positions_rad[j] = (1.0 - s) * pa + s * pb;
+    out.velocities_rad_s[j] = (pb - pa) * inv_T;
   }
   out.degree = 1;
 }
@@ -253,19 +129,56 @@ void emit_cubic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
   out.positions_rad.resize(joint_count);
   out.velocities_rad_s.resize(joint_count);
   out.accelerations_rad_s2.resize(joint_count);
-  const SegmentBasis basis = make_basis(s, T, 3);
+
+  const double s2 = s * s;
+  const double s3 = s2 * s;
+
+  const double H10 = s - 2.0 * s2 + s3;
+  const double H01 = 3.0 * s2 - 2.0 * s3;
+  const double H11 = -s2 + s3;
+
+  const double dH10 = 1.0 - 4.0 * s + 3.0 * s2;
+  const double dH01 = 6.0 * s - 6.0 * s2;
+  const double dH11 = -2.0 * s + 3.0 * s2;
+
+  const double ddH10 = -4.0 + 6.0 * s;
+  const double ddH01 = 6.0 - 12.0 * s;
+  const double ddH11 = -2.0 + 6.0 * s;
+
+  const double inv_T = 1.0 / T;
+  const double inv_T2 = inv_T * inv_T;
+
   for (std::size_t j = 0; j < joint_count; ++j) {
-    const auto value = cubic_joint(a, b, basis, j);
-    out.positions_rad[j] = value.position;
-    out.velocities_rad_s[j] = value.velocity;
-    out.accelerations_rad_s2[j] = value.acceleration;
+    const double pa = a.positions_rad[j];
+    const double pb = b.positions_rad[j];
+    const double delta = pb - pa;
+    const double va = a.velocities_rad_s[j];
+    const double vb = b.velocities_rad_s[j];
+    const double Tva = T * va;
+    const double Tvb = T * vb;
+
+    if (pa == pb && va == 0.0 && vb == 0.0) {
+      out.positions_rad[j] = pa;
+      out.velocities_rad_s[j] = out.accelerations_rad_s2[j] = 0.0;
+      continue;
+    }
+    // H00 + H01 = 1, while their derivatives sum to zero. Work in
+    // displacement coordinates so a joint origin cannot pollute derivatives.
+    out.positions_rad[j] = s == 0.0   ? pa
+                           : s == 1.0 ? pb
+                                      : pa + (Tva * H10 + delta * H01 + Tvb * H11);
+    out.velocities_rad_s[j] = s == 0.0   ? va
+                              : s == 1.0 ? vb
+                                         : (Tva * dH10 + delta * dH01 + Tvb * dH11) * inv_T;
+    out.accelerations_rad_s2[j] = (Tva * ddH10 + delta * ddH01 + Tvb * ddH11) * inv_T2;
   }
   out.degree = 3;
 }
 
 void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b, double s,
                   double T, std::size_t joint_count, TrajectorySampleResult& out) {
-  // Endpoint P/V/A is authoritative: copy the stored vectors unchanged.
+  // Endpoint P/V/A is authoritative even when the displacement of extreme
+  // finite endpoints is not representable (avoid infinity multiplied by zero).
   if (s == 0.0 || s == 1.0) {
     const auto& point = s == 0.0 ? a : b;
     out.positions_rad = point.positions_rad;
@@ -277,12 +190,58 @@ void emit_quintic(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b
   out.positions_rad.resize(joint_count);
   out.velocities_rad_s.resize(joint_count);
   out.accelerations_rad_s2.resize(joint_count);
-  const SegmentBasis basis = make_basis(s, T, 5);
+
+  const double s2 = s * s;
+  const double s3 = s2 * s;
+  const double s4 = s3 * s;
+  const double s5 = s4 * s;
+
+  const double N1 = s - 6.0 * s3 + 8.0 * s4 - 3.0 * s5;
+  const double N2 = 0.5 * s2 - 1.5 * s3 + 1.5 * s4 - 0.5 * s5;
+  const double N3 = 10.0 * s3 - 15.0 * s4 + 6.0 * s5;
+  const double N4 = -4.0 * s3 + 7.0 * s4 - 3.0 * s5;
+  const double N5 = 0.5 * s3 - s4 + 0.5 * s5;
+
+  const double dN1 = 1.0 - 18.0 * s2 + 32.0 * s3 - 15.0 * s4;
+  const double dN2 = s - 4.5 * s2 + 6.0 * s3 - 2.5 * s4;
+  const double dN3 = 30.0 * s2 - 60.0 * s3 + 30.0 * s4;
+  const double dN4 = -12.0 * s2 + 28.0 * s3 - 15.0 * s4;
+  const double dN5 = 1.5 * s2 - 4.0 * s3 + 2.5 * s4;
+
+  const double ddN1 = -36.0 * s + 96.0 * s2 - 60.0 * s3;
+  const double ddN2 = 1.0 - 9.0 * s + 18.0 * s2 - 10.0 * s3;
+  const double ddN3 = 60.0 * s - 180.0 * s2 + 120.0 * s3;
+  const double ddN4 = -24.0 * s + 84.0 * s2 - 60.0 * s3;
+  const double ddN5 = 3.0 * s - 12.0 * s2 + 10.0 * s3;
+
+  const double inv_T = 1.0 / T;
+  const double inv_T2 = inv_T * inv_T;
+  const double T2 = T * T;
+
   for (std::size_t j = 0; j < joint_count; ++j) {
-    const auto value = quintic_joint(a, b, basis, j);
-    out.positions_rad[j] = value.position;
-    out.velocities_rad_s[j] = value.velocity;
-    out.accelerations_rad_s2[j] = value.acceleration;
+    const double pa = a.positions_rad[j];
+    const double pb = b.positions_rad[j];
+    const double delta = pb - pa;
+    const double va = a.velocities_rad_s[j];
+    const double vb = b.velocities_rad_s[j];
+    const double aa = a.accelerations_rad_s2[j];
+    const double ab = b.accelerations_rad_s2[j];
+    const double Tva = T * va;
+    const double Tvb = T * vb;
+    const double T2aa = T2 * aa;
+    const double T2ab = T2 * ab;
+
+    if (pa == pb && va == 0.0 && vb == 0.0 && aa == 0.0 && ab == 0.0) {
+      out.positions_rad[j] = pa;
+      out.velocities_rad_s[j] = out.accelerations_rad_s2[j] = 0.0;
+      continue;
+    }
+    // N0 + N3 = 1; differentiate only the local displacement.
+    out.positions_rad[j] = pa + (Tva * N1 + T2aa * N2 + delta * N3 + Tvb * N4 + T2ab * N5);
+    out.velocities_rad_s[j] =
+        (Tva * dN1 + T2aa * dN2 + delta * dN3 + Tvb * dN4 + T2ab * dN5) * inv_T;
+    out.accelerations_rad_s2[j] =
+        (Tva * ddN1 + T2aa * ddN2 + delta * ddN3 + Tvb * ddN4 + T2ab * ddN5) * inv_T2;
   }
   out.degree = 5;
 }
@@ -512,48 +471,6 @@ Result<TrajectorySampleResult> sample_trajectory(
     return Result<TrajectorySampleResult>::Err(sampled.error());
   }
   return Result<TrajectorySampleResult>::Ok(std::move(out));
-}
-
-bool evaluate_trajectory_segment(const TrajectoryDTO& trajectory, std::size_t segment_index,
-                                 double time_s, std::uint8_t degree,
-                                 std::span<double> position, std::span<double> velocity,
-                                 std::span<double> acceleration,
-                                 std::span<double> jerk) noexcept {
-  if (!std::isfinite(time_s) || (degree != 1 && degree != 3 && degree != 5) ||
-      trajectory.waypoints.size() < 2 || segment_index >= trajectory.waypoints.size() - 1) {
-    return false;
-  }
-  const auto& a = trajectory.waypoints[segment_index];
-  const auto& b = trajectory.waypoints[segment_index + 1];
-  const bool final_endpoint = segment_index + 2 == trajectory.waypoints.size() &&
-                              time_s == b.time_from_start_s;
-  const double T = b.time_from_start_s - a.time_from_start_s;
-  const std::size_t joint_count = position.size();
-  if (!std::isfinite(T) || !(T > 0.0) || time_s < a.time_from_start_s ||
-      (time_s >= b.time_from_start_s && !final_endpoint) || velocity.size() != joint_count ||
-      acceleration.size() != joint_count || jerk.size() != joint_count ||
-      a.positions_rad.size() != joint_count || b.positions_rad.size() != joint_count ||
-      (degree >= 3 && (a.velocities_rad_s.size() != joint_count ||
-                       b.velocities_rad_s.size() != joint_count)) ||
-      (degree == 5 && (a.accelerations_rad_s2.size() != joint_count ||
-                       b.accelerations_rad_s2.size() != joint_count))) {
-    return false;
-  }
-  const SegmentBasis basis = make_basis((time_s - a.time_from_start_s) / T, T, degree);
-  for (std::size_t j = 0; j < joint_count; ++j) {
-    const auto value = degree == 5   ? quintic_joint(a, b, basis, j)
-                       : degree == 3 ? cubic_joint(a, b, basis, j)
-                                     : linear_joint(a, b, basis, j);
-    if (!std::isfinite(value.position) || !std::isfinite(value.velocity) ||
-        !std::isfinite(value.acceleration) || !std::isfinite(value.jerk)) {
-      return false;
-    }
-    position[j] = value.position;
-    velocity[j] = value.velocity;
-    acceleration[j] = value.acceleration;
-    jerk[j] = value.jerk;
-  }
-  return true;
 }
 
 }  // namespace manyforge::core

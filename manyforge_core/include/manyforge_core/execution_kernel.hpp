@@ -591,16 +591,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                                  const char* trigger);
   void try_refresh_recovery_assessment(const char* trigger);
   void schedule_recovery_assessment_refresh(const char* trigger) noexcept;
-  bool publish_stop_certificate(KernelStopCertificateDTO certificate,
-                                bool coalesce_owner_session = false);
   std::uint64_t begin_operator_stop_owner_generation(std::uint64_t execution_id);
-  std::uint64_t ensure_operator_stop_owner_generation(std::uint64_t execution_id);
   std::uint64_t operator_stop_owner_generation_for_execution(std::uint64_t execution_id) const;
-  void publish_operator_stop_certificate(std::uint64_t execution_id,
-                                         StopCertificateOutcome completion_result,
-                                         bool backend_stop_confirmed, std::string command_source,
-                                         std::string requested_stop_mode = "hard_stop",
-                                         std::string executed_stop_mode = "hard_stop");
   void schedule_recovery_freshness_deadline_locked(const KernelRecoveryAssessmentDTO& assessment);
   void schedule_recovery_observation_poll_locked(const KernelRecoveryAssessmentDTO& assessment);
   KernelRecoveryActionResultDTO apply_recovery_action_impl(KernelRecoveryActionRequestDTO request);

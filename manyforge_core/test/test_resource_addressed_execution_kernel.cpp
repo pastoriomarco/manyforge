@@ -3584,7 +3584,10 @@ TEST(ResourceAddressedExecutionKernelTest, BootstrapInventoryCannotCertifyUnknow
       ASSERT_TRUE(certificate.ok());
       EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kFailedUncontained);
       EXPECT_EQ(certificate.value().scope_entries.size(), binding.value().resources.size());
-      EXPECT_TRUE(replacement.get_stop_fault_latch().has_value());
+      // Q29: the uncontained Stop alone no longer latches (the Full Stop
+      // here). An ordinary selector that newly captures the unknown
+      // predecessor's unreconciled resources still keeps its latch.
+      EXPECT_EQ(replacement.get_stop_fault_latch().has_value(), selector != 0);
     }
   }
 }
@@ -4395,7 +4398,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       ASSERT_TRUE(certificate.terminal_error.has_value());
       EXPECT_EQ(certificate.terminal_error->details.at("reason"),
                 fails ? "prepared_motion_cancel_threw" : "prepared_cancellation_deadline_expired");
-      EXPECT_TRUE(kernel.get_stop_fault_latch().has_value());
+      // Q29: InterventionRequired without a cell-wide Stop-fault latch.
+      EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
       EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value().state,
                 OperationStateKind::kInterventionRequired);
     }
@@ -4463,7 +4467,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     if (finished) {
       EXPECT_EQ(kernel.get_stop_status(stopped.value().stop_id).value().state,
                 StopStatusStateDTO::kPartial);
-      EXPECT_TRUE(kernel.get_stop_fault_latch().has_value());
+      EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());  // Q29
       const auto state = kernel.get_operation_state(expected.operation_id).value();
       const auto reset = kernel.reset(control_request("request.late-after-deadline.reset", expected,
                                                       state.operation_revision.value()));
@@ -4530,10 +4534,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(certificate.value().terminal_error.has_value());
   EXPECT_EQ(certificate.value().terminal_error->details.at("reason"),
             "prepared_cancel_terminal_failed");
-  EXPECT_TRUE(kernel.get_stop_fault_latch().has_value());
+  // Q29: no cell-wide latch; the operation keeps its resources until Reset.
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
   const auto next = kernel.execute(motion_operation("request.after-cancel-prepare-failure"));
   ASSERT_FALSE(next.ok());
-  EXPECT_EQ(next.error().details.at("reason"), "motion_admission_closed");
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -5521,9 +5525,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
+  // Item 19: a runtime collision outside an operator Stop ends
+  // InterventionRequired through the ordinary outcome path once contained.
+  EXPECT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
   ASSERT_EQ(operation.value().participants.size(), 1U);
-  EXPECT_EQ(operation.value().participants.front().state, OperationStateKind::kStopped);
+  EXPECT_EQ(operation.value().participants.front().state,
+            OperationStateKind::kInterventionRequired);
   ASSERT_TRUE(operation.value().participants.front().terminal_error.has_value());
   const auto& terminal_error = *operation.value().participants.front().terminal_error;
   EXPECT_EQ(terminal_error.code, std::string(to_string(ErrorCode::kExecutionAborted)));
@@ -5535,6 +5542,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+  // The contained collision is no Stop fault: no cell-wide latch.
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6613,10 +6622,10 @@ TEST(ResourceAddressedExecutionKernelTest,
 TEST(ResourceAddressedExecutionKernelTest,
      StopFaultLatchHoldsNoRestObligationForSettledNeverDispatchedParticipant) {
   // A planning participant cancelled before dispatch has no Stop stage and so
-  // no motion-rest source. When a dispatched peer escalates, the latch keeps
-  // the peer's resources for physical recovery but must not hold the
+  // no motion-rest source. When a dispatched peer is not contained, the latch
+  // keeps the peer's resources for physical recovery but must not hold the
   // never-dispatched robot's resources hostage to an observation that cannot
-  // exist.
+  // exist. (A contained escalation no longer latches at all, item 25.)
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine dispatched_engine;
@@ -6640,23 +6649,28 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto planning = kernel.execute(planning_intent);
   ASSERT_TRUE(planning.ok()) << planning.error().message;
 
-  // The nominal stage is rejected; the stronger prepared stage contains.
-  dispatched_engine.translate_stop_stage_hook = [&, calls = std::make_shared<unsigned>(0U)] {
-    if ((*calls)++ > 0U) dispatched_engine.next_stop_result = StopResultDTO{true, std::nullopt};
-  };
-  const auto stopped = kernel.stop(program_run_stop_request("request.latch.stop", "run.1"));
+  // Every prepared stage of the dispatched peer is rejected: it stays
+  // uncontained while its never-dispatched peer settles. Q29: only the kept
+  // component-incident containment still latches the cell.
+  IKernelCellAdmissionPort& port = kernel;
+  const auto contained = port.RequestComponentIncidentContainment(
+      ComponentIncidentContainmentIntentDTO{"incident.latch.1",
+                                            ControllableComponentId("component.arm"),
+                                            LifecycleBlockingCauseClassDTO::kProviderLost});
+  ASSERT_TRUE(contained.ok()) << contained.error().message;
+  const auto stopped = kernel.get_stop_status(contained.value().stop_id);
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-  ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 2U);
+  ASSERT_EQ(stopped.value().accepted.affected_operation_revisions.size(), 2U);
   ASSERT_TRUE(wait_until([&] {
-    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    const auto status = kernel.get_stop_status(contained.value().stop_id);
     return status.ok() && status.value().stop_certificate.has_value();
   }));
-  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  const auto status = kernel.get_stop_status(contained.value().stop_id);
   ASSERT_TRUE(status.ok()) << status.error().message;
   const auto certificate =
       kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
   ASSERT_TRUE(certificate.ok()) << certificate.error().message;
-  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kPartial);
   std::vector<ResourceId> dispatched_resources;
   std::vector<ResourceId> planning_resources;
   for (const auto& entry : certificate.value().scope_entries) {
@@ -6675,7 +6689,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(planning_resources.empty());
   const auto latch = kernel.get_stop_fault_latch();
   ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+  // The certificate is partial because the never-dispatched peer settled.
+  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kPartial);
   EXPECT_EQ(latch->captured_resources, dispatched_resources);
   std::vector<OperationId> operations{dispatched.value().operation_id,
                                       planning.value().operation_id};
@@ -6690,7 +6705,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   // places that natural completion (or an abort) between acceptance and the
   // stage result. Only the exact natural-completion settlement avoids
   // escalation; a still-active goal whose Stop fails, or an aborted goal,
-  // escalates and latches as before.
+  // escalates to the hard floor. A contained escalation is a degraded Stop
+  // without a cell-wide latch (item 25).
   enum class Race { kNaturalCompletion, kStillActiveStopFailed, kAbortedBeforeStage };
   for (const auto race :
        {Race::kNaturalCompletion, Race::kStillActiveStopFailed, Race::kAbortedBeforeStage}) {
@@ -6774,9 +6790,26 @@ TEST(ResourceAddressedExecutionKernelTest,
     } else {
       EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
       EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
-      const auto latch = kernel.get_stop_fault_latch();
-      ASSERT_TRUE(latch.has_value());
-      EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+      EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+      EXPECT_FALSE(kernel.cell_stop_action_projection().fault.has_value());
+      if (race == Race::kStillActiveStopFailed) {
+        // `main`'s operator Stop: the fallback hard floor stopped the motion,
+        // so the operation ends Stopped with the degraded-Stop error.
+        const auto terminal = kernel.get_operation_state(accepted.value().operation_id);
+        ASSERT_TRUE(terminal.ok()) << terminal.error().message;
+        EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+        const auto& participant = terminal.value().participants.front();
+        EXPECT_EQ(participant.state, OperationStateKind::kStopped);
+        ASSERT_TRUE(participant.terminal_error.has_value());
+        EXPECT_EQ(participant.terminal_error->code, "motion_interrupt_backend_stop_failed");
+        EXPECT_EQ(participant.terminal_error->details.at("reason"),
+                  "operator_stop_profile_failed");
+        EXPECT_EQ(participant.terminal_error->details.at("controlled_stop_error_reason"),
+                  "prepared_goal_not_active");
+        EXPECT_EQ(participant.terminal_error->details.at("emergency_fallback"),
+                  "legacy_stop_succeeded");
+        EXPECT_EQ(participant.terminal_error->details.at("hard_stop_transitioned"), "true");
+      }
     }
   }
 }
@@ -8850,7 +8883,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(certificate.value().failed.empty());
   ASSERT_TRUE(certificate.value().terminal_error.has_value());
   EXPECT_EQ(certificate.value().terminal_error->code, "participant_terminal_unavailable");
-  EXPECT_TRUE(kernel.get_stop_fault_latch().has_value());
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());  // Q29
   const auto operation_state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(operation_state.ok()) << operation_state.error().message;
   EXPECT_EQ(operation_state.value().state, OperationStateKind::kInterventionRequired);
@@ -9921,15 +9954,16 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
       // Compare the stable latch only after that independent write completes.
       const bool recorded = wait_until(
           [&] {
-            const auto current = kernel.get_stop_fault_latch();
-            return current &&
-                   current->terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
+            const auto current = kernel.get_stop_status(stopped.value().stop_id);
+            return current.ok() && current.value().terminal_projection.state ==
+                                       StopDurableProjectionStateDTO::kRecorded;
           },
           std::chrono::seconds(1));
       if (!recorded) dispatch_return.Release();
       ASSERT_TRUE(recorded);
+      // Q29: the partial Stop holds no cell-wide latch.
       const auto latch = kernel.get_stop_fault_latch();
-      ASSERT_TRUE(latch);
+      EXPECT_FALSE(latch);
       EXPECT_EQ(backend.invalidations.load(), 1);
       dispatch_return.Release();
       const auto accepted = executing.get();
@@ -11436,11 +11470,11 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
         ASSERT_TRUE(wait_until([&] {
           const auto state = kernel.get_operation_projection(executed.value().operation_id);
           if (!state.ok()) return false;
-          if (!reset_fails && !stop_fails) return !state.value().resident;
+          // Q29: a successful Reset completes after any Stop outcome.
+          if (!reset_fails) return !state.value().resident;
           if (!state.value().resident ||
               state.value().operation.state != OperationStateKind::kInterventionRequired)
             return false;
-          if (!reset_fails) return true;
           const auto& failure = state.value().operation.participants.front().terminal_error;
           return failure.has_value() &&
                  (reset_result == 1
@@ -11453,7 +11487,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
             kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
         ASSERT_TRUE(unchanged.ok());
         EXPECT_EQ(unchanged.value(), certificate.value());
-        EXPECT_EQ(kernel.get_stop_fault_latch().has_value(), stop_fails);
+        EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());  // Q29
       }
     }
   }
@@ -12797,7 +12831,19 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(status.attempted_stage_results.front().authority,
               expired ? StopStageResultAuthorityDTO::kSupersededLate
                       : StopStageResultAuthorityDTO::kAuthoritative);
-    EXPECT_EQ(kernel.get_stop_fault_latch().has_value(), expired);
+    // The deadline watchdog's hard floor contained the motion: a degraded
+    // Stop, never a cell-wide latch (item 25).
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    const auto terminal = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(terminal.ok()) << terminal.error().message;
+    EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+    if (expired) {
+      ASSERT_TRUE(terminal.value().participants.front().terminal_error.has_value());
+      EXPECT_EQ(terminal.value().participants.front().terminal_error->details.at("reason"),
+                "in_stop_completion_timeout");
+    } else {
+      EXPECT_FALSE(terminal.value().participants.front().terminal_error.has_value());
+    }
   }
 }
 
@@ -12861,26 +12907,18 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto pending = kernel.get_stop_status(stopped.value().stop_id);
     ASSERT_TRUE(pending.ok());
     EXPECT_FALSE(pending.value().stop_certificate.has_value());
-    const auto early_latch = kernel.get_stop_fault_latch();
-    ASSERT_TRUE(early_latch.has_value());
-    EXPECT_FALSE(early_latch->stop_certificate.has_value());
-    EXPECT_EQ(early_latch->trigger, StopFaultTriggerDTO::kEscalated);
-    EXPECT_EQ(pending.value().fault_latch, early_latch);
-    EXPECT_TRUE(kernel.cell_stop_action_projection().fault.has_value());
+    // Escalating to the hard floor is not a cell-wide Stop fault (item 25):
+    // no latch is published and a disjoint robot stays admissible.
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    EXPECT_FALSE(pending.value().fault_latch.has_value());
+    EXPECT_FALSE(kernel.cell_stop_action_projection().fault.has_value());
     const auto offer = kernel.get_stop_fault_recovery_offer();
     ASSERT_TRUE(offer.ok());
-    ASSERT_TRUE(offer.value().has_value());
-    EXPECT_EQ(offer.value()->latch, *early_latch);
-    EXPECT_TRUE(offer.value()->configuration_expectations.empty());
-    EXPECT_FALSE(stop_fault_recovery_offer_field_error(*offer.value()).has_value());
-    auto forged_ready = *offer.value();
-    forged_ready.latch.recovery_status = StopFaultRecoveryStatusDTO::kReady;
-    EXPECT_TRUE(stop_fault_recovery_offer_field_error(forged_ready).has_value());
-    auto blocked_intent = motion_operation("request.blocked-stage.unaffected");
-    blocked_intent.program_binding_id = unaffected_binding.value().program_binding_id;
-    const auto blocked = kernel.execute(blocked_intent);
-    ASSERT_FALSE(blocked.ok());
-    EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+    EXPECT_FALSE(offer.value().has_value());
+    auto unaffected_intent = motion_operation("request.blocked-stage.unaffected");
+    unaffected_intent.program_binding_id = unaffected_binding.value().program_binding_id;
+    const auto unaffected = kernel.execute(unaffected_intent);
+    EXPECT_TRUE(unaffected.ok()) << unaffected.error().message;
     // The rejected nominal call has returned before the strongest lane starts.
     if (!timeout) engine.next_stop_result = StopResultDTO{true, std::nullopt};
     strongest.Release();
@@ -12889,13 +12927,22 @@ TEST(ResourceAddressedExecutionKernelTest,
       const auto status = kernel.get_stop_status(stopped.value().stop_id);
       return status.ok() && status.value().stop_certificate.has_value();
     }));
-    const auto latch = kernel.get_stop_fault_latch();
-    ASSERT_TRUE(latch.has_value());
-    EXPECT_EQ(latch->latch_id, early_latch->latch_id);
-    EXPECT_EQ(latch->latch_generation, early_latch->latch_generation);
-    EXPECT_TRUE(latch->stop_certificate.has_value());
-    EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
-    EXPECT_EQ(latch->state, StopFaultLatchStateDTO::kLatched);
+    const auto status = kernel.get_stop_status(stopped.value().stop_id).value();
+    const auto certificate =
+        kernel.get_stop_certificate(status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    // `main`'s degraded Stop: Stopped, with the error explaining the downgrade.
+    const auto terminal = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(terminal.ok()) << terminal.error().message;
+    EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+    ASSERT_TRUE(terminal.value().participants.front().terminal_error.has_value());
+    EXPECT_EQ(terminal.value().participants.front().terminal_error->details.at("reason"),
+              timeout ? "in_stop_completion_timeout" : "operator_stop_profile_failed");
+    EXPECT_EQ(
+        terminal.value().participants.front().terminal_error->details.at("emergency_fallback"),
+        "legacy_stop_succeeded");
   }
 }
 
@@ -12944,8 +12991,11 @@ TEST(ResourceAddressedExecutionKernelTest,
       std::chrono::seconds(10)));
 }
 
+// Q29: a collision on one robot's Stop path ends that operation
+// InterventionRequired but no longer latches the cell, so a disjoint robot's
+// prepared motion still dispatches (as `main`, which had no cell latch).
 TEST(ResourceAddressedExecutionKernelTest,
-     PendingCellStopFaultPreventsDisjointPrepareDispatch) {
+     StopPathCollisionDoesNotBlockDisjointPrepareDispatch) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine, second_engine;
@@ -12956,7 +13006,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
-  HeldSettlementCall strongest;
+  HeldSettlementCall nominal, strongest;
   const auto first = kernel.execute(motion_operation("request.fault-gate.first"));
   ASSERT_TRUE(first.ok());
   second_engine.defer_prepare_completion = true;
@@ -12964,21 +13014,26 @@ TEST(ResourceAddressedExecutionKernelTest,
   intent.program_binding_id = second_binding.value().program_binding_id;
   const auto second = kernel.execute(intent);
   ASSERT_TRUE(second.ok());
-  first_engine.next_stop_result =
-      StopResultDTO{false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
   first_engine.translate_stop_stage_hook = [calls = std::make_shared<std::atomic<unsigned>>(0),
-                                            hold = strongest.Blocker()] {
-    if (calls->fetch_add(1) > 0) hold();
+                                            hold_nominal = nominal.Blocker(),
+                                            hold_strongest = strongest.Blocker()] {
+    if (calls->fetch_add(1) == 0) {
+      hold_nominal();
+    } else {
+      hold_strongest();
+    }
   };
   const auto stopped = kernel.stop(stop_request("request.fault-gate.stop", first.value(), 1U));
   ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(nominal.Entered());
+  first_engine.emit_collision();
   ASSERT_TRUE(strongest.Entered());
-  ASSERT_TRUE(kernel.get_stop_fault_latch().has_value());
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
   ASSERT_TRUE(second_engine.complete_preparation().ok());
-  ASSERT_TRUE(wait_until([&] { return second_engine.cancel_prepared_motion_calls.load() > 0; }));
-  EXPECT_EQ(second_engine.dispatch_prepared_motion_calls.load(), 0);
-  first_engine.next_stop_result = StopResultDTO{true, std::nullopt};
+  ASSERT_TRUE(wait_until([&] { return second_engine.dispatch_prepared_motion_calls.load() > 0; }));
+  EXPECT_EQ(second_engine.cancel_prepared_motion_calls.load(), 0);
   strongest.Release();
+  nominal.Release();
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped.value().stop_id);
     return status.ok() && status.value().stop_certificate.has_value();
@@ -14219,7 +14274,7 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
                                           clock, scheduler, journal, std::move(config));
   const auto operation = kernel.execute(motion_operation("request.surveillance.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  HeldSettlementCall concurrent_strongest;
+  HeldSettlementCall concurrent_nominal, concurrent_strongest;
   std::optional<OperationAcceptedDTO> concurrent_operation;
   std::optional<StopAcceptedDTO> concurrent_stop;
   if (concurrent_fault_during_clear) {
@@ -14228,12 +14283,15 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
     const auto admitted = kernel.execute(intent);
     ASSERT_TRUE(admitted.ok());
     concurrent_operation = admitted.value();
-    unaffected_engine.next_stop_result =
-        StopResultDTO{false, ErrorDTO{"controller_stop_rejected", "controller rejected Stop", {}}};
     unaffected_engine.translate_stop_stage_hook =
-        [&, hold_concurrent_strongest = concurrent_strongest.Blocker(),
+        [&, hold_concurrent_nominal = concurrent_nominal.Blocker(),
+         hold_concurrent_strongest = concurrent_strongest.Blocker(),
          concurrent_calls = std::make_shared<std::atomic<unsigned>>(0)] {
-          if (concurrent_calls->fetch_add(1U) > 0U) hold_concurrent_strongest();
+          if (concurrent_calls->fetch_add(1U) == 0U) {
+            hold_concurrent_nominal();
+          } else {
+            hold_concurrent_strongest();
+          }
         };
   }
   std::optional<StopAcceptedDTO> stopped;
@@ -14248,17 +14306,22 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
         liveness.manager_owner_epoch, 1U, ManagerLivenessLossKindDTO::kExpiry});
     ASSERT_TRUE(wait_until([&] {
       std::lock_guard lock(journal.mutex);
-      if (!journal.last_stop_accepted.has_value()) {
-        return false;
-      }
-      stopped = journal.last_stop_accepted;
-      return true;
+      return journal.last_stop_accepted.has_value();
     }));
-  } else {
-    const auto accepted =
-        kernel.stop(stop_request("request.surveillance.stop", operation.value(), 1U));
-    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-    stopped = accepted.value();
+  }
+  // Q29: an uncontained Stop no longer latches the cell by itself. The
+  // retained latch here comes from the component-incident containment
+  // (kept, Q32), which joins a resident liveness-loss containment.
+  {
+    IKernelCellAdmissionPort& port = kernel;
+    const auto contained = port.RequestComponentIncidentContainment(
+        ComponentIncidentContainmentIntentDTO{"incident.surveillance.1",
+                                              ControllableComponentId("component.arm"),
+                                              LifecycleBlockingCauseClassDTO::kProviderLost});
+    ASSERT_TRUE(contained.ok()) << contained.error().message;
+    const auto status = kernel.get_stop_status(contained.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    stopped = status.value().accepted;
   }
   ASSERT_TRUE(stopped.has_value());
   ASSERT_TRUE(wait_until([&] {
@@ -14409,6 +14472,10 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
           stop_request("request.surveillance.concurrent.stop", *concurrent_operation, 1U));
       ASSERT_TRUE(result.ok());
       concurrent_stop = result.value();
+      ASSERT_TRUE(concurrent_nominal.Entered());
+      // A collision on the newer Stop's path latches its fault while it is
+      // still containing (an ordinary escalation no longer latches, item 25).
+      unaffected_engine.emit_collision();
       ASSERT_TRUE(concurrent_strongest.Entered());
     };
   }
@@ -14432,8 +14499,8 @@ void VerifyStopFaultRecoveryMotionAdmission(const bool latch_manager_liveness_lo
     const auto blocked = kernel.execute(motion_operation("request.surveillance.still-blocked"));
     ASSERT_FALSE(blocked.ok());
     EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
-    unaffected_engine.next_stop_result = StopResultDTO{true, std::nullopt};
     concurrent_strongest.Release();
+    concurrent_nominal.Release();
     ASSERT_TRUE(wait_until([&] {
       const auto status = kernel.get_stop_status(concurrent_stop->stop_id);
       return status.ok() && status.value().stop_certificate.has_value();
@@ -14622,6 +14689,17 @@ TEST(ResourceAddressedExecutionKernelTest,
     stopped = journal.last_stop_accepted;
     return true;
   }));
+  // Q29: the uncontained availability containment no longer latches the cell
+  // by itself; the component-incident containment that joins it does (Q32).
+  {
+    IKernelCellAdmissionPort& port = kernel;
+    const auto contained = port.RequestComponentIncidentContainment(
+        ComponentIncidentContainmentIntentDTO{"incident.availability.1",
+                                              ControllableComponentId("component.arm"),
+                                              LifecycleBlockingCauseClassDTO::kProviderLost});
+    ASSERT_TRUE(contained.ok()) << contained.error().message;
+    EXPECT_EQ(contained.value().stop_id, stopped->stop_id);
+  }
   ASSERT_TRUE(wait_until([&] {
     const auto status = kernel.get_stop_status(stopped->stop_id);
     return status.ok() && status.value().stop_certificate.has_value() &&
@@ -14802,6 +14880,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   // System attribution under the Kernel's own request identity.
   EXPECT_EQ(status.value().accepted.resolution_reason,
             StopScopeResolutionReasonDTO::kExplicitFullStop);
+  // Q32: released once the Stop finished as reported, not after an observed
+  // measured rest: no post-terminal rest surveillance is seeded.
+  EXPECT_FALSE(status.value().surveillance.has_value());
   EXPECT_FALSE(kernel.execute(motion_operation("request.incident.blocked")).ok());
   EXPECT_EQ(engine.execute_calls, 0);
 
@@ -14829,10 +14910,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.execute_calls, 0);
 }
 
-TEST(ResourceAddressedExecutionKernelTest,
-     DurableClearOfOlderStopFaultCannotReopenWhileNewerFaultIsStillContaining) {
-  VerifyStopFaultRecoveryMotionAdmission(false, true);
-}
 
 TEST(ResourceAddressedExecutionKernelTest,
      StopCancelsAReservedOperationWhileItsOrdinaryJournalIsBlockedWithoutDispatch) {
@@ -17577,10 +17654,18 @@ TEST(ResourceAddressedExecutionKernelTest, StopFaultLatchClosesMotionPreview) {
                                              CellId("cell.test"), 8U});
   const auto accepted = kernel.execute(motion_operation("request.motion.latched"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.stop.latched", accepted.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_fault_latch().has_value(); }));
+  // Q29: only the kept component-incident containment still latches.
+  IKernelCellAdmissionPort& port = kernel;
+  const auto contained = port.RequestComponentIncidentContainment(
+      ComponentIncidentContainmentIntentDTO{"incident.preview.1",
+                                            ControllableComponentId("component.arm"),
+                                            LifecycleBlockingCauseClassDTO::kProviderLost});
+  ASSERT_TRUE(contained.ok()) << contained.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(contained.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  ASSERT_TRUE(kernel.get_stop_fault_latch().has_value());
 
   const auto preview = kernel.begin_motion_preview_session(motion_operation("preview.latched"));
   ASSERT_FALSE(preview.ok());
@@ -18456,7 +18541,8 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, CompositionWithoutAlarmO
 }
 
 // The addressed Kernel, not the participant, commits operation outcomes from
-// the reported facts. The planning-deadline fact keeps today's Stopped outcome.
+// the reported facts. A planning timeout is a planning failure (P2): Failed
+// participant, InterventionRequired operation, never Stopped.
 TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromParticipantFacts) {
   struct Case {
     const char* name;
@@ -18471,10 +18557,10 @@ TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromPar
        {ParticipantExecutionFactKind::kComputedCompletion,
         ParticipantEffectKnowledge::kEffectSettled, std::nullopt},
        OperationStateKind::kCompleted},
-      {"planning_deadline", ExecutionState::kPlanning,
-       {ParticipantExecutionFactKind::kPlanningDeadlineExpired, ParticipantEffectKnowledge::kNoEffect,
+      {"planning_timeout", ExecutionState::kPlanning,
+       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect,
         timeout},
-       OperationStateKind::kStopped},
+       OperationStateKind::kFailed},
       {"local_failure", ExecutionState::kValidating,
        {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect, failure},
        OperationStateKind::kFailed},
@@ -18578,9 +18664,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.get_stop_certificate(status.stop_certificate->stop_certificate_id);
   ASSERT_TRUE(certificate.ok());
   EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
-  const auto latch = kernel.get_stop_fault_latch();
-  ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->trigger, StopFaultTriggerDTO::kEscalated);
+  // Q29: no cell-wide Stop-fault latch (as `main`).
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
   const auto state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
@@ -18687,6 +18772,229 @@ TEST(ResourceAddressedExecutionKernelTest, CollisionAfterTerminalStopDoesNotReop
   EXPECT_EQ(kernel.get_stop_status(stopped.value().stop_id).value().state,
             StopStatusStateDTO::kSucceeded);
   EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+}
+
+// Q27 (as `main` EK:8082-8221): Reset while busy runs the deployment's
+// operator Stop profile first and issues the lane's hard stop directly only
+// when no profile is configured; then it completes. Neither is a degraded
+// Stop or an escalation, and neither latches the cell.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetWhileBusyRunsTheOperatorStopProfileElseTheLaneHardStopThenCompletes) {
+  for (const bool operator_profile : {true, false}) {
+    SCOPED_TRACE(operator_profile ? "operator Stop profile" : "no operator Stop profile");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    auto arm = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    if (!operator_profile) arm.default_operator_stop_profile.reset();
+    ResourceAddressedExecutionKernel kernel({arm}, clock, scheduler, default_journal,
+                                            {RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation("request.reset-busy"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+    const auto executing = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(executing.ok());
+    ASSERT_EQ(executing.value().state, OperationStateKind::kExecuting);
+
+    ASSERT_TRUE(kernel
+                    .reset(control_request("request.reset-busy.reset", operation.value(),
+                                           executing.value().operation_revision.value()))
+                    .ok());
+    ASSERT_TRUE(wait_until([&] { return engine.certified_reset_calls.load() == 1; }));
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+    ASSERT_TRUE(engine.last_stop_stage.has_value());
+    const auto& plan = engine.last_stop_stage->participant_stop_plan;
+    EXPECT_EQ(engine.last_stop_stage->stage_index,
+              operator_profile ? 0U : plan.stage_commands.size() - 1U);
+    EXPECT_EQ(
+        plan.stage_commands.at(engine.last_stop_stage->stage_index).resolved_stage.stage_kind,
+        operator_profile ? StopEscalationStageKind::kNominal
+                         : StopEscalationStageKind::kSoftwareHard);
+    const auto stop = kernel.get_stop_status(StopId("stop.kernel.epoch.1.1"));
+    ASSERT_TRUE(stop.ok());
+    ASSERT_TRUE(stop.value().stop_certificate.has_value());
+    const auto certificate =
+        kernel.get_stop_certificate(stop.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    EXPECT_TRUE(wait_until([&] {
+      return !kernel.get_operation_projection(operation.value().operation_id).value().resident;
+    }));
+  }
+}
+
+// Item 40: when the slider has held a motion at zero for the user-set hold
+// timeout, the participant reports it and the Kernel ends the operation
+// Stopped with no error through its own Stop (the lane's hard stop), exactly
+// once, like an operator Stop and without a cell-wide latch.
+TEST(ResourceAddressedExecutionKernelTest, ZeroSpeedHoldTimeoutEndsTheOperationStoppedWithoutError) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.zero-hold"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+
+  // An unrelated stop request event is not a hold timeout.
+  engine.deliver_event(KernelEvent{KernelEventType::kStopRequested,
+                                   engine.next_execution_id,
+                                   0,
+                                   ExecutionState::kExecuting,
+                                   ExecutionState::kExecuting,
+                                   std::nullopt,
+                                   {{"reason", "something_else"}}});
+  EXPECT_FALSE(
+      kernel.get_operation_state(operation.value().operation_id).value().active_stop_id.has_value());
+
+  const KernelEvent hold{KernelEventType::kStopRequested,
+                         engine.next_execution_id,
+                         0,
+                         ExecutionState::kExecuting,
+                         ExecutionState::kExecuting,
+                         std::nullopt,
+                         {{"reason", "zero_speed_hold_timeout"}}};
+  engine.deliver_event(hold);
+  std::optional<StopId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    if (!state.ok() || !state.value().active_stop_id.has_value()) return false;
+    stop_id = state.value().active_stop_id;
+    const auto status = kernel.get_stop_status(*stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  engine.deliver_event(hold);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  EXPECT_EQ(engine.last_stop_stage->stage_index,
+            engine.last_stop_stage->participant_stop_plan.stage_commands.size() - 1U);
+  const auto state = kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(state.value().participants.front().state, OperationStateKind::kStopped);
+  EXPECT_FALSE(state.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(state.value().active_stop_id, stop_id);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+  // Q31: recorded as the hold-timeout Stop it requested, never an escalation.
+  const auto status = kernel.get_stop_status(*stop_id);
+  ASSERT_TRUE(status.ok());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+  ASSERT_EQ(certificate.value().lane_hard_stop_requested.size(), 1U);
+}
+
+// Q18 on the current backends: a Stop ramp that the controller finished
+// outside its goal tolerance is `main`'s confirmed-but-not-settled case. The
+// participant ends InterventionRequired and no second Stop command is issued.
+TEST(ResourceAddressedExecutionKernelTest,
+     StopRampOutsideGoalToleranceEndsInterventionRequiredWithoutASecondStopCommand) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.next_stop_result = StopResultDTO{
+      false, ErrorDTO{"motion_interrupt_backend_stop_failed",
+                      "managed FJT terminal soft-stop goal failed: goal tolerance violated",
+                      {{"reason", "stop_goal_tolerance_violated"},
+                       {"controller_result_code", "-5"}}}};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.goal-tolerance"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  const auto stopped =
+      kernel.stop(stop_request("request.goal-tolerance.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+  ASSERT_TRUE(engine.last_stop_stage.has_value());
+  EXPECT_EQ(engine.last_stop_stage->stage_index, 0U);
+  const auto state = kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  const auto& participant = state.value().participants.front();
+  EXPECT_EQ(participant.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(participant.terminal_error.has_value());
+  EXPECT_EQ(participant.terminal_error->details.at("reason"), "stop_goal_tolerance_violated");
+  EXPECT_EQ(participant.terminal_error->details.at("emergency_fallback"),
+            "not_attempted_controlled_stop_already_confirmed");
+  EXPECT_EQ(participant.terminal_error->details.at("hard_stop_transitioned"), "false");
+  // Q29: no cell-wide Stop-fault latch (as `main`).
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+}
+
+// Q33: a hard stop the Stop planner chose as the right Stop ends Stopped with
+// no error (main's ros2_control operator path); a hard stop used as a
+// fallback after a failed soft Stop keeps the degraded-Stop error.
+TEST(ResourceAddressedExecutionKernelTest,
+     PlannerSelectedHardStopEndsStoppedWithoutTheDegradedStopError) {
+  for (const bool planner_selected : {true, false}) {
+    SCOPED_TRACE(planner_selected ? "planner-selected hard stop" : "fallback hard stop");
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    std::map<std::string, std::string> details{{"reason", "soft_on_path_infeasible"},
+                                               {"recommended_disposition", "hard_stop"}};
+    if (planner_selected) details.emplace("stop_disposition", "planner_selected_hard_stop");
+    engine.next_stop_result = StopResultDTO{
+        false, ErrorDTO{"motion_interrupt_backend_stop_failed", "soft Stop infeasible", details}};
+    engine.translate_stop_stage_hook = [&, calls = std::make_shared<unsigned>(0U)] {
+      if ((*calls)++ > 0U) engine.next_stop_result = StopResultDTO{true, std::nullopt};
+    };
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation("request.planner-hard"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+    const auto stopped =
+        kernel.stop(stop_request("request.planner-hard.stop", operation.value(), 1U));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    EXPECT_EQ(state.value().state, OperationStateKind::kStopped);
+    const auto& participant = state.value().participants.front();
+    EXPECT_EQ(participant.state, OperationStateKind::kStopped);
+    EXPECT_EQ(participant.terminal_error.has_value(), !planner_selected);
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    const auto certificate =
+        kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_EQ(certificate.value().result, planner_selected
+                                              ? StopCertificateResultDTO::kSucceededNominal
+                                              : StopCertificateResultDTO::kSucceededEscalated);
+    if (!planner_selected) {
+      EXPECT_EQ(participant.terminal_error->details.at("emergency_fallback"),
+                "legacy_stop_succeeded");
+    }
+    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+  }
 }
 
 }  // namespace

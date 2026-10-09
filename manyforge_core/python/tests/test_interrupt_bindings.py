@@ -19,9 +19,8 @@ def test_explicit_jerk_settings_resolve_without_changing_the_authored_profile():
     frozen = core.resolve_motion_interrupt_stop_jerk_limits(profile)
     assert len(profile.per_joint_max_jerk) == 1
     assert frozen.per_joint_max_jerk["joint"].value_rad_s3 == 20.0
-    assert frozen.per_joint_max_jerk["slide"].value_m_s3 == pytest.approx(
-        core.motion_jerk_preset_limit(0.5, 1.0)
-    )
+    # Q36: missing jerk is derived per Stop phase at Stop time, not frozen.
+    assert "slide" not in frozen.per_joint_max_jerk
     profile.jerk_limits_enabled = False
     assert (
         len(core.resolve_motion_interrupt_stop_jerk_limits(profile).per_joint_max_jerk)

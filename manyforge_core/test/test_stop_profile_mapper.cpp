@@ -57,9 +57,10 @@ TEST(StopProfileMapper, ExplicitJerkActivationResolvesOnceWithMatchingUnits) {
   ASSERT_TRUE(frozen.ok()) << frozen.error().message;
   EXPECT_DOUBLE_EQ(
       std::get<AngularJerkDTO>(frozen.value().per_joint_max_jerk.at("joint_1")).value_rad_s3, 12.0);
-  EXPECT_DOUBLE_EQ(
-      std::get<LinearJerkDTO>(frozen.value().per_joint_max_jerk.at("axis_z")).value_m_s3,
-      motion_jerk_preset_limit(0.5, 0.25));
+  // Q36: only the authored value is frozen; the missing one is derived per
+  // Stop phase at Stop time, where the lane's lead-in is known.
+  EXPECT_FALSE(frozen.value().per_joint_max_jerk.contains("axis_z"));
+  EXPECT_EQ(frozen.value().per_joint_max_jerk.size(), 1U);
   EXPECT_EQ(profile.per_joint_max_jerk.size(), 1U);  // Authored provenance remains unchanged.
   EXPECT_EQ(resolve_motion_interrupt_stop_jerk_limits(frozen.value()).value(), frozen.value());
   auto changed_ramp = frozen.value();
@@ -128,9 +129,7 @@ TEST(StopProfileMapper, CompiledAuthoredJerkReplacesThePresetForItsJointOnly) {
   EXPECT_DOUBLE_EQ(
       std::get<AngularJerkDTO>(resolved.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
       12.5);
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularJerkDTO>(resolved.value().per_joint_max_jerk.at("joint_2")).value_rad_s3,
-      motion_jerk_preset_limit(3.0, 0.5));
+  EXPECT_FALSE(resolved.value().per_joint_max_jerk.contains("joint_2"));
 
   const JsonValueDTO wrong_units{
       JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
@@ -180,18 +179,47 @@ TEST(StopProfileMapper, JerkRejectsUnknownWrongUnitNonFiniteAndHardProfiles) {
   EXPECT_FALSE(resolve_motion_interrupt_stop_jerk_limits(profile).ok());
 }
 
-TEST(StopProfileMapper, SpringPresetUsesOneFrozenHalfDurationCeiling) {
+TEST(StopProfileMapper, LoadFreezesNoDefaultJerkForEitherMode) {
+  // Q36: the per-phase default depends on the lane's lead-in, so it is not
+  // frozen at load for any mode; authored values are kept verbatim.
   auto profile = soft_profile();
   profile.jerk_limits_enabled = true;
-  const auto soft = resolve_motion_interrupt_stop_jerk_limits(profile);
+  profile.per_joint_max_jerk = {{"joint_1", AngularJerkDTO{7.5}}};
+  for (const auto mode :
+       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
+    profile.stop_mode = mode;
+    if (mode == MotionInterruptStopMode::kSpringBackHold)
+      profile.allow_natural_completion_on_short_path = false;
+    const auto frozen = resolve_motion_interrupt_stop_jerk_limits(profile);
+    ASSERT_TRUE(frozen.ok()) << frozen.error().message;
+    EXPECT_EQ(frozen.value().per_joint_max_jerk, profile.per_joint_max_jerk);
+  }
+}
+
+TEST(StopProfileMapper, SpringDecelerationTimeDefaultIsFilledOnceAtLoad) {
+  // Item 24: an unset spring-back deceleration time takes main's 1.0 s
+  // default when the profile is loaded; the planner never substitutes it.
+  auto profile = soft_profile();
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  const auto spring = resolve_motion_interrupt_stop_jerk_limits(profile);
-  ASSERT_TRUE(soft.ok());
-  ASSERT_TRUE(spring.ok());
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularJerkDTO>(spring.value().per_joint_max_jerk.at("joint_1")).value_rad_s3,
-      motion_jerk_preset_limit(2.0, 0.125));
-  EXPECT_NE(soft.value().per_joint_max_jerk, spring.value().per_joint_max_jerk);
+  profile.allow_natural_completion_on_short_path = false;
+  profile.deceleration_time_s.reset();
+  for (const bool jerk : {false, true}) {
+    SCOPED_TRACE(jerk);
+    profile.jerk_limits_enabled = jerk;
+    const auto frozen = resolve_motion_interrupt_stop_jerk_limits(profile);
+    ASSERT_TRUE(frozen.ok()) << frozen.error().message;
+    ASSERT_TRUE(frozen.value().deceleration_time_s.has_value());
+    EXPECT_DOUBLE_EQ(*frozen.value().deceleration_time_s, kDefaultDecelerationTimeS);
+    EXPECT_EQ(resolve_motion_interrupt_stop_jerk_limits(frozen.value()).value(), frozen.value());
+    // Q36: no default jerk is frozen at load.
+    EXPECT_TRUE(frozen.value().per_joint_max_jerk.empty());
+  }
+  // An authored value is kept, and the 2.0 s ceiling still refuses.
+  profile.deceleration_time_s = 1.5;
+  EXPECT_DOUBLE_EQ(*resolve_motion_interrupt_stop_jerk_limits(profile).value().deceleration_time_s,
+                   1.5);
+  profile.deceleration_time_s = kMaxControlledStopDecelerationTimeS + 0.01;
+  EXPECT_FALSE(resolve_motion_interrupt_stop_jerk_limits(profile).ok());
 }
 
 TEST(StopProfileMapper, MapsTypedMixedCoordinatesToCanonicalResources) {

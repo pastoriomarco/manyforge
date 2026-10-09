@@ -229,12 +229,17 @@ template <typename T>
        facts.surveillance_projection.state != StopDurableProjectionStateDTO::kRecorded)) {
     return StopFaultRecoveryStatusDTO::kWaitingForDurableRecord;
   }
-  if (any_resource_unavailable(facts)) {
+  // Q32: the component-incident containment is released when its Stop
+  // finished as the controller/backend reported (its succeeded certificate),
+  // not on an observed measured rest: no settlement or quiescence gate.
+  const bool rest_gated = latch.trigger != StopFaultTriggerDTO::kPhysicalRestUnproven;
+  if (rest_gated && any_resource_unavailable(facts)) {
     return StopFaultRecoveryStatusDTO::kWaitingForObservation;
   }
-  if (!all_resources_settled(facts) ||
-      (facts.surveillance.has_value() &&
-       facts.surveillance->state != StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved)) {
+  if (rest_gated &&
+      (!all_resources_settled(facts) ||
+       (facts.surveillance.has_value() &&
+        facts.surveillance->state != StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved))) {
     return StopFaultRecoveryStatusDTO::kWaitingForQuiescence;
   }
   if (std::any_of(facts.configuration_facts.begin(), facts.configuration_facts.end(),

@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <string_view>
 #include <vector>
 
@@ -172,22 +171,5 @@ Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
                                             double time_s,
                                             std::size_t segment_index,
                                             TrajectorySampleResult& out);
-
-/// Real-time evaluation of one segment of a prevalidated trajectory at the
-/// exact interpolation `degree` (1 linear, 3 cubic Hermite, 5 quintic); never
-/// downgrades on missing derivatives. Writes q, dq/dt, d2q/dt2 and d3q/dt3
-/// for the `position.size()` joints into caller-owned fixed storage. The third
-/// derivative is the segment polynomial's own (zero for linear); it is
-/// continuous across knots only for quintic segments. Same right-continuous
-/// segment rule as the hinted overload. Returns false, without allocation or
-/// exceptions, for a mismatched segment, unsupported degree, missing
-/// derivative data of that degree, mismatched span sizes or a non-finite
-/// result; output contents are then unspecified.
-[[nodiscard]] bool evaluate_trajectory_segment(const TrajectoryDTO& trajectory,
-                                               std::size_t segment_index, double time_s,
-                                               std::uint8_t degree, std::span<double> position,
-                                               std::span<double> velocity,
-                                               std::span<double> acceleration,
-                                               std::span<double> jerk) noexcept;
 
 }  // namespace manyforge::core

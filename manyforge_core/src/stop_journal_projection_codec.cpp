@@ -1604,7 +1604,7 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V certificate_value(const StopCertificateDTO& v) {
-  return arr({enc(v.stop_certificate_id),
+  auto value = arr({enc(v.stop_certificate_id),
               enc(v.stop_certificate_revision),
               enc(v.stop_id),
               enc(v.stop_generation),
@@ -1627,10 +1627,26 @@ template <typename T, typename Decode>
               opt(v.fault_latch_generation, id_value),
               content_identity::nonnegative_int64_value(v.completed_at_ns),
               opt(v.terminal_error, error_value)});
+  // Q27/Q31: appended only when a Stop requested the lane's hard stop
+  // directly, so every other certificate keeps its established encoding.
+  if (!v.lane_hard_stop_requested.empty()) {
+    auto items = value.as_array();
+    items.push_back(vec(v.lane_hard_stop_requested, scope_key_value));
+    return V(std::move(items));
+  }
+  return value;
 }
 
 [[nodiscard]] StopCertificateDTO certificate_from(const V& v) {
-  const auto& f = exact(v, 23U, "Stop certificate");
+  const bool has_lane_hard_stop = v.is_array() && v.as_array().size() == 24U;
+  const auto& f = exact(v, has_lane_hard_stop ? 24U : 23U, "Stop certificate");
+  auto lane_hard_stop_requested =
+      has_lane_hard_stop
+          ? dvec<StopScopeEntryKeyDTO>(f[23], scope_key_from, "lane hard stop requested")
+          : std::vector<StopScopeEntryKeyDTO>{};
+  if (has_lane_hard_stop && lane_hard_stop_requested.empty()) {
+    bad("Stop certificate lane hard stop rows must be absent when empty");
+  }
   return StopCertificateDTO{
       did<StopCertificateId>(f[0], "certificate ID"),
       did<StopCertificateRevision>(f[1], "certificate revision"),
@@ -1662,7 +1678,8 @@ template <typename T, typename Decode>
                                            item, "fault latch generation");
                                      }),
       i64(f[21], "certificate completion time"),
-      dopt<ErrorDTO>(f[22], error_from)};
+      dopt<ErrorDTO>(f[22], error_from),
+      std::move(lane_hard_stop_requested)};
 }
 
 [[nodiscard]] V remaining_budget_value(const RemainingStopBudgetDTO& v) {

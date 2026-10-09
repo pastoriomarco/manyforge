@@ -722,29 +722,15 @@ Result<void> VerifyPreparedParticipantStopPlan(
 
 namespace {
 Result<void> validate_profile_timing(const RuntimeParticipantStopReadinessDTO& readiness,
-                                     const PreparedParticipantStopPlanDTO& plan) {
+                                     const PreparedParticipantStopPlanDTO&) {
+  // P3 / item 24: no Prepare-time Stop budget pre-check. As `main`, a profile
+  // longer than the saved timeout is not refused in advance; the Stop deadline
+  // watchdog issues the hard floor on overrun. Only the ceiling's own shape is
+  // checked.
   const auto maximum = readiness.maximum_controlled_stop_duration_ns;
   if (!maximum) return Result<void>::Ok();
   if (*maximum <= 0 || *maximum > kMaxStopEvidencePolicyDurationNs)
     return reject<void>("stop_profile_duration_ceiling_invalid");
-  for (const auto& stage : plan.stage_commands) {
-    if (stage.resolved_stage.containment_command.command_kind !=
-            StopContainmentCommandKind::kMotionControlledStop ||
-        !stage.validated_contract_parameters)
-      continue;
-    const auto found = stage.validated_contract_parameters->find("deceleration_time_s");
-    if (found == stage.validated_contract_parameters->end()) continue;  // hard profile has no ramp
-    const auto* duration = std::get_if<double>(&found->second.value);
-    // The complete Soft ramp / Spring brake-and-return, also used by the
-    // sole authorized nominal substitution; never halve it.
-    const auto duration_ns = authored_stop_duration_ns(duration ? *duration : 0);
-    if (!duration_ns.ok() || duration_ns.value() > *maximum)
-      return Result<void>::Err(
-          {"invalid_request",
-           "Stop profile exceeds the saved timeout after latency and settling allowances",
-           {{"reason", "stop_profile_exceeds_operational_timing"},
-            {"maximum_full_profile_duration_ns", std::to_string(*maximum)}}});
-  }
   return Result<void>::Ok();
 }
 }  // namespace

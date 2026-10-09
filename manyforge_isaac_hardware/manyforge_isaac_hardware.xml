@@ -1,7 +1,0 @@
-<library path="manyforge_isaac_hardware">
-  <class name="manyforge_isaac_hardware/IsaacSystem"
-         type="manyforge_isaac_hardware::IsaacSystem"
-         base_class_type="hardware_interface::SystemInterface">
-    <description>Inactive, bounded six-joint Isaac observation transport.</description>
-  </class>
-</library>

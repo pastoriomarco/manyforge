@@ -18,8 +18,8 @@ def test_stop_timing_keeps_ramp_allowances_and_operational_timeout_distinct():
     assert timing.settling_allowance_ns == 750_000_000
     assert timing.operational_timeout_ns == 2_000_000_000
     assert core.validate_controlled_stop_timing(timing, 1_000_000_000) is None
-    error = core.validate_controlled_stop_timing(timing, 1_000_000_001)
-    assert error.details["minimum_timeout_ns"] == "2000000001"
+    # Item 24: no Apply-time refusal compares the timeout with the profile.
+    assert core.validate_controlled_stop_timing(timing, 1_000_000_001) is None
     with pytest.raises(AttributeError):
         timing.operational_timeout_ns = 1
     selection = core.StopTimingSelectionDTO(

@@ -9,20 +9,16 @@ namespace manyforge::core::detail {
 namespace {
 constexpr double kRoundoff = 64.0 * std::numeric_limits<double>::epsilon();
 
-bool valid_scale(double scale, double max_scale = 1.0) noexcept {
-  return std::isfinite(scale) && scale >= 0.0 && scale <= max_scale;
+bool valid_scale(double scale) noexcept {
+  return std::isfinite(scale) && scale >= 0.0 && scale <= 1.0;
 }
 
-bool within_scale_roundoff(double scale, double max_scale) noexcept {
-  return std::isfinite(scale) && scale >= -kRoundoff && scale <= max_scale + kRoundoff;
+bool within_scale_roundoff(double scale) noexcept {
+  return std::isfinite(scale) && scale >= -kRoundoff && scale <= 1.0 + kRoundoff;
 }
 
 bool positive(double value) noexcept {
   return std::isfinite(value) && value > 0.0;
-}
-
-bool valid_bounds(RuntimeScaleBounds bounds) noexcept {
-  return positive(bounds.max_rate_per_s) && positive(bounds.max_rate_change_per_s2);
 }
 }  // namespace
 
@@ -170,30 +166,11 @@ std::optional<RuntimeScalePreparation> prepare_runtime_scaling(
   return prepared;
 }
 
-std::optional<RuntimeScaleGovernor> RuntimeScaleGovernor::create(
-    double initial_scale, RuntimeScaleBounds bounds) noexcept {
-  if (!valid_scale(initial_scale) || !valid_bounds(bounds)) return std::nullopt;
-  return RuntimeScaleGovernor(initial_scale, bounds, 1.0);
-}
-
-std::optional<RuntimeScaleGovernor> RuntimeScaleGovernor::create_continuation(
-    double initial_scale, RuntimeScaleBounds bounds, double initial_rate_per_s,
-    double target_scale, double max_scale) noexcept {
-  if (!std::isfinite(max_scale) || max_scale < 1.0 || !valid_scale(initial_scale, max_scale) ||
-      !valid_bounds(bounds) || !std::isfinite(initial_rate_per_s) ||
-      std::abs(initial_rate_per_s) > bounds.max_rate_per_s * (1.0 + kRoundoff)) {
-    return std::nullopt;
-  }
-  RuntimeScaleGovernor governor(initial_scale, bounds, max_scale);
-  governor.rate_ = initial_rate_per_s;
-  governor.target_ = -1.0;  // Force preparation, even when the new target equals the current scale.
-  if (!governor.retarget(target_scale)) return std::nullopt;
-  return governor;
-}
-
 RuntimeScaleGovernor::RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds)
-    : RuntimeScaleGovernor(initial_scale, bounds, 1.0) {
-  if (!create(initial_scale, bounds)) {
+    : bounds_(bounds), scale_(initial_scale), target_(initial_scale) {
+  if (!valid_scale(initial_scale) || !std::isfinite(bounds.max_rate_per_s) ||
+      bounds.max_rate_per_s <= 0.0 || !std::isfinite(bounds.max_rate_change_per_s2) ||
+      bounds.max_rate_change_per_s2 <= 0.0) {
     throw std::invalid_argument(
         "runtime scale governor requires finite positive bounds and [0,1] scale");
   }
@@ -202,27 +179,25 @@ RuntimeScaleGovernor::RuntimeScaleGovernor(double initial_scale, RuntimeScaleBou
 RuntimeScaleGovernor::RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds,
                                            double initial_rate_per_s, double target_scale)
     : RuntimeScaleGovernor(initial_scale, bounds) {
-  const auto continuation =
-      create_continuation(initial_scale, bounds, initial_rate_per_s, target_scale);
-  if (!continuation) {
-    throw std::invalid_argument(
-        std::isfinite(initial_rate_per_s) &&
-                std::abs(initial_rate_per_s) <= bounds.max_rate_per_s * (1.0 + kRoundoff)
-            ? "runtime scale continuation cannot preserve its bounds"
-            : "runtime scale continuation has an invalid rate");
+  if (!std::isfinite(initial_rate_per_s) ||
+      std::abs(initial_rate_per_s) > bounds.max_rate_per_s * (1.0 + kRoundoff)) {
+    throw std::invalid_argument("runtime scale continuation has an invalid rate");
   }
-  *this = *continuation;
+  rate_ = initial_rate_per_s;
+  target_ = -1.0;  // Force preparation, even when the new target equals the current scale.
+  if (!retarget(target_scale)) {
+    throw std::invalid_argument("runtime scale continuation cannot preserve its bounds");
+  }
 }
 
 double RuntimeScaleGovernor::position(const Phase& phase, double time_s) noexcept {
   return phase.initial_scale + time_s * (phase.initial_rate + 0.5 * phase.rate_change * time_s);
 }
 
-bool RuntimeScaleGovernor::valid_phase(const Phase& phase) const noexcept {
-  const double max_rate = bounds_.max_rate_per_s;
+bool RuntimeScaleGovernor::valid_phase(const Phase& phase, double max_rate) noexcept {
   if (!std::isfinite(phase.duration_s) || phase.duration_s < 0.0 ||
-      !within_scale_roundoff(phase.initial_scale, max_scale_) ||
-      !within_scale_roundoff(position(phase, phase.duration_s), max_scale_)) {
+      !within_scale_roundoff(phase.initial_scale) ||
+      !within_scale_roundoff(position(phase, phase.duration_s))) {
     return false;
   }
   const double final_rate = phase.initial_rate + phase.rate_change * phase.duration_s;
@@ -233,7 +208,7 @@ bool RuntimeScaleGovernor::valid_phase(const Phase& phase) const noexcept {
   if (phase.rate_change != 0.0) {
     const double extremum = -phase.initial_rate / phase.rate_change;
     if (extremum > 0.0 && extremum < phase.duration_s &&
-        !within_scale_roundoff(position(phase, extremum), max_scale_)) {
+        !within_scale_roundoff(position(phase, extremum))) {
       return false;
     }
   }
@@ -253,7 +228,7 @@ bool RuntimeScaleGovernor::retarget(double target_scale) noexcept {
   if (rate_ != 0.0 && std::abs(distance - stop_distance) <=
                           kRoundoff * (std::abs(distance) + std::abs(stop_distance))) {
     Phase brake{scale_, rate_, -std::copysign(acceleration, rate_), std::abs(rate_) / acceleration};
-    if (!valid_phase(brake)) return false;
+    if (!valid_phase(brake, bounds_.max_rate_per_s)) return false;
     phases_[0] = brake;
     phase_count_ = 1U;
     phase_index_ = 0U;
@@ -292,7 +267,7 @@ bool RuntimeScaleGovernor::retarget(double target_scale) noexcept {
     if (!std::isfinite(durations[index]) || durations[index] < 0.0) return false;
     if (durations[index] == 0.0) continue;
     Phase phase{next_scale, next_rate, changes[index], durations[index]};
-    if (!valid_phase(phase)) return false;
+    if (!valid_phase(phase, bounds_.max_rate_per_s)) return false;
     prepared[count++] = phase;
     next_scale = position(phase, phase.duration_s);
     next_rate += phase.rate_change * phase.duration_s;
@@ -352,11 +327,11 @@ std::optional<double> RuntimeScaleGovernor::advance_in_place(double dt_s) noexce
     }
   }
   integral += scale_ * dt_s;
-  if (!std::isfinite(integral) || integral < 0.0 || !within_scale_roundoff(scale_, max_scale_) ||
+  if (!std::isfinite(integral) || integral < 0.0 || !within_scale_roundoff(scale_) ||
       !std::isfinite(rate_)) {
     return std::nullopt;
   }
-  scale_ = std::clamp(scale_, 0.0, max_scale_);
+  scale_ = std::clamp(scale_, 0.0, 1.0);
   return integral;
 }
 

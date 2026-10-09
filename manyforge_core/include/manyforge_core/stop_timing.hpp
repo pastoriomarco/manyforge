@@ -20,8 +20,9 @@ namespace manyforge::core {
 [[nodiscard]] Result<StopDeadlineBudgetDTO> resolve_stop_timing_budget(
     const StopEvidencePolicyDTO& policy, const std::optional<StopTimingParametersDTO>& timing);
 
-/// Validate both authored defaults and explicit profiles at Prepare. A
-/// permitted substitution is checked separately using its complete duration.
+/// Field and range validation only. As `main` (item 24) the timeout is not
+/// compared with the profile in advance: the Stop deadline watchdog issues the
+/// hard floor on overrun.
 [[nodiscard]] Result<void> validate_controlled_stop_timing(const StopTimingParametersDTO& timing,
                                                            std::int64_t full_profile_duration_ns);
 
