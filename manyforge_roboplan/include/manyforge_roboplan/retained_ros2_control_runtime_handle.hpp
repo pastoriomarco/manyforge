@@ -10,11 +10,13 @@
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
+#include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 namespace manyforge::roboplan_backend {
 
-/// Weak product handle for the ROS adapter selected by one retained
-/// runtime composition.
+/// Retained resource lifetime for the two focused ROS adapters selected by one
+/// runtime composition. Aliasing execution/gripper ports retain this owner.
 ///
 /// The backend factory binds this handle exactly once. Lifecycle/host NRT work
 /// may then read immutable binding/transport snapshots and publish CCLC-owned
@@ -25,6 +27,7 @@ class RetainedRos2ControlRuntimeHandle final
     : public std::enable_shared_from_this<RetainedRos2ControlRuntimeHandle> {
 public:
   RetainedRos2ControlRuntimeHandle() = default;
+  ~RetainedRos2ControlRuntimeHandle();
 
   RetainedRos2ControlRuntimeHandle(const RetainedRos2ControlRuntimeHandle &) =
       delete;
@@ -32,8 +35,10 @@ public:
   operator=(const RetainedRos2ControlRuntimeHandle &) = delete;
 
   [[nodiscard]] core::Result<void> BindBackend(
-      std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend>
+      std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
+      std::unique_ptr<ros2_control_execution::Ros2ControlExecutionBackend>
           backend,
+      std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
       const core::RuntimeParticipantBinding &motion_binding,
       const std::optional<core::RuntimeParticipantBinding> &gripper_binding);
 
@@ -43,6 +48,11 @@ public:
               const core::RuntimeParticipantBinding &motion_binding,
               const std::optional<core::RuntimeParticipantBinding>
                   &gripper_binding) const;
+
+  /// Verify the distinct gripper adapter against its exact physical binding.
+  [[nodiscard]] bool OwnsGripper(
+      const core::IGripperCommandBackend *gripper,
+      const core::RuntimeParticipantBinding &gripper_binding) const;
 
   /// Nonwaiting, one-shot executor start after the host retains fenced
   /// ownership. A partial-start exception is retained; observing it never
@@ -87,7 +97,9 @@ private:
   };
 
   mutable std::mutex mutex_;
-  std::weak_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend_;
+  std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources_;
+  std::unique_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend_;
+  std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper_;
   std::optional<core::RuntimeParticipantBinding> motion_binding_;
   std::optional<core::RuntimeParticipantBinding> gripper_binding_;
   bool start_attempted_{false};

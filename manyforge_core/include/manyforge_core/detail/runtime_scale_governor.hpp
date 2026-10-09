@@ -72,12 +72,34 @@ struct TrajectoryDynamicsEnvelope {
 // A second-order time-law governor: scale and scale rate are continuous even
 // when the target changes during a ramp. Three analytic phases suffice; no
 // queue, allocation, clock read, owner call or integration substep is needed.
+//
+// Scale range: ordinary runtime scaling is [0,1]. A same-path Stop
+// continuation may carry a higher ceiling, the trajectory's sealed
+// `max_stop_path_rate` velocity certificate (>= 1): braking that starts with a
+// positive scale rate under Stop bounds can overshoot the current scale before
+// it decelerates, and only that certificate permits a path rate above one.
+// Targets always stay in [0,1]; the ceiling only admits the transient.
 class RuntimeScaleGovernor final {
  public:
+  // Throwing forms for cold-path callers; equivalent to the factories below.
   RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds);
   // Reconstruct the same bounded continuation at a captured Stop seam.
   RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds, double initial_rate_per_s,
                        double target_scale);
+
+  // Non-throwing factory: nullopt for non-finite/non-positive bounds or a
+  // scale outside [0,1].
+  [[nodiscard]] static std::optional<RuntimeScaleGovernor> create(
+      double initial_scale, RuntimeScaleBounds bounds) noexcept;
+  // Non-throwing continuation from a captured scale and scale rate under
+  // (possibly different) bounds, retargeted to `target_scale`. Scale and rate
+  // are preserved exactly. `max_scale` (finite, >= 1) is the scale ceiling for
+  // the whole continuation; above 1 only for a certified Stop interpolant.
+  // nullopt when the rate exceeds the bounds or the transition cannot stay in
+  // [0, max_scale].
+  [[nodiscard]] static std::optional<RuntimeScaleGovernor> create_continuation(
+      double initial_scale, RuntimeScaleBounds bounds, double initial_rate_per_s,
+      double target_scale, double max_scale = 1.0) noexcept;
 
   [[nodiscard]] bool retarget(double target_scale) noexcept;
   // Returns the exact integral of scale over dt, i.e. trajectory-time advance.
@@ -87,6 +109,14 @@ class RuntimeScaleGovernor final {
   [[nodiscard]] double scale() const noexcept { return scale_; }
   [[nodiscard]] double rate_per_s() const noexcept { return rate_; }
   [[nodiscard]] double target_scale() const noexcept { return target_; }
+  // Scale acceleration (s_ddot) of the interval that starts now: the active
+  // phase's constant rate change, zero when no transition is active. It is
+  // piecewise constant and right-continuous at phase boundaries.
+  [[nodiscard]] double scale_acceleration_per_s2() const noexcept {
+    return phase_index_ < phase_count_ ? phases_[phase_index_].rate_change : 0.0;
+  }
+  [[nodiscard]] RuntimeScaleBounds bounds() const noexcept { return bounds_; }
+  [[nodiscard]] double max_scale() const noexcept { return max_scale_; }
   [[nodiscard]] bool transitioning() const noexcept { return phase_index_ < phase_count_; }
   [[nodiscard]] double remaining_transition_s() const noexcept;
 
@@ -98,14 +128,18 @@ class RuntimeScaleGovernor final {
     double duration_s;
   };
 
+  RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds, double max_scale) noexcept
+      : bounds_(bounds), scale_(initial_scale), target_(initial_scale), max_scale_(max_scale) {}
+
   [[nodiscard]] std::optional<double> advance_in_place(double dt_s) noexcept;
   [[nodiscard]] static double position(const Phase& phase, double time_s) noexcept;
-  [[nodiscard]] static bool valid_phase(const Phase& phase, double max_rate) noexcept;
+  [[nodiscard]] bool valid_phase(const Phase& phase) const noexcept;
 
   RuntimeScaleBounds bounds_;
   double scale_;
   double rate_{};
   double target_;
+  double max_scale_{1.0};
   std::array<Phase, 3U> phases_{};
   std::size_t phase_count_{};
   std::size_t phase_index_{};

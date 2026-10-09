@@ -799,6 +799,17 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         assert "validation_collision" not in evidence, evidence
 
 
+def _wait_alarm_owner_reconciled(stack: ProcessStack, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        while True:
+            snapshot = headless.alarms()
+            if snapshot.get("reconciled") is True:
+                return
+            assert time.monotonic() < deadline, snapshot
+            time.sleep(0.05)
+
+
 def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
     # Removing ur5e removes its joints from the whole-cell planning model, so
     # every retained lite6 model coordinate changes index. The retained lite6
@@ -824,6 +835,9 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            # The Apply restarts the alarm owner's lifecycle source: motion is
+            # admitted once it has observed the new configuration.
+            _wait_alarm_owner_reconciled(stack)
             _start_motion(client, started, request_id="ui6i.solo.motion-start")
             accepted = _operation_acceptances(stack, program_run_id, minimum=1)
             assert {

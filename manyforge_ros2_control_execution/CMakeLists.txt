@@ -29,6 +29,8 @@ add_library(manyforge_ros2_control_execution
   src/package.cpp
   src/ros2_control_capability.cpp
   src/ros2_control_execution_backend.cpp
+  src/ros2_gripper_command_backend.cpp
+  src/ros2_transport_resources.cpp
   src/scene_projection_worker.cpp
 )
 
@@ -81,6 +83,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_ros2_control_execution_backend PRIVATE
       manyforge_ros2_control_execution GTest::gtest_main)
     gtest_discover_tests(test_ros2_control_execution_backend)
+
+    add_executable(test_ros2_gripper_command_backend
+      test/test_ros2_gripper_command_backend.cpp)
+    target_link_libraries(test_ros2_gripper_command_backend PRIVATE
+      manyforge_ros2_control_execution GTest::gtest_main)
+    gtest_discover_tests(test_ros2_gripper_command_backend)
 
     # WS8 hot-path qualification probe. This executable is intentionally not a
     # ctest case: unit tests prove behavior, while

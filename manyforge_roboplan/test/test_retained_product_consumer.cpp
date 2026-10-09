@@ -236,10 +236,6 @@ public:
         !peer_back_pointers_cleared_ || peer_back_pointers_cleared_());
   }
 
-  core::Result<std::uint64_t>
-  execute(const core::ExecuteRequestDTO &request) override {
-    return Require()->execute(request);
-  }
   core::AddressedParticipantStopFenceDisposition
   fence_addressed_participant_stop(
       const std::uint64_t execution_id) noexcept override {
@@ -250,10 +246,6 @@ public:
       const core::AddressedParticipantStopSettlementRequestDTO &request)
       override {
     return Require()->settle_addressed_participant_stop(request);
-  }
-  core::ResetResultDTO reset(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
-    return Require()->reset(expected_epoch);
   }
   core::ResetResultDTO reset_after_certified_containment(
       const std::uint64_t execution_id,
@@ -4521,8 +4513,6 @@ TEST(RetainedProductCrossConsumer,
       runtime_config.cell_stop_deadline_budget->phases.push_back(
           {core::StopBudgetPhaseId("phase.component.nominal"), 500'000'000});
     }
-    runtime_config.kernel.runtime_collision_stop_owned_by_addressed_kernel =
-        true;
     const auto local_runtime_unit_id = control.provider_runtime_unit_id;
     const auto local_runtime_epoch = control.provider_runtime_epoch;
     const auto local_component_id = physical.value().controllable_component_id;

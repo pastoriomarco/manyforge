@@ -1153,24 +1153,6 @@ create_retained_native_runtime_participants(
       motion_operator_stop_profile;
   std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
   if (controlled_stop_profiles.has_value()) {
-    if (config.kernel.operator_stop_profile &&
-        *config.kernel.operator_stop_profile !=
-            controlled_stop_profiles->operator_profile) {
-      throw std::invalid_argument(
-          "Kernel operator Stop profile differs from retained Stop authority");
-    }
-    if (config.kernel.default_fault_stop_profile &&
-        *config.kernel.default_fault_stop_profile !=
-            controlled_stop_profiles->fault_profile) {
-      throw std::invalid_argument(
-          "Kernel fault Stop profile differs from retained Stop authority");
-    }
-    config.kernel.operator_stop_profile =
-        std::make_shared<core::MotionInterruptStopProfileDTO>(
-            controlled_stop_profiles->operator_profile);
-    config.kernel.default_fault_stop_profile =
-        std::make_shared<core::MotionInterruptStopProfileDTO>(
-            controlled_stop_profiles->fault_profile);
     motion_operator_stop_profile = controlled_stop_profiles->operator_profile;
     motion_fault_stop_profile = controlled_stop_profiles->fault_profile;
   }
@@ -1566,7 +1548,6 @@ create_retained_native_runtime_participants(
                                    *runtime->reference_resolver_proxy,
                                    *runtime->kinematic_model,
                                    *runtime->kinematic_model,
-                                   nullptr,
                                    nullptr,
                                    runtime->planning_scene_synchronizer.get()};
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
@@ -4236,7 +4217,6 @@ void attach_retained_native_addressed_owner(
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
                                RetainedNativeRuntimeConfig config) {
-  config.kernel.runtime_collision_stop_owned_by_addressed_kernel = true;
   auto stop_budget = config.cell_stop_deadline_budget;
   if (!stop_budget.has_value() && input.motion_stop_readiness.has_value()) {
     stop_budget = input.motion_stop_readiness->value()

@@ -16,11 +16,8 @@ inline constexpr const char* kRuntimeCollisionFaultSourceId =
     "manyforge.kernel.runtime_collision_fault";
 inline constexpr const char* kRuntimeCollisionFaultPolicyId =
     "manyforge.kernel.runtime_collision_fault.preempt_trajectory";
-inline constexpr const char* kReasonRuntimeCollisionStopNotYetCertified =
-    "runtime_collision_stop_not_yet_certified";
 
 bool validation_cancelled_by_interrupt(const ErrorDTO& error);
-bool planning_cancelled_by_interrupt(const ErrorDTO& error);
 bool authoritative_collision_replan_candidate(const ErrorDTO& error);
 std::optional<KernelEventType> interrupt_event_type_from_name(
     const std::string& name);
@@ -32,10 +29,6 @@ ErrorDTO authoritative_collision_validation_config_error(
     std::string phase = "pre_execution_validation");
 const char* interrupt_preemption_result_name(
     InterruptPreemptionResult result) noexcept;
-ErrorDTO runtime_collision_stop_not_yet_certified_error(
-    const InterruptLatch& latch,
-    std::uint64_t execution_id,
-    bool fault_preempt_stop_active);
 InterruptSourceDefinition runtime_collision_fault_source_definition();
 InterruptPolicyDefinition runtime_collision_fault_policy_definition();
 

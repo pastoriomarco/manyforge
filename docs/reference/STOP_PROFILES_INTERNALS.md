@@ -176,10 +176,9 @@ subordinate ExecutionKernel collision observation
 
 The important behavioral invariant is that product Stop has one authority.
 Subordinate engines may publish collision/interrupt facts but cannot issue a
-competing backend Stop in addressed mode. Resume always creates new prepared
-participant/goal identity from fresh state; it never resumes stale controller
-trajectory state. A standalone `ExecutionKernel::stop()` remains only for
-legacy/non-addressed continuity until later transport lanes migrate.
+competing backend Stop. Resume always creates new prepared participant/goal
+identity from fresh state; it never resumes stale controller trajectory state.
+`ExecutionKernel` has no Stop entry point of its own.
 
 ## 5. soft_on_path Planner
 

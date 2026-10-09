@@ -30,10 +30,15 @@ configuration=$(printf '%s\n' "$variant" "SOURCE=$repo_root" "$generator" \
     "CFLAGS=${CFLAGS:-}" "CXXFLAGS=${CXXFLAGS:-}" "LDFLAGS=${LDFLAGS:-}" "$toolchain")
 config_key=$(printf '%s' "$configuration" | sha256sum)
 config_key=${config_key%% *}
-cache_root="$cache_base/$architecture/${image_id#sha256:}/$variant-$config_key"
-mkdir -p "$cache_root" "$cache_root/build" "$cache_root/ccache" "$cache_root/home"
+# Ninja trees stay per variant and checkout; the compiler cache is shared by
+# every tree of one image (its compiler) and verifies each input by content.
+image_root="$cache_base/$architecture/${image_id#sha256:}"
+cache_root="$image_root/$variant-$config_key"
+compiler_cache="$image_root/ccache"
+mkdir -p "$cache_root" "$cache_root/build" "$cache_root/home" "$compiler_cache"
 cache_root=$(cd "$cache_root" && pwd)
-for directory in "$cache_root" "$cache_root/build" "$cache_root/ccache" "$cache_root/home"; do
+compiler_cache=$(cd "$compiler_cache" && pwd)
+for directory in "$cache_root" "$cache_root/build" "$cache_root/home" "$compiler_cache"; do
     [[ -w "$directory" ]] || { echo "Diagnostic directory is not writable: $directory" >&2; exit 69; }
 done
 # Fail instead of running competing processes against one CMake/Ninja tree.
@@ -54,6 +59,7 @@ container_id=$(docker create --init --network none \
     --user "$(id -u):$(id -g)" \
     --mount "type=bind,source=$repo_root,target=/workspace,readonly" \
     --mount "type=bind,source=$cache_root,target=/runner" \
+    --mount "type=bind,source=$compiler_cache,target=/ccache" \
     "${git_mounts[@]}" \
     --workdir /workspace \
     --env HOME=/runner/home --env WORKSPACE=/workspace \
@@ -63,7 +69,7 @@ container_id=$(docker create --init --network none \
     --env "CFLAGS=${CFLAGS:-}" --env "CXXFLAGS=${CXXFLAGS:-}" --env "LDFLAGS=${LDFLAGS:-}" \
     --env CMAKE_GENERATOR=Ninja --env "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" \
     --env CMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache --env CMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache \
-    --env CCACHE_DIR=/runner/ccache --env CCACHE_MAXSIZE=5G --env CCACHE_COMPILERCHECK=content \
+    --env CCACHE_DIR=/ccache --env CCACHE_MAXSIZE=20G --env CCACHE_COMPILERCHECK=content \
     "$image_id" env -u CCACHE_DISABLE bash -c '
         set +e
         "$@"

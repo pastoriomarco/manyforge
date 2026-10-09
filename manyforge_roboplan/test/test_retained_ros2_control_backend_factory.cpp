@@ -46,6 +46,16 @@ public:
   }
 };
 
+[[nodiscard]] std::unique_ptr<ros2_control_execution::Ros2TransportResources>
+make_test_transport_resources(
+    const ros2_control_execution::Ros2ControlExecutionBackendConfig &config,
+    const std::shared_ptr<core::IExecutionStateSink> &sink,
+    core::IClock &clock) {
+  return std::make_unique<ros2_control_execution::Ros2TransportResources>(
+      config.node_name, config.node_namespace, config.executor_thread_count,
+      config.command_gate_topic, sink, "arm", clock);
+}
+
 [[nodiscard]] core::RuntimeParticipantBinding
 commanded_binding(std::string component_id = "robot_1") {
   core::RuntimeParticipantBindingDTO value{
@@ -489,8 +499,10 @@ struct InitialRosInstallationFixture final {
       std::make_shared<NullExecutionStateSink>();
   core::RuntimeParticipantBinding motion = commanded_binding();
   core::RuntimeParticipantBinding tool = commanded_gripper_binding();
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
-  RetainedRos2ControlRuntimeHandle handle;
+  ros2_control_execution::Ros2ControlExecutionBackend *backend = nullptr;
+  ros2_control_execution::Ros2GripperCommandBackend *gripper = nullptr;
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
+      std::make_shared<RetainedRos2ControlRuntimeHandle>();
   std::unique_ptr<core::GripperParticipantEngine> motion_engine;
   std::unique_ptr<core::GripperParticipantEngine> gripper_engine;
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
@@ -570,17 +582,32 @@ struct InitialRosInstallationFixture final {
     config.initial_joint_positions_rad = {0.25};
     config.enable_jtc_speed_scaling_input = false;
     config.initialize_commanded_sim_on_controller_ready = false;
-    backend =
-        std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+    config.command_gate_topic = "/initial_install_fixture/stop_joint_commands";
+    auto resources = make_test_transport_resources(config, sink, clock);
+    auto owned_backend =
+        std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+            *resources,
             ros2_control_execution::Ros2ControlExecutionBackend::
                 TestingNoRosStartupTag{},
             sink, "arm", clock, scheduler, config);
-    if (!handle.BindBackend(backend, motion, tool).ok())
+    auto owned_gripper =
+        std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
+            *resources, sink, clock, scheduler, true);
+    ros2_control_execution::Ros2GripperActionConfig gripper_config;
+    gripper_config.group_id = "gripper";
+    gripper_config.joint_name = "gripper_joint";
+    owned_gripper->configure_gripper_action(
+        tool.value().command_target_id.value(), gripper_config);
+    backend = owned_backend.get();
+    gripper = owned_gripper.get();
+    if (!handle->BindBackend(std::move(resources), std::move(owned_backend),
+                            std::move(owned_gripper), motion, tool).ok())
       throw std::logic_error("initial ROS fixture binding failed");
+    // This receipt fixture tests exact registration identity, not motion.
     motion_engine =
-        std::make_unique<core::GripperParticipantEngine>(*backend, clock);
+        std::make_unique<core::GripperParticipantEngine>(*gripper, clock);
     gripper_engine =
-        std::make_unique<core::GripperParticipantEngine>(*backend, clock);
+        std::make_unique<core::GripperParticipantEngine>(*gripper, clock);
     for (const auto *binding : {&motion, &tool}) {
       core::RuntimeParticipantExecutionRegistration registration{
           *binding,     std::nullopt,
@@ -591,14 +618,14 @@ struct InitialRosInstallationFixture final {
           std::nullopt};
       registration.engine =
           binding == &motion ? motion_engine.get() : gripper_engine.get();
-      registration.stop_execution_port = backend.get();
+      registration.stop_execution_port = backend;
       registrations.push_back(std::move(registration));
     }
   }
 
   component_manager::ManagerRuntimeComponentReceiptDTO receipt() const {
     return detail::ReadInitialRos2ComponentReceipt(
-        request, identity, handle, backend.get(), backend.get(), motion, tool,
+        request, identity, *handle, backend, gripper, motion, tool,
         registrations, motion_engine.get(), gripper_engine.get());
   }
 };
@@ -615,13 +642,68 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(fixture.receipt(), first);
   EXPECT_FALSE(first.predecessor_runtime_retained);
   EXPECT_FALSE(first.product_binding_resealed);
-  EXPECT_FALSE(fixture.handle.controller_binding_snapshot().has_value());
-  EXPECT_THROW(fixture.handle.StartBackend(), std::logic_error);
+  EXPECT_FALSE(fixture.handle->controller_binding_snapshot().has_value());
+  EXPECT_THROW(fixture.handle->StartBackend(), std::logic_error);
   // A failed deferred start remains failed; owner lifetime/receipt is
   // preserved, and no replay can pretend that controller readiness was
   // established.
-  EXPECT_THROW(fixture.handle.StartBackend(), std::logic_error);
+  EXPECT_THROW(fixture.handle->StartBackend(), std::logic_error);
   EXPECT_EQ(fixture.receipt(), first);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RuntimeHandleReadsDistinctGripperAndRejectsForeignReceiptIdentity) {
+  InitialRosInstallationFixture fixture;
+  EXPECT_TRUE(fixture.handle->OwnsBackend(
+      fixture.backend, fixture.motion, fixture.tool));
+  EXPECT_TRUE(fixture.handle->OwnsGripper(fixture.gripper, fixture.tool));
+  EXPECT_FALSE(fixture.handle->OwnsGripper(nullptr, fixture.tool));
+  EXPECT_FALSE(fixture.handle->OwnsGripper(
+      fixture.gripper, commanded_gripper_binding("another.robot")));
+  const auto readiness = fixture.handle->gripper_transport_readiness_snapshot();
+  ASSERT_TRUE(readiness.has_value());
+  EXPECT_TRUE(readiness->configured);
+  EXPECT_FALSE(readiness->command_gate_open);
+  auto *const configured_gripper = fixture.gripper;
+  fixture.gripper = nullptr;
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  InitialRosInstallationFixture foreign_fixture;
+  fixture.gripper = foreign_fixture.gripper;
+  EXPECT_FALSE(fixture.handle->OwnsGripper(fixture.gripper, fixture.tool));
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.gripper = configured_gripper;
+  EXPECT_NO_THROW(static_cast<void>(fixture.receipt()));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RetainingOnlyTheGripperPortRetainsBothBorrowedResourceUsers) {
+  InitialRosInstallationFixture fixture;
+  fixture.motion_engine.reset();
+  fixture.gripper_engine.reset();
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = fixture.handle;
+  auto port = std::shared_ptr<core::IGripperCommandBackend>(
+      fixture.handle, fixture.gripper);
+  fixture.handle.reset();
+  EXPECT_FALSE(owner.expired());
+  EXPECT_EQ(port->get_gripper_status(
+                    fixture.tool.value().command_target_id.value()).state,
+            core::GripperCommandState::kIdle);
+  port.reset();
+  EXPECT_TRUE(owner.expired());
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RetainingOnlyTheMotionPortRetainsTheSharedResourceOwner) {
+  InitialRosInstallationFixture fixture;
+  fixture.motion_engine.reset();
+  fixture.gripper_engine.reset();
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = fixture.handle;
+  auto port = std::shared_ptr<core::IExecutionBackend>(fixture.handle, fixture.backend);
+  fixture.handle.reset();
+  EXPECT_FALSE(owner.expired());
+  EXPECT_EQ(port->get_execution_snapshot().state, core::ExecutionState::kIdle);
+  port.reset();
+  EXPECT_TRUE(owner.expired());
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -649,7 +731,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
                      fixture.request, fixture.predecessor, fixture.candidate),
                  std::invalid_argument);
   }
-  EXPECT_FALSE(fixture.handle.controller_binding_snapshot().has_value());
+  EXPECT_FALSE(fixture.handle->controller_binding_snapshot().has_value());
   fixture.request.component_delta.components.clear();
   fixture.request.configuration_fence_scope = {};
   fixture.candidate.controllable_components.clear();
@@ -681,7 +763,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   fixture.registrations.front().engine = fixture.motion_engine.get();
   fixture.registrations.back().stop_execution_port = nullptr;
   EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
-  fixture.registrations.back().stop_execution_port = fixture.backend.get();
+  fixture.registrations.back().stop_execution_port = fixture.backend;
   fixture.request.configuration_fence_scope.resources.pop_back();
   EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
 }
@@ -702,14 +784,18 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(config, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, config);
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
   const auto binding = commanded_binding();
-  const auto bound = handle->BindBackend(backend, binding, std::nullopt);
+  const auto bound = handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, binding, std::nullopt);
   ASSERT_TRUE(bound.ok()) << bound.error().message;
   EXPECT_FALSE(handle->gripper_transport_readiness_snapshot().has_value());
 
@@ -790,7 +876,16 @@ TEST(RetainedRos2ControlBackendFactoryTest,
                                "external.controller_configuration_ready"),
             std::optional<bool>(false));
 
-  const auto rebound = handle->BindBackend(backend, binding, std::nullopt);
+  auto repeated_resources = make_test_transport_resources(config, sink, clock);
+  auto repeated_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *repeated_resources,
+          ros2_control_execution::Ros2ControlExecutionBackend::
+              TestingNoRosStartupTag{},
+          sink, "arm", clock, scheduler, config);
+  const auto rebound = handle->BindBackend(
+      std::move(repeated_resources), std::move(repeated_backend), nullptr,
+      binding, std::nullopt);
   ASSERT_FALSE(rebound.ok());
   EXPECT_EQ(rebound.error().details.at("reason"),
             "ros2_control_handle_already_bound");
@@ -813,13 +908,17 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(config, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, config);
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
-  ASSERT_TRUE(handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+  ASSERT_TRUE(handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, commanded_binding(), std::nullopt).ok());
 
   std::uint64_t activity = 0U;
   const auto publish = [&](const bool controller_active,
@@ -922,6 +1021,13 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   snapshot = publish(true, true, {});
   EXPECT_EQ(cause(snapshot), "none");
   EXPECT_TRUE(snapshot.exact_controller_configuration_active);
+  snapshot = publish(false, true,
+                     {"trajectory_controller_inactive",
+                      "hardware_command_interfaces_unavailable"});
+  EXPECT_EQ(cause(snapshot), "availability");
+  // Establish the separate hardware-loss case from fresh active status.
+  snapshot = publish(true, true, {});
+  EXPECT_EQ(cause(snapshot), "none");
   snapshot = publish(true, false,
                      {"hardware_component_inactive",
                       "hardware_command_interfaces_unavailable",
@@ -930,7 +1036,8 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   snapshot = publish(false, true,
                      {"trajectory_controller_inactive",
                       "hardware_command_interfaces_unavailable"});
-  EXPECT_EQ(cause(snapshot), "availability");
+  // Availability cannot clear the previous intervention-requiring Unknown.
+  EXPECT_EQ(cause(snapshot), "unknown");
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -946,14 +1053,18 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(selected.execution, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
   const auto binding = commanded_binding();
-  ASSERT_TRUE(handle->BindBackend(backend, binding, std::nullopt).ok());
+  ASSERT_TRUE(handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, binding, std::nullopt).ok());
 
   ros2_control_execution::ControllerBindingSnapshot ready;
   ready.activity_generation = 1U;
@@ -1022,14 +1133,18 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(selected.execution, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
   ASSERT_TRUE(
-      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+      handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, commanded_binding(), std::nullopt).ok());
 
   const auto component = active_component_snapshot();
   std::atomic<bool> refreshed{false};
@@ -1089,14 +1204,18 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(selected.execution, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
   ASSERT_TRUE(
-      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+      handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, commanded_binding(), std::nullopt).ok());
 
   const auto publish_ready_binding = [&]() {
     ros2_control_execution::ControllerBindingSnapshot ready;
@@ -1208,14 +1327,18 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   clock.set(1'000);
   core::ManualScheduler scheduler;
   auto sink = std::make_shared<NullExecutionStateSink>();
-  auto backend =
-      std::make_shared<ros2_control_execution::Ros2ControlExecutionBackend>(
+  auto resources = make_test_transport_resources(selected.execution, sink, clock);
+  auto owned_backend =
+      std::make_unique<ros2_control_execution::Ros2ControlExecutionBackend>(
+          *resources,
           ros2_control_execution::Ros2ControlExecutionBackend::
               TestingNoRosStartupTag{},
           sink, "arm", clock, scheduler, std::move(selected.execution));
+  auto *const backend = owned_backend.get();
   auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
   ASSERT_TRUE(
-      handle->BindBackend(backend, commanded_binding(), std::nullopt).ok());
+      handle->BindBackend(std::move(resources), std::move(owned_backend),
+                          nullptr, commanded_binding(), std::nullopt).ok());
 
   ros2_control_execution::ControllerBindingSnapshot ready;
   ready.activity_generation = 1U;

@@ -5,6 +5,7 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
+#include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -34,9 +35,9 @@ retained_ros2_control_gripper_state_config(
     const core::RuntimeParticipantBinding &binding);
 
 /// Construct a single-use retained runtime backend factory. The returned ROS
-/// adapter is one object implementing motion, gripper, and Stop-stage ports;
-/// it is joined to the existing retained Kernel rather than constructing a
-/// competing Kernel or state publication.
+/// motion and gripper adapters borrow one retained ROS resource lifetime and
+/// join the existing retained Kernel/state publication. The gripper Stop port
+/// still names the motion adapter until the participant Stop cutover.
 [[nodiscard]] RetainedRuntimeBackendFactory
 make_retained_ros2_control_backend_factory(
     RetainedRos2ControlBackendConfig config,

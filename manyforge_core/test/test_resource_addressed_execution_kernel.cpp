@@ -103,7 +103,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     gripper_status.progress = 0.25;
   }
 
-  Result<std::uint64_t> execute(const ExecuteRequestDTO& request) override {
+  Result<std::uint64_t> execute(const ExecuteRequestDTO& request) {
     ++execute_calls;
     Trace("engine:execute");
     last_execute = request;
@@ -536,15 +536,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     return result;
   }
-  ResetResultDTO reset(std::optional<std::uint64_t>) override {
-    ++reset_calls;
-    Trace("engine:reset");
-    if (reset_effect_hook) reset_effect_hook();
-    if (next_reset_result.accepted) {
-      emit_transition(get_status().state, ExecutionState::kIdle);
-    }
-    return next_reset_result;
-  }
   ResetResultDTO reset_after_certified_containment(std::uint64_t execution_id,
                                                    std::optional<std::uint64_t>) override {
     ++certified_reset_calls;
@@ -896,7 +887,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> reset_gripper_calls{};
   std::atomic<int> stop_calls{};
   std::atomic<int> translate_stop_stage_calls{};
-  std::atomic<int> reset_calls{};
   std::atomic<int> certified_reset_calls{};
   std::atomic<int> addressed_stop_fence_calls{};
   std::atomic<std::uint64_t> addressed_stop_fence_execution_id{};
@@ -4196,7 +4186,6 @@ TEST(ResourceAddressedExecutionKernelTest,
            kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
   }));
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
-  EXPECT_EQ(engine.reset_calls.load(), 0);
 
   engine.defer_prepare_completion = false;
   engine.next_execution_id = 42U;
@@ -7765,7 +7754,6 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAvailabilityDistinguishesSettle
     const auto value = kernel.get_manual_control_availability(manual);
     return value.ok() && value.value().available && value.value().cleanup_required;
   }));
-  EXPECT_EQ(engine.reset_calls, 0);
   EXPECT_EQ(engine.certified_reset_calls, 0);  // The query never cleans up.
   const auto current = kernel.get_operation_state(active.value().operation_id);
   ASSERT_TRUE(current.ok());
@@ -10354,7 +10342,6 @@ TEST(ResourceAddressedExecutionKernelTest,
     return engine.reset_gripper_calls.load() == 1 &&
            kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
   }));
-  EXPECT_EQ(engine.reset_calls.load(), 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -10550,8 +10537,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                     failed.value().operation.participants.front().terminal_error);
         }
         EXPECT_EQ(engine.acknowledge_calls.load(), initial_reset ? 0 : 1);
-        EXPECT_EQ(engine.reset_calls.load() + engine.certified_reset_calls.load(),
-                  initial_reset ? 1 : 0);
+        EXPECT_EQ(engine.certified_reset_calls.load(), initial_reset ? 1 : 0);
         EXPECT_EQ(failure_records.load(), 1);
         {
           std::lock_guard lock(journal.mutex);
@@ -10646,8 +10632,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                           failed.value().operation_revision.value());
       const auto rejected = kernel.reset(reset_request);
       ASSERT_FALSE(rejected.ok());
-      EXPECT_EQ(first_engine.reset_calls.load() + first_engine.certified_reset_calls.load(),
-                initial_reset ? 1 : 0);
+      EXPECT_EQ(first_engine.certified_reset_calls.load(), initial_reset ? 1 : 0);
       const auto reset =
           kernel.reset(control_request("request.scoped-fault.reset", executed.value(),
                                        failed.value().operation_revision.value()));
@@ -11308,7 +11293,6 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
                             failure->details.at("reason") == "operation_control_effect_threw");
         }));
         EXPECT_EQ(engine.certified_reset_calls.load(), 1);
-        EXPECT_EQ(engine.reset_calls.load(), 0);
         const auto unchanged =
             kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
         ASSERT_TRUE(unchanged.ok());
@@ -11441,7 +11425,7 @@ TEST(ResourceAddressedExecutionKernelTest, CompletionCleanupCannotOvertakeInitia
       return state.ok() && state.value().state == OperationStateKind::kStopped;
     }));
     EXPECT_EQ(engine.acknowledge_calls.load(), 0);
-    EXPECT_EQ(engine.reset_calls.load() + engine.certified_reset_calls.load(), 0);
+    EXPECT_EQ(engine.certified_reset_calls.load(), 0);
     EXPECT_FALSE(kernel.get_operation_state(operation.operation_id)
                      .value()
                      .participants.front()
@@ -11582,7 +11566,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto stale = kernel.reset(control_request("request.reset.stale", executed.value(), 2U));
   ASSERT_FALSE(stale.ok());
   EXPECT_EQ(stale.error().details.at("reason"), "operation_revision_stale");
-  EXPECT_EQ(engine.reset_calls.load(), 0);
 
   const auto reset = kernel.reset(control_request("request.reset.1", executed.value(), 1U));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
@@ -11590,7 +11573,6 @@ TEST(ResourceAddressedExecutionKernelTest,
     return engine.certified_reset_calls.load() == 1 &&
            kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
   }));
-  EXPECT_EQ(engine.reset_calls.load(), 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -11618,7 +11600,6 @@ TEST(ResourceAddressedExecutionKernelTest,
            kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
   }));
   EXPECT_EQ(engine.stop_calls.load(), 1);
-  EXPECT_EQ(engine.reset_calls.load(), 0);
 
   const auto retained = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(retained.ok()) << retained.error().message;
@@ -11668,8 +11649,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
   EXPECT_EQ(first_engine.stop_calls.load(), 1);
   EXPECT_EQ(second_engine.stop_calls.load(), 1);
-  EXPECT_EQ(first_engine.reset_calls.load(), 0);
-  EXPECT_EQ(second_engine.reset_calls.load(), 0);
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok()) << state.error().message;
   EXPECT_EQ(state.value().state, OperationStateKind::kStopped);

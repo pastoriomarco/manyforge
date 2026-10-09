@@ -477,8 +477,15 @@ void CCLCLifecycleTargetDriver::RunOnce() {
     // (unrecorded causes, reached marker, incident record) are kept.
     std::lock_guard lock(state_mutex_);
     for (auto& [component, state] : components_) {
-      Publish(state, LifecycleProgressPhaseDTO::kBlocked,
-              state.progress ? state.progress->next_intent : std::nullopt,
+      // `blocked` always names its next intent (spec 210 §3.17): the one in
+      // progress, otherwise the one toward the last target read.
+      std::optional<ComponentLifecycleIntentKindDTO> next_intent;
+      if (state.progress) next_intent = state.progress->next_intent;
+      if (!next_intent && state.requested_state) {
+        next_intent = NominalIntent(*state.requested_state);
+      }
+      if (!next_intent) continue;
+      Publish(state, LifecycleProgressPhaseDTO::kBlocked, next_intent,
               state.progress ? state.progress->blocking_cause_class
                              : LifecycleBlockingCauseClassDTO::kNone,
               ReasonOf("lifecycle_targets_unavailable", targets.error()), now);
@@ -731,8 +738,8 @@ void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ComponentState& state,
     // requested stands; the next pass re-evaluates on facts that include the
     // Recover and opens a new incident if the condition still warrants one.
     state.unrecorded_incident.reset();
-    Publish(state, LifecycleProgressPhaseDTO::kBlocked, std::nullopt, incident.cause_class,
-            std::string("lifecycle_facts_changed"), now_ns);
+    Publish(state, LifecycleProgressPhaseDTO::kBlocked, ComponentLifecycleIntentKindDTO::kRecover,
+            incident.cause_class, std::string("lifecycle_facts_changed"), now_ns);
     Wake();
     return;
   }
@@ -1044,6 +1051,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
   // The target read with the generation, never the (older) listed one.
   auto target = *facts.value().target;
   state.recovery_generation = facts.value().recovery_generation;
+  state.requested_state = target.requested_state;
 
   if (state.target_generation != target.target_generation) {
     // A new target (operator, superseding Apply) restarts progression; an

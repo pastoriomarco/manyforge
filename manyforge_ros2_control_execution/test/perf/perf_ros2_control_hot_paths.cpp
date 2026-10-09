@@ -72,6 +72,16 @@ using manyforge::core::ExecutionStateSinkStatus;
 using manyforge::core::ExecutionStateUpdateMode;
 using manyforge::ros2_control_execution::Ros2ControlExecutionBackend;
 using manyforge::ros2_control_execution::Ros2ControlExecutionBackendConfig;
+using manyforge::ros2_control_execution::Ros2TransportResources;
+
+struct ProbeTransportLifetime {
+  Ros2ControlExecutionBackend &backend;
+  Ros2TransportResources &resources;
+  ~ProbeTransportLifetime() {
+    backend.shutdown();
+    resources.quiesce();
+  }
+};
 
 std::size_t read_size_env(const char* name, std::size_t fallback) {
   const char* raw = std::getenv(name);
@@ -293,13 +303,15 @@ int main() {
   manyforge::core::FakeClock feedback_clock;
   manyforge::core::ManualScheduler feedback_scheduler;
   auto feedback_sink = std::make_shared<CountingExecutionStateSink>();
+  Ros2TransportResources feedback_resources("manyforge_feedback_hot_paths", "/",
+                                            3, "", feedback_sink, "arm",
+                                            feedback_clock);
   Ros2ControlExecutionBackend feedback_backend(
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-      feedback_sink,
-      "arm",
-      feedback_clock,
-      feedback_scheduler,
+      feedback_resources, Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      feedback_sink, "arm", feedback_clock, feedback_scheduler,
       make_config(hot_names));
+  ProbeTransportLifetime feedback_lifetime{feedback_backend,
+                                           feedback_resources};
   const auto feedback_allocations = measure_feedback_storage_allocations(
       feedback_backend,
       warm_names,
@@ -311,13 +323,12 @@ int main() {
   manyforge::core::FakeClock idle_clock;
   manyforge::core::ManualScheduler idle_scheduler;
   auto idle_sink = std::make_shared<CountingExecutionStateSink>();
+  Ros2TransportResources idle_resources("manyforge_idle_hot_paths", "/", 3, "",
+                                        idle_sink, "arm", idle_clock);
   Ros2ControlExecutionBackend idle_backend(
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-      idle_sink,
-      "arm",
-      idle_clock,
-      idle_scheduler,
-      make_config(hot_names));
+      idle_resources, Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      idle_sink, "arm", idle_clock, idle_scheduler, make_config(hot_names));
+  ProbeTransportLifetime idle_lifetime{idle_backend, idle_resources};
   const auto idle_skip_allocations =
       measure_idle_repeated_sample_skip_allocations(
           idle_backend, hot_names, hot_positions, iterations);

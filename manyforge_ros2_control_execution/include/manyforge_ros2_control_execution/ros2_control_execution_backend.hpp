@@ -23,7 +23,6 @@
 #include <vector>
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
-#include <control_msgs/action/gripper_command.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
@@ -42,12 +41,12 @@
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
-#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/trajectory/trajectory_progress_projection.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 namespace manyforge::ros2_control_execution {
 
@@ -58,63 +57,7 @@ class Ros2ControlStopQualificationAccess;
 class SceneProjectionWorker;
 struct CommandedIdleHeartbeatState;
 struct SceneProjectionCompletion;
-struct SceneProjectionWorkerDeleter {
-  void operator()(SceneProjectionWorker *worker) const noexcept;
-};
 } // namespace detail
-
-struct Ros2GripperActionConfig {
-  std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
-  std::string transport_kind = "ros_gripper_command";
-  std::string command_topic;
-  std::string state_topic;
-  std::vector<std::string> command_joint_names;
-  // Exact joint identity carried by the raw transport state topic. This is
-  // intentionally separate from joint_name, which is the compiled coordinate
-  // used by the execution-state projection sink.
-  std::string state_joint_name;
-  // Optional execution-state sink projection metadata. When set, the ROS
-  // gripper command/status path also updates the declared gripper group so
-  // Composer's FK/link-pose scene state renders the gripper through the same
-  // robot-state path as the arm.
-  std::string group_id;
-  std::string joint_name;
-  std::string completion_policy = "position_reached";
-  double open_position = 0.0;
-  double closed_position = 0.0;
-  double open_effort = 0.0;
-  double close_effort = 0.0;
-  bool publish_nominal_position = false;
-  double state_freshness_timeout_s = 1.0;
-  double wait_for_action_server_timeout_s = 2.0;
-  double result_timeout_s = 5.0;
-};
-
-/// One bounded, non-blocking readiness read for a configured gripper
-/// transport. This is diagnostic/lifecycle evidence only; it grants no command
-/// authority and performs no discovery wait.
-struct Ros2GripperTransportReadinessSnapshot {
-  std::string transport_kind;
-  std::string state_topic;
-  std::string state_joint_name;
-  bool configured{};
-  bool command_path_ready{};
-  bool feedback_path_ready{};
-  // Diagnostic admission state only; a closed gate does not make the
-  // underlying physical transport unavailable.
-  bool command_gate_open{};
-  // Exact physical transport readiness. Command admission remains separately
-  // fail-closed through command_gate_open and the backend lifecycle authority.
-  bool ready{};
-  std::uint64_t feedback_publisher_count{};
-  std::uint64_t feedback_messages_received{};
-  std::uint64_t feedback_samples_matched{};
-  std::vector<std::string> reason_codes;
-
-  friend bool
-  operator==(const Ros2GripperTransportReadinessSnapshot &,
-             const Ros2GripperTransportReadinessSnapshot &) = default;
-};
 
 struct Ros2ControlSceneProjectionMetrics {
   std::uint64_t misses_total = 0;
@@ -187,18 +130,10 @@ struct Ros2ControlControllerProgressMetrics {
 /// - The scoped JTC cancel-reference writer may take execution_mutex_ then the
 ///   authored-state publication leaf lock; the leaf lock never takes
 ///   execution_mutex_.
-/// - Do not hold gripper_map_mutex_ while taking execution_mutex_ or
-/// state_mutex_.
-/// - monitor/callback paths must use best-effort execution-state sink updates
-///   so long validation sweeps cannot block reset/stop completion.
-/// - Per-GripperRuntime::mutex is taken only after gripper_map_mutex_ has been
-///   released, using a copied shared_ptr to the runtime.
-/// - A gripper runtime mutex may call only the sink's kBestEffort projection;
-///   that call uses try_lock and no scene/sink path may call back into a
-///   GripperRuntime. This linearizes generation invalidation with projection
-///   without introducing a blocking scene-lock dependency.
-class Ros2ControlExecutionBackend final : public core::IExecutionBackend,
-                                          public core::IGripperCommandBackend {
+/// - monitor/callback paths use best-effort execution-state sink updates.
+/// The retained host owns transport resources and quiesces callbacks before
+/// destroying the adapter.
+class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 public:
   struct DeferredRosExecutorStartTag {};
   using ObservedRobotStatePublishWriter =
@@ -208,11 +143,12 @@ public:
           std::int64_t)>;
 
   Ros2ControlExecutionBackend(
+      Ros2TransportResources &resources,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   Ros2ControlExecutionBackend(
-      DeferredRosExecutorStartTag,
+      Ros2TransportResources &resources, DeferredRosExecutorStartTag,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
@@ -220,26 +156,27 @@ public:
   /// backend remains its sole adapter writer; construction rejects a joint
   /// order or source set that differs from the exact backend config.
   Ros2ControlExecutionBackend(
-      DeferredRosExecutorStartTag,
+      Ros2TransportResources &resources, DeferredRosExecutorStartTag,
       core::AddressedObservedStatePublication &addressed_state_publication,
       ObservedRobotStatePublishWriter addressed_state_writer,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   Ros2ControlExecutionBackend(
-      DeferredRosExecutorStartTag,
+      Ros2TransportResources &resources, DeferredRosExecutorStartTag,
       core::ObservedRobotStatePublication &addressed_state_publication,
       ObservedRobotStatePublishWriter addressed_state_writer,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   Ros2ControlExecutionBackend(
-      DeferredRosExecutorStartTag,
+      Ros2TransportResources &resources, DeferredRosExecutorStartTag,
       core::ObservedRobotStatePublication &addressed_state_publication,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
+  void shutdown() noexcept;
 
   core::PrepareParticipantResultDTO
   Prepare(const core::PreparedOperationParticipantDTO &participant,
@@ -258,7 +195,7 @@ public:
   RebindRoute(core::RuntimeParticipantBinding binding,
               std::vector<core::RuntimeParticipantBinding> program_aliases);
 
-  // Deployment-owned ROS entities, including gripper transports, must be
+  // Deployment-owned ROS entities must be
   // installed before this one-way transition. Mutating the ROS graph while the
   // executor spins is rejected because rclcpp/rcutils graph construction is not
   // a runtime-safe reconfiguration boundary.
@@ -340,36 +277,12 @@ public:
   // execution/monitoring.
   void set_runtime_velocity_scale(double scale) override;
 
-  void configure_gripper_action(std::string gripper_id,
-                                Ros2GripperActionConfig config);
-  [[nodiscard]] Ros2GripperTransportReadinessSnapshot
-  gripper_transport_readiness(const std::string &gripper_id) const;
-  [[nodiscard]] core::Result<void> validate_gripper_command(
-      const core::GripperCommandRequestDTO &request) const override;
-  core::GripperCommandResultDTO
-  command_gripper(const core::GripperCommandRequestDTO &request) override;
-  core::GripperCommandResultDTO mark_gripper_grasp_lost(
-      const std::string &gripper_id, std::uint64_t expected_command_id,
-      std::uint64_t expected_generation, const std::string &evidence_label,
-      const std::string &message,
-      const std::string &reason_code = "grasp_confirmation_lost") override;
-  core::GripperCommandStatusDTO
-  get_gripper_status(const std::string &gripper_id) const override;
-  void invalidate_gripper_commands(
-      core::GripperInvalidationReason reason) noexcept override;
-  void authorize_gripper_commands() noexcept override;
-
-  // Command-enable gate: this backend is the SINGLE publishing authority
-  // for the gate topic (reliable + transient_local, so the latched value is
-  // the truth for late-joining bridge subscribers). External flows that need
-  // command suppression — e.g. the simulator-reset flow — must request it
-  // here instead of publishing the topic themselves; a second publisher
-  // makes the latched gate value reader-dependent (split-brain).
+  // The retained transport holder is the sole command-gate publisher.
   bool command_gate_configured() const {
-    return !config_.command_gate_topic.empty();
+    return resources_.command_gate_configured();
   }
   bool command_gate_enabled() const {
-    return command_gate_enabled_.load(std::memory_order_acquire);
+    return resources_.command_gate_enabled();
   }
   // Public request form of the gate write. Returns false when no gate is
   // configured for this deployment (callers must treat that as a contract
@@ -395,13 +308,15 @@ public:
   struct TestingNoRosStartupTag {};
 
   Ros2ControlExecutionBackend(
-      TestingNoRosStartupTag,
+      Ros2TransportResources &resources, TestingNoRosStartupTag,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config)
-      : execution_state_sink_(std::move(execution_state_sink)),
+      : resources_(resources),
+        execution_state_sink_(std::move(execution_state_sink)),
         group_name_(std::move(group_name)), clock_(clock),
-        scheduler_(scheduler), config_(std::move(config)) {
+        scheduler_(scheduler), config_(std::move(config)),
+        node_(resources.node()) {
     if (!execution_state_sink_) {
       throw std::invalid_argument("execution state sink must not be null");
     }
@@ -416,15 +331,17 @@ public:
   }
 
   Ros2ControlExecutionBackend(
-      TestingNoRosStartupTag,
+      Ros2TransportResources &resources, TestingNoRosStartupTag,
       core::ObservedRobotStatePublication &addressed_state_publication,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config)
-      : execution_state_sink_(std::move(execution_state_sink)),
+      : resources_(resources),
+        execution_state_sink_(std::move(execution_state_sink)),
         group_name_(std::move(group_name)), clock_(clock),
         scheduler_(scheduler), config_(std::move(config)),
-        observed_state_publication_(&addressed_state_publication) {
+        observed_state_publication_(&addressed_state_publication),
+        node_(resources.node()) {
     if (!execution_state_sink_) {
       throw std::invalid_argument("execution state sink must not be null");
     }
@@ -756,8 +673,6 @@ private:
 
   using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
   using GoalHandleFJT = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
-  using GripperCommand = control_msgs::action::GripperCommand;
-  using GoalHandleGripper = rclcpp_action::ClientGoalHandle<GripperCommand>;
 
   struct JointSample {
     std::vector<std::string> joint_names;
@@ -817,54 +732,6 @@ private:
     kBestEffort,
   };
 
-  struct GripperRuntime {
-    Ros2GripperActionConfig config;
-    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
-    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
-        joint_state_sub;
-    mutable std::mutex mutex;
-    GoalHandleGripper::SharedPtr active_goal_handle;
-    std::string state = "idle";
-    bool executing = false;
-    bool goal_accepted = false;
-    bool cancel_pending = false;
-    std::uint64_t command_id = 0;
-    std::uint64_t generation = 0;
-    std::uint64_t revision = 0;
-    double progress = 0.0;
-    std::optional<core::ScheduleHandle> lifecycle_handle;
-    std::uint64_t lifecycle_schedule_generation = 0;
-    std::optional<double> start_position;
-    std::optional<double> current_position;
-    std::optional<double> observed_position;
-    std::optional<std::chrono::steady_clock::time_point> observed_at;
-    std::uint64_t feedback_messages_received = 0;
-    std::uint64_t feedback_samples_matched = 0;
-    std::optional<double> max_effort;
-    double target_position = 0.0;
-    double duration_s = 0.0;
-    core::TimePoint started_at_ns = 0;
-    std::optional<core::TimePoint> deadline_at_ns;
-    std::string commanded_state;
-    std::string actuation_kind;
-    std::string state_authority;
-    std::string completion_policy;
-    std::string grasp_confirmation_policy;
-    std::string transport_kind;
-    core::GripperProjectionState projection_state =
-        core::GripperProjectionState::kNotRequired;
-    std::string projection_reason;
-    int projection_retry_count = 0;
-    std::optional<std::size_t> scene_projection_slot;
-    std::uint64_t scene_projection_request_id = 0;
-    std::vector<std::string> evidence;
-    std::string evidence_state;
-    bool externally_failed = false;
-    std::string error;
-    std::string reason_code;
-  };
-
   void validate_config() const;
   core::StopResultDTO stop_if_running_generation(
       std::optional<std::uint64_t> expected_running_generation,
@@ -910,14 +777,13 @@ private:
       std::optional<std::uint64_t> expected_running_generation,
       bool invalidate_before_publish) noexcept;
   Ros2ControlExecutionBackend(
-      bool defer_ros_executor_start,
+      Ros2TransportResources &resources, bool defer_ros_executor_start,
       core::ObservedRobotStatePublication *addressed_state_publication,
       ObservedRobotStatePublishWriter addressed_state_writer,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name, core::IClock &clock, core::IScheduler &scheduler,
       Ros2ControlExecutionBackendConfig config);
   void initialize_ros();
-  void stop_ros();
   void start_controller_binding_monitor();
   void stop_controller_binding_monitor() noexcept;
   void controller_binding_monitor_worker(std::stop_token stop_token);
@@ -1047,7 +913,6 @@ private:
                                    std::int64_t source_timestamp_ns);
   bool schedule_active_scene_projection(std::vector<double> joint_positions,
                                         std::int64_t source_timestamp_ns);
-  void stop_scene_projection_worker() noexcept;
   bool drain_scene_projection_for(std::chrono::nanoseconds timeout);
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
@@ -1057,15 +922,6 @@ private:
   void record_action_result_latency_ns(std::int64_t latency_ns);
   void record_cancel_latency_ns(std::int64_t latency_ns);
   void record_stop_confirmation_latency_ns(std::int64_t latency_ns);
-  std::optional<double>
-  scene_group_joint_position(const std::string &group_id,
-                             const std::string &joint_name) const;
-  bool schedule_gripper_scene_projection_locked(
-      const std::shared_ptr<GripperRuntime> &runtime, double position,
-      bool terminal);
-  void on_gripper_scene_projection_complete(
-      const std::weak_ptr<GripperRuntime> &runtime,
-      const detail::SceneProjectionCompletion &completion) noexcept;
   bool publish_snapshot(
       core::ExecutionState state, double progress,
       const std::vector<double> &joint_positions,
@@ -1141,23 +997,8 @@ private:
   double max_abs_error(const std::vector<double> &lhs,
                        const std::vector<double> &rhs) const;
 
-  void on_gripper_feedback(
-      const std::shared_ptr<GripperRuntime> &runtime, std::uint64_t command_id,
-      std::uint64_t generation, GoalHandleGripper::SharedPtr,
-      const std::shared_ptr<const GripperCommand::Feedback> feedback);
-  void on_gripper_result(const std::shared_ptr<GripperRuntime> &runtime,
-                         std::uint64_t command_id, std::uint64_t generation,
-                         const GoalHandleGripper::WrappedResult &result);
-  void cancel_all_gripper_commands();
-  bool
-  schedule_gripper_lifecycle(const std::shared_ptr<GripperRuntime> &runtime,
-                             std::uint64_t command_id, std::uint64_t generation,
-                             core::TimePoint deadline_ns);
-  void advance_gripper_command(const std::shared_ptr<GripperRuntime> &runtime,
-                               std::uint64_t command_id,
-                               std::uint64_t generation,
-                               std::uint64_t schedule_generation);
-
+  Ros2TransportResources &resources_;
+  std::atomic<bool> shutdown_started_{false};
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink_;
   std::string group_name_;
   core::IClock &clock_;
@@ -1225,12 +1066,9 @@ private:
   // odd epoch and only successful publication commits the next even epoch.
   std::atomic<std::uint64_t> authored_state_authority_epoch_{1};
 
-  std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
-  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
   mutable std::mutex ros_configuration_mutex_;
   bool ros_configuration_complete_ = false;
-  std::thread spin_thread_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client_;
   rclcpp::CallbackGroup::SharedPtr action_callback_group_;
   rclcpp::CallbackGroup::SharedPtr state_callback_group_;
@@ -1246,11 +1084,6 @@ private:
       list_controllers_client_;
   rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::
       SharedPtr list_hardware_components_client_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr command_gate_pub_;
-  // Last value published on the command-gate topic. Read by goal-rejection
-  // diagnostics so a closed gate is named as the rejection cause instead of
-  // surfacing as an unexplained controller refusal.
-  std::atomic<bool> command_gate_enabled_{false};
   // Controller recovery and an operator Reset can both require the exact
   // commanded-sim initialization goal. Serialize that physical boundary so a
   // delayed readiness refresh cannot overlap or replay an admitted Reset.
@@ -1345,18 +1178,6 @@ private:
   std::condition_variable_any controller_binding_monitor_cv_;
   bool controller_binding_refresh_requested_ = false;
   std::jthread controller_binding_monitor_thread_;
-
-  // Authority serializes admission/dispatch against reset, stop, and runtime
-  // replacement without holding lifecycle or scene locks across ROS waits.
-  // Lock order is authority -> map -> per-runtime; callbacks only take the
-  // per-runtime leaf lock.
-  mutable std::mutex gripper_authority_mutex_;
-  std::uint64_t gripper_authority_generation_ = 1;
-  bool gripper_admission_blocked_ = false;
-  mutable std::mutex gripper_map_mutex_;
-  std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;
-  std::atomic<std::uint64_t> next_gripper_command_id_{1};
-  std::atomic<std::uint64_t> next_gripper_generation_{1};
 
   // Managed FollowJointTrajectory preempt/controlled-stop substrate. Used by
   // the motion-interrupt controlled-stop paths (spring_back_hold /
@@ -1463,9 +1284,7 @@ private:
   std::atomic<detail::IRos2ControlStopQualificationProbe *>
       stop_qualification_probe_{nullptr};
   mutable std::mutex scene_projection_barrier_mutex_;
-  std::unique_ptr<detail::SceneProjectionWorker,
-                  detail::SceneProjectionWorkerDeleter>
-      scene_projection_worker_;
+  detail::SceneProjectionWorker *scene_projection_worker_ = nullptr;
 };
 
 } // namespace manyforge::ros2_control_execution

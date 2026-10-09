@@ -243,6 +243,9 @@ class CCLCLifecycleTargetDriver final {
   };
   struct ComponentState final {
     std::uint64_t target_generation{};
+    /// Requested state of the target last read; names the next intent while
+    /// the targets cannot be read.
+    std::optional<LifecycleTargetStateDTO> requested_state;
     std::uint32_t step{};
     /// Request-identity attempt; advances after every consumed request id.
     std::uint32_t attempt{1U};

@@ -18,12 +18,9 @@
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
 #include <manyforge_core/kernel_event_publisher.hpp>
 #include <manyforge_core/kernel_flight_recorder.hpp>
-#include <manyforge_core/motion_trip_stop_coordinator.hpp>
-#include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
-#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
@@ -37,7 +34,6 @@
 #include <manyforge_core/runtime_collision_monitor.hpp>
 #include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/state_machine.hpp>
-#include <manyforge_core/stop_policy.hpp>
 #include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
@@ -136,12 +132,6 @@ struct ExecutionKernelConfig {
   // production rejections.
   bool enable_collision_diagnostic_compare = false;
 
-  // Native execution-backend lifecycle drain. ROS adapters expose their own
-  // `stop_completion_timeout_s`; this field provides the equivalent reset
-  // drain knob for the non-ROS RoboPlan backend used by Composer/native
-  // simulation.
-  double native_reset_completion_timeout_s = 5.0;
-
   // Per-call budget (seconds) for single-shot IK resolution
   // (`IPlannerBackend::solve_ik`), used by the RoboPlan/ros2_control factories
   // to size the dedicated single-shot SimpleIk solver. This is deliberately
@@ -201,56 +191,6 @@ struct ExecutionKernelConfig {
   // freshness checks.
   Duration runtime_dynamic_body_max_age_cap_ns = 500'000'000;  // 500 ms
 
-  // Terminal motion-outcome retention. Outcomes are queryable via
-  // `get_execution_outcome(execution_id)` until the store reaches this
-  // depth; oldest entries are evicted FIFO. Audit-grade deployments
-  // should raise this and pair with an audit archive subscriber.
-  std::size_t motion_execution_outcome_retention = 256;
-
-  // Transitional deployment stop-confirmation tolerance. Until the complete
-  // retained participant Stop plan supplies the one outer deadline, the
-  // effective envelope is requested/default deceleration plus this tolerance.
-  Duration complete_move_on_signal_timeout_ns = 500'000'000;  // 500 ms
-
-  // Deployment-default fault-stop profile. Used by
-  // `apply_latched_interrupt_preemption`
-  // when a latched fault policy has `preemption_action == kPreemptTrajectory`
-  // AND no `stop_profile` of its own. Deployments should normally configure
-  // `kSpringBackHold`, matching the operator's stated intent ("default on
-  // interrupts / collision-during-motion is spring-back"). Leave unset to
-  // preserve the legacy `execution_backend_.stop()` behavior.
-  //
-  // The per-policy `InterruptPolicyDefinition.stop_profile` wins when
-  // present. This kernel-level default applies only when the policy
-  // is otherwise unconfigured, so deployments can either opt the whole
-  // kernel into controlled-stop semantics here or override on a per-
-  // policy basis.
-  std::shared_ptr<const MotionInterruptStopProfileDTO> default_fault_stop_profile;
-
-  // Deployment-default operator-stop profile. Used by
-  // `ExecutionKernel::stop()` (the operator stop-button path) to route
-  // active physical motion through `execute_controlled_stop` instead of the
-  // legacy `execution_backend_.stop()`. Deployments should normally configure
-  // `kSoftOnPath`, matching the operator's stated intent ("default on stop
-  // button press is soft stop on path"). Leave unset to keep the legacy
-  // behavior.
-  //
-  // The two defaults are intentionally distinct because the operator
-  // stop button and a fault interrupt are operationally different
-  // events: a fault is "the system noticed something wrong, stop now
-  // safely" (default spring-back to known state), while an operator
-  // stop is "I am taking back control, decelerate cleanly along the
-  // current path" (default soft-on-path).
-  std::shared_ptr<const MotionInterruptStopProfileDTO> operator_stop_profile;
-
-  // The maintained addressed runtime owns the sole public Stop transaction.
-  // In that composition the subordinate still detects and publishes runtime
-  // collision/interrupt truth, but it MUST NOT call a backend Stop surface;
-  // ResourceAddressedExecutionKernel accepts the exact scoped Stop instead.
-  // Standalone, not-yet-restored lanes retain their historical local
-  // preemption behavior until their later product gate.
-  bool runtime_collision_stop_owned_by_addressed_kernel = false;
-
   /// Exact implementation revision of the Kernel-owned validation pipeline
   /// recorded in every prepared motion participant. A changed pipeline
   /// contract rotates this value; operation callers never supply it.
@@ -282,7 +222,6 @@ struct ExecutionKernelPorts {
   ITrajectoryValidator& trajectory_validator;
   ICollisionTrajectoryProjector& collision_projector;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator = nullptr;
-  IGripperCommandBackend* gripper_command_backend = nullptr;
   IPlanningSceneSynchronizer* planning_scene_synchronizer = nullptr;
 };
 
@@ -301,11 +240,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                   TrajectoryCache& cache, ExecutionKernelConfig config = {});
 
   ~ExecutionKernel() override;
-
-  /// Execute a motion request. Only valid from Idle.
-  /// Returns execution_id immediately; plan → validate → dispatch runs
-  /// on a worker thread. Callers observe progress via get_status() and events.
-  Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
 
   AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept override;
@@ -352,19 +286,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                 std::uint32_t planning_attempt_index = 0U,
                                                 std::stop_token stop_token = {}) override;
 
-  /// Non-blocking stop from any non-terminal state.
-  /// Accepted stop invalidates older lifecycle/recovery commands by bumping
-  /// `control_command_epoch()`. Stop is never rejectable by epoch staleness.
-  StopResultDTO stop();
-
-  /// Non-blocking reset. Valid from any state except Idle.
-  ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
   ResetResultDTO reset_after_certified_containment(
       std::uint64_t execution_id,
       std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
-  /// Backend-neutral gripper command surface. The injected adapter owns all
-  /// progression and publishes immutable observer status.
+  /// Gripper commands belong to the separate gripper participant; this motion
+  /// participant reports them as not configured.
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override;
   Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const override;
   GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const override;
@@ -373,29 +300,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                      std::uint64_t expected_generation) override;
   Result<void> reset_gripper(const std::string& gripper_id, std::uint64_t expected_command_id,
                              std::uint64_t expected_generation) override;
-  GripperCommandResultDTO mark_gripper_grasp_lost(const std::string& gripper_id,
-                                                  std::uint64_t expected_command_id,
-                                                  std::uint64_t expected_generation,
-                                                  const std::string& evidence_label,
-                                                  const std::string& message,
-                                                  const std::string& reason_code);
-
-  /// Monotonic lifecycle/recovery command epoch. Python control surfaces use
-  /// this only to stamp bounded control calls; the C++ kernel owns the actual
-  /// stale-command rejection at side-effect boundaries.
-  std::uint64_t control_command_epoch() const;
-  std::uint64_t bump_control_command_epoch();
-
-  /// Backend-agnostic accessor for the active execution backend's
-  /// motion-interrupt stop capability (the advertised supported stop modes
-  /// and the soft_on_path planner config it would use). This is the same
-  /// capability the arm-time gate validates against; exposing it lets a
-  /// deployment load-time check fail closed — disabling execution before any
-  /// motion is armed — when the configured operator/fault stop profile names
-  /// a mode the backend does not advertise. Delegates to
-  /// IExecutionBackend::get_motion_interrupt_stop_capability.
-  MotionInterruptStopCapabilityDTO get_motion_interrupt_stop_capability() const;
-
   /// Acknowledge a successful terminal execution and return to Idle.
   ///
   /// Valid only when the kernel is currently Completed for exactly the supplied
@@ -418,18 +322,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Bounded copy of the stop-certificate evidence ring (tests/diagnostics).
   std::vector<KernelStopCertificateDTO> stop_certificate_evidence() const;
 
-  /// ADR-0018: update the runtime velocity scale for active execution.
-  ///
-  /// The UI velocity slider drives this through cycle_manager → kernel →
-  /// backend. Backends retime discrete trajectory execution continuously;
-  /// changing the scale never stops an action by itself. `scale` is validated
-  /// finite and clamped to [0, 1]. NOT serialized through lifecycle_mutex_:
-  /// this is a high-rate operator surface and the backend's atomic store
-  /// handles concurrency. `principal_id` is optional because lower-level
-  /// backend/direct callers may not have a supervisory actor identity.
-  void set_runtime_velocity_scale(double scale,
-                                  std::optional<std::string> principal_id = std::nullopt);
-
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) override;
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
@@ -440,11 +332,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Get the latest observer-safe execution snapshot published by the kernel.
   ExecutionSnapshot get_execution_snapshot() const;
-
-  /// Explicitly ask the execution adapter to publish its current observed
-  /// state, then refresh the observer-facing kernel snapshot. Intended for
-  /// simulator/bootstrap commands only; status reads never call it.
-  Result<void> refresh_observed_state_snapshot();
 
   /// Run a single collision monitoring tick.
   /// Called externally (e.g., by a scheduler) during Executing.
@@ -501,39 +388,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// planner/context work so they defer loudly instead of borrowing a runtime
   /// monitor resource.
   std::optional<ErrorDTO> collision_validation_admission_error() const;
-
-  // ---------------------------------------------------------------
-  // Kernel-native interrupt registration and latch surface (spec/260,
-  // sprint Chunk I-2). This chunk owns source/policy registration, signal
-  // ingestion, priority arbitration, latch visibility, disposition validation,
-  // and event emission.
-  // ---------------------------------------------------------------
-
-  Result<void> register_interrupt_source(const InterruptSourceDefinition& source);
-  Result<void> register_interrupt_policy(const InterruptPolicyDefinition& policy);
-  InterruptIngestResult publish_fast_interrupt_signal(const InterruptSignalUpdate& update);
-  InterruptIngestResult publish_supervisory_interrupt_signal(const InterruptSignalUpdate& update);
-  InterruptIngestResult publish_fast_interrupt_signals(
-      const std::vector<InterruptSignalUpdate>& updates);
-  std::optional<InterruptLatch> get_active_interrupt_latch() const;
-  Result<InterruptIngestResult> apply_interrupt_disposition(
-      const InterruptDisposition& disposition);
-
-  // ---------------------------------------------------------------
-  // Motion-scoped terminal outcome surface (spec/210 §3.11,
-  // spec/230 §3.4). Read-only observer; Composer and the behavior
-  // runtime consume outcomes here instead of polling signal state.
-  // ---------------------------------------------------------------
-
-  /// Return the immutable terminal outcome record for `execution_id`, if
-  /// the kernel has emitted one. Outcomes survive subsequent executions
-  /// so callers (BT, MCP, audit) can correlate by id; the bound is the
-  /// `motion_execution_outcome_retention` config knob.
-  std::optional<MotionExecutionOutcomeDTO> get_execution_outcome(std::uint64_t execution_id) const;
-
-  /// Diagnostics-only observer for armed move-scoped bindings
-  /// (spec/260 §B.3). BT/policy code MUST NOT poll this for control flow.
-  std::vector<MotionInterruptScopeStatusDTO> active_motion_interrupt_scopes() const;
 
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
@@ -674,14 +528,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
-  enum class RuntimeCollisionProtectionPurpose {
-    kMotion,
-    kControlledStop,
-  };
-  std::uint64_t start_collision_monitoring(
-      std::string reason,
-      RuntimeCollisionProtectionPurpose purpose = RuntimeCollisionProtectionPurpose::kMotion,
-      const CollisionWorldLeaseInventory* admission_inventory = nullptr);
+  std::uint64_t start_collision_monitoring(std::string reason,
+                                           const CollisionWorldLeaseInventory* admission_inventory);
   void stop_collision_monitoring(RuntimeCollisionMonitorRelease release,
                                  std::optional<std::uint64_t> expected_generation = std::nullopt,
                                  bool drain_callbacks = false);
@@ -719,32 +567,20 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   current_scene_snapshot_lease_validation_context() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(const std::shared_ptr<CollisionCancellationToken>& token);
-  void request_validation_cancel_from_interrupt(const InterruptIngestResult& result);
-  void request_planning_cancel_from_interrupt(const InterruptIngestResult& result);
   void request_active_validation_cancel(std::string reason);
   void request_active_planning_cancel();
+  /// Planning-deadline watchdog: records the expiry and cancels planning. The
+  /// execute worker alone commits the resulting terminal.
+  void expire_planning_deadline();
   void record_terminal_fault_authority(const InterruptIngestResult& result);
-  void mark_active_interrupt_preemption_result(
-      InterruptPreemptionResult result,
-      const std::map<std::string, std::string>& extra_details = {});
-  void mark_interrupt_preemption_result(
-      const InterruptLatch& latch, InterruptPreemptionResult result,
-      const std::map<std::string, std::string>& extra_details = {});
   bool active_trajectory_preempt_pending() const;
-  void apply_interrupt_ingest_effects(const InterruptIngestResult& result,
-                                      bool apply_preemption_inline);
+  void apply_interrupt_ingest_effects(const InterruptIngestResult& result);
   void install_builtin_interrupt_sources();
   InterruptIngestResult publish_runtime_collision_fault_interrupt(
       const CollisionCheckResultDTO& check,
       const std::map<std::string, std::string>& metadata = {});
-  InterruptIngestResult publish_fast_interrupt_signals_internal(
-      const std::vector<InterruptSignalUpdate>& updates, bool apply_preemption_inline);
-  void schedule_latched_interrupt_preemption(InterruptIngestResult result);
-  void apply_latched_interrupt_preemption(const InterruptIngestResult& result,
-                                          std::stop_token worker_stop_token = {});
-  bool request_fault_preempt_controlled_stop();
-  bool fault_preempt_stop_active() const;
-  std::uint64_t fault_preempt_stop_generation() const;
+  InterruptIngestResult publish_fast_interrupt_signals(
+      const std::vector<InterruptSignalUpdate>& updates);
 
   // RT-8B internals.
   RecoveryAuthorityCapture capture_recovery_authority_locked();
@@ -756,8 +592,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(const char* trigger);
   KernelRecoveryAssessmentDTO publish_recovery_assessment_locked(RecoveryAuthorityCapture capture,
                                                                  const char* trigger);
-  KernelRecoveryAssessmentDTO publish_terminal_recovery_assessment_locked(
-      ExecutionState terminal_state, const char* trigger);
   void try_refresh_recovery_assessment(const char* trigger);
   void schedule_recovery_assessment_refresh(const char* trigger) noexcept;
   bool publish_stop_certificate(KernelStopCertificateDTO certificate,
@@ -773,59 +607,27 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void schedule_recovery_freshness_deadline_locked(const KernelRecoveryAssessmentDTO& assessment);
   void schedule_recovery_observation_poll_locked(const KernelRecoveryAssessmentDTO& assessment);
   KernelRecoveryActionResultDTO apply_recovery_action_impl(KernelRecoveryActionRequestDTO request);
-  bool signal_fault_preempt_stop_path_collision(std::map<std::string, std::string> details);
-  std::optional<std::map<std::string, std::string>> fault_preempt_stop_path_collision_details()
-      const;
-  void clear_fault_preempt_stop_path_collision();
-  void set_fault_preempt_intervention_error(ErrorDTO error);
-  std::optional<ErrorDTO> fault_preempt_intervention_error_for_active_latch() const;
-  void clear_fault_preempt_intervention_error();
-  bool request_operator_stop_controlled_stop();
-  bool signal_operator_stop_path_collision(std::map<std::string, std::string> details);
-  std::optional<std::map<std::string, std::string>> operator_stop_path_collision_details() const;
   bool control_command_epoch_matches(std::optional<std::uint64_t> expected_epoch) const;
   InterruptRuntimeContext current_interrupt_context() const;
   void stamp_interrupt_latch_collision_world_revision(InterruptIngestResult& result);
   void emit_interrupt_events(const InterruptIngestResult& result);
 
-  /// Operator-stop worker lifecycle. Operator stops can run a
-  /// deployment-configured controlled-stop profile; that backend call may take
-  /// the soft-stop deceleration window. Keep the API admission path short and
-  /// run the long backend work on this cancellable worker instead.
-  bool cancel_operator_stop_worker(bool invalidate_generation);
-  void join_finished_operator_stop_worker();
-  bool wait_for_operator_stop_worker(std::chrono::steady_clock::duration timeout);
-  bool start_operator_stop_worker(MotionInterruptStopProfileDTO profile,
-                                  ExecutionState pre_completion_state,
-                                  std::optional<std::uint64_t> runtime_collision_generation,
-                                  std::uint64_t stop_owner_generation);
-  void run_operator_stop_worker(std::uint64_t generation, std::uint64_t stop_owner_generation,
-                                MotionInterruptStopProfileDTO profile,
-                                ExecutionState pre_completion_state,
-                                std::optional<std::uint64_t> runtime_collision_generation,
-                                std::stop_token stop_token);
-  bool operator_stop_worker_is_current(std::uint64_t generation, std::stop_token stop_token) const;
-  void begin_runtime_velocity_scale_freeze();
-  void end_runtime_velocity_scale_freeze();
-
-  // Motion-scope lifecycle plumbing on the worker thread.
-  // `active_motion_execution_` is reset at execute() entry and populated
-  // by `arm_motion_scopes_for_dispatch_locked` after validation passes.
-  // The worker MUST call `finalize_motion_execution_outcome` exactly
-  // once on every terminal exit so the outcome store has a 1:1
-  // correspondence with terminal executions.
+  // Worker-local terminal record. Every worker terminal exit records exactly
+  // once (first record wins); a recorded error is the exact cause handed to
+  // the prepared-motion owner when the worker exits before dispatch.
   struct ActiveMotionExecution {
-    std::uint64_t execution_id = 0;
-    std::string move_id;
-    bool had_scopes = false;
-    bool arm_succeeded = false;
-    bool outcome_emitted = false;
-    bool correlation_captured = false;
+    bool terminal_recorded = false;
+    std::optional<ErrorDTO> terminal_error;
     std::uint64_t runtime_collision_protection_generation = 0;
     std::uint64_t execution_progress_generation = 0;
-    std::optional<ActionSpanDTO> action_span;
-    std::string contact_policy_id;
-    std::optional<InterruptLatch> motion_trip_latch;
+
+    void record_terminal(std::optional<ErrorDTO> error) {
+      if (terminal_recorded) {
+        return;
+      }
+      terminal_recorded = true;
+      terminal_error = std::move(error);
+    }
   };
 
   enum class ExecuteWorkerPhaseStatus {
@@ -862,9 +664,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void notify_execution_waiters();
   bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
                              bool containment_already_certified = false);
-
-  void invalidate_gripper_authority(GripperInvalidationReason reason) noexcept;
-  void authorize_gripper_authority() noexcept;
 
   bool finalize_overridden_terminal_authority(const ExecuteRequestDTO& request,
                                               std::uint64_t exec_id,
@@ -924,47 +723,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                      ExecutionHandle& execution_handle,
                                      ActiveMotionExecution& motion_state);
 
-  /// Arm scopes carried by `request.motion_interrupt_scopes` atomically
-  /// with dispatch (spec/230 §3.4): all scopes succeed or none do. On
-  /// success, populates `motion_state.had_scopes` /
-  /// `motion_state.arm_succeeded` and emits
-  /// `motion_interrupt_scope_armed` kernel events. Returns Err with the
-  /// manager's failure reason; the caller fails the execution closed.
-  Result<void> arm_motion_scopes_for_dispatch(const ExecuteRequestDTO& request,
-                                              std::uint64_t execution_id,
-                                              ActiveMotionExecution& motion_state);
-
-  /// Build, validate, store, and emit the immutable
-  /// `MotionExecutionOutcomeDTO` for `execution_id`. Always reaps any
-  /// remaining armed bindings tied to `execution_id`. Safe to call from
-  /// every terminal exit; subsequent calls for the same execution are
-  /// no-ops so worker code can be defensive without producing duplicate
-  /// records.
-  void finalize_motion_execution_outcome(ActiveMotionExecution& motion_state,
-                                         MotionExecutionTerminalCause terminal_cause,
-                                         std::optional<ErrorDTO> error,
-                                         std::optional<MotionTripOutcomeDTO> trip,
-                                         std::string reap_reason);
-
-  /// Handle a `complete_move_on_signal` latch (spec/260 §5.6) by
-  /// running the controlled-stop flow end to end. The
-  /// function takes the worker's `motion_state`, the originating
-  /// `request` (so the matching `MotionInterruptScopeDTO.stop_profile`
-  /// can be resolved from `latch.motion_interrupt_scope_id`), the
-  /// latch itself, and the worker's `exec_id` / `latest_backend_snapshot`.
-  /// It performs the controlled-stop call, captures the stop snapshot,
-  /// enforces the conjunctive fallback rule, transitions the state
-  /// machine Stopping->Completed (signal_trip success) or
-  /// Stopping->Failed (failure path), and finalizes the outcome.
-  void handle_motion_trip_latch(const ExecuteRequestDTO& request, const InterruptLatch& latch,
-                                std::uint64_t exec_id,
-                                const ExecutionSnapshot& latest_backend_snapshot,
-                                ActiveMotionExecution& motion_state,
-                                std::stop_token worker_stop_token);
-
-  void emit_interrupt_manager_events(const std::vector<InterruptManagerEvent>& events,
-                                     std::uint64_t execution_id);
-
   IPlannerBackend& planner_;
   IObservedRobotStateProvider& observed_state_;
   IRobotKinematics& kinematics_;
@@ -972,7 +730,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ITrajectoryValidator& trajectory_validator_;
   ICollisionTrajectoryProjector& collision_projector_;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator_;
-  IGripperCommandBackend* gripper_command_backend_;
   IPlanningSceneSynchronizer* planning_scene_synchronizer_;
   IExecutionBackend& execution_backend_;
   IClock& clock_;
@@ -981,7 +738,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ExecutionKernelConfig config_;
 
   ExecutionStateMachine sm_;
-  StopPolicy stop_policy_;
   InterruptManager interrupt_manager_;
   /// K3: the only path to terminal states. Declared after the objects its
   /// probes read so construction order matches the authority dependency.
@@ -1009,8 +765,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // RT-8B recovery authority state. Lock order (documented at the admission
   // site): lifecycle_mutex_ -> interrupt-manager leaf -> exactly one of
   // {recovery_certificate_mutex_, recovery_assessment_mutex_,
-  //  recovery_refresh_mutex_,
-  //  operator_stop_identity_mutex_, fault_preempt_stop_mutex_}; the leaf
+  //  recovery_refresh_mutex_, operator_stop_identity_mutex_}; the leaf
   // locks are never nested and no
   // publisher takes lifecycle_mutex_ while holding one. The refresh scheduler
   // may take recovery_refresh_mutex_ alone before its callback later acquires
@@ -1027,7 +782,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ScheduleHandle recovery_freshness_deadline_handle_ = 0;  // lifecycle-guarded
   std::int64_t recovery_freshness_deadline_ns_ = 0;        // lifecycle-guarded
   ScheduleHandle recovery_observation_poll_handle_ = 0;    // lifecycle-guarded
-  std::uint64_t fault_preempt_stop_generation_ = 0;        // fault_preempt_stop_mutex_
   // One coherent operator-stop identity. The generation counter is global,
   // while the selected generation is bound to exactly one execution. Keeping
   // the pair under a leaf mutex prevents a capture from combining a new
@@ -1049,8 +803,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // It prevents late work from the replaced trajectory from competing with
   // the aggregate Stop terminal; it is not containment evidence.
   std::atomic<std::uint64_t> addressed_stop_fence_execution_id_{0};
-  std::atomic<std::uint64_t> motion_trip_stop_generation_{0};
-  std::atomic<bool> operator_stop_command_active_{false};
   mutable std::mutex runtime_collision_state_projection_mutex_;
   std::optional<RuntimeCollisionStateProjection> runtime_collision_state_projection_;
   std::atomic<std::uint64_t> runtime_collision_snapshot_invalidation_epoch_{0};
@@ -1062,17 +814,19 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
-  // Serializes low-rate lifecycle authority transitions across execute, stop,
-  // reset, and acknowledge.
+  // Serializes low-rate lifecycle authority transitions across admission,
+  // certified-containment reset, recovery and acknowledge.
   std::mutex lifecycle_mutex_;
   /// A native preview holds lifecycle_mutex_ for exclusive planner access
   /// while it plans. Lifecycle commands that must not wait for that planning
-  /// (Stop, Reset, recovery) announce themselves here and cancel the active
+  /// (certified-containment reset, recovery) announce themselves here and cancel the active
   /// preview before blocking on lifecycle_mutex_.
   struct LifecyclePreemption;
   std::atomic<std::uint32_t> lifecycle_preemption_waiters_{0U};
   std::mutex preview_cancellation_mutex_;
   std::optional<std::stop_source> active_preview_cancellation_;
+  // Lifecycle/recovery command epoch, bumped by each settled addressed Stop and
+  // captured into the recovery assessment.
   std::atomic<std::uint64_t> control_command_epoch_{0};
   std::atomic<uint64_t> next_execution_id_{1};
   // Exact normal-completion event batch currently being published. Matching
@@ -1081,11 +835,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<std::uint64_t> completion_publication_execution_id_{0};
   mutable std::mutex completion_publication_status_mutex_;
   ExecutionStatus completion_publication_previous_status_;
-  std::atomic<double> runtime_velocity_scale_{1.0};
-  mutable std::mutex runtime_velocity_scale_mutex_;
-  int runtime_velocity_scale_freeze_depth_ = 0;
-  std::optional<double> deferred_runtime_velocity_scale_;
-  std::optional<std::string> deferred_runtime_velocity_scale_principal_id_;
   ExecutionCorrelationTracker active_correlation_;
   std::mutex resolved_runtime_scale_submission_mutex_;
   mutable std::mutex resolved_runtime_scale_mutex_;
@@ -1110,10 +859,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::jthread worker_thread_;
   std::uint64_t execute_worker_generation_ = 0;  // guarded by lifecycle_mutex_
   ExecutionWorkerSignals worker_signals_;
-  std::atomic<bool> execute_admission_interruptible_{false};
-  std::atomic<bool> lifecycle_stop_requested_while_busy_{false};
-  std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
-  std::atomic<bool> lifecycle_reset_requested_while_busy_{false};
   // Linearizes Reset's ownership claim against the execute worker's first
   // post-plan state decision. Lifecycle commands take lifecycle_mutex_ first
   // and then this leaf; the worker takes only this leaf. Never wait for a
@@ -1123,45 +868,18 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // worker's generic planning-failure path. It remains asserted until the old
   // worker is retired before a later execute admission.
   std::atomic<bool> planning_reset_requested_{false};
-  std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
+  // Set by the planning-deadline watchdog for the current planning attempt.
+  std::atomic<bool> planning_deadline_expired_{false};
   std::atomic<bool> lifecycle_worker_retirement_in_progress_{false};
   // Set before requesting worker retirement only after the addressed owner has
   // committed its immutable Stop certificate. The retiring worker must then
   // release local state without issuing a duplicate backend Stop.
   std::atomic<bool> certified_containment_retirement_{false};
-  // Monotonic per-execution terminal authority. Active interrupt latches can
-  // be consumed by preemption/stop machinery before the backend finalizer runs;
-  // this flag preserves the fact that safety authority existed so a later
-  // normal completion cannot launder it.
-  std::atomic<bool> terminal_stop_authority_asserted_{false};
+  // Monotonic per-execution fault authority. The interrupt latch can be
+  // cleared before the backend finalizer runs; this flag preserves the fact
+  // that fault authority existed so a later normal completion cannot launder
+  // it.
   std::atomic<bool> terminal_fault_authority_asserted_{false};
-  OperatorStopWorker operator_stop_worker_;
-  std::mutex operator_stop_source_mutex_;
-  std::shared_ptr<std::stop_source> operator_stop_source_;
-  std::atomic<bool> operator_stop_path_collision_detected_{false};
-  mutable std::mutex operator_stop_path_collision_mutex_;
-  std::map<std::string, std::string> operator_stop_path_collision_details_;
-
-  // Stop-path collision boundary. While a motion-trip controlled stop is in
-  // flight, the runtime collision monitor keeps running over the decelerating
-  // robot. On a collision the monitor does NOT latch a new fault or touch the
-  // state machine; it only signals this coordinator. The trip handler then owns
-  // the hard-stop escalation and terminal decision. Monitor signals; worker
-  // acts.
-  MotionTripStopCoordinator motion_trip_stop_;
-
-  // Cancellable stop source for fault-latch preemption. Runtime collision /
-  // supervisory faults can execute a configured controlled stop outside the
-  // main execute-worker path, so teardown/reset/watchdogs need an explicit
-  // owner they can signal without relying on the caller's thread lifetime.
-  OperatorStopWorker fault_preempt_worker_;
-  mutable std::mutex fault_preempt_stop_mutex_;
-  std::shared_ptr<std::stop_source> fault_preempt_stop_source_;
-  std::atomic<bool> fault_preempt_stop_path_collision_detected_{false};
-  mutable std::mutex fault_preempt_stop_path_collision_mutex_;
-  std::map<std::string, std::string> fault_preempt_stop_path_collision_details_;
-  mutable std::mutex fault_preempt_intervention_error_mutex_;
-  std::optional<ErrorDTO> fault_preempt_intervention_error_;
   // Metrics. `metrics_` covers low-rate counters. Runtime-monitor cadence
   // counters stay atomic so telemetry reads cannot block the safety lane.
   mutable std::mutex metrics_mutex_;
@@ -1172,18 +890,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<std::uint64_t> runtime_collision_tick_max_ns_{0};
   RuntimeCollisionStopCoverageTracker runtime_collision_stop_coverage_;
   std::atomic<std::uint64_t> validation_deferred_runtime_monitor_active_{0};
-
-  // Bounded outcome store keyed by execution_id. FIFO
-  // eviction beyond `motion_execution_outcome_retention`. The eviction
-  // order is captured in `motion_outcome_order_` because std::map keeps
-  // execution_ids sorted ascending, not insertion-ordered; eviction
-  // tracks the original publication order so retention behaves
-  // intuitively under id reuse-prevention. The per-execution motion
-  // state lives on the worker stack and is NOT a kernel field — two
-  // worker threads must not share it across overlapping executions.
-  mutable std::mutex motion_outcomes_mutex_;
-  std::map<std::uint64_t, MotionExecutionOutcomeDTO> motion_execution_outcomes_;
-  std::vector<std::uint64_t> motion_outcome_order_;
 
   mutable std::mutex prepared_motion_session_mutex_;
   std::shared_ptr<PreparedMotionSession> active_prepared_motion_session_;

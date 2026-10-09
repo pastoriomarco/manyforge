@@ -25,6 +25,7 @@
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -335,11 +336,6 @@ public:
       Ros2ControlExecutionBackend &backend)
       : backend_(backend) {}
 
-  [[nodiscard]] core::Result<std::uint64_t>
-  execute(const core::ExecuteRequestDTO &) override {
-    return Unsupported<std::uint64_t>();
-  }
-
   [[nodiscard]] core::Result<std::uint64_t> PrepareMotion(
       core::ResolvedPreparedMotionExecutionRequestDTO request) override {
     auto participant = MakePreparedMotionParticipant(request);
@@ -539,11 +535,6 @@ public:
             recovery_});
   }
 
-  [[nodiscard]] core::ResetResultDTO
-  reset(std::optional<std::uint64_t>) override {
-    return {false, core::ErrorDTO{"unsupported_capability",
-                                  "test engine does not reset", {}}};
-  }
   [[nodiscard]] core::ResetResultDTO
   reset_after_certified_containment(std::uint64_t,
                                     std::optional<std::uint64_t>) override {
@@ -1011,9 +1002,24 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
   // speed-scaling input, so bounded trajectories run at nominal timing.
   auto config = fixture::backend_config(binding, action_name);
   config.enable_jtc_speed_scaling_input = false;
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
+  ros2_control_execution::Ros2TransportResources resources(
+      config.node_name, config.node_namespace, config.executor_thread_count,
+      config.command_gate_topic, sink, "arm", clock);
+  Ros2ControlExecutionBackend backend(resources, sink, "arm", clock, scheduler,
+                                      config);
   RecordingRos2ControlStopPort port(backend);
   Ros2ControlPreparedMotionEngine engine(backend);
+  // Quiesce callbacks while the adapter and its test ports are still alive,
+  // including fatal assertion returns. Resources outlive the adapter.
+  struct TransportLifetime final {
+    ros2_control_execution::Ros2TransportResources &resources;
+    Ros2ControlExecutionBackend &backend;
+    ~TransportLifetime() {
+      backend.shutdown();
+      resources.quiesce();
+    }
+  } transport_lifetime{resources, backend};
+  resources.start();
 
   const auto journal_path =
       std::filesystem::temp_directory_path() /

@@ -25,10 +25,6 @@ using namespace std::chrono_literals;
 class FakeEngine final : public IResolvedParticipantExecutionEngine,
                          public IResolvedPreparedParticipantExecutionEngine {
  public:
-  Result<std::uint64_t> execute(const ExecuteRequestDTO&) override {
-    return Result<std::uint64_t>::Err(unsupported());
-  }
-  ResetResultDTO reset(std::optional<std::uint64_t>) override { return {false, unsupported()}; }
   ResetResultDTO reset_after_certified_containment(std::uint64_t,
                                                    std::optional<std::uint64_t>) override {
     std::lock_guard lock(mutex_);

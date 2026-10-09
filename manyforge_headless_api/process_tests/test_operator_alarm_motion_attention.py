@@ -190,7 +190,13 @@ def test_program_run_is_refused_by_an_unacknowledged_alarm_until_acknowledged() 
                 if "refused" not in initial:
                     break
                 assert initial["refused"] == "operator_alarm_state_unavailable", initial
-                assert initial["details"].get("availability") == "configuration_mismatch", initial
+                # Until then the owner either still names the previous
+                # configuration or has not yet accepted a lifecycle
+                # observation of the new one (spec 530 §3.3).
+                assert initial["details"].get("availability") in {
+                    "configuration_mismatch",
+                    "unreconciled",
+                }, initial
                 assert time.monotonic() < deadline, initial
                 time.sleep(0.1)
             terminal = _wait_run_state(

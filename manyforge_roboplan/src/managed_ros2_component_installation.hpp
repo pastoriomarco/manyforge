@@ -73,9 +73,8 @@ ReadInitialRos2ComponentReceipt(
   require(
       rows.front().candidate_runtime_identity == installed_runtime_identity &&
           handle.OwnsBackend(execution, motion, tool) && execution != nullptr &&
-          dynamic_cast<const core::IGripperCommandBackend *>(execution) ==
-              gripper,
-      "ROS installed receipt has no exact live factory-bound adapter");
+          handle.OwnsGripper(gripper, tool),
+      "ROS installed receipt has no exact live factory-bound adapters");
   require(motion_engine != nullptr && gripper_engine != nullptr &&
               motion_engine != gripper_engine,
           "ROS installed receipt has no distinct owned participant engines");

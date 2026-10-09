@@ -81,9 +81,7 @@ add_library(manyforge_core
   src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
   src/kinematic_state_view_provider.cpp
-  src/motion_trip_stop_coordinator.cpp
   src/motion_target_resolution.cpp
-  src/operator_stop_worker.cpp
   src/operation_intent.cpp
   src/participant_stop_stage.cpp
   src/pick_place_candidate.cpp
@@ -110,7 +108,6 @@ add_library(manyforge_core
   src/runtime_participant_policy.cpp
   src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
-  src/runtime_scale_governor.cpp
   src/coordinated_motion_preparation.cpp
   src/coordinated_execution_clock.cpp
   src/runtime_collision_query_session.cpp
@@ -126,11 +123,9 @@ add_library(manyforge_core
   src/stop_terminal_reducer.cpp
   src/stop_terminal_state.cpp
   src/stop_journal_projection_codec.cpp
-  src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/trajectory_cache_intent.cpp
   src/trajectory_cache_compatibility.cpp
-  src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/ordered_contact_validation.cpp
@@ -150,6 +145,15 @@ target_include_directories(manyforge_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
+
+# The shared motion numerics (motion step, runtime-scale governor, trajectory
+# sampler) are one separately consumable target, compiled once; Core links it.
+if(NOT TARGET manyforge_motion_numerics)
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/motion_numerics"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_motion_numerics")
+endif()
+target_link_libraries(manyforge_core PUBLIC manyforge::motion_numerics)
 
 # The static library is linked into both standalone test executables AND
 # the pybind11 shared module (manyforge_core_py). Shared modules require
@@ -323,6 +327,18 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_cclc_open_request
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_interfaces_compile
+    test/test_execution_interfaces_compile.cpp)
+  target_link_libraries(test_execution_interfaces_compile PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_interfaces_compile
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_motion_step test/test_motion_step.cpp)
+  target_link_libraries(test_motion_step PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_motion_step
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_component_lifecycle_plan_evaluator
     test/test_component_lifecycle_plan_evaluator.cpp)
   target_link_libraries(test_component_lifecycle_plan_evaluator PRIVATE
@@ -452,13 +468,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_stop_intent PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_stop_intent
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_execution_stop_support
-    test/test_execution_stop_support.cpp)
-  target_link_libraries(test_execution_stop_support PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_execution_stop_support
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_scope_resolver
@@ -711,11 +720,6 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_state_machine
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_stop_policy test/test_stop_policy.cpp)
-  target_link_libraries(test_stop_policy PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_stop_policy
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
   add_executable(test_runtime_collision_monitor
     test/test_runtime_collision_monitor.cpp)
   target_link_libraries(test_runtime_collision_monitor PRIVATE
@@ -749,13 +753,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_collision_lookahead_session PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_runtime_collision_lookahead_session
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_motion_trip_stop_coordinator
-    test/test_motion_trip_stop_coordinator.cpp)
-  target_link_libraries(test_motion_trip_stop_coordinator PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_motion_trip_stop_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_worker_signals
@@ -826,13 +823,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_motion_target_resolution PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_motion_target_resolution
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_operator_stop_worker
-    test/test_operator_stop_worker.cpp)
-  target_link_libraries(test_operator_stop_worker PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_operator_stop_worker
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_observed_robot_state_publication

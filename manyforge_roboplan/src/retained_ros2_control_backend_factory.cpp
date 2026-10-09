@@ -153,6 +153,9 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
     std::shared_ptr<RetainedRos2ControlRuntimeHandle> runtime_handle) {
   auto single_use =
       std::make_shared<SingleUseRos2ControlBackendConfig>(std::move(config));
+  if (!runtime_handle) {
+    runtime_handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  }
   return
       [single_use = std::move(single_use),
        runtime_handle = std::move(runtime_handle)](
@@ -222,8 +225,14 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             clock, std::move(sink_bindings));
         const std::weak_ptr<RetainedObservedStateChannel> weak_motion_channel =
             motion_channel;
-        auto backend = std::make_shared<
+        auto resources = std::make_unique<
+            ros2_control_execution::Ros2TransportResources>(
+            selected.execution.node_name, selected.execution.node_namespace,
+            selected.execution.executor_thread_count,
+            selected.execution.command_gate_topic, sink, motion_group, clock);
+        auto backend = std::make_unique<
             ros2_control_execution::Ros2ControlExecutionBackend>(
+            *resources,
             ros2_control_execution::Ros2ControlExecutionBackend::
                 DeferredRosExecutorStartTag{},
             motion_channel->addressed_publication_writer(),
@@ -244,19 +253,27 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                   source_timestamp_ns, received_timestamp_ns);
             },
             sink, motion_group, clock, scheduler, selected.execution);
+        std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend>
+            gripper;
         if (gripper_binding.has_value()) {
-          backend->configure_gripper_action(
+          gripper = std::make_unique<
+              ros2_control_execution::Ros2GripperCommandBackend>(
+              *resources, sink, clock, scheduler,
+              selected.execution.execution_state_source_mode == "commanded_sim");
+          gripper->configure_gripper_action(
               gripper_binding->value().command_target_id.value(),
               *selected.gripper);
         }
-        if (!selected.defer_ros_start)
-          backend->complete_ros_configuration();
-        if (runtime_handle) {
-          const auto bound = runtime_handle->BindBackend(
-              backend, motion_binding, gripper_binding);
-          if (!bound.ok()) {
-            throw std::invalid_argument(bound.error().message);
-          }
+        auto *const backend_pointer = backend.get();
+        auto *const gripper_pointer = gripper.get();
+        const auto bound = runtime_handle->BindBackend(
+            std::move(resources), std::move(backend), std::move(gripper),
+            motion_binding, gripper_binding);
+        if (!bound.ok()) {
+          throw std::invalid_argument(bound.error().message);
+        }
+        if (!selected.defer_ros_start) {
+          runtime_handle->StartBackend();
         }
 
         const auto gripper_target =
@@ -264,20 +281,26 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                 ? std::optional(gripper_binding->value().command_target_id)
                 : std::nullopt;
         RetainedRuntimeBackendSet result;
-        result.execution = backend;
+        // The handle owns both children and their borrowed resources. Retaining
+        // either port alone retains that same lifetime without an ownership cycle.
+        auto owned_backend = std::shared_ptr<
+            ros2_control_execution::Ros2ControlExecutionBackend>(
+            runtime_handle, backend_pointer);
+        result.execution = owned_backend;
         if (gripper_binding.has_value()) {
-          result.gripper = backend;
-          result.gripper_stop_execution_port = backend.get();
+          result.gripper = std::shared_ptr<core::IGripperCommandBackend>(
+              runtime_handle, gripper_pointer);
+          result.gripper_stop_execution_port = owned_backend.get();
           result.rebind_gripper_route =
-              [backend, expected_target = *gripper_target](
+              [runtime_handle, expected_target = *gripper_target](
                   core::RuntimeParticipantBinding binding,
                   std::shared_ptr<IRetainedObservedStateChannel> channel) {
-                static_cast<void>(backend);
+                static_cast<void>(runtime_handle);
                 return gripper_rebind_result(binding, channel, expected_target);
               };
         }
         result.rebind_motion_route =
-            [backend](core::RuntimeParticipantBinding binding,
+            [backend = std::move(owned_backend)](core::RuntimeParticipantBinding binding,
                       std::vector<core::RuntimeParticipantBinding> aliases) {
               return backend->RebindRoute(std::move(binding),
                                           std::move(aliases));

@@ -804,7 +804,7 @@ class AdmissionEngine final
       public core::IControlDomainExecutionPort {
 public:
   [[nodiscard]] core::Result<std::uint64_t>
-  execute(const core::ExecuteRequestDTO &) override {
+  execute(const core::ExecuteRequestDTO &) {
     ++execute_count_;
     status_.state = core::ExecutionState::kPlanning;
     status_.execution_id = 1U;
@@ -915,10 +915,6 @@ public:
     return Unsupported<void>();
   }
 
-  [[nodiscard]] core::ResetResultDTO
-  reset(std::optional<std::uint64_t>) override {
-    return {true, std::nullopt};
-  }
   [[nodiscard]] core::ResetResultDTO
   reset_after_certified_containment(std::uint64_t,
                                     std::optional<std::uint64_t>) override {

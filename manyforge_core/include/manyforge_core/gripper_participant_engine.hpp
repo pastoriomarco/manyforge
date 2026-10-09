@@ -47,12 +47,6 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   void unsubscribe_events(SubscriptionHandle handle) override;
 
   // Motion-only calls cannot acquire authority over this command participant.
-  Result<std::uint64_t> execute(const ExecuteRequestDTO&) override {
-    return unsupported<std::uint64_t>();
-  }
-  ResetResultDTO reset(std::optional<std::uint64_t> = std::nullopt) override {
-    return {false, unsupported_error()};
-  }
   ResetResultDTO reset_after_certified_containment(
       std::uint64_t, std::optional<std::uint64_t> = std::nullopt) override {
     return {false, unsupported_error()};

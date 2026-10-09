@@ -91,6 +91,21 @@ def test_isolates_source_checkouts_under_one_variant(
     ).read_text()
 
 
+def test_variants_share_one_compiler_cache(
+    docker_stub: dict[str, str],
+) -> None:
+    assert _launch(docker_stub).returncode == 0
+    assert _launch(docker_stub, "core-asan").returncode == 0
+    calls = [json.loads(line) for line in Path(docker_stub["DOCKER_CALLS"]).read_text().splitlines()]
+    launches = [call for call in calls if call[0] == "create"]
+    caches = {
+        argument for launch in launches for argument in launch
+        if argument.startswith("type=bind,") and argument.endswith(",target=/ccache")
+    }
+    assert len(launches) == 2 and len(caches) == 1
+    assert all("CCACHE_DIR=/ccache" in launch for launch in launches)
+
+
 def test_launch_uses_pinned_image_stable_paths_and_explicit_cache_activation(
     docker_stub: dict[str, str],
 ) -> None:
@@ -101,7 +116,7 @@ def test_launch_uses_pinned_image_stable_paths_and_explicit_cache_activation(
     assert f"type=bind,source={_ROOT},target=/workspace,readonly" in launch
     assert "HOME=/runner/home" in launch
     assert "MANYFORGE_BUILD_DIR=/runner/build" in launch
-    assert "CCACHE_MAXSIZE=5G" in launch
+    assert "CCACHE_MAXSIZE=20G" in launch
     assert "CMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache" in launch
     assert launch[launch.index("-u") + 1] == "CCACHE_DISABLE"
     assert launch[-2:] == ["cmake", "--version"]

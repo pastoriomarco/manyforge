@@ -220,15 +220,45 @@ only_reasons(const std::vector<std::string> &reasons,
 
 } // namespace
 
+RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
+  // Children still exist while callbacks and borrowed resources are quiesced.
+  // Destructors repeat only their idempotent local shutdown, never ROS startup.
+  if (backend_)
+    backend_->shutdown();
+  if (gripper_)
+    gripper_->shutdown();
+  if (resources_)
+    resources_->quiesce();
+  gripper_.reset();
+  backend_.reset();
+  resources_.reset();
+}
+
 core::Result<void> RetainedRos2ControlRuntimeHandle::BindBackend(
-    std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend>
+    std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
+    std::unique_ptr<ros2_control_execution::Ros2ControlExecutionBackend>
         backend,
+    std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding) {
-  if (!backend || !motion_binding.value().control_path.has_value() ||
+  const auto reject_owned = [&](const char *reason, const char *message) {
+    if (backend)
+      backend->shutdown();
+    if (gripper)
+      gripper->shutdown();
+    if (resources)
+      resources->quiesce();
+    gripper.reset();
+    backend.reset();
+    resources.reset();
+    return reject<void>(reason, message);
+  };
+  if (!resources || !backend ||
+      gripper_binding.has_value() != (gripper != nullptr) ||
+      !motion_binding.value().control_path.has_value() ||
       (gripper_binding.has_value() &&
        !gripper_binding->value().control_path.has_value())) {
-    return reject<void>("ros2_control_handle_binding_invalid",
+    return reject_owned("ros2_control_handle_binding_invalid",
                         "ROS runtime handle requires exact control-addressed "
                         "physical bindings");
   }
@@ -240,17 +270,20 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::BindBackend(
                 gripper_binding->value().control_path->control_domain_id)
           : std::nullopt;
   if (gripper_domain.has_value() && *gripper_domain == motion_domain) {
-    return reject<void>("ros2_control_handle_domain_alias",
+    return reject_owned("ros2_control_handle_domain_alias",
                         "motion and gripper bindings cannot alias one control "
                         "domain");
   }
 
-  std::lock_guard lock(mutex_);
-  if (!backend_.expired() || motion_domain_id_.has_value()) {
-    return reject<void>("ros2_control_handle_already_bound",
+  std::unique_lock lock(mutex_);
+  if (backend_ || motion_domain_id_.has_value()) {
+    lock.unlock();
+    return reject_owned("ros2_control_handle_already_bound",
                         "ROS runtime handle is already bound");
   }
+  resources_ = std::move(resources);
   backend_ = std::move(backend);
+  gripper_ = std::move(gripper);
   motion_binding_ = motion_binding;
   gripper_binding_ = gripper_binding;
   motion_domain_id_ = motion_domain;
@@ -267,13 +300,21 @@ bool RetainedRos2ControlRuntimeHandle::OwnsBackend(
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding)
     const {
   std::lock_guard lock(mutex_);
-  const auto owned = backend_.lock();
-  return owned != nullptr && owned.get() == backend &&
+  return backend_ != nullptr && backend_.get() == backend &&
          motion_binding_.has_value() &&
          motion_binding_->value() == motion_binding.value() &&
          gripper_binding_.has_value() == gripper_binding.has_value() &&
          (!gripper_binding.has_value() ||
           gripper_binding_->value() == gripper_binding->value());
+}
+
+bool RetainedRos2ControlRuntimeHandle::OwnsGripper(
+    const core::IGripperCommandBackend *gripper,
+    const core::RuntimeParticipantBinding &gripper_binding) const {
+  std::lock_guard lock(mutex_);
+  return gripper_ != nullptr && gripper_.get() == gripper &&
+         gripper_binding_.has_value() &&
+         gripper_binding_->value() == gripper_binding.value();
 }
 
 void RetainedRos2ControlRuntimeHandle::StartBackend() {
@@ -282,12 +323,14 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
     std::rethrow_exception(start_failure_);
   if (start_attempted_)
     return;
-  const auto backend = backend_.lock();
-  if (backend == nullptr)
+  if (backend_ == nullptr || resources_ == nullptr)
     throw std::logic_error("ROS initial installation has no live backend");
   start_attempted_ = true;
   try {
-    backend->complete_ros_configuration();
+    backend_->complete_ros_configuration();
+    if (gripper_)
+      gripper_->complete_ros_configuration();
+    resources_->start();
   } catch (...) {
     start_failure_ = std::current_exception();
     throw;
@@ -307,7 +350,8 @@ core::Result<RetainedExternallyManagedDomainSnapshot>
 RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
     const core::ControlDomainId &control_domain_id,
     const core::TimePoint now_ns) {
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  ros2_control_execution::Ros2ControlExecutionBackend *backend = nullptr;
+  ros2_control_execution::Ros2GripperCommandBackend *gripper = nullptr;
   std::optional<core::ControlDomainId> motion_domain;
   std::optional<core::ControlDomainId> gripper_domain;
   std::optional<std::string> gripper_id;
@@ -315,7 +359,8 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
   bool startup = true;
   {
     std::lock_guard lock(mutex_);
-    backend = backend_.lock();
+    backend = backend_.get();
+    gripper = gripper_.get();
     motion_domain = motion_domain_id_;
     gripper_domain = gripper_domain_id_;
     gripper_id = gripper_id_;
@@ -369,9 +414,9 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
         state = core::ComponentLifecycleStateDTO::kDisabled;
       }
     }
-  } else if (gripper_domain.has_value() && gripper_id.has_value() &&
+  } else if (gripper && gripper_domain.has_value() && gripper_id.has_value() &&
              control_domain_id == *gripper_domain) {
-    const auto snapshot = backend->gripper_transport_readiness(*gripper_id);
+    const auto snapshot = gripper->gripper_transport_readiness(*gripper_id);
     signature = gripper_signature(snapshot);
     transport_ready = snapshot.ready;
     exact_configuration_ready = snapshot.ready;
@@ -438,10 +483,10 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
 
 bool RetainedRos2ControlRuntimeHandle::publish_execution_admission_snapshot(
     ros2_control_execution::ExecutionAdmissionSnapshot snapshot) {
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  ros2_control_execution::Ros2ControlExecutionBackend *backend = nullptr;
   {
     std::lock_guard lock(mutex_);
-    backend = backend_.lock();
+    backend = backend_.get();
   }
   return backend &&
          backend->publish_execution_admission_snapshot(std::move(snapshot));
@@ -449,37 +494,37 @@ bool RetainedRos2ControlRuntimeHandle::publish_execution_admission_snapshot(
 
 std::optional<ros2_control_execution::ExecutionAdmissionSnapshot>
 RetainedRos2ControlRuntimeHandle::execution_admission_snapshot() const {
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  ros2_control_execution::Ros2ControlExecutionBackend *backend = nullptr;
   {
     std::lock_guard lock(mutex_);
-    backend = backend_.lock();
+    backend = backend_.get();
   }
   return backend ? backend->execution_admission_snapshot() : std::nullopt;
 }
 
 std::optional<ros2_control_execution::ControllerBindingSnapshot>
 RetainedRos2ControlRuntimeHandle::controller_binding_snapshot() const {
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  ros2_control_execution::Ros2ControlExecutionBackend *backend = nullptr;
   {
     std::lock_guard lock(mutex_);
-    backend = backend_.lock();
+    backend = backend_.get();
   }
   return backend ? backend->controller_binding_snapshot() : std::nullopt;
 }
 
 std::optional<ros2_control_execution::Ros2GripperTransportReadinessSnapshot>
 RetainedRos2ControlRuntimeHandle::gripper_transport_readiness_snapshot() const {
-  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> backend;
+  ros2_control_execution::Ros2GripperCommandBackend *gripper = nullptr;
   std::optional<std::string> gripper_id;
   {
     std::lock_guard lock(mutex_);
-    backend = backend_.lock();
+    gripper = gripper_.get();
     gripper_id = gripper_id_;
   }
-  if (!backend || !gripper_id.has_value()) {
+  if (!gripper || !gripper_id.has_value()) {
     return std::nullopt;
   }
-  return backend->gripper_transport_readiness(*gripper_id);
+  return gripper->gripper_transport_readiness(*gripper_id);
 }
 
 } // namespace manyforge::roboplan_backend

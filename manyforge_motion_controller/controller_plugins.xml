@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="manyforge_motion_controller">
+  <class name="manyforge_motion_controller/MotionController"
+         type="manyforge_motion_controller::MotionController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Inactive integration skeleton. Motion activation is unavailable until the shared motion step is wired and qualified.
+    </description>
+  </class>
+</library>

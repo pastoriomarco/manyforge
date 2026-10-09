@@ -70,6 +70,9 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
     return Result<ComponentLifecycleTargetDTO>::Ok(target);
   }
   Result<std::vector<ComponentLifecycleTargetDTO>> LoadLifecycleTargets() override {
+    if (fail_load_targets) {
+      return Result<std::vector<ComponentLifecycleTargetDTO>>::Err(Unavailable());
+    }
     std::vector<ComponentLifecycleTargetDTO> result;
     for (const auto& [id, target] : targets) result.push_back(target);
     return Result<std::vector<ComponentLifecycleTargetDTO>>::Ok(result);
@@ -274,6 +277,7 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
   std::set<ControllableComponentId> applying;
   bool fail_open_incident{};
   bool fail_load_facts{};
+  bool fail_load_targets{};
   bool fail_record_cause{};
   bool fail_record_reached{};
   std::function<void()> before_write;
@@ -1657,6 +1661,21 @@ TEST_F(LifecycleIncidentTest, RecoverAcceptedDuringAPassIsNotUndoneByItsStaleWri
   ExpectNoMotionOrRecoverySubmitted();
 }
 
+TEST_F(LifecycleIncidentTest, UnreadableTargetsBlockWithTheNextIntentNamed) {
+  ReachTarget();
+  store_.fail_load_targets = true;
+  clock_.advance(kSecond);
+  Driver().RunOnce();
+  const auto progress = Progress();
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kBlocked);
+  ASSERT_TRUE(progress.blocking_reason.has_value());
+  EXPECT_EQ(progress.blocking_reason->rfind("lifecycle_targets_unavailable:", 0U), 0U);
+  // `blocked` never publishes a null next intent: the one toward the last
+  // target read.
+  EXPECT_EQ(progress.next_intent, ComponentLifecycleIntentKindDTO::kEnable);
+  ExpectNoMotionOrRecoverySubmitted();
+}
+
 TEST_F(LifecycleIncidentTest, IncidentDetectedOnFactsARecoverReplacedIsNotRecorded) {
   ReachTarget();
   // A loss is detected; an ordinary operator Recover is accepted after the
@@ -1666,6 +1685,7 @@ TEST_F(LifecycleIncidentTest, IncidentDetectedOnFactsARecoverReplacedIsNotRecord
   Driver().RunOnce();
   EXPECT_TRUE(store_.incidents.empty());
   EXPECT_EQ(Progress().blocking_reason, "lifecycle_facts_changed");
+  EXPECT_EQ(Progress().next_intent, ComponentLifecycleIntentKindDTO::kRecover);
   // Containment does not wait for the record and is not withdrawn.
   EXPECT_EQ(ports_.containments.size(), 1U);
 

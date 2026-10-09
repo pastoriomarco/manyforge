@@ -210,6 +210,9 @@ MANYFORGE_DECLARE_STRONG_COUNTER(CellAdmissionClaimGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(ActiveControlConfigurationGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(OperationRevision);
 MANYFORGE_DECLARE_STRONG_COUNTER(ControllerGoalGeneration);
+// The owning participant Kernel's existing monotonic prepared execution id
+// (the `execution_id` passed to Prepare/Retire); typed, not a new identity.
+MANYFORGE_DECLARE_STRONG_COUNTER(PreparedExecutionId);
 MANYFORGE_DECLARE_STRONG_COUNTER(StopGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(StopCertificateRevision);
 MANYFORGE_DECLARE_STRONG_COUNTER(StopFaultLatchGeneration);

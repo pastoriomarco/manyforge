@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - "manyforge_core/src/execution_kernel.cpp"
-      - "manyforge_core/src/operator_stop_worker.cpp"
       - "manyforge_core/src/execution_worker_signals.cpp"
       - "manyforge_core/src/interrupt_manager.cpp"
       - "manyforge_core/tools/stability_gate.sh"
@@ -13,7 +12,6 @@ on:
     branches: [main, dev]
     paths:
       - "manyforge_core/src/execution_kernel.cpp"
-      - "manyforge_core/src/operator_stop_worker.cpp"
       - "manyforge_core/src/execution_worker_signals.cpp"
       - "manyforge_core/src/interrupt_manager.cpp"
       - "manyforge_core/tools/stability_gate.sh"

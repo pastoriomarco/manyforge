@@ -64,7 +64,6 @@ class IResolvedParticipantExecutionEngine {
  public:
   virtual ~IResolvedParticipantExecutionEngine() = default;
 
-  virtual Result<std::uint64_t> execute(const ExecuteRequestDTO& request) = 0;
   /// Close lower-priority participant work as soon as the addressed owner has
   /// linearized an exact Stop, before it publishes the physical Stop stages.
   /// This process-local, non-blocking fence does not issue a backend command,
@@ -88,7 +87,6 @@ class IResolvedParticipantExecutionEngine {
                  "participant execution engine cannot settle addressed Stop evidence",
                  {{"reason", "addressed_participant_stop_settlement_unavailable"}}});
   }
-  virtual ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
   /// Retires one exact subordinate execution after the addressed Kernel has
   /// already committed an immutable containment certificate. This bounded
   /// process-local/backend-reset seam MUST NOT issue another Stop command.

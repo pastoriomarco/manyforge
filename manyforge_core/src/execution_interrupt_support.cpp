@@ -11,15 +11,6 @@ bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
          it->second == "collision_validation_cancelled";
 }
 
-bool planning_cancelled_by_interrupt(const ErrorDTO& error) {
-  if (error.code != kErrorPlanningFailed) {
-    return false;
-  }
-  const auto it = error.details.find("reason");
-  return it != error.details.end() &&
-         it->second == "planning_cancelled_by_interrupt";
-}
-
 bool authoritative_collision_replan_candidate(const ErrorDTO& error) {
   if ((error.code != kErrorValidationCollision &&
        error.code != kErrorContactPolicyViolation) ||
@@ -139,35 +130,6 @@ const char* interrupt_preemption_result_name(
       return "none_required";
   }
   return "unknown";
-}
-
-ErrorDTO runtime_collision_stop_not_yet_certified_error(
-    const InterruptLatch& latch,
-    std::uint64_t execution_id,
-    bool fault_preempt_stop_active) {
-  const bool retryable =
-      latch.preemption_result == InterruptPreemptionResult::kPending ||
-      (latch.preemption_result == InterruptPreemptionResult::kSucceeded &&
-       fault_preempt_stop_active);
-  std::map<std::string, std::string> details{
-      {"reason", kReasonRuntimeCollisionStopNotYetCertified},
-      {"reason_code", kReasonRuntimeCollisionStopNotYetCertified},
-      {"phase", "interrupted_retry_admission"},
-      {"retryable", retryable ? "true" : "false"},
-      {"execution_id", std::to_string(execution_id)},
-      {"latch_id", latch.latch_id},
-      {"source_id", latch.source_id},
-      {"policy_id", latch.policy_id},
-      {"preemption_result",
-       interrupt_preemption_result_name(latch.preemption_result)},
-      {"required_preemption_result", "succeeded"},
-      {"fault_preempt_stop_active",
-       fault_preempt_stop_active ? "true" : "false"}};
-  return ErrorDTO{
-      kErrorInvalidRequest,
-      "Runtime-collision retry is not admissible until fault preemption "
-      "succeeds and its controlled stop is no longer active",
-      std::move(details)};
 }
 
 InterruptSourceDefinition runtime_collision_fault_source_definition() {

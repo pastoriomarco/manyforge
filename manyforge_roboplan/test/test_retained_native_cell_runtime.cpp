@@ -174,14 +174,6 @@ RetainedNativeCellRuntimeInput EmptyCellInput() {
 class CellTestExecutionEngine final
     : public core::IResolvedParticipantExecutionEngine {
 public:
-  [[nodiscard]] core::Result<std::uint64_t>
-  execute(const core::ExecuteRequestDTO &) override {
-    return unused<std::uint64_t>();
-  }
-  [[nodiscard]] core::ResetResultDTO
-  reset(std::optional<std::uint64_t>) override {
-    return {};
-  }
   [[nodiscard]] core::ResetResultDTO reset_after_certified_containment(
       std::uint64_t, std::optional<std::uint64_t>) override {
     return {};
