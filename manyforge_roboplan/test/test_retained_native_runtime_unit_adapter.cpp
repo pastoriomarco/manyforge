@@ -1023,6 +1023,55 @@ TEST(NativeExecutionRuntimeUnitAdmission,
             std::string::npos);
   EXPECT_EQ(status_packet.find(admission->implementation_revision()),
             std::string::npos);
+  // Exercise the production parser used by ObserveProgress, including the
+  // absent older packet and counts beyond the I-JSON integer width.
+  const auto old_report =
+      admission->parse_status_packet(packet_epoch, status_packet);
+  EXPECT_FALSE(old_report.dropped_host_notice_lines().has_value());
+  EXPECT_FALSE(old_report.dropped_host_notice_bytes().has_value());
+  const auto full_report = admission->parse_status_packet(
+      packet_epoch, status_packet +
+                        " dropped_host_notice_lines=9007199254740992"
+                        " dropped_host_notice_bytes=18446744073709551615");
+  EXPECT_EQ(full_report.dropped_host_notice_lines(), 9007199254740992ULL);
+  EXPECT_EQ(full_report.dropped_host_notice_bytes(), 18446744073709551615ULL);
+  EXPECT_EQ(full_report.source_health(), old_report.source_health());
+  EXPECT_EQ(full_report.local_phase(), old_report.local_phase());
+  EXPECT_EQ(full_report.ready_runtime_role_ids(),
+            old_report.ready_runtime_role_ids());
+  EXPECT_EQ(full_report.reason_codes(), old_report.reason_codes());
+  const auto zero_report = admission->parse_status_packet(
+      packet_epoch,
+      status_packet +
+          " dropped_host_notice_lines=0 dropped_host_notice_bytes=0");
+  EXPECT_EQ(zero_report.dropped_host_notice_lines(), 0U);
+  for (const std::string suffix :
+       {" dropped_host_notice_lines=1",
+        " dropped_host_notice_bytes=1 dropped_host_notice_lines=1",
+        " dropped_host_notice_lines=01 dropped_host_notice_bytes=1",
+        " dropped_host_notice_lines=-1 dropped_host_notice_bytes=1",
+        " dropped_host_notice_lines=1 dropped_host_notice_bytes=+1",
+        " dropped_host_notice_lines=1 "
+        "dropped_host_notice_bytes=18446744073709551616",
+        " dropped_host_notice_lines= dropped_host_notice_bytes=1",
+        " dropped_host_notice_lines=1 dropped_host_notice_bytes=1 extra",
+        "  dropped_host_notice_lines=1 dropped_host_notice_bytes=1",
+        " dropped_host_notice_lines=1 dropped_host_notice_bytes=1 "}) {
+    SCOPED_TRACE(suffix);
+    EXPECT_THROW(
+        admission->parse_status_packet(packet_epoch, status_packet + suffix),
+        component_manager::NativeExecutionRuntimeUnitAdmissionError);
+  }
+  EXPECT_THROW(admission->parse_status_packet(
+                   core::RuntimeEpoch("foreign-epoch"), status_packet),
+               component_manager::NativeExecutionRuntimeUnitAdmissionError);
+  EXPECT_THROW(
+      admission->parse_status_packet(packet_epoch, status_packet + " "),
+      component_manager::NativeExecutionRuntimeUnitAdmissionError);
+  EXPECT_THROW(
+      admission->parse_status_packet(
+          packet_epoch, admission->expected_ready_packet(packet_epoch)),
+      component_manager::NativeExecutionRuntimeUnitAdmissionError);
   const auto arguments = admission->launch_arguments(3, packet_epoch);
   ASSERT_EQ(arguments.size(), 10U);
   EXPECT_EQ(arguments.front(), "--manyforge-managed-runtime-channel-fd");

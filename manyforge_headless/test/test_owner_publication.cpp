@@ -173,7 +173,9 @@ component_manager::RuntimeObservationSnapshot ObservationWithoutDigest() {
   return reducer.Evaluate({RuntimeExpectation()});
 }
 
-component_manager::RuntimeObservationSnapshot ObservationWithDigest() {
+component_manager::RuntimeObservationSnapshot ObservationWithDigest(
+    const std::optional<std::uint64_t> dropped_lines = std::nullopt,
+    const std::optional<std::uint64_t> dropped_bytes = std::nullopt) {
   component_manager::RuntimeObservationReducer reducer(
       [] { return 42U; }, {"runtime.publication"});
   if (!reducer.ObserveProcess(component_manager::ProcessPresenceObservation(
@@ -186,7 +188,7 @@ component_manager::RuntimeObservationSnapshot ObservationWithDigest() {
           component_manager::RuntimeSourceHealth::kHealthy,
           std::string(kDigestOne), std::string(kDigestTwo), {"status"},
           component_manager::ManagedCommandSurfaceState::kClosedNoActiveEffect,
-          {}, std::string(kDigestOne)))) {
+          {}, std::string(kDigestOne), dropped_lines, dropped_bytes))) {
     throw std::runtime_error("owner-publication test observation was rejected");
   }
   return reducer.Evaluate({RuntimeExpectation()});
@@ -434,6 +436,41 @@ TEST(ManagerSourcePublication, ProjectsSelectedAndObservedOfferDigests) {
   EXPECT_NE(bytes.find("\"observed_runtime_contract_offer_digest\":\"" +
                        std::string(kDigestOne) + "\""),
             std::string::npos);
+}
+
+TEST(ManagerSourcePublication, HostNoticeCountsPreserveFullWidthAndReadiness) {
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  const auto publish = [&](const std::optional<std::uint64_t> lines,
+                           const std::optional<std::uint64_t> bytes) {
+    return content_identity::canonical_json(BuildManagerSourcePayload(
+        admission.retained_bundle(),
+        RuntimeWithRow(admission, ObservationWithDigest(lines, bytes),
+                       component_manager::ManagerActiveRuntimeConvergenceState::
+                           kConverged),
+        journal, ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+  };
+  const auto absent = publish(std::nullopt, std::nullopt);
+  EXPECT_EQ(absent.find("dropped_host_notice_"), std::string::npos);
+  const auto zero = publish(0U, 0U);
+  EXPECT_NE(zero.find("\"dropped_host_notice_lines\":0"), std::string::npos);
+  const auto boundary = publish(9007199254740991ULL, 9007199254740992ULL);
+  EXPECT_NE(boundary.find("\"dropped_host_notice_lines\":9007199254740991"),
+            std::string::npos);
+  EXPECT_NE(boundary.find("\"dropped_host_notice_bytes\":\"9007199254740992\""),
+            std::string::npos);
+  const auto full = publish(18446744073709551615ULL, 18446744073709551615ULL);
+  EXPECT_NE(full.find("\"dropped_host_notice_lines\":\"18446744073709551615\""),
+            std::string::npos);
+  EXPECT_NE(full.find("\"dropped_host_notice_bytes\":\"18446744073709551615\""),
+            std::string::npos);
+  for (const auto &payload : {absent, zero, boundary, full}) {
+    EXPECT_NE(payload.find("\"manager_ready\":true"), std::string::npos);
+    EXPECT_NE(payload.find("\"source_health\":\"healthy\""), std::string::npos);
+    EXPECT_NE(payload.find("\"source_reason_codes\":[]"), std::string::npos);
+  }
 }
 
 TEST(ManagerSourcePublication, ProjectsMissingObservedOfferDigestAsNull) {

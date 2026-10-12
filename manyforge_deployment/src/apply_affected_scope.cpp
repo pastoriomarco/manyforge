@@ -369,17 +369,6 @@ derive_apply_configuration_fence_scope_verified_values(
     MarkBindingId(old_graph, id, affected_resources);
     MarkBindingId(new_graph, id, affected_resources);
   }
-  // Stop-timing selections are part of a binding's runtime identity.
-  const auto changed_stop_timing =
-      ChangedGroupedIds<core::StopTimingSelectionDTO, core::ControlBindingId>(
-          old_bundle.stop_timing_parameters, new_bundle.stop_timing_parameters,
-          [](const core::StopTimingSelectionDTO &selection) {
-            return selection.control_binding_id;
-          });
-  for (const auto &id : changed_stop_timing) {
-    MarkBindingId(old_graph, id, affected_resources);
-    MarkBindingId(new_graph, id, affected_resources);
-  }
 
   const auto changed_desired =
       ChangedIds<core::DesiredControlConfigurationDTO, core::ControlDomainId>(

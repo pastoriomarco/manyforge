@@ -13,6 +13,7 @@ from manyforge_ros.isaac_pose_observer import (
     detection3d_observation_intent,
     joint_state_observation_intent,
     load_isaac_pose_observer_site_config,
+    manager_source_epoch_factory,
     simulation_entity_observation_intent,
     unknown_observation_intent,
 )
@@ -364,6 +365,87 @@ def _wait_for(predicate, *, timeout_s: float = 2.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("dispatcher did not reach the expected state")
+
+
+def test_manager_epoch_factory_keeps_full_base_and_bounds_rotation(monkeypatch) -> None:
+    import manyforge_ros.isaac_pose_observer as module
+
+    monkeypatch.setattr(module, "MAXIMUM_SAFE_INTEGER", 2)
+    factory = manager_source_epoch_factory("manager.process.base.27")
+    assert factory() == "manager.process.base.27.1"
+    assert factory() == "manager.process.base.27.2"
+    with pytest.raises(ValueError, match="rotation exhausted"):
+        factory()
+    with pytest.raises(IsaacPoseObserverConfigError):
+        manager_source_epoch_factory("")
+    with pytest.raises(IsaacPoseObserverConfigError):
+        manager_source_epoch_factory("x" * 255)
+    assert len(manager_source_epoch_factory("x" * 254)().encode()) == 256
+
+
+def test_manager_epoch_base_reserves_full_counter_and_utf8_identity_budget() -> None:
+    from manyforge_ros.manager_scene_runtime import MAXIMUM_SAFE_INTEGER
+
+    base_bytes = 256 - len(f".{MAXIMUM_SAFE_INTEGER}".encode())
+    for base in ("x" * base_bytes, "é" * (base_bytes // 2) + "x" * (base_bytes % 2)):
+        factory = manager_source_epoch_factory(base)
+        assert factory() == f"{base}.1"
+        for rotation in range(2, 11):
+            assert factory() == f"{base}.{rotation}"
+        with pytest.raises(IsaacPoseObserverConfigError):
+            manager_source_epoch_factory(base + "x")
+    with pytest.raises(IsaacPoseObserverConfigError):
+        manager_source_epoch_factory("x" * 254)
+
+
+@pytest.mark.parametrize("rotation_reason", ["sequence_exhaustion", "request_conflict"])
+def test_manager_owned_dispatcher_preserves_existing_rotation_paths(rotation_reason) -> None:
+    class ConflictClient(_FakeSceneRuntimeClient):
+        def observe(self, session, **kwargs):
+            result = super().observe(session, **kwargs)
+            if len(self.observations) == 1:
+                raise SceneRuntimeManagerError(
+                    "scene_runtime_observation_request_conflict", "conflicting payload"
+                )
+            return result
+
+    client = ConflictClient() if rotation_reason == "request_conflict" else _FakeSceneRuntimeClient()
+    dispatcher = ObservationDispatcher(
+        client=client,
+        expected_cell_id="cell.1",
+        source_id="isaac.observer",
+        allowed_keys=frozenset({("robot", "viewer.measured_robot")}),
+        source_epoch_factory=manager_source_epoch_factory("manager.base.27"),
+        retry_initial_s=0.001,
+        retry_max_s=0.01,
+    )
+    if rotation_reason == "sequence_exhaustion":
+        from manyforge_ros.manager_scene_runtime import MAXIMUM_SAFE_INTEGER
+        dispatcher._next_sequence = MAXIMUM_SAFE_INTEGER + 1
+    dispatcher.submit(_intent(0.1))
+    dispatcher.start()
+    try:
+        _wait_for(lambda: dispatcher.snapshot().delivered == 1)
+        assert client.opens == [("isaac.observer", "manager.base.27.1"), ("isaac.observer", "manager.base.27.2")]
+        assert all(sequence == 1 for sequence, _ in client.observations)
+    finally:
+        assert dispatcher.close()
+
+
+def test_for_manager_root_forwards_owner_factory_and_keeps_unmanaged_default(tmp_path) -> None:
+    config_path = tmp_path / "observer.json"
+    config_path.write_text(json.dumps(_config_value()), encoding="utf-8")
+    config = load_isaac_pose_observer_site_config(config_path)
+    owned = ObservationDispatcher.for_manager_root(
+        manager_run_root=tmp_path,
+        config=config,
+        source_epoch_factory=manager_source_epoch_factory("manager.base.27"),
+    )
+    assert owned._source_epoch == "manager.base.27.1"
+    assert owned._new_source_epoch() == "manager.base.27.2"
+    unmanaged = ObservationDispatcher.for_manager_root(manager_run_root=tmp_path, config=config)
+    assert unmanaged._source_epoch.startswith("isaac-observer-")
+    assert unmanaged._new_source_epoch() != unmanaged._source_epoch
 
 
 def test_dispatcher_is_latest_per_key_and_rejoins_with_exact_retry() -> None:

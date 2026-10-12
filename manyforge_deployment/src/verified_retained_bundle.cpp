@@ -984,7 +984,7 @@ verify_structural_applicability_projection(
     const CanonicalValue &retained_policy_records_value,
     const CanonicalValue *site_overlay_ref_value,
     const CanonicalValue *external_resources_value,
-    const CanonicalValue *stop_timing_value, const core::CellGraphDTO &graph,
+    const core::CellGraphDTO &graph,
     std::span<const QualifiedRuntimeProfile> runtime_profiles) {
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
@@ -1010,14 +1010,6 @@ verify_structural_applicability_projection(
   if (site_overlay_ref_value != nullptr) {
     root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
   }
-  if (stop_timing_value != nullptr) {
-    auto member =
-        std::find_if(root_members.begin(), root_members.end(),
-                     [](const auto &row) { return row.first == "policies"; });
-    auto policies = std::get<CanonicalValue::Object>(member->second.storage());
-    policies.emplace_back("stop_timing_parameters", *stop_timing_value);
-    member->second = CanonicalValue(std::move(policies));
-  }
   if (external_resources_value != nullptr) {
     root_members.emplace_back("external_resources", *external_resources_value);
   }
@@ -1035,23 +1027,6 @@ verify_structural_applicability_projection(
       verified.value().external_resources.empty()) {
     detail::fail_retained_bundle(
         "retained external_resources must be omitted when empty");
-  }
-  if (stop_timing_value != nullptr) {
-    const auto *normalized = verified.normalized_policies()->find_object_member(
-        "stop_timing_parameters");
-    if (normalized == nullptr || *normalized != *stop_timing_value)
-      detail::fail_retained_bundle(
-          "retained Stop timing must be nonempty and exactly normalized");
-  }
-  for (const auto &selected : verified.value().stop_timing_parameters) {
-    if (std::none_of(graph.control_bindings.begin(),
-                     graph.control_bindings.end(), [&](const auto &binding) {
-                       return binding.control_binding_id ==
-                                  selected.control_binding_id &&
-                              binding.control_binding_revision ==
-                                  selected.control_binding_revision;
-                     }))
-      detail::fail_retained_bundle("retained Stop timing has no exact binding");
   }
   if (!verified.value().external_resources.empty() &&
       !verified.value().site_overlay_ref.has_value()) {
@@ -1267,8 +1242,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
        "desired_control_configurations", "capability_provider_bindings",
        "retained_policy_records", "runtime_contract_requirements",
        "compiled_products", "provenance"},
-      {"site_overlay_ref", "external_resources", "assistant",
-       "stop_timing_parameters"},
+      {"site_overlay_ref", "external_resources", "assistant"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1313,7 +1287,8 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
                      "retained_bundle.catalogs.bootstrap_contract_digest");
   if (bootstrap_contract_digest != kClosedSchemaBootstrapContractDigest) {
     detail::fail_retained_bundle(
-        "retained bootstrap contract does not match this build");
+        "retained bootstrap contract does not match this build; "
+        "recompile the authored Deployment with the current ManyForge version");
   }
   const std::string &qualification_registry_digest =
       require_string(require_member(catalogs, "qualification_registry_digest",
@@ -1323,7 +1298,8 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
                                            .qualification_registry_digest()
                                            .value()) {
     detail::fail_retained_bundle(
-        "retained qualification registry does not match this build");
+        "retained qualification registry does not match this build; "
+        "recompile the authored Deployment with the current ManyForge version");
   }
   const auto catalog_records = parse_catalog_records_projection(
       require_member(catalogs, "records", "retained_bundle.catalogs"));
@@ -1353,6 +1329,10 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
         profile_document =
             detail::ros2_control_execution_runtime_profile_document();
       } else {
+        if (profile->record_id.value() == detail::kRos2ControlExecutionRuntimeProfileId) {
+          detail::fail_retained_bundle("sealed ROS runtime profile is not qualified by this build; "
+              "recompile the authored Deployment with the current ManyForge version");
+        }
         detail::fail_retained_bundle(
             "retained runtime profile has no build-qualified verifier");
       }
@@ -1373,8 +1353,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       require_member(object, "capability_provider_bindings", "retained_bundle"),
       require_member(object, "retained_policy_records", "retained_bundle"),
       root.find_object_member("site_overlay_ref"),
-      root.find_object_member("external_resources"),
-      root.find_object_member("stop_timing_parameters"), verified_graph.graph(),
+      root.find_object_member("external_resources"), verified_graph.graph(),
       runtime_profiles);
   require_structural_catalog_closure(
       verified_graph.graph(),
@@ -1830,7 +1809,6 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       applicability.value().external_resources,
       std::move(assistant),
       std::move(runtime_contract_requirements),
-      applicability.value().stop_timing_parameters,
   };
 }
 

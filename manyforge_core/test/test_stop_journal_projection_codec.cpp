@@ -197,11 +197,6 @@ inline constexpr char kDigestB[] =
   const StopScopeEntryKeyDTO key{
       stage.stop_id, stage.stop_generation,
       StopParticipantScopeKeyDTO{stage.operation_id, stage.participant_id}};
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
-  for (const auto& phase : stage.participant_stop_plan.deadline_budget.phases) {
-    phases.push_back({phase.phase_id, phase.deadline_offset_ns, phase.deadline_offset_ns});
-  }
-  const auto fixed_outer = stage.participant_stop_plan.deadline_budget.outer_duration_ns;
   StopScopeEntryDTO scope{
       key,
       StopParticipantScopeFactsDTO{
@@ -218,9 +213,7 @@ inline constexpr char kDigestB[] =
       stage.stop_evidence_policy_id,
       stage.stop_evidence_policy_revision,
       stage.participant_stop_plan.participant_stop_invocation_plan_digest,
-      10,
-      fixed_outer,
-      phases};
+      10};
   StopTerminalReductionInputDTO input{
       StopCertificateId("certificate.1"),
       StopCertificateRevision(1U),
@@ -264,13 +257,7 @@ inline constexpr char kDigestB[] =
       input.capture_history.front().captured_scope_digest,
       {},
       input.capture_history.front().newly_fenced_operation_revisions,
-      fixed_outer,
-      stage.participant_stop_plan.deadline_budget.kernel_completion_reserve_ns,
-      fixed_outer,
-      10,
-      {StopAcceptedParticipantBudgetDTO{
-          input.stop_id, input.stop_generation, stage.operation_id, stage.participant_id,
-          stage.participant_stop_plan.participant_stop_invocation_plan_digest, phases}}};
+      10};
   const auto accepted_error = stop_accepted_field_error(accepted);
   EXPECT_FALSE(accepted_error.has_value())
       << (accepted_error.has_value() ? std::string(*accepted_error) : std::string{});
@@ -380,8 +367,8 @@ TEST(StopJournalProjectionCodecTest, RoundTripsAcceptanceAndAffectedStateCanonic
     const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
     ASSERT_TRUE(encoded.ok()) << encoded.error().message;
     EXPECT_NE(encoded.value().find(
-                  capture_order == 0U ? "manyforge.internal.stop-journal-acceptance-projection.v1"
-                                      : "manyforge.internal.stop-journal-acceptance-projection.v2"),
+                  capture_order == 0U ? "manyforge.internal.stop-journal-acceptance-projection.v4"
+                                      : "manyforge.internal.stop-journal-acceptance-projection.v5"),
               std::string::npos);
     const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
     ASSERT_TRUE(decoded.ok()) << decoded.error().message;
@@ -429,14 +416,22 @@ TEST(StopJournalProjectionCodecTest, CapturedNodeOriginUsesAnExplicitVersionAndR
   StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
   const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
   ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  EXPECT_NE(encoded.value().find("acceptance-projection.v3"), std::string::npos);
+  EXPECT_NE(encoded.value().find("acceptance-projection.v6"), std::string::npos);
   const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
   ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   EXPECT_EQ(decoded.value(), projection);
   auto legacy_alias = encoded.value();
-  legacy_alias.replace(legacy_alias.find("acceptance-projection.v3"),
-                       std::string("acceptance-projection.v3").size(), "acceptance-projection.v2");
+  legacy_alias.replace(legacy_alias.find("acceptance-projection.v6"),
+                       std::string("acceptance-projection.v6").size(), "acceptance-projection.v5");
   EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(legacy_alias).ok());
+  // Q51/Q53: the earlier (budgeted) layouts are refused, never converted.
+  for (const auto* earlier : {"acceptance-projection.v1", "acceptance-projection.v2",
+                              "acceptance-projection.v3"}) {
+    auto old = encoded.value();
+    old.replace(old.find("acceptance-projection.v6"),
+                std::string("acceptance-projection.v6").size(), earlier);
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(old).ok()) << earlier;
+  }
   auto unordered = projection;
   unordered.affected_state.operations.front().journal_capture_order = 0U;
   EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(unordered).ok());

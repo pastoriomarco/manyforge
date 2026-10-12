@@ -12,28 +12,37 @@ import pytest
 core = pytest.importorskip("manyforge_core_py")
 
 
-def test_stop_timing_keeps_ramp_allowances_and_operational_timeout_distinct():
-    timing = core.StopTimingParametersDTO(250_000_000, 750_000_000, 2_000_000_000)
-    assert timing.command_latency_allowance_ns == 250_000_000
-    assert timing.settling_allowance_ns == 750_000_000
-    assert timing.operational_timeout_ns == 2_000_000_000
-    assert core.validate_controlled_stop_timing(timing, 1_000_000_000) is None
-    # Item 24: no Apply-time refusal compares the timeout with the profile.
-    assert core.validate_controlled_stop_timing(timing, 1_000_000_001) is None
-    with pytest.raises(AttributeError):
-        timing.operational_timeout_ns = 1
-    selection = core.StopTimingSelectionDTO(
-        core.ControlBindingId("arm"),
-        core.ControlBindingRevision("sha256:" + "a" * 64),
-        timing,
+def test_stop_timing_is_the_robots_own_profile_value_without_a_cell_table():
+    # Q51: per-robot Stop timing is the controlled-Stop profile's optional
+    # `max_stop_time_s`; the cell-wide timing table and its bindings are gone.
+    for removed in (
+        "StopTimingParametersDTO",
+        "StopTimingSelectionDTO",
+        "StopDeadlineBudgetDTO",
+        "StopBudgetPhaseDTO",
+        "StopBudgetPhaseId",
+        "validate_controlled_stop_timing",
+        "resolve_stop_timing_budget",
+        "harmonize_stop_timing_budgets",
+    ):
+        assert not hasattr(core, removed), removed
+    inputs = core.DeploymentApplicabilityInputsDTO(None, [], [], [], [], [], [])
+    assert not hasattr(inputs, "stop_timing_parameters")
+    soft = core.SoftOnPathStopParametersDTO(
+        core.MotionControlledStopMode.kSoftOnPath,
+        1.0,
+        [],
+        True,
+        max_stop_time_s=3.0,
     )
-    inputs = core.DeploymentApplicabilityInputsDTO(
-        None, [], [], [], [], [], [], [selection]
+    assert soft.max_stop_time_s == 3.0
+    assert core.SoftOnPathStopParametersDTO(
+        core.MotionControlledStopMode.kSoftOnPath, 1.0, [], True
+    ).max_stop_time_s is None
+    spring = core.SpringBackHoldStopParametersDTO(
+        core.MotionControlledStopMode.kSpringBackHold, 1.0, [], max_stop_time_s=2.0
     )
-    assert inputs.stop_timing_parameters == [selection]
-    assert inputs.stop_timing_parameters[0].timing == timing
-    with pytest.raises(AttributeError):
-        selection.timing = core.StopTimingParametersDTO(1, 0, 2)
+    assert spring.max_stop_time_s == 2.0
 
 
 def test_authored_stop_duration_uses_the_same_decimal_rounding_as_deadlines():
@@ -136,7 +145,6 @@ STRONG_STRING_TYPES = (
     "StopEvidencePolicyId",
     "StopEvidencePolicyRevision",
     "StopEscalationStageId",
-    "StopBudgetPhaseId",
     "StopEvidenceItemId",
     "ProviderContractRoleId",
     "RegisteredStopCommandKindId",
@@ -386,24 +394,18 @@ def _stop_evidence_policy_document(
     if observation_kind == "post_command_dwell":
         observation["minimum_dwell_ns"] = 200
 
-    phases = [
-        {"phase_id": "command", "deadline_offset_ns": 100},
-        {"phase_id": "terminal", "deadline_offset_ns": 500},
-    ]
     stages = [
         {
             "stop_escalation_stage_id": "nominal",
             "stage_kind": "nominal",
             "containment_granularity": "control_domain",
             "containment_command": {
-                "command_phase_id": "command",
                 "command": {"command_kind": "controller_goal_cancel"},
             },
             "evidence_conjunction": "all_of",
             "evidence_requirements": [
                 {
                     "evidence_item_id": "terminal",
-                    "phase_id": "terminal",
                     "evidence": evidence,
                     "source_requirement": source,
                     "observation_semantics": observation,
@@ -412,14 +414,12 @@ def _stop_evidence_policy_document(
         }
     ]
     if evidence_kind == "motion_rest":
-        phases.append({"phase_id": "hard_command", "deadline_offset_ns": 700})
         stages.append(
             {
                 "stop_escalation_stage_id": "software_hard_floor",
                 "stage_kind": "software_hard",
                 "containment_granularity": "control_domain",
                 "containment_command": {
-                    "command_phase_id": "hard_command",
                     "command": {
                         "command_kind": "registered",
                         "registered_command_kind_id": "software_hard_stop",
@@ -436,7 +436,6 @@ def _stop_evidence_policy_document(
                 "evidence_requirements": [
                     {
                         "evidence_item_id": "hard_acknowledged",
-                        "phase_id": "hard_command",
                         "evidence": {"evidence_kind": "discrete_acknowledgement"},
                         "source_requirement": {
                             "source_kind": "command_target_status",
@@ -453,11 +452,6 @@ def _stop_evidence_policy_document(
         "stop_evidence_policy_id": policy_id,
         "disposition": "stoppable",
         "containment_granularity": "control_domain",
-        "deadline_budget": {
-            "outer_duration_ns": 1000,
-            "kernel_completion_reserve_ns": 100,
-            "phases": phases,
-        },
         "escalation_stages": stages,
     }
     canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -481,7 +475,7 @@ def _stop_evidence_policy_reference(document: str, policy_id: str):
         ),
         schema_id=core.SchemaId("manyforge.stop_evidence_policy.v2"),
         schema_revision=core.SchemaRevision(
-            "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970"
+            "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13"
         ),
         content_digest=core.ContentDigest(
             "sha256:" + hashlib.sha256(document.encode()).hexdigest()
@@ -798,7 +792,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 105
+    assert len(STRONG_STRING_TYPES) == 104
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -1158,22 +1152,11 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         contract_schema_revision=core.SchemaRevision(ZERO_DIGEST),
     )
     command = core.StopContainmentCommandDTO(
-        command_phase_id=core.StopBudgetPhaseId("command"),
         command_kind=core.StopContainmentCommandKind.kMotionControlledStop,
         provider_contract_ref=contract,
     )
-    budget = core.StopDeadlineBudgetDTO(
-        outer_duration_ns=1000,
-        kernel_completion_reserve_ns=100,
-        phases=[
-            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("command"), 100),
-            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("rest"), 500),
-            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("hard_command"), 700),
-        ],
-    )
     evidence = core.StopEvidenceRequirementDTO(
         evidence_item_id=core.StopEvidenceItemId("rest"),
-        phase_id=core.StopBudgetPhaseId("rest"),
         evidence_kind=core.StopEvidenceRequirementKind.kMotionRest,
         provider_contract_ref=contract,
         source_requirement=core.StopEvidenceSourceRequirementDTO(
@@ -1196,7 +1179,6 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         evidence_requirements=[evidence],
     )
     hard_command = core.StopContainmentCommandDTO(
-        command_phase_id=core.StopBudgetPhaseId("hard_command"),
         command_kind=core.StopContainmentCommandKind.kRegistered,
         provider_contract_ref=contract,
         registered_command_kind_id=core.RegisteredStopCommandKindId(
@@ -1205,7 +1187,6 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
     )
     hard_evidence = core.StopEvidenceRequirementDTO(
         evidence_item_id=core.StopEvidenceItemId("hard_acknowledged"),
-        phase_id=core.StopBudgetPhaseId("hard_command"),
         evidence_kind=core.StopEvidenceRequirementKind.kDiscreteAcknowledgement,
         source_requirement=core.StopEvidenceSourceRequirementDTO(
             source_kind=core.StopEvidenceSourceKind.kCommandTargetStatus,
@@ -1228,10 +1209,9 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         stop_evidence_policy_revision=core.StopEvidencePolicyRevision(ZERO_DIGEST),
         disposition=core.StopEvidenceDisposition.kStoppable,
         containment_granularity=core.ContainmentGranularity.kControlDomain,
-        deadline_budget=budget,
         escalation_stages=[nominal_stage, hard_stage],
     )
-    assert dto.deadline_budget == budget
+    assert not hasattr(dto, "deadline_budget")
     assert dto.escalation_stages == [nominal_stage, hard_stage]
     with pytest.raises(AttributeError):
         dto.escalation_stages = []
@@ -1862,7 +1842,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-            "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
+            "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
         ),
         (
             "manyforge.value_schema.runtime.empty.v1",
@@ -1874,7 +1854,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905",
+            "sha256:f927705d80b40e266f3c62341911a223de2a3811188a2c4656d4bee98f81c30b",
         ),
     }
     assert (

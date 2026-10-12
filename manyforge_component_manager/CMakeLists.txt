@@ -194,6 +194,7 @@ add_library(manyforge_component_manager
   src/apply_completion.cpp
   src/canonical_empty_bootstrap_coordinator.cpp
   src/durable_store_set.cpp
+  src/isaac_site_settings.cpp
   src/kernel_apply_fence_rpc_internal.cpp
   src/kernel_cell_admission_rpc_internal.cpp
   src/manager_apply_fence_coordinator.cpp
@@ -300,6 +301,12 @@ if(BUILD_TESTING)
   add_custom_target(
     manyforge_manager_test_canonical_empty_package
     DEPENDS "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}")
+
+  add_executable(test_isaac_site_settings test/test_isaac_site_settings.cpp)
+  target_link_libraries(test_isaac_site_settings PRIVATE
+    manyforge_component_manager GTest::gtest_main)
+  gtest_discover_tests(test_isaac_site_settings
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_observation
     test/test_runtime_observation.cpp)

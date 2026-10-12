@@ -146,7 +146,9 @@ class RuntimeUnitSourceReport final {
       std::vector<std::string> ready_runtime_role_ids,
       ManagedCommandSurfaceState command_surface_state,
       std::vector<std::string> reason_codes = {},
-      std::string offered_runtime_contract_offer_digest = {});
+      std::string offered_runtime_contract_offer_digest = {},
+      std::optional<std::uint64_t> dropped_host_notice_lines = std::nullopt,
+      std::optional<std::uint64_t> dropped_host_notice_bytes = std::nullopt);
 
   [[nodiscard]] const std::string& runtime_unit_id() const noexcept;
   [[nodiscard]] const std::string& process_incarnation() const noexcept;
@@ -164,6 +166,14 @@ class RuntimeUnitSourceReport final {
   offered_runtime_contract_offer_digest() const noexcept;
   [[nodiscard]] const std::vector<std::string>& reason_codes() const noexcept;
 
+  /// Informational cumulative counts since this host incarnation started.
+  /// Host replacement resets them; absent means the source does not report
+  /// them.
+  [[nodiscard]] std::optional<std::uint64_t>
+  dropped_host_notice_lines() const noexcept;
+  [[nodiscard]] std::optional<std::uint64_t>
+  dropped_host_notice_bytes() const noexcept;
+
   bool operator==(const RuntimeUnitSourceReport&) const = default;
 
  private:
@@ -179,6 +189,8 @@ class RuntimeUnitSourceReport final {
   ManagedCommandSurfaceState command_surface_state_;
   std::string offered_runtime_contract_offer_digest_;
   std::vector<std::string> reason_codes_;
+  std::optional<std::uint64_t> dropped_host_notice_lines_;
+  std::optional<std::uint64_t> dropped_host_notice_bytes_;
 };
 
 class RuntimeUnitObservation final {
@@ -216,6 +228,13 @@ class RuntimeUnitObservation final {
   [[nodiscard]] const std::vector<std::string>& source_reason_codes()
       const noexcept;
   [[nodiscard]] const std::vector<std::string>& reason_codes() const noexcept;
+  /// Informational cumulative counts since this host incarnation started.
+  /// Host replacement resets them; absent means the source does not report
+  /// them.
+  [[nodiscard]] std::optional<std::uint64_t>
+  dropped_host_notice_lines() const noexcept;
+  [[nodiscard]] std::optional<std::uint64_t>
+  dropped_host_notice_bytes() const noexcept;
   [[nodiscard]] bool converged() const noexcept;
 
  private:
@@ -243,7 +262,9 @@ class RuntimeUnitObservation final {
       std::string observed_runtime_contract_offer_digest,
       std::map<std::string, std::string> dependency_runtime_epochs,
       std::vector<std::string> source_reason_codes,
-      std::vector<std::string> reason_codes);
+      std::vector<std::string> reason_codes,
+      std::optional<std::uint64_t> dropped_host_notice_lines,
+      std::optional<std::uint64_t> dropped_host_notice_bytes);
 
   std::string runtime_unit_id_;
   RuntimeLifecycleControl lifecycle_control_;
@@ -267,6 +288,8 @@ class RuntimeUnitObservation final {
   std::map<std::string, std::string> dependency_runtime_epochs_;
   std::vector<std::string> source_reason_codes_;
   std::vector<std::string> reason_codes_;
+  std::optional<std::uint64_t> dropped_host_notice_lines_;
+  std::optional<std::uint64_t> dropped_host_notice_bytes_;
 };
 
 class RuntimeObservationSnapshot final {

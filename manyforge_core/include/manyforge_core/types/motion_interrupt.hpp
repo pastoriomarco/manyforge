@@ -110,6 +110,10 @@ struct MotionInterruptStopProfileDTO {
   /// spring-back the value is split into equal forward-deceleration (lead-in
   /// included) and reverse-return halves.
   std::optional<double> deceleration_time_s;
+  /// Q28/Q51 (`main`'s per-profile override): upper bound on this robot's
+  /// controlled Stop, measured from the Stop request. Absent: the deceleration
+  /// time (or its default) plus `complete_move_on_signal_timeout` (500 ms).
+  std::optional<double> max_stop_time_s;
   /// Typed source-URDF/SRDF-joint acceleration limits. Required with exact
   /// target-joint coverage for soft_on_path and spring_back_hold; forbidden
   /// for hard_deceleration. Kernel Prepare resolves these source names to
@@ -216,6 +220,11 @@ inline std::string motion_interrupt_stop_profile_field_error(
     const MotionInterruptStopProfileDTO& profile) {
   if (!motion_interrupt_stop_profile_id_valid(profile.profile_id)) {
     return "profile_id must be a 1-128 byte portable token";
+  }
+  if (profile.max_stop_time_s.has_value() &&
+      (!std::isfinite(*profile.max_stop_time_s) || *profile.max_stop_time_s <= 0.0 ||
+       *profile.max_stop_time_s > 9.0e9)) {
+    return "stop_profile.max_stop_time_s must be finite and > 0";
   }
   if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath ||
       profile.stop_mode == MotionInterruptStopMode::kSpringBackHold) {

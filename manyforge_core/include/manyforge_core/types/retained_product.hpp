@@ -255,7 +255,6 @@ struct RetainedBundleDTO final {
   std::vector<ExternalResourceDTO> external_resources;
   std::optional<RetainedAssistantProjectionDTO> assistant;
   std::vector<RetainedRuntimeContractRequirementDTO> runtime_contract_requirements;
-  std::vector<StopTimingSelectionDTO> stop_timing_parameters{};
 
   friend bool operator==(const RetainedBundleDTO&, const RetainedBundleDTO&) = default;
 };

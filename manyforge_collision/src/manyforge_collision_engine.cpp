@@ -7,10 +7,20 @@
 #include <coal/mesh_loader/loader.h>
 #include <coal/shape/convex.h>
 #include <coal/shape/geometric_shapes.h>
-// The pinned urdfdom parser requires these official pointer declarations
+// The pinned urdfdom parser needs `urdf::ModelInterfaceSharedPtr` declared
 // before its header when co-installed with the distribution's model headers.
+// urdfdom_headers 1.x (Jazzy, the ROS-free image) declares it only in
+// <urdf_world/types.h>; urdfdom_headers 2.x (Lyrical) moved it into
+// <urdf_model/types.h> and deprecates <urdf_world/types.h> with a #warning
+// (an error under -Werror). Declare the identical pointer type here: a
+// repeated typedef of the same type is valid C++, so this compiles against
+// both header generations without including the deprecated header.
+#include <memory>
+namespace urdf {
+class ModelInterface;
+typedef std::shared_ptr<ModelInterface> ModelInterfaceSharedPtr;
+} // namespace urdf
 // clang-format off
-#include <urdf_world/types.h>
 #include <urdf_parser/urdf_parser.h>
 // clang-format on
 

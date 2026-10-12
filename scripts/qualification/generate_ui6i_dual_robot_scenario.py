@@ -156,13 +156,13 @@ def build_deployment(root: Path) -> dict[str, Any]:
     lite6 = occurrence(
         component="lite6_robot",
         family="lite6_lite_gripper",
-        runtime_profile="lite6_native_simulated_v0",
+        runtime_profile="lite6_mock_commanded_v0",
         y_m=0.0,
     )
     ur5e = occurrence(
         component="ur5e_robot",
         family="ur5e_robotiq_2f_85",
-        runtime_profile="ur5e_robotiq_native_simulated_v0",
+        runtime_profile="ur5e_robotiq_mock_commanded_v0",
         y_m=1.0,
     )
     candidates = (lite6, ur5e)
@@ -198,19 +198,40 @@ def build_deployment(root: Path) -> dict[str, Any]:
     ]
     for field in ("execution_tick_hz", "collision_monitor_period_ms", "mode"):
         if configurations[0][field] != configurations[1][field]:
-            raise GenerationError(f"dual native runtimes disagree on {field}")
-    combined_runtime_id = "robot_cell.native_execution"
+            raise GenerationError(f"dual runtimes disagree on {field}")
+    # Q63-Q68: both robots run on the offline mock lane in one ROS runtime
+    # unit named after the first component, as the activation compiler does;
+    # each robot keeps its own controller profile and fault Stop profile.
+    ros2_control = (
+        runtime_units[0]["runtime_profile_id"]
+        == "manyforge.ros2_control_execution_runtime"
+    )
+    combined_runtime_id = (
+        "robot_cell.ros2_control_execution"
+        if ros2_control
+        else "robot_cell.native_execution"
+    )
     combined_configuration = copy.deepcopy(configurations[0])
     combined_configuration["initial_joint_positions_rad"] = [
         position
         for configuration in configurations
         for position in configuration["initial_joint_positions_rad"]
     ]
-    for field in (
-        "motion_target_limits",
-        "direct_control_joint_limits",
-        "gripper_target_configurations",
-    ):
+    merged_fields = (
+        (
+            "motion_target_limits",
+            "default_fault_stop_profiles",
+            "gripper_target_configurations",
+            "controller_profiles",
+        )
+        if ros2_control
+        else (
+            "motion_target_limits",
+            "direct_control_joint_limits",
+            "gripper_target_configurations",
+        )
+    )
+    for field in merged_fields:
         combined_configuration[field] = sorted(
             [
                 copy.deepcopy(item)
@@ -219,7 +240,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
             ],
             key=lambda item: (
                 item["controllable_component_id"],
-                item["command_target_id"],
+                item.get("command_target_id", ""),
                 item.get("source_joint_name", ""),
             ),
         )
@@ -240,9 +261,8 @@ def build_deployment(root: Path) -> dict[str, Any]:
     ]
 
     source_runtime_ids = {
-        "lite6_robot.native_execution",
-        "ur5e_robot.native_execution",
-    }
+        row["runtime_unit_id"] for row in runtime_units
+    } - {combined_runtime_id}
 
     def replace_runtime_unit(value: Any) -> None:
         if isinstance(value, dict):
@@ -309,11 +329,6 @@ def build_deployment(root: Path) -> dict[str, Any]:
             for candidate in candidates
             for row in candidate["policies"]["stop_stage_parameters"]
         ],
-        "stop_timing_parameters": [
-            copy.deepcopy(row)
-            for candidate in candidates
-            for row in candidate["policies"]["stop_timing_parameters"]
-        ],
     }
     policies["stop_stage_parameters"].sort(
         key=lambda row: (
@@ -321,7 +336,6 @@ def build_deployment(root: Path) -> dict[str, Any]:
             row["stop_escalation_stage_id"],
         )
     )
-    policies["stop_timing_parameters"].sort(key=lambda row: row["control_binding_id"])
     replace_runtime_unit(desired)
     replace_runtime_unit(providers)
     replace_runtime_unit(policies)
@@ -333,7 +347,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
         "cell_id": CELL_ID,
         "name": "ur5e_lite6_wall",
         "description": (
-            "Minimal native UR5e and Lite6 qualification cell derived from the "
+            "Minimal offline mock UR5e and Lite6 qualification cell derived from the "
             "simple ManyMove dual-robot wall layout. The robots plan independently; "
             "both are owned by one cell execution Kernel and remain independently planned."
         ),
@@ -692,7 +706,7 @@ def main() -> int:
                         ),
                         "component_occurrence_id": "lite6_robot",
                         "runtime_restoration_profile_id": (
-                            "lite6_native_simulated_v0"
+                            "lite6_mock_commanded_v0"
                         ),
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
@@ -706,7 +720,7 @@ def main() -> int:
                         },
                     },
                     "lite6_lite_gripper",
-                    "lite6_native_simulated_v0",
+                    "lite6_mock_commanded_v0",
                 ),
                 (
                     {
@@ -718,7 +732,7 @@ def main() -> int:
                         ),
                         "component_occurrence_id": "ur5e_robot",
                         "runtime_restoration_profile_id": (
-                            "ur5e_robotiq_native_simulated_v0"
+                            "ur5e_robotiq_mock_commanded_v0"
                         ),
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
@@ -732,7 +746,7 @@ def main() -> int:
                         },
                     },
                     "ur5e_robotiq_2f_85",
-                    "ur5e_robotiq_native_simulated_v0",
+                    "ur5e_robotiq_mock_commanded_v0",
                 ),
             )
             intents = [

@@ -184,34 +184,12 @@ struct ProviderContractRefDTO {
 /// operation/profile values into the executable participant plan. Stop-time
 /// fallback discovery is forbidden.
 struct StopContainmentCommandDTO {
-  StopBudgetPhaseId command_phase_id;
   StopContainmentCommandKind command_kind;
   std::optional<ProviderContractRefDTO> provider_contract_ref;
   std::optional<RegisteredStopCommandKindId> registered_command_kind_id;
 
   friend bool operator==(const StopContainmentCommandDTO&,
                          const StopContainmentCommandDTO&) = default;
-};
-
-struct StopBudgetPhaseDTO {
-  StopBudgetPhaseId phase_id;
-  std::int64_t deadline_offset_ns = 0;
-
-  friend bool operator==(const StopBudgetPhaseDTO&,
-                         const StopBudgetPhaseDTO&) = default;
-};
-
-/// Phase deadlines are strictly increasing offsets inside the sole
-/// Kernel-owned outer monotonic budget. Downstream receivers translate
-/// positive remaining offsets onto their own monotonic clocks; they never
-/// receive or compare the Kernel's absolute timestamp.
-struct StopDeadlineBudgetDTO {
-  std::int64_t outer_duration_ns = 0;
-  std::int64_t kernel_completion_reserve_ns = 0;
-  std::vector<StopBudgetPhaseDTO> phases;
-
-  friend bool operator==(const StopDeadlineBudgetDTO&,
-                         const StopDeadlineBudgetDTO&) = default;
 };
 
 struct StopEvidenceSourceRequirementDTO {
@@ -234,7 +212,6 @@ struct StopEvidenceObservationDTO {
 
 struct StopEvidenceRequirementDTO {
   StopEvidenceItemId evidence_item_id;
-  StopBudgetPhaseId phase_id;
   StopEvidenceRequirementKind evidence_kind;
   std::optional<ProviderContractRefDTO> provider_contract_ref;
   std::optional<RegisteredStopEvidenceKindId> registered_evidence_kind_id;
@@ -247,7 +224,8 @@ struct StopEvidenceRequirementDTO {
 
 /// One fixed member of the policy's ordered escalation chain. This is
 /// configuration, not a runtime list of candidates: Kernel alone advances
-/// through the retained order under the policy's single outer deadline.
+/// through the retained order; each robot is bounded by its own Stop-time
+/// deadlines (Q51), never by a shared policy budget.
 struct StopEscalationStageDTO {
   StopEscalationStageId stop_escalation_stage_id;
   StopEscalationStageKind stage_kind;
@@ -274,7 +252,6 @@ struct StopEvidencePolicyDTO {
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   StopEvidenceDisposition disposition;
   ContainmentGranularity containment_granularity;
-  std::optional<StopDeadlineBudgetDTO> deadline_budget;
   std::vector<StopEscalationStageDTO> escalation_stages;
 
   friend bool operator==(const StopEvidencePolicyDTO&,

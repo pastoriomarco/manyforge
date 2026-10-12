@@ -161,7 +161,6 @@ template <typename ProviderPath>
 
 [[nodiscard]] CanonicalValue containment_command_value(const StopContainmentCommandDTO& value) {
   CanonicalValue::Object fields{
-      {"command_phase_id", CanonicalValue(value.command_phase_id.value())},
       {"command_kind", CanonicalValue(std::string(to_string(value.command_kind)))}};
   if (value.provider_contract_ref.has_value()) {
     fields.emplace_back("provider_contract_ref",
@@ -347,12 +346,7 @@ template <typename ProviderPath>
           plan.participant_stop_invocation_plan_digest.value()) ||
       !identity(plan.resolved_stop_base_plan_id) || plan.operation_id != stage.operation_id ||
       plan.operation_revision != stage.operation_revision ||
-      plan.participant_id != stage.participant_id || plan.deadline_budget.outer_duration_ns <= 0 ||
-      plan.deadline_budget.outer_duration_ns > kMaximumStopDurationNs ||
-      plan.deadline_budget.kernel_completion_reserve_ns <= 0 ||
-      plan.deadline_budget.kernel_completion_reserve_ns >= plan.deadline_budget.outer_duration_ns ||
-      plan.deadline_budget.phases.empty() ||
-      plan.deadline_budget.phases.size() > kMaximumStopAcceptedPhases) {
+      plan.participant_id != stage.participant_id) {
     return invalid("participant_stop_plan_join_invalid");
   }
   const auto& resolved = command->resolved_stage;
@@ -362,17 +356,6 @@ template <typename ProviderPath>
       resolved.evidence_requirements.empty() ||
       resolved.evidence_requirements.size() > kMaximumStopAcceptedPhases) {
     return invalid("participant_stop_stage_selection_invalid");
-  }
-  std::set<StopBudgetPhaseId> phases;
-  std::int64_t prior = 0;
-  for (const auto& phase : plan.deadline_budget.phases) {
-    if (!identity(phase.phase_id) || !phases.insert(phase.phase_id).second ||
-        phase.deadline_offset_ns <= prior ||
-        phase.deadline_offset_ns > plan.deadline_budget.outer_duration_ns -
-                                       plan.deadline_budget.kernel_completion_reserve_ns) {
-      return invalid("participant_stop_plan_budget_invalid");
-    }
-    prior = phase.deadline_offset_ns;
   }
   return Result<void>::Ok();
 }
@@ -542,26 +525,19 @@ template <typename ProviderPath>
 
 [[nodiscard]] Result<void> validate_budget(const ResolvedParticipantStopStageDTO& stage,
                                            const RemainingStopBudgetDTO& budget) {
-  const auto& fixed = stage.participant_stop_plan.deadline_budget;
-  if (budget.stop_id != stage.stop_id || budget.stop_generation != stage.stop_generation ||
-      budget.remaining_outer_duration_ns < 0 ||
-      budget.remaining_outer_duration_ns > fixed.outer_duration_ns ||
-      budget.phases.size() != fixed.phases.size()) {
+  // Q51: only this robot's own Stop-time values; a controlled deadline only
+  // for a controlled-Stop command (hard stages are bounded by the lane, Q57;
+  // gripper cancels are fire-and-forget, Q58).
+  const auto* command = selected_command(stage);
+  if (command == nullptr || budget.stop_id != stage.stop_id ||
+      budget.stop_generation != stage.stop_generation || budget.elapsed_since_stop_ns < 0 ||
+      budget.elapsed_since_stop_ns > kMaximumStopDurationNs ||
+      (budget.remaining_controlled_deadline_ns.has_value() &&
+       (command->resolved_stage.containment_command.command_kind !=
+            StopContainmentCommandKind::kMotionControlledStop ||
+        *budget.remaining_controlled_deadline_ns < 0 ||
+        *budget.remaining_controlled_deadline_ns > kMaximumStopDurationNs))) {
     return invalid("participant_stop_remaining_budget_invalid");
-  }
-  const auto elapsed = fixed.outer_duration_ns - budget.remaining_outer_duration_ns;
-  for (std::size_t index = 0U; index < fixed.phases.size(); ++index) {
-    const auto& expected = fixed.phases[index];
-    const auto& actual = budget.phases[index];
-    const auto remaining =
-        budget.remaining_outer_duration_ns <= fixed.kernel_completion_reserve_ns
-            ? 0
-            : std::max<std::int64_t>(0, std::min(expected.deadline_offset_ns - elapsed,
-                                                 budget.remaining_outer_duration_ns -
-                                                     fixed.kernel_completion_reserve_ns));
-    if (actual.phase_id != expected.phase_id || actual.remaining_deadline_offset_ns != remaining) {
-      return invalid("participant_stop_remaining_phase_budget_invalid");
-    }
   }
   return Result<void>::Ok();
 }

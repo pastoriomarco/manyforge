@@ -33,6 +33,7 @@ from manyforge_ros.isaac_pose_observer import (
     detection3d_observation_intent,
     joint_state_observation_intent,
     load_isaac_pose_observer_site_config,
+    manager_source_epoch_factory,
     simulation_entity_observation_intent,
     unknown_observation_intent,
 )
@@ -89,6 +90,7 @@ class PoseSourceSnapshotPublisher(Node):
         *,
         site_config_path: Path | None = None,
         manager_run_root: Path | None = None,
+        source_epoch_base: str | None = None,
         dispatcher_factory: DispatcherFactory = _default_dispatcher_factory,
         simulation_client_factory: SimulationClientFactory = (
             _default_simulation_client_factory
@@ -98,6 +100,7 @@ class PoseSourceSnapshotPublisher(Node):
         super().__init__("manyforge_pose_source_snapshot_publisher", context=context)
         self.declare_parameter("site_config_path", "")
         self.declare_parameter("manager_run_root", "")
+        self.declare_parameter("source_epoch_base", "")
         self.declare_parameter("manager_timeout_s", 2.0)
         self.declare_parameter("simulation_service_timeout_s", 2.0)
         self.declare_parameter("retry_log_period_s", 5.0)
@@ -126,11 +129,21 @@ class PoseSourceSnapshotPublisher(Node):
             self, "retry_log_period_s", minimum=0.1, maximum=300.0
         )
         if dispatcher_factory is _default_dispatcher_factory:
+            configured_epoch_base = (
+                source_epoch_base
+                if source_epoch_base is not None
+                else self.get_parameter("source_epoch_base").value
+            )
             self._dispatcher = ObservationDispatcher.for_manager_root(
                 manager_run_root=configured_manager_root,
                 config=self._config,
                 event_callback=self._on_dispatch_event,
                 timeout_s=self._manager_timeout_s,
+                source_epoch_factory=(
+                    manager_source_epoch_factory(configured_epoch_base)
+                    if configured_epoch_base != ""
+                    else None
+                ),
             )
         else:
             self._dispatcher = dispatcher_factory(
@@ -550,6 +563,34 @@ def _bounded_parameter(
 
 
 def main(args: list[str] | None = None) -> int:
+    invocation = sys.argv[1:] if args is None else args
+    if invocation and invocation[0] == "--check-config":
+        try:
+            if len(invocation) != 2:
+                raise ValueError("--check-config requires exactly one site config path")
+            config = load_isaac_pose_observer_site_config(Path(invocation[1]))
+            # Only metadata from the existing bounded strict parser. The host
+            # captures stdout losslessly before running any world barrier;
+            # this is neither an Open session nor an observation receipt.
+            print(
+                json.dumps(
+                    {
+                        "cell_id": config.cell_id,
+                        "source_id": config.source_id,
+                        "bindings": [
+                            binding.to_value() for binding in config.observer_bindings
+                        ],
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        except Exception as error:
+            print(f"isaac_pose_observer_failed: {error}", file=sys.stderr)
+            return 78
+
     context = Context()
     rclpy.init(args=args, context=context)
     node: PoseSourceSnapshotPublisher | None = None

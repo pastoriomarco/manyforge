@@ -2920,8 +2920,9 @@ ExecutionKernel::make_and_prepare_motion_participant(
         scope.scope_id,
         scope.node_category};
     auto stop_plan =
-        MakePreparedParticipantStopPlan(authority.stop_readiness.value(), std::move(stop_context),
-                                        binding.resources, authority.retained_default_stop_limits);
+        MakePreparedParticipantStopPlan(authority.stop_readiness.value().resolved_stop_base_plan,
+                                        std::move(stop_context), binding.resources,
+                                        authority.retained_default_stop_limits);
     if (!stop_plan.ok()) {
       return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(stop_plan.error());
     }
@@ -3465,7 +3466,13 @@ void ExecutionKernel::async_execute_worker(
   } catch (const std::exception& e) {
     stop_collision_monitoring(RuntimeCollisionMonitorRelease::kFailClosedTerminal,
                               motion_state.runtime_collision_protection_generation);
-    const ErrorDTO exception_error{kErrorInternalError, e.what(), {{"reason", "worker_exception"}}};
+    // A backend's reported critical fault (Q52) keeps its own error; any
+    // other exception is the worker's (item 17). Both take this path.
+    const auto* critical = dynamic_cast<const ExecutionCriticalFault*>(&e);
+    const ErrorDTO exception_error =
+        critical != nullptr
+            ? critical->error()
+            : ErrorDTO{kErrorInternalError, e.what(), {{"reason", "worker_exception"}}};
     bool dispatched = false;
     if (prepared_session) {
       std::lock_guard lock(prepared_session->mutex);
@@ -3490,7 +3497,7 @@ void ExecutionKernel::async_execute_worker(
     settle_local_failure(request, exec_id, motion_state, exception_error,
                          dispatched ? ParticipantEffectKnowledge::kEffectUncertain
                                     : ParticipantEffectKnowledge::kNoEffect,
-                         "worker_exception");
+                         critical != nullptr ? "execution_critical_fault" : "worker_exception");
   }
 }
 
@@ -3842,7 +3849,7 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
                  {{"reason", "prepared_motion_authority_mismatch"}}});
   }
   auto verified_stop = VerifyPreparedParticipantStopPlan(
-      request.stop_readiness.value(), *request.ordinary_stop_plan, binding.resources,
+      request.stop_readiness.value().resolved_stop_base_plan, *request.ordinary_stop_plan, binding.resources,
       request.retained_default_stop_limits, request.stop_node_category);
   if (!verified_stop.ok() || request.ordinary_stop_plan->operation_id != resolved.operation_id ||
       request.ordinary_stop_plan->operation_revision != request.operation_revision ||
@@ -3857,7 +3864,7 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
   }
   if (request.fault_stop_plan) {
     const auto verified_fault = VerifyPreparedParticipantStopPlan(
-        request.stop_readiness.value(), *request.fault_stop_plan, binding.resources,
+        request.stop_readiness.value().resolved_stop_base_plan, *request.fault_stop_plan, binding.resources,
         request.retained_default_stop_limits, request.stop_node_category);
     if (!verified_fault.ok() || request.fault_stop_plan->operation_id != resolved.operation_id ||
         request.fault_stop_plan->operation_revision != request.operation_revision ||

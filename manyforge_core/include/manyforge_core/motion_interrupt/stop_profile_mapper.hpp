@@ -1,9 +1,11 @@
 #pragma once
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/stop_control.hpp>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -43,6 +45,13 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
 /// provider-contract stage. The deployment contract is resource-addressed;
 /// the portable execution contract remains source-joint-addressed, so this is
 /// the one shared inverse projection used by every lane adapter.
+/// Q28/Q51: a robot's controlled-Stop deadline (from the Stop request)
+/// computed at Stop time from its exact prepared contract parameters
+/// (`max_stop_time_s`, else deceleration time + 0.5 s); nullopt for a hard
+/// deceleration profile or unusable parameters (no controlled deadline).
+[[nodiscard]] std::optional<Duration> controlled_stop_deadline_from_contract_parameters(
+    const JsonObjectDTO& parameters);
+
 [[nodiscard]] Result<MotionInterruptStopProfileDTO>
 map_motion_controlled_stop_contract_parameters_to_profile(
     const JsonObjectDTO& parameters, std::span<const RuntimeResourceBindingDTO> resources,

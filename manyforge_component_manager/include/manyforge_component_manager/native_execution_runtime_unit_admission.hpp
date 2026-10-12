@@ -1,5 +1,7 @@
 #pragma once
 
+#include "manyforge_component_manager/runtime_observation.hpp"
+
 #include <cstdint>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -65,6 +67,12 @@ public:
   [[nodiscard]] std::string
   expected_status_packet(const manyforge::core::RuntimeEpoch &runtime_epoch,
                          std::uint64_t source_report_sequence) const;
+
+  /// Validates the exact existing status identity plus an optional ordered
+  /// canonical uint64 host-notice counter pair. Counters confer no readiness.
+  [[nodiscard]] RuntimeUnitSourceReport
+  parse_status_packet(const manyforge::core::RuntimeEpoch &runtime_epoch,
+                      std::string_view packet) const;
 
 private:
   NativeExecutionRuntimeUnitAdmission(

@@ -21,10 +21,9 @@
 
 namespace manyforge::ros2_control_execution {
 Ros2TransportResources::Ros2TransportResources(
-    std::string node_name, std::string node_namespace,
-    std::size_t executor_thread_count, std::string command_gate_topic,
-    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
-    std::string arm_group_id, core::IClock &clock) {
+    std::string node_name, std::string node_namespace, std::size_t executor_thread_count,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink, std::string arm_group_id,
+    core::IClock& clock) {
   context_ = std::make_shared<rclcpp::Context>();
   int argc = 0;
   char **argv = nullptr;
@@ -40,11 +39,6 @@ Ros2TransportResources::Ros2TransportResources(
   executor_->add_node(node_);
   scene_projection_worker_ = std::make_unique<detail::SceneProjectionWorker>(
       std::move(execution_state_sink), std::move(arm_group_id), clock);
-  if (!command_gate_topic.empty()) {
-    command_gate_pub_ = node_->create_publisher<std_msgs::msg::Bool>(
-        command_gate_topic, rclcpp::QoS(1).reliable().transient_local());
-    (void)request_command_gate(false);
-  }
 }
 
 Ros2TransportResources::~Ros2TransportResources() { quiesce(); }
@@ -54,22 +48,25 @@ Ros2TransportResources::projection_worker() const noexcept {
   return *scene_projection_worker_;
 }
 
-bool Ros2TransportResources::request_command_gate(bool enabled) {
-  if (!command_gate_pub_)
-    return false;
-  command_gate_enabled_.store(enabled, std::memory_order_release);
-  std_msgs::msg::Bool msg;
-  msg.data = enabled;
-  command_gate_pub_->publish(msg);
-  return true;
-}
-
 void Ros2TransportResources::start() {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-  if (started() || quiesced_)
+  if (started() || quiesced_ ||
+      spin_finished_.load(std::memory_order_acquire))
     throw std::logic_error(
         "ROS transport cannot be started twice or after quiescence");
-  spin_thread_ = std::thread([this]() { executor_->spin(); });
+  spin_thread_ = std::thread([this]() {
+    executor_->spin();
+    spin_finished_.store(true, std::memory_order_release);
+  });
+  // spin() establishes its cancellation state internally. Do not let quiesce()
+  // cancel before that state exists: spin() would overwrite an early cancel.
+  while (!executor_->is_spinning() &&
+         !spin_finished_.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  if (spin_finished_.load(std::memory_order_acquire)) {
+    spin_thread_.join();
+    throw std::runtime_error("ROS transport executor exited during startup");
+  }
   started_.store(true, std::memory_order_release);
 }
 
@@ -78,16 +75,13 @@ void Ros2TransportResources::quiesce() noexcept {
   if (quiesced_)
     return;
   quiesced_ = true;
-  try {
-    (void)request_command_gate(false);
-  } catch (...) {
-  }
-  // Context shutdown is durable even if spin() has not entered its wait yet.
+  // Cancellation stops new executor work; selected SDK callbacks must finish
+  // with a valid context before shutdown invalidates their ROS entities.
   executor_->cancel();
-  context_->shutdown("manyforge ROS transport shutdown");
   if (spin_thread_.joinable())
     spin_thread_.join();
   executor_->remove_node(node_);
+  context_->shutdown("manyforge ROS transport shutdown");
   if (!scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
     RCLCPP_FATAL(node_->get_logger(),
                  "Timed out draining scene projection callbacks during ROS "

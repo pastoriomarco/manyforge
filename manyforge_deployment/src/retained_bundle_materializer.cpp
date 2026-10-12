@@ -472,7 +472,6 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                     .retained_projection())
           : std::nullopt,
       std::move(runtime_contract_requirements),
-      deployment.applicability_inputs().value().stop_timing_parameters,
   };
 }
 
@@ -544,14 +543,6 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                              runtime_unit_products)},
   };
   const auto &applicability = qualified.compiler_ir().applicability();
-  if (!deployment.applicability_inputs()
-           .value()
-           .stop_timing_parameters.empty()) {
-    root.emplace_back("stop_timing_parameters",
-                      *deployment.applicability_inputs()
-                           .normalized_policies()
-                           ->find_object_member("stop_timing_parameters"));
-  }
   if (applicability.selected_site_overlay_ref().has_value()) {
     root.emplace_back("site_overlay_ref",
                       site_overlay_ref_projection(

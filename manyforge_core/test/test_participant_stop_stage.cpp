@@ -143,18 +143,19 @@ namespace {
   return plan.value();
 }
 
+[[nodiscard]] bool ControlledCommand(const ResolvedParticipantStopStageDTO& stage) {
+  return stage.participant_stop_plan.stage_commands.at(stage.stage_index)
+             .resolved_stage.containment_command.command_kind ==
+         StopContainmentCommandKind::kMotionControlledStop;
+}
+
+// Q51: only this robot's own Stop-time values; a controlled deadline only for
+// a controlled-Stop command.
 [[nodiscard]] RemainingStopBudgetDTO Budget(const ResolvedParticipantStopStageDTO& stage,
-                                            std::int64_t remaining = 4'000'000'000LL) {
-  RemainingStopBudgetDTO result{stage.stop_id, stage.stop_generation, remaining, {}};
-  const auto& fixed = stage.participant_stop_plan.deadline_budget;
-  const auto elapsed = fixed.outer_duration_ns - remaining;
-  for (const auto& phase : fixed.phases) {
-    const auto offset =
-        remaining <= fixed.kernel_completion_reserve_ns
-            ? 0
-            : std::max<std::int64_t>(0, std::min(phase.deadline_offset_ns - elapsed,
-                                                 remaining - fixed.kernel_completion_reserve_ns));
-    result.phases.push_back({phase.phase_id, offset});
+                                            std::int64_t elapsed = 0) {
+  RemainingStopBudgetDTO result{stage.stop_id, stage.stop_generation, elapsed, std::nullopt};
+  if (ControlledCommand(stage)) {
+    result.remaining_controlled_deadline_ns = 1'000'000'000LL - elapsed;
   }
   return result;
 }
@@ -267,6 +268,10 @@ TEST(ParticipantStopStageTest, AcceptsRegisteredControlPathProviderWithoutCapabi
   const auto fixture = Fixture(stage_index);
   EXPECT_FALSE(fixture.stage.capability_provider_binding_id.has_value());
   EXPECT_TRUE(ValidateStage(fixture, fixture.stage, Budget(fixture.stage)).ok());
+  // Q51/Q57: a controlled deadline belongs to a controlled-Stop command only.
+  auto controlled = Budget(fixture.stage);
+  controlled.remaining_controlled_deadline_ns = 1'000'000'000LL;
+  EXPECT_FALSE(ValidateStage(fixture, fixture.stage, controlled).ok());
 }
 
 TEST(ParticipantStopStageTest, AcceptsDirectTargetWhenSupportingProviderIsCoLocated) {
@@ -295,9 +300,16 @@ TEST(ParticipantStopStageTest, AcceptsDirectTargetWhenSupportingProviderIsCoLoca
 
 TEST(ParticipantStopStageTest, RejectsForeignOrExtendedBudgetAndExpandedScope) {
   const auto fixture = Fixture();
-  auto budget = Budget(fixture.stage);
-  budget.phases.front().remaining_deadline_offset_ns += 1;
-  EXPECT_FALSE(ValidateStage(fixture, fixture.stage, budget).ok());
+  ASSERT_TRUE(ControlledCommand(fixture.stage));
+  auto foreign = Budget(fixture.stage);
+  foreign.stop_generation = StopGeneration(fixture.stage.stop_generation.value() + 1U);
+  EXPECT_FALSE(ValidateStage(fixture, fixture.stage, foreign).ok());
+  auto negative = Budget(fixture.stage);
+  negative.remaining_controlled_deadline_ns = -1;
+  EXPECT_FALSE(ValidateStage(fixture, fixture.stage, negative).ok());
+  auto backwards = Budget(fixture.stage);
+  backwards.elapsed_since_stop_ns = -1;
+  EXPECT_FALSE(ValidateStage(fixture, fixture.stage, backwards).ok());
 
   auto stage = fixture.stage;
   stage.resources.pop_back();

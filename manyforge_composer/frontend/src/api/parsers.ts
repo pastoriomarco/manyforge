@@ -3434,13 +3434,19 @@ export function parseDeploymentWorkspaceResponse(
     allowedKeysAt(document,
       ['api_version', 'deployment_artifact_id', 'name',
         'components', 'attachments', 'policies'],
-      ['description', 'assistant_profile_id', 'compatibility'],
+      ['description', 'assistant_profile_id', 'compatibility', 'isaac_world'],
       `${path}.draft.document`);
     if (stringAt(document.deployment_artifact_id,
       `${path}.draft.document.deployment_artifact_id`) !== deploymentArtifactId) {
       return fail(`${path}.draft`, 'one exact authored Deployment identity');
     }
     stringAt(document.name, `${path}.draft.document.name`);
+    if (document.isaac_world !== undefined) {
+      const world = stringAt(document.isaac_world, `${path}.draft.document.isaac_world`);
+      if (!/^[a-z][a-z0-9._-]{0,127}$/.test(world)) {
+        return fail(`${path}.draft.document.isaac_world`, 'one portable identifier');
+      }
+    }
     boundedArrayAt(document.components, `${path}.draft.document.components`, 4096);
     boundedArrayAt(document.attachments, `${path}.draft.document.attachments`, 4096);
     objectAt(document.policies, `${path}.draft.document.policies`);

@@ -134,6 +134,7 @@ describe('DeploymentFocusedEditor', () => {
       api_version: 'manyforge.deployment_intent.v2',
       deployment_artifact_id: 'cell-a',
       name: 'Cell A',
+      isaac_world: 'lite6_grf_ros2',
       components: [{
         component_id: 'robot',
         component_profile_id: 'robot_native_v1',
@@ -185,13 +186,48 @@ describe('DeploymentFocusedEditor', () => {
       sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
       gripperDescriptors={[]} />);
 
+    expect(markup).toContain('Isaac world');
+    expect(markup).toContain('lite6_grf_ros2');
     expect(markup).toContain('Maximum TCP linear speed');
     expect(markup).toContain('value="0.2"');
     expect(markup).toContain('robot · arm');
     expect(markup).toContain('joint1 maximum deceleration');
     expect(markup).toContain('Native runtime configuration');
+    expect(markup).not.toContain('TF frame prefix');
+    expect(markup).not.toContain('Applying a change restarts this robot holding.');
     expect(markup).toContain('Execution cadence');
     expect(markup).toContain('Controlled Stop jerk limits');
+    const authored = value.workspace!.draft.document as unknown as {
+      components: Array<{ frame_prefix: string; configuration: Record<string, unknown> }>;
+    };
+    authored.components[0].configuration.runtime_kind = 'ros2_control';
+    authored.components[0].frame_prefix = 'robot/';
+    const rosMarkup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
+      gripperDescriptors={[]} />);
+    expect(rosMarkup).toContain('TF frame prefix');
+    expect(rosMarkup).toContain('value="robot/"');
+    expect(rosMarkup).toContain('Applying a change restarts this robot holding.');
+    for (const prefix of ['', 'second/', 'Robot_2/nested/', '0/', '_/', 'robot//']) {
+      authored.components[0].frame_prefix = prefix;
+      const validMarkup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+        sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
+        gripperDescriptors={[]} />);
+      expect(validMarkup).toContain(`value="${prefix}"`);
+      expect(validMarkup).not.toContain('Frame prefix must be empty');
+      expect(validMarkup).toContain('aria-invalid="false"');
+    }
+    for (const prefix of ['literal prefix/', '/robot/', '/', 'robot', 'robot-b/', 'robot.b/',
+      'röbot/', 'robot/\n', 'robot\\/']) {
+      authored.components[0].frame_prefix = prefix;
+      const invalidMarkup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+        sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
+        gripperDescriptors={[]} />);
+      expect(invalidMarkup).toContain('Frame prefix must be empty or use only ASCII letters');
+      expect(invalidMarkup).toContain('without a leading');
+      expect(invalidMarkup).toContain('with a trailing');
+      expect(invalidMarkup).toContain('aria-invalid="true"');
+    }
   });
 
   it.each([
@@ -310,7 +346,7 @@ describe('DeploymentFocusedEditor', () => {
     const value = controller();
     const document = value.workspace!.draft!.document as unknown as {
       graph: { control_bindings: Array<Record<string, unknown>> };
-      policies: { stop_stage_parameters: Array<Record<string, unknown>>; stop_timing_parameters?: unknown[] };
+      policies: { stop_stage_parameters: Array<Record<string, unknown>> };
     };
     document.graph.control_bindings.push({ ...document.graph.control_bindings[0],
       control_binding_id: 'arm_contact', capability_id: 'execution.contact.geometric' });
@@ -320,21 +356,19 @@ describe('DeploymentFocusedEditor', () => {
     let markup = render();
     expect(markup).toContain('robot · arm');
     expect(markup.match(/>robot · arm<\/option>/g)).toHaveLength(1);
-    expect(markup).toContain('Using qualified policy timings.');
-    expect(markup).not.toContain('value="0.25"');
-    const timing = { command_latency_allowance_ns: 250_000_000,
-      settling_allowance_ns: 750_000_000, operational_timeout_ns: 3_000_000_000 };
-    document.policies.stop_timing_parameters = [
-      { control_binding_id: 'arm_binding', control_binding_revision: digest, timing },
-      { control_binding_id: 'arm_contact', control_binding_revision: digest, timing },
-    ];
+    // Q51: absent, the robot's own deadline is its deceleration time + 0.5 s.
+    expect(markup).toContain('Explicit maximum Stop time');
+    expect(markup).toContain('Automatic: 1.5 s (deceleration time + 0.5 s).');
+    expect(markup).not.toContain('Max Stop time');
+    for (const row of document.policies.stop_stage_parameters) {
+      (row.default_contract_parameters as Record<string, unknown>).max_stop_time_s = 3;
+    }
     markup = render();
-    expect(markup).toContain('Command latency');
-    expect(markup).toContain('Settling allowance');
-    expect(markup).toContain('Stop timeout');
-    expect(markup).toContain('value="0.25"');
-    expect(markup).toContain('value="0.75"');
-    expect(markup).not.toContain('Using qualified policy timings.');
+    expect(markup).toContain('Max Stop time');
+    expect(markup).toContain('value="3"');
+    expect(markup).not.toContain('Automatic: 1.5 s');
+    expect(markup).not.toContain('Stop timeout');
+    expect(markup).not.toContain('Command latency');
   });
 
   it.each([false, true])('shows Spring brake-and-return timing and the saved natural-completion choice (%s)', (natural) => {

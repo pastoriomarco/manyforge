@@ -1,28 +1,6 @@
 {
   "api_version": "manyforge.stop_evidence_policy.v2",
   "containment_granularity": "resource",
-  "deadline_budget": {
-    "kernel_completion_reserve_ns": 200000000,
-    "outer_duration_ns": 3000000000,
-    "phases": [
-      {
-        "deadline_offset_ns": 300000000,
-        "phase_id": "command"
-      },
-      {
-        "deadline_offset_ns": 1750000000,
-        "phase_id": "terminal"
-      },
-      {
-        "deadline_offset_ns": 1900000000,
-        "phase_id": "hard_command"
-      },
-      {
-        "deadline_offset_ns": 2700000000,
-        "phase_id": "hard_terminal"
-      }
-    ]
-  },
   "disposition": "stoppable",
   "escalation_stages": [
     {
@@ -31,11 +9,10 @@
           "command_kind": "motion_controlled_stop",
           "provider_contract_ref": {
             "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-            "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
+            "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
             "provider_contract_role_id": "stop_contract"
           }
-        },
-        "command_phase_id": "command"
+        }
       },
       "containment_granularity": "resource",
       "evidence_conjunction": "all_of",
@@ -45,7 +22,7 @@
             "evidence_kind": "motion_rest",
             "provider_contract_ref": {
               "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-              "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
+              "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
               "provider_contract_role_id": "stop_contract"
             }
           },
@@ -54,7 +31,6 @@
             "minimum_dwell_ns": 10000000,
             "observation_kind": "post_command_dwell"
           },
-          "phase_id": "terminal",
           "source_requirement": {
             "allowed_authority_classes": [
               "commanded",
@@ -80,8 +56,7 @@
             "provider_contract_role_id": "software_hard_stop"
           },
           "registered_command_kind_id": "manyforge.stop.software_hard"
-        },
-        "command_phase_id": "hard_command"
+        }
       },
       "containment_granularity": "resource",
       "evidence_conjunction": "all_of",
@@ -100,7 +75,6 @@
             "minimum_dwell_ns": 10000000,
             "observation_kind": "post_command_dwell"
           },
-          "phase_id": "hard_terminal",
           "source_requirement": {
             "allowed_authority_classes": [
               "commanded",
@@ -118,5 +92,5 @@
     }
   ],
   "stop_evidence_policy_id": "manyforge.arm_motion_controlled_stop",
-  "stop_evidence_policy_revision": "sha256:6e49f21b6dd2586c1ccff4864f6a6416526e4dec99e55bef3a9a2f9e05728ad1"
+  "stop_evidence_policy_revision": "sha256:82b10ec1d1932168b11a901979527c34200a09a349e9b173620d5b12ff4bdcbb"
 }

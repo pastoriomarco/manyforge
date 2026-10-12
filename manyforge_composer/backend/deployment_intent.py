@@ -18,6 +18,7 @@ from manyforge_behavior.canonical_artifact import (
 DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v2"
 _PORTABLE_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _PACKAGE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+_FRAME_PREFIX = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/]*/")
 _MAX_COMPONENTS = 128
 _MAX_ATTACHMENTS = 256
 _MAX_PACKAGE_ROOTS = 128
@@ -68,6 +69,17 @@ def _require_text(value: Any, label: str, maximum_bytes: int) -> str:
         or len(value.encode("utf-8")) > maximum_bytes
     ):
         _fail(f"{label} must be bounded non-empty text")
+    return value
+
+
+def _require_frame_prefix(value: Any, label: str) -> str:
+    if type(value) is not str:
+        _fail(f"{label} must be a string")
+    if value and _FRAME_PREFIX.fullmatch(value) is None:
+        _fail(
+            f"{label} must be empty or use only ASCII letters, digits, '_' and '/', "
+            "without a leading '/' and with a trailing '/'"
+        )
     return value
 
 
@@ -203,7 +215,7 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
             "deceleration_time_s",
             "per_joint_limits",
         },
-        optional={"timing"},
+        optional={"max_stop_time_s"},
         label=label,
     )
     mode = profile["stop_mode"]
@@ -269,23 +281,12 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
         ),
         "per_joint_limits": normalized_limits,
     }
-    if "timing" in profile:
-        timing = _require_object(profile["timing"], f"{label}.timing")
-        _require_exact_fields(
-            timing,
-            required={
-                "command_latency_allowance_ns",
-                "settling_allowance_ns",
-                "operational_timeout_ns",
-            },
-            label=f"{label}.timing",
+    # Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+    # deadline from the Stop request; absent: deceleration time + 0.5 s.
+    if "max_stop_time_s" in profile:
+        result["max_stop_time_s"] = _positive_finite(
+            profile["max_stop_time_s"], f"{label}.max_stop_time_s"
         )
-        normalized_timing: dict[str, int] = {}
-        for name, selected in timing.items():
-            if type(selected) is not int or not 0 <= selected <= 9_007_199_254_740_991:
-                _fail(f"{label}.timing.{name} must be a bounded nonnegative integer")
-            normalized_timing[name] = selected
-        result["timing"] = normalized_timing
     return result
 
 
@@ -306,7 +307,7 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         "attachments",
         "policies",
     }
-    optional = {"description", "assistant_profile_id", "compatibility"}
+    optional = {"description", "assistant_profile_id", "compatibility", "isaac_world"}
     _require_exact_fields(
         intent, required=required, optional=optional, label=f"{source}: Deployment intent"
     )
@@ -323,6 +324,9 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         if type(intent["description"]) is not str or len(intent["description"].encode("utf-8")) > 4096:
             _fail(f"{source}: description is invalid")
         result["description"] = intent["description"]
+
+    if "isaac_world" in intent:
+        result["isaac_world"] = _require_id(intent["isaac_world"], f"{source}: isaac_world")
 
     components = intent["components"]
     if type(components) is not list or len(components) > _MAX_COMPONENTS:
@@ -342,6 +346,7 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
                 "target_settings",
                 "configuration",
             },
+            optional={"frame_prefix"},
             label=label,
         )
         component_id = _require_id(component["component_id"], f"{label}.component_id")
@@ -378,9 +383,13 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
             normalized_source["srdf"] = validate_source_reference(
                 model_source["srdf"], label=f"{label}.model_source.srdf"
             )
+        frame_prefix = _require_frame_prefix(
+            component.get("frame_prefix", ""), f"{label}.frame_prefix"
+        )
         normalized_components.append(
             {
                 "component_id": component_id,
+                "frame_prefix": frame_prefix,
                 "component_profile_id": _require_id(
                     component["component_profile_id"],
                     f"{label}.component_profile_id",

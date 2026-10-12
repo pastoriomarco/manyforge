@@ -202,7 +202,9 @@ TEST(KernelCellAdmissionSqlite, HeldManualParentAndOfferSurviveOwnerReplacement)
             CellAdmissionClaimIntentDigest(claim.intent).value());
 }
 
-TEST(KernelCellAdmissionSqlite, V12ClaimsRetainTheirExactIdentityAfterAttributionMigration) {
+TEST(KernelCellAdmissionSqlite, V12ClaimsAreRefusedNotConvertedAfterTheStopTimingFormat) {
+  // Q51/Q53: a journal of an earlier format (here v12, before the attribution
+  // columns and the per-robot Stop timing) is refused, never migrated.
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const auto claim = Claim();
@@ -226,13 +228,7 @@ TEST(KernelCellAdmissionSqlite, V12ClaimsRetainTheirExactIdentityAfterAttributio
                    nullptr, nullptr, nullptr);
   sqlite3_close(legacy);
   ASSERT_EQ(downgraded, SQLITE_OK);
-  SqliteOperationJournal journal(database, CellId("cell.1"));
-  const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
-  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
-  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 1U);
-  EXPECT_EQ(recovery.value().recovered_cell_admission_claims.front().claim, claim);
-  EXPECT_EQ(recovery.value().recovered_cell_admission_membership.front().semantic_intent_digest,
-            CellAdmissionClaimIntentDigest(claim.intent).value());
+  EXPECT_THROW(SqliteOperationJournal(database, CellId("cell.1")), std::runtime_error);
 }
 
 TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth) {

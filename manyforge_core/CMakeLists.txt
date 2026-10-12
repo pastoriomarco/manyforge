@@ -136,6 +136,9 @@ add_library(manyforge_core
   src/logical_scene_projection.cpp
   src/interrupt_structured_value.cpp
   src/soft_on_path_stop_planner.cpp
+  src/stop_replacement.cpp
+  src/participant_stop_stage_helper.cpp
+  src/execution_port_participant.cpp
   src/stop_profile_mapper.cpp
   src/stop_timing.cpp
   src/execution_kernel.cpp
@@ -144,7 +147,7 @@ target_include_directories(manyforge_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
+target_link_libraries(manyforge_core PUBLIC manyforge::content_identity)
 
 # The static library is linked into both standalone test executables AND
 # the pybind11 shared module (manyforge_core_py). Shared modules require
@@ -579,7 +582,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_resource_addressed_execution_kernel PRIVATE
       MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL=1)
     target_link_libraries(test_resource_addressed_execution_kernel PRIVATE
-      manyforge_core_sqlite_operation_journal)
+      manyforge_core_sqlite_operation_journal SQLite::SQLite3)
     add_executable(test_sqlite_operation_journal
       test/test_sqlite_operation_journal.cpp)
     target_link_libraries(test_sqlite_operation_journal PRIVATE
@@ -602,7 +605,7 @@ if(BUILD_TESTING)
       test/test_sqlite_cclc_journal.cpp)
     target_link_libraries(test_sqlite_cclc_journal PRIVATE
       manyforge_core_sqlite_cclc_journal manyforge::content_identity
-      GTest::gtest_main)
+      SQLite::SQLite3 GTest::gtest_main)
     gtest_discover_tests(test_sqlite_cclc_journal
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
@@ -922,6 +925,32 @@ if(BUILD_TESTING)
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_soft_on_path_stop_planner
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_replacement test/test_stop_replacement.cpp)
+  target_link_libraries(test_stop_replacement PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_replacement
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_participant_stop_stage_helper
+    test/test_participant_stop_stage_helper.cpp)
+  target_link_libraries(test_participant_stop_stage_helper PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_participant_stop_stage_helper
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # Test-support exporter of Core's exact Stop replacement trajectories for
+  # Track 2's pinned-JTC characterization. Built with the tests, never
+  # installed. The smoke test runs it on a fixed input.
+  add_executable(stop_replacement_export
+    test_support/src/stop_replacement_export.cpp)
+  target_link_libraries(stop_replacement_export PRIVATE
+    manyforge_core manyforge::content_identity)
+  add_test(NAME stop_replacement_export_smoke
+    COMMAND stop_replacement_export
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/golden/stop_replacement_export_input.json
+      ${CMAKE_CURRENT_BINARY_DIR}/stop_replacement_export_output.json)
+  set_tests_properties(stop_replacement_export_smoke PROPERTIES
+    TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   # Phase 4.5G qualification probe. This executable is intentionally not a
   # ctest case: unit tests prove correctness invariants, while

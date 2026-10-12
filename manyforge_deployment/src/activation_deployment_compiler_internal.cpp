@@ -1,4 +1,5 @@
 #include "activation_deployment_compiler_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "stop_deceleration_coherence_internal.hpp"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cmath>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <sstream>
@@ -154,6 +156,32 @@ constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{{
     found->second = std::move(selected);
   }
   return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue object_without(const CanonicalValue &source,
+                                            std::string_view name) {
+  Object result = object(source, "object");
+  std::erase_if(result, [&](const auto &row) { return row.first == name; });
+  return CanonicalValue(std::move(result));
+}
+
+// Q68: the controller profile a ROS component profile selects from the
+// catalog: exactly one of `isaac_profile` (Isaac lane) or `mock_profile`
+// (offline mock lane). Returns the selector field name, or none.
+[[nodiscard]] std::optional<std::string_view>
+controller_profile_selector(const CanonicalValue &ros2_control_runtime) {
+  std::optional<std::string_view> selected;
+  for (const std::string_view name : {std::string_view("isaac_profile"),
+                                      std::string_view("mock_profile")}) {
+    const auto *value = ros2_control_runtime.find_object_member(name);
+    if (value == nullptr) continue;
+    if (!value->is_string() || value->as_string().empty() ||
+        selected.has_value()) {
+      return std::nullopt;
+    }
+    selected = name;
+  }
+  return selected;
 }
 
 [[nodiscard]] CanonicalValue catalog_value(
@@ -330,6 +358,49 @@ motion_limits(const ActivationDeploymentComponent &component,
   return CanonicalValue(std::move(result));
 }
 
+// Q37: carry the component's authored `default_fault_stop_profile` (main's
+// field set) unchanged into the ROS runtime configuration for its arm target.
+// The source-joint map becomes canonical-sorted rows because the closed
+// runtime schema has no map form; nothing is derived or defaulted here.
+[[nodiscard]] CanonicalValue fault_stop_profile_row(
+    const ActivationDeploymentComponent &component,
+    const CanonicalValue &authored) {
+  constexpr std::array<std::string_view, 6U> kFields{
+      "profile_id",          "stop_mode",
+      "deceleration_time_s", "per_joint_max_deceleration_rad_s2",
+      "allow_natural_completion_on_short_path",
+      "require_backend_confirmation"};
+  Object row{
+      {"controllable_component_id", CanonicalValue(component.component_id)},
+      {"command_target_id", CanonicalValue("arm")},
+  };
+  for (const auto &[name, value] :
+       object(authored, "configuration.default_fault_stop_profile")) {
+    if (std::find(kFields.begin(), kFields.end(), name) == kFields.end()) {
+      fail(component.component_id + " default_fault_stop_profile field " +
+           name + " is not supported");
+    }
+    if (name != "per_joint_max_deceleration_rad_s2") {
+      row.emplace_back(name, value);
+      continue;
+    }
+    Array limits;
+    for (const auto &[joint, limit] :
+         object(value, "default_fault_stop_profile.per_joint_max_deceleration_rad_s2")) {
+      limits.push_back(CanonicalValue(Object{
+          {"source_joint_name", CanonicalValue(joint)},
+          {"max_deceleration_rad_s2", limit},
+      }));
+    }
+    std::sort(limits.begin(), limits.end(), [](const auto &left, const auto &right) {
+      return text(member(left, "source_joint_name", "row"), "joint") <
+             text(member(right, "source_joint_name", "row"), "joint");
+    });
+    row.emplace_back(name, CanonicalValue(std::move(limits)));
+  }
+  return CanonicalValue(std::move(row));
+}
+
 struct ComponentProjection final {
   CanonicalValue runtime_configuration;
   CanonicalValue model_instance;
@@ -363,15 +434,32 @@ struct ComponentProjection final {
                                     profile.model_asset_id));
   const auto &configuration = member(component.configuration,
                                      "runtime_configuration", "configuration");
+  std::optional<CanonicalValue> controller_profile_row;
   if (ros2_control) {
     const auto &profile_configuration =
         member(profile.runtime_restoration_profile, "ros2_control_runtime",
                "component profile");
-    if (member(configuration, "isaac_profile", "runtime configuration") !=
-        member(profile_configuration, "isaac_profile", "component profile")) {
-      fail(component.component_id +
-           " isaac_profile does not match its ROS component profile");
+    const auto selector = controller_profile_selector(profile_configuration);
+    if (!selector.has_value()) {
+      fail(component.component_id + " (profile " +
+           profile.component_profile_id +
+           ") has no ROS controller profile in the catalog");
     }
+    if (controller_profile_selector(configuration) != selector ||
+        member(configuration, *selector, "runtime configuration") !=
+            member(profile_configuration, *selector, "component profile")) {
+      fail(component.component_id + " " + std::string(*selector) +
+           " does not match its ROS component profile");
+    }
+    controller_profile_row = CanonicalValue(Object{
+        {"controllable_component_id", CanonicalValue(component.component_id)},
+        {"frame_prefix", CanonicalValue(component.frame_prefix)},
+        {std::string(*selector),
+         member(configuration, *selector, "runtime configuration")},
+    });
+  }
+  if (configuration.find_object_member("isaac_world") != nullptr) {
+    fail("isaac_world must be authored once at the Deployment cell level");
   }
   const auto arm_resource_count =
       array(resource_bindings(component.component_id, "arm", profile),
@@ -392,6 +480,11 @@ struct ComponentProjection final {
       fail("runtime_configuration.motion_target_limits must be authored "
            "through target_settings");
     }
+    if (configuration.find_object_member("default_fault_stop_profiles") !=
+        nullptr) {
+      fail("runtime_configuration.default_fault_stop_profiles must be "
+           "authored as configuration.default_fault_stop_profile");
+    }
     const auto &rows = array(limits, "motion limits");
     if (rows.size() != 1U ||
         text(member(rows.front(), "command_target_id", "motion limit"),
@@ -402,6 +495,22 @@ struct ComponentProjection final {
   }
   CanonicalValue runtime_configuration =
       object_with(configuration, "motion_target_limits", limits);
+  if (controller_profile_row.has_value()) {
+    // Q68: the unit carries each component's own controller profile.
+    runtime_configuration = object_with(
+        object_without(object_without(runtime_configuration, "isaac_profile"),
+                       "mock_profile"),
+        "controller_profiles",
+        CanonicalValue(Array{std::move(*controller_profile_row)}));
+  }
+  if (const auto *fault_profile =
+          component.configuration.find_object_member(
+              "default_fault_stop_profile");
+      ros2_control && fault_profile != nullptr) {
+    runtime_configuration = object_with(
+        runtime_configuration, "default_fault_stop_profiles",
+        CanonicalValue(Array{fault_stop_profile_row(component, *fault_profile)}));
+  }
   if (component.configuration.find_object_member(
           "native_lifecycle_management") != nullptr) {
     fail("native_lifecycle_management is obsolete; native component lifecycle "
@@ -515,7 +624,7 @@ struct ComponentProjection final {
               {"stop_evidence_policy_revision", CanonicalValue(revision(stop))},
               {"containment_granularity", CanonicalValue("resource")},
           });
-      if (!ros2_control && target == "arm" &&
+      if (target == "arm" &&
           (capability == "execution.trajectory.execute" ||
            capability == "execution.runtime_scale.operation_scoped")) {
         binding.emplace_back("runtime_scale_route_qualifications",
@@ -590,7 +699,7 @@ struct ComponentProjection final {
           : "manyforge.value_schema.provider_contract.motion_controlled_stop.v1")},
       {"contract_schema_revision", CanonicalValue(hard
           ? "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
-          : "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b")},
+          : "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27")},
   });
 }
 
@@ -614,18 +723,43 @@ CanonicalValue compile_activation_deployment(
   const bool ros2_control =
       !component_profiles.empty() && component_profiles.front().runtime_kind ==
                                          ActivationRuntimeKind::kRos2Control;
+  // Q68: a ROS composition admits any number of robots and components, each
+  // of which must select a ROS controller profile from the catalog. Mixing
+  // with native components stays refused until the native executor goes.
+  const auto has_ros_controller_profile = [](const auto &profile) {
+    if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control) {
+      return false;
+    }
+    const auto *runtime =
+        profile.runtime_restoration_profile.find_object_member(
+            "ros2_control_runtime");
+    return runtime != nullptr &&
+           controller_profile_selector(*runtime).has_value();
+  };
+  const auto lacking_ros_controller_profile = [&] {
+    return std::find_if_not(component_profiles.begin(),
+                            component_profiles.end(),
+                            has_ros_controller_profile);
+  };
   if (std::any_of(component_profiles.begin(), component_profiles.end(),
                   [&](const auto &profile) {
                     return (profile.runtime_kind ==
                             ActivationRuntimeKind::kRos2Control) !=
                            ros2_control;
                   })) {
-    fail("mixed native and ROS runtime compositions are not yet supported");
+    const auto lacking = lacking_ros_controller_profile();
+    fail("mixed native and ROS runtime compositions are not yet supported: "
+         "component " +
+         lacking->component_id + " (profile " + lacking->component_profile_id +
+         ") has no ROS controller profile in the catalog");
   }
-  if (ros2_control && (component_profiles.size() != 1U ||
-                       component_profiles.front().component_profile_id !=
-                           "ur10e_robotiq_isaac_commanded_v0")) {
-    fail("authored ROS composition requires one UR10e aggregate profile");
+  if (ros2_control) {
+    if (const auto lacking = lacking_ros_controller_profile();
+        lacking != component_profiles.end()) {
+      fail("component " + lacking->component_id + " (profile " +
+           lacking->component_profile_id +
+           ") has no ROS controller profile in the catalog");
+    }
   }
   const std::string runtime_profile_id =
       ros2_control
@@ -658,9 +792,33 @@ CanonicalValue compile_activation_deployment(
   }
   const std::string runtime_id =
       ros2_control
-          ? intent.components.front().component_id + ".ros2_control_execution"
+          ? std::string(ros2_control_execution_runtime_contract::kCellHostRuntimeUnitId)
           : std::string(
                 native_execution_runtime_contract::kCellHostRuntimeUnitId);
+  if (ros2_control) {
+    std::map<std::string, std::string> frame_owners;
+    bool shared_world_seen = false;
+    for (std::size_t index = 0; index < intent.components.size(); ++index) {
+      const auto &component = intent.components[index];
+      const auto &urdf = prepared_models[index].verified_asset.source_ir().urdf();
+      for (const auto &link : urdf.links) {
+        // Only the unprefixed root world is the shared global parent. A
+        // prefixed link named world is still a component-owned published frame.
+        const bool shared_world = component.frame_prefix.empty() && link.name == "world" &&
+            std::none_of(urdf.joints.begin(), urdf.joints.end(), [&](const auto &joint) {
+              return joint.child_link_name == link.name;
+            });
+        const auto frame = component.frame_prefix + link.name;
+        if (shared_world && shared_world_seen) continue;
+        const auto [owner, inserted] = frame_owners.emplace(frame, component.component_id);
+        if (!inserted) {
+          fail("published TF frame collision: " + frame + " between " +
+               owner->second + " and " + component.component_id);
+        }
+        if (shared_world) shared_world_seen = true;
+      }
+    }
+  }
   std::vector<ComponentProjection> projections;
   projections.reserve(intent.components.size());
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
@@ -668,6 +826,28 @@ CanonicalValue compile_activation_deployment(
         intent.components[index], component_profiles[index],
         prepared_models[index], catalog, runtime_id));
   }
+
+  Array controller_profiles;
+  bool uses_isaac = false;
+  for (const auto &projection : projections) {
+    const auto *rows = projection.runtime_configuration.find_object_member(
+        "controller_profiles");
+    if (rows == nullptr)
+      continue;
+    controller_profiles.insert(controller_profiles.end(),
+                               rows->as_array().begin(),
+                               rows->as_array().end());
+    uses_isaac =
+        uses_isaac ||
+        std::any_of(rows->as_array().begin(), rows->as_array().end(),
+                    [](const auto &row) {
+                      return row.find_object_member("isaac_profile") != nullptr;
+                    });
+  }
+  if (uses_isaac && !intent.isaac_world.has_value()) {
+    fail("isaac_world is required when a component uses an Isaac profile");
+  }
+  require_no_exclusive_ros_controller_topic_collision(controller_profiles);
 
   CanonicalValue runtime_configuration = projections.front().runtime_configuration;
   if (projections.size() > 1U) {
@@ -682,17 +862,33 @@ CanonicalValue compile_activation_deployment(
         }
       }
     }
-    for (const std::string_view name : {"initial_joint_positions_rad",
-                                        "motion_target_limits",
-                                        "direct_control_joint_limits",
-                                        "gripper_target_configurations"}) {
+    using MergedFields = std::array<std::string_view, 5U>;
+    // Q68: one ROS runtime unit hosts every component and each component
+    // keeps its own controller profile, fault Stop profile and authored
+    // gripper target rows; the ROS runtime schema has no native
+    // direct-control field.
+    const MergedFields merged_fields =
+        ros2_control ? MergedFields{"initial_joint_positions_rad",
+                                    "motion_target_limits",
+                                    "default_fault_stop_profiles",
+                                    "gripper_target_configurations",
+                                    "controller_profiles"}
+                     : MergedFields{"initial_joint_positions_rad",
+                                    "motion_target_limits",
+                                    "direct_control_joint_limits",
+                                    "gripper_target_configurations", ""};
+    for (const std::string_view name : merged_fields) {
+      if (name.empty()) continue;
       Array combined;
+      bool present = false;
       for (const auto &projection : projections) {
         const auto *selected = projection.runtime_configuration.find_object_member(name);
         if (selected == nullptr) continue;
+        present = true;
         const auto &values = array(*selected, name);
         combined.insert(combined.end(), values.begin(), values.end());
       }
+      if (ros2_control && !present) continue;
       if (name != "initial_joint_positions_rad") {
         std::sort(combined.begin(), combined.end(), [](const auto &left, const auto &right) {
           const auto key = [](const auto &row) {
@@ -709,6 +905,11 @@ CanonicalValue compile_activation_deployment(
       runtime_configuration = object_with(runtime_configuration, std::string(name),
                                           CanonicalValue(std::move(combined)));
     }
+  }
+
+  if (ros2_control && intent.isaac_world.has_value()) {
+    runtime_configuration = object_with(runtime_configuration, "isaac_world",
+                                        CanonicalValue(*intent.isaac_world));
   }
 
   Array models;
@@ -769,7 +970,6 @@ CanonicalValue compile_activation_deployment(
   Array desired;
   Array providers;
   Array stop_stages;
-  Array stop_timing;
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
     const auto &component = intent.components[index];
     const auto &profile = component_profiles[index];
@@ -995,23 +1195,25 @@ CanonicalValue compile_activation_deployment(
             }
             resource_limits.emplace_back(std::move(resource_limit));
           }
-          stage("motion_controlled_stop", false, CanonicalValue(Object{
+          Object controlled_parameters{
               {"stop_mode", member(controlled, "stop_mode", "controlled stop")},
               {"jerk_limits_enabled", member(controlled, "jerk_limits_enabled", "controlled stop")},
               {"deceleration_time_s", member(controlled, "deceleration_time_s", "controlled stop")},
               {"per_resource_limits", CanonicalValue(std::move(resource_limits))},
               {"allow_natural_completion_on_short_path", member(controlled, "allow_natural_completion_on_short_path", "controlled stop")},
-          }));
+          };
+          // Q28/Q51 (`main`): the per-profile maximum Stop time, when authored.
+          if (const auto *max_stop = controlled.find_object_member("max_stop_time_s");
+              max_stop != nullptr) {
+            const auto *seconds = std::get_if<double>(&max_stop->storage());
+            if (seconds == nullptr || !std::isfinite(*seconds) || *seconds <= 0.0) {
+              fail("controlled Stop max_stop_time_s must be a finite positive number");
+            }
+            controlled_parameters.emplace_back("max_stop_time_s", CanonicalValue(*seconds));
+          }
+          stage("motion_controlled_stop", false, CanonicalValue(std::move(controlled_parameters)));
         }
         stage("software_hard", true, CanonicalValue(Object{}));
-        const auto &settings = member(component.target_settings, "arm", "target settings");
-        const auto &timing = member(member(settings, "controlled_stop", "arm settings"),
-                                    "timing", "controlled stop");
-        stop_timing.emplace_back(Object{
-            {"control_binding_id", member(binding, "control_binding_id", "binding")},
-            {"control_binding_revision", member(binding, "control_binding_revision", "binding")},
-            {"timing", timing},
-        });
       }
     }
     // Every native component uses the generic CCLC lifecycle provider.
@@ -1061,12 +1263,10 @@ CanonicalValue compile_activation_deployment(
            std::tuple(text(member(right, "control_binding_id", "stage"), "id"),
                       text(member(right, "stop_escalation_stage_id", "stage"), "stage"));
   });
-  std::sort(stop_timing.begin(), stop_timing.end(), by("control_binding_id"));
 
   Object policies{
       {"retained_policy_records", CanonicalValue(Array{})},
       {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
-      {"stop_timing_parameters", CanonicalValue(std::move(stop_timing))},
       {"commissioned_stop_interfaces", CanonicalValue(Array{})},
       {"interrupt_sources", CanonicalValue(Array{})},
       {"interrupt_policies", CanonicalValue(Array{})},

@@ -1,6 +1,9 @@
 /**/controller_manager:
   ros__parameters:
     update_rate: 100
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
@@ -26,6 +29,9 @@
     action_monitor_rate: 20.0
     allow_partial_joints_goal: false
     interpolation_method: splines
+    interpolate_from_desired_state: true
+    allow_trajectory_replacement: false
+    set_last_command_interface_value_as_state_on_activation: false
     constraints:
       decelerate_on_cancel: true
       stopped_velocity_tolerance: 0.2

@@ -36,8 +36,6 @@ ENV MANYFORGE_VENV=/opt/manyforge/venv
 ENV VIRTUAL_ENV=/opt/manyforge/venv
 ENV PATH=/opt/manyforge/venv/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/karanchahal-nv/topic_based_ros2_control.git
-ARG TOPIC_BASED_ROS2_CONTROL_REF=7ee291ab13adba52ab5889deb9e520009fe2283d
 
 SHELL ["/bin/bash", "-c"]
 
@@ -75,6 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-simulation-interfaces \
         ros-${ROS_DISTRO}-trajectory-msgs \
         ros-${ROS_DISTRO}-vision-msgs \
+        ros-${ROS_DISTRO}-xacro \
         ros-${ROS_DISTRO}-rclpy \
         ros-${ROS_DISTRO}-controller-manager \
         ros-${ROS_DISTRO}-joint-state-broadcaster \
@@ -85,23 +84,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && cp lib/*.a /usr/lib/ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN set -eux; \
-    mkdir -p /tmp/topic_based_ros2_control_ws/src /opt/manyforge/topic_based_ros2_control; \
-    git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
-    cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
-    git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
-    cd /tmp/topic_based_ros2_control_ws; \
-    set +u; \
-    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
-    set -u; \
-    colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
-    rm -rf /tmp/topic_based_ros2_control_ws
 
 # This venv runs over a ROS Jazzy base with --system-site-packages, so ROS may
 # ship its own urdfdom/eigen/console_bridge. Pin the full Pinocchio 4 cmeel set
 # via a constraints file (same set as the slim image) so the cmeel wheels win
 # and pip cannot float the new `libpinocchio`/`libcoal` split-out libs or pull a
-# mismatched urdfdom soname. cmeel's ldconfig entry then prioritises its libs.
+# mismatched urdfdom soname. Native XML is privately linked below so that
+# sharing this closure with ROS does not interpose a different XML ABI.
 RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
     && python -m pip install --no-cache-dir --upgrade pip "setuptools<80" \
     && printf '%s\n' \
@@ -143,6 +132,54 @@ RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
     && CMEEL_LIB=$(python -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/manyforge-cmeel.conf && ldconfig; fi
 
+# Keep native XML 11 private to its consumers; ROS retains its XML 10 ABI.
+# Exact released cmeel sources; no dependency-version or ROS middleware change.
+RUN set -eux; \
+    curl -fsSL https://files.pythonhosted.org/packages/9b/96/4311533fee0a364bb605b585762f04c249f47857b33548a8ea837a7eb860/cmeel_tinyxml2-11.0.0.tar.gz -o /tmp/native-tinyxml.tar.gz; \
+    echo '85d9c7680b3369af4c6b40a0dce70bbd84aa67832755622e57eb260cd95abe40  /tmp/native-tinyxml.tar.gz' | sha256sum -c -; \
+    curl -fsSL https://files.pythonhosted.org/packages/21/75/4e8aff079e98582aeeb8e752805081da0c2dea405e79bafeefb555defe9f/cmeel_urdfdom-6.0.0.tar.gz -o /tmp/native-urdfdom.tar.gz; \
+    echo '65c0fdc6021300fc55b2d0c03ab64dedc328034a74e40498e671bc894bb1dcf7  /tmp/native-urdfdom.tar.gz' | sha256sum -c -; \
+    curl -fsSL https://files.pythonhosted.org/packages/a1/ba/f214a686878ab7ec94c4316377ac0b2083dd948e30bbbbdc15053de231b1/cmeel_urdfdom_headers-3.0.0.tar.gz -o /tmp/native-urdfdom-headers.tar.gz; \
+    echo '0db50c69c316485b3f2616e7b1961ee0496bcc6f36fad2a052f350d96fc5b5ae  /tmp/native-urdfdom-headers.tar.gz' | sha256sum -c -; \
+    tar -xzf /tmp/native-tinyxml.tar.gz -C /tmp; \
+    tar -xzf /tmp/native-urdfdom.tar.gz -C /tmp; \
+    tar -xzf /tmp/native-urdfdom-headers.tar.gz -C /tmp; \
+    cmake -S /tmp/cmeel_tinyxml2-11.0.0/tinyxml2 -B /tmp/native-tinyxml-build \
+      -DCMAKE_BUILD_TYPE=Release -Dtinyxml2_SHARED_LIBS=OFF -Dtinyxml2_BUILD_TESTING=OFF \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_INSTALL_PREFIX=/opt/manyforge/private-tinyxml2-11; \
+    cmake --build /tmp/native-tinyxml-build --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"; \
+    cmake --install /tmp/native-tinyxml-build; \
+    cmake -S /tmp/cmeel_urdfdom_headers-3.0.0/urdfdom_headers -B /tmp/native-urdfdom-headers-build \
+      -DCMAKE_INSTALL_PREFIX=/tmp/native-urdfdom-headers; \
+    cmake --install /tmp/native-urdfdom-headers-build; \
+    CMEEL_PREFIX=$(python -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix; \
+    cmake -S /tmp/cmeel_urdfdom-6.0.0/urdfdom -B /tmp/native-urdfdom-build \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DCMAKE_PREFIX_PATH="/opt/manyforge/private-tinyxml2-11;/tmp/native-urdfdom-headers;${CMEEL_PREFIX}" \
+      -DTinyXML2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 \
+      -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--exclude-libs,libtinyxml2.a \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'; \
+    cmake --build /tmp/native-urdfdom-build --target urdfdom_model urdfdom_sensor urdfdom_world \
+      --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"; \
+    for name in model sensor world; do \
+      native_xml_versioned="liburdfdom_${name}.so.6.0.0"; \
+      test -f "${CMEEL_PREFIX}/lib/${native_xml_versioned}"; \
+      test ! -L "${CMEEL_PREFIX}/lib/${native_xml_versioned}"; \
+      for suffix in so so.6; do \
+        test ! -L "${CMEEL_PREFIX}/lib/liburdfdom_${name}.${suffix}"; \
+        cmp "${CMEEL_PREFIX}/lib/${native_xml_versioned}" "${CMEEL_PREFIX}/lib/liburdfdom_${name}.${suffix}"; \
+      done; \
+      cp "/tmp/native-urdfdom-build/lib/${native_xml_versioned}" "${CMEEL_PREFIX}/lib/${native_xml_versioned}"; \
+      for suffix in so so.6; do \
+        ln -sfn "${native_xml_versioned}" "${CMEEL_PREFIX}/lib/liburdfdom_${name}.${suffix}"; \
+        test "$(readlink -f "${CMEEL_PREFIX}/lib/liburdfdom_${name}.${suffix}")" = "${CMEEL_PREFIX}/lib/${native_xml_versioned}"; \
+      done; \
+    done; \
+    ldconfig; \
+    rm -rf /tmp/native-tinyxml* /tmp/native-urdfdom* /tmp/cmeel_tinyxml2-11.0.0 \
+      /tmp/cmeel_urdfdom-6.0.0 /tmp/cmeel_urdfdom_headers-3.0.0
+
 # Exact RoboPlan 0.7 source closure with source-built ProxSuite and TOPPRA.
 # Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
@@ -176,7 +213,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
          git -C /tmp/roboplan apply "/tmp/roboplan-manifest/$patch"; \
        done < patches.sha256 \
     && umask 0022 \
-    && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
+    && export CMAKE_PREFIX_PATH="/opt/manyforge/private-tinyxml2-11:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
     && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
@@ -188,6 +225,9 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
          /tmp/proxsuite /tmp/toppra /tmp/roboplan \
          -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
          -DBUILD_PYTHON_BINDINGS=OFF \
+         -Dtinyxml2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 \
+         -DTinyXML2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 \
+         -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--exclude-libs,libtinyxml2.a \
     && CLOSURE_INSTALL=/tmp/roboplan-install-closure \
     && for prefix in \
          "${CLOSURE_INSTALL}/proxsuite" \
@@ -197,9 +237,9 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
        done \
     && ldconfig \
     && ROBOPLAN_SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") \
-    && export CMAKE_PREFIX_PATH="${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
+    && export CMAKE_PREFIX_PATH="/opt/manyforge/private-tinyxml2-11:${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
     && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
-    && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON" \
+    && export CMEEL_CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON -Dtinyxml2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DTinyXML2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--exclude-libs,libtinyxml2.a" \
     && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          python -m pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
@@ -208,11 +248,65 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && ldconfig \
     && python -m pip check \
     && python /tmp/check-roboplan-dependency-stack.py \
+    && for native_xml_library in liburdfdom_model.so.6 liburdfdom_sensor.so.6 liburdfdom_world.so.6 libroboplan.so; do \
+         native_xml_consumer="${PINOCCHIO_PREFIX}/lib/${native_xml_library}"; \
+         test -f "$native_xml_consumer"; \
+         readelf -d "$native_xml_consumer" > /tmp/native-xml-needed.txt || exit 1; \
+         nm -D --format=posix "$native_xml_consumer" > /tmp/native-xml-symbols.txt || exit 1; \
+         if grep -E '\(NEEDED\).*libtinyxml2\.so' /tmp/native-xml-needed.txt; then \
+           echo "Native XML consumer still uses a shared TinyXML ABI: $native_xml_consumer" >&2; exit 1; \
+         fi; \
+         if c++filt < /tmp/native-xml-symbols.txt | grep -E '^(tinyxml2::|vtable for tinyxml2::|typeinfo (name )?for tinyxml2::)'; then \
+           echo "Native XML symbols escaped private linkage: $native_xml_consumer" >&2; exit 1; \
+         fi; \
+       done \
     && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/toppra /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
          /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
          /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
-         /tmp/check-roboplan-dependency-stack.py
+         /tmp/check-roboplan-dependency-stack.py /tmp/native-xml-needed.txt /tmp/native-xml-symbols.txt
+
+ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/PickNikRobotics/topic_based_ros2_control.git
+ARG TOPIC_BASED_ROS2_CONTROL_REF=aa9f9ef9525a60f8becea322537dd1d6d1bf9123
+
+RUN set -eux; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    mkdir -p /tmp/topic_based_ros2_control_ws/src /opt/manyforge/topic_based_ros2_control; \
+    git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
+    test "$(git rev-parse HEAD)" = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"; \
+    cd /tmp/topic_based_ros2_control_ws; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
+    printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
+    rm -rf /tmp/topic_based_ros2_control_ws
+
+# Vendor data only: no xarm driver, messages, launch stack or hardware process.
+# Keep the exact previously qualified description revision independently pinned.
+ARG XARM_DESCRIPTION_REPO=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_DESCRIPTION_REF=c3172e57c1c1bb2982fc008304ad6bc886357c87
+RUN set -eux; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    git clone --no-checkout "${XARM_DESCRIPTION_REPO}" /tmp/xarm_description_ws/src/xarm_ros2; \
+    cd /tmp/xarm_description_ws/src/xarm_ros2; \
+    git sparse-checkout init --cone; \
+    git sparse-checkout set xarm_description; \
+    git checkout "${XARM_DESCRIPTION_REF}"; \
+    test "$(git rev-parse HEAD)" = "c3172e57c1c1bb2982fc008304ad6bc886357c87"; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    cd /tmp/xarm_description_ws; \
+    colcon build --base-paths src/xarm_ros2/xarm_description \
+      --install-base /opt/manyforge/xarm_description/install \
+      --packages-select xarm_description --cmake-args -DBUILD_TESTING=OFF; \
+    printf '%s\n' "c3172e57c1c1bb2982fc008304ad6bc886357c87" \
+      > /opt/manyforge/xarm_description/install/VENDOR_COMMIT; \
+    rm -rf /tmp/xarm_description_ws
+
 
 # The venv distributions are the sole RoboPlan runtime/CMake prefix. The
 # disconnected C++ closure is removed in the same layer and cannot compete at

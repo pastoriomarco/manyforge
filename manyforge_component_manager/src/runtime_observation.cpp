@@ -261,7 +261,9 @@ RuntimeUnitSourceReport::RuntimeUnitSourceReport(
     std::vector<std::string> ready_runtime_role_ids,
     const ManagedCommandSurfaceState command_surface_state,
     std::vector<std::string> reason_codes,
-    std::string offered_runtime_contract_offer_digest)
+    std::string offered_runtime_contract_offer_digest,
+    const std::optional<std::uint64_t> dropped_host_notice_lines,
+    const std::optional<std::uint64_t> dropped_host_notice_bytes)
     : runtime_unit_id_(std::move(runtime_unit_id)),
       process_incarnation_(std::move(process_incarnation)),
       source_report_sequence_(source_report_sequence),
@@ -280,7 +282,14 @@ RuntimeUnitSourceReport::RuntimeUnitSourceReport(
       reason_codes_(NormalizeIdentifiers(
           std::move(reason_codes),
           "reason_codes",
-          kMaximumSourceReasonCodes)) {
+          kMaximumSourceReasonCodes)),
+      dropped_host_notice_lines_(dropped_host_notice_lines),
+      dropped_host_notice_bytes_(dropped_host_notice_bytes) {
+  if (dropped_host_notice_lines_.has_value() !=
+      dropped_host_notice_bytes_.has_value()) {
+    throw std::invalid_argument(
+        "host notice drop counters must appear together");
+  }
   static_cast<void>(ToString(local_phase_));
   static_cast<void>(ToString(source_health_));
   static_cast<void>(ToString(command_surface_state_));
@@ -355,6 +364,16 @@ const std::vector<std::string>& RuntimeUnitSourceReport::reason_codes()
   return reason_codes_;
 }
 
+std::optional<std::uint64_t>
+RuntimeUnitSourceReport::dropped_host_notice_lines() const noexcept {
+  return dropped_host_notice_lines_;
+}
+
+std::optional<std::uint64_t>
+RuntimeUnitSourceReport::dropped_host_notice_bytes() const noexcept {
+  return dropped_host_notice_bytes_;
+}
+
 RuntimeUnitObservation::RuntimeUnitObservation(
     std::string runtime_unit_id,
     const RuntimeLifecycleControl lifecycle_control,
@@ -377,7 +396,9 @@ RuntimeUnitObservation::RuntimeUnitObservation(
     std::string observed_runtime_contract_offer_digest,
     std::map<std::string, std::string> dependency_runtime_epochs,
     std::vector<std::string> source_reason_codes,
-    std::vector<std::string> reason_codes)
+    std::vector<std::string> reason_codes,
+    const std::optional<std::uint64_t> dropped_host_notice_lines,
+    const std::optional<std::uint64_t> dropped_host_notice_bytes)
     : runtime_unit_id_(std::move(runtime_unit_id)),
       lifecycle_control_(lifecycle_control),
       derived_state_(derived_state),
@@ -411,7 +432,14 @@ RuntimeUnitObservation::RuntimeUnitObservation(
           std::move(reason_codes),
           "reason_codes",
           kMaximumManagerReasonCodes,
-          kMaximumIdentifierBytes + 64U)) {
+          kMaximumIdentifierBytes + 64U)),
+      dropped_host_notice_lines_(dropped_host_notice_lines),
+      dropped_host_notice_bytes_(dropped_host_notice_bytes) {
+  if (dropped_host_notice_lines_.has_value() !=
+      dropped_host_notice_bytes_.has_value()) {
+    throw std::invalid_argument(
+        "host notice drop counters must appear together");
+  }
   ValidateIdentifier(runtime_unit_id_, "runtime_unit_id");
   if (!process_observer_instance_id_.empty()) {
     ValidateIdentifier(
@@ -581,6 +609,16 @@ const std::vector<std::string>& RuntimeUnitObservation::reason_codes()
 
 bool RuntimeUnitObservation::converged() const noexcept {
   return derived_state_ == RuntimeConvergenceState::kConverged;
+}
+
+std::optional<std::uint64_t>
+RuntimeUnitObservation::dropped_host_notice_lines() const noexcept {
+  return dropped_host_notice_lines_;
+}
+
+std::optional<std::uint64_t>
+RuntimeUnitObservation::dropped_host_notice_bytes() const noexcept {
+  return dropped_host_notice_bytes_;
 }
 
 RuntimeObservationSnapshot::RuntimeObservationSnapshot(
@@ -1192,7 +1230,11 @@ class RuntimeObservationReducer::Impl final {
         report == nullptr
             ? std::vector<std::string>{}
             : report->reason_codes(),
-        std::move(reason_codes));
+        std::move(reason_codes),
+        report == nullptr ? std::optional<std::uint64_t>{}
+                          : report->dropped_host_notice_lines(),
+        report == nullptr ? std::optional<std::uint64_t>{}
+                          : report->dropped_host_notice_bytes());
   }
 
   [[nodiscard]] RuntimeUnitObservation EvaluateOne(

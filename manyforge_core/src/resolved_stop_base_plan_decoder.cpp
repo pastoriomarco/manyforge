@@ -265,7 +265,7 @@ template <typename Enum>
 }
 
 [[nodiscard]] StopContainmentCommandDTO decode_command(const CanonicalValue& value) {
-  exact_object(value, {"command_phase_id", "command"}, {}, "containment command");
+  exact_object(value, {"command"}, {}, "containment command");
   const auto& command = member(value, "command", "containment command");
   exact_object(command, {"command_kind"}, {"provider_contract_ref", "registered_command_kind_id"},
                "command body");
@@ -277,9 +277,7 @@ template <typename Enum>
   if (const auto* item = optional_member(command, "registered_command_kind_id")) {
     registered = RegisteredStopCommandKindId(text(*item, "registered_command_kind_id"));
   }
-  return {StopBudgetPhaseId(
-              text(member(value, "command_phase_id", "containment command"), "command_phase_id")),
-          command_kind(member(command, "command_kind", "command body")), std::move(contract),
+  return {command_kind(member(command, "command_kind", "command body")), std::move(contract),
           std::move(registered)};
 }
 
@@ -488,7 +486,7 @@ template <typename Enum>
 
 [[nodiscard]] StopEvidenceRequirementDTO decode_requirement(const CanonicalValue& value) {
   exact_object(value,
-               {"evidence_item_id", "phase_id", "evidence", "source_requirement",
+               {"evidence_item_id", "evidence", "source_requirement",
                 "observation_semantics", "resolved_source"},
                {}, "resolved evidence requirement");
   const auto& evidence = member(value, "evidence", "evidence requirement");
@@ -504,7 +502,6 @@ template <typename Enum>
   }
   return {StopEvidenceItemId(
               text(member(value, "evidence_item_id", "evidence requirement"), "evidence_item_id")),
-          StopBudgetPhaseId(text(member(value, "phase_id", "evidence requirement"), "phase_id")),
           evidence_kind(member(evidence, "evidence_kind", "evidence body")),
           std::move(contract),
           std::move(registered),
@@ -618,26 +615,6 @@ template <typename Enum>
           std::move(evidence)};
 }
 
-[[nodiscard]] StopDeadlineBudgetDTO decode_deadline(const CanonicalValue& value) {
-  exact_object(value, {"outer_duration_ns", "kernel_completion_reserve_ns", "phases"}, {},
-               "Stop deadline budget");
-  const auto& phases_value = member(value, "phases", "deadline budget");
-  const auto& phase_rows = bounded_array(phases_value, 1U, 64U, "deadline phases");
-  std::vector<StopBudgetPhaseDTO> phases;
-  phases.reserve(phase_rows.size());
-  for (const auto& row : phase_rows) {
-    exact_object(row, {"phase_id", "deadline_offset_ns"}, {}, "Stop deadline phase");
-    phases.push_back(
-        {StopBudgetPhaseId(text(member(row, "phase_id", "deadline phase"), "phase_id")),
-         signed_integer(member(row, "deadline_offset_ns", "deadline phase"),
-                        "deadline_offset_ns")});
-  }
-  return {
-      signed_integer(member(value, "outer_duration_ns", "deadline budget"), "outer_duration_ns"),
-      signed_integer(member(value, "kernel_completion_reserve_ns", "deadline budget"),
-                     "kernel_completion_reserve_ns"),
-      std::move(phases)};
-}
 
 [[nodiscard]] ResolvedStopTemplateRefDTO decode_template(const CanonicalValue& value) {
   exact_object(value,
@@ -677,7 +654,6 @@ template <typename Enum>
                 "stop_evidence_policy_id",
                 "stop_evidence_policy_revision",
                 "containment_granularity",
-                "deadline_budget",
                 "escalation_stages"},
                {}, "resolved Stop base plan");
   if (text(member(value, "api_version", "base plan"), "api_version") !=
@@ -727,7 +703,6 @@ template <typename Enum>
       StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision", "base plan"),
                                       "stop_evidence_policy_revision")),
       containment_granularity(member(value, "containment_granularity", "base plan")),
-      decode_deadline(member(value, "deadline_budget", "base plan")),
       std::move(stages)};
 }
 

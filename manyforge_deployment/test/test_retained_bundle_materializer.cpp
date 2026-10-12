@@ -1648,6 +1648,115 @@ TEST(RetainedBundleMaterializer,
       RetainedBundleError);
 }
 
+[[nodiscard]] CanonicalValue authored_fault_stop_profile_rows(
+    std::string_view target_id, std::string_view stop_mode,
+    std::optional<bool> natural_completion = std::nullopt) {
+  CanonicalValue::Array limits;
+  for (const std::string_view joint :
+       {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}) {
+    limits.push_back(CanonicalValue(CanonicalValue::Object{
+        {"source_joint_name", CanonicalValue(std::string(joint))},
+        {"max_deceleration_rad_s2", CanonicalValue(10.0)},
+    }));
+  }
+  CanonicalValue::Object row{
+      {"controllable_component_id",
+       CanonicalValue(std::string(test::kLite6ControllableComponentId))},
+      {"command_target_id", CanonicalValue(std::string(target_id))},
+      {"profile_id", CanonicalValue("fault_spring_back_hold")},
+      {"stop_mode", CanonicalValue(std::string(stop_mode))},
+      {"require_backend_confirmation", CanonicalValue(true)},
+  };
+  if (stop_mode != "hard_deceleration") {
+    row.emplace_back("deceleration_time_s", CanonicalValue(1.0));
+    row.emplace_back("per_joint_max_deceleration_rad_s2",
+                     CanonicalValue(std::move(limits)));
+  }
+  if (natural_completion.has_value()) {
+    row.emplace_back("allow_natural_completion_on_short_path",
+                     CanonicalValue(*natural_completion));
+  }
+  return CanonicalValue(CanonicalValue::Array{CanonicalValue(std::move(row))});
+}
+
+[[nodiscard]] ros2_control_execution_runtime_contract::Configuration
+ros2_configuration_with_fault_rows(const CanonicalValue &rows) {
+  const auto fixture = test::make_lite6_ros2_control_motion_retention_fixture(
+      false, test::kLite6ArmTargetId, rows);
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  if (bundle == nullptr) {
+    throw std::logic_error("ROS fault-profile fixture did not materialize");
+  }
+  return ros2_control_execution_runtime_contract::require_configuration(
+      *bundle, bundle->value().cell_graph.runtime_units.front().runtime_unit_id);
+}
+
+TEST(RetainedBundleMaterializer,
+     Ros2ControlConfigurationReadsAuthoredFaultStopProfileDirectly) {
+  const auto configuration = ros2_configuration_with_fault_rows(
+      authored_fault_stop_profile_rows(test::kLite6ArmTargetId,
+                                       "spring_back_hold"));
+  ASSERT_EQ(configuration.default_fault_stop_profiles.size(), 1U);
+  const auto &authored = configuration.default_fault_stop_profiles.front();
+  EXPECT_EQ(authored.controllable_component_id.value(),
+            test::kLite6ControllableComponentId);
+  EXPECT_EQ(authored.command_target_id.value(), test::kLite6ArmTargetId);
+  const auto &profile = authored.profile;
+  EXPECT_EQ(profile.profile_id, "fault_spring_back_hold");
+  EXPECT_EQ(profile.stop_mode, core::MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(profile.deceleration_time_s, std::optional<double>(1.0));
+  ASSERT_EQ(profile.per_joint_max_deceleration.size(), 6U);
+  for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {
+    SCOPED_TRACE(joint);
+    ASSERT_TRUE(std::holds_alternative<core::AngularAccelerationDTO>(limit));
+    EXPECT_DOUBLE_EQ(std::get<core::AngularAccelerationDTO>(limit).value_rad_s2,
+                     10.0);
+  }
+  // Normalized as every authored profile: natural completion only for soft.
+  EXPECT_FALSE(profile.allow_natural_completion_on_short_path);
+  EXPECT_TRUE(profile.require_backend_confirmation);
+  // main shaped every Stop ramp with its default jerk; no per-joint override.
+  EXPECT_EQ(profile.jerk_limits_enabled, std::optional<bool>(true));
+  EXPECT_TRUE(profile.per_joint_max_jerk.empty());
+  EXPECT_FALSE(profile.per_joint_settle_velocity_threshold.has_value());
+  EXPECT_FALSE(profile.recoverable_substitution_mode.has_value());
+
+  const auto soft = ros2_configuration_with_fault_rows(
+      authored_fault_stop_profile_rows(test::kLite6ArmTargetId,
+                                       "soft_on_path"));
+  ASSERT_EQ(soft.default_fault_stop_profiles.size(), 1U);
+  EXPECT_TRUE(soft.default_fault_stop_profiles.front()
+                  .profile.allow_natural_completion_on_short_path);
+
+  const auto hard = ros2_configuration_with_fault_rows(
+      authored_fault_stop_profile_rows(test::kLite6ArmTargetId,
+                                       "hard_deceleration"));
+  ASSERT_EQ(hard.default_fault_stop_profiles.size(), 1U);
+  EXPECT_EQ(hard.default_fault_stop_profiles.front().profile.stop_mode,
+            core::MotionInterruptStopMode::kHardDeceleration);
+  EXPECT_EQ(hard.default_fault_stop_profiles.front().profile.jerk_limits_enabled,
+            std::optional<bool>(false));
+}
+
+TEST(RetainedBundleMaterializer,
+     Ros2ControlConfigurationRejectsInvalidAuthoredFaultStopProfile) {
+  EXPECT_THROW(static_cast<void>(ros2_configuration_with_fault_rows(
+                   authored_fault_stop_profile_rows("unhosted_arm",
+                                                    "spring_back_hold"))),
+               RetainedBundleError);
+  EXPECT_THROW(static_cast<void>(ros2_configuration_with_fault_rows(
+                   authored_fault_stop_profile_rows(
+                       test::kLite6ArmTargetId, "hard_deceleration", true))),
+               RetainedBundleError);
+}
+
 TEST(RetainedBundleMaterializer,
      Ros2ControlMotionLite6RetainsDistinctExactRuntimeProduct) {
   const auto fixture =
@@ -1733,7 +1842,7 @@ TEST(RetainedBundleMaterializer,
       RetainedBundleError);
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
-      R"({"collision_monitor_period_ms":100,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"isaac_profile":"lite6","mode":"commanded_sim","motion_target_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","maximum_tcp_linear_speed_mps":0.15}],"planner_rng_seed":12345,"runtime_collision_immediate_query_budget_ms":75,"runtime_collision_lookahead_cycle_budget_ms":350,"runtime_collision_lookahead_max_samples":32,"runtime_collision_lookahead_query_budget_ms":75,"runtime_collision_lookahead_s":2,"runtime_collision_lookahead_workers":4,"runtime_dynamic_body_max_age_cap_ms":1000,"validation_collision_workers":4})");
+      "{}");
   EXPECT_NO_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
@@ -1741,7 +1850,14 @@ TEST(RetainedBundleMaterializer,
   const auto runtime_configuration =
       ros2_control_execution_runtime_contract::require_configuration(
           *bundle, group.runtime_unit_id);
-  EXPECT_EQ(runtime_configuration.isaac_profile, "lite6");
+  ASSERT_EQ(runtime_configuration.controller_profiles.size(), 1U);
+  EXPECT_EQ(runtime_configuration.controller_profiles.front()
+                .controllable_component_id.value(),
+            test::kLite6ControllableComponentId);
+  EXPECT_EQ(runtime_configuration.controller_profiles.front().isaac_profile,
+            std::optional<std::string>("lite6"));
+  EXPECT_FALSE(
+      runtime_configuration.controller_profiles.front().mock_profile.has_value());
   ASSERT_EQ(runtime_configuration.motion_target_limits.size(), 1U);
   const auto &motion_limit = runtime_configuration.motion_target_limits.front();
   EXPECT_EQ(motion_limit.controllable_component_id.value(),
@@ -1767,13 +1883,14 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(runtime_configuration.runtime_dynamic_body_max_age_cap_ms,
             1000.0);
   EXPECT_EQ(runtime_configuration.validation_collision_workers, 4U);
+  EXPECT_TRUE(runtime_configuration.default_fault_stop_profiles.empty());
 
-  const std::string changed_configuration =
-      replace_once(manifest, "\"isaac_profile\":\"lite6\"",
-                   "\"isaac_profile\":\"ur10e\"");
-  EXPECT_NO_THROW(static_cast<void>(
+  const auto changed_configuration = canonical_json(replace_object_member(
+      parsed_manifest, "configuration", CanonicalValue(CanonicalValue::Object{
+          {"isaac_profile", CanonicalValue("ur10e")}})));
+  EXPECT_THROW(static_cast<void>(
       detail::parse_and_verify_ros2_control_execution_runtime_manifest(
-          changed_configuration)));
+          changed_configuration)), RetainedBundleError);
   EXPECT_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           changed_configuration, launch_descriptor, bundle->value(),
@@ -2601,10 +2718,11 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(stop, "disposition"), "stoppable");
   EXPECT_EQ(string_member(stop, "stop_evidence_policy_id"),
             "lite6_binding_state_stop");
-  EXPECT_DOUBLE_EQ(std::get<double>(member(member(stop, "deadline_budget"),
-                                           "outer_duration_ns")
-                                        .storage()),
-                   1'000'000'000.0);
+  // Q51: the retained Stop policy carries no shared cell Stop budget.
+  EXPECT_FALSE(std::get<CanonicalValue::Object>(stop.storage()).end() !=
+               std::find_if(std::get<CanonicalValue::Object>(stop.storage()).begin(),
+                            std::get<CanonicalValue::Object>(stop.storage()).end(),
+                            [](const auto &row) { return row.first == "deadline_budget"; }));
 
   const auto &stages = array_member(stop, "escalation_stages");
   ASSERT_EQ(stages.size(), 2U);
@@ -2612,7 +2730,6 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(nominal, "stop_escalation_stage_id"), "nominal");
   EXPECT_EQ(string_member(nominal, "stage_kind"), "nominal");
   const CanonicalValue &command = member(nominal, "containment_command");
-  EXPECT_EQ(string_member(command, "command_phase_id"), "nominal_command");
   EXPECT_EQ(string_member(command, "command_kind"), "controller_goal_cancel");
   EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
       member(command, "provider_contract_ref").storage()));
@@ -2650,7 +2767,6 @@ TEST(ControlDomainControlVerifier,
   EXPECT_EQ(string_member(software_hard, "stage_kind"), "software_hard");
   const CanonicalValue &hard_command =
       member(software_hard, "containment_command");
-  EXPECT_EQ(string_member(hard_command, "command_phase_id"), "hard_command");
   EXPECT_EQ(string_member(hard_command, "command_kind"), "registered");
   EXPECT_EQ(string_member(hard_command, "registered_command_kind_id"),
             "manyforge.stop.software_hard");

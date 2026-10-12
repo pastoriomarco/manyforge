@@ -8,12 +8,12 @@
   "description": "Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group without synchronized timing.",
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
-    "deployment.yaml": "sha256:22e2a33a95da693d5fa29b0a5aa3bcdef3c6c252bbfc98bfd234c66d1641c28a",
+    "deployment.yaml": "sha256:49822d999149f08999db5fdcec6137a16f9b99a96281840b2889f0f4618540ab",
     "program.yaml": "sha256:9c3b177a755285d37716d77d8ec51331060fc0185836df9bc2a349ae74f7697a"
   },
   "name": "ur5e_lite6_wall_grouped",
   "saved_status": {
-    "checked_content_digest": "sha256:7714f9c6d4035c6a9b22a8cc0b3a123def27c51fa15a5693973eae6b5b9ee711",
+    "checked_content_digest": "sha256:7419b11439936798d78a4bc12d3c4efde4fa1230a2a8f328797f775d5a4a69a6",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

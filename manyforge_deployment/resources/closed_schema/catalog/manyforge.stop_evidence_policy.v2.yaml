@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.stop_evidence_policy.v2
-schema_revision: sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970
+schema_revision: sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13
 schema_purpose: artifact_document
 root_definition_id: stop_evidence_policy
 definitions:
@@ -78,13 +78,6 @@ definitions:
                   - resource
                   - controller_set
                   - control_domain
-        - field_id: deadline_budget
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: local_ref
-            definition_id: deadline_budget
         - field_id: escalation_stages
           presence: required
           default:
@@ -235,16 +228,6 @@ definitions:
     value_schema:
       kind: object
       fields:
-        - field_id: command_phase_id
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
         - field_id: command
           presence: required
           default:
@@ -443,88 +426,11 @@ definitions:
             constraints:
               - kind: string_format
                 value: sha256_digest
-  - definition_id: deadline_budget
-    value_schema:
-      kind: object
-      fields:
-        - field_id: outer_duration_ns
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: integer
-            constraints:
-              - kind: minimum
-                value: 1
-              - kind: maximum
-                value: 9007199254740991
-        - field_id: kernel_completion_reserve_ns
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: integer
-            constraints:
-              - kind: minimum
-                value: 1
-              - kind: maximum
-                value: 9007199254740991
-        - field_id: phases
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: array
-            min_items: 1
-            max_items: 64
-            collection:
-              kind: ordered
-            item_schema:
-              kind: local_ref
-              definition_id: budget_phase
-  - definition_id: budget_phase
-    value_schema:
-      kind: object
-      fields:
-        - field_id: phase_id
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: deadline_offset_ns
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: integer
-            constraints:
-              - kind: minimum
-                value: 1
-              - kind: maximum
-                value: 9007199254740991
   - definition_id: evidence_requirement
     value_schema:
       kind: object
       fields:
         - field_id: evidence_item_id
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: phase_id
           presence: required
           default:
             kind: absent

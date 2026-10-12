@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
@@ -9,6 +10,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/stop_certificate.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -376,6 +378,10 @@ struct BrandLifecycleObservationDTO final {
   std::int64_t fresh_until_ns;
   ComponentLifecycleStateDTO observed_state;
   std::vector<LifecycleFactDTO> facts;
+  // Bounded diagnostics from the same observation. They never determine
+  // lifecycle eligibility, fault classification, or containment.
+  std::optional<ErrorDTO> diagnostic{};
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool matches(const BrandLifecycleObservationQueryDTO& query) const noexcept;

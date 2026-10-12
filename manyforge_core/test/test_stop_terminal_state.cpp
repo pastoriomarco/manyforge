@@ -22,11 +22,7 @@ inline constexpr char kDigestB[] =
                          ContentDigest(kDigestB),
                          {},
                          {},
-                         1'000,
-                         100,
-                         900,
-                         10,
-                         {}};
+                         10};
 }
 
 [[nodiscard]] StopCertificateDTO Certificate() {

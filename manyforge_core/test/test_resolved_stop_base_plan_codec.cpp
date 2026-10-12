@@ -102,10 +102,8 @@ namespace {
           std::nullopt};
 }
 
-[[nodiscard]] StopEvidenceRequirementDTO MotionRestRequirement(std::string evidence_id,
-                                                               std::string phase_id) {
+[[nodiscard]] StopEvidenceRequirementDTO MotionRestRequirement(std::string evidence_id) {
   return {StopEvidenceItemId(std::move(evidence_id)),
-          StopBudgetPhaseId(std::move(phase_id)),
           StopEvidenceRequirementKind::kMotionRest,
           Contract(),
           std::nullopt,
@@ -116,19 +114,16 @@ namespace {
           {StopEvidenceObservationKind::kPostCommandDwell, 100'000'000LL}};
 }
 
-[[nodiscard]] ResolvedStopEvidenceRequirementDTO ResolvedMotionRest(std::string evidence_id,
-                                                                    std::string phase_id) {
-  const auto requirement = MotionRestRequirement(std::move(evidence_id), std::move(phase_id));
+[[nodiscard]] ResolvedStopEvidenceRequirementDTO ResolvedMotionRest(std::string evidence_id) {
+  const auto requirement = MotionRestRequirement(std::move(evidence_id));
   return {requirement,
           {StopEvidenceSourceKind::kBindingStateAuthority, Target("state.stop", "state.stop"),
            StateAuthorityId("state.measured"), StateAuthorityClass::kMeasured, std::nullopt}};
 }
 
-[[nodiscard]] ResolvedStopEvidenceRequirementDTO ResolvedProviderEvidence(std::string evidence_id,
-                                                                          std::string phase_id) {
+[[nodiscard]] ResolvedStopEvidenceRequirementDTO ResolvedProviderEvidence(std::string evidence_id) {
   StopEvidenceRequirementDTO requirement{
       StopEvidenceItemId(std::move(evidence_id)),
-      StopBudgetPhaseId(std::move(phase_id)),
       StopEvidenceRequirementKind::kIoSafeOutput,
       Contract(),
       std::nullopt,
@@ -154,8 +149,7 @@ namespace {
           StopEscalationStageId("stage.nominal"),
           StopEscalationStageKind::kNominal,
           ContainmentGranularity::kResource,
-          {StopBudgetPhaseId("phase.nominal.command"),
-           StopContainmentCommandKind::kMotionControlledStop, Contract(), std::nullopt},
+          {StopContainmentCommandKind::kMotionControlledStop, Contract(), std::nullopt},
           std::move(parameters),
           {StopActionClass::kControlled, Substitution(), std::nullopt, std::nullopt, std::nullopt,
            std::nullopt},
@@ -163,7 +157,7 @@ namespace {
           ResolvedStopResourceContainmentScopeDTO{ActivationSetId("activation.main"),
                                                   {ResourceId("joint.1"), ResourceId("joint.2")}},
           StopEvidenceConjunction::kAllOf,
-          {ResolvedMotionRest("evidence.nominal.rest", "phase.nominal.rest")}};
+          {ResolvedMotionRest("evidence.nominal.rest")}};
 }
 
 [[nodiscard]] ResolvedStopEscalationStageDTO HardStage() {
@@ -171,7 +165,7 @@ namespace {
           StopEscalationStageId("stage.hard"),
           StopEscalationStageKind::kSoftwareHard,
           ContainmentGranularity::kControllerSet,
-          {StopBudgetPhaseId("phase.hard.command"), StopContainmentCommandKind::kRegistered,
+          {StopContainmentCommandKind::kRegistered,
            Contract(), RegisteredStopCommandKindId("manyforge.stop.software_hard")},
           JsonObjectDTO{},
           {StopActionClass::kSoftwareHard, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -181,7 +175,7 @@ namespace {
               ActivationSetId("activation.main"),
               {{ControllerRoleId("controller.arm"), "controller.arm"}}},
           StopEvidenceConjunction::kAllOf,
-          {ResolvedMotionRest("evidence.hard.rest", "phase.hard.rest")}};
+          {ResolvedMotionRest("evidence.hard.rest")}};
 }
 
 [[nodiscard]] ResolvedStopEscalationStageDTO SafetyStage() {
@@ -189,7 +183,7 @@ namespace {
           StopEscalationStageId("stage.safety"),
           StopEscalationStageKind::kSafetySystemRequest,
           ContainmentGranularity::kControllerSet,
-          {StopBudgetPhaseId("phase.safety.command"), StopContainmentCommandKind::kRegistered,
+          {StopContainmentCommandKind::kRegistered,
            Contract(), RegisteredStopCommandKindId("manyforge.stop.safety.protective_request")},
           JsonObjectDTO{},
           {StopActionClass::kSafetySystemRequest, std::nullopt,
@@ -203,7 +197,7 @@ namespace {
               ActivationSetId("activation.main"),
               {{ControllerRoleId("controller.arm"), "controller.arm"}}},
           StopEvidenceConjunction::kAllOf,
-          {ResolvedMotionRest("evidence.safety.rest", "phase.safety.rest")}};
+          {ResolvedMotionRest("evidence.safety.rest")}};
 }
 
 [[nodiscard]] ResolvedStopBasePlanDTO Candidate() {
@@ -232,12 +226,6 @@ namespace {
           StopEvidencePolicyId("policy.arm"),
           StopEvidencePolicyRevision(Digest('f')),
           ContainmentGranularity::kControllerSet,
-          {5'000'000'000LL,
-           500'000'000LL,
-           {{StopBudgetPhaseId("phase.nominal.command"), 1'000'000'000LL},
-            {StopBudgetPhaseId("phase.nominal.rest"), 2'000'000'000LL},
-            {StopBudgetPhaseId("phase.hard.command"), 3'000'000'000LL},
-            {StopBudgetPhaseId("phase.hard.rest"), 4'000'000'000LL}}},
           {NominalStage(), HardStage()}};
 }
 
@@ -330,9 +318,9 @@ TEST(ResolvedStopBasePlanCodec, EmitsStableCanonicalBytesAndOwnIdentity) {
 
   // These two constants are the cross-language normalized-byte/ID golden.
   EXPECT_EQ(plan.resolved_stop_base_plan_id.value(),
-            "sha256:ba4b37bfaa312d688ea229a4ba4d516fd2a519c3a9dc82e43e275366769a367a");
+            "sha256:840a16b6b0860f5e838d109bd327685a8d354d48f119f493d6635101c693f0d5");
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:6580fa0212890c5f6714fffc367c7f2488e893e016acae5e7e68993458b0e819");
+            "sha256:896dc7ef6c85eefeec67231a7b490889db491480448939b6bc4ee34036f48515");
 }
 
 TEST(ResolvedStopBasePlanCodec, OwnIdIsOmittedAndEverySemanticJoinRotatesIt) {
@@ -379,7 +367,7 @@ TEST(ResolvedStopBasePlanCodec, DecodesOnlyTheExactCanonicalClosedWireObject) {
                                                       "\"source_sequence\":11.5,"))
                    .ok());
   EXPECT_FALSE(DecodeResolvedStopBasePlan(
-                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:ba4b",
+                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:840a",
                                "\"resolved_stop_base_plan_id\":\"sha256:0925"))
                    .ok());
   EXPECT_FALSE(
@@ -517,12 +505,12 @@ TEST(ResolvedStopBasePlanCodec, RejectsSourceAndQualificationConfusion) {
 
   auto provider_evidence = Candidate();
   provider_evidence.escalation_stages.front().evidence_requirements = {
-      ResolvedProviderEvidence("evidence.nominal.provider", "phase.nominal.rest")};
+      ResolvedProviderEvidence("evidence.nominal.provider")};
   EXPECT_TRUE(MakeResolvedStopBasePlan(std::move(provider_evidence)).ok());
 
   auto wrong_provider_contract = Candidate();
   wrong_provider_contract.escalation_stages.front().evidence_requirements = {
-      ResolvedProviderEvidence("evidence.nominal.provider", "phase.nominal.rest")};
+      ResolvedProviderEvidence("evidence.nominal.provider")};
   wrong_provider_contract.escalation_stages.front()
       .evidence_requirements.front()
       .resolved_source.provider_contract_ref = ProviderContractRefDTO{
@@ -533,13 +521,6 @@ TEST(ResolvedStopBasePlanCodec, RejectsSourceAndQualificationConfusion) {
 
 TEST(ResolvedStopBasePlanCodec, AcceptsOnlyCompleteFinalCommissionedSafetyStage) {
   auto commissioned = Candidate();
-  commissioned.deadline_budget.phases = {
-      {StopBudgetPhaseId("phase.nominal.command"), 750'000'000LL},
-      {StopBudgetPhaseId("phase.nominal.rest"), 1'500'000'000LL},
-      {StopBudgetPhaseId("phase.hard.command"), 2'250'000'000LL},
-      {StopBudgetPhaseId("phase.hard.rest"), 3'000'000'000LL},
-      {StopBudgetPhaseId("phase.safety.command"), 3'750'000'000LL},
-      {StopBudgetPhaseId("phase.safety.rest"), 4'500'000'000LL}};
   commissioned.escalation_stages.push_back(SafetyStage());
   EXPECT_TRUE(MakeResolvedStopBasePlan(commissioned).ok());
 
@@ -561,7 +542,7 @@ TEST(ResolvedStopBasePlanCodec, AcceptsOnlyCompleteFinalCommissionedSafetyStage)
   EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(not_final)).ok());
 }
 
-TEST(ResolvedStopBasePlanCodec, RejectsOrderNarrowingAndPhaseGaps) {
+TEST(ResolvedStopBasePlanCodec, RejectsOrderAndNarrowing) {
   auto wrong_index = Candidate();
   wrong_index.escalation_stages.back().stage_index = 0U;
   EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(wrong_index)).ok());
@@ -601,11 +582,6 @@ TEST(ResolvedStopBasePlanCodec, RejectsOrderNarrowingAndPhaseGaps) {
                                                    ControlDomainRevision(Digest('c'))};
   foreign_domain.containment_granularity = ContainmentGranularity::kControlDomain;
   EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(foreign_domain)).ok());
-
-  auto unused_phase = Candidate();
-  unused_phase.deadline_budget.phases.push_back(
-      {StopBudgetPhaseId("phase.unused"), 4'250'000'000LL});
-  EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(unused_phase)).ok());
 }
 
 TEST(ResolvedStopBasePlanCodec, RejectsUnsafeAndNonCanonicalValues) {
@@ -625,7 +601,7 @@ TEST(ResolvedStopBasePlanCodec, RejectsUnsafeAndNonCanonicalValues) {
 
   auto control_stage_claims_hard_command = Candidate();
   control_stage_claims_hard_command.escalation_stages.front().containment_command = {
-      StopBudgetPhaseId("phase.nominal.command"), StopContainmentCommandKind::kRegistered,
+      StopContainmentCommandKind::kRegistered,
       Contract(), RegisteredStopCommandKindId("manyforge.stop.software_hard")};
   EXPECT_FALSE(MakeResolvedStopBasePlan(std::move(control_stage_claims_hard_command)).ok());
 
@@ -691,9 +667,9 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:b52156d4da6ecf586177c0533011329c2ec17e498973a93187b3137530a2b903");
+            "sha256:94398b22375ecc50ed1aa2c7699d75c27c5babca5dfbd996e4491c3b0fe3101a");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:960198ca5da9b7d114858f1b2bc18cfa6bac701db4aa4086df45808a4767029f");
+            "sha256:55223af5a643d2f24252cedc19d6691c375abeab66cce0dac464a8c3b29f14f3");
 }
 
 TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndRejectsForgery) {
@@ -737,82 +713,6 @@ TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndReje
   EXPECT_FALSE(VerifyPreparedParticipantStopPlan(base, forged, resources, defaults,
                                                  MotionInterruptNodeCategory::kGeneric)
                    .ok());
-}
-
-// P3 / item 24: no Prepare-time Stop budget pre-check. A profile longer than
-// the saved timeout is prepared; the Stop deadline watchdog bounds it at run
-// time (as `main`).
-TEST(PreparedParticipantStopPlanCodec, ReadinessCeilingDoesNotRefuseALongerProfileAtPrepare) {
-  const auto base = PreparedBasePlan();
-  // This pure codec check uses the DTO projection. The deployment/registration
-  // tests separately seal the complete current controller-domain referent.
-  RuntimeParticipantStopReadinessDTO readiness{
-      ControllableComponentId("arm"),
-      ComponentLifecycleGeneration(1U),
-      {base.control_domain_id,
-       base.control_domain_revision,
-       base.controller_topology_id,
-       base.topology_revision,
-       ProductId("product"),
-       ProductContractId("contract"),
-       ProductContractRevision(Digest('1')),
-       ContentDigest(Digest('2')),
-       ContentDigest(Digest('3')),
-       base.source_runtime_unit_id,
-       base.source_runtime_epoch,
-       {base.controller_topology_id, base.topology_revision, {}, {}, {}, {}},
-       {base.control_domain_id,
-        base.control_domain_revision,
-        base.controller_topology_id,
-        base.topology_revision,
-        base.activation_set_id,
-        {}},
-       {},
-       {},
-       {}},
-      base,
-      250'000'000};
-  auto context = PreparedContext();
-  const auto resources = Resources();
-  const auto defaults = DefaultLimits();
-  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-  context.participant_stop_profile->deceleration_time_s = 0.5;
-  for (const auto mode :
-       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
-    context.participant_stop_profile->stop_mode = mode;
-    if (mode == MotionInterruptStopMode::kSpringBackHold) {
-      context.participant_stop_profile->allow_natural_completion_on_short_path = false;
-      context.participant_stop_profile->recoverable_substitution_mode.reset();
-    }
-    const auto prebuilt = MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
-                                                          context, resources, defaults);
-    ASSERT_TRUE(prebuilt.ok()) << prebuilt.error().message;
-    EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-    EXPECT_TRUE(VerifyPreparedParticipantStopPlan(readiness, prebuilt.value(), resources, defaults,
-                                                  context.node_category)
-                    .ok());
-    // Historic bytes remain inspectable, not preparation authority.
-    EXPECT_TRUE(EncodePreparedParticipantStopPlan(readiness.resolved_stop_base_plan,
-                                                  prebuilt.value(), resources, defaults,
-                                                  context.node_category)
-                    .ok());
-  }
-  context.participant_stop_profile.reset();
-  context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kOrdinary;
-  context.motion_interrupt_scope_id.reset();
-  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-  readiness.maximum_controlled_stop_duration_ns.reset();
-  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-
-  context = PreparedContext();
-  context.participant_stop_profile->deceleration_time_s = 1.1;
-  readiness.maximum_controlled_stop_duration_ns = 1'100'000'000;
-  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-  readiness.maximum_controlled_stop_duration_ns = 1'099'999'999;
-  EXPECT_TRUE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
-  // Only the ceiling's own shape is still checked.
-  readiness.maximum_controlled_stop_duration_ns = 0;
-  EXPECT_FALSE(MakePreparedParticipantStopPlan(readiness, context, resources, defaults).ok());
 }
 
 TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIdentity) {

@@ -126,6 +126,10 @@ void validate_configuration_schema(
       build_qualified_closed_schema_registry().find_qualified_value_schema(
           schema_ref.schema_id, schema_ref.schema_revision);
   if (selected == nullptr) {
+    if (schema_ref.schema_id.value() == "manyforge.value_schema.runtime.ros2_control_execution.v1") {
+      fail("ROS runtime configuration schema is not qualified by this build; "
+           "recompile the authored Deployment with the current ManyForge version");
+    }
     fail("runtime-profile selects an unqualified configuration value schema");
   }
   const auto root_shape = selected->compiled_schema().root_shape();

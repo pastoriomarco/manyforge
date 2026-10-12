@@ -1189,11 +1189,13 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
 class SqliteCCLCJournal::Impl final {
  public:
   Impl(std::filesystem::path database_path, CellId cell_id,
-       std::size_t exact_result_history_capacity, std::size_t terminal_result_bytes_capacity)
+       std::size_t exact_result_history_capacity, std::size_t terminal_result_bytes_capacity,
+       std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned)
       : database_path_(ValidatePath(std::move(database_path))),
         cell_id_(std::move(cell_id)),
         exact_result_history_capacity_(exact_result_history_capacity),
-        terminal_result_bytes_capacity_(terminal_result_bytes_capacity) {
+        terminal_result_bytes_capacity_(terminal_result_bytes_capacity),
+        on_incidents_pruned_(std::move(on_incidents_pruned)) {
     Require(!cell_id_.empty() && exact_result_history_capacity_ > 0U &&
                 terminal_result_bytes_capacity_ > 0U &&
                 cell_id_.value().size() <= kMaxLifecycleIdentityBytes &&
@@ -1372,12 +1374,15 @@ class SqliteCCLCJournal::Impl final {
                                    LifecycleBlockingCauseClassDTO cause_class,
                                    const std::vector<std::string>& vendor_codes,
                                    const std::string& record_json);
+  bool AppendComponentIncidentDiagnostic(
+      const std::string& incident_id, std::int64_t occurred_at_ns, const ErrorDTO& diagnostic,
+      std::shared_ptr<const content_identity::CanonicalValue> snapshot);
   std::vector<ComponentIncidentEventDTO> LoadComponentIncidentEvents(std::uint64_t after_sequence,
                                                                      std::size_t limit);
 
  private:
   std::optional<ComponentIncidentRecordDTO> ReadOpenComponentIncidentLocked(
-      const ControllableComponentId& component);
+      const ControllableComponentId& component, bool decode_diagnostic = true);
   std::vector<ComponentLifecycleInterventionCauseDTO> ReadInterventionCausesLocked(
       const ControllableComponentId& component);
   /// The Recover result retained for one request membership, if that
@@ -1388,6 +1393,8 @@ class SqliteCCLCJournal::Impl final {
   /// AcceptOrReplayLifecycle's write transaction: the operator target, or a
   /// Recover's clearing of retained intervention causes.
   void RecordAcceptedOperatorRequestLocked(const ComponentLifecycleIntentDTO& intent);
+  std::string PreserveComponentIncidentDiagnosticLocked(const std::string& incident_id,
+                                                        const std::string& record_json);
   void AppendComponentIncidentEventLocked(std::string_view event_kind,
                                           const std::string& incident_id,
                                           std::int64_t occurred_at_ns,
@@ -1718,6 +1725,7 @@ class SqliteCCLCJournal::Impl final {
   CellId cell_id_;
   std::size_t exact_result_history_capacity_;
   std::size_t terminal_result_bytes_capacity_;
+  std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned_;
   std::mutex mutex_;
   sqlite3* database_{};
   bool closed_{};
@@ -6002,7 +6010,7 @@ ComponentLifecycleTargetFactsDTO SqliteCCLCJournal::Impl::LoadLifecycleTargetFac
   }
   facts.recovery_generation = ReadRecoveryGenerationLocked(component);
   facts.intervention_causes = ReadInterventionCausesLocked(component);
-  facts.open_incident = ReadOpenComponentIncidentLocked(component);
+  facts.open_incident = ReadOpenComponentIncidentLocked(component, false);
   transaction.Commit();
   return facts;
 }
@@ -6061,9 +6069,8 @@ bool SqliteCCLCJournal::Impl::RecordLifecycleTargetReached(
 
 namespace {
 
-constexpr std::size_t kMaximumRetainedComponentIncidents = 256U;
+constexpr std::size_t kMaximumRetainedComponentIncidents = 200U;
 constexpr std::size_t kMaximumRetainedComponentIncidentEvents = 1024U;
-constexpr std::size_t kMaximumComponentIncidentRecordBytes = 256U * 1024U;
 
 [[nodiscard]] std::string EncodeVendorCodes(const std::vector<std::string>& codes) {
   content_identity::CanonicalValue::Array values;
@@ -6086,8 +6093,8 @@ constexpr std::size_t kMaximumComponentIncidentRecordBytes = 256U * 1024U;
 
 }  // namespace
 
-std::optional<ComponentIncidentRecordDTO>
-SqliteCCLCJournal::Impl::ReadOpenComponentIncidentLocked(const ControllableComponentId& component) {
+std::optional<ComponentIncidentRecordDTO> SqliteCCLCJournal::Impl::ReadOpenComponentIncidentLocked(
+    const ControllableComponentId& component, const bool decode_diagnostic) {
   Statement row(database_,
                 "SELECT incident_id,cause_class,vendor_codes_json,detected_at_ns,summary,"
                 "containment_state,record_json FROM cclc_component_incidents "
@@ -6123,7 +6130,36 @@ SqliteCCLCJournal::Impl::ReadOpenComponentIncidentLocked(const ControllableCompo
   }
   Require(!row.Step(), "component_lifecycle_journal_corrupt",
           "component has more than one open incident");
+  Require(record.record_json.size() <= kMaxComponentIncidentRecordBytes,
+          "component_lifecycle_journal_corrupt", "incident record exceeds its bound");
+  record.diagnostic_loaded = decode_diagnostic;
+  if (decode_diagnostic) {
+    const auto receipt = ComponentIncidentContainmentReceiptFromRecord(
+        record.record_json, &record.incident.containment_error);
+    if (record.incident.containment_state == ComponentIncidentContainmentStateDTO::kRequested) {
+      record.incident.containment = receipt;
+      Require(record.incident.locally_valid(), "component_lifecycle_journal_corrupt",
+              "stored containment receipt is invalid");
+    }
+    record.diagnostic =
+        ComponentIncidentDiagnosticFromRecord(record.record_json, &record.diagnostic_snapshot);
+    record.incident.diagnostic = record.diagnostic;
+    record.incident.diagnostic_snapshot = record.diagnostic_snapshot;
+  }
   return record;
+}
+
+std::string SqliteCCLCJournal::Impl::PreserveComponentIncidentDiagnosticLocked(
+    const std::string& incident_id, const std::string& record_json) {
+  Statement row(database_, "SELECT record_json FROM cclc_component_incidents WHERE incident_id=?");
+  row.Bind(1, incident_id);
+  if (row.Step()) {
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot;
+    const auto diagnostic = ComponentIncidentDiagnosticFromRecord(row.Text(0), &snapshot);
+    if (diagnostic)
+      return ComponentIncidentRecordWithDiagnostic(record_json, *diagnostic, snapshot);
+  }
+  return record_json;
 }
 
 void SqliteCCLCJournal::Impl::AppendComponentIncidentEventLocked(
@@ -6173,9 +6209,9 @@ ComponentIncidentRecordDTO SqliteCCLCJournal::Impl::OpenComponentIncident(
   Require(incident.locally_valid() && !incident.acknowledged &&
               incident.containment_state == ComponentIncidentContainmentStateDTO::kPending &&
               !record.record_json.empty() &&
-              record.record_json.size() <= kMaximumComponentIncidentRecordBytes,
+              record.record_json.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "component incident is invalid");
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   RequireOpen();
   // A detection made from facts read before the operator's Recover is not
   // recorded: the driver re-evaluates on facts that include the Recover.
@@ -6202,28 +6238,52 @@ ComponentIncidentRecordDTO SqliteCCLCJournal::Impl::OpenComponentIncident(
   write.Bind(8, record.record_json);
   Require(!write.Step(), "component_lifecycle_journal_corrupt",
           "incident write returned a row");
-  // Bounded: acknowledged incidents beyond the retention are dropped (their
-  // record stays in history); open ones are never dropped. The Recover's
-  // request membership stays as an expired-result tombstone, like a
-  // compacted transaction result.
-  const auto retained_floor =
-      sequence - static_cast<std::int64_t>(kMaximumRetainedComponentIncidents);
-  Statement expire(database_,
-                   "UPDATE cclc_request_memberships SET retained_result=0 WHERE EXISTS ("
-                   "SELECT 1 FROM cclc_component_incidents i WHERE i.acknowledged=1 AND "
-                   "i.incident_sequence <= ? AND "
-                   "i.acknowledgement_owner_epoch=cclc_request_memberships.owner_epoch AND "
-                   "i.acknowledgement_request_id=cclc_request_memberships.request_id)");
-  expire.Bind(1, retained_floor);
-  Require(!expire.Step(), "component_lifecycle_journal_corrupt",
-          "incident recovery expiry returned a row");
-  Statement trim(database_,
-                 "DELETE FROM cclc_component_incidents WHERE acknowledged=1 AND "
-                 "incident_sequence <= ?");
-  trim.Bind(1, retained_floor);
-  Require(!trim.Step(), "component_lifecycle_journal_corrupt",
-          "incident trim returned a row");
+  // Closed rows have their own count bound. Open incidents never consume it
+  // and can never be removed by this cleanup.
+  ComponentIncidentPruneNotice pruned;
+  Statement cutoff(database_,
+                   "SELECT incident_sequence FROM cclc_component_incidents "
+                   "WHERE acknowledged=1 ORDER BY incident_sequence DESC LIMIT 1 OFFSET ?");
+  cutoff.Bind(1, static_cast<std::int64_t>(kMaximumRetainedComponentIncidents));
+  if (cutoff.Step()) {
+    const auto retained_floor = cutoff.Integer(0);
+    Statement notice(database_,
+                     "SELECT count(*),min(incident_sequence),max(incident_sequence) "
+                     "FROM cclc_component_incidents WHERE acknowledged=1 AND incident_sequence<=?");
+    notice.Bind(1, retained_floor);
+    Require(notice.Step(), "component_lifecycle_journal_corrupt",
+            "incident prune count is unavailable");
+    pruned = {static_cast<std::uint64_t>(notice.Integer(0)),
+              static_cast<std::uint64_t>(notice.Integer(1)),
+              static_cast<std::uint64_t>(notice.Integer(2))};
+    Statement expire(database_,
+                     "UPDATE cclc_request_memberships SET retained_result=0 WHERE EXISTS ("
+                     "SELECT 1 FROM cclc_component_incidents i WHERE i.acknowledged=1 AND "
+                     "i.incident_sequence <= ? AND "
+                     "i.acknowledgement_owner_epoch=cclc_request_memberships.owner_epoch AND "
+                     "i.acknowledgement_request_id=cclc_request_memberships.request_id)");
+    expire.Bind(1, retained_floor);
+    Require(!expire.Step(), "component_lifecycle_journal_corrupt",
+            "incident recovery expiry returned a row");
+    Statement trim(
+        database_,
+        "DELETE FROM cclc_component_incidents WHERE acknowledged=1 AND incident_sequence<=?");
+    trim.Bind(1, retained_floor);
+    Require(!trim.Step(), "component_lifecycle_journal_corrupt", "incident trim returned a row");
+    Require(static_cast<std::uint64_t>(sqlite3_changes(database_)) == pruned.count,
+            "component_lifecycle_journal_corrupt",
+            "incident prune count differs from removed rows");
+  }
   transaction.Commit();
+  lock.unlock();
+  if (pruned.count && on_incidents_pruned_) {
+    // The host callback queues one bounded INFO notice. Failure is auxiliary:
+    // the committed pruning and successful request remain successful.
+    try {
+      on_incidents_pruned_(pruned);
+    } catch (...) {
+    }
+  }
   return record;
 }
 
@@ -6239,22 +6299,23 @@ bool SqliteCCLCJournal::Impl::RecordComponentIncidentContainment(
     const std::string& record_json, const std::int64_t occurred_at_ns) {
   Require(!incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
               state != ComponentIncidentContainmentStateDTO::kPending && !record_json.empty() &&
-              record_json.size() <= kMaximumComponentIncidentRecordBytes && occurred_at_ns >= 0,
+              record_json.size() <= kMaxComponentIncidentRecordBytes && occurred_at_ns >= 0,
           "component_lifecycle_incident_invalid", "incident containment record is invalid");
   std::lock_guard lock(mutex_);
   RequireOpen();
   Transaction transaction(database_);
+  const auto preserved = PreserveComponentIncidentDiagnosticLocked(incident_id, record_json);
   Statement write(database_,
                   "UPDATE cclc_component_incidents SET containment_state=?,record_json=? "
                   "WHERE incident_id=? AND acknowledged=0 AND containment_state=0");
   write.Bind(1, static_cast<std::int64_t>(state));
-  write.Bind(2, record_json);
+  write.Bind(2, preserved);
   write.Bind(3, incident_id);
   Require(!write.Step(), "component_lifecycle_journal_corrupt",
           "incident containment write returned a row");
   if (sqlite3_changes(database_) != 1) return false;
   AppendComponentIncidentEventLocked(kComponentIncidentEventKind, incident_id, occurred_at_ns,
-                                     record_json);
+                                     preserved);
   transaction.Commit();
   return true;
 }
@@ -6289,7 +6350,7 @@ std::optional<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::Impl::RecoverCom
   incident.acknowledged_at_ns = acknowledged_at_ns;
   incident.acknowledgement_request_id = intent.request_context.request_id;
   const auto payload = ComponentIncidentAcknowledgedPayload(open->record_json, incident);
-  Require(payload.size() <= kMaximumComponentIncidentRecordBytes,
+  Require(payload.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "incident acknowledgement record is too large");
 
   // Authorization only: one membership with no transaction; its result is
@@ -6371,21 +6432,184 @@ bool SqliteCCLCJournal::Impl::UpdateOpenComponentIncident(
   Require(!incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
               lifecycle_cause_requires_intervention(cause_class) &&
               vendor_codes.size() <= kMaxComponentIncidentVendorCodes && !record_json.empty() &&
-              record_json.size() <= kMaximumComponentIncidentRecordBytes,
+              record_json.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "incident update is invalid");
   std::lock_guard lock(mutex_);
   RequireOpen();
   Transaction transaction(database_);
+  const auto preserved = PreserveComponentIncidentDiagnosticLocked(incident_id, record_json);
   Statement write(database_,
                   "UPDATE cclc_component_incidents SET cause_class=?,vendor_codes_json=?,"
                   "record_json=? WHERE incident_id=? AND acknowledged=0");
   write.Bind(1, static_cast<std::int64_t>(cause_class));
   write.Bind(2, EncodeVendorCodes(vendor_codes));
-  write.Bind(3, record_json);
+  write.Bind(3, preserved);
   write.Bind(4, incident_id);
   Require(!write.Step(), "component_lifecycle_journal_corrupt",
           "incident update returned a row");
   if (sqlite3_changes(database_) != 1) return false;
+  transaction.Commit();
+  return true;
+}
+
+bool SqliteCCLCJournal::Impl::AppendComponentIncidentDiagnostic(
+    const std::string& incident_id, const std::int64_t occurred_at_ns, const ErrorDTO& diagnostic,
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot) {
+  Require(!incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
+              occurred_at_ns >= 0 && diagnostic.code == "controller_launch_exited",
+          "component_lifecycle_incident_invalid", "incident diagnostic identity is invalid");
+  Require(ComponentIncidentDiagnosticIsValid(diagnostic) &&
+              (!snapshot || ComponentIncidentDiagnosticSnapshotShapeIsValid(*snapshot)),
+          "component_lifecycle_incident_invalid", "incident diagnostic is outside its bound");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement row(database_,
+                "SELECT controllable_component_id,containment_state FROM cclc_component_incidents "
+                "WHERE incident_id=? AND acknowledged=0");
+  row.Bind(1, incident_id);
+  if (!row.Step()) return false;
+  // Enrichment cannot consume room for a containment receipt not recorded yet.
+  if (row.Integer(1) == static_cast<std::int64_t>(ComponentIncidentContainmentStateDTO::kPending))
+    return false;
+  const auto original = ReadOpenComponentIncidentLocked(ControllableComponentId(row.Text(0)));
+  if (!original || original->diagnostic_snapshot || (original->diagnostic && !snapshot))
+    return false;
+  auto bounded_error = original->diagnostic.value_or(diagnostic);
+  const auto* settings = snapshot ? snapshot->find_object_member("settings") : nullptr;
+  const auto* configuration =
+      settings ? settings->find_object_member("retained_configuration_json") : nullptr;
+  if (configuration && configuration->is_string()) {
+    Require(bounded_error.details.size() < kMaxLifecycleErrorDetails ||
+                bounded_error.details.contains("retained_configuration_sha256"),
+            "component_lifecycle_incident_invalid",
+            "settings hash exceeds diagnostic detail capacity");
+    const auto hash = content_identity::sha256_digest(configuration->as_string());
+    const auto existing = bounded_error.details.find("retained_configuration_sha256");
+    Require(existing == bounded_error.details.end() || existing->second == hash,
+            "component_lifecycle_incident_invalid",
+            "capture conflicts with original settings hash");
+    bounded_error.details.emplace("retained_configuration_sha256", hash);
+  }
+  auto bounded_snapshot = snapshot ? *snapshot : content_identity::CanonicalValue(nullptr);
+  const auto replace_member = [](const content_identity::CanonicalValue& object,
+                                 const std::string_view key,
+                                 content_identity::CanonicalValue value) {
+    auto fields = object.as_object();
+    for (auto& [name, current] : fields) {
+      if (name != key) continue;
+      current = std::move(value);
+      return content_identity::CanonicalValue(std::move(fields));
+    }
+    fields.emplace_back(std::string(key), std::move(value));
+    return content_identity::CanonicalValue(std::move(fields));
+  };
+  // Reserve actual canonical growth allowed by the existing bounded cause
+  // history and public Recover fields before storing immutable evidence.
+  // Controls are valid NFC text and encode six bytes, so this uses the codec
+  // rather than assuming raw UTF8 bytes equal JSON bytes.
+  const std::vector<std::string> maximal_codes(
+      kMaxComponentIncidentVendorCodes, std::string(kMaxComponentIncidentVendorCodeBytes, '\x01'));
+  auto longest_cause = original->incident.cause_class;
+  for (const auto& policy : DefaultLifecycleIncidentRecoveryPolicy())
+    if (to_string(policy.cause_class).size() > to_string(longest_cause).size())
+      longest_cause = policy.cause_class;
+  auto future_primary = original->record_json;
+  for (std::size_t change = 0; change < kMaxComponentIncidentTimelineEntries; ++change)
+    future_primary = ComponentIncidentRecordWithChange(
+        future_primary, std::numeric_limits<std::int64_t>::max(), longest_cause, maximal_codes);
+  auto recovered = original->incident;
+  recovered.acknowledged = true;
+  recovered.acknowledged_by = std::string(kMaxLifecycleRequestLabelBytes, '\x01');
+  recovered.acknowledgement_request_id = RequestId(std::string(kMaxLifecycleIdentityBytes, '\x01'));
+  recovered.acknowledged_at_ns = std::numeric_limits<std::int64_t>::max();
+  future_primary = ComponentIncidentAcknowledgedPayload(future_primary, recovered);
+  const auto future_growth = future_primary.size() > original->record_json.size()
+                                 ? future_primary.size() - original->record_json.size()
+                                 : 0U;
+  Require(future_growth < kMaxComponentIncidentRecordBytes, "component_lifecycle_incident_invalid",
+          "mandatory incident history exceeds its bound");
+  const auto enrichment_budget = kMaxComponentIncidentRecordBytes - future_growth;
+  std::string updated;
+  std::string event;
+  const auto materialize = [&] {
+    // Candidate encoding stays local: optional settings may exceed the total
+    // budget at ingress. Only the final strictly validated value is persisted.
+    using content_identity::CanonicalValue;
+    CanonicalValue::Object details;
+    for (const auto& [key, value] : bounded_error.details)
+      details.emplace_back(key, CanonicalValue(value));
+    const CanonicalValue envelope(CanonicalValue::Object{
+        {"error",
+         CanonicalValue(CanonicalValue::Object{{"code", CanonicalValue(bounded_error.code)},
+                                               {"message", CanonicalValue(bounded_error.message)},
+                                               {"details", CanonicalValue(std::move(details))}})},
+        {"snapshot", bounded_snapshot}});
+    const auto attach = [&](const std::string& primary) {
+      return content_identity::canonical_json(
+          replace_member(content_identity::parse_canonical_json(primary), "diagnostic", envelope));
+    };
+    updated = attach(original->record_json);
+    event = attach(ComponentIncidentRecordWithChange(original->record_json, occurred_at_ns,
+                                                     original->incident.cause_class,
+                                                     original->incident.vendor_codes));
+  };
+  const auto oversized = [&] {
+    return updated.size() > enrichment_budget || event.size() > kMaxComponentIncidentRecordBytes;
+  };
+  materialize();
+  // DX246: preserve the entire already-bounded tail. Optional settings text
+  // is omitted first, explicitly named through the existing ErrorDTO detail.
+  std::string omitted;
+  while (oversized()) {
+    if (bounded_snapshot.is_null()) break;
+    auto settings = *bounded_snapshot.find_object_member("settings");
+    std::string largest;
+    std::size_t largest_bytes{};
+    for (const auto& [key, value] : settings.as_object()) {
+      if (key == "argv" || !value.is_string()) continue;
+      const auto bytes = content_identity::canonical_json(value).size();
+      if (bytes > largest_bytes) {
+        largest = key;
+        largest_bytes = bytes;
+      }
+    }
+    if (largest.empty()) break;
+    if (!omitted.empty()) omitted += ',';
+    omitted += largest;
+    if (bounded_error.details.contains("snapshot_omitted_fields") ||
+        bounded_error.details.size() < 8U) {
+      bounded_error.details["snapshot_omitted_fields"] = omitted;
+    } else {
+      Require(false, "component_lifecycle_incident_invalid",
+              "omission metadata exceeds original diagnostic detail capacity");
+    }
+    settings = replace_member(settings, largest, content_identity::CanonicalValue(nullptr));
+    bounded_snapshot = replace_member(bounded_snapshot, "settings", std::move(settings));
+    materialize();
+  }
+  if (original->diagnostic) {
+    const auto original_omission = original->diagnostic->details.find("snapshot_omitted_fields");
+    Require(original_omission == original->diagnostic->details.end() ||
+                original_omission->second == omitted,
+            "component_lifecycle_incident_invalid",
+            "capture conflicts with original omission facts");
+  }
+  Require(ComponentIncidentDiagnosticIsValid(bounded_error) &&
+              (bounded_snapshot.is_null() ||
+               ComponentIncidentDiagnosticSnapshotIsValid(bounded_snapshot)) &&
+              !oversized(),
+          "component_lifecycle_incident_invalid",
+          "mandatory incident facts exceed the diagnostic payload bound");
+  Statement write(database_,
+                  "UPDATE cclc_component_incidents SET record_json=? "
+                  "WHERE incident_id=? AND acknowledged=0");
+  write.Bind(1, updated);
+  write.Bind(2, incident_id);
+  Require(!write.Step(), "component_lifecycle_journal_corrupt", "diagnostic write returned a row");
+  if (sqlite3_changes(database_) != 1) return false;
+  AppendComponentIncidentEventLocked(kComponentIncidentEventKind, incident_id, occurred_at_ns,
+                                     event);
   transaction.Commit();
   return true;
 }
@@ -6405,6 +6629,8 @@ std::vector<ComponentIncidentEventDTO> SqliteCCLCJournal::Impl::LoadComponentInc
   rows.Bind(2, static_cast<std::int64_t>(limit));
   std::vector<ComponentIncidentEventDTO> result;
   while (rows.Step()) {
+    Require(rows.Text(4).size() <= kMaxComponentIncidentRecordBytes,
+            "component_lifecycle_journal_corrupt", "incident event exceeds its bound");
     result.push_back({Positive(rows.Integer(0), "incident event sequence"), rows.Text(1),
                       rows.Text(2), rows.Integer(3), rows.Text(4)});
   }
@@ -6489,12 +6715,13 @@ void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_ter
   }
 }
 
-SqliteCCLCJournal::SqliteCCLCJournal(std::filesystem::path database_path, CellId cell_id,
-                                     std::size_t exact_result_history_capacity,
-                                     std::size_t terminal_result_bytes_capacity)
+SqliteCCLCJournal::SqliteCCLCJournal(
+    std::filesystem::path database_path, CellId cell_id, std::size_t exact_result_history_capacity,
+    std::size_t terminal_result_bytes_capacity,
+    std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned)
     : impl_(std::make_unique<Impl>(std::move(database_path), std::move(cell_id),
-                                   exact_result_history_capacity, terminal_result_bytes_capacity)) {
-}
+                                   exact_result_history_capacity, terminal_result_bytes_capacity,
+                                   std::move(on_incidents_pruned))) {}
 
 SqliteCCLCJournal::~SqliteCCLCJournal() = default;
 
@@ -6815,6 +7042,15 @@ Result<bool> SqliteCCLCJournal::UpdateOpenComponentIncident(
     const std::vector<std::string>& vendor_codes, const std::string& record_json) {
   return AsResult<bool>([&]() {
     return impl_->UpdateOpenComponentIncident(incident_id, cause_class, vendor_codes, record_json);
+  });
+}
+
+Result<bool> SqliteCCLCJournal::AppendComponentIncidentDiagnostic(
+    const std::string& incident_id, const std::int64_t occurred_at_ns, const ErrorDTO& diagnostic,
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot) {
+  return AsResult<bool>([&]() {
+    return impl_->AppendComponentIncidentDiagnostic(incident_id, occurred_at_ns, diagnostic,
+                                                    std::move(snapshot));
   });
 }
 

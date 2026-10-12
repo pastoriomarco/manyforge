@@ -1,0 +1,37 @@
+# Deployment generator input, not a runnable controller configuration.
+# Replace __arm_controller__/__joint__ with the retained binding names/joints
+# and null with each joint's retained max_deceleration_on_cancel. No fallback.
+# Rename the controller_manager key to the retained manager name when different.
+# Copy each model's vendor joint constraints exactly before adding cancel bounds;
+# xArm7 has no joint7 trajectory/goal block. Do not extrapolate another joint's.
+# Common values come from xarm_ros2 c3172e57's five vendor controller YAMLs:
+# xarm5, xarm6, xarm7, lite6, uf850. Real goal tolerances remain unchanged;
+# the simulation execution port erases goal tolerances on each goal.
+# Q64 overrides only the offline action monitor rate to 20 Hz; real vendor
+# controller files retain their 10 Hz value.
+/**/controller_manager:
+  ros__parameters:
+    update_rate: 150
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    __arm_controller__:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+/**/__arm_controller__:
+  ros__parameters:
+    joints: [__joint__]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 25.0
+    action_monitor_rate: 20.0
+    interface_name: position
+    interpolate_from_desired_state: true
+    allow_trajectory_replacement: false
+    constraints:
+      goal_time: 0.5
+      stopped_velocity_tolerance: 0.0
+      decelerate_on_cancel: true
+      __joint__: {max_deceleration_on_cancel: null}

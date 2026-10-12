@@ -443,6 +443,19 @@ TEST(CCLCOpenRequest, WaitingSinceUsesTheFullWidthClockContract) {
           std::nullopt};
 }
 
+TEST(CCLCOpenRequest, ComponentOutputDropsAreAnOptionalInformationalFullWidthPair) {
+  TargetViewPort port;
+  EXPECT_EQ(SnapshotResult(port).find_object_member("dropped_output_lines"), nullptr);
+  port.view.dropped_output_lines = 0U;
+  port.view.dropped_output_bytes = std::numeric_limits<std::uint64_t>::max();
+  const auto snapshot = SnapshotResult(port);
+  EXPECT_EQ(Member(snapshot, "dropped_output_lines").as_number(), 0.0);
+  EXPECT_EQ(Member(snapshot, "dropped_output_bytes").as_string(), "18446744073709551615");
+  EXPECT_EQ(snapshot.find_object_member("lifecycle_progress")->is_null(), true);
+  port.view.dropped_output_bytes.reset();
+  EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+}
+
 TEST(CCLCOpenRequest, ComponentSnapshotShowsTheOpenIncidentInContractShape) {
   TargetViewPort port;
   port.view = {ComponentLifecycleTargetDTO{ControllableComponentId("component.arm"),
@@ -457,10 +470,11 @@ TEST(CCLCOpenRequest, ComponentSnapshotShowsTheOpenIncidentInContractShape) {
   EXPECT_EQ(Member(progress, "phase").as_string(), "blocked");
   EXPECT_EQ(Member(progress, "blocking_cause_class").as_string(), "emergency_stop");
   const auto& incident = Member(progress, "incident");
-  EXPECT_EQ(content_identity::canonical_json(incident),
-            R"({"acknowledged":false,"cause_class":"emergency_stop","detected_at_ns":5000,)"
-            R"("incident_id":"incident.component.arm.5000","summary":"Component component.arm )"
-            R"(reported an emergency stop.","vendor_codes":["C2","mode=0","state=4"]})");
+  EXPECT_EQ(
+      content_identity::canonical_json(incident),
+      R"({"acknowledged":false,"cause_class":"emergency_stop","detected_at_ns":5000,"diagnostic":null,)"
+      R"("incident_id":"incident.component.arm.5000","summary":"Component component.arm )"
+      R"(reported an emergency stop.","vendor_codes":["C2","mode=0","state=4"]})");
 
   // Full-width clock: above 2^53-1 the time is a canonical decimal string.
   auto wide = OpenIncident();
@@ -530,6 +544,46 @@ TEST(CCLCOpenRequest, IncidentRecoveryResultAndIncidentEventsAreExact) {
       port, {});
   ASSERT_TRUE(unbounded.ok());
   EXPECT_FALSE(Member(content_identity::parse_canonical_json(unbounded.value()), "ok").as_bool());
+}
+
+TEST(CCLCOpenRequest, NearMaximumIncidentEventsPageWithinTheExistingByteBoundAndAdvanceExactly) {
+  TargetViewPort port;
+  // Quoting costs two encoded bytes per source byte. Each whole payload is
+  // near the approved512KiB row bound, so a64-row page cannot fit8MiB.
+  const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"tail", CanonicalValue(std::string((kMaxComponentIncidentRecordBytes - 16U) / 2U, '"'))}}));
+  ASSERT_LE(payload.size(), kMaxComponentIncidentRecordBytes);
+  ASSERT_GT(payload.size(), kMaxComponentIncidentRecordBytes - 32U);
+  for (std::uint64_t sequence = 1U; sequence <= kMaxComponentIncidentEventPage; ++sequence)
+    port.events.push_back(
+        {sequence, "component_incident", "incident.arm", kMaximumClockNs, payload});
+  std::uint64_t after{};
+  std::size_t pages{};
+  while (after < port.events.size()) {
+    const auto read = ExecuteCanonicalCCLCOpenRequest(
+        Request(
+            "incident_events",
+            CanonicalValue(CanonicalValue::Object{
+                {"after_sequence", CanonicalValue(static_cast<double>(after))},
+                {"limit", CanonicalValue(static_cast<double>(kMaxComponentIncidentEventPage))}})),
+        port, {});
+    ASSERT_TRUE(read.ok()) << read.error().message;
+    EXPECT_LE(read.value().size(), kMaximumCCLCOpenResponseBytes);
+    const auto response = content_identity::parse_canonical_json(read.value());
+    ASSERT_TRUE(Member(response, "ok").as_bool());
+    const auto& result = Member(response, "result");
+    const auto& events = Member(result, "events").as_array();
+    ASSERT_FALSE(events.empty());
+    EXPECT_LT(events.size(), kMaxComponentIncidentEventPage);
+    for (const auto& event : events) {
+      EXPECT_EQ(Member(event, "event_sequence").as_number(), static_cast<double>(++after));
+      EXPECT_EQ(content_identity::canonical_json(Member(event, "payload")), payload);
+    }
+    EXPECT_EQ(Member(result, "through_sequence").as_number(), static_cast<double>(after));
+    ASSERT_LE(++pages, kMaxComponentIncidentEventPage);
+  }
+  EXPECT_EQ(after, kMaxComponentIncidentEventPage);
+  EXPECT_GT(pages, 1U);
 }
 
 TEST(CCLCOpenRequest, IncidentRecoveryAndEventTimesUseTheFullWidthClockContract) {

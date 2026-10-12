@@ -100,10 +100,11 @@ template <typename Identity>
   if (!identity(stage.stop_escalation_stage_id) || stage.stage_index >= kMaxStopEscalationStages ||
       stage.remaining_budget.stop_id != accepted.stop_id ||
       stage.remaining_budget.stop_generation != accepted.stop_generation ||
-      stage.remaining_budget.remaining_outer_duration_ns < 0 ||
-      stage.remaining_budget.remaining_outer_duration_ns > accepted.fixed_outer_duration_ns ||
-      stage.remaining_budget.phases.empty() ||
-      stage.remaining_budget.phases.size() > kMaximumStopAcceptedPhases) {
+      stage.remaining_budget.elapsed_since_stop_ns < 0 ||
+      stage.remaining_budget.elapsed_since_stop_ns > kMaximumStopDurationNs ||
+      (stage.remaining_budget.remaining_controlled_deadline_ns.has_value() &&
+       (*stage.remaining_budget.remaining_controlled_deadline_ns < 0 ||
+        *stage.remaining_budget.remaining_controlled_deadline_ns > kMaximumStopDurationNs))) {
     return false;
   }
   switch (stage.stage_kind) {
@@ -114,15 +115,6 @@ template <typename Identity>
       break;
     default:
       return false;
-  }
-  std::int64_t previous = -1;
-  for (const auto& phase : stage.remaining_budget.phases) {
-    if (!identity(phase.phase_id) || phase.remaining_deadline_offset_ns < 0 ||
-        phase.remaining_deadline_offset_ns <= previous ||
-        phase.remaining_deadline_offset_ns > stage.remaining_budget.remaining_outer_duration_ns) {
-      return false;
-    }
-    previous = phase.remaining_deadline_offset_ns;
   }
   return true;
 }

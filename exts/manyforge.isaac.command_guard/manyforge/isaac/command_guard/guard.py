@@ -80,13 +80,27 @@ class CommandGuard:
 
     def authorize(self, controller_hold_stamp_ns: int) -> bool:
         """Accept only a newer trusted Reset/startup cutoff; this is no hold proof."""
+        return self.authorize_with_status(controller_hold_stamp_ns)[0]
+
+    def _status(self) -> GuardStatus:
+        return GuardStatus(self._authorized, self._tripped, self._reason,
+                           self._authorization, self._last_stamp, self._progress)
+
+    def authorize_with_status(self, controller_hold_stamp_ns: int
+                              ) -> tuple[bool, GuardStatus, GuardStatus]:
+        """Capture prior and resulting facts atomically for ordered reporting.
+
+        Reporting happens after this short lock is released. In particular,
+        a monitor trip immediately before authorization must remain observable.
+        """
         if type(controller_hold_stamp_ns) is not int:
             raise ValueError("authorization requires an exact controller timestamp")
         with self._lock:
+            prior = self._status()
             now = self._now()
             if now is None or (self._authorization is not None and
                                controller_hold_stamp_ns <= self._authorization):
-                return False
+                return False, prior, self._status()
             self._authorization = controller_hold_stamp_ns
             if self._last_stamp is None or self._last_stamp < controller_hold_stamp_ns:
                 self._last_stamp = controller_hold_stamp_ns
@@ -95,7 +109,14 @@ class CommandGuard:
             self._authorized = True
             self._tripped = False
             self._reason = None
-            return True
+            return True, prior, self._status()
+
+    def close(self) -> GuardStatus:
+        """Lifecycle closure discards pending work, retaining floors and trip."""
+        with self._lock:
+            self._authorized = False
+            self._latest = None
+            return self._status()
 
     def offer(self, command: JointCommand, received_local_ns: int) -> bool:
         validate_command(command, self.config.joint_names)
@@ -139,5 +160,4 @@ class CommandGuard:
             now = self._now()
             if now is not None:
                 self._expire(now)
-            return GuardStatus(self._authorized, self._tripped, self._reason,
-                               self._authorization, self._last_stamp, self._progress)
+            return self._status()

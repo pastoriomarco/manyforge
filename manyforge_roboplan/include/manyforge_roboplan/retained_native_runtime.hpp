@@ -50,10 +50,6 @@ struct RetainedNativeRuntimeConfig final {
   /// Empty remains available only to lower-level fixtures that intentionally
   /// bootstrap from the scene's already-established state.
   std::vector<double> initial_motion_positions_rad;
-  /// Cell-wide Stop envelope supplied by the current configuration owner when
-  /// no verified participant readiness is installed yet. It is never
-  /// inferred from a not-stoppable retained policy or a test constant.
-  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   /// Process-owned monitoring policy. Public operation/caller payloads never
   /// select or override these cadences.
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
@@ -72,7 +68,6 @@ struct RetainedNativeAddressedOwnerConfig final {
   std::size_t request_replay_capacity{1024U};
   core::IResourceOperationAdmissionGate *operation_admission_gate{};
   core::GraphRevision graph_revision;
-  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   core::CellAdmissionInterventionValidator
       cell_admission_intervention_validator;
   core::CellAdmissionSettlementValidator cell_admission_settlement_validator;
@@ -280,6 +275,13 @@ struct RetainedNativeRuntimeInput final {
       ordinary_motion_jerk{};
   /// Cell-wide render wake shared by independently owned robot channels.
   std::shared_ptr<RetainedObservationWake> observation_wake{};
+  /// Q37 (as `main`): when set, the Deployment-authored fault Stop profile
+  /// below is the motion target's fault profile, read directly (absent means
+  /// no fault profile); nothing is derived from the operator profile. Unset
+  /// keeps the native lane's derivation from the retained Stop plan.
+  bool fault_stop_profile_from_deployment{false};
+  std::optional<core::MotionInterruptStopProfileDTO>
+      deployment_fault_stop_profile{};
 };
 
 struct RetainedNativeRuntime;
@@ -357,11 +359,12 @@ struct RetainedNativeRuntime final
   std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
   std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
   std::vector<core::RuntimeParticipantBinding> control_binding_representatives;
-  std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::optional<core::StopSurveillancePolicyDTO> stop_surveillance_policy;
   std::optional<core::MotionInterruptStopProfileDTO>
       motion_operator_stop_profile;
   std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
+  /// The fault profile above is Deployment-authored (Q37), not derived.
+  bool motion_fault_stop_profile_from_deployment{false};
   std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
   std::optional<core::CellId> addressed_cell_id;
   std::shared_ptr<RetainedObservedStateChannel> motion_state_channel;

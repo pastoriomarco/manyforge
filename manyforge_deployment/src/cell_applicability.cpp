@@ -1,6 +1,5 @@
 #include "manyforge_deployment/cell_applicability.hpp"
 
-#include "stop_timing_resolution_internal.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1322,11 +1321,10 @@ void preflight_stop_rows(const BindingContext &context,
   if (policy.disposition == core::StopEvidenceDisposition::kNotStoppable) {
     return;
   }
-  if (!policy.deadline_budget.has_value() || policy.escalation_stages.empty()) {
-    fail("qualified stoppable policy lost its deadline budget or stages");
+  if (policy.escalation_stages.empty()) {
+    fail("qualified stoppable policy lost its escalation stages");
   }
 
-  budget.charge_logical_rows(policy.deadline_budget->phases.size());
   budget.charge_logical_rows(policy.escalation_stages.size());
   for (const auto &stage : policy.escalation_stages) {
     budget.charge_logical_rows(stage.evidence_requirements.size());
@@ -1455,7 +1453,6 @@ preflight_applicability_output(
   budget.charge_logical_rows(inputs.capability_provider_bindings.size());
   budget.charge_logical_rows(inputs.external_resources.size());
   budget.charge_logical_rows(inputs.stop_stage_parameters.size());
-  budget.charge_logical_rows(inputs.stop_timing_parameters.size());
   budget.charge_logical_rows(inputs.commissioned_stop_interfaces.size());
   for (const auto &binding : inputs.capability_provider_bindings) {
     budget.charge_logical_rows(binding.endpoint_bindings.size());
@@ -2845,9 +2842,6 @@ qualify_commissioned_stop_interface(
 [[nodiscard]] std::size_t stop_nested_logical_rows(
     const LogicalStoppableApplicabilityTemplate &stoppable) {
   std::size_t rows = 0U;
-  checked_add(rows, stoppable.deadline_budget.phases.size(),
-              kMaxCellLogicalApplicabilityRows,
-              "cell logical applicability rows");
   checked_add(rows, stoppable.escalation_stages.size(),
               kMaxCellLogicalApplicabilityRows,
               "cell logical applicability rows");
@@ -2914,8 +2908,7 @@ qualify_stop_applicability(
     const std::vector<LogicalControllerTemplate> &logical_controllers,
     const core::DeploymentApplicabilityInputsDTO &inputs,
     QualifiedStopDependencies &dependencies, LogicalNameRegistry &names,
-    std::size_t &logical_rows,
-    const detail::BindingStopTimingBudgets &timing_budgets) {
+    std::size_t &logical_rows) {
   std::vector<LogicalStopApplicabilityTemplate> result;
   for (const auto &context : bindings) {
     const auto &binding = *context.binding;
@@ -2938,10 +2931,8 @@ qualify_stop_applicability(
         continue;
       }
 
-      if (!policy.deadline_budget.has_value() ||
-          policy.escalation_stages.empty()) {
-        fail("qualified stoppable policy lost its deadline budget or "
-             "escalation chain");
+      if (policy.escalation_stages.empty()) {
+        fail("qualified stoppable policy lost its escalation chain");
       }
       if (binding_affects_motion_resources(context) &&
           std::count_if(policy.escalation_stages.begin(),
@@ -2969,35 +2960,6 @@ qualify_stop_applicability(
             context.manifest->value(), logical_route);
         auto default_parameters = qualify_stop_stage_parameters(
             context, route_id, policy, stage, dependencies);
-        const auto timing = std::find_if(
-            inputs.stop_timing_parameters.begin(),
-            inputs.stop_timing_parameters.end(), [&](const auto &selected) {
-              return selected.control_binding_id == binding.control_binding_id;
-            });
-        if (timing != inputs.stop_timing_parameters.end() &&
-            default_parameters &&
-            stage.containment_command.command_kind ==
-                core::StopContainmentCommandKind::kMotionControlledStop) {
-          const auto duration = default_parameters->find("deceleration_time_s");
-          if (duration != default_parameters->end()) {
-            const auto *seconds = std::get_if<double>(&duration->second.value);
-            if (seconds == nullptr)
-              fail("controlled Stop duration is outside the qualified range");
-            const auto duration_ns = core::authored_stop_duration_ns(*seconds);
-            if (!duration_ns.ok())
-              fail(duration_ns.error().message);
-            const auto checked = core::validate_controlled_stop_timing(
-                timing->timing, duration_ns.value());
-            if (!checked.ok()) {
-              auto message = checked.error().message;
-              if (const auto minimum =
-                      checked.error().details.find("minimum_timeout_ns");
-                  minimum != checked.error().details.end())
-                message += "; minimum_timeout_ns=" + minimum->second;
-              fail(std::move(message));
-            }
-          }
-        }
         std::vector<LogicalStopProviderEvidenceEndpoint> provider_evidence;
         std::vector<LogicalStopBindingStateAuthoritySource>
             binding_state_sources;
@@ -3064,7 +3026,6 @@ qualify_stop_applicability(
                                policy.stop_evidence_policy_id.value()},
                               {"stop_evidence_policy_revision",
                                policy.stop_evidence_policy_revision.value()}}),
-          timing_budgets.at(binding.control_binding_id),
           std::move(stages),
       };
       checked_add(logical_rows, 1U, kMaxCellLogicalApplicabilityRows,
@@ -3119,11 +3080,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   qualify_provider_instances(composition.graph(), deployment_inputs.value());
 
   auto bindings = qualify_binding_contexts(composition, indexes);
-  const auto timing_budgets = detail::resolve_binding_stop_timing(
-      composition.graph().control_bindings, stop_evidence_policies,
-      deployment_inputs.value().stop_timing_parameters);
-  if (!timing_budgets.ok())
-    fail(timing_budgets.error().message);
   auto stop_dependencies =
       qualify_stop_dependencies(bindings, deployment_inputs.value(),
                                 value_schemas, commissioning_evidence_refs);
@@ -3139,9 +3095,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   checked_add(
       logical_rows, deployment_inputs.value().stop_stage_parameters.size(),
       kMaxCellLogicalApplicabilityRows, "cell logical applicability rows");
-  checked_add(
-      logical_rows, deployment_inputs.value().stop_timing_parameters.size(),
-      kMaxCellLogicalApplicabilityRows, "cell logical applicability rows");
   checked_add(logical_rows,
               deployment_inputs.value().commissioned_stop_interfaces.size(),
               kMaxCellLogicalApplicabilityRows,
@@ -3156,7 +3109,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   auto stop_applicability = qualify_stop_applicability(
       composition.graph().cell_id, bindings, controllers_and_routes.routes,
       controllers_and_routes.controllers, deployment_inputs.value(),
-      stop_dependencies, names, logical_rows, timing_budgets.value());
+      stop_dependencies, names, logical_rows);
 
   std::vector<LogicalBindingInterfaceTemplate> binding_interfaces;
   binding_interfaces.reserve(bindings.size());

@@ -52,6 +52,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {
@@ -116,12 +117,7 @@
                 "source_joint_name": "joint6"
               }
             ],
-            "stop_mode": "soft_on_path",
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 1500000000
-            }
+            "stop_mode": "soft_on_path"
           },
           "maximum_tcp_linear_speed_mps": 0.15
         }
@@ -130,6 +126,7 @@
   ],
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
+  "isaac_world": "test_scene_realsense_foundationpose_trocar",
   "name": "trocar_lite6_foundationpose_pick",
   "policies": {
     "interrupt_config": {

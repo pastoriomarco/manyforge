@@ -206,7 +206,6 @@ struct ResourceAddressedExecutionKernelConfig final {
       RuntimeParticipantAdmissionResolver resolver = {},
       IResourceOperationAdmissionGate* admission_gate = nullptr,
       std::optional<GraphRevision> current_graph_revision = {},
-      std::optional<StopDeadlineBudgetDTO> stop_budget = {},
       std::size_t stop_correlation_capacity = kMaximumEmergencyStopCorrelationEntries,
       std::size_t maximum_live_stop_participants = 0U,
       std::size_t forensic_projection_capacity = 0U,
@@ -218,7 +217,6 @@ struct ResourceAddressedExecutionKernelConfig final {
         participant_resolver(std::move(resolver)),
         operation_admission_gate(admission_gate),
         graph_revision(std::move(current_graph_revision)),
-        cell_stop_deadline_budget(std::move(stop_budget)),
         emergency_stop_correlation_capacity(stop_correlation_capacity),
         prequalified_max_live_stop_participants(maximum_live_stop_participants),
         stop_forensic_projection_capacity(forensic_projection_capacity),
@@ -240,10 +238,6 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// omitted, construction derives it only when every registered participant
   /// names one identical non-empty graph revision.
   std::optional<GraphRevision> graph_revision;
-  /// Cell-wide outer/reserve envelope. Participant phase tables remain local
-  /// to their prepared plans. If omitted, construction derives the common
-  /// envelope from verified readiness and fails when no such referent exists.
-  std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget;
   std::size_t emergency_stop_correlation_capacity{kMaximumEmergencyStopCorrelationEntries};
   /// Maximum number of participants whose Stop cascades may be live at once.
   /// Zero derives the exact bound from the initially registered execution
@@ -525,12 +519,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
 
   /// Select one verified runtime product before route readiness is published.
-  /// Unlike a later participant/readiness refresh, this replaces the retained
-  /// cell-wide Stop deadline referent with the exact product-owned value.
   [[nodiscard]] Result<void> reconfigure_runtime_product(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
-      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
       std::function<Result<void>()> commit_publication = {});
 
   /// Install an exact component-set transition beneath one held Manager Apply
@@ -541,7 +532,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> reconfigure_runtime_component_set(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
-      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
       RetainedBundleId candidate_retained_bundle_id,
       GraphRevision candidate_graph_revision,
       const ConfigurationFenceId& apply_fence_id,
@@ -728,6 +718,17 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> release_prepared_dispatch_barrier(
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
       std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product);
+  /// Q58: the exact local settlement a completed Stop handed to this
+  /// command's dispatch return. A failed settlement fails closed.
+  void settle_deferred_capability_stop(const OperationId& operation_id,
+                                       IResolvedParticipantExecutionEngine* participant_engine,
+                                       IResolvedParticipantExecutionEngine* settlement_engine,
+                                       const AddressedParticipantStopSettlementRequestDTO& request);
+  /// Q60: perform, on the Stop lane, the exact settlements that closed Stops
+  /// deferred to their never-dispatched participants' late cancellation
+  /// terminals. A late failure is retained on the participant; one not proved
+  /// an already-failed preparation fails closed (as a failed Stop settlement).
+  void settle_deferred_pre_dispatch_cancellations() noexcept;
   [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
       const OperationIntentDTO& intent);
   /// Dispatch none, cancel every prepared participant and release the
@@ -757,7 +758,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
       bool retain_unready_configuration_facts,
-      const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget = nullptr,
       const ConfigurationFenceId* apply_fence_id = nullptr,
       const ConfigurationFenceScopeDTO* apply_scope = nullptr,
       const std::vector<ControllableComponentId>* retained_components = nullptr,
@@ -914,7 +914,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // a fully validated runtime reconfiguration.
   std::optional<GraphRevision> stop_graph_revision_;
   std::optional<RetainedBundleId> stop_retained_bundle_id_;
-  std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget_;
   std::vector<StopScopeComponentSnapshotDTO> stop_component_scope_;
   EmergencyStopAcceptanceReserve emergency_stop_reserve_;
   std::vector<std::unique_ptr<StopTransaction>> stop_transactions_;

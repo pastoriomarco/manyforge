@@ -44,19 +44,23 @@ enum class StopEvidenceItemStateDTO : std::uint8_t {
   kInapplicable,
 };
 
-struct RemainingStopPhaseBudgetDTO final {
-  StopBudgetPhaseId phase_id;
-  std::int64_t remaining_deadline_offset_ns{};
-
-  friend bool operator==(const RemainingStopPhaseBudgetDTO&,
-                         const RemainingStopPhaseBudgetDTO&) = default;
-};
-
+/// Q51/Q53: the per-robot Stop-time values handed with one Stop stage. There
+/// is no shared cell-wide budget: each robot is checked against its own
+/// deadlines, computed by the Kernel at Stop time from its own profile.
+/// Durations are relative to the stage dispatch, so receivers translate them
+/// onto their own monotonic clocks and never see the Kernel's timestamps.
 struct RemainingStopBudgetDTO final {
   StopId stop_id;
   StopGeneration stop_generation;
-  std::int64_t remaining_outer_duration_ns{};
-  std::vector<RemainingStopPhaseBudgetDTO> phases;
+  /// Time since the Stop was accepted (Q28: deadlines run from the Stop
+  /// request).
+  std::int64_t elapsed_since_stop_ns{};
+  /// Controlled stages only (Q28/Q51): the remaining time of this robot's own
+  /// controlled-Stop deadline (`max_stop_time_s`, else deceleration time plus
+  /// `complete_move_on_signal_timeout`). Absent for hard stages (Q57: the
+  /// participant bounds them with its lane's stop-completion timeout) and for
+  /// fire-and-forget gripper cancels (Q58).
+  std::optional<std::int64_t> remaining_controlled_deadline_ns;
 
   friend bool operator==(const RemainingStopBudgetDTO&, const RemainingStopBudgetDTO&) = default;
 };

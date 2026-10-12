@@ -37,7 +37,14 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
     } == {"lite6_lite_gripper", "ur5e_robotiq_2f_85"}
     assert len(graph["runtime_units"]) == 1
     runtime = graph["runtime_units"][0]
-    assert runtime["runtime_unit_id"] == "robot_cell.native_execution"
+    # Q63-Q68: both robots run on the offline mock lane in one ROS runtime
+    # unit, each with its own controller profile.
+    assert runtime["runtime_unit_id"] == "robot_cell.ros2_control_execution"
+    assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
+    assert runtime["configuration"]["controller_profiles"] == [
+        {"controllable_component_id": "lite6_robot", "frame_prefix": "", "mock_profile": "lite6_lite_gripper"},
+        {"controllable_component_id": "ur5e_robot", "frame_prefix": "", "mock_profile": "ur5e_robotiq_2f_85"},
+    ]
     assert {
         row["controllable_component_id"]
         for row in runtime["configuration"]["motion_target_limits"]
@@ -59,7 +66,7 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         for row in grippers.values()
     )
     assert all(
-        row["runtime_unit_ids"] == ["robot_cell.native_execution"]
+        row["runtime_unit_ids"] == ["robot_cell.ros2_control_execution"]
         for row in components.values()
     )
 
@@ -74,7 +81,7 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
             if endpoint["source_kind"] == "runtime_unit"
         }
         if runtime_sources:
-            assert runtime_sources == {"robot_cell.native_execution"}
+            assert runtime_sources == {"robot_cell.ros2_control_execution"}
         if provider["scope"] != "target_binding":
             continue
         target = provider["target"]

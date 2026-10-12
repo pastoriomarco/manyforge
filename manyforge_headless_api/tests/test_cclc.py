@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -292,6 +293,170 @@ def test_client_requires_the_incident_key(tmp_path: Path) -> None:
     del snapshot["lifecycle_progress"]["incident"]
     with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
         _snapshot_through_client(tmp_path, snapshot)
+
+
+def _incident_diagnostic() -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "controller_launch_exited", "message": "m" * 1024,
+            "details": {"component_id": "component.arm"},
+        },
+        "snapshot": {
+            "exit": {
+                "status": None, "signal": 11, "core_dumped": False,
+                "observed_utc": "2026-10-11T18:00:00Z",
+            },
+            "context": {
+                "component_id": "component.arm", "request_context": "Apply request.1",
+                "runtime_unit_id": "runtime.arm", "runtime_epoch": "epoch.1",
+                "bundle_id": "bundle.1", "graph_revision": "graph.1",
+                "generator_identity": None, "launch_identity": "launch.1",
+            },
+            "readiness": {
+                "known": True, "controller_manager_present": True,
+                "controller_observed": True, "controller_loaded": True,
+                "controller_bound": False, "arm_controller_active": None,
+                "hardware_ready": None, "joint_sample_available": False,
+                "binding_epoch": str(2**64 - 1), "sample_age_ns": str(2**63 - 1),
+                "captured_utc": None,
+            },
+            "settings": {
+                "argv": ["ros2", "launch"], "controller_profile": "lite6",
+                "runtime_namespace": "", "arm_controller_name": "arm_controller",
+                "gripper_controller_name": None, "frame_prefix": "",
+                "controllers_yaml": "controllers: {}\n",
+                "retained_configuration_json": '{"effective":true}',
+            },
+            "generated": {
+                "robot_description_sha256": "sha256:" + "a" * 64,
+                "controllers_sha256": None,
+            },
+            "output": {
+                "tail": 'first "line"\nCafé\n', "line_count": 2, "truncated": True,
+                "dropped_forward_lines": str(2**64 - 1), "dropped_forward_bytes": 0,
+                "invalid_text_bytes": 0,
+            },
+            "core_dump_link": None,
+        },
+    }
+
+
+@pytest.mark.parametrize("diagnostic", [
+    None, {**_incident_diagnostic(), "snapshot": None}, _incident_diagnostic(),
+])
+def test_client_preserves_optional_incident_diagnostic(
+    tmp_path: Path, diagnostic: Any
+) -> None:
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+def test_short_only_diagnostic_requires_a_valid_error_and_closed_fields() -> None:
+    for diagnostic in [
+        {"error": None, "snapshot": None},
+        {"error": _incident_diagnostic()["error"]},
+        {"error": _incident_diagnostic()["error"], "snapshot": None, "extra": True},
+    ]:
+        snapshot = _incident_snapshot()
+        snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+        with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+            _validate_lifecycle_target_facts(snapshot)
+
+
+@pytest.mark.parametrize("lines,bytes_", [
+    (0, 0), (2**53 - 1, str(2**53)), (str(2**64 - 1), str(2**64 - 1)),
+])
+def test_client_preserves_paired_output_drop_counters(
+    tmp_path: Path, lines: Any, bytes_: Any
+) -> None:
+    snapshot = _target_snapshot()
+    snapshot.update(dropped_output_lines=lines, dropped_output_bytes=bytes_)
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+@pytest.mark.parametrize("invalid", [None, True, -1, 1.5, 2**53, "01", str(2**64)])
+def test_rejects_invalid_or_unpaired_output_drop_counters(invalid: Any) -> None:
+    for field in ("dropped_output_lines", "dropped_output_bytes"):
+        snapshot = _target_snapshot()
+        snapshot.update(dropped_output_lines=0, dropped_output_bytes=0)
+        snapshot[field] = invalid
+        with pytest.raises(HeadlessApiError, match="dropped_output"):
+            _validate_lifecycle_target_facts(snapshot)
+        del snapshot[field]
+        with pytest.raises(HeadlessApiError, match="dropped_output"):
+            _validate_lifecycle_target_facts(snapshot)
+
+
+def test_client_preserves_diagnostic_bom_and_literal_detail_keys(tmp_path: Path) -> None:
+    snapshot = _incident_snapshot()
+    diagnostic = _incident_diagnostic()
+    diagnostic["snapshot"]["settings"]["controllers_yaml"] = "\ufeffcontrollers: {}\n"
+    diagnostic["error"]["details"] = {"__proto__": "observed"}
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid"),
+    [
+        (("extra",), True),
+        (("error", "details"), {str(i): "value" for i in range(9)}),
+        (("error", "details"), {"": "value"}),
+        (("error", "message"), "m" * 1025),
+        (("snapshot", "extra"), {}),
+        (("snapshot", "exit", "signal"), True),
+        (("snapshot", "exit", "status"), 256),
+        (("snapshot", "context", "component_id"), "x" * 129),
+        (("snapshot", "readiness", "controller_bound"), "unknown"),
+        (("snapshot", "readiness", "sample_age_ns"), 2**53),
+        (("snapshot", "readiness", "sample_age_ns"), str(2**63)),
+        (("snapshot", "readiness", "binding_epoch"), str(2**64)),
+        (("snapshot", "settings", "retained_configuration_json"), {"escape": True}),
+        (("snapshot", "settings", "frame_prefix"), "Cafe\u0301"),
+        (("snapshot", "settings", "argv"), ["\ud800"]),
+        (("snapshot", "generated", "controllers_sha256"), "sha256:" + "A" * 64),
+        (("snapshot", "output", "tail"), "Cafe\u0301\n"),
+        (("snapshot", "output", "line_count"), 1),
+        (("snapshot", "output", "truncated"), 1),
+        (("snapshot", "output", "dropped_forward_bytes"), "01"),
+    ],
+)
+def test_rejects_malformed_closed_diagnostic(path: tuple[str, ...], invalid: Any) -> None:
+    snapshot = _incident_snapshot()
+    diagnostic = _incident_diagnostic()
+    cursor = diagnostic
+    for field in path[:-1]:
+        cursor = cursor[field]
+    cursor[path[-1]] = invalid
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(snapshot)
+
+
+def test_diagnostic_caps_encoded_tail_and_preserves_nullable_facts() -> None:
+    snapshot = _incident_snapshot()
+    diagnostic = _incident_diagnostic()
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    facts = diagnostic["snapshot"]
+    facts["readiness"] = dict.fromkeys(facts["readiness"])
+    output = facts["output"]
+    for tail, lines in [("", 0), ("a\nb", 2), ("a\n" * 2000, 2000), ('"' * 65535, 1)]:
+        output.update(tail=tail, line_count=lines)
+        _validate_lifecycle_target_facts(snapshot)
+    for tail, lines in [('"' * 65536, 1), ("a\n" * 2001, 2001), ("😀" * 32768, 1)]:
+        output.update(tail=tail, line_count=lines)
+        with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+            _validate_lifecycle_target_facts(snapshot)
+    output.update(tail="", line_count=0)
+    facts["settings"]["controllers_yaml"] = "x" * (300 * 1024)
+    _validate_lifecycle_target_facts(snapshot)
+    oversized = deepcopy(snapshot)
+    oversized["lifecycle_progress"]["incident"]["diagnostic"]["snapshot"]["settings"][
+        "controllers_yaml"
+    ] = "x" * (512 * 1024)
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(oversized)
 
 
 def test_client_rejects_a_lifecycle_progress_with_a_missing_key(tmp_path: Path) -> None:

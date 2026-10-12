@@ -225,33 +225,9 @@ namespace {
         "registered_command_kind_id"));
   }
   return core::StopContainmentCommandDTO{
-      core::StopBudgetPhaseId(require_string(
-          require_member(value, "command_phase_id"), "command_phase_id")),
       kind,
       std::move(contract),
       std::move(registered_kind),
-  };
-}
-
-[[nodiscard]] core::StopDeadlineBudgetDTO decode_budget(
-    const CanonicalValue& value) {
-  const auto& items = require_array(require_member(value, "phases"), "phases");
-  std::vector<core::StopBudgetPhaseDTO> phases;
-  phases.reserve(items.size());
-  for (const auto& item : items) {
-    phases.push_back(core::StopBudgetPhaseDTO{
-        core::StopBudgetPhaseId(
-            require_string(require_member(item, "phase_id"), "phase_id")),
-        require_integer(require_member(item, "deadline_offset_ns"),
-                        "deadline_offset_ns"),
-    });
-  }
-  return core::StopDeadlineBudgetDTO{
-      require_integer(require_member(value, "outer_duration_ns"),
-                      "outer_duration_ns"),
-      require_integer(require_member(value, "kernel_completion_reserve_ns"),
-                      "kernel_completion_reserve_ns"),
-      std::move(phases),
   };
 }
 
@@ -322,8 +298,6 @@ namespace {
   return core::StopEvidenceRequirementDTO{
       core::StopEvidenceItemId(require_string(
           require_member(value, "evidence_item_id"), "evidence_item_id")),
-      core::StopBudgetPhaseId(
-          require_string(require_member(value, "phase_id"), "phase_id")),
       kind,
       std::move(contract),
       std::move(registered_kind),
@@ -534,62 +508,20 @@ void validate_evidence_shape(
 
 void validate_policy_semantics(const core::StopEvidencePolicyDTO& policy) {
   if (policy.disposition == core::StopEvidenceDisposition::kNotStoppable) {
-    if (policy.deadline_budget.has_value() ||
-        !policy.escalation_stages.empty()) {
+    if (!policy.escalation_stages.empty()) {
       fail("not_stoppable policy carries stoppable-only fields");
     }
     return;
   }
 
-  if (!policy.deadline_budget.has_value() ||
-      policy.escalation_stages.empty() ||
+  if (policy.escalation_stages.empty() ||
       policy.escalation_stages.size() > core::kMaxStopEscalationStages) {
     fail("stoppable policy is missing or exceeds its bounded escalation chain");
   }
-  const auto& budget = *policy.deadline_budget;
-  if (budget.phases.empty() ||
-      budget.phases.size() > core::kMaxStopEvidencePolicyItems) {
-    fail("Stop policy exceeds its fixed phase bound");
-  }
-  if (budget.outer_duration_ns <= 0 ||
-      budget.kernel_completion_reserve_ns <= 0) {
-    fail("Stop outer duration and Kernel completion reserve must be positive");
-  }
-
-  std::set<std::string> phase_ids;
-  std::vector<std::string> phase_order;
-  phase_order.reserve(budget.phases.size());
-  std::int64_t previous_offset = 0;
-  for (const auto& phase : budget.phases) {
-    if (!phase_ids.insert(phase.phase_id.value()).second) {
-      fail("Stop deadline budget contains a duplicate phase ID");
-    }
-    if (phase.deadline_offset_ns <= previous_offset) {
-      fail("Stop phase deadline offsets are not strictly increasing");
-    }
-    phase_order.push_back(phase.phase_id.value());
-    previous_offset = phase.deadline_offset_ns;
-  }
-  if (previous_offset >
-      budget.outer_duration_ns - budget.kernel_completion_reserve_ns) {
-    fail("last Stop phase leaves less than the Kernel completion reserve");
-  }
-
-  const auto phase_index = [&phase_order](const core::StopBudgetPhaseId& id) {
-    for (std::size_t index = 0U; index < phase_order.size(); ++index) {
-      if (phase_order[index] == id.value()) {
-        return index;
-      }
-    }
-    fail("Stop stage references an unknown phase");
-  };
 
   std::set<std::string> stage_ids;
-  std::set<std::string> command_phase_ids;
   std::set<std::string> evidence_ids;
-  std::vector<bool> used_phases(budget.phases.size(), false);
   std::size_t evidence_count = 0U;
-  std::size_t previous_stage_last_phase = 0U;
   std::size_t previous_granularity = 0U;
   std::size_t software_hard_count = 0U;
   bool motion_policy = false;
@@ -657,22 +589,6 @@ void validate_policy_semantics(const core::StopEvidencePolicyDTO& policy) {
                     stage.containment_command.command_kind ==
                         core::StopContainmentCommandKind::kMotionControlledStop;
 
-    const auto command_index =
-        phase_index(stage.containment_command.command_phase_id);
-    if (!command_phase_ids
-             .insert(stage.containment_command.command_phase_id.value())
-             .second) {
-      fail("Stop escalation stages reuse a command phase");
-    }
-    if (stage_index == 0U && command_index != 0U) {
-      fail("nominal containment command does not use the first Stop phase");
-    }
-    if (stage_index > 0U && command_index <= previous_stage_last_phase) {
-      fail("later Stop command does not follow the preceding stage evidence");
-    }
-    used_phases[command_index] = true;
-
-    std::size_t stage_last_phase = command_index;
     for (const auto& requirement : stage.evidence_requirements) {
       ++evidence_count;
       if (evidence_count > core::kMaxStopEvidencePolicyItems) {
@@ -685,44 +601,22 @@ void validate_policy_semantics(const core::StopEvidencePolicyDTO& policy) {
       motion_policy = motion_policy ||
                       requirement.evidence_kind ==
                           core::StopEvidenceRequirementKind::kMotionRest;
-      const auto evidence_phase = phase_index(requirement.phase_id);
       const auto observation =
           requirement.observation_semantics.observation_kind;
-      if (observation == core::StopEvidenceObservationKind::kCommandResult) {
-        if (evidence_phase != command_index ||
-            requirement.observation_semantics.minimum_dwell_ns.has_value()) {
-          fail("command-result evidence must use its stage command phase");
-        }
-      } else {
-        if (evidence_phase <= command_index) {
-          fail("post-command evidence must use a later phase");
-        }
+      if (observation == core::StopEvidenceObservationKind::kCommandResult &&
+          requirement.observation_semantics.minimum_dwell_ns.has_value()) {
+        fail("command-result evidence carries minimum_dwell_ns");
       }
       if (observation == core::StopEvidenceObservationKind::kPostCommandDwell) {
         if (!requirement.observation_semantics.minimum_dwell_ns.has_value() ||
             *requirement.observation_semantics.minimum_dwell_ns <= 0) {
           fail("post-command dwell must be positive");
         }
-        const auto available =
-            budget.phases[evidence_phase].deadline_offset_ns -
-            budget.phases[command_index].deadline_offset_ns;
-        if (*requirement.observation_semantics.minimum_dwell_ns > available) {
-          fail("post-command dwell exceeds its static phase-offset window");
-        }
       } else if (requirement.observation_semantics.minimum_dwell_ns
                      .has_value()) {
         fail("non-dwell observation carries minimum_dwell_ns");
       }
-      if (evidence_phase < stage_last_phase) {
-        fail("Stop evidence order does not follow the phase sequence");
-      }
-      used_phases[evidence_phase] = true;
-      stage_last_phase = evidence_phase;
     }
-    if (stage_index > 0U && stage_last_phase <= previous_stage_last_phase) {
-      fail("Stop stage terminal evidence phases are not strictly increasing");
-    }
-    previous_stage_last_phase = stage_last_phase;
   }
 
   if (motion_policy && software_hard_count != 1U) {
@@ -734,11 +628,6 @@ void validate_policy_semantics(const core::StopEvidencePolicyDTO& policy) {
   if (granularity_rank(policy.containment_granularity) !=
       previous_granularity) {
     fail("policy containment granularity is not its coarsest stage");
-  }
-  if (previous_stage_last_phase + 1U != budget.phases.size() ||
-      std::find(used_phases.begin(), used_phases.end(), false) !=
-          used_phases.end()) {
-    fail("Stop deadline budget contains an unused phase");
   }
 }
 
@@ -762,12 +651,9 @@ void validate_policy_semantics(const core::StopEvidencePolicyDTO& policy) {
       parse_granularity(require_string(
           require_member(normalized, "containment_granularity"),
           "containment_granularity")),
-      std::nullopt,
       {},
   };
   if (disposition == core::StopEvidenceDisposition::kStoppable) {
-    policy.deadline_budget =
-        decode_budget(require_member(normalized, "deadline_budget"));
     const auto& items = require_array(
         require_member(normalized, "escalation_stages"),
         "escalation_stages");

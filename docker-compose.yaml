@@ -167,7 +167,8 @@ services:
     profiles:
       - ros-full
 
-  # I9 mechanical Isaac ros2_control product. Isaac remains a separately
+  # Developer tool: standalone I9 Isaac ros2_control qualification, separate
+  # from the Manager-owned component/world launch. Isaac remains a separately
   # owned laptop process; this Orin-side service builds into the persistent
   # cache, proves the exact stopped world, then exposes JTC and thin adapters.
   # Composer/Program auto-load and DemoSupervisor ownership remain absent.

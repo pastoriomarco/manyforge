@@ -1,4 +1,3 @@
-#include "stop_timing_resolution_internal.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1036,7 +1035,6 @@ verify_optional_identity(const CanonicalValue &value, std::string_view path) {
 }
 
 struct StopEvidenceFacts final {
-  std::string phase_id;
   std::string source_kind;
   std::optional<std::string> endpoint_role_id;
   std::optional<ContractFacts> provider_contract;
@@ -1103,7 +1101,7 @@ void verify_stop_applicability(
            "control_domain_id", "control_domain_revision",
            "controller_topology_id", "topology_revision",
            "containment_granularity", "disposition", "logical_stop_symbol",
-           "deadline_budget", "escalation_stages"},
+           "escalation_stages"},
           path);
     } else {
       fail_retained_bundle(path + " has an unknown Stop disposition");
@@ -1164,8 +1162,6 @@ void verify_stop_applicability(
       fail_retained_bundle(stop_path +
                            " has an invalid Stop escalation inventory");
     }
-    std::size_t previous_stage_last_phase = 0U;
-    bool has_previous_stage = false;
     int previous_granularity = -1;
     std::size_t software_hard_count = 0U;
     bool saw_safety_request = false;
@@ -1228,12 +1224,9 @@ void verify_stop_applicability(
           require_object(require_member(row, "containment_command", path),
                          path + ".containment_command");
       require_exact_fields(command,
-                           {"command_phase_id", "command_kind",
-                            "provider_contract_ref",
+                           {"command_kind", "provider_contract_ref",
                             "registered_command_kind_id"},
                            path + ".containment_command");
-      const std::string command_phase = require_identity_member(
-          command, "command_phase_id", path + ".containment_command");
       const std::string &command_kind =
           require_string(require_member(command, "command_kind",
                                         path + ".containment_command"),
@@ -1335,61 +1328,6 @@ void verify_stop_applicability(
         }
       }
 
-      const auto &budget =
-          require_object(require_member(stop_row, "deadline_budget", stop_path),
-                         stop_path + ".deadline_budget");
-      require_exact_fields(
-          budget,
-          {"outer_duration_ns", "kernel_completion_reserve_ns", "phases"},
-          stop_path + ".deadline_budget");
-      const std::int64_t outer = require_safe_integer(
-          require_member(budget, "outer_duration_ns",
-                         stop_path + ".deadline_budget"),
-          stop_path + ".deadline_budget.outer_duration_ns");
-      const std::int64_t reserve = require_safe_integer(
-          require_member(budget, "kernel_completion_reserve_ns",
-                         stop_path + ".deadline_budget"),
-          stop_path + ".deadline_budget.kernel_completion_reserve_ns");
-      const auto &phase_rows = require_array(
-          require_member(budget, "phases", stop_path + ".deadline_budget"),
-          stop_path + ".deadline_budget.phases");
-      if (outer <= 0 || reserve <= 0 || reserve >= outer ||
-          phase_rows.empty() ||
-          phase_rows.size() > core::kMaxStopEvidencePolicyItems) {
-        fail_retained_bundle(path + " has an invalid Stop deadline budget");
-      }
-      std::map<std::string, std::size_t, std::less<>> phase_order;
-      std::vector<std::int64_t> phase_deadlines;
-      phase_deadlines.reserve(phase_rows.size());
-      std::int64_t previous_deadline = 0;
-      for (std::size_t phase_index = 0U; phase_index < phase_rows.size();
-           ++phase_index) {
-        const std::string phase_path = stop_path + ".deadline_budget.phases[" +
-                                       std::to_string(phase_index) + "]";
-        const auto &phase = require_object(phase_rows[phase_index], phase_path);
-        require_exact_fields(phase, {"phase_id", "deadline_offset_ns"},
-                             phase_path);
-        const std::string phase_id =
-            require_identity_member(phase, "phase_id", phase_path);
-        const std::int64_t deadline = require_safe_integer(
-            require_member(phase, "deadline_offset_ns", phase_path),
-            phase_path + ".deadline_offset_ns");
-        if (deadline <= previous_deadline || deadline > outer - reserve ||
-            !phase_order.emplace(phase_id, phase_index).second) {
-          fail_retained_bundle(phase_path +
-                               " is not a valid ordered budget phase");
-        }
-        previous_deadline = deadline;
-        phase_deadlines.push_back(deadline);
-      }
-      const auto command_phase_position = phase_order.find(command_phase);
-      if (command_phase_position == phase_order.end() ||
-          (!has_previous_stage && command_phase_position->second != 0U) ||
-          (has_previous_stage &&
-           command_phase_position->second != previous_stage_last_phase + 1U)) {
-        fail_retained_bundle(path +
-                             " command phase is outside the exact stage order");
-      }
       if (require_string(require_member(row, "evidence_conjunction", path),
                          path + ".evidence_conjunction") != "all_of") {
         fail_retained_bundle(path + " has an unsupported evidence conjunction");
@@ -1403,8 +1341,6 @@ void verify_stop_applicability(
         fail_retained_bundle(path + " has an invalid Stop evidence inventory");
       }
       std::map<std::string, StopEvidenceFacts, std::less<>> evidence_facts;
-      std::size_t previous_evidence_phase = command_phase_position->second;
-      bool has_evidence_phase = false;
       for (std::size_t evidence_index = 0U;
            evidence_index < evidence_rows.size(); ++evidence_index) {
         const std::string evidence_path = path +
@@ -1413,7 +1349,7 @@ void verify_stop_applicability(
         const auto &evidence =
             require_object(evidence_rows[evidence_index], evidence_path);
         require_exact_fields(evidence,
-                             {"evidence_item_id", "phase_id", "evidence_kind",
+                             {"evidence_item_id", "evidence_kind",
                               "provider_contract_ref",
                               "registered_evidence_kind_id",
                               "source_requirement", "observation_semantics"},
@@ -1424,20 +1360,10 @@ void verify_stop_applicability(
           fail_retained_bundle(evidence_path +
                                " repeats an evidence item across Stop stages");
         }
-        const std::string phase_id =
-            require_identity_member(evidence, "phase_id", evidence_path);
-        const auto phase = phase_order.find(phase_id);
         const std::string &evidence_kind = require_string(
             require_member(evidence, "evidence_kind", evidence_path),
             evidence_path + ".evidence_kind");
-        if (phase == phase_order.end() ||
-            (!has_evidence_phase &&
-             (phase->second < command_phase_position->second ||
-              phase->second > command_phase_position->second + 1U)) ||
-            (has_evidence_phase &&
-             (previous_evidence_phase > phase->second ||
-              phase->second > previous_evidence_phase + 1U)) ||
-            !is_one_of(evidence_kind,
+        if (!is_one_of(evidence_kind,
                        {"controller_goal_terminal", "motion_rest",
                         "discrete_acknowledgement", "io_safe_output",
                         "logical_cancellation_no_continuing_effect",
@@ -1445,8 +1371,6 @@ void verify_stop_applicability(
           fail_retained_bundle(evidence_path +
                                " has invalid ordered evidence semantics");
         }
-        previous_evidence_phase = phase->second;
-        has_evidence_phase = true;
         const auto evidence_contract = verify_optional_provider_contract(
             require_member(evidence, "provider_contract_ref", evidence_path),
             evidence_path + ".provider_contract_ref");
@@ -1549,33 +1473,18 @@ void verify_stop_applicability(
             (!is_null(dwell) &&
              require_safe_integer(
                  dwell, evidence_path +
-                            ".observation_semantics.minimum_dwell_ns") <= 0) ||
-            (observation_kind == "command_result" &&
-             phase->second != command_phase_position->second) ||
-            (observation_kind != "command_result" &&
-             phase->second == command_phase_position->second) ||
-            (!is_null(dwell) &&
-             require_safe_integer(
-                 dwell,
-                 evidence_path + ".observation_semantics.minimum_dwell_ns") >
-                 phase_deadlines[phase->second] -
-                     phase_deadlines[command_phase_position->second])) {
+                            ".observation_semantics.minimum_dwell_ns") <= 0)) {
           fail_retained_bundle(evidence_path +
                                " has invalid observation semantics");
         }
         if (!evidence_facts
                  .emplace(evidence_id,
-                          StopEvidenceFacts{phase_id, source_kind,
-                                            endpoint_role, evidence_contract,
+                          StopEvidenceFacts{source_kind, endpoint_role,
+                                            evidence_contract,
                                             authority_classes})
                  .second) {
           fail_retained_bundle(evidence_path + " duplicates an evidence item");
         }
-      }
-      if (stage_index + 1U == stage_rows.size() &&
-          previous_evidence_phase + 1U != phase_rows.size()) {
-        fail_retained_bundle(path +
-                             " contains a Stop budget phase with no evidence");
       }
 
       const CanonicalValue &command_endpoint_value =
@@ -1814,8 +1723,6 @@ void verify_stop_applicability(
                                " has an unknown containment scope kind");
         }
       }
-      previous_stage_last_phase = previous_evidence_phase;
-      has_previous_stage = true;
     }
     const int top_level_granularity =
         binding->second.containment == "resource"         ? 0
@@ -2098,11 +2005,6 @@ void verify_catalog_source_closure(
   for (const auto &binding : retained_bundle.cell_graph.control_bindings)
     expected_policy_ids.emplace(binding.stop_evidence_policy_id.value(),
                                 binding.stop_evidence_policy_revision.value());
-  const auto timing_budgets = resolve_binding_stop_timing(
-      retained_bundle.cell_graph.control_bindings, stop_policies,
-      retained_bundle.stop_timing_parameters);
-  if (!timing_budgets.ok())
-    fail_retained_bundle(timing_budgets.error().message);
   std::map<Identity, const QualifiedStopEvidencePolicy *> policies;
   for (const auto &policy : stop_policies) {
     const Identity key{policy.value().stop_evidence_policy_id.value(),
@@ -2253,9 +2155,6 @@ void verify_catalog_source_closure(
     if (require_string(require_member(stop, "disposition", "control"),
                        "control.stop_applicability.disposition") ==
         "stoppable") {
-      policy_fields.emplace_back(
-          "deadline_budget",
-          require_member(stop, "deadline_budget", "control"));
       CanonicalValue::Array stages;
       for (const auto &stage_value :
            require_array(require_member(stop, "escalation_stages", "control"),
@@ -2279,11 +2178,7 @@ void verify_catalog_source_closure(
       policy_fields.emplace_back("escalation_stages",
                                  CanonicalValue(std::move(stages)));
     }
-    auto expected_policy = policy->second->value();
-    if (expected_policy.disposition ==
-        core::StopEvidenceDisposition::kStoppable)
-      expected_policy.deadline_budget =
-          timing_budgets.value().at(core::ControlBindingId(binding_id));
+    const auto &expected_policy = policy->second->value();
     if (canonical_json(CanonicalValue(std::move(policy_fields))) !=
         canonical_json(stop_policy_applicability_projection(expected_policy))) {
       fail_retained_bundle(
@@ -2340,31 +2235,6 @@ void verify_catalog_source_closure(
       const auto &command = require_object(
           require_member(stage, "containment_command", "control"),
           "control.stop_applicability.containment_command");
-      const auto timing = std::find_if(
-          retained_bundle.stop_timing_parameters.begin(),
-          retained_bundle.stop_timing_parameters.end(), [&](const auto &row) {
-            return row.control_binding_id.value() == binding_id;
-          });
-      if (timing != retained_bundle.stop_timing_parameters.end() &&
-          require_string(require_member(command, "command_kind", "control"),
-                         "control") == "motion_controlled_stop") {
-        const auto &parameters =
-            require_member(stage, "default_contract_parameters", "control");
-        if (const auto *duration =
-                parameters.find_object_member("deceleration_time_s")) {
-          const auto *seconds = std::get_if<double>(&duration->storage());
-          if (seconds == nullptr || !std::isfinite(*seconds) || *seconds <= 0 ||
-              *seconds > core::kMaxControlledStopDecelerationTimeS)
-            fail_retained_bundle("retained controlled Stop duration is outside "
-                                 "the qualified range");
-          const auto checked = core::validate_controlled_stop_timing(
-              timing->timing,
-              static_cast<std::int64_t>(std::ceil(
-                  static_cast<long double>(*seconds) * 1'000'000'000.0L)));
-          if (!checked.ok())
-            fail_retained_bundle(checked.error().message);
-        }
-      }
       const auto contract = verify_optional_provider_contract(
           require_member(command, "provider_contract_ref", "control"),
           "control.stop_applicability.provider_contract_ref");

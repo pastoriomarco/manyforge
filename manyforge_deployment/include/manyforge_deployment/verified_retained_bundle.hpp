@@ -665,6 +665,18 @@ class VerifiedRetainedPlanningResource final {
   friend class detail::VerifiedRetainedPlanningConstructionAuthority;
 };
 
+/// The exact, independently verified URDF entrypoint of one graph-selected
+/// model asset's source closure (the ManyForge model URDF of the model
+/// bundle, design Q69: the controller-description generator input).
+struct VerifiedRetainedModelSourceUrdf final {
+  core::ModelAssetId model_asset_id;
+  core::ModelRevision model_revision;
+  std::string urdf_bytes;
+
+  friend bool operator==(const VerifiedRetainedModelSourceUrdf&,
+                         const VerifiedRetainedModelSourceUrdf&) = default;
+};
+
 /// Sealed, owned planning input reconstructed from one exact retained bundle.
 ///
 /// The URDF/SRDF bytes are the exact compiled planning-product artifacts.
@@ -698,21 +710,30 @@ class VerifiedRetainedPlanningModel final {
   resources() const noexcept {
     return resources_;
   }
+  /// The verified source URDF entrypoint of every graph-selected model asset,
+  /// canonical-sorted by model identity.
+  [[nodiscard]] const std::vector<VerifiedRetainedModelSourceUrdf>&
+  model_source_urdfs() const noexcept {
+    return model_source_urdfs_;
+  }
 
  private:
   VerifiedRetainedPlanningModel(
       RetainedPlanningModelQuery query, std::string urdf_bytes,
       std::string srdf_bytes,
-      std::vector<VerifiedRetainedPlanningResource> resources)
+      std::vector<VerifiedRetainedPlanningResource> resources,
+      std::vector<VerifiedRetainedModelSourceUrdf> model_source_urdfs)
       : query_(std::move(query)),
         urdf_bytes_(std::move(urdf_bytes)),
         srdf_bytes_(std::move(srdf_bytes)),
-        resources_(std::move(resources)) {}
+        resources_(std::move(resources)),
+        model_source_urdfs_(std::move(model_source_urdfs)) {}
 
   RetainedPlanningModelQuery query_;
   std::string urdf_bytes_;
   std::string srdf_bytes_;
   std::vector<VerifiedRetainedPlanningResource> resources_;
+  std::vector<VerifiedRetainedModelSourceUrdf> model_source_urdfs_;
 
   friend class FilesystemVerifiedRetainedPlanningModelSource;
 };

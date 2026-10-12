@@ -8,12 +8,12 @@
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "members": {
     "assignment.yaml": "sha256:1a04360d772c4925b8f0b02708b479388500d222c3b642d3eb039df7d79528f5",
-    "deployment.yaml": "sha256:ae9a4059808399842c0a2a1d6cbf9f42105e691e2723e2c477131cf3fa5eca7b",
+    "deployment.yaml": "sha256:28f1ff888173e4cc491b7e8857409cf35197073ec771a4281a785f8f55fdd824",
     "program.yaml": "sha256:806376925d37df50191d4f0f641e42cdfb898e3dcca2b40f964d823073509665"
   },
   "name": "trocar_lite6_foundationpose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:dff3a16d2589328700ff79a66a80ba2ec91e86ae544ec57b7a236b835cea23bb",
+    "checked_content_digest": "sha256:ce6657b122372cc193d633b7a961ee76778489cc2098d0472e8cee7a6a66f01a",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

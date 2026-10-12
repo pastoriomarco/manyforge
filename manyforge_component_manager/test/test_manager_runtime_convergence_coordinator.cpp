@@ -164,7 +164,7 @@ MaterializeNativeRuntimePackage(const std::filesystem::path &root,
   auto fixture = shared_domain
       ? deployment::test::make_lite6_controllable_retention_fixture(
             false, false, 2U, false, true, "runtime_only_cell", false,
-            false, "resource", false, {}, {}, false, false, {}, false,
+            false, "resource", false, {}, {}, false, false, false,
             std::nullopt, true)
       : deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
             "runtime_only_cell");
@@ -199,7 +199,7 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
                                  deployment::test::kLite6ArmTargetId) {
   auto fixture = deployment::test::make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, "runtime_only_cell", false, false,
-      "resource", false, {}, {}, true, false, {}, false, std::nullopt, false,
+      "resource", false, {}, {}, true, false, false, std::nullopt, false,
       motion_limit_target);
   const deployment::test::Lite6ControllableCompilerInputArtifactSource
       input_source(fixture);
@@ -1643,7 +1643,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ASSERT_FALSE(native_to_ros.ok());
   EXPECT_EQ(native_to_ros.error().details.at("reason"),
             "candidate_native_host_missing");
-  for (const auto *candidate : {&removed, &replaced, &drifted}) {
+  for (const auto *candidate : {&removed, &replaced}) {
     auto intent = ApplyIntent(*predecessor.bundle);
     intent.candidate_retained_bundle_id = candidate->bundle->retained_bundle_id();
     intent.candidate_graph_revision = candidate->bundle->value().cell_graph.graph_revision;
@@ -1652,8 +1652,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     ASSERT_FALSE(continuity.ok());
     EXPECT_EQ(continuity.error().code, "native_execution_host_incompatible");
     EXPECT_EQ(continuity.error().details.at("reason"),
-              candidate == &drifted ? "native_product_identity_changed"
-                                    : "candidate_native_host_missing");
+              "candidate_native_host_missing");
     const auto database = state_root.path() /
         (candidate->bundle->retained_bundle_id().value().substr(7U) + ".sqlite3");
     SqliteManagerApplyJournal journal(database, intent.cell_id);
@@ -1672,6 +1671,40 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     EXPECT_EQ(publication.read_calls, 0);
     EXPECT_EQ(ports.observe_calls, 0);
     EXPECT_EQ(ports.ensure_calls, 0);
+    EXPECT_FALSE(journal.ReadIntent(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadFenceAttempt(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadFenceAcceptance(intent.apply_id, intent.apply_generation).has_value());
+    EXPECT_FALSE(journal.ReadRuntimeConvergenceIntent(intent.apply_id, intent.apply_generation).has_value());
+  }
+  // The ROS runtime manifest is infrastructure-only, like native's (DX-228):
+  // a controller-configuration change is not a host-product change, so host
+  // continuity holds. The drifted candidate's motion-limit table names a
+  // target its component does not host; that configuration must still be
+  // refused before any fence or runtime effect.
+  {
+    auto intent = ApplyIntent(*predecessor.bundle);
+    intent.candidate_retained_bundle_id = drifted.bundle->retained_bundle_id();
+    intent.candidate_graph_revision = drifted.bundle->value().cell_graph.graph_revision;
+    EXPECT_TRUE(VerifyNativeExecutionHostContinuity(
+        *predecessor.bundle, *drifted.bundle, *predecessor.artifact_source).ok());
+    const auto database = state_root.path() /
+        (drifted.bundle->retained_bundle_id().value().substr(7U) + ".sqlite3");
+    SqliteManagerApplyJournal journal(database, intent.cell_id);
+    ExactFencePort kernel;
+    ManagerApplyFenceCoordinator fence_coordinator(
+        journal, kernel, RuntimeEpoch("manager-runtime-1"));
+    try {
+      static_cast<void>(fence_coordinator.AcquireOrRecoverFence(
+          intent, *predecessor.bundle, *drifted.bundle,
+          ManagerApplyFenceExpectationDTO{
+              0U, ConfigurationFenceGeneration(0U), {}}));
+      ADD_FAILURE() << "unhosted motion-limit target reached the Apply fence";
+    } catch (const std::exception &error) {
+      EXPECT_NE(std::string(error.what()).find("TCP-speed maximum"),
+                std::string::npos)
+          << error.what();
+    }
+    EXPECT_EQ(kernel.acquire_calls, 0);
     EXPECT_FALSE(journal.ReadIntent(intent.apply_id, intent.apply_generation).has_value());
     EXPECT_FALSE(journal.ReadFenceAttempt(intent.apply_id, intent.apply_generation).has_value());
     EXPECT_FALSE(journal.ReadFenceAcceptance(intent.apply_id, intent.apply_generation).has_value());

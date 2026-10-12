@@ -211,10 +211,6 @@ inline constexpr char kDigestC[] =
 
 [[nodiscard]] StopScopeEntryDTO ScopeEntry() {
   const auto stage = Stage();
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
-  for (const auto& phase : stage.participant_stop_plan.deadline_budget.phases) {
-    phases.push_back({phase.phase_id, phase.deadline_offset_ns, phase.deadline_offset_ns});
-  }
   return StopScopeEntryDTO{
       ParticipantKey(stage),
       StopParticipantScopeFactsDTO{
@@ -231,9 +227,7 @@ inline constexpr char kDigestC[] =
       stage.stop_evidence_policy_id,
       stage.stop_evidence_policy_revision,
       stage.participant_stop_plan.participant_stop_invocation_plan_digest,
-      10,
-      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
-      std::move(phases)};
+      10};
 }
 
 [[nodiscard]] StopCertificateDTO Certificate() {

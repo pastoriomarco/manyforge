@@ -43,7 +43,6 @@ ObservationSource(const core::RuntimeParticipantBinding &binding) {
   return RetainedStopSurveillanceObservationSource{
       core::StopEvidenceRequirementDTO{
           core::StopEvidenceItemId("evidence.motion.rest"),
-          core::StopBudgetPhaseId("phase.rest"),
           core::StopEvidenceRequirementKind::kMotionRest, std::nullopt,
           std::nullopt,
           core::StopEvidenceSourceRequirementDTO{
@@ -136,11 +135,7 @@ IdleCellWideStatus(const core::RuntimeParticipantBinding &binding) {
                             core::ContentDigest(kIdleDigestB),
                             {},
                             {},
-                            1'000,
-                            100,
-                            900,
-                            10,
-                            {}},
+                            10},
       core::StopStatusStateDTO::kSucceeded,
       certificate.scope_entries,
       {},

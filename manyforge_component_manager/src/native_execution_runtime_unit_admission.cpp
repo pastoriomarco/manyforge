@@ -1,11 +1,13 @@
 #include "manyforge_component_manager/native_execution_runtime_unit_admission.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
-#include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -26,6 +28,26 @@ constexpr std::string_view kStatusApiVersion =
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw NativeExecutionRuntimeUnitAdmissionError(detail);
+}
+
+[[nodiscard]] std::uint64_t
+ParseCanonicalUnsigned(const std::string_view value,
+                       const std::string_view label) {
+  if (value.empty() || (value.size() > 1U && value.front() == '0')) {
+    Fail(std::string(label) + " is not a canonical unsigned integer");
+  }
+  std::uint64_t result = 0U;
+  for (const char digit : value) {
+    if (digit < '0' || digit > '9') {
+      Fail(std::string(label) + " is not a canonical unsigned integer");
+    }
+    const auto next = static_cast<std::uint64_t>(digit - '0');
+    if (result > (std::numeric_limits<std::uint64_t>::max() - next) / 10U) {
+      Fail(std::string(label) + " overflows");
+    }
+    result = result * 10U + next;
+  }
+  return result;
 }
 
 [[nodiscard]] const manyforge::deployment::CanonicalValue::Object &
@@ -202,6 +224,55 @@ std::string NativeExecutionRuntimeUnitAdmission::expected_status_packet(
          " " + product_.configuration_identity().value() + " " +
          std::string(product_.runtime_role_id()) +
          " closed_no_active_effect";
+}
+
+RuntimeUnitSourceReport
+NativeExecutionRuntimeUnitAdmission::parse_status_packet(
+    const manyforge::core::RuntimeEpoch &runtime_epoch,
+    const std::string_view packet) const {
+  std::istringstream stream{std::string(packet)};
+  std::vector<std::string> fields;
+  std::string field;
+  while (stream >> field) {
+    fields.push_back(std::move(field));
+  }
+  if (fields.size() != 12U && fields.size() != 14U) {
+    Fail("native execution child emitted a malformed status field count");
+  }
+  const auto sequence =
+      ParseCanonicalUnsigned(fields[3], "native source-report sequence");
+  if (sequence == 0U) {
+    Fail("native execution child emitted a malformed or foreign status");
+  }
+  std::optional<std::uint64_t> lines;
+  std::optional<std::uint64_t> bytes;
+  auto expected = expected_status_packet(runtime_epoch, sequence);
+  if (fields.size() == 14U) {
+    constexpr std::string_view line_prefix = "dropped_host_notice_lines=";
+    constexpr std::string_view byte_prefix = "dropped_host_notice_bytes=";
+    if (!fields[12].starts_with(line_prefix) ||
+        !fields[13].starts_with(byte_prefix)) {
+      Fail("native execution host notice drop counter pair is malformed");
+    }
+    lines = ParseCanonicalUnsigned(
+        std::string_view(fields[12]).substr(line_prefix.size()),
+        "dropped_host_notice_lines");
+    bytes = ParseCanonicalUnsigned(
+        std::string_view(fields[13]).substr(byte_prefix.size()),
+        "dropped_host_notice_bytes");
+    expected += " " + fields[12] + " " + fields[13];
+  }
+  if (packet != expected) {
+    Fail("native execution child emitted a malformed or foreign status");
+  }
+  return RuntimeUnitSourceReport(
+      product_.runtime_unit_id().value(), runtime_epoch.value(), sequence, 1U,
+      RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
+      product_.product_identity().value(),
+      product_.configuration_identity().value(),
+      {std::string(product_.runtime_role_id())},
+      ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
+      runtime_contract_offer_digest_, lines, bytes);
 }
 
 std::optional<NativeExecutionRuntimeUnitAdmission>

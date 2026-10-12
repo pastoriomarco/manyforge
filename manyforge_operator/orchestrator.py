@@ -18,6 +18,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import shlex
 import socket
 import stat
 import subprocess
@@ -327,11 +329,24 @@ class _ManagedProcess:
     component_id: str
     process: subprocess.Popen[bytes]
     argv: tuple[str, ...]
-    log_path: Path
+    log_path: Path | str
     pid: int
     start_ticks: int
     boot_id: str
     process_group_id: int
+
+
+def _journal_command(instance_id: str, component_id: str, argv: Sequence[str]) -> tuple[list[str], str]:
+    """Route one detached child's output through the operating system journal."""
+    systemd_cat = shutil.which("systemd-cat")
+    if systemd_cat is None or not Path("/run/systemd/journal/stdout").is_socket():
+        raise LauncherError(
+            "journald_unavailable",
+            "detached startup requires systemd-cat and the journald stream socket /run/systemd/journal/stdout",
+            exit_code=70,
+        )
+    identifier = f"manyforge-{instance_id}-{component_id}"
+    return [systemd_cat, "-t", identifier, "--", *argv], f"journalctl -t {shlex.quote(identifier)}"
 
 
 def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
@@ -1596,21 +1611,18 @@ class NativeLauncher:
         ]
 
     def _spawn(self, spec: ProcessSpec) -> _ManagedProcess:
-        log, log_path = self.store.open_log(f"{spec.component_id}.log")
-        try:
-            environment = os.environ.copy()
-            environment.update(spec.environment)
-            process = subprocess.Popen(
-                list(spec.argv),
-                cwd=str(spec.cwd),
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        finally:
-            log.close()
+        argv, log_path = _journal_command(self.config.instance_id, spec.component_id, spec.argv)
+        environment = os.environ.copy()
+        environment.update(spec.environment)
+        process = subprocess.Popen(
+            argv,
+            cwd=str(spec.cwd),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             observation = _proc_observation(process.pid)

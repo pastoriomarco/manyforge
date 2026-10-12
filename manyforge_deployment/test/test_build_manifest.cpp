@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -87,9 +89,19 @@ class ScopedDirectoryFsyncFailure final {
 
 }  // namespace
 
-extern "C" int __real_fsync(int fd);
-
-extern "C" int __wrap_fsync(int fd) {
+// Interpose fsync by defining it in this executable instead of using
+// `ld --wrap`: --wrap rewrites only references linked into this
+// executable, so it misses the fsync calls made inside
+// libmanyforge_deployment when that library is shared (the ROS
+// integration graph builds with BUILD_SHARED_LIBS=ON). An executable
+// definition preempts libc for static and shared library builds alike.
+extern "C" int fsync(int fd) {
+  using FsyncFunction = int (*)(int);
+  static const auto real_fsync = reinterpret_cast<FsyncFunction>(
+      ::dlsym(RTLD_NEXT, "fsync"));
+  if (real_fsync == nullptr) {
+    std::abort();
+  }
   if (g_fail_directory_fsync.load()) {
     struct stat status {};
     if (::fstat(fd, &status) == 0 &&
@@ -105,7 +117,7 @@ extern "C" int __wrap_fsync(int fd) {
       }
     }
   }
-  return __real_fsync(fd);
+  return real_fsync(fd);
 }
 
 namespace manyforge::deployment {

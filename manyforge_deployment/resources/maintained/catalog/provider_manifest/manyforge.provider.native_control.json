@@ -136,7 +136,7 @@
     {
       "provider_contract_ref": {
         "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-        "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
+        "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
         "provider_contract_role_id": "stop_contract"
       },
       "stop_command_support": {
@@ -154,5 +154,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.native_control",
-  "provider_manifest_revision": "sha256:72a97879729eced7b536ff94d98f90aa97f43d2cb1a222388e0e8195c23c72de"
+  "provider_manifest_revision": "sha256:e8de93b2ac804d7ee9f950b7178e83a6e9d5315bede2ea4ec8adf6cb7b50e3d3"
 }

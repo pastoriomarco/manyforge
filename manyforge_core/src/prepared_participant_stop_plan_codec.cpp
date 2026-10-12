@@ -178,6 +178,8 @@ void require_identifier(std::string_view value, std::string reason) {
         result.emplace("per_resource_limits", JsonValueDTO{std::move(limits)});
         if constexpr (!std::is_same_v<Selected, HardDecelerationStopParametersDTO>) {
           result.emplace("deceleration_time_s", JsonValueDTO{selected.deceleration_time_s});
+          if (selected.max_stop_time_s.has_value())
+            result.emplace("max_stop_time_s", JsonValueDTO{*selected.max_stop_time_s});
           result.emplace("jerk_limits_enabled", JsonValueDTO{selected.jerk_limits_enabled});
           result.emplace("allow_natural_completion_on_short_path",
                          JsonValueDTO{selected.allow_natural_completion_on_short_path});
@@ -219,6 +221,9 @@ void require_identifier(std::string_view value, std::string reason) {
   }
   if (profile.deceleration_time_s.has_value()) {
     fields.emplace_back("deceleration_time_s", CanonicalValue(*profile.deceleration_time_s));
+  }
+  if (profile.max_stop_time_s.has_value()) {
+    fields.emplace_back("max_stop_time_s", CanonicalValue(*profile.max_stop_time_s));
   }
   if (!profile.per_joint_max_deceleration.empty()) {
     CanonicalValue::Object limits;
@@ -375,7 +380,7 @@ void require_closed_object(const CanonicalValue& value,
   require_closed_object(value,
                         {"profile_id", "stop_mode", "allow_natural_completion_on_short_path",
                          "require_backend_confirmation"},
-                        {"deceleration_time_s", "per_joint_max_deceleration",
+                        {"deceleration_time_s", "max_stop_time_s", "per_joint_max_deceleration",
                          "recoverable_substitution_mode", "per_joint_settle_velocity_threshold",
                          "diagnostics", "per_joint_max_jerk", "jerk_limits_enabled"},
                         "prepared Stop profile object is invalid");
@@ -415,6 +420,12 @@ void require_closed_object(const CanonicalValue& value,
   if (value.find_object_member("deceleration_time_s") != nullptr) {
     profile.deceleration_time_s = required_positive_number(
         value, "deceleration_time_s", "prepared Stop profile duration is invalid");
+  }
+  if (value.find_object_member("max_stop_time_s") != nullptr) {
+    profile.max_stop_time_s = required_positive_number(
+        value, "max_stop_time_s", "prepared Stop profile maximum Stop time is invalid");
+    if (!max_stop_time_valid(profile.max_stop_time_s))
+      fail("prepared Stop profile maximum Stop time is invalid");
   }
   if (const auto* limits = value.find_object_member("per_joint_max_deceleration");
       limits != nullptr) {
@@ -478,7 +489,6 @@ void require_closed_object(const CanonicalValue& value,
 }
 
 struct BaseWireRows final {
-  CanonicalValue deadline_budget;
   CanonicalValue::Array escalation_stages;
 };
 
@@ -488,12 +498,11 @@ struct BaseWireRows final {
     fail("resolved Stop base plan is not verified");
   }
   const auto root = content_identity::parse_canonical_json(encoded.value());
-  const auto* deadline = root.find_object_member("deadline_budget");
   const auto* stages = root.find_object_member("escalation_stages");
-  if (deadline == nullptr || stages == nullptr || !stages->is_array()) {
+  if (stages == nullptr || !stages->is_array()) {
     fail("resolved Stop base plan lost canonical wire rows");
   }
-  return {*deadline, stages->as_array()};
+  return {stages->as_array()};
 }
 
 [[nodiscard]] CanonicalValue plan_value(const PreparedParticipantStopPlanDTO& plan,
@@ -528,7 +537,6 @@ struct BaseWireRows final {
       {"program_run_id", CanonicalValue(plan.program_run_id.value())},
       {"participant_stop_profile_purpose",
        CanonicalValue(std::string(to_string(plan.participant_stop_profile_purpose)))},
-      {"deadline_budget", base_wire.deadline_budget},
       {"stage_commands", CanonicalValue(std::move(stages))}};
   if (plan.participant_stop_profile.has_value()) {
     fields.emplace_back("participant_stop_profile", profile_value(*plan.participant_stop_profile));
@@ -650,7 +658,6 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
                                         std::move(context.participant_stop_profile),
                                         context.participant_stop_profile_purpose,
                                         std::move(context.motion_interrupt_scope_id),
-                                        verified_base_plan.deadline_budget,
                                         {}};
     plan.stage_commands.reserve(verified_base_plan.escalation_stages.size());
     for (std::size_t index = 0U; index < verified_base_plan.escalation_stages.size(); ++index) {
@@ -718,45 +725,6 @@ Result<void> VerifyPreparedParticipantStopPlan(
                  {{"reason", "prepared_participant_stop_plan_mismatch"}}});
   }
   return Result<void>::Ok();
-}
-
-namespace {
-Result<void> validate_profile_timing(const RuntimeParticipantStopReadinessDTO& readiness,
-                                     const PreparedParticipantStopPlanDTO&) {
-  // P3 / item 24: no Prepare-time Stop budget pre-check. As `main`, a profile
-  // longer than the saved timeout is not refused in advance; the Stop deadline
-  // watchdog issues the hard floor on overrun. Only the ceiling's own shape is
-  // checked.
-  const auto maximum = readiness.maximum_controlled_stop_duration_ns;
-  if (!maximum) return Result<void>::Ok();
-  if (*maximum <= 0 || *maximum > kMaxStopEvidencePolicyDurationNs)
-    return reject<void>("stop_profile_duration_ceiling_invalid");
-  return Result<void>::Ok();
-}
-}  // namespace
-
-Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
-    const RuntimeParticipantStopReadinessDTO& readiness,
-    PreparedParticipantStopPlanContextDTO context,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits) {
-  auto plan = MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan, std::move(context),
-                                              resources, retained_default_limits);
-  if (!plan.ok()) return plan;
-  const auto timing = validate_profile_timing(readiness, plan.value());
-  if (!timing.ok()) return Result<PreparedParticipantStopPlanDTO>::Err(timing.error());
-  return plan;
-}
-
-Result<void> VerifyPreparedParticipantStopPlan(
-    const RuntimeParticipantStopReadinessDTO& readiness, const PreparedParticipantStopPlanDTO& plan,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits,
-    MotionInterruptNodeCategory node_category) {
-  const auto verified = VerifyPreparedParticipantStopPlan(
-      readiness.resolved_stop_base_plan, plan, resources, retained_default_limits, node_category);
-  if (!verified.ok()) return verified;
-  return validate_profile_timing(readiness, plan);
 }
 
 Result<std::string> EncodePreparedParticipantStopPlan(

@@ -103,40 +103,7 @@ namespace {
       ContentDigest("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
       {},
       {{OperationId("operation.a"), OperationRevision(4U)}},
-      1'000,
-      100,
-      800,
-      123'456,
-      {{StopId("stop.1"),
-        StopGeneration(8U),
-        OperationId("operation.a"),
-        OperationParticipantId("participant.a"),
-        ContentDigest("sha256:3333333333333333333333333333333333333333333333333333333333333333"),
-        {{StopBudgetPhaseId("command"), 250, 50}, {StopBudgetPhaseId("evidence"), 750, 550}}}}};
-}
-
-[[nodiscard]] StopDeadlineBudgetDTO fixed_budget() {
-  return StopDeadlineBudgetDTO{
-      1'000, 100, {{StopBudgetPhaseId("command"), 250}, {StopBudgetPhaseId("evidence"), 750}}};
-}
-
-[[nodiscard]] PreparedParticipantStopPlanDTO prepared_plan(
-    std::string participant_id = "participant.a") {
-  return PreparedParticipantStopPlanDTO{
-      ContentDigest("sha256:3333333333333333333333333333333333333333333333333333333333333333"),
-      ResolvedStopBasePlanId("base-plan.a"),
-      OperationId("operation.a"),
-      OperationRevision(3U),
-      OperationParticipantId(std::move(participant_id)),
-      ProgramId("program.a"),
-      ProgramRevision("program.revision.a"),
-      ProgramBindingId("binding.a"),
-      ProgramRunId("run.a"),
-      std::nullopt,
-      ParticipantStopProfilePurposeDTO::kOrdinary,
-      std::nullopt,
-      fixed_budget(),
-      {}};
+      123'456};
 }
 
 TEST(StopScopeResolverTest, ResolvesExactOperationWithoutWideningToIndependentWork) {
@@ -560,34 +527,27 @@ TEST(StopScopeResolverTest, NormalizedIntentDigestClosesReplayFieldsButExcludesA
             ComputeNormalizedStopIntentDigest(stale_full).value());
 }
 
-TEST(StopScopeResolverTest, MakesCanonicalParticipantQualifiedAcceptance) {
+TEST(StopScopeResolverTest, MakesCanonicalAcceptanceWithoutSharedStopBudget) {
   const auto intent = operation_stop();
   auto resolution = resolve_stop_scope(intent, independent_snapshot());
   ASSERT_TRUE(resolution.ok());
-  auto second_plan = prepared_plan("participant.b");
-  second_plan.deadline_budget.phases = {{StopBudgetPhaseId("brake"), 300},
-                                        {StopBudgetPhaseId("rest"), 700}};
-  const std::vector plans{prepared_plan("participant.a"), std::move(second_plan)};
   const auto accepted =
       MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-                       {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
-                       8'000'000'000LL, plans);
+                       {{OperationId("operation.a"), OperationRevision(4U)}}, 8'000'000'000LL);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(accepted.value().requested_selector_digest,
             ComputeRequestedStopSelectorDigest(intent).value());
   EXPECT_EQ(accepted.value().captured_scope_digest,
             ComputeCapturedStopScopeDigest(resolution.value()).value());
-  ASSERT_EQ(accepted.value().participant_budget_allocations.size(), 2U);
-  EXPECT_EQ(accepted.value().participant_budget_allocations[0].participant_id,
-            OperationParticipantId("participant.a"));
-  EXPECT_EQ(accepted.value().participant_budget_allocations[1].participant_id,
-            OperationParticipantId("participant.b"));
-  EXPECT_EQ(accepted.value().participant_budget_allocations[0].phases[0],
-            (StopAcceptedPhaseBudgetDTO{StopBudgetPhaseId("command"), 250, 50}));
-  EXPECT_EQ(accepted.value().participant_budget_allocations[1].phases[0],
-            (StopAcceptedPhaseBudgetDTO{StopBudgetPhaseId("brake"), 300, 100}));
-  EXPECT_EQ(accepted.value().participant_budget_allocations[1].phases[1],
-            (StopAcceptedPhaseBudgetDTO{StopBudgetPhaseId("rest"), 700, 500}));
+  // Q51: the acceptance carries only its time; every robot's own deadlines
+  // are computed at Stop time from its own profile and lane.
+  EXPECT_EQ(accepted.value().accepted_at_ns, 8'000'000'000LL);
+
+  const auto negative_time =
+      MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
+                       {{OperationId("operation.a"), OperationRevision(4U)}}, -1);
+  ASSERT_FALSE(negative_time.ok());
+  EXPECT_EQ(negative_time.error().details.at("reason"), "stop_acceptance_time_invalid");
 }
 
 TEST(StopScopeResolverTest, MakesNoEffectAcceptanceWithoutInventedParticipantPlan) {
@@ -597,28 +557,22 @@ TEST(StopScopeResolverTest, MakesNoEffectAcceptanceWithoutInventedParticipantPla
   auto resolution = resolve_stop_scope(intent, snapshot);
   ASSERT_TRUE(resolution.ok());
   ASSERT_EQ(resolution.value().disposition, StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
-  const auto accepted =
-      MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(), {},
-                       fixed_budget(), 1'000, 8'000'000'000LL, {});
+  const auto accepted = MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U),
+                                         resolution.value(), {}, 8'000'000'000LL);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_TRUE(accepted.value().affected_operation_revisions.empty());
-  EXPECT_TRUE(accepted.value().participant_budget_allocations.empty());
   EXPECT_EQ(accepted.value().accepted_at_ns, 8'000'000'000LL);
 }
 
-TEST(StopScopeResolverTest, AggregatesPredecessorsWithoutRebasingOrWideningTheirTruth) {
+TEST(StopScopeResolverTest, AggregatesPredecessorsWithoutRebasingTheirTruth) {
   const auto prior_intent = operation_stop();
   const auto prior_resolution = resolve_stop_scope(prior_intent, independent_snapshot());
   ASSERT_TRUE(prior_resolution.ok());
   const auto prior =
       MakeStopAccepted(prior_intent, StopId("stop.7"), StopGeneration(7U), prior_resolution.value(),
-                       {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
-                       100, std::vector{prepared_plan("participant.a")});
+                       {{OperationId("operation.a"), OperationRevision(4U)}}, 100);
   ASSERT_TRUE(prior.ok()) << prior.error().message;
 
-  auto new_plan = prepared_plan("participant.b");
-  new_plan.operation_id = OperationId("operation.b");
-  new_plan.operation_revision = OperationRevision(4U);
   StopScopeResolutionDTO aggregate_resolution{
       StopResolutionDispositionDTO::kPromotedToFull,
       StopScopeResolutionReasonDTO::kOverlappingStopTransactions,
@@ -628,116 +582,44 @@ TEST(StopScopeResolverTest, AggregatesPredecessorsWithoutRebasingOrWideningTheir
       {},
       {}};
   const FullStopIntentDTO full{request_context(), StopGeneration(7U), {}};
-  const std::vector predecessors{StopAcceptedPredecessorInput{prior.value(), 600}};
+  const std::vector predecessors{StopAcceptedPredecessorInput{prior.value()}};
   const auto aggregate = MakeAggregatedStopAccepted(
       full, StopId("stop.8"), StopGeneration(8U), aggregate_resolution,
-      {{OperationId("operation.b"), OperationRevision(5U)}}, fixed_budget(), 900, 200,
-      std::span<const PreparedParticipantStopPlanDTO>(&new_plan, 1U), predecessors);
+      {{OperationId("operation.b"), OperationRevision(5U)}}, 200, predecessors);
   ASSERT_TRUE(aggregate.ok()) << aggregate.error().message;
   ASSERT_EQ(aggregate.value().joined_predecessor_stops.size(), 1U);
   EXPECT_EQ(aggregate.value().joined_predecessor_stops.front().predecessor_stop_id,
             StopId("stop.7"));
-  EXPECT_EQ(aggregate.value().remaining_outer_duration_ns, 600);
+  EXPECT_EQ(aggregate.value().joined_predecessor_stops.front().captured_scope_digest,
+            prior.value().captured_scope_digest);
+  EXPECT_EQ(aggregate.value().accepted_at_ns, 200);
   ASSERT_EQ(aggregate.value().affected_operation_revisions.size(), 2U);
   EXPECT_EQ(aggregate.value().affected_operation_revisions.front(),
             prior.value().affected_operation_revisions.front());
-  ASSERT_EQ(aggregate.value().participant_budget_allocations.size(), 2U);
-  EXPECT_EQ(aggregate.value().participant_budget_allocations.front().origin_stop_id,
-            StopId("stop.7"));
-  EXPECT_EQ(aggregate.value().participant_budget_allocations.back().origin_stop_id,
-            StopId("stop.8"));
-  EXPECT_EQ(aggregate.value()
-                .participant_budget_allocations.front()
-                .phases.front()
-                .remaining_deadline_offset_ns,
-            0);
   EXPECT_EQ(stop_accepted_field_error(aggregate.value()), std::nullopt);
-
-  auto widened = aggregate.value();
-  widened.remaining_outer_duration_ns = 700;
-  const auto elapsed = widened.fixed_outer_duration_ns - widened.remaining_outer_duration_ns;
-  for (auto& participant : widened.participant_budget_allocations) {
-    for (auto& budget : participant.phases) {
-      budget.remaining_deadline_offset_ns =
-          widened.remaining_outer_duration_ns <= widened.fixed_kernel_completion_reserve_ns
-              ? 0
-              : std::max<std::int64_t>(0, std::min(budget.fixed_deadline_offset_ns - elapsed,
-                                                   widened.remaining_outer_duration_ns -
-                                                       widened.fixed_kernel_completion_reserve_ns));
-    }
-  }
-  EXPECT_EQ(stop_accepted_field_error(widened), "stop_accepted_predecessor_deadline_widened");
-  auto wrong_origin = aggregate.value();
-  wrong_origin.participant_budget_allocations.front().origin_stop_id = StopId("stop.missing");
-  EXPECT_EQ(stop_accepted_field_error(wrong_origin), "stop_accepted_participant_budget_invalid");
 
   auto second_resolution = prior_resolution.value();
   second_resolution.operations = {OperationId("operation.b")};
   second_resolution.resources = {ResourceId("robot.b")};
-  auto second_plan = prepared_plan("participant.b");
-  second_plan.operation_id = OperationId("operation.b");
   const auto second_prior =
       MakeStopAccepted(prior_intent, StopId("stop.6"), StopGeneration(6U), second_resolution,
-                       {{OperationId("operation.b"), OperationRevision(4U)}}, fixed_budget(), 700,
-                       100, std::span<const PreparedParticipantStopPlanDTO>(&second_plan, 1U));
+                       {{OperationId("operation.b"), OperationRevision(4U)}}, 100);
   ASSERT_TRUE(second_prior.ok()) << second_prior.error().message;
-  const std::vector two_predecessors{StopAcceptedPredecessorInput{second_prior.value(), 500},
-                                     StopAcceptedPredecessorInput{prior.value(), 600}};
+  const std::vector two_predecessors{StopAcceptedPredecessorInput{second_prior.value()},
+                                     StopAcceptedPredecessorInput{prior.value()}};
   const auto predecessor_only =
       MakeAggregatedStopAccepted(full, StopId("stop.9"), StopGeneration(9U), aggregate_resolution,
-                                 {}, fixed_budget(), 900, 200, {}, two_predecessors);
+                                 {}, 200, two_predecessors);
   ASSERT_TRUE(predecessor_only.ok())
       << predecessor_only.error().message << ": " << predecessor_only.error().details.at("reason");
   EXPECT_EQ(predecessor_only.value().joined_predecessor_stops.size(), 2U);
-  EXPECT_EQ(predecessor_only.value().remaining_outer_duration_ns, 500);
-}
 
-TEST(StopScopeResolverTest, RetainsDispatchPlanAcrossControlRevisionsAndRejectsMismatch) {
-  const auto intent = operation_stop();
-  const auto resolution = resolve_stop_scope(intent, independent_snapshot());
-  ASSERT_TRUE(resolution.ok());
-  auto control_advanced_plan = prepared_plan();
-  control_advanced_plan.operation_revision = OperationRevision(2U);
-  auto accepted = MakeStopAccepted(
-      intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-      {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800, 100,
-      std::span<const PreparedParticipantStopPlanDTO>(&control_advanced_plan, 1U));
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-
-  auto wrong_revision = prepared_plan();
-  wrong_revision.operation_revision = OperationRevision(4U);
-  accepted =
-      MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-                       {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800,
-                       100, std::span<const PreparedParticipantStopPlanDTO>(&wrong_revision, 1U));
-  ASSERT_FALSE(accepted.ok());
-  EXPECT_EQ(accepted.error().details.at("reason"), "stop_acceptance_participant_plan_mismatch");
-
-  auto wrong_budget = fixed_budget();
-  wrong_budget.kernel_completion_reserve_ns = wrong_budget.outer_duration_ns;
-  accepted = MakeStopAccepted(intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-                              {{OperationId("operation.a"), OperationRevision(4U)}}, wrong_budget,
-                              800, 100, {});
-  ASSERT_FALSE(accepted.ok());
-  EXPECT_EQ(accepted.error().details.at("reason"), "stop_acceptance_budget_invalid");
-
-  auto mismatched_plan_budget = prepared_plan();
-  mismatched_plan_budget.deadline_budget.outer_duration_ns += 1;
-  accepted = MakeStopAccepted(
-      intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-      {{OperationId("operation.a"), OperationRevision(4U)}}, fixed_budget(), 800, 100,
-      std::span<const PreparedParticipantStopPlanDTO>(&mismatched_plan_budget, 1U));
-  ASSERT_FALSE(accepted.ok());
-  EXPECT_EQ(accepted.error().details.at("reason"), "stop_acceptance_participant_plan_mismatch");
-
-  auto exhausted_revision = prepared_plan();
-  exhausted_revision.operation_revision = OperationRevision(9'007'199'254'740'991ULL);
-  accepted = MakeStopAccepted(
-      intent, StopId("stop.8"), StopGeneration(8U), resolution.value(),
-      {{OperationId("operation.a"), OperationRevision(9'007'199'254'740'991ULL)}}, fixed_budget(),
-      800, 100, std::span<const PreparedParticipantStopPlanDTO>(&exhausted_revision, 1U));
-  ASSERT_FALSE(accepted.ok());
-  EXPECT_EQ(accepted.error().details.at("reason"), "stop_acceptance_participant_plan_mismatch");
+  const std::vector self_join{StopAcceptedPredecessorInput{predecessor_only.value()}};
+  const auto nested =
+      MakeAggregatedStopAccepted(full, StopId("stop.10"), StopGeneration(10U),
+                                 aggregate_resolution, {}, 300, self_join);
+  ASSERT_FALSE(nested.ok());
+  EXPECT_EQ(nested.error().details.at("reason"), "stop_aggregate_predecessor_mismatch");
 }
 
 TEST(StopScopeResolverTest, ValidatesImmutableAcceptedResultShape) {
@@ -750,7 +632,6 @@ TEST(StopScopeResolverTest, ValidatesImmutableAcceptedResultShape) {
   accepted.resolution_disposition = StopResolutionDispositionDTO::kAlreadyTerminalNoEffect;
   accepted.resolution_reason = StopScopeResolutionReasonDTO::kKnownTerminalOrIdleNoEffect;
   accepted.affected_operation_revisions.clear();
-  accepted.participant_budget_allocations.clear();
   EXPECT_EQ(stop_accepted_field_error(accepted), std::nullopt);
 }
 
@@ -770,18 +651,8 @@ TEST(StopScopeResolverTest, RejectsMixedOrNoncanonicalAcceptedResultEvidence) {
   EXPECT_EQ(stop_accepted_field_error(accepted), "stop_accepted_digest_invalid");
 
   accepted = accepted_stop();
-  accepted.participant_budget_allocations[0].phases[1].remaining_deadline_offset_ns = 900;
-  EXPECT_EQ(stop_accepted_field_error(accepted), "stop_accepted_phase_budget_invalid");
-
-  accepted = accepted_stop();
-  accepted.participant_budget_allocations[0].participant_stop_invocation_plan_digest =
-      ContentDigest("sha256:not-a-digest");
-  EXPECT_EQ(stop_accepted_field_error(accepted), "stop_accepted_participant_budget_invalid");
-
-  accepted = accepted_stop();
-  accepted.participant_budget_allocations.clear();
-  EXPECT_EQ(stop_accepted_field_error(accepted),
-            "stop_accepted_participant_budget_coverage_invalid");
+  accepted.accepted_at_ns = -1;
+  EXPECT_EQ(stop_accepted_field_error(accepted), "stop_accepted_time_invalid");
 
   accepted = accepted_stop();
   accepted.resolution_disposition = StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved;

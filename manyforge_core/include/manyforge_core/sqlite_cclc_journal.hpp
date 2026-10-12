@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/ports/icclc_lifecycle_target_store.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
@@ -95,6 +96,13 @@ struct NativeApplyFactAdoptionDTO final {
   std::vector<ActiveControlConfigurationDTO> current_routes;
 };
 
+/// Per-write informational notice; no new durable counter or incident identity.
+struct ComponentIncidentPruneNotice final {
+  std::uint64_t count{};
+  std::uint64_t oldest_sequence{};
+  std::uint64_t newest_sequence{};
+};
+
 /// SQLite-backed CCLC lifecycle journal.
 ///
 /// The adapter is deliberately separate from the pure Core target. It uses a
@@ -102,9 +110,11 @@ struct NativeApplyFactAdoptionDTO final {
 /// acquire lifecycle semantics or call any external primitive.
 class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTargetStore {
  public:
-  SqliteCCLCJournal(std::filesystem::path database_path, CellId cell_id,
-                    std::size_t exact_result_history_capacity = kDefaultCCLCExactResultHistory,
-                    std::size_t terminal_result_bytes_capacity = kDefaultCCLCTerminalResultBytes);
+  SqliteCCLCJournal(
+      std::filesystem::path database_path, CellId cell_id,
+      std::size_t exact_result_history_capacity = kDefaultCCLCExactResultHistory,
+      std::size_t terminal_result_bytes_capacity = kDefaultCCLCTerminalResultBytes,
+      std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned = {});
   ~SqliteCCLCJournal() override;
 
   SqliteCCLCJournal(const SqliteCCLCJournal&) = delete;
@@ -286,6 +296,9 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<bool> UpdateOpenComponentIncident(
       const std::string& incident_id, LifecycleBlockingCauseClassDTO cause_class,
       const std::vector<std::string>& vendor_codes, const std::string& record_json) override;
+  [[nodiscard]] Result<bool> AppendComponentIncidentDiagnostic(
+      const std::string& incident_id, std::int64_t occurred_at_ns, const ErrorDTO& diagnostic,
+      std::shared_ptr<const content_identity::CanonicalValue> snapshot = {}) override;
   [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> LoadComponentIncidentEvents(
       std::uint64_t after_sequence, std::size_t limit) override;
 

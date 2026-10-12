@@ -548,7 +548,6 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding,
                    const bool controller_goal_cancel = false) {
   const auto &value = binding.value();
   const auto &path = *value.control_path;
-  const StopBudgetPhaseId command_phase("gripper.hard.command");
   const std::vector<ResourceId> resources{value.resources.front().resource_id};
   const ResolvedStopRuntimeTargetDTO target{
       path.provider_instance_id,
@@ -591,7 +590,6 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding,
                              : StopEscalationStageKind::kSoftwareHard,
       ContainmentGranularity::kResource,
       StopContainmentCommandDTO{
-          command_phase,
           controller_goal_cancel
               ? StopContainmentCommandKind::kControllerGoalCancel
               : StopContainmentCommandKind::kRegistered,
@@ -612,7 +610,6 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding,
               StopEvidenceItemId(controller_goal_cancel
                                      ? "gripper.goal-terminal"
                                      : "gripper.rest"),
-              StopBudgetPhaseId("gripper.hard.rest"),
               controller_goal_cancel
                   ? StopEvidenceRequirementKind::kControllerGoalTerminal
                   : StopEvidenceRequirementKind::kMotionRest,
@@ -678,11 +675,6 @@ gripper_stop_stage(const RuntimeParticipantBinding &binding,
           std::nullopt,
           ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
-          StopDeadlineBudgetDTO{
-              1'000'000,
-              100'000,
-              {{command_phase, 500'000},
-               {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}},
           {PreparedStopStageCommandDTO{resolved_stage, std::nullopt,
                                        std::nullopt}}},
       0U,
@@ -696,9 +688,8 @@ TEST(RetainedGripperCommandBackendTest,
   const RemainingStopBudgetDTO budget{
       stage.stop_id,
       stage.stop_generation,
-      1'000'000,
-      {{StopBudgetPhaseId("gripper.hard.command"), 500'000},
-       {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}};
+      0,
+      std::nullopt};
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0});
   FakeClock clock;
@@ -736,9 +727,8 @@ TEST(RetainedGripperCommandBackendTest,
   const RemainingStopBudgetDTO budget{
       stage.stop_id,
       stage.stop_generation,
-      1'000'000,
-      {{StopBudgetPhaseId("gripper.hard.command"), 500'000},
-       {StopBudgetPhaseId("gripper.hard.rest"), 900'000}}};
+      0,
+      std::nullopt};
   FakeClock clock;
   ManualScheduler scheduler;
 

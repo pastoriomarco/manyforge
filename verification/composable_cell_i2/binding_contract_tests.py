@@ -344,7 +344,6 @@ _EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
         "retained_policy_records",
         "site_overlay_ref",
         "stop_stage_parameters",
-        "stop_timing_parameters",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -424,7 +423,6 @@ _EXPECTED_CONSTRUCTOR_PARAMETERS: dict[str, tuple[str, ...]] = {
         "stop_stage_parameters",
         "commissioned_stop_interfaces",
         "retained_policy_records",
-        "stop_timing_parameters",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -1306,7 +1304,6 @@ def _constructible_dto_fixture(module: ModuleType) -> dict[str, Any]:
         "stop_stage_parameters": (),
         "commissioned_stop_interfaces": (),
         "retained_policy_records": (),
-        "stop_timing_parameters": (),
     }
     applicability_inputs = module.DeploymentApplicabilityInputsDTO(
         **applicability_inputs_kwargs
@@ -1923,14 +1920,7 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
         name: list(parameters)
         for name, parameters in sorted(_EXPECTED_CONSTRUCTOR_PARAMETERS.items())
     }
-    expected_constructor_defaults = {
-        name: (
-            ["stop_timing_parameters"]
-            if name == "DeploymentApplicabilityInputsDTO"
-            else []
-        )
-        for name in expected_constructor_parameters
-    }
+    expected_constructor_defaults = {name: [] for name in expected_constructor_parameters}
     expected_required_constructor_arguments = {
         name: [
             parameter

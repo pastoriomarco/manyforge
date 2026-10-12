@@ -13,6 +13,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 from manyforge_ros.isaac_pose_observer import (
+    MAX_SITE_CONFIG_BYTES,
     ObservationDispatchSnapshot,
     SITE_CONFIG_VERSION,
     load_isaac_pose_observer_site_config,
@@ -80,6 +81,132 @@ def _write_joint_config(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _forbid_check_runtime(monkeypatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("configuration check must not construct ROS runtime")
+
+    monkeypatch.setattr(pose_source_snapshot_publisher, "Context", forbidden)
+    monkeypatch.setattr(pose_source_snapshot_publisher.rclpy, "init", forbidden)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher, "PoseSourceSnapshotPublisher", forbidden
+    )
+
+
+def test_check_config_returns_only_exact_metadata_without_ros_runtime(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = tmp_path / "captured.json"
+    _write_joint_config(path)
+    record = json.loads(path.read_text())
+    record["source_id"] = "configured.observer.é"
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    config = load_isaac_pose_observer_site_config(path)
+    _forbid_check_runtime(monkeypatch)
+    assert pose_source_snapshot_publisher.main(["--check-config", str(path)]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == {
+        "cell_id": config.cell_id,
+        "source_id": config.source_id,
+        "bindings": [binding.to_value() for binding in config.observer_bindings],
+    }
+
+
+def test_check_config_accepts_existing_full_file_bound_from_console_argv(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = tmp_path / "captured.json"
+    _write_joint_config(path)
+    document = path.read_bytes()
+    path.write_bytes(document + b" " * (MAX_SITE_CONFIG_BYTES - len(document)))
+    _forbid_check_runtime(monkeypatch)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher.sys,
+        "argv",
+        ["pose_source_snapshot_publisher", "--check-config", str(path)],
+    )
+    assert pose_source_snapshot_publisher.main() == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out)["source_id"] == "isaac.observer"
+
+
+@pytest.mark.parametrize("invalid", ["missing", "duplicate", "source_id", "symlink"])
+def test_check_config_refuses_strict_loader_errors_before_ros_runtime(
+    tmp_path, monkeypatch, capsys, invalid
+) -> None:
+    path = tmp_path / "captured.json"
+    if invalid != "missing":
+        _write_joint_config(path)
+        if invalid == "duplicate":
+            path.write_text('{"cell_id":"first","cell_id":"second"}')
+        elif invalid == "source_id":
+            record = json.loads(path.read_text())
+            del record["source_id"]
+            path.write_text(json.dumps(record))
+        elif invalid == "symlink":
+            link = tmp_path / "link.json"
+            link.symlink_to(path)
+            path = link
+    _forbid_check_runtime(monkeypatch)
+    assert pose_source_snapshot_publisher.main(["--check-config", str(path)]) == 78
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "isaac_pose_observer_failed:" in output.err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["--check-config"], ["--check-config", "site.json", "extra"]],
+)
+def test_check_config_refuses_ambiguous_arguments_without_ros_runtime(
+    monkeypatch, capsys, arguments
+) -> None:
+    _forbid_check_runtime(monkeypatch)
+    assert pose_source_snapshot_publisher.main(arguments) == 78
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "requires exactly one site config path" in output.err
+
+
+@pytest.mark.parametrize("epoch_base", ["", "manager.base.27"])
+def test_publisher_forwards_ros_owner_base_and_keeps_unmanaged_default(
+    tmp_path, monkeypatch, epoch_base
+) -> None:
+    config_path = tmp_path / "site.json"
+    _write_joint_config(config_path)
+    dispatcher = _FakeDispatcher()
+    captured = []
+
+    def for_manager_root(**kwargs):
+        captured.append(kwargs)
+        return dispatcher
+
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher.ObservationDispatcher,
+        "for_manager_root",
+        for_manager_root,
+    )
+    rclpy.init(args=["--ros-args", "-p", f"source_epoch_base:={epoch_base}"] if epoch_base else [])
+    publisher = None
+    try:
+        publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
+            site_config_path=config_path,
+            manager_run_root=tmp_path,
+        )
+        factory = captured[0]["source_epoch_factory"]
+        if epoch_base:
+            assert factory() == "manager.base.27.1"
+            assert factory() == "manager.base.27.2"
+        else:
+            assert factory is None
+        assert captured[0]["manager_run_root"] == tmp_path
+    finally:
+        if publisher is not None:
+            publisher.destroy_node()
+        rclpy.shutdown()
 
 
 def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(

@@ -57,7 +57,6 @@ using namespace std::chrono_literals;
                                      std::nullopt,
                                      ParticipantStopProfilePurposeDTO::kOrdinary,
                                      std::nullopt,
-                                     StopDeadlineBudgetDTO{1'000'000'000, 1, {}},
                                      {}},
       0U,
       ContentDigest("scope.digest")});
@@ -65,7 +64,7 @@ using namespace std::chrono_literals;
 
 [[nodiscard]] std::shared_ptr<const RemainingStopBudgetDTO> budget() {
   return std::make_shared<RemainingStopBudgetDTO>(
-      RemainingStopBudgetDTO{StopId("stop.origin"), StopGeneration(1U), 1'000'000'000, {}});
+      RemainingStopBudgetDTO{StopId("stop.origin"), StopGeneration(1U), 0, std::nullopt});
 }
 
 [[nodiscard]] ParticipantStopStageResultDTO completed(

@@ -1,17 +1,18 @@
 #include <gtest/gtest.h>
 
-#include <functional>
-
 #include <atomic>
-#include <map>
-#include <thread>
+#include <functional>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
+#include <manyforge_core/cclc_open_request.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -96,7 +97,16 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
     for (const auto& [key, cause] : causes) {
       if (key.first == component) facts.intervention_causes.push_back(cause);
     }
-    if (const auto* open = Open(component)) facts.open_incident = *open;
+    if (const auto* open = Open(component)) {
+      facts.open_incident = *open;
+      if (omit_facts_diagnostic) {
+        facts.open_incident->diagnostic.reset();
+        facts.open_incident->diagnostic_snapshot.reset();
+        facts.open_incident->incident.diagnostic.reset();
+        facts.open_incident->incident.diagnostic_snapshot.reset();
+        facts.open_incident->diagnostic_loaded = false;
+      }
+    }
     return Result<ComponentLifecycleTargetFactsDTO>::Ok(std::move(facts));
   }
   Result<bool> RecordInterventionCause(const ControllableComponentId& component,
@@ -154,14 +164,24 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
       return Result<ComponentIncidentRecordDTO>::Ok(*open);
     }
     ++writes;
-    incidents.insert_or_assign(record.incident.incident_id, record);
+    auto stored = record;
+    stored.diagnostic =
+        ComponentIncidentDiagnosticFromRecord(stored.record_json, &stored.diagnostic_snapshot);
+    stored.incident.diagnostic = stored.diagnostic;
+    stored.incident.diagnostic_snapshot = stored.diagnostic_snapshot;
+    incidents.insert_or_assign(record.incident.incident_id, stored);
     return Result<ComponentIncidentRecordDTO>::Ok(record);
   }
   Result<std::optional<ComponentIncidentRecordDTO>> LoadOpenComponentIncident(
       const ControllableComponentId& component) override {
     const auto* open = Open(component);
-    return Result<std::optional<ComponentIncidentRecordDTO>>::Ok(
-        open == nullptr ? std::nullopt : std::optional(*open));
+    if (!open) return Result<std::optional<ComponentIncidentRecordDTO>>::Ok(std::nullopt);
+    auto explicit_record = *open;
+    if (explicit_record.incident.containment_state ==
+        ComponentIncidentContainmentStateDTO::kRequested)
+      explicit_record.incident.containment =
+          ComponentIncidentContainmentReceiptFromRecord(explicit_record.record_json);
+    return Result<std::optional<ComponentIncidentRecordDTO>>::Ok(std::move(explicit_record));
   }
   Result<bool> RecordComponentIncidentContainment(const std::string& id,
                                                   ComponentIncidentContainmentStateDTO state,
@@ -239,6 +259,34 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
     found->second.record_json = json;
     return Result<bool>::Ok(true);
   }
+  Result<bool> AppendComponentIncidentDiagnostic(
+      const std::string& id, std::int64_t at, const ErrorDTO& diagnostic,
+      std::shared_ptr<const content_identity::CanonicalValue> snapshot = {}) override {
+    ++diagnostic_attempts;
+    if (on_diagnostic) on_diagnostic();
+    if (fail_diagnostic) return Result<bool>::Err(Unavailable());
+    const auto found = incidents.find(id);
+    if (found == incidents.end() || found->second.incident.acknowledged ||
+        found->second.diagnostic_snapshot || (found->second.diagnostic && !snapshot))
+      return Result<bool>::Ok(false);
+    auto& record = found->second;
+    const auto captured_error = record.diagnostic.value_or(diagnostic);
+    const auto event =
+        ComponentIncidentRecordWithChange(record.record_json, at, record.incident.cause_class,
+                                          record.incident.vendor_codes, captured_error, snapshot);
+    record.record_json =
+        ComponentIncidentRecordWithDiagnostic(record.record_json, captured_error, snapshot);
+    record.diagnostic = captured_error;
+    record.diagnostic_snapshot = snapshot;
+    record.incident.diagnostic = captured_error;
+    record.incident.diagnostic_snapshot = snapshot;
+    events.push_back({events.size() + 1U, std::string(kComponentIncidentEventKind), id, at, event});
+    return Result<bool>::Ok(true);
+  }
+  bool fail_diagnostic{};
+  bool omit_facts_diagnostic{};
+  std::size_t diagnostic_attempts{};
+  std::function<void()> on_diagnostic;
   Result<std::vector<ComponentIncidentEventDTO>> LoadComponentIncidentEvents(
       std::uint64_t after, std::size_t limit) override {
     std::vector<ComponentIncidentEventDTO> result;
@@ -359,12 +407,15 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
          query.controllable_component_id, query.control_domain_id, query.control_domain_revision,
          query.provider_instance_id, query.provider_manifest_id, query.provider_manifest_revision,
          query.provider_runtime_unit_id, query.provider_runtime_epoch, observation_generation,
-         observation_generation, now, now, now + kSecond, observed, std::move(facts)});
+         observation_generation, now, now, now + kSecond, observed, std::move(facts), diagnostic,
+         diagnostic_snapshot});
   }
 
   // Runs inside Observe before the observation is stamped, like the real
   // adapter whose sampling takes time on the owner clock.
   std::function<void()> on_observe;
+  std::optional<ErrorDTO> diagnostic;
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
 
   AuthoringAdmissionDTO ReadCellAdmission() override {
     return {authoring_allowed, AdmissionGeneration(admission_generation)};
@@ -574,6 +625,13 @@ class LifecycleTargetDriverTest : public ::testing::Test {
   FakePorts ports_;
   std::optional<CCLCLifecycleTargetDriver> driver_;
 };
+
+[[nodiscard]] std::shared_ptr<const content_identity::CanonicalValue>
+TestLaunchDiagnosticSnapshot() {
+  return std::make_shared<
+      const content_identity::CanonicalValue>(content_identity::parse_canonical_json(
+      R"snapshot({"context":{"bundle_id":"bundle.1","component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
+}
 
 TEST_F(LifecycleTargetDriverTest, LateReadinessIsFollowedByPrepareThenEnableWithoutAnOperator) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
@@ -942,6 +1000,321 @@ class LifecycleIncidentTest : public LifecycleTargetDriverTest {
     }
   }
 };
+
+// Read-only test adapter over the real driver's public view and the retained
+// journal facts. It exercises the same canonical status API the host serves.
+class IncidentStatusPort final : public ICCLCOpenRequestPort {
+ public:
+  IncidentStatusPort(CCLCLifecycleTargetDriver& driver, FakePorts& ports, FakeStore& store)
+      : driver_(driver), ports_(ports), store_(store) {}
+  RequestOwnerEpoch ReadRequestOwnerEpoch() const override {
+    return RequestOwnerEpoch("cclc.owner.1");
+  }
+  Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
+      const ComponentLifecycleIntentDTO& intent) override {
+    return ports_.SubmitLifecycle(intent);
+  }
+  Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
+      const LifecycleTransactionId&) override {
+    return Result<std::optional<ComponentLifecycleStatusDTO>>::Ok(std::nullopt);
+  }
+  Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
+      const ControllableComponentId& id) const override {
+    auto snapshot = ports_.ReadCurrentComponent(id);
+    if (!snapshot.ok()) return snapshot;
+    const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot.value());
+    if (!digest.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(digest.error());
+    snapshot.value().snapshot_digest = digest.value();
+    return snapshot;
+  }
+  Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
+      const ControllableComponentId& id) const override {
+    return driver_.ReadTargetView(id);
+  }
+  Result<std::vector<ComponentIncidentEventDTO>> ReadIncidentEvents(std::uint64_t after,
+                                                                    std::size_t limit) override {
+    std::vector<ComponentIncidentEventDTO> events;
+    for (const auto& event : store_.events)
+      if (event.sequence > after && events.size() < limit) events.push_back(event);
+    return Result<std::vector<ComponentIncidentEventDTO>>::Ok(std::move(events));
+  }
+  Result<CCLCRouteSelectionTemplateSetDTO> ReadRouteSelectionTemplates(
+      const ControllableComponentId&) const override {
+    return Result<CCLCRouteSelectionTemplateSetDTO>::Err({"unused", "unused", {}});
+  }
+  Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
+      const RouteSelectionIntentDTO&) override {
+    return Result<CCLCRouteSelectionRequestResultDTO>::Err({"unused", "unused", {}});
+  }
+  Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
+      const RouteSelectionTransactionId&) override {
+    return Result<std::optional<RouteSelectionStatusDTO>>::Ok(std::nullopt);
+  }
+
+ private:
+  CCLCLifecycleTargetDriver& driver_;
+  FakePorts& ports_;
+  FakeStore& store_;
+};
+
+TEST_F(LifecycleIncidentTest, LaunchExitDiagnosticSurvivesStatusJournalAndDriverReplacement) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ports_.diagnostic = ErrorDTO{
+      "controller_launch_exited",
+      "component=component.arm signal=11 observed_utc=2026-10-11T18:00:00Z Apply=apply.7 "
+      "cached controller: active=1 bound=1 sample_age_ns=23 log=/launch/controller_launch.log "
+      "settings=sha256:abc tail=controller crashed",
+      {{"log_path", "/launch/controller_launch.log"}}};
+  ports_.diagnostic_snapshot = TestLaunchDiagnosticSnapshot();
+  ++ports_.observation_generation;
+  Driver().RunOnce();  // Primary incident/containment precede enrichment.
+  Driver().RunOnce();
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident);
+  const auto id = progress.incident->incident_id;
+  EXPECT_EQ(progress.incident->summary.find("signal=11"), std::string::npos);
+  ASSERT_TRUE(progress.blocking_reason);
+  EXPECT_NE(progress.blocking_reason->find("Apply=apply.7"), std::string::npos);
+  EXPECT_LE(progress.blocking_reason->size(), kMaxLifecycleErrorMessageBytes);
+  ASSERT_EQ(store_.events.size(), 2U);
+  const auto original = content_identity::parse_canonical_json(store_.events.front().payload_json);
+  ASSERT_NE(original.find_object_member("diagnostic"), nullptr);
+  EXPECT_TRUE(original.find_object_member("diagnostic")->find_object_member("snapshot")->is_null());
+  EXPECT_EQ(original.find_object_member("diagnostic")
+                ->find_object_member("error")
+                ->find_object_member("message")
+                ->as_string(),
+            ports_.diagnostic->message);
+  const auto record = content_identity::parse_canonical_json(store_.events.back().payload_json);
+  ASSERT_NE(record.find_object_member("diagnostic"), nullptr);
+  EXPECT_EQ(record.find_object_member("diagnostic")
+                ->find_object_member("error")
+                ->find_object_member("message")
+                ->as_string(),
+            ports_.diagnostic->message);
+  EXPECT_NE(store_.incidents.at(id).record_json.find("controller_launch_exited"),
+            std::string::npos);
+  ASSERT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
+
+  // Event retention is auxiliary: explicit status reads the durable row.
+  store_.events.clear();
+  CCLCLifecycleTargetDriver replacement({}, store_, ports_, clock_, scheduler_);
+  IncidentStatusPort api(replacement, ports_, store_);
+  const auto status = ExecuteCanonicalCCLCOpenRequest(
+      R"({"api_version":"manyforge.cclc_open_request.v1","command":"component_snapshot","payload":{"controllable_component_id":"component.arm"}})",
+      api, {});
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_NE(status.value().find(id), std::string::npos);
+  EXPECT_NE(status.value().find("signal=11"), std::string::npos);
+  EXPECT_NE(status.value().find("controller_launch.log"), std::string::npos);
+  const auto events = ExecuteCanonicalCCLCOpenRequest(
+      R"({"api_version":"manyforge.cclc_open_request.v1","command":"incident_events","payload":{"after_sequence":0,"limit":10}})",
+      api, {});
+  ASSERT_TRUE(events.ok()) << events.error().message;
+  EXPECT_EQ(events.value().find(id), std::string::npos);
+  EXPECT_NE(status.value().find("arm: effective settings"), std::string::npos);
+  EXPECT_NE(status.value().find("controller crashed"), std::string::npos);
+  EXPECT_NE(status.value().find("robot_description_sha256"), std::string::npos);
+  EXPECT_NE(status.value().find("log_path"), std::string::npos);
+  EXPECT_EQ(events.value().find("controller_launch_exited"), std::string::npos);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(LifecycleIncidentTest, OutputCounterReadIsExplicitAndInformational) {
+  CCLCLifecycleTargetDriverConfig config;
+  std::size_t reads{};
+  bool unavailable{};
+  config.read_output_drop_counts = [&](const ControllableComponentId& component)
+      -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+    EXPECT_EQ(component, kComponent);
+    ++reads;
+    if (unavailable) throw std::runtime_error("optional counts unavailable");
+    return std::pair<std::uint64_t, std::uint64_t>{0U, std::numeric_limits<std::uint64_t>::max()};
+  };
+  CCLCLifecycleTargetDriver driver(config, store_, ports_, clock_, scheduler_);
+  driver.RunOnce();
+  EXPECT_EQ(reads, 0U);
+  const auto view = driver.ReadTargetView(kComponent);
+  ASSERT_TRUE(view.ok());
+  EXPECT_EQ(view.value().dropped_output_lines, 0U);
+  EXPECT_EQ(view.value().dropped_output_bytes, std::numeric_limits<std::uint64_t>::max());
+  unavailable = true;
+  const auto unavailable_view = driver.ReadTargetView(kComponent);
+  ASSERT_TRUE(unavailable_view.ok());
+  EXPECT_FALSE(unavailable_view.value().dropped_output_lines);
+  EXPECT_FALSE(unavailable_view.value().dropped_output_bytes);
+  EXPECT_TRUE(ports_.containments.empty());
+}
+
+TEST_F(LifecycleIncidentTest, ShortExitErrorIsDurableWithoutRichCapture) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ports_.diagnostic = ErrorDTO{
+      "controller_launch_exited", "signal=11 Apply=apply.7", {{"component", "component.arm"}}};
+  ports_.diagnostic_snapshot.reset();
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  Driver().RunOnce();
+  const auto original = store_.events.front();
+  ASSERT_EQ(store_.events.size(), 1U);
+  ASSERT_TRUE(Progress().incident && Progress().incident->diagnostic);
+  EXPECT_EQ(Progress().incident->diagnostic, ports_.diagnostic);
+  EXPECT_FALSE(Progress().incident->diagnostic_snapshot);
+  CCLCLifecycleTargetDriver replacement({}, store_, ports_, clock_, scheduler_);
+  IncidentStatusPort api(replacement, ports_, store_);
+  const auto status = ExecuteCanonicalCCLCOpenRequest(
+      R"({"api_version":"manyforge.cclc_open_request.v1","command":"component_snapshot","payload":{"controllable_component_id":"component.arm"}})",
+      api, {});
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_NE(status.value().find("signal=11 Apply=apply.7"), std::string::npos);
+  EXPECT_NE(status.value().find("\"snapshot\":null"), std::string::npos);
+  EXPECT_EQ(store_.events.front(), original);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(LifecycleIncidentTest, LaterLaunchExitKeepsTheGuardIncidentAndSurvivesReplacement) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;  // Guard trips first.
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  const auto initial = Progress();
+  ASSERT_TRUE(initial.incident);
+  const auto id = initial.incident->incident_id;
+  const auto summary = initial.incident->summary;
+  ASSERT_EQ(store_.events.size(), 1U);
+  const auto original_event = store_.events.front();
+  ports_.diagnostic =
+      ErrorDTO{"controller_launch_exited", "signal=11 Apply=apply.7 tail=crash", {}};
+  ports_.diagnostic_snapshot.reset();
+  ++ports_.observation_generation;
+  // Diagnostic journal failure leaves the primary incident/containment intact.
+  store_.fail_diagnostic = true;
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().incident->incident_id, id);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_EQ(store_.events.size(), 1U);
+  store_.fail_diagnostic = false;
+  Driver().RunOnce();
+  ASSERT_EQ(store_.events.size(), 2U);
+  const auto short_event = store_.events.back();
+  EXPECT_TRUE(content_identity::parse_canonical_json(short_event.payload_json)
+                  .find_object_member("diagnostic")
+                  ->find_object_member("snapshot")
+                  ->is_null());
+  EXPECT_FALSE(Progress().incident->diagnostic_snapshot);
+  const auto first_error = Progress().incident->diagnostic;
+  ASSERT_TRUE(first_error);
+  ports_.diagnostic = ErrorDTO{"controller_launch_exited", "later replacement message", {}};
+  ports_.diagnostic_snapshot = TestLaunchDiagnosticSnapshot();
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  ASSERT_EQ(store_.events.size(), 3U);
+  EXPECT_EQ(store_.events[1], short_event);
+  EXPECT_EQ(Progress().incident->diagnostic, first_error);
+  ASSERT_TRUE(Progress().incident->diagnostic_snapshot);
+  EXPECT_EQ(store_.events.front(), original_event);
+  EXPECT_EQ(Progress().incident->summary, summary);
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
+  for (int pass = 0; pass < 4; ++pass) {
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+  }
+  EXPECT_EQ(store_.events.size(), 3U);
+  CCLCLifecycleTargetDriver replacement({}, store_, ports_, clock_, scheduler_);
+  IncidentStatusPort api(replacement, ports_, store_);
+  const auto status = ExecuteCanonicalCCLCOpenRequest(
+      R"({"api_version":"manyforge.cclc_open_request.v1","command":"component_snapshot","payload":{"controllable_component_id":"component.arm"}})",
+      api, {});
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_NE(status.value().find(id), std::string::npos);
+  EXPECT_NE(status.value().find("signal=11"), std::string::npos);
+  EXPECT_NE(status.value().find(summary), std::string::npos);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(LifecycleIncidentTest, RoutineFactsReuseExactDiagnosticWhileRefreshingPrimaryMetadata) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ports_.diagnostic = ErrorDTO{"controller_launch_exited", "signal=11", {}};
+  ports_.diagnostic_snapshot = TestLaunchDiagnosticSnapshot();
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  Driver().RunOnce();
+  const auto snapshot = Progress().incident->diagnostic_snapshot;
+  ASSERT_TRUE(snapshot);
+  const auto attempts = store_.diagnostic_attempts;
+  store_.omit_facts_diagnostic = true;
+  auto& row = store_.incidents.begin()->second;
+  row.incident.vendor_codes = {"new_vendor_fact"};
+  row.incident.containment_state = ComponentIncidentContainmentStateDTO::kFailed;
+  for (int pass = 0; pass < 4; ++pass) {
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+    EXPECT_EQ(Progress().incident->diagnostic_snapshot.get(), snapshot.get());
+    EXPECT_EQ(Progress().incident->vendor_codes, row.incident.vendor_codes);
+    EXPECT_EQ(Progress().incident->containment_state,
+              ComponentIncidentContainmentStateDTO::kFailed);
+  }
+  EXPECT_EQ(store_.diagnostic_attempts, attempts);
+  CCLCLifecycleTargetDriver replacement({}, store_, ports_, clock_, scheduler_);
+  replacement.RunOnce();
+  const auto persisted = replacement.ReadTargetView(kComponent).value().progress->incident;
+  ASSERT_TRUE(persisted->diagnostic_snapshot);
+  EXPECT_EQ(content_identity::canonical_json(*persisted->diagnostic_snapshot),
+            content_identity::canonical_json(*snapshot));
+  // A replacement must probe/load once; later routine passes reuse its progress.
+  const auto replacement_attempts = store_.diagnostic_attempts;
+  replacement.RunOnce();
+  EXPECT_EQ(store_.diagnostic_attempts, replacement_attempts);
+}
+
+TEST_F(LifecycleIncidentTest, ReplacementContainsPendingIncidentBeforeDiagnosticWriter) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  auto& stored = store_.incidents.begin()->second;
+  stored.incident.containment_state = ComponentIncidentContainmentStateDTO::kPending;
+  ports_.containments.clear();
+  ports_.diagnostic = ErrorDTO{"controller_launch_exited", "signal=11 tail=crash", {}};
+  ports_.diagnostic_snapshot = TestLaunchDiagnosticSnapshot();
+  ++ports_.observation_generation;
+  store_.fail_diagnostic = true;
+  store_.on_diagnostic = [&] {
+    ASSERT_EQ(ports_.containments.size(), 1U);
+    EXPECT_EQ(ports_.containments.front().incident_id, stored.incident.incident_id);
+  };
+  CCLCLifecycleTargetDriver replacement({}, store_, ports_, clock_, scheduler_);
+  replacement.RunOnce();
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_FALSE(stored.diagnostic);
+  EXPECT_EQ(replacement.ReadTargetView(kComponent).value().progress->phase,
+            LifecycleProgressPhaseDTO::kBlocked);
+}
+
+TEST_F(LifecycleIncidentTest, InvalidLogTextCannotEraseThePrimaryIncidentRecord) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  const std::vector<std::string> invalid_text{std::string("bad\xFF", 4U), "e\u0301",
+                                              std::string("truncated\xC3", 10U)};
+  for (const auto& text : invalid_text) {
+    ports_.diagnostic = ErrorDTO{"controller_launch_exited", text, {}};
+    ports_.diagnostic_snapshot = TestLaunchDiagnosticSnapshot();
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+    Driver().RunOnce();  // Exercise the rejected auxiliary append too.
+    const auto progress = Progress();
+    ASSERT_TRUE(progress.incident);
+    EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
+    EXPECT_EQ(store_.incidents.size(), 1U);
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    EXPECT_FALSE(store_.incidents.begin()->second.diagnostic);
+  }
+  EXPECT_EQ(store_.events.size(), 1U);
+}
 
 TEST_F(LifecycleIncidentTest, StartupWaitingIsNeverAnIncident) {
   // Adopted Active before the controller ever reported fresh status.

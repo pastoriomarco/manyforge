@@ -1,8 +1,8 @@
 #pragma once
 
 #include <condition_variable>
-#include <functional>
 #include <cstdint>
+#include <functional>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/ports/icclc_brand_lifecycle_port_resolver.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
@@ -15,10 +15,11 @@
 #include <manyforge_core/types/lifecycle_target.hpp>
 #include <map>
 #include <memory>
-#include <string>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -42,6 +43,13 @@ struct CCLCLifecycleTargetDriverConfig final {
   /// override replaces this table when it is wired (hook only today).
   std::vector<LifecycleIncidentRecoveryPolicyDTO> incident_recovery_policy{
       DefaultLifecycleIncidentRecoveryPolicy()};
+
+  /// Optional host-owned scalar counts, read only by explicit status requests.
+  /// No tail capture, lifecycle authority or health consequence; unavailable
+  /// and throwing sources omit both informational fields.
+  std::function<std::optional<std::pair<std::uint64_t, std::uint64_t>>(
+      const ControllableComponentId&)>
+      read_output_drop_counts{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
     return fallback_period_ns > 0 && in_flight_poll_period_ns > 0 &&
@@ -326,7 +334,9 @@ class CCLCLifecycleTargetDriver final {
   /// it; a failed record keeps it for the next pass.
   void ContainAndRecordIncident(ComponentState& state, std::int64_t now_ns);
   void PublishIncident(ComponentState& state, const ComponentLifecycleIncidentDTO& incident,
-                       std::int64_t now_ns) const;
+                       std::int64_t now_ns,
+                       const std::optional<ErrorDTO>& diagnostic = std::nullopt,
+                       bool diagnostic_loaded = true) const;
   /// The Kernel's containment of one incident, requested at most once per
   /// incident by this driver; a later call returns the remembered outcome.
   const ContainmentOutcome& Contain(const ComponentLifecycleIncidentDTO& incident);

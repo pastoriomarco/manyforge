@@ -10,6 +10,8 @@ import type {
   CCLCDesiredConfiguration,
   CCLCExpectedActiveConfiguration,
   CCLCIncidentCauseClass,
+  CCLCIncidentDiagnostic,
+  CCLCIncidentDiagnosticSnapshot,
   CCLCIncidentRecovery,
   CCLCLifecycleIntent,
   CCLCLifecycleProgress,
@@ -77,6 +79,8 @@ const MAX_INCIDENT_ID_BYTES = 128;
 const MAX_INCIDENT_SUMMARY_BYTES = 1024;
 const MAX_VENDOR_CODES = 16;
 const MAX_VENDOR_CODE_BYTES = 64;
+const MAX_DIAGNOSTIC_BYTES = 512 * 1024;
+const MAX_DIAGNOSTIC_TAIL_BYTES = 128 * 1024;
 
 function fail(path: string, expected: string): never {
   throw new Error(`${path} must be ${expected}`);
@@ -371,12 +375,146 @@ function boundedNfcText(value: unknown, maximumBytes: number): value is string {
     && new TextEncoder().encode(value).length <= maximumBytes;
 }
 
+function diagnosticTextAt(value: unknown, path: string, maximum: number): string {
+  if (
+    typeof value !== 'string'
+    || value.normalize('NFC') !== value
+    || new TextEncoder().encode(value).length > maximum
+    || new TextDecoder('utf-8', { ignoreBOM: true }).decode(new TextEncoder().encode(value)) !== value
+  ) {
+    return fail(path, 'bounded NFC Unicode text');
+  }
+  return value;
+}
+
+function diagnosticUnsigned64At(value: unknown, path: string): number | string {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value === 'string' && value.length <= 20
+    && /^(0|[1-9]\d*)$/.test(value) && BigInt(value) <= 18_446_744_073_709_551_615n) {
+    return value;
+  }
+  return fail(path, 'an exact nonnegative uint64 scalar');
+}
+
+function diagnosticAt(value: unknown, path: string): CCLCIncidentDiagnostic | null {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exact(row, ['error', 'snapshot'], path);
+  const errorPath = `${path}.error`;
+  const error = objectAt(row.error, errorPath);
+  exact(error, ['code', 'message', 'details'], errorPath);
+  const code = diagnosticTextAt(error.code, `${errorPath}.code`, 128);
+  if (!code) fail(`${errorPath}.code`, 'non-empty text');
+  const message = diagnosticTextAt(error.message, `${errorPath}.message`, 1024);
+  const details = objectAt(error.details, `${errorPath}.details`);
+  if (Object.keys(details).length > 8) fail(`${errorPath}.details`, 'at most 8 rows');
+  const parsedDetails = Object.fromEntries(Object.entries(details).map(([key, detail]) => {
+    if (!diagnosticTextAt(key, `${errorPath}.details key`, 64)) {
+      fail(`${errorPath}.details key`, 'non-empty text');
+    }
+    return [key, diagnosticTextAt(detail, `${errorPath}.details.${key}`, 256)];
+  }));
+  if (row.snapshot === null) {
+    return { error: { code, message, details: parsedDetails }, snapshot: null };
+  }
+  const snapshotPath = `${path}.snapshot`;
+  const snapshot = objectAt(row.snapshot, snapshotPath);
+  const groups = {
+    exit: ['status', 'signal', 'core_dumped', 'observed_utc'],
+    context: [
+      'component_id', 'request_context', 'runtime_unit_id', 'runtime_epoch',
+      'bundle_id', 'graph_revision', 'generator_identity', 'launch_identity',
+    ],
+    readiness: [
+      'known', 'controller_manager_present', 'controller_observed', 'controller_loaded',
+      'controller_bound', 'arm_controller_active', 'hardware_ready', 'joint_sample_available',
+      'binding_epoch', 'sample_age_ns', 'captured_utc',
+    ],
+    settings: [
+      'argv', 'controller_profile', 'runtime_namespace', 'arm_controller_name',
+      'gripper_controller_name', 'frame_prefix', 'controllers_yaml', 'retained_configuration_json',
+    ],
+    generated: ['robot_description_sha256', 'controllers_sha256'],
+    output: [
+      'tail', 'line_count', 'truncated', 'dropped_forward_lines',
+      'dropped_forward_bytes', 'invalid_text_bytes',
+    ],
+  };
+  exact(snapshot, [...Object.keys(groups), 'core_dump_link'], snapshotPath);
+  Object.entries(groups).forEach(([group, fields]) => {
+    exact(objectAt(snapshot[group], `${snapshotPath}.${group}`), fields, `${snapshotPath}.${group}`);
+  });
+  const exit = snapshot.exit as JsonObject;
+  for (const field of ['status', 'signal']) {
+    if (exit[field] !== null) {
+      const fact = safeIntegerAt(exit[field], `${snapshotPath}.exit.${field}`);
+      if (fact < 0 || fact > 255) fail(`${snapshotPath}.exit.${field}`, 'an integer from 0 to 255 or null');
+    }
+  }
+  booleanAt(exit.core_dumped, `${snapshotPath}.exit.core_dumped`);
+  if (!diagnosticTextAt(exit.observed_utc, `${snapshotPath}.exit.observed_utc`, 128)) {
+    fail(`${snapshotPath}.exit.observed_utc`, 'non-empty text');
+  }
+  Object.entries(snapshot.context as JsonObject).forEach(([key, fact]) => {
+    if (fact !== null) diagnosticTextAt(fact, `${snapshotPath}.context.${key}`,
+      key === 'request_context' || key === 'generator_identity' ? 1024 : 128);
+  });
+  Object.entries(snapshot.readiness as JsonObject).forEach(([key, fact]) => {
+    if (fact === null) return;
+    const factPath = `${snapshotPath}.readiness.${key}`;
+    if (key === 'binding_epoch') diagnosticUnsigned64At(fact, factPath);
+    else if (key === 'sample_age_ns') parseNanoseconds(fact, factPath);
+    else if (key === 'captured_utc') diagnosticTextAt(fact, factPath, 128);
+    else booleanAt(fact, factPath);
+  });
+  const settings = snapshot.settings as JsonObject;
+  // The incident byte budget bounds the collection too; it has no extra policy cap.
+  arrayAt(settings.argv, `${snapshotPath}.settings.argv`, MAX_DIAGNOSTIC_BYTES).forEach((argument, index) => {
+    diagnosticTextAt(argument, `${snapshotPath}.settings.argv[${index}]`, MAX_DIAGNOSTIC_BYTES);
+  });
+  Object.entries(settings).forEach(([key, fact]) => {
+    if (key !== 'argv' && fact !== null) {
+      diagnosticTextAt(fact, `${snapshotPath}.settings.${key}`, MAX_DIAGNOSTIC_BYTES);
+    }
+  });
+  Object.entries(snapshot.generated as JsonObject).forEach(([key, fact]) => {
+    if (fact !== null && (typeof fact !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(fact))) {
+      fail(`${snapshotPath}.generated.${key}`, 'a lowercase SHA256 digest or null');
+    }
+  });
+  if (snapshot.core_dump_link !== null) {
+    diagnosticTextAt(snapshot.core_dump_link, `${snapshotPath}.core_dump_link`, 1024);
+  }
+  const output = snapshot.output as JsonObject;
+  const tailPath = `${snapshotPath}.output.tail`;
+  const tail = diagnosticTextAt(output.tail, tailPath, MAX_DIAGNOSTIC_TAIL_BYTES);
+  const lines = tail === '' ? 0 : tail.split('\n').length - (tail.endsWith('\n') ? 1 : 0);
+  if (safeIntegerAt(output.line_count, `${snapshotPath}.output.line_count`) !== lines || lines > 2000) {
+    fail(`${snapshotPath}.output.line_count`, 'the exact tail line count from 0 to 2000');
+  }
+  booleanAt(output.truncated, `${snapshotPath}.output.truncated`);
+  for (const key of ['dropped_forward_lines', 'dropped_forward_bytes', 'invalid_text_bytes']) {
+    diagnosticUnsigned64At(output[key], `${snapshotPath}.output.${key}`);
+  }
+  if (new TextEncoder().encode(JSON.stringify(tail)).length > MAX_DIAGNOSTIC_TAIL_BYTES) {
+    fail(tailPath, 'at most 128 KiB of encoded JSON text');
+  }
+  // Core alone enforces the complete durable row budget, including row metadata.
+  if (new TextEncoder().encode(JSON.stringify(row)).length > MAX_DIAGNOSTIC_BYTES) {
+    fail(path, 'at most 512 KiB of encoded JSON');
+  }
+  return {
+    error: { code, message, details: parsedDetails },
+    snapshot: snapshot as unknown as CCLCIncidentDiagnosticSnapshot,
+  };
+}
+
 function incidentAt(value: unknown, path: string): CCLCComponentIncident | null {
   if (value === null) return null;
   const row = objectAt(value, path);
   exact(row, [
     'acknowledged', 'cause_class', 'detected_at_ns', 'incident_id', 'summary',
-    'vendor_codes',
+    'vendor_codes', ...('diagnostic' in row ? ['diagnostic'] : []),
   ], path);
   if (!boundedNfcText(row.incident_id, MAX_INCIDENT_ID_BYTES)) {
     fail(`${path}.incident_id`, 'bounded non-empty NFC text');
@@ -403,6 +541,7 @@ function incidentAt(value: unknown, path: string): CCLCComponentIncident | null 
     detectedAtNs: parseNanoseconds(row.detected_at_ns, `${path}.detected_at_ns`),
     summary: row.summary,
     acknowledged: false,
+    ...('diagnostic' in row ? { diagnostic: diagnosticAt(row.diagnostic, `${path}.diagnostic`) } : {}),
   };
 }
 
@@ -445,12 +584,14 @@ function lifecycleProgressAt(
 
 export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapshot {
   const row = objectAt(value, 'cclcComponent');
+  const hasOutputCounters = 'dropped_output_lines' in row || 'dropped_output_bytes' in row;
   exact(row, [
     'active_public_pointer_digest', 'component_lifecycle_generation',
     'component_lifecycle_state', 'controllable_component_id', 'domains',
     'graph_revision', 'lifecycle_progress', 'lifecycle_target',
     'provider_occurrences', 'publication_generation',
     'retained_bundle_id', 'snapshot_digest',
+    ...(hasOutputCounters ? ['dropped_output_lines', 'dropped_output_bytes'] : []),
   ], 'cclcComponent');
   const state = textAt(
     row.component_lifecycle_state,
@@ -606,6 +747,14 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
       row.lifecycle_progress,
       'cclcComponent.lifecycle_progress',
     ),
+    ...(hasOutputCounters ? {
+      droppedOutputLines: diagnosticUnsigned64At(
+        row.dropped_output_lines, 'cclcComponent.dropped_output_lines',
+      ),
+      droppedOutputBytes: diagnosticUnsigned64At(
+        row.dropped_output_bytes, 'cclcComponent.dropped_output_bytes',
+      ),
+    } : {}),
   };
 }
 

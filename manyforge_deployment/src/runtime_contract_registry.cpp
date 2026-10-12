@@ -497,6 +497,10 @@ const RuntimeContractDeclaration& require_runtime_contract(
       runtime_profile_id, runtime_profile_revision, runtime_product_id,
       runtime_product_revision);
   if (result == nullptr) {
+    if (runtime_profile_id.value() == detail::kRos2ControlExecutionRuntimeProfileId) {
+      fail_retained_bundle("ROS runtime profile/product is not qualified by this build; "
+                           "recompile the authored Deployment with the current ManyForge version");
+    }
     fail_retained_bundle(
         "runtime profile/product has no component contract declaration");
   }

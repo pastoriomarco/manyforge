@@ -194,6 +194,18 @@ _UI6I_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
         "acceptance_steps": ["UI6-I/T3", "UI6-I/T4"],
     },
 ]
+# Q63-Q66: the offline mock lane replaces the native simulated executor; every
+# retained native value keeps its historical source, the lane selection and
+# controller profile are maintainer decisions (no native direct-control field).
+_MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
+    **{
+        field: source
+        for field, source in _RUNTIME_RESTORATION_SOURCE_FIELDS.items()
+        if field != "direct_control_joint_limits"
+    },
+    "mock_profile": "maintainer_decision.Q69.model_family_id",
+    "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
+}
 _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
     "default_fault_stop_profile": (
@@ -268,52 +280,52 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "lite6_isaac_commanded_v0": (
         "6f98cdd29116ce939ad35a0b8aaa1b66c8d839c1bddb9eeddd6b98b4ffb000a7"
     ),
-    "lite6_native_simulated_v0": (
-        "8db5dc901743548637f0f6371da30afe1692f01f9e76b5eca3c2278f5e0451e5"
+    "lite6_mock_commanded_v0": (
+        "8c7b7839a4cb349bbead974ec949c453559d9f9c9697446d88dd2826477941b2"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
         "366f75e72576a463da26595e7167b202a9621e7c69c49f4bad403934d90f34b4"
     ),
-    "ur10e_robotiq_assistant_native_simulated_v0": (
-        "ebc4ae29cb59420a463895a8b2f43d7155f56c320e8bdcc0794f9f6deda10613"
+    "ur10e_robotiq_assistant_mock_commanded_v0": (
+        "cfcb6a43cbd5ec738d683a639d2e536ce98c13acb9924d16cb37f5be4b41fd6d"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
         "418afdd6eb7d45dbcabce7ca686f1dee41c3099e2ca7770d2c7f469b219efb23"
     ),
-    "ur10e_robotiq_native_simulated_v0": (
-        "1bf900ab5269eadf578a5344bf87d974a02c3ac52131db5f2e3e9533f7822f0a"
+    "ur10e_robotiq_mock_commanded_v0": (
+        "604c5de89e11e39b6a5767c719d0e9e42381879fdce068c8f16bb5908080ef20"
     ),
-    "ur5_native_simulated_v0": (
-        "f0c73afe865b8952c82310ef47f9db62ccd2ab5c7002fc76262be7f07f1abac5"
+    "ur5_mock_commanded_v0": (
+        "2d05adb391ce8fe9e2d59cc41d8a0ebba6e090e0395964afe303985e8612dee5"
     ),
-    "ur5e_robotiq_native_simulated_v0": (
-        "3f500ed608e42f2855cb45a74b1fc940ce68f20e0f1758b9259f382e56f4364f"
+    "ur5e_robotiq_mock_commanded_v0": (
+        "b39f02f42614ece09918444333c0f17792803d0966301472ae36d6a33a8c96d8"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "lite6_isaac_commanded_v0": "lite6_lite_gripper",
-    "lite6_native_simulated_v0": "lite6_lite_gripper",
+    "lite6_mock_commanded_v0": "lite6_lite_gripper",
     "ur10e_robotiq_assistant_isaac_commanded_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_assistant_native_simulated_v0": "ur10e_robotiq_2f_140",
+    "ur10e_robotiq_assistant_mock_commanded_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
-    "ur5_native_simulated_v0": "ur5_roboplan",
-    "ur5e_robotiq_native_simulated_v0": "ur5e_robotiq_2f_85",
+    "ur10e_robotiq_mock_commanded_v0": "ur10e_robotiq_2f_140",
+    "ur5_mock_commanded_v0": "ur5_roboplan",
+    "ur5e_robotiq_mock_commanded_v0": "ur5e_robotiq_2f_85",
 }
 _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": (
-        "ur10e_robotiq_assistant_native_simulated_v0"
+        "ur10e_robotiq_assistant_mock_commanded_v0"
     ),
     "examples/lite6_lite_gripper_pick_and_place.deployment.yaml": (
-        "lite6_native_simulated_v0"
+        "lite6_mock_commanded_v0"
     ),
-    "examples/pick_and_place.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/pick_and_place.deployment.yaml": "ur5_mock_commanded_v0",
     "examples/pick_and_place_ur10e_robotiq.deployment.yaml": (
-        "ur10e_robotiq_native_simulated_v0"
+        "ur10e_robotiq_mock_commanded_v0"
     ),
-    "examples/semantic_shape_pick.deployment.yaml": "ur5_native_simulated_v0",
-    "examples/vision_guided_bin_pick.deployment.yaml": "ur5_native_simulated_v0",
-    "examples/vision_guided_pose_pick.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/semantic_shape_pick.deployment.yaml": "ur5_mock_commanded_v0",
+    "examples/vision_guided_bin_pick.deployment.yaml": "ur5_mock_commanded_v0",
+    "examples/vision_guided_pose_pick.deployment.yaml": "ur5_mock_commanded_v0",
     "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": (
         "lite6_isaac_commanded_v0"
     ),
@@ -1859,14 +1871,19 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path} changes the exact runtime restoration/example-policy input"
             )
+        is_mock = is_ros2_control and "mock_profile" in _object(
+            profile["ros2_control_runtime"], path=f"{path}.ros2_control_runtime"
+        )
         expected_source_fields = (
-            _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS
+            _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS
+            if is_mock
+            else _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS
             if is_ros2_control
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
         )
         if profile_id in {
-            "lite6_native_simulated_v0",
-            "ur5e_robotiq_native_simulated_v0",
+            "lite6_mock_commanded_v0",
+            "ur5e_robotiq_mock_commanded_v0",
         }:
             expected_source_fields = {
                 **expected_source_fields,
@@ -1878,10 +1895,10 @@ def validate(source: Path, root: Path) -> None:
             )
         expected_acceptance = (
             _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE
-            if is_ros2_control
+            if is_ros2_control and not is_mock
             else _RUNTIME_RESTORATION_ACCEPTANCE
         )
-        if profile_id == "ur5e_robotiq_native_simulated_v0":
+        if profile_id == "ur5e_robotiq_mock_commanded_v0":
             expected_acceptance = _UI6I_RUNTIME_RESTORATION_ACCEPTANCE
         if profile["acceptance_obligations"] != expected_acceptance:
             raise SourceDescriptionError(
@@ -1940,6 +1957,7 @@ def validate(source: Path, root: Path) -> None:
                     "historical_program_blob",
                     "i9_behavior_obligations",
                     "root_pose_in_cell",
+                    "isaac_world",
                 }
             )
         row = _exact(
@@ -1947,6 +1965,8 @@ def validate(source: Path, root: Path) -> None:
             required=frozenset(deployment_fields),
             path=path,
         )
+        if is_i9:
+            _identifier(row["isaac_world"], path=f"{path}.isaac_world")
         deployment_source = _source_path(
             row["deployment_source"], root=root, path=f"{path}.deployment_source"
         )

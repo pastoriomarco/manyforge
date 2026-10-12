@@ -58,7 +58,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: stop_evidence_policy
     schema_id: manyforge.stop_evidence_policy.v2
-    schema_revision: sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970
+    schema_revision: sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13
     relative_path: catalog/manyforge.stop_evidence_policy.v2.yaml
     qualification: qualified
 value_schemas:
@@ -67,7 +67,7 @@ value_schemas:
     relative_path: value/manyforge.value_schema.provider_contract.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
-    schema_revision: sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b
+    schema_revision: sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27
     relative_path: value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.empty.v1
@@ -79,6 +79,6 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905
+    schema_revision: sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

@@ -25,6 +25,15 @@ decode_execution_motion_target_limits(
     const core::JsonValueDTO::Array &motion_target_limits,
     bool include_ordinary_jerk);
 
+/// Authored gripper target configurations (native and offline mock ROS
+/// runtime units), sorted by target; `label` names the configuration in
+/// diagnostics.
+[[nodiscard]] std::vector<
+    native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+decode_execution_gripper_target_configurations(
+    const core::JsonValueDTO::Array &gripper_target_configurations,
+    std::string_view label);
+
 // The artifact-role/media contract is unchanged. This payload version pins the
 // infrastructure-only projection; candidate controller settings stay in the
 // retained graph and are independently qualified before installation.

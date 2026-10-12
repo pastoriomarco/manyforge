@@ -2,7 +2,7 @@
   "api_version": "manyforge.provider_manifest.v1",
   "lifecycle_plan_catalog": {
     "catalog_api_version": "manyforge.brand_lifecycle_plan_catalog.v1",
-    "semantic_digest": "sha256:b56660c812db2e09af08d4bf7b7850b08a28fbfc2d24f9fb9fcace34e2dbcef2"
+    "semantic_digest": "sha256:f6d46812c1a953a09c081e331c92d20473ecfc42d0ac68749e30d724c03cc3b7"
   },
   "offered_capabilities": [
     {
@@ -203,7 +203,7 @@
     {
       "provider_contract_ref": {
         "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-        "contract_schema_revision": "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b",
+        "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
         "provider_contract_role_id": "stop_contract"
       },
       "stop_command_support": {
@@ -221,5 +221,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.ros2_control",
-  "provider_manifest_revision": "sha256:0f208d318a1774a2f3deb31b084a826498ff248c52d19c81385f970a588614ef"
+  "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232"
 }

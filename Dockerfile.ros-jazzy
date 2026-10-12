@@ -12,8 +12,8 @@ FROM ros:jazzy-ros-base-noble
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=jazzy
-ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/karanchahal-nv/topic_based_ros2_control.git
-ARG TOPIC_BASED_ROS2_CONTROL_REF=7ee291ab13adba52ab5889deb9e520009fe2283d
+ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/PickNikRobotics/topic_based_ros2_control.git
+ARG TOPIC_BASED_ROS2_CONTROL_REF=aa9f9ef9525a60f8becea322537dd1d6d1bf9123
 
 SHELL ["/bin/bash", "-c"]
 
@@ -37,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-joint-trajectory-controller \
         ros-${ROS_DISTRO}-ros2-control \
         ros-${ROS_DISTRO}-ros2-controllers \
+        ros-${ROS_DISTRO}-ros-testing \
+        ros-${ROS_DISTRO}-picknik-ament-copyright \
+        ros-${ROS_DISTRO}-xacro \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -44,11 +47,13 @@ RUN set -eux; \
     git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
     cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
     git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
+    test "$(git rev-parse HEAD)" = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"; \
     cd /tmp/topic_based_ros2_control_ws; \
     set +u; \
     source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
     set -u; \
     colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
+    printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
     rm -rf /tmp/topic_based_ros2_control_ws
 
 WORKDIR /workspace

@@ -613,6 +613,39 @@ def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, An
     }
 
 
+def _operator_manager_ready(manager: dict[str, Any]) -> bool:
+    source = manager.get("source")
+    payload = manager.get("status")
+    return (isinstance(source, dict) and isinstance(payload, dict)
+            and source.get("available") is True and source.get("freshness") == "fresh"
+            and source.get("known_gaps") == [] and payload.get("manager_ready") is True)
+
+
+def query_operator_status(*, headless_port: int, runner_port: int,
+                          composer_port: int) -> dict[str, Any]:
+    """Read real owner payloads; timing is never a readiness predicate."""
+    with HeadlessHttpClient(f"http://127.0.0.1:{headless_port}", timeout_seconds=1.0) as client:
+        headless = client.health()
+        manager = client.manager_status()
+    with HeadlessHttpClient(f"http://127.0.0.1:{runner_port}", timeout_seconds=1.0) as client:
+        runner = client.request("GET", "/api/program/health")
+    with HeadlessHttpClient(f"http://127.0.0.1:{composer_port}", timeout_seconds=1.0) as client:
+        composer = client.health()
+    if not all(isinstance(row, dict) for row in (manager, headless, runner, composer)):
+        raise WorkbenchError("owner status must be an object")
+    ready = (_operator_manager_ready(manager)
+             and headless.get("status") == "ready"
+             and headless.get("headless_projection_ready") is True
+             and runner.get("started") is True and runner.get("closed") is False
+             and composer.get("status") == "ready")
+    try:
+        timing = json.loads((STATE_ROOT / "workbench-startup-timing.json").read_text())
+    except (OSError, ValueError):
+        timing = None
+    return {"ready": ready, "manager": manager, "headless": headless,
+            "program_runner": runner, "composer": composer, "timing": timing}
+
+
 def _startup_cycle_state(client: HeadlessHttpClient) -> str:
     """Accept only contained startup states; terminal state remains resettable."""
 
@@ -635,6 +668,18 @@ class Workbench:
         artifact_root: Path | None = None,
         ros2_control: bool = False,
         bootstrap_project_path: str | None = None,
+        operator_install_root: Path | None = None,
+        operator_cell_id: str | None = None,
+        canonical_empty_admission_filename: str | None = None,
+        composer_static_dir: Path | None = None,
+        composer_bind_host: str = "127.0.0.1",
+        simulation_control_config: Path | None = None,
+        isaac_site_settings: Path | None = None,
+        package_aggregate_digest: str | None = None,
+        operator_instance_id: str | None = None,
+        node_catalog_path: Path | None = None,
+        alarm_catalog_path: Path | None = None,
+        operator_readiness_timeout: float = 60.0,
     ) -> None:
         self.project_path = project_path
         self.headless_port = headless_port
@@ -644,6 +689,21 @@ class Workbench:
         self.artifact_root = artifact_root or WORKSPACE / "examples"
         self.ros2_control = ros2_control
         self.bootstrap_project_path = bootstrap_project_path
+        self.operator_install_root = operator_install_root
+        self.operator_cell_id = operator_cell_id
+        self.operator_admission = canonical_empty_admission_filename
+        self.composer_static_dir = composer_static_dir
+        self.composer_bind_host = composer_bind_host
+        self.simulation_control_config = simulation_control_config
+        self.isaac_site_settings = isaac_site_settings
+        self.package_aggregate_digest = package_aggregate_digest
+        self.operator_instance_id = operator_instance_id
+        self.node_catalog_path = node_catalog_path or NODE_CATALOG
+        self.alarm_catalog_path = alarm_catalog_path or ALARM_CATALOG
+        if not 0 < operator_readiness_timeout <= 600:
+            raise WorkbenchError("operator readiness timeout must be in (0, 600]")
+        self.operator_readiness_timeout = operator_readiness_timeout
+        self._readiness_deadline: float | None = None
         self.scenario_id: str | None = None
         self.processes: list[tuple[str, subprocess.Popen[bytes]]] = []
         self.stop_requested = False
@@ -679,7 +739,7 @@ class Workbench:
             "-m",
             "manyforge_composer",
             "--host",
-            "127.0.0.1",
+            self.composer_bind_host,
             "--port",
             str(self.composer_port),
             "--headless-api-url",
@@ -687,6 +747,8 @@ class Workbench:
             "--headless-api-timeout-s",
             "20",
         ]
+        if self.composer_static_dir is not None:
+            command.extend(("--static-dir", str(self.composer_static_dir)))
         if self.project_path is not None:
             command.extend(("--startup-scenario-document", self.project_path))
         return command
@@ -699,17 +761,49 @@ class Workbench:
     def _simulation_control_arguments(self) -> tuple[str, ...]:
         if not self.ros2_control:
             return ()
-        config = WORKSPACE / "manyforge_ros_bringup/config/isaac_program_simulation_site.json"
+        config = self.simulation_control_config or WORKSPACE / "manyforge_ros_bringup/config/isaac_program_simulation_site.json"
         _regular_file(config, "Isaac Program simulation site configuration")
         return ("--simulation-control-config", str(config))
+
+    def _wait_until(self, description: str, predicate: Callable[[], Any],
+                    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
+                    *, timeout_seconds: float | None = 20.0) -> Any:
+        if self._readiness_deadline is not None:
+            timeout_seconds = max(0.0, self._readiness_deadline - time.monotonic())
+        return _wait_until(description, predicate, processes, timeout_seconds=timeout_seconds)
+
+    def _isaac_manager_arguments(self) -> tuple[str, ...]:
+        if self.isaac_site_settings is None:
+            return ()
+        observer = (BUILD_ROOT / "isaac/ros-overlay/install/manyforge_ros_bringup"
+                    / "lib/manyforge_ros_bringup/pose_source_snapshot_publisher")
+        _regular_file(observer, "installed Isaac pose observer", executable=True)
+        return ("--isaac-site-settings", str(self.isaac_site_settings),
+                "--isaac-pose-observer-executable", str(observer))
 
     def start(self) -> None:
         if self.bootstrap_project_path is not None and (
             not self.ros2_control or self.project_path is not None
         ):
             raise WorkbenchError("--bootstrap-project requires --ros2-control and excludes --project")
+        operator_mode = self.operator_install_root is not None
+        if operator_mode:
+            if not self.ros2_control or self.project_path or self.bootstrap_project_path:
+                raise WorkbenchError("operator install requires ROS and excludes project auto-Load")
+            if not self.operator_cell_id or not self.operator_admission:
+                raise WorkbenchError("operator install requires its original cell/admission identity")
+            if Path(self.operator_admission).name != self.operator_admission:
+                raise WorkbenchError("operator admission must be package-relative")
+            from manyforge_operator.package_aggregate import package_aggregate_sha256
+            if package_aggregate_sha256(self.operator_install_root) != self.package_aggregate_digest:
+                raise WorkbenchError("qualified operator package aggregate mismatch")
+            _regular_file(self.operator_install_root / self.operator_admission, "qualified operator admission")
+            if self.composer_static_dir is not None:
+                _regular_file(self.composer_static_dir / "index.html", "built Composer frontend")
+            if self.isaac_site_settings is not None:
+                _regular_file(self.isaac_site_settings, "Isaac site settings")
         ros_capture: dict[str, Any] | None = None
-        if self.ros2_control:
+        if self.ros2_control and not operator_mode:
             intended_project = self.bootstrap_project_path or self.project_path
             if intended_project is None:
                 raise WorkbenchError(
@@ -726,18 +820,23 @@ class Workbench:
             self.headless_port,
             self.runner_port,
             self.composer_port,
-            self.frontend_port,
+            *((self.frontend_port,) if not operator_mode else ()),
         ):
             if not _port_available(port):
                 raise WorkbenchError(
                     f"required development port {port} is already in use"
                 )
+        STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        timing_path = STATE_ROOT / "workbench-startup-timing.json"
+        timing_path.write_text(_json({"build_elapsed_seconds": None,
+                                      "readiness_elapsed_seconds": None}) + "\n", encoding="utf-8")
+        build_started = time.monotonic()
         current_headless_extension = _ensure_current_backend()
         current_runtime_targets = self._runtime_targets()
         activation_preparer = _ensure_activation_preparer()
         bootstrap_root: Path
-        bootstrap_admission = BOOTSTRAP_ADMISSION
-        cell_id = WORKBENCH_CELL_ID
+        bootstrap_admission = self.operator_admission or BOOTSTRAP_ADMISSION
+        cell_id = self.operator_cell_id or WORKBENCH_CELL_ID
         if self.project_path is not None and not self.ros2_control:
             from manyforge_composer.backend.scenario_artifacts import (
                 ScenarioArtifactError,
@@ -753,7 +852,7 @@ class Workbench:
                 raise WorkbenchError(str(error)) from error
             self.project_path = project_path
             self.scenario_id = project["scenario_id"]
-        bootstrap_root = (
+        bootstrap_root = self.operator_install_root or (
             _ensure_ros_bootstrap_package(ros_capture, activation_preparer=activation_preparer)
             if ros_capture is not None else _ensure_repository_bootstrap_package()
         )
@@ -769,8 +868,17 @@ class Workbench:
         os.environ["PYTHONPATH"] = (
             f"{HEADLESS_BUILD}:{os.environ.get('PYTHONPATH', '')}"
         )
-        _ensure_frontend_dependencies()
+        if not operator_mode:
+            _ensure_frontend_dependencies()
         paths = self._paths()
+        # Timing is diagnostic only; status always reads the actual owners.
+        timing = {"build_elapsed_seconds": time.monotonic() - build_started,
+                  "readiness_elapsed_seconds": None}
+        timing_path = STATE_ROOT / "workbench-startup-timing.json"
+        timing_path.write_text(_json(timing) + "\n", encoding="utf-8")
+        readiness_started = time.monotonic()
+        if operator_mode:
+            self._readiness_deadline = readiness_started + self.operator_readiness_timeout
         installed = STATE_ROOT / "installed-targets"
         installed.mkdir(parents=True, exist_ok=True)
         manager = installed / "manyforge_manager_daemon"
@@ -816,7 +924,7 @@ class Workbench:
                 "--cell-id",
                 cell_id,
                 "--owner-id",
-                "program-runner.development-workbench",
+                f"program-runner.{self.operator_instance_id or 'development-workbench'}",
                 "--persistent-key-register-path",
                 str(_persistent_key_register_path()),
                 *self._simulation_control_arguments(),
@@ -840,11 +948,11 @@ class Workbench:
                 "--artifact-root",
                 str(paths["artifacts"]),
                 "--node-catalog-path",
-                str(NODE_CATALOG),
+                str(self.node_catalog_path),
                 "--node-environment-manifest-path",
                 str(NODE_ENVIRONMENT_MANIFEST),
                 "--alarm-catalog-path",
-                str(ALARM_CATALOG),
+                str(self.alarm_catalog_path),
                 "--historian-database-path",
                 str(STATE_ROOT / "history.sqlite3"),
                 "--manager-run-root",
@@ -854,7 +962,7 @@ class Workbench:
                 "--cell-id",
                 cell_id,
                 "--owner-id",
-                "headless-api.development-workbench",
+                f"headless-api.{self.operator_instance_id or 'development-workbench'}",
                 "--freshness-ms",
                 "2000",
                 "--manager-timeout-s",
@@ -880,7 +988,7 @@ class Workbench:
                 api = client.runtime()
             return bool(runner.get("started") is True and api.get("schema_version"))
 
-        _wait_until(
+        self._wait_until(
             "Program Runner and Headless reconciliation services",
             reconciliation_services_ready,
             self.processes,
@@ -915,9 +1023,9 @@ class Workbench:
                 # as examples/<name>/meshes/*.obj resolve below the checkout.
                 "--scene-asset-root",
                 str(WORKSPACE),
-            ),
+            ) + self._isaac_manager_arguments(),
         )
-        _wait_until(
+        self._wait_until(
             "Manager command socket",
             manager_socket.is_socket,
             self.processes,
@@ -928,6 +1036,8 @@ class Workbench:
         # keep waiting while the managed processes remain alive; do not turn a
         # slow but healthy operation into a startup failure.
         while True:
+            if self._readiness_deadline is not None and time.monotonic() >= self._readiness_deadline:
+                raise WorkbenchError("timed out waiting for fresh Manager readiness")
             for name, process in self.processes:
                 if process.poll() is not None:
                     raise WorkbenchError(
@@ -936,8 +1046,8 @@ class Workbench:
                     )
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 status = client.manager_status()
-                diff = client.manager_diff()
-            if _manager_projection_ready(status, diff):
+                diff = {} if operator_mode else client.manager_diff()
+            if (_operator_manager_ready(status) if operator_mode else _manager_projection_ready(status, diff)):
                 break
             # Manager reconciliation itself runs at 500 ms. Polling faster
             # only reserializes two large status documents and competes with
@@ -956,12 +1066,13 @@ class Workbench:
                     # never as permission to continue the old run.
                     return None
 
-        _wait_until(
-            "contained Program-cycle startup reconciliation",
-            contained_startup_cycle,
-            self.processes,
-            timeout_seconds=None,
-        )
+        if not operator_mode:
+            self._wait_until(
+                "contained Program-cycle startup reconciliation",
+                contained_startup_cycle,
+                self.processes,
+                timeout_seconds=None,
+            )
 
         def authoring_ready() -> dict[str, Any] | None:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
@@ -996,7 +1107,7 @@ class Workbench:
             ) as client:
                 return bool(client.health())
 
-        _wait_until(
+        self._wait_until(
             "Composer backend",
             composer_ready,
             self.processes,
@@ -1011,18 +1122,25 @@ class Workbench:
                 )
                 return result if result["ready"] else None
 
-            _wait_until(
+            self._wait_until(
                 "exact current Scenario project",
                 exact_status,
                 self.processes,
                 timeout_seconds=None,
             )
-        _wait_until(
-            "idle authoring admission",
-            authoring_ready,
-            self.processes,
-            timeout_seconds=None,
-        )
+        if not operator_mode:
+            self._wait_until(
+                "idle authoring admission",
+                authoring_ready,
+                self.processes,
+                timeout_seconds=None,
+            )
+        if operator_mode:
+            timing["readiness_elapsed_seconds"] = time.monotonic() - readiness_started
+            timing_path.write_text(_json(timing) + "\n", encoding="utf-8")
+            print(_json({"ready": True, "url": f"http://localhost:{self.composer_port}",
+                         "timing": timing}), flush=True)
+            return
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"
@@ -1048,7 +1166,7 @@ class Workbench:
             ):
                 return True
 
-        _wait_until("Vite HMR", frontend_ready, self.processes)
+        self._wait_until("Vite HMR", frontend_ready, self.processes)
         print(
             _json(
                 {
@@ -1202,11 +1320,24 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--runner-port", type=int, default=9011)
         command.add_argument("--composer-port", type=int, default=9020)
         command.add_argument("--frontend-port", type=int, default=3000)
+        command.add_argument("--operator-runtime", action="store_true")
         if name == "serve":
             projects.add_argument(
                 "--bootstrap-project",
                 help="select the first ROS Scenario for empty startup, without loading it",
             )
+            command.add_argument("--operator-install-root", type=Path)
+            command.add_argument("--operator-cell-id")
+            command.add_argument("--operator-instance-id")
+            command.add_argument("--operator-readiness-timeout", type=float, default=60.0)
+            command.add_argument("--node-catalog-path", type=Path)
+            command.add_argument("--alarm-catalog-path", type=Path)
+            command.add_argument("--canonical-empty-admission-filename")
+            command.add_argument("--composer-static-dir", type=Path)
+            command.add_argument("--composer-bind-host", default="127.0.0.1")
+            command.add_argument("--simulation-control-config", type=Path)
+            command.add_argument("--isaac-site-settings", type=Path)
+            command.add_argument("--package-aggregate-sha256")
             command.add_argument(
                 "--ros2-control",
                 action="store_true",
@@ -1218,6 +1349,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "status" and args.operator_runtime:
+            result = query_operator_status(headless_port=args.headless_port,
+                                           runner_port=args.runner_port,
+                                           composer_port=args.composer_port)
+            print(_json(result))
+            return 0 if result["ready"] else 69
         if args.command == "status":
             scenario_id = None
             if args.project is not None:
@@ -1234,6 +1371,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(_json(result))
             return 0 if result["ready"] else 69
+        if args.operator_runtime != (args.operator_install_root is not None):
+            raise WorkbenchError("operator runtime requires its qualified install root and explicit startup mode")
         Workbench(
             project_path=args.project,
             headless_port=args.headless_port,
@@ -1242,6 +1381,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             frontend_port=args.frontend_port,
             ros2_control=args.ros2_control,
             bootstrap_project_path=args.bootstrap_project,
+            operator_install_root=args.operator_install_root,
+            operator_cell_id=args.operator_cell_id,
+            canonical_empty_admission_filename=args.canonical_empty_admission_filename,
+            composer_static_dir=args.composer_static_dir,
+            composer_bind_host=args.composer_bind_host,
+            simulation_control_config=args.simulation_control_config,
+            isaac_site_settings=args.isaac_site_settings,
+            package_aggregate_digest=args.package_aggregate_sha256,
+            operator_instance_id=args.operator_instance_id,
+            node_catalog_path=args.node_catalog_path,
+            alarm_catalog_path=args.alarm_catalog_path,
+            operator_readiness_timeout=args.operator_readiness_timeout,
         ).serve()
         return 0
     except (HeadlessClientError, OSError, ValueError, WorkbenchError) as error:

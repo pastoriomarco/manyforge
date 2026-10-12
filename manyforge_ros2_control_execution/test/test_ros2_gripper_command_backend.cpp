@@ -22,7 +22,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
 
@@ -52,7 +52,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
 
@@ -71,7 +71,6 @@ TEST(Ros2GripperCommandBackendTest,
   EXPECT_EQ(configured.transport_kind, "ros_gripper_command");
   EXPECT_FALSE(configured.command_path_ready);
   EXPECT_FALSE(configured.feedback_path_ready);
-  EXPECT_TRUE(configured.command_gate_open);
   EXPECT_FALSE(configured.ready);
   EXPECT_EQ(configured.reason_codes,
             std::vector<std::string>{"gripper_action_server_unavailable"});
@@ -86,7 +85,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   auto gripper =
@@ -134,20 +133,16 @@ TEST(Ros2GripperCommandBackendTest,
             std::vector<std::string>{"gripper_command_subscriber_unavailable"});
 }
 
-TEST(Ros2GripperCommandBackendTest,
-     ClosedSimulatorGateDoesNotHideReadyGripperTransportOrAdmitCommand) {
+TEST(Ros2GripperCommandBackendTest, ReadyGripperTransportAdmitsCommandWithoutLegacyArmGate) {
   const std::string suffix = unique_suffix();
-  const std::string command_topic =
-      "/manyforge_gated_gripper_command_" + suffix;
-  const std::string state_topic = "/manyforge_gated_gripper_state_" + suffix;
+  const std::string command_topic = "/manyforge_gripper_command_" + suffix;
+  const std::string state_topic = "/manyforge_gripper_state_" + suffix;
 
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.command_gate_topic = "/manyforge_command_gate_" + suffix;
-  auto resources = test_transport_resources(sink, clock, "arm", config);
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
 
@@ -167,26 +162,17 @@ TEST(Ros2GripperCommandBackendTest,
     std::this_thread::sleep_for(20ms);
   }
 
-  const auto closed = backend.gripper_transport_readiness("tool");
-  EXPECT_TRUE(closed.configured);
-  EXPECT_TRUE(closed.command_path_ready);
-  EXPECT_TRUE(closed.feedback_path_ready);
-  EXPECT_FALSE(closed.command_gate_open);
-  EXPECT_TRUE(closed.ready);
-  EXPECT_TRUE(closed.reason_codes.empty());
+  const auto readiness = backend.gripper_transport_readiness("tool");
+  EXPECT_TRUE(readiness.configured);
+  EXPECT_TRUE(readiness.command_path_ready);
+  EXPECT_TRUE(readiness.feedback_path_ready);
+  EXPECT_TRUE(readiness.ready);
+  EXPECT_TRUE(readiness.reason_codes.empty());
 
-  const auto rejected = backend.command_gripper(make_gripper_request(
-      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
-  EXPECT_FALSE(rejected.accepted);
-  ASSERT_TRUE(rejected.error.has_value());
-  EXPECT_EQ(rejected.error->code,
-            ros2_control_fault_reason::kGripperGoalRejected);
-
-  EXPECT_TRUE(resources->request_command_gate(true));
-  const auto open = backend.gripper_transport_readiness("tool");
-  EXPECT_TRUE(open.command_gate_open);
-  EXPECT_TRUE(open.ready);
-  EXPECT_TRUE(open.reason_codes.empty());
+  const auto accepted = backend.command_gripper(
+      make_gripper_request(0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  EXPECT_TRUE(accepted.accepted);
+  EXPECT_FALSE(accepted.error.has_value());
 }
 
 TEST(Ros2GripperCommandBackendTest,
@@ -195,7 +181,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -228,7 +214,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -253,7 +239,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -285,7 +271,7 @@ TEST(Ros2GripperCommandBackendTest,
                            std::numeric_limits<double>::quiet_NaN());
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
 
@@ -311,7 +297,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
 
@@ -368,7 +354,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -405,7 +391,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   RejectingScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -432,7 +418,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -472,7 +458,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -512,7 +498,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->block_single_update();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -557,7 +543,7 @@ TEST(
   sink->block_single_update();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -598,7 +584,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -625,7 +611,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -649,7 +635,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->block_read();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -686,7 +672,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->block_read();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -716,7 +702,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->block_read();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -758,7 +744,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   ThrowingCancelScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, backend);
   backend.configure_gripper_action(
@@ -785,7 +771,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   ThrowingCancelScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   {
     Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler,
                                       false);
@@ -871,7 +857,7 @@ TEST(Ros2GripperCommandBackendTest,
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
   DequeuedCallbackScheduler scheduler;
-  auto resources = test_transport_resources(sink, clock, "arm", base_config());
+  auto resources = test_transport_resources(sink, clock, "arm");
   auto backend = std::make_unique<Ros2GripperCommandBackend>(
       *resources, sink, clock, scheduler, false);
   TestTransportLifetime lifetime(*resources, *backend);

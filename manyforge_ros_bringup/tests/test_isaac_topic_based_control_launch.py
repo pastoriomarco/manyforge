@@ -6,9 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from launch import LaunchContext
-from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument, EmitEvent, OpaqueFunction, RegisterEventHandler, TimerAction,
+)
 from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
+from launch_ros.utilities import evaluate_parameters
 import pytest
 from rclpy.parameter import parameter_dict_from_yaml_file
 
@@ -29,8 +32,27 @@ def _load_launch_module():
     return module
 
 
+@pytest.fixture(autouse=True)
+def _supplied_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Action-wiring fixture only: no generated-lane validation or RSP graph.
+    description = tmp_path / "supplied description.urdf"
+    description.write_text(
+        '<robot name="explicit_fixture" version="1.0">'
+        '<link name="base"/><!-- preserve {literal_braces} -->'
+        '</robot>', encoding="utf-8"
+    )
+    controllers = tmp_path / "supplied controllers.yaml"
+    controllers.write_text("/**/controller_manager:\n  ros__parameters:\n    update_rate: 100\n", encoding="utf-8")
+    monkeypatch.setitem(_SUPPLIED_ARTIFACTS, "robot_description_file", str(description))
+    monkeypatch.setitem(_SUPPLIED_ARTIFACTS, "controllers_file", str(controllers))
+
+
+_SUPPLIED_ARTIFACTS: dict[str, str] = {}
+
+
 def _launch_context(module, *, profile: str = "ur10e") -> LaunchContext:
     context = LaunchContext()
+    context.launch_configurations.update(_SUPPLIED_ARTIFACTS)
     for entity in module.generate_launch_description().entities:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
@@ -73,13 +95,13 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
     )
     assert {action.name for action in declarations} >= {
         "isaac_profile",
+        "robot_description_file",
+        "controllers_file",
         "runtime_namespace",
         "world_uri",
         "expected_world_name",
         "require_existing_world",
         "additional_required_topics",
-        "command_gate_owner_node",
-        "command_gate_owner_namespace",
         "manager_run_root",
         "pose_observer_site_config",
         "pointcloud_topic",
@@ -91,6 +113,8 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
     )
 
     source = _LAUNCH_FILE.read_text(encoding="utf-8")
+    assert "isaac_topic_command_gate" not in source
+    assert "stop_joint_commands" not in source
     for retired_wire in (
         "isaac_demo_supervisor",
         "supervisor_enable_topic",
@@ -99,6 +123,32 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "program_path",
     ):
         assert retired_wire not in source
+
+
+@pytest.mark.parametrize("name", ("robot_description_file", "controllers_file"))
+def test_missing_artifact_refuses_before_runtime_action_construction(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
+    context = _launch_context(module)
+    context.launch_configurations[name] = str(tmp_path / "missing")
+    monkeypatch.setattr(module, "Node", lambda **_kwargs: pytest.fail("runtime action constructed before artifact check"))
+    with pytest.raises(ValueError, match=f"{name} must be a readable"):
+        module._launch_setup(context)
+
+
+def test_artifact_paths_accept_readable_relative_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
+    context = _launch_context(module)
+    parent = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).parent
+    monkeypatch.chdir(parent)
+    for name, path in _SUPPLIED_ARTIFACTS.items():
+        context.launch_configurations[name] = Path(path).name
+    assert len(module._launch_setup(context)) == 2
 
 
 @pytest.mark.parametrize(
@@ -153,20 +203,19 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
     callback = getattr(event_handler, "_OnActionEventBase__on_event")
 
     released = callback(SimpleNamespace(returncode=0), LaunchContext())
-    assert [_node_executable(action) for action in released[:4]] == [
-        "isaac_topic_command_gate",
+    assert [_node_executable(action) for action in released[:3]] == [
         "robot_state_publisher",
         "static_transform_publisher",
         "isaac_gripper_action_bridge",
     ]
-    assert len(released) == 7
+    assert len(released) == 6
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
-        for action in released[:4]
+        for action in released[:3]
     )
     timed_nodes = [
         getattr(action, "_TimerAction__actions")[0]
-        for action in released[4:]
+        for action in released[3:]
     ]
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
@@ -175,6 +224,20 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
     expected_manager = (
         module.DEFAULT_RUNTIME_NAMESPACE + "/controller_manager"
     )
+    assert "--inactive" in getattr(timed_nodes[-1], "_Node__arguments")
+    arm_arguments = getattr(timed_nodes[-1], "_Node__arguments")
+    assert arm_arguments.count("--param-file") == 1
+    assert arm_arguments[arm_arguments.index("--param-file") + 1] == (
+        _SUPPLIED_ARTIFACTS["controllers_file"]
+    )
+    expected_description = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).read_text(encoding="utf-8")
+    assert evaluate_parameters(context, released[0]._Node__parameters)[0] == {
+        "robot_description": expected_description, "frame_prefix": "",
+    }
+    assert evaluate_parameters(context, timed_nodes[0]._Node__parameters)[0] == {
+        "robot_description": expected_description,
+    }
+    assert evaluate_parameters(context, getattr(timed_nodes[0], "_Node__parameters"))[-1] == Path(_SUPPLIED_ARTIFACTS["controllers_file"])
     for spawner in timed_nodes[1:]:
         arguments = getattr(spawner, "_Node__arguments")
         assert arguments[arguments.index("--controller-manager") + 1] == (
@@ -183,6 +246,52 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
 
     with pytest.raises(RuntimeError, match="return code 2"):
         callback(SimpleNamespace(returncode=2), LaunchContext())
+
+
+@pytest.mark.parametrize("profile", ["ur10e", "lite6"])
+@pytest.mark.parametrize("prefix", ["", "authored_component/"])
+def test_explicit_prefix_changes_rsp_and_static_child_only(
+    monkeypatch: pytest.MonkeyPatch, profile: str, prefix: str,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT),
+    )
+    context = _launch_context(module, profile=profile)
+    assert context.launch_configurations["frame_prefix"] == ""
+    context.launch_configurations.update(
+        frame_prefix=prefix, base_parent_frame="authored_global_world",
+        base_child_frame="authored_model_root",
+    )
+    actions = module._launch_setup(context)
+    handler = actions[1]._RegisterEventHandler__event_handler
+    callback = handler._OnActionEventBase__on_event
+    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+    rsp, static = released[:2]
+    description = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).read_text()
+    assert evaluate_parameters(context, rsp._Node__parameters)[0] == {
+        "robot_description": description, "frame_prefix": prefix,
+    }
+    arguments = [
+        value if isinstance(value, str) else perform_substitutions(context, [value])
+        for value in static._Node__arguments
+    ]
+    assert arguments[arguments.index("--frame-id") + 1] == "authored_global_world"
+    assert arguments[arguments.index("--child-frame-id") + 1] == (
+        prefix + "authored_model_root"
+    )
+    manager = next(
+        action._TimerAction__actions[0] for action in released
+        if hasattr(action, "_TimerAction__actions")
+        and _node_executable(action._TimerAction__actions[0]) == "ros2_control_node"
+    )
+    assert evaluate_parameters(context, manager._Node__parameters)[0] == {
+        "robot_description": description,
+    }
+    assert evaluate_parameters(context, manager._Node__parameters)[-1] == (
+        Path(_SUPPLIED_ARTIFACTS["controllers_file"])
+    )
+    assert _node_namespace(rsp, context) == module.DEFAULT_RUNTIME_NAMESPACE
 
 
 def test_launch_lite6_stack_omits_python_gripper_action_adapter(
@@ -205,7 +314,7 @@ def test_launch_lite6_stack_omits_python_gripper_action_adapter(
     assert "isaac_gripper_action_bridge" not in {
         _node_executable(action) for action in released
     }
-    assert len(released) == 6
+    assert len(released) == 5
 
 
 @pytest.mark.parametrize("require_existing_world", ["false", "true"])
@@ -399,24 +508,6 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
             module._parse_vector3(invalid, name="xyz")
 
 
-def test_launch_rejects_crossed_command_owner_namespace(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare,
-        "find",
-        lambda _self, _name: str(_PACKAGE_ROOT),
-    )
-    context = _launch_context(module, profile="ur10e")
-    context.launch_configurations["command_gate_owner_namespace"] = (
-        "/manyforge/another_robot"
-    )
-
-    with pytest.raises(ValueError, match="must equal runtime_namespace"):
-        module._launch_setup(context)
-
-
 def test_controller_manager_resource_parsers_remain_bounded() -> None:
     module = _load_launch_module()
 
@@ -446,9 +537,8 @@ def test_controller_manager_resource_parsers_remain_bounded() -> None:
 @pytest.mark.parametrize("profile", ("ur10e", "lite6"))
 def test_controller_parameters_follow_each_runtime_namespace(profile: str) -> None:
     module = _load_launch_module()
-    selected = module._profile_configuration(profile)
     parameter_file = (
-        _PACKAGE_ROOT / "config" / selected["controller_config_file"]
+        _PACKAGE_ROOT / "config" / f"isaac_{profile}_topic_based_controllers.yaml"
     )
     manager = parameter_dict_from_yaml_file(
         str(parameter_file),
@@ -468,6 +558,8 @@ def test_controller_parameters_follow_each_runtime_namespace(profile: str) -> No
     assert "joints" not in manager
     assert len(controller["joints"].value.string_array_value) == 6
     assert controller["constraints.decelerate_on_cancel"].value.bool_value
+    assert controller["interpolate_from_desired_state"].value.bool_value is True
+    assert controller["set_last_command_interface_value_as_state_on_activation"].value.bool_value is False
     assert "update_rate" not in controller
 
 
@@ -497,3 +589,61 @@ def test_demo_supervisor_entrypoint_has_no_backup_owner(
     assert "urllib" not in source
     assert isaac_demo_supervisor.main() == 78
     assert capsys.readouterr().err.strip() == isaac_demo_supervisor.UNAVAILABLE_MESSAGE
+
+
+def test_owned_nodes_disable_external_library_log_files():
+    import ast
+
+    source = _LAUNCH_FILE.read_text(encoding="utf-8")
+    nodes = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "Node"
+    ]
+    assert nodes
+    for node in nodes:
+        arguments = next(keyword.value for keyword in node.keywords if keyword.arg == "ros_arguments")
+        assert ast.literal_eval(arguments) == ["--disable-external-lib-logs"]
+
+
+@pytest.mark.parametrize("profile", ["ur10e", "lite6"])
+def test_manager_cell_owned_launch_omits_only_world_barrier_and_pose_observer(
+    monkeypatch: pytest.MonkeyPatch, profile: str,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
+    context = _launch_context(module, profile=profile)
+    context.launch_configurations.update({
+        "pose_observer_site_config": "/opt/manyforge/pose-observer.json",
+        "manager_run_root": "/run/manyforge",
+    })
+    assert context.launch_configurations["manager_cell_world_owned"] == "false"
+    _, registration = module._launch_setup(context)
+    handler = getattr(registration, "_RegisterEventHandler__event_handler")
+    callback = getattr(handler, "_OnActionEventBase__on_event")
+    standalone = callback(SimpleNamespace(returncode=0), LaunchContext())
+    context.launch_configurations["manager_cell_world_owned"] = "true"
+    managed = module._launch_setup(context)
+    expected = [a for a in standalone if _node_executable(a) != "pose_source_snapshot_publisher"]
+    assert len(managed) == len(expected)
+    assert [_node_executable(a) for a in managed] == [_node_executable(a) for a in expected]
+    assert not any(isinstance(a, RegisterEventHandler) for a in managed)
+    assert not any(_node_executable(a) in ("isaac_scene_load_barrier", "pose_source_snapshot_publisher") for a in managed)
+    assert sum(isinstance(a, TimerAction) for a in managed) == 3
+
+
+@pytest.mark.parametrize("key,value", [
+    ("manager_cell_world_owned", "invalid"),
+    ("scene_startup_timeout_s", "601"),
+    ("scene_service_timeout_s", "121"),
+])
+def test_manager_cell_mode_preserves_existing_launch_input_validation(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
+    context = _launch_context(module)
+    context.launch_configurations["manager_cell_world_owned"] = "true"
+    context.launch_configurations[key] = value
+    with pytest.raises(ValueError, match=key):
+        module._launch_setup(context)

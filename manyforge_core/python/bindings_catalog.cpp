@@ -924,13 +924,11 @@ void register_catalog_record_bindings(py::module_& module) {
   module.attr("MAX_PROVIDER_MANIFEST_ENDPOINT_ROLES") = kMaxProviderManifestEndpointRoles;
 
   py::class_<StopContainmentCommandDTO>(module, "StopContainmentCommandDTO", py::is_final())
-      .def(py::init<StopBudgetPhaseId, StopContainmentCommandKind,
-                    std::optional<ProviderContractRefDTO>,
+      .def(py::init<StopContainmentCommandKind, std::optional<ProviderContractRefDTO>,
                     std::optional<RegisteredStopCommandKindId>>(),
-           py::arg("command_phase_id"), py::arg("command_kind"),
+           py::arg("command_kind"),
            py::arg("provider_contract_ref") = std::nullopt,
            py::arg("registered_command_kind_id") = std::nullopt)
-      .def_readonly("command_phase_id", &StopContainmentCommandDTO::command_phase_id)
       .def_readonly("command_kind", &StopContainmentCommandDTO::command_kind)
       .def_readonly("provider_contract_ref", &StopContainmentCommandDTO::provider_contract_ref)
       .def_readonly("registered_command_kind_id",
@@ -942,26 +940,6 @@ void register_catalog_record_bindings(py::module_& module) {
           },
           py::is_operator());
 
-  py::class_<StopBudgetPhaseDTO>(module, "StopBudgetPhaseDTO", py::is_final())
-      .def(py::init<StopBudgetPhaseId, std::int64_t>(), py::arg("phase_id"),
-           py::arg("deadline_offset_ns"))
-      .def_readonly("phase_id", &StopBudgetPhaseDTO::phase_id)
-      .def_readonly("deadline_offset_ns", &StopBudgetPhaseDTO::deadline_offset_ns)
-      .def(
-          "__eq__",
-          [](const StopBudgetPhaseDTO& lhs, const StopBudgetPhaseDTO& rhs) { return lhs == rhs; },
-          py::is_operator());
-
-  py::class_<StopTimingParametersDTO>(module, "StopTimingParametersDTO", py::is_final())
-      .def(py::init<std::int64_t, std::int64_t, std::int64_t>(),
-           py::arg("command_latency_allowance_ns"), py::arg("settling_allowance_ns"),
-           py::arg("operational_timeout_ns"))
-      .def_readonly("command_latency_allowance_ns",
-                    &StopTimingParametersDTO::command_latency_allowance_ns)
-      .def_readonly("settling_allowance_ns", &StopTimingParametersDTO::settling_allowance_ns)
-      .def_readonly("operational_timeout_ns", &StopTimingParametersDTO::operational_timeout_ns)
-      .def(py::self == py::self);
-
   module.def(
       "authored_stop_duration_ns",
       [](double seconds) {
@@ -970,45 +948,6 @@ void register_catalog_record_bindings(py::module_& module) {
         return result.value();
       },
       py::arg("seconds"));
-  module.def(
-      "validate_controlled_stop_timing",
-      [](const StopTimingParametersDTO& timing, std::int64_t duration) -> std::optional<ErrorDTO> {
-        const auto result = validate_controlled_stop_timing(timing, duration);
-        return result.ok() ? std::nullopt : std::optional(result.error());
-      },
-      py::arg("timing"), py::arg("full_profile_duration_ns"));
-  module.def(
-      "resolve_stop_timing_budget",
-      [](const StopEvidencePolicyDTO& policy,
-         const std::optional<StopTimingParametersDTO>& timing) {
-        auto result = resolve_stop_timing_budget(policy, timing);
-        if (!result.ok()) throw py::value_error(result.error().message);
-        return std::move(result.value());
-      },
-      py::arg("policy"), py::arg("timing") = std::nullopt);
-  module.def(
-      "harmonize_stop_timing_budgets",
-      [](std::vector<StopDeadlineBudgetDTO> budgets) {
-        auto result = harmonize_stop_timing_budgets(budgets);
-        if (!result.ok()) throw py::value_error(result.error().message);
-        return budgets;
-      },
-      py::arg("budgets"));
-
-  py::class_<StopDeadlineBudgetDTO>(module, "StopDeadlineBudgetDTO", py::is_final())
-      .def(py::init<std::int64_t, std::int64_t, std::vector<StopBudgetPhaseDTO>>(),
-           py::arg("outer_duration_ns"), py::arg("kernel_completion_reserve_ns"), py::arg("phases"))
-      .def_readonly("outer_duration_ns", &StopDeadlineBudgetDTO::outer_duration_ns)
-      .def_readonly("kernel_completion_reserve_ns",
-                    &StopDeadlineBudgetDTO::kernel_completion_reserve_ns)
-      .def_readonly("phases", &StopDeadlineBudgetDTO::phases)
-      .def(
-          "__eq__",
-          [](const StopDeadlineBudgetDTO& lhs, const StopDeadlineBudgetDTO& rhs) {
-            return lhs == rhs;
-          },
-          py::is_operator());
-
   py::class_<StopEvidenceSourceRequirementDTO>(module, "StopEvidenceSourceRequirementDTO",
                                                py::is_final())
       .def(py::init<StopEvidenceSourceKind, std::int64_t, std::optional<EndpointRoleId>,
@@ -1040,26 +979,24 @@ void register_catalog_record_bindings(py::module_& module) {
           py::is_operator());
 
   py::class_<StopEvidenceRequirementDTO>(module, "StopEvidenceRequirementDTO", py::is_final())
-      .def(py::init([](StopEvidenceItemId evidence_item_id, StopBudgetPhaseId phase_id,
+      .def(py::init([](StopEvidenceItemId evidence_item_id,
                        StopEvidenceRequirementKind evidence_kind,
                        StopEvidenceSourceRequirementDTO source_requirement,
                        StopEvidenceObservationDTO observation_semantics,
                        std::optional<ProviderContractRefDTO> provider_contract_ref,
                        std::optional<RegisteredStopEvidenceKindId> registered_evidence_kind_id) {
              return StopEvidenceRequirementDTO{std::move(evidence_item_id),
-                                               std::move(phase_id),
                                                evidence_kind,
                                                std::move(provider_contract_ref),
                                                std::move(registered_evidence_kind_id),
                                                std::move(source_requirement),
                                                std::move(observation_semantics)};
            }),
-           py::arg("evidence_item_id"), py::arg("phase_id"), py::arg("evidence_kind"),
+           py::arg("evidence_item_id"), py::arg("evidence_kind"),
            py::arg("source_requirement"), py::arg("observation_semantics"),
            py::arg("provider_contract_ref") = std::nullopt,
            py::arg("registered_evidence_kind_id") = std::nullopt)
       .def_readonly("evidence_item_id", &StopEvidenceRequirementDTO::evidence_item_id)
-      .def_readonly("phase_id", &StopEvidenceRequirementDTO::phase_id)
       .def_readonly("evidence_kind", &StopEvidenceRequirementDTO::evidence_kind)
       .def_readonly("provider_contract_ref", &StopEvidenceRequirementDTO::provider_contract_ref)
       .def_readonly("registered_evidence_kind_id",
@@ -1095,18 +1032,15 @@ void register_catalog_record_bindings(py::module_& module) {
 
   py::class_<StopEvidencePolicyDTO>(module, "StopEvidencePolicyDTO", py::is_final())
       .def(py::init<StopEvidencePolicyId, StopEvidencePolicyRevision, StopEvidenceDisposition,
-                    ContainmentGranularity, std::optional<StopDeadlineBudgetDTO>,
-                    std::vector<StopEscalationStageDTO>>(),
+                    ContainmentGranularity, std::vector<StopEscalationStageDTO>>(),
            py::arg("stop_evidence_policy_id"), py::arg("stop_evidence_policy_revision"),
            py::arg("disposition"), py::arg("containment_granularity"),
-           py::arg("deadline_budget") = std::nullopt,
            py::arg("escalation_stages") = std::vector<StopEscalationStageDTO>{})
       .def_readonly("stop_evidence_policy_id", &StopEvidencePolicyDTO::stop_evidence_policy_id)
       .def_readonly("stop_evidence_policy_revision",
                     &StopEvidencePolicyDTO::stop_evidence_policy_revision)
       .def_readonly("disposition", &StopEvidencePolicyDTO::disposition)
       .def_readonly("containment_granularity", &StopEvidencePolicyDTO::containment_granularity)
-      .def_readonly("deadline_budget", &StopEvidencePolicyDTO::deadline_budget)
       .def_readonly("escalation_stages", &StopEvidencePolicyDTO::escalation_stages)
       .def(
           "__eq__",

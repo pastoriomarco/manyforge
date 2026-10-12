@@ -99,6 +99,8 @@ _MAX_INCIDENT_ID_BYTES = 128
 _MAX_INCIDENT_SUMMARY_BYTES = 1024
 _MAX_VENDOR_CODES = 16
 _MAX_VENDOR_CODE_BYTES = 64
+_MAX_DIAGNOSTIC_BYTES = 512 * 1024
+_MAX_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
 INCIDENT_EVENT_KINDS = frozenset(
     {"component_incident", "component_incident_acknowledged"}
 )
@@ -136,12 +138,162 @@ def _bounded_text(value: Any, maximum: int) -> bool:
     )
 
 
+def _diagnostic_text(value: Any, maximum: int, *, nonempty: bool = False) -> bool:
+    return (
+        isinstance(value, str)
+        and (not nonempty or bool(value))
+        and unicodedata.is_normalized("NFC", value)
+        and len(value.encode("utf-8")) <= maximum
+    )
+
+
+def _is_owner_uint64(value: Any) -> bool:
+    if _is_int(value):
+        return 0 <= value <= MAXIMUM_SAFE_INTEGER
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 20
+        and value.isascii()
+        and value.isdigit()
+        and (len(value) == 1 or value[0] != "0")
+        and int(value) <= 2**64 - 1
+    )
+
+
+def _closed(value: Any, fields: set[str]) -> bool:
+    return isinstance(value, dict) and set(value) == fields
+
+
+def _valid_diagnostic(value: Any) -> bool:
+    """Validate observation-only wire facts; the Core owns the total row budget."""
+
+    if value is None:
+        return True
+    try:
+        if not _closed(value, {"error", "snapshot"}):
+            return False
+        error = value["error"]
+        if not _closed(error, {"code", "message", "details"}):
+            return False
+        details = error["details"]
+        if (
+            not _diagnostic_text(error["code"], 128, nonempty=True)
+            or not _diagnostic_text(error["message"], 1024)
+            or not isinstance(details, dict)
+            or len(details) > 8
+            or not all(
+                _diagnostic_text(key, 64, nonempty=True)
+                and _diagnostic_text(detail, 256)
+                for key, detail in details.items()
+            )
+        ):
+            return False
+        snapshot = value["snapshot"]
+        if snapshot is None:
+            return len(rfc8785.dumps(value)) <= _MAX_DIAGNOSTIC_BYTES
+        groups = {
+            "exit": {"status", "signal", "core_dumped", "observed_utc"},
+            "context": {
+                "component_id", "request_context", "runtime_unit_id", "runtime_epoch",
+                "bundle_id", "graph_revision", "generator_identity", "launch_identity",
+            },
+            "readiness": {
+                "known", "controller_manager_present", "controller_observed",
+                "controller_loaded", "controller_bound", "arm_controller_active",
+                "hardware_ready", "joint_sample_available", "binding_epoch",
+                "sample_age_ns", "captured_utc",
+            },
+            "settings": {
+                "argv", "controller_profile", "runtime_namespace", "arm_controller_name",
+                "gripper_controller_name", "frame_prefix", "controllers_yaml",
+                "retained_configuration_json",
+            },
+            "generated": {"robot_description_sha256", "controllers_sha256"},
+            "output": {
+                "tail", "line_count", "truncated", "dropped_forward_lines",
+                "dropped_forward_bytes", "invalid_text_bytes",
+            },
+        }
+        if not _closed(snapshot, set(groups) | {"core_dump_link"}) or any(
+            not _closed(snapshot[group], fields) for group, fields in groups.items()
+        ):
+            return False
+        exit_fact = snapshot["exit"]
+        if (
+            any(
+                fact is not None and (not _is_int(fact) or not 0 <= fact <= 255)
+                for fact in (exit_fact["status"], exit_fact["signal"])
+            )
+            or type(exit_fact["core_dumped"]) is not bool
+            or not _diagnostic_text(exit_fact["observed_utc"], 128, nonempty=True)
+        ):
+            return False
+        for key, fact in snapshot["context"].items():
+            maximum = 1024 if key in {"request_context", "generator_identity"} else 128
+            if fact is not None and not _diagnostic_text(fact, maximum):
+                return False
+        readiness = snapshot["readiness"]
+        for key, fact in readiness.items():
+            if fact is None:
+                continue
+            if key == "binding_epoch":
+                valid = _is_owner_uint64(fact)
+            elif key == "sample_age_ns":
+                valid = _is_owner_ns(fact)
+            elif key == "captured_utc":
+                valid = _diagnostic_text(fact, 128)
+            else:
+                valid = type(fact) is bool
+            if not valid:
+                return False
+        settings = snapshot["settings"]
+        if not isinstance(settings["argv"], list) or not all(
+            _diagnostic_text(argument, _MAX_DIAGNOSTIC_BYTES)
+            for argument in settings["argv"]
+        ):
+            return False
+        if any(
+            fact is not None and not _diagnostic_text(fact, _MAX_DIAGNOSTIC_BYTES)
+            for key, fact in settings.items() if key != "argv"
+        ):
+            return False
+        for fact in snapshot["generated"].values():
+            if fact is not None and (
+                not isinstance(fact, str) or len(fact) != 71
+                or not fact.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in fact[7:])
+            ):
+                return False
+        link = snapshot["core_dump_link"]
+        if link is not None and not _diagnostic_text(link, 1024):
+            return False
+        output = snapshot["output"]
+        tail = output["tail"]
+        if not _diagnostic_text(tail, _MAX_DIAGNOSTIC_TAIL_BYTES):
+            return False
+        lines = tail.count("\n") + (1 if tail and not tail.endswith("\n") else 0)
+        if (
+            not _is_int(output["line_count"])
+            or not 0 <= output["line_count"] <= 2000
+            or output["line_count"] != lines
+            or type(output["truncated"]) is not bool
+            or not all(_is_owner_uint64(output[key]) for key in (
+                "dropped_forward_lines", "dropped_forward_bytes", "invalid_text_bytes",
+            ))
+            or len(rfc8785.dumps(tail)) > _MAX_DIAGNOSTIC_TAIL_BYTES
+        ):
+            return False
+        return len(rfc8785.dumps(value)) <= _MAX_DIAGNOSTIC_BYTES
+    except (rfc8785.CanonicalizationError, UnicodeError, ValueError):
+        return False
+
+
 def _valid_incident(incident: Any) -> bool:
     """One open component incident (addendum 2 contract item 2), or null."""
 
     if incident is None:
         return True
-    if not isinstance(incident, dict) or set(incident) != {
+    if not isinstance(incident, dict) or set(incident) - {"diagnostic"} != {
         "acknowledged",
         "cause_class",
         "detected_at_ns",
@@ -162,6 +314,7 @@ def _valid_incident(incident: Any) -> bool:
         and _bounded_text(summary, _MAX_INCIDENT_SUMMARY_BYTES)
         and unicodedata.is_normalized("NFC", summary)
         and incident["acknowledged"] is False
+        and _valid_diagnostic(incident.get("diagnostic"))
     )
 
 
@@ -178,8 +331,16 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
     The snapshot is otherwise forwarded unchanged; these two owner-issued
     facts carry closed enums that Composer presents, so Headless rejects an
     unknown key or spelling instead of forwarding an unpresentable state.
+    Available output-loss counters arrive as one exact uint64 pair.
     """
 
+    output_counter_fields = {"dropped_output_lines", "dropped_output_bytes"}
+    present_output_counters = output_counter_fields.intersection(snapshot)
+    if present_output_counters and (
+        present_output_counters != output_counter_fields
+        or not all(_is_owner_uint64(snapshot[field]) for field in output_counter_fields)
+    ):
+        raise _invalid_lifecycle_fact("dropped_output_lines/dropped_output_bytes")
     if "lifecycle_target" in snapshot:
         target = snapshot["lifecycle_target"]
         if target is not None and (

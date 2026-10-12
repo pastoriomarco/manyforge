@@ -21,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <string>
 #include <thread>
 
@@ -35,38 +34,28 @@ class SceneProjectionWorker;
 /// destroying either adapter. This holder contains no command or Stop policy.
 class Ros2TransportResources final {
 public:
-  Ros2TransportResources(
-      std::string node_name, std::string node_namespace,
-      std::size_t executor_thread_count, std::string command_gate_topic,
-      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
-      std::string arm_group_id, core::IClock &clock);
-  ~Ros2TransportResources();
-  Ros2TransportResources(const Ros2TransportResources &) = delete;
-  Ros2TransportResources &operator=(const Ros2TransportResources &) = delete;
+ Ros2TransportResources(std::string node_name, std::string node_namespace,
+                        std::size_t executor_thread_count,
+                        std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+                        std::string arm_group_id, core::IClock& clock);
+ ~Ros2TransportResources();
+ Ros2TransportResources(const Ros2TransportResources&) = delete;
+ Ros2TransportResources& operator=(const Ros2TransportResources&) = delete;
 
-  rclcpp::Node::SharedPtr node() const noexcept { return node_; }
-  detail::SceneProjectionWorker &projection_worker() const noexcept;
-  bool command_gate_configured() const noexcept {
-    return static_cast<bool>(command_gate_pub_);
-  }
-  bool command_gate_enabled() const noexcept {
-    return command_gate_enabled_.load(std::memory_order_acquire);
-  }
-  bool request_command_gate(bool enabled);
-  bool started() const noexcept {
-    return started_.load(std::memory_order_acquire);
-  }
-  void start();
-  void quiesce() noexcept;
+ rclcpp::Node::SharedPtr node() const noexcept { return node_; }
+ detail::SceneProjectionWorker& projection_worker() const noexcept;
+ bool started() const noexcept { return started_.load(std::memory_order_acquire); }
+ void start();
+ void quiesce() noexcept;
 
 private:
+  friend class JtcExecutionPortTestPeer;
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr command_gate_pub_;
   std::unique_ptr<detail::SceneProjectionWorker> scene_projection_worker_;
-  std::atomic<bool> command_gate_enabled_{false};
   std::atomic<bool> started_{false};
+  std::atomic<bool> spin_finished_{false};
   std::mutex lifecycle_mutex_;
   bool quiesced_ = false;
   std::thread spin_thread_;

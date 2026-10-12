@@ -35,13 +35,10 @@ from manyforge_ros_bringup.isaac_gripper_command import (
     log_readiness_transition,
     map_gripper_positions,
 )
-from manyforge_ros_bringup.isaac_topic_command_gate import (
-    DEFAULT_ENABLE_TOPIC,
-    DEFAULT_OWNER_NODE,
-    DEFAULT_OWNER_NAMESPACE,
-    owner_endpoint_identity,
-)
 
+
+
+DEFAULT_RUNTIME_NAMESPACE = "/manyforge/isaac_ur10e_light_robot"
 
 DEFAULT_COMMAND_JOINT_NAMES = ["finger_joint"]
 DEFAULT_COMMAND_MULTIPLIERS = [1.0]
@@ -62,9 +59,6 @@ class IsaacGripperActionBridge(Node):
         self._latest_positions: dict[str, float] = {}
         self._latest_state_time = 0.0
         self._latest_state_generation = 0
-        self._command_enabled = False
-        self._owner_topology_valid = False
-        self._sample_owner_identity: tuple[int, ...] | None = None
         self._active_target_positions: list[float] | None = None
         self._goal_reservation = SingleGoalReservation()
         self._last_readiness_value: bool | None = None
@@ -92,13 +86,6 @@ class IsaacGripperActionBridge(Node):
             10,
             callback_group=self._callback_group,
         )
-        self._gate_subscription = self.create_subscription(
-            Bool,
-            self._command_enable_topic,
-            self._on_command_enable,
-            latched_qos,
-            callback_group=self._callback_group,
-        )
         self._timer = self.create_timer(
             self._publish_period_s,
             self._reconcile,
@@ -115,26 +102,21 @@ class IsaacGripperActionBridge(Node):
         )
         self._reconcile()
         self.get_logger().info(
-            "Isaac gripper adapter ready: %s -> %s, owner gate %s"
-            % (self._action_name, self._command_topic, self._command_enable_topic)
+            "Isaac gripper adapter ready: %s -> %s"
+            % (self._action_name, self._command_topic)
         )
 
     def _declare_parameters(self) -> None:
         self.declare_parameter(
             "action_name",
-            DEFAULT_OWNER_NAMESPACE
+            DEFAULT_RUNTIME_NAMESPACE
             + "/robotiq_gripper_controller/gripper_cmd",
         )
         self.declare_parameter("command_topic", "/isaac_gripper_state")
         self.declare_parameter("state_topic", "/isaac_joint_states")
         self.declare_parameter(
             "readiness_topic",
-            DEFAULT_OWNER_NAMESPACE + "/manyforge/isaac_gripper_bridge/ready",
-        )
-        self.declare_parameter("command_enable_topic", DEFAULT_ENABLE_TOPIC)
-        self.declare_parameter("expected_owner_node", DEFAULT_OWNER_NODE)
-        self.declare_parameter(
-            "expected_owner_namespace", DEFAULT_OWNER_NAMESPACE
+            DEFAULT_RUNTIME_NAMESPACE + "/manyforge/isaac_gripper_bridge/ready",
         )
         self.declare_parameter("commanded_joint", "finger_joint")
         self.declare_parameter("command_joint_names", DEFAULT_COMMAND_JOINT_NAMES)
@@ -162,9 +144,6 @@ class IsaacGripperActionBridge(Node):
         self._command_topic = text("command_topic")
         self._state_topic = text("state_topic")
         self._readiness_topic = text("readiness_topic")
-        self._command_enable_topic = text("command_enable_topic")
-        self._expected_owner_node = text("expected_owner_node")
-        self._expected_owner_namespace = text("expected_owner_namespace")
         self._commanded_joint = text("commanded_joint")
         self._command_joint_names = array("command_joint_names")
         self._command_multipliers = array("command_multipliers")
@@ -202,15 +181,10 @@ class IsaacGripperActionBridge(Node):
             ("command_topic", self._command_topic),
             ("state_topic", self._state_topic),
             ("readiness_topic", self._readiness_topic),
-            ("command_enable_topic", self._command_enable_topic),
-            ("expected_owner_node", self._expected_owner_node),
-            ("expected_owner_namespace", self._expected_owner_namespace),
             ("commanded_joint", self._commanded_joint),
         ):
             if not value or len(value.encode("utf-8")) > 1024:
                 raise ValueError(f"{name} must be bounded non-empty text")
-        if not self._expected_owner_namespace.startswith("/"):
-            raise ValueError("expected_owner_namespace must be absolute")
         self._validate_mapping(
             "command",
             self._command_joint_names,
@@ -261,30 +235,6 @@ class IsaacGripperActionBridge(Node):
         if not all(finite_float(value) for value in (*multipliers, *offsets)):
             raise ValueError(f"{label} mapping values must be finite")
 
-    def _owner_endpoint_identity(self) -> tuple[int, ...] | None:
-        try:
-            publishers = self.get_publishers_info_by_topic(
-                self._command_enable_topic
-            )
-        except Exception:
-            return None
-        return owner_endpoint_identity(
-            publishers,
-            expected_node_name=self._expected_owner_node,
-            expected_node_namespace=self._expected_owner_namespace,
-        )
-
-    def _on_command_enable(self, message: Bool) -> None:
-        identity = self._owner_endpoint_identity()
-        topology_valid = identity is not None
-        with self._lock:
-            self._sample_owner_identity = identity
-            self._owner_topology_valid = topology_valid
-            self._command_enabled = bool(message.data) if topology_valid else False
-            if not self._command_enabled:
-                self._active_target_positions = None
-        self._publish_readiness_if_due(force=True)
-
     def _on_joint_state(self, message: JointState) -> None:
         positions = coherent_joint_positions(message.name, message.position)
         with self._lock:
@@ -297,9 +247,6 @@ class IsaacGripperActionBridge(Node):
         if not finite_float(request.command.position):
             return GoalResponse.REJECT
         if not finite_float(request.command.max_effort) or request.command.max_effort < 0:
-            return GoalResponse.REJECT
-        if not self._commands_enabled():
-            self.get_logger().warning("Rejecting gripper goal: command gate closed")
             return GoalResponse.REJECT
         if self._require_state_before_goal and not self._state_is_fresh():
             return GoalResponse.REJECT
@@ -344,9 +291,6 @@ class IsaacGripperActionBridge(Node):
         result = GripperCommand.Result()
 
         while rclpy.ok():
-            if not self._commands_enabled():
-                goal_handle.abort()
-                return self._finish_result(result, target, reached=False, stalled=True)
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 return self._finish_result(result, target, reached=False, stalled=False)
@@ -397,10 +341,6 @@ class IsaacGripperActionBridge(Node):
                 self._active_target_positions = None
         return result
 
-    def _commands_enabled(self) -> bool:
-        with self._lock:
-            return self._owner_topology_valid and self._command_enabled
-
     def _state_is_fresh(self) -> bool:
         with self._lock:
             return self._state_is_fresh_locked(time.monotonic())
@@ -449,21 +389,10 @@ class IsaacGripperActionBridge(Node):
         return float(value) if value is not None and finite_float(value) else fallback
 
     def _reconcile(self) -> None:
-        identity = self._owner_endpoint_identity()
         with self._lock:
-            topology_valid = (
-                identity is not None and identity == self._sample_owner_identity
-            )
-            self._owner_topology_valid = topology_valid
-            if not topology_valid:
-                self._command_enabled = False
-                self._sample_owner_identity = None
-                self._active_target_positions = None
             target = (
                 list(self._active_target_positions)
                 if self._active_target_positions is not None
-                and self._command_enabled
-                and topology_valid
                 else None
             )
         if target is not None:
@@ -474,8 +403,7 @@ class IsaacGripperActionBridge(Node):
         now = time.monotonic()
         with self._lock:
             ready = (
-                self._owner_topology_valid
-                and self._state_is_fresh_locked(now)
+                self._state_is_fresh_locked(now)
                 and joint_state_contract_ready(
                     self._latest_positions,
                     self._completion_joint_names,

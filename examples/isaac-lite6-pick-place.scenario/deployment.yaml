@@ -50,6 +50,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {
@@ -114,12 +115,7 @@
                 "source_joint_name": "joint6"
               }
             ],
-            "stop_mode": "soft_on_path",
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 1500000000
-            }
+            "stop_mode": "soft_on_path"
           },
           "maximum_tcp_linear_speed_mps": 0.15
         }
@@ -128,6 +124,7 @@
   ],
   "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
   "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
+  "isaac_world": "lite6_grf_ros2",
   "name": "isaac_lite6_lite_gripper_pick_and_place",
   "policies": {
     "interrupt_config": {

@@ -9,6 +9,7 @@ add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenSSL REQUIRED)
+find_package(EXPAT REQUIRED)
 find_package(SQLite3 3.37 REQUIRED)
 find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
@@ -185,6 +186,82 @@ target_link_libraries(manyforge_roboplan_native_runtime_support
   PUBLIC manyforge_core
   PRIVATE Threads::Threads)
 
+# Q69: ROS-free controller robot_description generation (model URDF in,
+# URDF text out). Expat is the XML parser Deployment already links into every
+# host process; no other XML library is introduced.
+add_library(manyforge_roboplan_controller_robot_description
+  src/controller_robot_description.cpp)
+target_include_directories(manyforge_roboplan_controller_robot_description PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_controller_robot_description
+  PUBLIC manyforge_core
+  PRIVATE EXPAT::EXPAT)
+
+# Q63-Q74: Track 2's controller templates and the retained Isaac controller
+# files are build inputs of the host's controller launch artifacts, embedded so
+# the generated files never depend on a runtime package lookup.
+set(_MANYFORGE_CONTROLLER_TEMPLATE_ROOT
+  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros_bringup/config")
+set(_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES "")
+foreach(_entry
+    "kEmbeddedMockUFactoryControllersTemplate=mock_ufactory_controllers.template.yaml"
+    "kEmbeddedMockUrControllersTemplate=mock_ur_controllers.template.yaml"
+    "kEmbeddedMockGripperControllerTemplate=mock_gripper_controller.template.yaml"
+    "kEmbeddedIsaacLite6ControllersYaml=isaac_lite6_topic_based_controllers.yaml"
+    "kEmbeddedIsaacUr10eControllersYaml=isaac_ur10e_topic_based_controllers.yaml")
+  string(REPLACE "=" ";" _pair "${_entry}")
+  list(GET _pair 0 MANYFORGE_EMBEDDED_CONTROLLER_SYMBOL)
+  list(GET _pair 1 _file)
+  set(MANYFORGE_EMBEDDED_CONTROLLER_SOURCE
+    "manyforge_ros_bringup/config/${_file}")
+  set(_path "${_MANYFORGE_CONTROLLER_TEMPLATE_ROOT}/${_file}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_path}")
+  file(READ "${_path}" MANYFORGE_EMBEDDED_CONTROLLER_TEXT)
+  string(FIND "${MANYFORGE_EMBEDDED_CONTROLLER_TEXT}" ")mf_ctl_tpl\""
+    _collision)
+  if(NOT _collision EQUAL -1)
+    message(FATAL_ERROR "${_file} collides with its embedded raw-string delimiter")
+  endif()
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_controller_template.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/controller_templates/${MANYFORGE_EMBEDDED_CONTROLLER_SYMBOL}.hpp"
+    @ONLY)
+  string(APPEND _MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES
+    "#include \"controller_templates/${MANYFORGE_EMBEDDED_CONTROLLER_SYMBOL}.hpp\"\n")
+endforeach()
+file(WRITE
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_controller_templates.hpp.tmp"
+  "#pragma once\n${_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES}")
+configure_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_controller_templates.hpp.tmp"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_controller_templates.hpp"
+  COPYONLY)
+unset(_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES)
+
+add_library(manyforge_roboplan_controller_launch_artifacts
+  src/controller_launch_artifacts.cpp)
+target_include_directories(manyforge_roboplan_controller_launch_artifacts
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(manyforge_roboplan_controller_launch_artifacts
+  PUBLIC manyforge_roboplan_controller_robot_description
+  PRIVATE manyforge::content_identity)
+
+# Q78/§7.5: command and process ownership of the controller launches the
+# execution host starts per component (ROS-free).
+add_library(manyforge_roboplan_controller_launch_process
+  src/controller_launch_process.cpp)
+target_include_directories(manyforge_roboplan_controller_launch_process
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_controller_launch_process
+  PUBLIC manyforge_roboplan_controller_launch_artifacts
+  PRIVATE Threads::Threads)
+
 add_library(manyforge_roboplan_native_lifecycle_product
   src/retained_native_lifecycle_product.cpp)
 target_include_directories(manyforge_roboplan_native_lifecycle_product PUBLIC
@@ -275,6 +352,7 @@ target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
   manyforge_roboplan_native_candidate)
 
 add_library(manyforge_roboplan_native_runtime
+  src/isaac_arm_guard.cpp
   src/retained_native_runtime.cpp
   src/retained_native_cell_runtime.cpp
   src/retained_stop_surveillance_owner.cpp)
@@ -309,18 +387,26 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
     unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
   endif()
+  find_package(diagnostic_msgs REQUIRED)
+  find_package(pal_statistics_msgs REQUIRED)
   add_library(manyforge_roboplan_ros2_control_runtime
+    src/retained_isaac_arm_guard_binding.cpp
     src/retained_isaac_ros2_control_profile.cpp
-    src/retained_ros2_control_admission_owner.cpp
     src/retained_ros2_control_backend_factory.cpp
     src/retained_ros2_control_lifecycle_product.cpp
-    src/retained_ros2_control_runtime_handle.cpp)
+    src/retained_ros2_control_runtime_handle.cpp
+    src/retained_ros2_control_statistics_monitor.cpp)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_roboplan_ros2_control_runtime PUBLIC
     manyforge_roboplan_native_runtime
+    manyforge_roboplan_controller_robot_description
+    manyforge_roboplan_controller_launch_artifacts
+    manyforge_roboplan_controller_launch_process
     manyforge_ros2_control_execution
+    ${diagnostic_msgs_TARGETS}
+    ${pal_statistics_msgs_TARGETS}
     manyforge::content_identity)
 endif()
 
@@ -615,6 +701,30 @@ if(BUILD_TESTING)
     target_link_libraries(test_native_runtime_support PRIVATE
       manyforge_roboplan_native_runtime_support GTest::gtest_main)
 
+    add_executable(test_controller_robot_description
+      test/test_controller_robot_description.cpp)
+    target_compile_definitions(test_controller_robot_description PRIVATE
+      MANYFORGE_TEST_REPOSITORY_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}")
+    target_link_libraries(test_controller_robot_description PRIVATE
+      manyforge_roboplan_controller_robot_description EXPAT::EXPAT
+      GTest::gtest_main)
+
+    add_executable(test_controller_launch_artifacts
+      test/test_controller_launch_artifacts.cpp)
+    target_compile_definitions(test_controller_launch_artifacts PRIVATE
+      MANYFORGE_TEST_REPOSITORY_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}")
+    target_link_libraries(test_controller_launch_artifacts PRIVATE
+      manyforge_roboplan_controller_launch_artifacts
+      manyforge_core manyforge::content_identity GTest::gtest_main)
+
+    add_executable(test_controller_launch_process
+      test/test_controller_launch_process.cpp)
+    target_compile_definitions(test_controller_launch_process PRIVATE
+      MANYFORGE_TEST_REPOSITORY_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}")
+    target_link_libraries(test_controller_launch_process PRIVATE
+      manyforge_roboplan_controller_launch_process
+      manyforge_core manyforge::content_identity GTest::gtest_main)
+
     add_executable(test_cell_admission_command_codec
       test/test_cell_admission_command_codec.cpp)
     target_link_libraries(test_cell_admission_command_codec PRIVATE
@@ -721,8 +831,19 @@ if(BUILD_TESTING)
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_backend_factory)
 
-      # Real addressed Kernel + real ros2_control backend Stop port against an
-      # in-process FollowJointTrajectory server (requires a ROS 2 runtime).
+      # Runtime handle (CCLC controller switching, binding epochs) and the
+      # Isaac guard binding against in-process ROS stand-ins.
+      add_executable(test_retained_ros2_control_runtime_handle
+        test/test_retained_ros2_control_runtime_handle.cpp)
+      target_link_libraries(test_retained_ros2_control_runtime_handle PRIVATE
+        manyforge_roboplan_ros2_control_runtime
+        manyforge_roboplan_native_runtime_support
+        GTest::gtest_main)
+      gtest_discover_tests(test_retained_ros2_control_runtime_handle
+        PROPERTIES TIMEOUT 120)
+
+      # Real addressed Kernel + the Core participant over the real JTC adapter
+      # against an in-process trajectory controller (requires a ROS 2 runtime).
       add_executable(test_ros2_control_kernel_stop_integration
         test/test_ros2_control_kernel_stop_integration.cpp)
       target_link_libraries(test_ros2_control_kernel_stop_integration PRIVATE
@@ -733,6 +854,10 @@ if(BUILD_TESTING)
       gtest_discover_tests(test_ros2_control_kernel_stop_integration
         PROPERTIES TIMEOUT 120)
     endif()
+
+    add_executable(test_isaac_arm_guard test/test_isaac_arm_guard.cpp)
+    target_link_libraries(test_isaac_arm_guard PRIVATE
+      manyforge_roboplan_native_runtime GTest::gtest_main)
 
     add_executable(test_retained_stop_surveillance_owner
       test/test_retained_stop_surveillance_owner.cpp)
@@ -1201,6 +1326,7 @@ if(BUILD_TESTING)
       MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>")
     target_include_directories(test_retained_product_consumer PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
@@ -1241,6 +1367,10 @@ if(BUILD_TESTING)
       manyforge_component_manager
       manyforge_deployment_verification_core
       manyforge_scene
+      # The test encodes logical Scene snapshots itself; link the codec
+      # directly (strict --no-copy-dt-needed-entries linkers reject reaching
+      # it only through another shared library's DT_NEEDED).
+      manyforge::scene_value_codec
       manyforge_roboplan_native_runtime
       GTest::gtest_main)
 
@@ -1270,6 +1400,18 @@ if(BUILD_TESTING)
     # CTest execution. Register every RoboPlan GTest with the exact library
     # closure derived above instead of relying on inherited process state.
     gtest_discover_tests(test_native_runtime_support
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_controller_robot_description
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_controller_launch_artifacts
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_controller_launch_process
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
@@ -1322,6 +1464,10 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_isaac_arm_guard
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

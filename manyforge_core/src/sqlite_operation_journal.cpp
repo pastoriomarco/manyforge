@@ -1467,9 +1467,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
         {"predecessor_stop_generation",
          Number(predecessor.predecessor_stop_generation.value(), "predecessor Stop generation")},
         {"predecessor_stop_id", CanonicalValue(predecessor.predecessor_stop_id.value())},
-        {"remaining_outer_duration_ns_at_join",
-         Timestamp(predecessor.remaining_outer_duration_ns_at_join,
-                   "predecessor remaining Stop duration")},
     });
   }
 
@@ -1484,44 +1481,11 @@ void AddExecutionScope(CanonicalValue::Object& row,
     });
   }
 
-  CanonicalValue::Array participant_budgets;
-  participant_budgets.reserve(accepted.participant_budget_allocations.size());
-  for (const auto& participant : accepted.participant_budget_allocations) {
-    CanonicalValue::Array phases;
-    phases.reserve(participant.phases.size());
-    for (const auto& phase : participant.phases) {
-      phases.emplace_back(CanonicalValue::Object{
-          {"fixed_deadline_offset_ns",
-           Timestamp(phase.fixed_deadline_offset_ns, "fixed Stop phase offset")},
-          {"phase_id", CanonicalValue(phase.phase_id.value())},
-          {"remaining_deadline_offset_ns",
-           Timestamp(phase.remaining_deadline_offset_ns, "remaining Stop phase offset")},
-      });
-    }
-    participant_budgets.emplace_back(CanonicalValue::Object{
-        {"operation_id", CanonicalValue(participant.operation_id.value())},
-        {"origin_stop_generation",
-         Number(participant.origin_stop_generation.value(), "participant origin Stop generation")},
-        {"origin_stop_id", CanonicalValue(participant.origin_stop_id.value())},
-        {"participant_id", CanonicalValue(participant.participant_id.value())},
-        {"participant_stop_invocation_plan_digest",
-         CanonicalValue(participant.participant_stop_invocation_plan_digest.value())},
-        {"phases", CanonicalValue(std::move(phases))},
-    });
-  }
-
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns", Timestamp(accepted.accepted_at_ns, "Stop accepted timestamp")},
       {"affected_operation_revisions", CanonicalValue(std::move(affected_operations))},
       {"captured_scope_digest", CanonicalValue(accepted.captured_scope_digest.value())},
-      {"fixed_kernel_completion_reserve_ns", Timestamp(accepted.fixed_kernel_completion_reserve_ns,
-                                                       "fixed Kernel Stop completion reserve")},
-      {"fixed_outer_duration_ns",
-       Timestamp(accepted.fixed_outer_duration_ns, "fixed Stop outer duration")},
       {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
-      {"participant_budget_allocations", CanonicalValue(std::move(participant_budgets))},
-      {"remaining_outer_duration_ns",
-       Timestamp(accepted.remaining_outer_duration_ns, "remaining Stop outer duration")},
       {"replay_status", CanonicalValue(std::string(to_string(accepted.replay_status)))},
       {"request_id", CanonicalValue(accepted.request_id.value())},
       {"requested_selector_digest", CanonicalValue(accepted.requested_selector_digest.value())},
@@ -1582,7 +1546,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
        CanonicalValue(std::string(EmergencyStopEntryStateName(acceptance.entry_state)))},
       {"malformed_ingress_reason", OptionalText(acceptance.malformed_ingress_reason)},
       {"normalized_request_digest", OptionalIdentity(acceptance.normalized_request_digest)},
-      {"outer_deadline_ns", Timestamp(acceptance.outer_deadline_ns, "Stop outer deadline")},
       {"owner_epoch", CanonicalValue(acceptance.owner_epoch.value())},
       {"projection_state",
        CanonicalValue(std::string(EmergencyStopProjectionStateName(acceptance.projection_state)))},
@@ -1811,7 +1774,6 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
               BoundedIdentity(acceptance.request_id.value(), kMaximumEmergencyStopRequestIdBytes) &&
               BoundedIdentity(acceptance.stop_id.value(), kMaximumEmergencyStopIdentityBytes) &&
               acceptance.stop_generation.nonzero() && acceptance.accepted_at_ns >= 0 &&
-              acceptance.outer_deadline_ns > acceptance.accepted_at_ns &&
               content_identity::is_sha256_digest(acceptance.captured_scope_digest.value()) &&
               acceptance.projection_state == EmergencyStopProjectionStateDTO::kPending &&
               KnownEmergencyStopRecordEnums(acceptance) && acceptance.attribution.locally_valid() &&
@@ -1837,8 +1799,6 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
               accepted.stop_id == acceptance.stop_id &&
               accepted.stop_generation == acceptance.stop_generation &&
               accepted.accepted_at_ns == acceptance.accepted_at_ns &&
-              accepted.remaining_outer_duration_ns ==
-                  acceptance.outer_deadline_ns - acceptance.accepted_at_ns &&
               accepted.resolution_disposition == acceptance.resolution_disposition &&
               accepted.captured_scope_digest == acceptance.captured_scope_digest,
           "operation_journal_record_invalid",
@@ -1921,33 +1881,18 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
             "operation_journal_record_invalid",
             "affected operation state does not match its accepted revision");
 
-    const auto first_budget =
-        std::lower_bound(accepted.participant_budget_allocations.begin(),
-                         accepted.participant_budget_allocations.end(), state.operation_id,
-                         [](const auto& budget, const OperationId& operation_id) {
-                           return budget.operation_id < operation_id;
-                         });
-    Require(first_budget != accepted.participant_budget_allocations.end() &&
-                first_budget->operation_id == state.operation_id,
-            "operation_journal_record_invalid",
-            "affected operation has no origin-tagged participant budget");
-    const auto origin_stop_id = first_budget->origin_stop_id;
-    const auto origin_stop_generation = first_budget->origin_stop_generation;
-    Require(
-        std::all_of(first_budget,
-                    std::upper_bound(first_budget, accepted.participant_budget_allocations.end(),
-                                     state.operation_id,
-                                     [](const OperationId& operation_id, const auto& budget) {
-                                       return operation_id < budget.operation_id;
-                                     }),
-                    [&](const auto& budget) {
-                      return budget.origin_stop_id == origin_stop_id &&
-                             budget.origin_stop_generation == origin_stop_generation;
-                    }) &&
-            state.active_stop_id == origin_stop_id &&
-            state.active_stop_generation == origin_stop_generation,
-        "operation_journal_record_invalid",
-        "affected operation does not retain its exact originating Stop");
+    // The originating Stop is this acceptance or one of its joined
+    // predecessors (Q51: no per-participant budget rows remain).
+    const bool current_origin = state.active_stop_id == accepted.stop_id &&
+                                state.active_stop_generation == accepted.stop_generation;
+    const bool predecessor_origin = std::any_of(
+        accepted.joined_predecessor_stops.begin(), accepted.joined_predecessor_stops.end(),
+        [&](const auto& predecessor) {
+          return state.active_stop_id == predecessor.predecessor_stop_id &&
+                 state.active_stop_generation == predecessor.predecessor_stop_generation;
+        });
+    Require(current_origin || predecessor_origin, "operation_journal_record_invalid",
+            "affected operation does not retain its exact originating Stop");
     for (const auto& participant : state.participants) {
       Require(std::is_sorted(participant.resources.begin(), participant.resources.end()) &&
                   std::all_of(participant.resources.begin(), participant.resources.end(),
@@ -3000,47 +2945,6 @@ class SqliteOperationJournal::Impl final {
     sqlite3_limit(database_, SQLITE_LIMIT_LENGTH, static_cast<int>(kMaximumRecordJsonBytes));
   }
 
-  void ValidateLegacy(std::int64_t version) {
-    // Migration must not widen the domain of corrupt legacy rows. Stream the
-    // bounded retained journal once, before publishing its new format identity.
-    Statement integrity(database_, "PRAGMA quick_check");
-    Require(integrity.Step() && integrity.Text(0) == "ok" && !integrity.Step(),
-            "operation_journal_corrupt", "legacy journal integrity check failed");
-    Statement foreign_keys(database_, "PRAGMA foreign_key_check");
-    Require(!foreign_keys.Step(), "operation_journal_corrupt",
-            "legacy journal contains broken references");
-    Statement timestamps(database_,
-                         "SELECT started_at_ns FROM owner_epochs UNION ALL "
-                         "SELECT closed_at_ns FROM owner_epochs WHERE closed_at_ns IS NOT NULL "
-                         "UNION ALL SELECT occurred_at_ns FROM journal_records "
-                         "UNION ALL SELECT updated_at_ns FROM operation_snapshots "
-                         "UNION ALL SELECT accepted_at_ns FROM cell_admission_claims");
-    while (timestamps.Step()) {
-      const auto value = timestamps.Integer(0);
-      Require(
-          value >= 0 && (version != 9 || static_cast<std::uint64_t>(value) <= kMaximumSafeInteger),
-          "operation_journal_corrupt", "legacy journal timestamp exceeds its declared domain");
-    }
-    Statement payloads(database_,
-                       "SELECT payload_json,payload_digest FROM journal_records UNION ALL "
-                       "SELECT acceptance_payload,acceptance_digest FROM stop_projections "
-                       "UNION ALL SELECT terminal_payload,terminal_digest FROM stop_projections "
-                       "WHERE terminal_payload IS NOT NULL UNION ALL "
-                       "SELECT surveillance_payload,surveillance_digest FROM stop_projections "
-                       "WHERE surveillance_payload IS NOT NULL UNION ALL "
-                       "SELECT clear_payload,clear_digest FROM stop_projections "
-                       "WHERE clear_payload IS NOT NULL");
-    while (payloads.Step()) {
-      const auto payload = payloads.Text(0);
-      // These bytes were canonicalized on admission. Verify the original
-      // commitment, just as ReadEvents does; this format-only cutover must not
-      // impose a newer parser's smaller byte/depth/node limits on old evidence.
-      Require(payload.size() <= kMaximumRecordJsonBytes &&
-                  content_identity::sha256_digest(payload) == payloads.Text(1),
-              "operation_journal_corrupt", "legacy journal payload integrity check failed");
-    }
-  }
-
   void InitializeOrValidate() {
     const auto lock = LockOrdinaryWriter();
     Transaction transaction(database_);
@@ -3065,60 +2969,17 @@ class SqliteOperationJournal::Impl final {
       Require(!metadata.Step(), "operation_journal_corrupt",
               "operation journal metadata insert returned an unexpected row");
     }
+    // Q51/Q53: the per-robot Stop timing changed the journal format; journals
+    // of an earlier format (only this unreleased branch wrote them) are
+    // refused, never converted.
+    Require(ScalarInteger(database_, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
+            "operation_journal_format_unsupported",
+            "operation journal predates the per-robot Stop timing format and is not converted");
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects(),
             "operation_journal_storage_foreign", "operation journal contains an unexpected schema");
     Require(
         ScalarInteger(database_, "PRAGMA application_id") == kOperationJournalSqliteApplicationId,
         "operation_journal_storage_foreign", "operation journal application identity is invalid");
-    // Validate before adding the private capture order. Legacy canonical
-    // payload bytes, sequence numbers and hashes are never rewritten.
-    const auto legacy_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (legacy_version >= 9 && legacy_version <= 12) {
-      {
-        Statement legacy(database_,
-                         "SELECT schema_id,schema_version,cell_id,history_capacity FROM "
-                         "journal_metadata WHERE singleton=1");
-        Require(
-            legacy.Step() &&
-                legacy.Text(0) == "manyforge.internal.execution.operation-journal.o1.5.v" +
-                                      std::to_string(legacy_version) &&
-                legacy.Integer(1) == legacy_version && legacy.Text(2) == cell_id_.value() &&
-                legacy.Integer(3) == static_cast<std::int64_t>(history_capacity_) && !legacy.Step(),
-            "operation_journal_storage_foreign", "legacy operation journal identity is invalid");
-      }
-      ValidateLegacy(legacy_version);
-      if (legacy_version < 11) {
-        Exec(database_,
-             "ALTER TABLE operation_snapshots ADD COLUMN journal_capture_order "
-             "INTEGER NOT NULL DEFAULT 0 CHECK(journal_capture_order >= 0)");
-      }
-      if (legacy_version < 12) {
-        Exec(database_,
-             "ALTER TABLE operation_participants ADD COLUMN execution_node_instance_id TEXT");
-        Exec(database_,
-             "ALTER TABLE operation_participants ADD COLUMN execution_node_attempt_id TEXT");
-      }
-      for (const auto column :
-           {"program_node_runner_owner_epoch", "program_node_run_id", "program_node_instance_id",
-            "program_node_attempt_id", "program_node_owner_api"}) {
-        Exec(database_,
-             "ALTER TABLE cell_admission_claims ADD COLUMN " + std::string(column) + " TEXT");
-      }
-      Statement snapshots(database_,
-                          "SELECT operation_id,journal_capture_order FROM operation_snapshots");
-      while (snapshots.Step()) {
-        Require(snapshots.Integer(1) >= 0, "operation_journal_corrupt",
-                "legacy capture order is invalid");
-        ValidateSnapshotCapture(database_, OperationId(snapshots.Text(0)),
-                                static_cast<std::uint64_t>(snapshots.Integer(1)));
-      }
-      Statement upgrade(
-          database_, "UPDATE journal_metadata SET schema_id=?,schema_version=? WHERE singleton=1");
-      upgrade.Bind(1, kOperationJournalSchemaId);
-      upgrade.Bind(2, kOperationJournalSchemaVersion);
-      Require(!upgrade.Step(), "operation_journal_corrupt", "journal cutover returned a row");
-      Exec(database_, "PRAGMA user_version=" + std::to_string(kOperationJournalSchemaVersion));
-    }
     Require(
         ScalarInteger(database_, "PRAGMA application_id") == kOperationJournalSqliteApplicationId &&
             ScalarInteger(database_, "PRAGMA user_version") == kOperationJournalSchemaVersion,

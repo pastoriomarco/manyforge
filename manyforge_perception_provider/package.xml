@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>manyforge_perception_provider</name>
+  <version>0.1.0</version>
+  <description>Request-driven single-owner multi-instance pose provider.</description>
+  <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
+  <depend>composition_interfaces</depend>
+  <depend>message_filters</depend>
+  <depend>manyforge_perception_interfaces</depend>
+  <depend>sensor_msgs</depend>
+  <depend>vision_msgs</depend>
+  <depend>isaac_ros_tensor_msgs</depend>
+  <depend>openssl</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_cppcheck</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

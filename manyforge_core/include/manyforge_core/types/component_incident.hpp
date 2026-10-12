@@ -20,6 +20,7 @@ namespace manyforge::core {
 /// lifecycle progress and keeps it open until the operator's acknowledgement
 /// (an accepted operator `recover` request) is recorded.
 
+inline constexpr std::size_t kMaxComponentIncidentRecordBytes = 512U * 1024U;
 inline constexpr std::size_t kMaxComponentIncidentIdBytes = 128U;
 inline constexpr std::size_t kMaxComponentIncidentVendorCodes = 16U;
 inline constexpr std::size_t kMaxComponentIncidentVendorCodeBytes = 64U;
@@ -132,6 +133,8 @@ struct ComponentLifecycleIncidentDTO final {
   std::optional<std::string> acknowledged_by;
   std::optional<std::int64_t> acknowledged_at_ns;
   std::optional<RequestId> acknowledgement_request_id;
+  std::optional<ErrorDTO> diagnostic{};
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
@@ -215,8 +218,9 @@ DefaultLifecycleIncidentRecoveryPolicy();
 /// providers, recovery policy and, for `component_incident_acknowledged`, who
 /// and when.
 [[nodiscard]] std::string ComponentIncidentEventPayload(
-    const ComponentLifecycleIncidentDTO& incident,
-    const LifecycleIncidentRecoveryPolicyDTO& policy, std::string_view event_kind);
+    const ComponentLifecycleIncidentDTO& incident, const LifecycleIncidentRecoveryPolicyDTO& policy,
+    std::string_view event_kind, const std::optional<ErrorDTO>& diagnostic = std::nullopt,
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot = {});
 
 /// The record with its containment outcome: state, Stop reference, captured
 /// operations and Program run, or the refusal reason.
@@ -230,7 +234,35 @@ DefaultLifecycleIncidentRecoveryPolicy();
 /// one bounded timeline entry is appended.
 [[nodiscard]] std::string ComponentIncidentRecordWithChange(
     std::string_view record_json, std::int64_t at_ns, LifecycleBlockingCauseClassDTO cause,
-    const std::vector<std::string>& vendor_codes);
+    const std::vector<std::string>& vendor_codes,
+    const std::optional<ErrorDTO>& diagnostic = std::nullopt,
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot = {});
+
+[[nodiscard]] bool ComponentIncidentDiagnosticIsValid(const ErrorDTO& diagnostic) noexcept;
+/// Ingress validates each closed field before the journal omits optional
+/// settings to fit the complete record budget. Persisted/status values use
+/// the strict aggregate validator below.
+[[nodiscard]] bool ComponentIncidentDiagnosticSnapshotShapeIsValid(
+    const content_identity::CanonicalValue& snapshot) noexcept;
+[[nodiscard]] bool ComponentIncidentDiagnosticSnapshotIsValid(
+    const content_identity::CanonicalValue& snapshot) noexcept;
+[[nodiscard]] content_identity::CanonicalValue ComponentIncidentDiagnosticValue(
+    const ErrorDTO& diagnostic, const content_identity::CanonicalValue& snapshot);
+
+/// First short error can be stored with a null snapshot; its one later rich
+/// completion preserves every original error fact and adds only capture metadata.
+[[nodiscard]] std::string ComponentIncidentRecordWithDiagnostic(
+    std::string_view record_json, const ErrorDTO& diagnostic,
+    std::shared_ptr<const content_identity::CanonicalValue> snapshot = {});
+[[nodiscard]] std::optional<ErrorDTO> ComponentIncidentDiagnosticFromRecord(
+    std::string_view record_json,
+    std::shared_ptr<const content_identity::CanonicalValue>* snapshot = nullptr) noexcept;
+
+/// Decode the real accepted Stop reference kept in the existing record.
+/// Explicit status reads hydrate this; routine facts do not parse evidence.
+[[nodiscard]] std::optional<ComponentIncidentContainmentReceiptDTO>
+ComponentIncidentContainmentReceiptFromRecord(
+    std::string_view record_json, std::optional<std::string>* containment_error = nullptr) noexcept;
 
 /// The `component_incident_acknowledged` payload: the record plus who
 /// recovered it, when and with which request.

@@ -1005,9 +1005,7 @@ template <typename Intent>
     const Intent& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, const std::int64_t remaining_outer_duration_ns,
-    const std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> participant_plans) {
+    const std::int64_t accepted_at_ns) {
   const auto selector_digest = ComputeRequestedStopSelectorDigest(intent);
   if (!selector_digest.ok()) {
     return Result<StopAcceptedDTO>::Err(selector_digest.error());
@@ -1034,74 +1032,10 @@ template <typename Intent>
         stop_acceptance_input_error("stop_acceptance_operation_scope_mismatch"));
   }
 
-  if (fixed_budget.outer_duration_ns <= 0 ||
-      fixed_budget.outer_duration_ns > kMaximumStopDurationNs ||
-      fixed_budget.kernel_completion_reserve_ns <= 0 ||
-      fixed_budget.kernel_completion_reserve_ns >= fixed_budget.outer_duration_ns ||
-      remaining_outer_duration_ns < 0 ||
-      remaining_outer_duration_ns > fixed_budget.outer_duration_ns || accepted_at_ns < 0 ||
-      participant_plans.size() > kMaximumStopAcceptedParticipants) {
+  if (accepted_at_ns < 0) {
     return Result<StopAcceptedDTO>::Err(
-        stop_acceptance_input_error("stop_acceptance_budget_invalid"));
+        stop_acceptance_input_error("stop_acceptance_time_invalid"));
   }
-
-  std::vector<StopAcceptedParticipantBudgetDTO> participant_budgets;
-  participant_budgets.reserve(participant_plans.size());
-  for (const auto& plan : participant_plans) {
-    const auto affected =
-        std::lower_bound(affected_operation_revisions.begin(), affected_operation_revisions.end(),
-                         plan.operation_id, [](const auto& row, const OperationId& operation_id) {
-                           return row.operation_id < operation_id;
-                         });
-    if (!plan.operation_revision.nonzero() || !safe_counter(plan.operation_revision) ||
-        plan.operation_revision.value() == kMaximumIJsonInteger ||
-        plan.deadline_budget.outer_duration_ns != fixed_budget.outer_duration_ns ||
-        plan.deadline_budget.kernel_completion_reserve_ns !=
-            fixed_budget.kernel_completion_reserve_ns ||
-        plan.deadline_budget.phases.empty() ||
-        plan.deadline_budget.phases.size() > kMaximumStopAcceptedPhases ||
-        affected == affected_operation_revisions.end() ||
-        affected->operation_id != plan.operation_id ||
-        affected->operation_revision_after_acceptance <= plan.operation_revision) {
-      return Result<StopAcceptedDTO>::Err(
-          stop_acceptance_input_error("stop_acceptance_participant_plan_mismatch"));
-    }
-    std::int64_t prior_phase_offset = 0;
-    std::set<StopBudgetPhaseId> phase_ids;
-    for (const auto& phase : plan.deadline_budget.phases) {
-      if (!bounded_identity(phase.phase_id) || !phase_ids.insert(phase.phase_id).second ||
-          phase.deadline_offset_ns <= prior_phase_offset ||
-          phase.deadline_offset_ns >
-              fixed_budget.outer_duration_ns - fixed_budget.kernel_completion_reserve_ns) {
-        return Result<StopAcceptedDTO>::Err(
-            stop_acceptance_input_error("stop_acceptance_participant_plan_mismatch"));
-      }
-      prior_phase_offset = phase.deadline_offset_ns;
-    }
-    StopAcceptedParticipantBudgetDTO participant{stop_id,
-                                                 stop_generation,
-                                                 plan.operation_id,
-                                                 plan.participant_id,
-                                                 plan.participant_stop_invocation_plan_digest,
-                                                 {}};
-    participant.phases.reserve(plan.deadline_budget.phases.size());
-    const auto elapsed = fixed_budget.outer_duration_ns - remaining_outer_duration_ns;
-    for (const auto& phase : plan.deadline_budget.phases) {
-      const auto remaining =
-          remaining_outer_duration_ns <= fixed_budget.kernel_completion_reserve_ns
-              ? 0
-              : std::max<std::int64_t>(0, std::min(phase.deadline_offset_ns - elapsed,
-                                                   remaining_outer_duration_ns -
-                                                       fixed_budget.kernel_completion_reserve_ns));
-      participant.phases.push_back({phase.phase_id, phase.deadline_offset_ns, remaining});
-    }
-    participant_budgets.push_back(std::move(participant));
-  }
-  std::sort(participant_budgets.begin(), participant_budgets.end(),
-            [](const auto& left, const auto& right) {
-              return std::tie(left.operation_id, left.participant_id) <
-                     std::tie(right.operation_id, right.participant_id);
-            });
 
   StopAcceptedDTO accepted{intent.request_context.request_id,
                            RequestReplayStatusDTO::kAcceptedNew,
@@ -1114,11 +1048,7 @@ template <typename Intent>
                            std::move(scope_digest.value()),
                            {},
                            std::move(affected_operation_revisions),
-                           fixed_budget.outer_duration_ns,
-                           fixed_budget.kernel_completion_reserve_ns,
-                           remaining_outer_duration_ns,
-                           accepted_at_ns,
-                           std::move(participant_budgets)};
+                           accepted_at_ns};
   if (const auto field = stop_accepted_field_error(accepted); field.has_value()) {
     return Result<StopAcceptedDTO>::Err(stop_acceptance_input_error(std::string(*field)));
   }
@@ -1131,41 +1061,32 @@ Result<StopAcceptedDTO> MakeStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, const std::int64_t remaining_outer_duration_ns,
-    const std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> participant_plans) {
+    const std::int64_t accepted_at_ns) {
   return make_stop_accepted(intent, std::move(stop_id), stop_generation, std::move(resolution),
-                            std::move(affected_operation_revisions), fixed_budget,
-                            remaining_outer_duration_ns, accepted_at_ns, participant_plans);
+                            std::move(affected_operation_revisions), accepted_at_ns);
 }
 
 Result<StopAcceptedDTO> MakeStopAccepted(
     const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, const std::int64_t remaining_outer_duration_ns,
-    const std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> participant_plans) {
+    const std::int64_t accepted_at_ns) {
   return make_stop_accepted(intent, std::move(stop_id), stop_generation, std::move(resolution),
-                            std::move(affected_operation_revisions), fixed_budget,
-                            remaining_outer_duration_ns, accepted_at_ns, participant_plans);
+                            std::move(affected_operation_revisions), accepted_at_ns);
 }
 
 Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
     const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget,
-    const std::int64_t proposed_remaining_outer_duration_ns, const std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> new_participant_plans,
-    std::span<const StopAcceptedPredecessorInput> predecessors) {
+    const std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors) {
   const bool aggregate_resolution =
       resolution.disposition == StopResolutionDispositionDTO::kPromotedToFull ||
       ((resolution.disposition == StopResolutionDispositionDTO::kExact ||
         resolution.disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
        resolution.reason == StopScopeResolutionReasonDTO::kExplicitFullStop);
   if (!aggregate_resolution || !resolution.full_stop || predecessors.empty() ||
-      predecessors.size() > kMaximumStopPredecessors || proposed_remaining_outer_duration_ns <= 0) {
+      predecessors.size() > kMaximumStopPredecessors) {
     return Result<StopAcceptedDTO>::Err(
         stop_acceptance_input_error("stop_aggregate_shape_invalid"));
   }
@@ -1181,8 +1102,7 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
 
   auto made = make_stop_accepted(
       intent, stop_id, stop_generation, std::move(newly_affected_resolution),
-      newly_affected_operation_revisions, fixed_budget, proposed_remaining_outer_duration_ns,
-      accepted_at_ns, new_participant_plans);
+      newly_affected_operation_revisions, accepted_at_ns);
   if (!made.ok()) {
     return made;
   }
@@ -1196,7 +1116,6 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
   accepted.stale_diagnostics = std::move(resolution.stale_diagnostics);
   accepted.captured_scope_digest = aggregate_scope_digest.value();
 
-  std::int64_t aggregate_remaining = proposed_remaining_outer_duration_ns;
   accepted.joined_predecessor_stops.reserve(predecessors.size());
   for (const auto& predecessor : predecessors) {
     const auto& prior = predecessor.acceptance;
@@ -1204,25 +1123,15 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
       return Result<StopAcceptedDTO>::Err(
           stop_acceptance_input_error("stop_aggregate_predecessor_invalid"));
     }
-    if (!prior.joined_predecessor_stops.empty() || prior.stop_id == stop_id ||
-        prior.fixed_outer_duration_ns != fixed_budget.outer_duration_ns ||
-        prior.fixed_kernel_completion_reserve_ns != fixed_budget.kernel_completion_reserve_ns ||
-        predecessor.remaining_outer_duration_ns_at_join <= 0 ||
-        predecessor.remaining_outer_duration_ns_at_join > prior.remaining_outer_duration_ns) {
+    if (!prior.joined_predecessor_stops.empty() || prior.stop_id == stop_id) {
       return Result<StopAcceptedDTO>::Err(
           stop_acceptance_input_error("stop_aggregate_predecessor_mismatch"));
     }
-    accepted.joined_predecessor_stops.push_back({prior.stop_id, prior.stop_generation,
-                                                 prior.captured_scope_digest,
-                                                 predecessor.remaining_outer_duration_ns_at_join});
-    aggregate_remaining =
-        std::min(aggregate_remaining, predecessor.remaining_outer_duration_ns_at_join);
+    accepted.joined_predecessor_stops.push_back(
+        {prior.stop_id, prior.stop_generation, prior.captured_scope_digest});
     accepted.affected_operation_revisions.insert(accepted.affected_operation_revisions.end(),
                                                  prior.affected_operation_revisions.begin(),
                                                  prior.affected_operation_revisions.end());
-    accepted.participant_budget_allocations.insert(accepted.participant_budget_allocations.end(),
-                                                   prior.participant_budget_allocations.begin(),
-                                                   prior.participant_budget_allocations.end());
   }
   std::sort(accepted.joined_predecessor_stops.begin(), accepted.joined_predecessor_stops.end(),
             [](const auto& left, const auto& right) {
@@ -1231,23 +1140,6 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
   std::sort(
       accepted.affected_operation_revisions.begin(), accepted.affected_operation_revisions.end(),
       [](const auto& left, const auto& right) { return left.operation_id < right.operation_id; });
-  std::sort(accepted.participant_budget_allocations.begin(),
-            accepted.participant_budget_allocations.end(), [](const auto& left, const auto& right) {
-              return std::tie(left.operation_id, left.participant_id) <
-                     std::tie(right.operation_id, right.participant_id);
-            });
-  accepted.remaining_outer_duration_ns = aggregate_remaining;
-  const auto elapsed = accepted.fixed_outer_duration_ns - aggregate_remaining;
-  for (auto& participant : accepted.participant_budget_allocations) {
-    for (auto& phase : participant.phases) {
-      phase.remaining_deadline_offset_ns =
-          aggregate_remaining <= accepted.fixed_kernel_completion_reserve_ns
-              ? 0
-              : std::max<std::int64_t>(
-                    0, std::min(phase.fixed_deadline_offset_ns - elapsed,
-                                aggregate_remaining - accepted.fixed_kernel_completion_reserve_ns));
-    }
-  }
   if (!std::equal(resolution.operations.begin(), resolution.operations.end(),
                   accepted.affected_operation_revisions.begin(),
                   accepted.affected_operation_revisions.end(),
@@ -1268,15 +1160,11 @@ Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget,
-    const std::int64_t proposed_remaining_outer_duration_ns, const std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> new_participant_plans,
-    std::span<const StopAcceptedPredecessorInput> predecessors) {
+    const std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors) {
   auto accepted = MakeAggregatedStopAccepted(
       FullStopIntentDTO{intent.request_context, stop_generation, intent.attribution},
       std::move(stop_id), stop_generation, std::move(resolution),
-      std::move(newly_affected_operation_revisions), fixed_budget,
-      proposed_remaining_outer_duration_ns, accepted_at_ns, new_participant_plans, predecessors);
+      std::move(newly_affected_operation_revisions), accepted_at_ns, predecessors);
   if (!accepted.ok()) {
     return accepted;
   }
@@ -1343,10 +1231,7 @@ std::optional<std::string_view> stop_accepted_field_error(
                             row.predecessor_stop_id != accepted.stop_id &&
                             row.predecessor_stop_generation.nonzero() &&
                             safe_counter(row.predecessor_stop_generation) &&
-                            content_identity::is_sha256_digest(row.captured_scope_digest.value()) &&
-                            row.remaining_outer_duration_ns_at_join > 0 &&
-                            row.remaining_outer_duration_ns_at_join <=
-                                accepted.fixed_outer_duration_ns;
+                            content_identity::is_sha256_digest(row.captured_scope_digest.value());
                    })) {
     return "stop_accepted_predecessors_invalid";
   }
@@ -1362,86 +1247,8 @@ std::optional<std::string_view> stop_accepted_field_error(
       !accepted.affected_operation_revisions.empty()) {
     return "stop_accepted_no_effect_operation_revision_present";
   }
-  if (accepted.fixed_outer_duration_ns <= 0 ||
-      accepted.fixed_outer_duration_ns > kMaximumStopDurationNs ||
-      accepted.fixed_kernel_completion_reserve_ns <= 0 ||
-      accepted.fixed_kernel_completion_reserve_ns >= accepted.fixed_outer_duration_ns ||
-      accepted.remaining_outer_duration_ns < 0 ||
-      accepted.remaining_outer_duration_ns > accepted.fixed_outer_duration_ns ||
-      accepted.accepted_at_ns < 0) {
-    return "stop_accepted_outer_budget_invalid";
-  }
-  if (accepted.participant_budget_allocations.size() > kMaximumStopAcceptedParticipants ||
-      !canonical_rows(accepted.participant_budget_allocations, [](const auto& row) {
-        return std::tie(row.operation_id, row.participant_id);
-      })) {
-    return "stop_accepted_participant_budget_invalid";
-  }
-  std::set<OperationId> budgeted_operations;
-  const auto elapsed_ns = accepted.fixed_outer_duration_ns - accepted.remaining_outer_duration_ns;
-  for (const auto& participant : accepted.participant_budget_allocations) {
-    const auto affected = std::lower_bound(
-        accepted.affected_operation_revisions.begin(), accepted.affected_operation_revisions.end(),
-        participant.operation_id, [](const auto& row, const OperationId& operation_id) {
-          return row.operation_id < operation_id;
-        });
-    const auto predecessor = std::lower_bound(
-        accepted.joined_predecessor_stops.begin(), accepted.joined_predecessor_stops.end(),
-        participant.origin_stop_id,
-        [](const auto& row, const StopId& stop_id) { return row.predecessor_stop_id < stop_id; });
-    const bool current_origin = participant.origin_stop_id == accepted.stop_id &&
-                                participant.origin_stop_generation == accepted.stop_generation;
-    const bool predecessor_origin =
-        predecessor != accepted.joined_predecessor_stops.end() &&
-        predecessor->predecessor_stop_id == participant.origin_stop_id &&
-        predecessor->predecessor_stop_generation == participant.origin_stop_generation;
-    if ((!current_origin && !predecessor_origin) || !bounded_identity(participant.origin_stop_id) ||
-        !participant.origin_stop_generation.nonzero() ||
-        !safe_counter(participant.origin_stop_generation) ||
-        !bounded_identity(participant.operation_id) ||
-        !bounded_identity(participant.participant_id) ||
-        !content_identity::is_sha256_digest(
-            participant.participant_stop_invocation_plan_digest.value()) ||
-        affected == accepted.affected_operation_revisions.end() ||
-        affected->operation_id != participant.operation_id || participant.phases.empty() ||
-        participant.phases.size() > kMaximumStopAcceptedPhases) {
-      return "stop_accepted_participant_budget_invalid";
-    }
-    budgeted_operations.insert(participant.operation_id);
-    std::set<StopBudgetPhaseId> phase_ids;
-    std::int64_t prior_fixed = 0;
-    for (const auto& phase : participant.phases) {
-      const auto remaining_phase_ns =
-          accepted.remaining_outer_duration_ns <= accepted.fixed_kernel_completion_reserve_ns
-              ? 0
-              : std::max<std::int64_t>(0,
-                                       std::min(phase.fixed_deadline_offset_ns - elapsed_ns,
-                                                accepted.remaining_outer_duration_ns -
-                                                    accepted.fixed_kernel_completion_reserve_ns));
-      if (!bounded_identity(phase.phase_id) || !phase_ids.insert(phase.phase_id).second ||
-          phase.fixed_deadline_offset_ns <= prior_fixed ||
-          phase.fixed_deadline_offset_ns >
-              accepted.fixed_outer_duration_ns - accepted.fixed_kernel_completion_reserve_ns ||
-          phase.remaining_deadline_offset_ns != remaining_phase_ns) {
-        return "stop_accepted_phase_budget_invalid";
-      }
-      prior_fixed = phase.fixed_deadline_offset_ns;
-    }
-  }
-  if (std::any_of(accepted.joined_predecessor_stops.begin(),
-                  accepted.joined_predecessor_stops.end(), [&](const auto& predecessor) {
-                    return accepted.remaining_outer_duration_ns >
-                           predecessor.remaining_outer_duration_ns_at_join;
-                  })) {
-    return "stop_accepted_predecessor_deadline_widened";
-  }
-  if (budgeted_operations.size() != accepted.affected_operation_revisions.size() ||
-      !std::equal(budgeted_operations.begin(), budgeted_operations.end(),
-                  accepted.affected_operation_revisions.begin(),
-                  [](const OperationId& operation_id, const auto& affected) {
-                    return operation_id == affected.operation_id;
-                  })) {
-    return "stop_accepted_participant_budget_coverage_invalid";
+  if (accepted.accepted_at_ns < 0) {
+    return "stop_accepted_time_invalid";
   }
   return std::nullopt;
 }

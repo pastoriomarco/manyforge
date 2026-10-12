@@ -118,26 +118,6 @@ def require(path: Path, description: str) -> None:
         raise FileNotFoundError(f"missing {description}: {path}")
 
 
-def remove_elements_by_tag(root: ET.Element, tag: str) -> int:
-    removed = 0
-    for parent in list(root.iter()):
-        for child in list(parent):
-            if child.tag == tag:
-                parent.remove(child)
-                removed += 1
-    return removed
-
-
-def remove_xml_comments(root: ET.Element) -> int:
-    removed = 0
-    for parent in list(root.iter()):
-        for child in list(parent):
-            if not isinstance(child.tag, str):
-                parent.remove(child)
-                removed += 1
-    return removed
-
-
 def rewrite_mesh_uris(root: ET.Element) -> None:
     for mesh in root.iter("mesh"):
         filename = mesh.attrib.get("filename", "")
@@ -362,59 +342,6 @@ def write_srdf(output_path: Path) -> None:
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_isaac_topic_based_ros2_control_urdf(
-    source_urdf: Path,
-    output_path: Path,
-    moveit_joint_dynamics: dict[str, tuple[float, float]],
-) -> None:
-    """Write the Isaac topic-based ros2_control URDF from the canonical model.
-
-    This file is an execution resource for controller_manager, not a reduced
-    planning model. It preserves the canonical links, joints, geometry, sibling
-    mimic, Gazebo tags, and transmissions, while replacing the xarm-generated
-    ros2_control blocks with the ManyForge-owned topic_based_ros2_control arm
-    system used by the Isaac smoke lane. The gripper remains outside
-    ros2_control in this lane because ManyForge drives it through the
-    GripperCommand-to-Isaac-JointState bridge.
-    """
-    root = load_rewritten_urdf(source_urdf, moveit_joint_dynamics)
-    root.set("name", "manyforge_isaac_lite6_topic_based")
-    remove_xml_comments(root)
-    remove_elements_by_tag(root, "ros2_control")
-
-    ros2_control = ET.Element(
-        "ros2_control",
-        {"name": "IsaacLite6TopicBasedSystem", "type": "system"},
-    )
-    hardware = ET.SubElement(ros2_control, "hardware")
-    ET.SubElement(hardware, "plugin").text = "topic_based_ros2_control/TopicBasedSystem"
-    params = {
-        "joint_commands_topic": "{joint_commands_topic}",
-        "joint_states_topic": "{joint_states_topic}",
-        "trigger_joint_command_threshold": "{trigger_joint_command_threshold}",
-        "sum_wrapped_joint_states": "{sum_wrapped_joint_states}",
-    }
-    for name, value in params.items():
-        ET.SubElement(hardware, "param", {"name": name}).text = value
-
-    for joint_name in ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"):
-        joint = ET.SubElement(ros2_control, "joint", {"name": joint_name})
-        ET.SubElement(joint, "command_interface", {"name": "position"})
-        position = ET.SubElement(joint, "state_interface", {"name": "position"})
-        ET.SubElement(position, "param", {"name": "initial_value"}).text = (
-            "{" + f"{joint_name}_initial" + "}"
-        )
-        ET.SubElement(joint, "state_interface", {"name": "velocity"})
-
-    insert_index = 0
-    for idx, child in enumerate(list(root)):
-        if child.tag == "joint" and child.attrib.get("name") == "world_joint":
-            insert_index = idx + 1
-            break
-    root.insert(insert_index, ros2_control)
-    write_xml(root, output_path)
-
-
 def copy_meshes(xarm_description: Path, model_dir: Path) -> None:
     for rel in REQUIRED_MESHES:
         src = xarm_description / rel
@@ -615,20 +542,6 @@ def main() -> int:
         type=Path,
         default=root / "manyforge_example_models" / "models" / "lite6_lite_gripper",
     )
-    parser.add_argument(
-        "--isaac-topic-based-urdf-output",
-        type=Path,
-        default=(
-            root
-            / "manyforge_ros_bringup"
-            / "urdf"
-            / "isaac_lite6_topic_based.ros2_control.urdf"
-        ),
-        help=(
-            "Full-model Isaac topic_based_ros2_control URDF template to refresh. "
-            "Use an empty string to skip."
-        ),
-    )
     args = parser.parse_args()
 
     xarm_root = args.xarm_ros2.resolve()
@@ -650,12 +563,6 @@ def main() -> int:
         moveit_joint_dynamics,
     )
     write_srdf(model_dir / "lite6_lite_gripper.srdf")
-    if str(args.isaac_topic_based_urdf_output):
-        isaac_urdf_output = args.isaac_topic_based_urdf_output.resolve()
-        isaac_urdf_output.parent.mkdir(parents=True, exist_ok=True)
-        write_isaac_topic_based_ros2_control_urdf(
-            source_urdf, isaac_urdf_output, moveit_joint_dynamics
-        )
     write_license(model_dir, xarm_root)
     write_readme(
         model_dir,

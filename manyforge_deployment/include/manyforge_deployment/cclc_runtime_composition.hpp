@@ -44,6 +44,9 @@ struct CCLCRuntimeCompositionConfig final {
       core::kMaximumResolvedStopBasePlanEncodedBytes};
   /// CCLC-owned requested-target follower, started with the composition.
   core::CCLCLifecycleTargetDriverConfig lifecycle_target_driver{};
+  // Optional informational logging only; invoked after journal commit/unlock.
+  std::function<void(const core::ComponentIncidentPruneNotice &)>
+      on_incidents_pruned{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool trusted_roots_valid() const noexcept;

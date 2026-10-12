@@ -23,6 +23,12 @@ bool source_may_be_non_expiring(ObservedRobotStateAuthorityProfile profile) noex
          profile == ObservedRobotStateAuthorityProfile::kPredictedNative;
 }
 
+// Observed state is the entry of measured/commanded floats into Core, and it
+// becomes canonical prepared data (a plan start state), which refuses -0.0 to
+// keep content identity unique. A sample may carry -0.0 (e.g. a Stop ramp's
+// rest velocity, negative path slope x zero path rate): store the equal +0.0.
+double without_negative_zero(double value) noexcept { return value == 0.0 ? 0.0 : value; }
+
 void atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept {
   auto current = target.load(std::memory_order_relaxed);
   while (current < value && !target.compare_exchange_weak(current, value, std::memory_order_relaxed,
@@ -297,9 +303,9 @@ ObservedRobotStatePublishResult ObservedRobotStatePublication::publish(
       source_shape_valid = false;
       break;
     }
-    target->positions_rad[index] = position;
+    target->positions_rad[index] = without_negative_zero(position);
     if (source_index < velocities_rad_s.size() && std::isfinite(velocities_rad_s[source_index])) {
-      target->velocities_rad_s[index] = velocities_rad_s[source_index];
+      target->velocities_rad_s[index] = without_negative_zero(velocities_rad_s[source_index]);
     }
   }
   const bool complete =

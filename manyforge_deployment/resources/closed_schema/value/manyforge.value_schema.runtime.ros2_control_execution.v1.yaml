@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905
+schema_revision: sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -21,18 +21,78 @@ definitions:
                   - commanded_sim
               - kind: string_format
                 value: portable_id
-        - field_id: isaac_profile
+        - field_id: controller_profiles
           presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - [controllable_component_id]
+            item_schema:
+              kind: object
+              fields:
+                - field_id: controllable_component_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: frame_prefix
+                  presence: optional
+                  default:
+                    kind: materialized
+                    value: ""
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints: []
+                - field_id: isaac_profile
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - lite6
+                          - ur10e
+                      - kind: string_format
+                        value: portable_id
+                - field_id: mock_profile
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - lite6_lite_gripper
+                          - ur10e_robotiq_2f_140
+                          - ur5_roboplan
+                          - ur5e_robotiq_2f_85
+                      - kind: string_format
+                        value: portable_id
+        - field_id: isaac_world
+          presence: optional
           default:
             kind: absent
           value_schema:
             kind: scalar
             scalar_type: string
             constraints:
-              - kind: enum
-                values:
-                  - lite6
-                  - ur10e
               - kind: string_format
                 value: portable_id
         - field_id: planner_rng_seed
@@ -109,6 +169,290 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 1000
+        - field_id: default_fault_stop_profiles
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - [controllable_component_id]
+                - [command_target_id]
+            item_schema:
+              kind: object
+              fields:
+                - field_id: controllable_component_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: command_target_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: profile_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: stop_mode
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - hard_deceleration
+                          - soft_on_path
+                          - spring_back_hold
+                - field_id: deceleration_time_s
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: number
+                    constraints:
+                      - kind: exclusive_minimum
+                        value: 0
+                      - kind: maximum
+                        value: 2
+                - field_id: per_joint_max_deceleration_rad_s2
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: array
+                    min_items: 1
+                    max_items: 256
+                    collection:
+                      kind: keyed_record_set
+                      key_paths:
+                        - [source_joint_name]
+                    item_schema:
+                      kind: object
+                      fields:
+                        - field_id: source_joint_name
+                          presence: required
+                          default:
+                            kind: absent
+                          value_schema:
+                            kind: scalar
+                            scalar_type: string
+                            constraints:
+                              - kind: string_format
+                                value: portable_id
+                        - field_id: max_deceleration_rad_s2
+                          presence: required
+                          default:
+                            kind: absent
+                          value_schema:
+                            kind: scalar
+                            scalar_type: number
+                            constraints:
+                              - kind: exclusive_minimum
+                                value: 0
+                - field_id: allow_natural_completion_on_short_path
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: boolean
+                    constraints: []
+                - field_id: require_backend_confirmation
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: boolean
+                    constraints: []
+        - field_id: gripper_target_configurations
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - [controllable_component_id]
+                - [command_target_id]
+            item_schema:
+              kind: object
+              fields:
+                - field_id: controllable_component_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: command_target_id
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: description
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints: []
+                - field_id: actuation_kind
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - position_commanded
+                          - pneumatic
+                - field_id: open_state_ref
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: closed_state_ref
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: command_duration_s
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: number
+                    constraints:
+                      - kind: exclusive_minimum
+                        value: 0
+                      - kind: maximum
+                        value: 60
+                - field_id: operator_confirmation_validity_ns
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: integer
+                    constraints:
+                      - kind: minimum
+                        value: 1
+                      - kind: maximum
+                        value: 3600000000000
+                - field_id: touch_links
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: array
+                    min_items: 1
+                    max_items: 256
+                    collection:
+                      kind: scalar_set
+                    item_schema:
+                      kind: scalar
+                      scalar_type: string
+                      constraints:
+                        - kind: string_format
+                          value: portable_id
+                - field_id: mount_frame
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: attach_frame
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: tcp_frame
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: string_format
+                        value: portable_id
+                - field_id: auxiliary_frames
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: array
+                    min_items: 0
+                    max_items: 256
+                    collection:
+                      kind: scalar_set
+                    item_schema:
+                      kind: scalar
+                      scalar_type: string
+                      constraints:
+                        - kind: string_format
+                          value: portable_id
         - field_id: execution_tick_hz
           presence: required
           default:

@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
-schema_revision: sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b
+schema_revision: sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27
 schema_purpose: value
 root_definition_id: motion_controlled_stop_parameters
 definitions:
@@ -56,6 +56,18 @@ definitions:
                 value: 0
               - kind: maximum
                 value: 2
+        - field_id: max_stop_time_s
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+              - kind: maximum
+                value: 9007199
         - field_id: per_resource_limits
           presence: required
           default:
@@ -125,6 +137,18 @@ definitions:
                 value: 0
               - kind: maximum
                 value: 2
+        - field_id: max_stop_time_s
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+              - kind: maximum
+                value: 9007199
         - field_id: per_resource_limits
           presence: required
           default:

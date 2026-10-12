@@ -21,6 +21,11 @@ inline constexpr std::size_t kMaxComponentIncidentEventPage = 64U;
 struct ComponentIncidentRecordDTO final {
   ComponentLifecycleIncidentDTO incident;
   std::string record_json;
+  // Set-once auxiliary diagnostic from existing row JSON; original event unchanged.
+  std::optional<ErrorDTO> diagnostic{};
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot{};
+  // Routine facts may omit decoding; this is different from known absence.
+  bool diagnostic_loaded{true};
 
   friend bool operator==(const ComponentIncidentRecordDTO&,
                          const ComponentIncidentRecordDTO&) = default;
@@ -132,6 +137,15 @@ class ICCLCLifecycleTargetStore {
   [[nodiscard]] virtual Result<bool> UpdateOpenComponentIncident(
       const std::string& incident_id, LifecycleBlockingCauseClassDTO cause_class,
       const std::vector<std::string>& vendor_codes, const std::string& record_json) = 0;
+  /// Set once in the existing row JSON and append one exit-evidence event.
+  /// Does not change the original event, summary or cause. False for replay/closed.
+  [[nodiscard]] virtual Result<bool> AppendComponentIncidentDiagnostic(
+      const std::string&, std::int64_t, const ErrorDTO&,
+      std::shared_ptr<const content_identity::CanonicalValue> = {}) {
+    return Result<bool>::Err({"component_incident_diagnostic_unavailable",
+                              "incident diagnostic append is not composed",
+                              {}});
+  }
   /// Durable incident history events after `after_sequence`, oldest first,
   /// at most `limit` (bounded by kMaxComponentIncidentEventPage).
   [[nodiscard]] virtual Result<std::vector<ComponentIncidentEventDTO>>

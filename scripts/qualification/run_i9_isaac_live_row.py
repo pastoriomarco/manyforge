@@ -1117,7 +1117,6 @@ def _ros2_control_transport_diagnostic(
     return {
         key: value.get(key)
         for key in (
-            "command_gate_open",
             "command_path_ready",
             "configured",
             "feedback_messages_received",
@@ -2637,7 +2636,6 @@ def _process_commands(
             "isaac_topic_based_control.launch.py",
             f"isaac_profile:={config.spec.profile}",
             f"runtime_namespace:=/manyforge/{config.spec.component_id}",
-            f"command_gate_owner_namespace:=/manyforge/{config.spec.component_id}",
             f"world_uri:={config.spec.world_uri}",
             f"expected_world_name:={config.spec.world_name}",
             f"scene_startup_timeout_s:={config.startup_timeout_s}",

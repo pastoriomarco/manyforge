@@ -729,8 +729,6 @@ Ros2GripperTransportReadinessSnapshot
 Ros2GripperCommandBackend::gripper_transport_readiness(
     const std::string &gripper_id) const {
   Ros2GripperTransportReadinessSnapshot result;
-  result.command_gate_open = !resources_.command_gate_configured() ||
-                             resources_.command_gate_enabled();
   if (gripper_id.empty()) {
     result.reason_codes.push_back("gripper_identity_missing");
     return result;
@@ -1045,12 +1043,6 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           "Timed out waiting for gripper action server " +
               runtime->config.action_name);
     }
-  } else if (resources_.command_gate_configured() &&
-             !resources_.command_gate_enabled()) {
-    return rejected_gripper_command(
-        ros2_control_fault_reason::kGripperGoalRejected,
-        "Gripper command rejected (command gate closed: simulator reset "
-        "incomplete or failed)");
   }
 
   const auto command_id =
@@ -1209,86 +1201,70 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   // Runtime state is generation-owned. Backend access is limited to cancelling
   // the owner-scheduled deadline; the retained host quiesces the ROS executor
   // before adapter destruction.
-  // A closed command gate makes the bridge reject every goal; name that
-  // cause instead of leaving an unexplained rejection. Only when a gate is
-  // configured — non-gated (real-controller) deployments must not get a
-  // false gate attribution.
-  const bool gate_closed_at_dispatch = resources_.command_gate_configured() &&
-                                       !resources_.command_gate_enabled();
-  options.goal_response_callback =
-      [this, runtime, gate_closed_at_dispatch, command_id,
-       generation](const GoalHandleGripper::SharedPtr &goal_handle) {
-        GoalHandleGripper::SharedPtr handle_to_cancel;
-        rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
-        std::optional<core::ScheduleHandle> lifecycle_handle;
-        {
-          std::lock_guard<std::mutex> lock(runtime->mutex);
-          if (runtime->command_id != command_id ||
-              runtime->generation != generation) {
-            handle_to_cancel = goal_handle;
-            action_client = runtime->action_client;
-          } else if (!goal_handle) {
-            if (runtime->executing) {
-              lifecycle_handle = runtime->lifecycle_handle;
-              runtime->lifecycle_handle.reset();
-              ++runtime->lifecycle_schedule_generation;
-              runtime->state = "failed";
-              runtime->executing = false;
-              runtime->goal_accepted = false;
-              runtime->cancel_pending = false;
-              runtime->error =
-                  gate_closed_at_dispatch
-                      ? "Gripper action goal was rejected (command gate "
-                        "closed: simulator reset incomplete or failed — run "
-                        "simulation reset)"
-                      : "Gripper action goal was rejected";
-              runtime->reason_code =
-                  ros2_control_fault_reason::kGripperGoalRejected;
-              runtime->projection_state =
-                  core::GripperProjectionState::kNotRequired;
-              runtime->projection_reason.clear();
-              ++runtime->revision;
-            }
-          } else if (runtime->cancel_pending || !runtime->executing) {
-            lifecycle_handle = runtime->lifecycle_handle;
-            runtime->lifecycle_handle.reset();
-            ++runtime->lifecycle_schedule_generation;
-            handle_to_cancel = goal_handle;
-            action_client = runtime->action_client;
-            runtime->active_goal_handle.reset();
-            runtime->goal_accepted = false;
-            runtime->executing = false;
-            runtime->cancel_pending = false;
-            runtime->state = "idle";
-            runtime->error.clear();
-            runtime->reason_code.clear();
-            runtime->projection_state =
-                core::GripperProjectionState::kNotRequired;
-            runtime->projection_reason.clear();
-            ++runtime->revision;
-          } else {
-            runtime->goal_accepted = true;
-            runtime->active_goal_handle = goal_handle;
-            ++runtime->revision;
-          }
+  options.goal_response_callback = [this, runtime, command_id,
+                                    generation](const GoalHandleGripper::SharedPtr& goal_handle) {
+    GoalHandleGripper::SharedPtr handle_to_cancel;
+    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    std::optional<core::ScheduleHandle> lifecycle_handle;
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      if (runtime->command_id != command_id || runtime->generation != generation) {
+        handle_to_cancel = goal_handle;
+        action_client = runtime->action_client;
+      } else if (!goal_handle) {
+        if (runtime->executing) {
+          lifecycle_handle = runtime->lifecycle_handle;
+          runtime->lifecycle_handle.reset();
+          ++runtime->lifecycle_schedule_generation;
+          runtime->state = "failed";
+          runtime->executing = false;
+          runtime->goal_accepted = false;
+          runtime->cancel_pending = false;
+          runtime->error = "Gripper action goal was rejected";
+          runtime->reason_code = ros2_control_fault_reason::kGripperGoalRejected;
+          runtime->projection_state = core::GripperProjectionState::kNotRequired;
+          runtime->projection_reason.clear();
+          ++runtime->revision;
         }
-        if (lifecycle_handle.has_value()) {
-          try {
-            scheduler_.cancel(*lifecycle_handle);
-          } catch (...) {
-            // The response already retired this lifecycle generation.
-          }
-        }
-        if (action_client && handle_to_cancel) {
-          try {
-            (void)action_client->async_cancel_goal(handle_to_cancel);
-          } catch (const std::exception &) {
-            // Reset/stop remains best-effort if the remote goal disappears
-            // during negotiation; the next status/result callback will
-            // reconcile state.
-          }
-        }
-      };
+      } else if (runtime->cancel_pending || !runtime->executing) {
+        lifecycle_handle = runtime->lifecycle_handle;
+        runtime->lifecycle_handle.reset();
+        ++runtime->lifecycle_schedule_generation;
+        handle_to_cancel = goal_handle;
+        action_client = runtime->action_client;
+        runtime->active_goal_handle.reset();
+        runtime->goal_accepted = false;
+        runtime->executing = false;
+        runtime->cancel_pending = false;
+        runtime->state = "idle";
+        runtime->error.clear();
+        runtime->reason_code.clear();
+        runtime->projection_state = core::GripperProjectionState::kNotRequired;
+        runtime->projection_reason.clear();
+        ++runtime->revision;
+      } else {
+        runtime->goal_accepted = true;
+        runtime->active_goal_handle = goal_handle;
+        ++runtime->revision;
+      }
+    }
+    if (lifecycle_handle.has_value()) {
+      try {
+        scheduler_.cancel(*lifecycle_handle);
+      } catch (...) {
+        // The response already retired this lifecycle generation.
+      }
+    }
+    if (action_client && handle_to_cancel) {
+      try {
+        (void)action_client->async_cancel_goal(handle_to_cancel);
+      } catch (const std::exception&) {
+        // Reset/stop remains best-effort if the remote goal disappears
+        // during negotiation; the next status/result callback will
+        // reconcile state.
+      }
+    }
+  };
   options.feedback_callback =
       [this, runtime, command_id, generation](
           GoalHandleGripper::SharedPtr goal_handle,

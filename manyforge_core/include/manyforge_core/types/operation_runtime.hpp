@@ -316,45 +316,13 @@ struct StopAffectedOperationRevisionDTO final {
 };
 
 /// Exact immutable acceptance truth inherited by a promoted aggregate Stop.
-/// The remaining duration is sampled again at the aggregate acceptance time;
-/// it is never copied from an older public acceptance projection.
 struct StopPredecessorAcceptanceRefDTO final {
   StopId predecessor_stop_id;
   StopGeneration predecessor_stop_generation;
   ContentDigest captured_scope_digest;
-  std::int64_t remaining_outer_duration_ns_at_join{};
 
   friend bool operator==(const StopPredecessorAcceptanceRefDTO&,
                          const StopPredecessorAcceptanceRefDTO&) = default;
-};
-
-/// One immutable phase allocation published with Stop acceptance. The fixed
-/// offset retains the selected plan meaning; the remaining offset is the
-/// owner-stamped shortened duration at this publication and is never an
-/// absolute timestamp.
-struct StopAcceptedPhaseBudgetDTO final {
-  StopBudgetPhaseId phase_id;
-  std::int64_t fixed_deadline_offset_ns{};
-  std::int64_t remaining_deadline_offset_ns{};
-
-  friend bool operator==(const StopAcceptedPhaseBudgetDTO&,
-                         const StopAcceptedPhaseBudgetDTO&) = default;
-};
-
-/// One participant-local phase table from the exact immutable Stop plan
-/// prepared before operation dispatch. Phase identifiers are intentionally
-/// scoped by this row: two participants may use the same phase spelling with
-/// different retained offsets.
-struct StopAcceptedParticipantBudgetDTO final {
-  StopId origin_stop_id;
-  StopGeneration origin_stop_generation;
-  OperationId operation_id;
-  OperationParticipantId participant_id;
-  ContentDigest participant_stop_invocation_plan_digest;
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
-
-  friend bool operator==(const StopAcceptedParticipantBudgetDTO&,
-                         const StopAcceptedParticipantBudgetDTO&) = default;
 };
 
 struct StopAcceptedDTO final {
@@ -369,11 +337,9 @@ struct StopAcceptedDTO final {
   ContentDigest captured_scope_digest;
   std::vector<StopPredecessorAcceptanceRefDTO> joined_predecessor_stops;
   std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions;
-  std::int64_t fixed_outer_duration_ns{};
-  std::int64_t fixed_kernel_completion_reserve_ns{};
-  std::int64_t remaining_outer_duration_ns{};
+  /// Q51: no shared Stop budget is accepted; each robot's own deadlines are
+  /// computed at stage dispatch from its own profile and lane.
   std::int64_t accepted_at_ns{};
-  std::vector<StopAcceptedParticipantBudgetDTO> participant_budget_allocations;
 
   friend bool operator==(const StopAcceptedDTO&, const StopAcceptedDTO&) = default;
 };

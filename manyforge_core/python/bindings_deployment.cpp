@@ -618,14 +618,26 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::self != py::self);
 
   py::class_<SoftOnPathStopParametersDTO>(module, "SoftOnPathStopParametersDTO", py::is_final())
-      .def(py::init<MotionControlledStopMode, double, std::vector<ControlledStopResourceLimitDTO>,
-                    bool, std::optional<MotionControlledStopMode>, bool>(),
+      .def(py::init([](MotionControlledStopMode stop_mode, double deceleration_time_s,
+                       std::vector<ControlledStopResourceLimitDTO> per_resource_limits,
+                       bool allow_natural_completion_on_short_path,
+                       std::optional<MotionControlledStopMode> recoverable_substitution_mode,
+                       bool jerk_limits_enabled, std::optional<double> max_stop_time_s) {
+             return SoftOnPathStopParametersDTO{stop_mode,
+                                                deceleration_time_s,
+                                                max_stop_time_s,
+                                                std::move(per_resource_limits),
+                                                allow_natural_completion_on_short_path,
+                                                recoverable_substitution_mode,
+                                                jerk_limits_enabled};
+           }),
            py::arg("stop_mode"), py::arg("deceleration_time_s"), py::arg("per_resource_limits"),
            py::arg("allow_natural_completion_on_short_path"),
            py::arg("recoverable_substitution_mode") = std::nullopt,
-           py::arg("jerk_limits_enabled") = false)
+           py::arg("jerk_limits_enabled") = false, py::arg("max_stop_time_s") = std::nullopt)
       .def_readonly("stop_mode", &SoftOnPathStopParametersDTO::stop_mode)
       .def_readonly("deceleration_time_s", &SoftOnPathStopParametersDTO::deceleration_time_s)
+      .def_readonly("max_stop_time_s", &SoftOnPathStopParametersDTO::max_stop_time_s)
       .def_property_readonly("per_resource_limits",
                              [](const SoftOnPathStopParametersDTO& value) {
                                return immutable_snapshot(value.per_resource_limits);
@@ -640,13 +652,23 @@ void register_deployment_candidate_bindings(py::module_& module) {
 
   py::class_<SpringBackHoldStopParametersDTO>(module, "SpringBackHoldStopParametersDTO",
                                               py::is_final())
-      .def(py::init<MotionControlledStopMode, double, std::vector<ControlledStopResourceLimitDTO>,
-                    bool, bool>(),
+      .def(py::init([](MotionControlledStopMode stop_mode, double deceleration_time_s,
+                       std::vector<ControlledStopResourceLimitDTO> per_resource_limits,
+                       bool allow_natural_completion_on_short_path, bool jerk_limits_enabled,
+                       std::optional<double> max_stop_time_s) {
+             return SpringBackHoldStopParametersDTO{stop_mode,
+                                                    deceleration_time_s,
+                                                    max_stop_time_s,
+                                                    std::move(per_resource_limits),
+                                                    allow_natural_completion_on_short_path,
+                                                    jerk_limits_enabled};
+           }),
            py::arg("stop_mode"), py::arg("deceleration_time_s"), py::arg("per_resource_limits"),
            py::arg("allow_natural_completion_on_short_path") = false,
-           py::arg("jerk_limits_enabled") = false)
+           py::arg("jerk_limits_enabled") = false, py::arg("max_stop_time_s") = std::nullopt)
       .def_readonly("stop_mode", &SpringBackHoldStopParametersDTO::stop_mode)
       .def_readonly("deceleration_time_s", &SpringBackHoldStopParametersDTO::deceleration_time_s)
+      .def_readonly("max_stop_time_s", &SpringBackHoldStopParametersDTO::max_stop_time_s)
       .def_readonly("allow_natural_completion_on_short_path",
                     &SpringBackHoldStopParametersDTO::allow_natural_completion_on_short_path)
       .def_readonly("jerk_limits_enabled", &SpringBackHoldStopParametersDTO::jerk_limits_enabled)
@@ -777,14 +799,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<StopTimingSelectionDTO>(module, "StopTimingSelectionDTO", py::is_final())
-      .def(py::init<ControlBindingId, ControlBindingRevision, StopTimingParametersDTO>(),
-           py::arg("control_binding_id"), py::arg("control_binding_revision"), py::arg("timing"))
-      .def_readonly("control_binding_id", &StopTimingSelectionDTO::control_binding_id)
-      .def_readonly("control_binding_revision", &StopTimingSelectionDTO::control_binding_revision)
-      .def_readonly("timing", &StopTimingSelectionDTO::timing)
-      .def(py::self == py::self);
-
   py::class_<DeploymentApplicabilityInputsDTO>(module, "DeploymentApplicabilityInputsDTO",
                                                py::is_final())
       .def(py::init([](std::optional<SiteOverlayRefDTO> site_overlay_ref,
@@ -793,8 +807,7 @@ void register_deployment_candidate_bindings(py::module_& module) {
                        const py::iterable& external_resources,
                        const py::iterable& stop_stage_parameters,
                        const py::iterable& commissioned_stop_interfaces,
-                       const py::iterable& retained_policy_records,
-                       const py::iterable& stop_timing_parameters) {
+                       const py::iterable& retained_policy_records) {
              auto bounded_configurations =
                  bounded_values_from_python<DesiredControlConfigurationDTO,
                                             deployment::DeploymentApplicabilityCodecError>(
@@ -823,21 +836,16 @@ void register_deployment_candidate_bindings(py::module_& module) {
              auto bounded_policy_records = bounded_catalog_record_refs_from_python(
                  retained_policy_records, kMaxDeploymentApplicabilityRows,
                  "retained_policy_records");
-             auto bounded_timings =
-                 bounded_values_from_python<StopTimingSelectionDTO,
-                                            deployment::DeploymentApplicabilityCodecError>(
-                     stop_timing_parameters, kMaxDeploymentApplicabilityRows,
-                     "stop_timing_parameters", "StopTimingSelectionDTO");
              return DeploymentApplicabilityInputsDTO{
                  std::move(site_overlay_ref),        std::move(bounded_configurations),
                  std::move(bounded_providers),       std::move(bounded_resources),
                  std::move(bounded_stop_parameters), std::move(bounded_commissioned),
-                 std::move(bounded_policy_records),  std::move(bounded_timings)};
+                 std::move(bounded_policy_records)};
            }),
            py::arg("site_overlay_ref"), py::arg("desired_control_configurations"),
            py::arg("capability_provider_bindings"), py::arg("external_resources"),
            py::arg("stop_stage_parameters"), py::arg("commissioned_stop_interfaces"),
-           py::arg("retained_policy_records"), py::arg("stop_timing_parameters") = py::tuple())
+           py::arg("retained_policy_records"))
       .def_readonly("site_overlay_ref", &DeploymentApplicabilityInputsDTO::site_overlay_ref)
       .def_readonly("desired_control_configurations",
                     &DeploymentApplicabilityInputsDTO::desired_control_configurations)
@@ -850,8 +858,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
                     &DeploymentApplicabilityInputsDTO::commissioned_stop_interfaces)
       .def_readonly("retained_policy_records",
                     &DeploymentApplicabilityInputsDTO::retained_policy_records)
-      .def_readonly("stop_timing_parameters",
-                    &DeploymentApplicabilityInputsDTO::stop_timing_parameters)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

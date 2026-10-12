@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <thread>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
@@ -362,6 +363,113 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   ASSERT_FALSE(conflicting.ok());
   EXPECT_EQ(conflicting.error().details.at("reason"),
             "external_controller_lifecycle_generation_invalid");
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     EqualReconstructedDiagnosticKeepsItsExternalGeneration) {
+  FakeClock clock;
+  clock.set(1'000);
+  const auto expected = MakeExpectedDomain();
+  const auto payload = [](const char *text) {
+    return std::make_shared<const content_identity::CanonicalValue>(
+        content_identity::CanonicalValue::Object{
+            {"evidence", content_identity::CanonicalValue(std::string(text))}});
+  };
+  RetainedExternallyManagedDomainSnapshot external{
+      1U, ComponentLifecycleStateDTO::kActive, true, {}, std::nullopt,
+      payload("same")};
+  auto created = RetainedExternallyManagedControllerLifecyclePort::Create(
+      expected, {MakePhysicalBinding()},
+      [&external](const ControlDomainId &, const TimePoint) {
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
+      },
+      clock, 500);
+  ASSERT_TRUE(created.ok());
+  const auto query = MakeControllerLifecycleObservationQuery(expected.value());
+  ASSERT_TRUE(created.value()->Observe(query).ok());
+  const auto original = external.diagnostic_snapshot;
+  external.diagnostic_snapshot = payload("same");
+  ASSERT_NE(external.diagnostic_snapshot.get(), original.get());
+  clock.advance(10);
+  const auto reconstructed = created.value()->Observe(query);
+  ASSERT_TRUE(reconstructed.ok()) << reconstructed.error().message;
+  EXPECT_TRUE(reconstructed.value().active_configuration.has_value());
+  external.diagnostic_snapshot = payload("changed");
+  clock.advance(10);
+  const auto changed = created.value()->Observe(query);
+  ASSERT_FALSE(changed.ok());
+  EXPECT_EQ(changed.error().details.at("reason"),
+            "external_controller_lifecycle_generation_invalid");
+}
+
+TEST(RetainedExternallyManagedLifecyclePorts,
+     BoundedIncidentDiagnosticSurvivesAndOversizedDiagnosticCannotHideFault) {
+  FakeClock clock;
+  clock.set(5'000);
+  const ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      ControlDomainId("domain.arm"),
+      ControlDomainRevision("domain-revision"),
+      ProviderInstanceId("provider.external"),
+      ProviderManifestId("provider-manifest.external"),
+      ProviderManifestRevision("provider-manifest-revision"),
+      RuntimeUnitId("runtime.native"),
+      RuntimeEpoch("runtime-epoch.1"),
+      ContentDigest("catalog-digest")};
+  RetainedExternallyManagedDomainSnapshot external{
+      11U,
+      ComponentLifecycleStateDTO::kFaulted,
+      false,
+      {},
+      ErrorDTO{"controller_launch_exited",
+               "component=robot.1 signal=11 Apply=apply.7",
+               {}}};
+  auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
+      occurrence,
+      [&](const ControlDomainId &, const TimePoint) {
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
+      },
+      clock, 1'000);
+  ASSERT_TRUE(created.ok());
+  const BrandLifecycleObservationQueryDTO query{
+      LifecycleTransactionId("transaction"),
+      LifecycleTransactionGeneration(1U),
+      ControllableComponentId("robot.1"),
+      occurrence.control_domain_id,
+      occurrence.control_domain_revision,
+      occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,
+      occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id,
+      occurrence.provider_runtime_epoch};
+  const auto observed = created.value()->Observe(query);
+  ASSERT_TRUE(observed.ok());
+  ASSERT_TRUE(observed.value().diagnostic);
+  EXPECT_EQ(observed.value().diagnostic, external.diagnostic);
+  EXPECT_EQ(observed.value().observed_state,
+            ComponentLifecycleStateDTO::kFaulted);
+  // Auxiliary evidence failure does not convert the same primary fault into
+  // an unavailable observation or suppress containment.
+  ++external.source_generation;
+  external.diagnostic->message =
+      std::string(kMaxLifecycleErrorMessageBytes + 1U, 'x');
+  const auto oversized = created.value()->Observe(query);
+  ASSERT_TRUE(oversized.ok()) << oversized.error().message;
+  EXPECT_FALSE(oversized.value().diagnostic);
+  EXPECT_EQ(oversized.value().observed_state,
+            ComponentLifecycleStateDTO::kFaulted);
+  EXPECT_EQ(oversized.value().observation_generation,
+            external.source_generation);
+  for (const auto &malformed :
+       {std::string("invalid\xFF", 8U), std::string("non-NFC e\xCC\x81"),
+        std::string("truncated\xC3", 10U)}) {
+    ++external.source_generation;
+    external.diagnostic->message = malformed;
+    const auto invalid = created.value()->Observe(query);
+    ASSERT_TRUE(invalid.ok()) << invalid.error().message;
+    EXPECT_FALSE(invalid.value().diagnostic);
+    EXPECT_EQ(invalid.value().observed_state,
+              ComponentLifecycleStateDTO::kFaulted);
+  }
 }
 
 TEST(RetainedExternallyManagedLifecyclePorts,

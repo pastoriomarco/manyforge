@@ -40,7 +40,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905";
+        "d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -81,6 +81,11 @@ inline constexpr std::size_t kMaxRos2ControlExecutionRuntimeManifestBytes =
     64U * 1024U;
 inline constexpr std::size_t
     kMaxRos2ControlExecutionLaunchDescriptorBytes = 4U * 1024U;
+
+/// Q85: reject collisions on the exclusive topics of the known Isaac profiles.
+/// Both authored compilation and retained activation use this one check.
+void require_no_exclusive_ros_controller_topic_collision(
+    const CanonicalValue::Array &controller_profiles);
 
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_document();
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_revision();

@@ -33,6 +33,7 @@ JOINT_STATE_BROADCASTER_TYPE = (
     'joint_state_broadcaster/JointStateBroadcaster'
 )
 EXPECTED_COMMAND_INTERFACES = ('position', 'velocity')
+EXPECTED_CONTROLLER_COMMAND_INTERFACES = ('position',)
 EXPECTED_STATE_INTERFACES = ('position', 'velocity')
 ACTIVITY_QOS = {
     'depth': 1,
@@ -350,7 +351,7 @@ def compile_production_controller_binding(
         controller_parameters.get('command_interfaces'),
         f'{controller_leaf}.command_interfaces',
     )
-    if command_interfaces != EXPECTED_COMMAND_INTERFACES:
+    if command_interfaces != EXPECTED_CONTROLLER_COMMAND_INTERFACES:
         raise ValueError(
             'trajectory controller command interfaces disagree with hardware'
         )

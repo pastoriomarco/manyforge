@@ -105,6 +105,17 @@ void require_fields(const CanonicalValue &value,
   return result;
 }
 
+[[nodiscard]] bool valid_frame_prefix(std::string_view value) noexcept {
+  if (value.empty()) return true;
+  if (value.front() == '/' || value.back() != '/') return false;
+  return std::all_of(value.begin(), value.end(), [](char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '_' ||
+           character == '/';
+  });
+}
+
 void require_source_reference(const CanonicalValue &value,
                               std::string_view label) {
   const auto &members = object(value, label);
@@ -211,11 +222,12 @@ void require_target_settings(const CanonicalValue &value,
 ActivationDeploymentIntent parse_activation_deployment_intent(
     const CanonicalValue &value,
     std::vector<CapturedComponentModelSource> captured_sources) {
-  require_fields(value,
-                 {"api_version", "attachments", "components",
-                  "deployment_artifact_id", "name", "policies"},
-                 {"assistant_profile_id", "compatibility", "description"},
-                 "root");
+  require_fields(
+      value,
+      {"api_version", "attachments", "components", "deployment_artifact_id",
+       "name", "policies"},
+      {"assistant_profile_id", "compatibility", "description", "isaac_world"},
+      "root");
   if (text(member(value, "api_version", "root"), "api_version") !=
       kApiVersion) {
     fail("has an unsupported api_version");
@@ -253,7 +265,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     require_fields(component,
                    {"component_id", "component_profile_id", "configuration",
                     "model_source", "root_pose_in_cell", "target_settings"},
-                   {}, label);
+                   {"frame_prefix"}, label);
     const auto &component_id = portable_identifier(
         member(component, "component_id", label), label + ".component_id");
     const auto &profile_id = portable_identifier(
@@ -276,9 +288,18 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     require_pose(pose, label + ".root_pose_in_cell");
     require_target_settings(target_settings, label + ".target_settings");
     static_cast<void>(object(configuration, label + ".configuration"));
+    std::string frame_prefix;
+    if (const auto *prefix = component.find_object_member("frame_prefix"); prefix != nullptr) {
+      if (!prefix->is_string()) fail(label + ".frame_prefix must be a string");
+      frame_prefix = prefix->as_string();
+    }
+    if (!valid_frame_prefix(frame_prefix)) {
+      fail(label + ".frame_prefix must be empty or use only ASCII letters, "
+           "digits, '_' and '/', without a leading '/' and with a trailing '/'");
+    }
     parsed_components.push_back(
         {component_id, profile_id, pose, target_settings, configuration,
-         std::move(captured)});
+         std::move(captured), std::move(frame_prefix)});
   }
 
   const auto &deployment_id = portable_identifier(
@@ -286,6 +307,11 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       "deployment_artifact_id");
   const auto &name = text(member(value, "name", "root"), "name");
   if (name.size() > 256U) fail("name exceeds its byte bound");
+
+  std::optional<std::string> isaac_world;
+  if (const auto *world = value.find_object_member("isaac_world")) {
+    isaac_world = portable_identifier(*world, "isaac_world");
+  }
 
   return ActivationDeploymentIntent{
       deployment_id,
@@ -295,6 +321,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       optional_portable_identifier(
           value.find_object_member("assistant_profile_id"),
           "assistant_profile_id"),
+      std::move(isaac_world),
       member(value, "attachments", "root"),
       member(value, "policies", "root"),
       value.find_object_member("compatibility") == nullptr

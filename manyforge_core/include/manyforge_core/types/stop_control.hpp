@@ -19,7 +19,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kMotionControlledStopContractSchemaId =
     "manyforge.value_schema.provider_contract.motion_controlled_stop.v1";
 inline constexpr std::string_view kMotionControlledStopContractSchemaRevision =
-    "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b";
+    "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27";
 inline constexpr std::size_t kMaxMotionControlledStopResourceLimits = 256U;
 
 enum class MotionControlledStopMode : std::uint8_t {
@@ -61,6 +61,9 @@ struct HardStopResourceLimitDTO final {
 struct SoftOnPathStopParametersDTO final {
   MotionControlledStopMode stop_mode{MotionControlledStopMode::kSoftOnPath};
   double deceleration_time_s{};
+  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// deadline from the Stop request; absent: deceleration time + 0.5 s.
+  std::optional<double> max_stop_time_s;
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
   bool allow_natural_completion_on_short_path{};
   std::optional<MotionControlledStopMode> recoverable_substitution_mode;
@@ -73,6 +76,9 @@ struct SoftOnPathStopParametersDTO final {
 struct SpringBackHoldStopParametersDTO final {
   MotionControlledStopMode stop_mode{MotionControlledStopMode::kSpringBackHold};
   double deceleration_time_s{};
+  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// deadline from the Stop request; absent: deceleration time + 0.5 s.
+  std::optional<double> max_stop_time_s;
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
   bool allow_natural_completion_on_short_path{false};
   bool jerk_limits_enabled{false};

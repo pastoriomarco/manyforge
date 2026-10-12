@@ -116,7 +116,6 @@ class RetainedNativeCellRuntime final {
           registrations,
       core::RuntimeParticipantAdmissionResolver participant_resolver,
       std::vector<RetainedStopSurveillanceSourceInput> candidate_stop_sources,
-      std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget,
       std::function<core::Result<void>()> commit_publication = {});
 
   /// Install a Manager-selected component delta beneath its exact held fence.
@@ -126,7 +125,6 @@ class RetainedNativeCellRuntime final {
           registrations,
       core::RuntimeParticipantAdmissionResolver participant_resolver,
       std::vector<RetainedStopSurveillanceSourceInput> candidate_stop_sources,
-      std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget,
       core::RetainedBundleId candidate_retained_bundle_id,
       core::GraphRevision candidate_graph_revision,
       const core::ConfigurationFenceId &apply_fence_id,

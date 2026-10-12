@@ -170,7 +170,6 @@ void validate_command(const StopContainmentCommandDTO& command) {
   if (to_string(command.command_kind).empty()) {
     fail("containment command kind is invalid");
   }
-  require_identifier(command.command_phase_id.value(), "containment command phase ID is invalid");
   const bool requires_contract =
       command.command_kind == StopContainmentCommandKind::kMotionControlledStop ||
       command.command_kind == StopContainmentCommandKind::kSafeOutputCommand ||
@@ -288,7 +287,6 @@ void validate_source_requirement(const StopEvidenceSourceRequirementDTO& source)
 
 void validate_declarative_evidence(const StopEvidenceRequirementDTO& requirement) {
   require_identifier(requirement.evidence_item_id.value(), "evidence item ID is invalid");
-  require_identifier(requirement.phase_id.value(), "evidence phase ID is invalid");
   if (to_string(requirement.evidence_kind).empty() ||
       to_string(requirement.observation_semantics.observation_kind).empty()) {
     fail("evidence enum value is invalid");
@@ -614,45 +612,9 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
   if (plan.escalation_stages.empty() || plan.escalation_stages.size() > kMaxStopEscalationStages) {
     fail("resolved Stop plan has no bounded escalation chain");
   }
-  const auto& budget = plan.deadline_budget;
-  if (budget.outer_duration_ns <= 0 || budget.outer_duration_ns > kMaximumSafeSignedInteger ||
-      budget.kernel_completion_reserve_ns <= 0 ||
-      budget.kernel_completion_reserve_ns > kMaximumSafeSignedInteger ||
-      budget.kernel_completion_reserve_ns >= budget.outer_duration_ns || budget.phases.empty() ||
-      budget.phases.size() > kMaxStopEvidencePolicyItems) {
-    fail("resolved Stop deadline budget is invalid");
-  }
-  std::vector<std::string> phase_order;
-  phase_order.reserve(budget.phases.size());
-  std::set<std::string> phase_ids;
-  std::int64_t previous_offset = 0;
-  for (const auto& phase : budget.phases) {
-    require_identifier(phase.phase_id.value(), "Stop phase ID is invalid");
-    if (!phase_ids.insert(phase.phase_id.value()).second ||
-        phase.deadline_offset_ns <= previous_offset ||
-        phase.deadline_offset_ns > kMaximumSafeSignedInteger) {
-      fail("Stop phase order is not strictly increasing and unique");
-    }
-    previous_offset = phase.deadline_offset_ns;
-    phase_order.push_back(phase.phase_id.value());
-  }
-  if (previous_offset > budget.outer_duration_ns - budget.kernel_completion_reserve_ns) {
-    fail("Stop budget does not retain the Kernel completion reserve");
-  }
-  const auto phase_index = [&](const StopBudgetPhaseId& id) {
-    const auto found = std::find(phase_order.begin(), phase_order.end(), id.value());
-    if (found == phase_order.end()) {
-      fail("resolved Stop plan references an unknown phase");
-    }
-    return static_cast<std::size_t>(found - phase_order.begin());
-  };
-
   std::set<std::string> stage_ids;
   std::set<std::string> evidence_ids;
-  std::set<std::string> command_phase_ids;
-  std::vector<bool> phase_used(budget.phases.size(), false);
   std::size_t evidence_count = 0U;
-  std::size_t previous_stage_last_phase = 0U;
   std::size_t software_hard_count = 0U;
   const ResolvedStopContainmentScopeDTO* previous_scope = nullptr;
 
@@ -708,14 +670,6 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
       fail("resolved Stop stage lacks non-empty all-of evidence");
     }
 
-    const std::size_t command_index = phase_index(stage.containment_command.command_phase_id);
-    if (!command_phase_ids.insert(stage.containment_command.command_phase_id.value()).second ||
-        (index == 0U && command_index != 0U) ||
-        (index != 0U && command_index <= previous_stage_last_phase)) {
-      fail("resolved Stop command phases are not canonical");
-    }
-    phase_used[command_index] = true;
-    std::size_t stage_last_phase = command_index;
     for (const auto& evidence : stage.evidence_requirements) {
       ++evidence_count;
       if (evidence_count > kMaxStopEvidencePolicyItems) {
@@ -726,36 +680,11 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
       if (!evidence_ids.insert(evidence.requirement.evidence_item_id.value()).second) {
         fail("resolved Stop plan contains duplicate evidence IDs");
       }
-      const auto evidence_phase = phase_index(evidence.requirement.phase_id);
-      const auto observation = evidence.requirement.observation_semantics.observation_kind;
-      if (observation == StopEvidenceObservationKind::kCommandResult) {
-        if (evidence_phase != command_index) {
-          fail("command-result evidence does not share its command phase");
-        }
-      } else if (evidence_phase <= command_index) {
-        fail("post-command evidence does not follow its command phase");
-      }
-      if (const auto dwell = evidence.requirement.observation_semantics.minimum_dwell_ns;
-          dwell.has_value() && *dwell > budget.phases[evidence_phase].deadline_offset_ns -
-                                            budget.phases[command_index].deadline_offset_ns) {
-        fail("resolved evidence dwell exceeds its phase window");
-      }
-      if (evidence_phase < stage_last_phase) {
-        fail("resolved evidence order regresses its phase order");
-      }
-      phase_used[evidence_phase] = true;
-      stage_last_phase = evidence_phase;
     }
-    if (index != 0U && stage_last_phase <= previous_stage_last_phase) {
-      fail("resolved Stop stage does not advance its terminal evidence phase");
-    }
-    previous_stage_last_phase = stage_last_phase;
   }
   if (software_hard_count != 1U || previous_scope == nullptr ||
-      scope_granularity(*previous_scope) != plan.containment_granularity ||
-      previous_stage_last_phase + 1U != budget.phases.size() ||
-      std::find(phase_used.begin(), phase_used.end(), false) != phase_used.end()) {
-    fail("resolved Stop plan lacks its exact hard floor, top scope, or phase closure");
+      scope_granularity(*previous_scope) != plan.containment_granularity) {
+    fail("resolved Stop plan lacks its exact hard floor or top scope");
   }
 }
 
@@ -853,8 +782,7 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
                                 CanonicalValue(command.registered_command_kind_id->value()));
   }
   return CanonicalValue(
-      CanonicalValue::Object{{"command_phase_id", CanonicalValue(command.command_phase_id.value())},
-                             {"command", CanonicalValue(std::move(command_fields))}});
+      CanonicalValue::Object{{"command", CanonicalValue(std::move(command_fields))}});
 }
 
 [[nodiscard]] CanonicalValue runtime_target_value(const ResolvedStopRuntimeTargetDTO& target) {
@@ -1005,7 +933,6 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
   }
   CanonicalValue::Object fields{
       {"evidence_item_id", CanonicalValue(requirement.evidence_item_id.value())},
-      {"phase_id", CanonicalValue(requirement.phase_id.value())},
       {"evidence", CanonicalValue(std::move(evidence_fields))},
       {"source_requirement", source_requirement_value(requirement.source_requirement)},
       {"observation_semantics", observation_value(requirement.observation_semantics)}};
@@ -1059,20 +986,6 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] CanonicalValue deadline_value(const StopDeadlineBudgetDTO& budget) {
-  CanonicalValue::Array phases;
-  phases.reserve(budget.phases.size());
-  for (const auto& phase : budget.phases) {
-    phases.emplace_back(
-        CanonicalValue::Object{{"phase_id", CanonicalValue(phase.phase_id.value())},
-                               {"deadline_offset_ns", safe_signed(phase.deadline_offset_ns)}});
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"outer_duration_ns", safe_signed(budget.outer_duration_ns)},
-      {"kernel_completion_reserve_ns", safe_signed(budget.kernel_completion_reserve_ns)},
-      {"phases", CanonicalValue(std::move(phases))}});
-}
-
 [[nodiscard]] CanonicalValue template_value(const ResolvedStopTemplateRefDTO& source) {
   return CanonicalValue(CanonicalValue::Object{
       {"product_id", CanonicalValue(source.product_id.value())},
@@ -1114,7 +1027,6 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
       {"stop_evidence_policy_revision", CanonicalValue(plan.stop_evidence_policy_revision.value())},
       {"containment_granularity",
        CanonicalValue(std::string(to_string(plan.containment_granularity)))},
-      {"deadline_budget", deadline_value(plan.deadline_budget)},
       {"escalation_stages", CanonicalValue(std::move(stages))}};
   if (include_own_id) {
     fields.emplace_back("resolved_stop_base_plan_id",

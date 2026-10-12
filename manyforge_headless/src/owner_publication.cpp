@@ -216,7 +216,7 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
           ? CanonicalValue(std::string(
                 component_manager::ToString(*value.command_surface_state())))
           : CanonicalValue(nullptr);
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"command_surface_state", optional_surface},
       {"converged", CanonicalValue(value.converged())},
       {"critical_progress_sequence",
@@ -254,7 +254,19 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
       {"observed_runtime_contract_offer_digest",
        RuntimeContractOfferDigest(
            value.observed_runtime_contract_offer_digest())},
-  });
+  };
+  if (value.dropped_host_notice_lines()) {
+    const auto count_value = [](const std::uint64_t count) {
+      return count <= kMaximumSafeInteger
+                 ? Unsigned(count, "host notice drop counter")
+                 : CanonicalValue(std::to_string(count));
+    };
+    fields.emplace_back("dropped_host_notice_lines",
+                        count_value(*value.dropped_host_notice_lines()));
+    fields.emplace_back("dropped_host_notice_bytes",
+                        count_value(*value.dropped_host_notice_bytes()));
+  }
+  return CanonicalValue(std::move(fields));
 }
 
 CanonicalValue

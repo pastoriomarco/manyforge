@@ -696,7 +696,7 @@ bool BrandLifecycleObservationDTO::locally_valid() const noexcept {
       source_sequence == 0U || observation_generation == 0U || source_timestamp_ns < 0 ||
       received_timestamp_ns < 0 || fresh_until_ns < 0 ||
       source_timestamp_ns > received_timestamp_ns || received_timestamp_ns >= fresh_until_ns ||
-      !known(observed_state) || facts.size() > kMaxLifecycleFacts) {
+      !known(observed_state) || facts.size() > kMaxLifecycleFacts || !error_valid(diagnostic)) {
     return false;
   }
   const auto less = [](const LifecycleFactDTO& left, const LifecycleFactDTO& right) {

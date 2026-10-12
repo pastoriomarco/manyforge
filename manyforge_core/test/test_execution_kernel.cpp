@@ -16,13 +16,16 @@
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
+#include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/controller_lifecycle.hpp>
@@ -2859,7 +2862,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewUsesExplicitStartAndDoesNotDispatchOrMu
       {ResourceId("joint.1"), AngularVelocityDTO{0.02}},
       {ResourceId("joint.2"), AngularVelocityDTO{0.02}}};
   auto stop = MakePreparedParticipantStopPlan(
-      readiness.value().value(),
+      readiness.value().value().resolved_stop_base_plan,
       PreparedParticipantStopPlanContextDTO{
           resolved.operation_id, revision, resolved.participant_id, sealed.program_id,
           sealed.program_revision, sealed.program_binding_id, resolved.program_run_id,
@@ -8444,6 +8447,1021 @@ TEST_F(ExecutionKernelTest, CancelBeforeDispatchIsReportedAsItsOwnFact) {
   ASSERT_NE(settled, events.end());
   EXPECT_EQ(settled->participant_fact->kind, ParticipantExecutionFactKind::kCancelledBeforeDispatch);
   EXPECT_EQ(settled->execution_id, prepared.value());
+}
+
+
+// =============================================================================
+// Core robot participant over IExecutionPort, driven by the real participant
+// Kernel (shared execution design §4.1, §7.4). The fake port scripts every
+// controller fact; the participant's waiter is the tick that advances fake
+// time, so the Kernel worker's own timing runs deterministically.
+// =============================================================================
+
+class PortParticipantKernelTest : public ExecutionKernelTest {
+ protected:
+  void SetUp() override {
+    ExecutionKernelTest::SetUp();
+    ExecutionLaneFactsDTO facts;
+    facts.joint_names = {"joint_1", "joint_2"};
+    facts.supports_scale = true;
+    facts.has_measured_velocity = true;
+    facts.state_rate_hz = 100.0;
+    facts.feedback_rate_hz = 10.0;
+    facts.controller_update_rate_hz = 100.0;
+    port->SetLaneFacts(facts);
+    // The observed start state on the binding's compiled joint names.
+    context.current_state_value.joint_names = {"joint_1", "joint_2"};
+  }
+
+  void TearDown() override {
+    if (pkernel) {
+      {
+        std::lock_guard lock(hook_mutex);
+        tick = nullptr;
+      }
+      // Let a motion still on the fake controller end so the worker exits.
+      for (const auto& command : port->commands()) {
+        if (const auto* submit = std::get_if<testing::FakeExecutionPort::SubmitCall>(&command)) {
+          const auto goal = port->ReadGoal(submit->key);
+          if (goal && goal->phase != ExecutionGoalPhase::kTerminal) {
+            port->FinishGoal(submit->key, ExecutionGoalResult::kCanceled, std::nullopt,
+                             pclock.now());
+          }
+        }
+      }
+      (void)pkernel->wait_for_completion(2'000'000'000);
+    }
+    pkernel.reset();
+    participant.reset();
+  }
+
+  /// A fresh controller (fake port) and participant for the next case.
+  void Reset() {
+    TearDown();
+    auto facts = port->ReadLaneFacts();
+    port = std::make_shared<testing::FakeExecutionPort>();
+    port->SetLaneFacts(facts);
+    receipts = 0U;
+    ticks = 0;
+  }
+
+  /// The fixture request on the binding's compiled joint names (the port's
+  /// lane joint order), as a production planner returns them.
+  static ExecuteRequestDTO PortRequest(const std::string& move_id) {
+    auto request = make_test_request(move_id);
+    request.binding.model_group_binding.compiled_joint_names = {"joint_1", "joint_2"};
+    return request;
+  }
+
+  ExecutionPortParticipantConfig Config(StateAuthorityClass authority) {
+    ExecutionPortParticipantConfig config;
+    config.stop.trip_authority = authority;
+    config.stop.stop_traj_delta_s = 0.05;
+    config.stop.sample_period_s = 0.01;
+    config.stop.replacement_start_allowance_s = 0.02;
+    config.stop.max_deceleration_on_cancel_rad_s2 = {{"joint_1", 4.0}, {"joint_2", 4.0}};
+    config.stop.hard_stop_completion_timeout_ns = 1'000'000'000;
+    if (authority == StateAuthorityClass::kMeasured) {
+      config.progress_freshness_budget_ns = 100'000'000;
+      config.final_tolerance_rad = 0.01;
+      config.start_tolerance_rad = 0.01;
+      config.completion_state_timeout_ns = 500'000'000;
+    }
+    config.late_cycle_margin_s = 0.015;
+    config.initial_speed_factor = 1.0;
+    return config;
+  }
+
+  void Build(ExecutionPortParticipantConfig config) {
+    participant = std::make_unique<ExecutionPortParticipant>(
+        prepared_motion_binding(prepared_motion_stop_base_plan()), port, pclock, pscheduler,
+        [this](TimePoint, const std::stop_token&) {
+          {
+            std::lock_guard lock(hook_mutex);
+            ++ticks;
+            if (tick) tick();
+          }
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+        },
+        ExecutionPortParticipantStateAuthority{&publication, [] { return Result<void>::Ok(); }},
+        std::move(config));
+    pkernel = std::make_unique<ExecutionKernel>(planner, context, *participant, pclock,
+                                                pscheduler, pcache);
+    configure_authoritative_collision_validation(*pkernel, collision_world_publisher,
+                                                 collision_engine);
+    planner.next_result.trajectory = PortTrajectory();
+  }
+
+  /// Both joints 0 -> 2 rad over 4 path seconds, complete P/V/A, at rest at
+  /// both ends (a prepared trajectory with runtime-scale bounds).
+  static TrajectoryDTO PortTrajectory() {
+    TrajectoryDTO trajectory;
+    trajectory.resources = {ResourceId("joint.1"), ResourceId("joint.2")};
+    trajectory.joint_names = {"joint_1", "joint_2"};
+    for (int index = 0; index <= 16; ++index) {
+      const double t = 0.25 * index;
+      const double v = index == 0 || index == 16 ? 0.0 : 0.5;
+      trajectory.waypoints.push_back({t, {0.5 * t, 0.5 * t}, {v, v}, {0.0, 0.0}});
+    }
+    trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0};
+    return trajectory;
+  }
+
+  std::optional<ExecutionGoalKey> SubmittedKey() const {
+    for (const auto& command : port->commands()) {
+      if (const auto* submit = std::get_if<testing::FakeExecutionPort::SubmitCall>(&command)) {
+        return submit->key;
+      }
+    }
+    return std::nullopt;
+  }
+
+  template <typename Call>
+  std::vector<Call> Calls() const {
+    std::vector<Call> calls;
+    for (const auto& command : port->commands()) {
+      if (const auto* call = std::get_if<Call>(&command)) calls.push_back(*call);
+    }
+    return calls;
+  }
+
+  void Executing(const ExecutionGoalKey& key) {
+    ExecutionGoalObservationDTO goal;
+    goal.key = key;
+    goal.binding_epoch = port->ReadReadiness().binding_epoch;
+    goal.phase = ExecutionGoalPhase::kExecuting;
+    goal.mechanism_goal_id = MechanismGoalId("uuid-" + std::to_string(
+                                                           key.controller_goal_generation.value()));
+    ExecutionGoalFeedbackDTO feedback;
+    feedback.source_stamp_ns = pclock.now() - 1;
+    feedback.local_receipt_stamp_ns = pclock.now() - 1;
+    goal.latest_feedback = feedback;
+    port->SetGoal(goal);
+  }
+
+  /// The newest replacement's final position (the level-3 brake's end).
+  double BrakeEnd() const {
+    const auto replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    return replaces.back().trajectory.waypoints.back().positions_rad.front();
+  }
+
+  void Sample(double cursor, double position, double velocity, std::optional<double> factor = 1.0,
+              double error = 0.0, std::optional<double> measured = std::nullopt) {
+    ExecutionControllerSampleDTO sample;
+    sample.source_stamp_ns = pclock.now();
+    sample.local_receipt_stamp_ns = pclock.now();
+    sample.local_receipt_count = ExecutionReceiptCount(++receipts);
+    sample.binding_epoch = port->ReadReadiness().binding_epoch;
+    sample.cursor_s = cursor;
+    sample.applied_factor = factor;
+    sample.reference_positions_rad = {position, position};
+    sample.reference_velocities_rad_s = {velocity, velocity};
+    sample.reference_accelerations_rad_s2 = {0.0, 0.0};
+    sample.command_positions_rad = {position, position};
+    sample.measured_positions_rad = {measured.value_or(position), measured.value_or(position)};
+    sample.measured_velocities_rad_s = std::vector<double>{velocity, velocity};
+    sample.error_positions_rad = {error, 0.0};
+    port->SetSample(sample);
+  }
+
+  ResolvedParticipantStopStageDTO StageFor(std::uint64_t execution_id, std::size_t index) const {
+    const auto observed = pkernel->ObservePreparedMotion(execution_id);
+    if (!observed.ok() || !observed.value().last_dispatched_participant) {
+      throw std::logic_error("no dispatched participant");
+    }
+    const auto& participant = *observed.value().last_dispatched_participant;
+    const auto key = SubmittedKey().value();
+    return ResolvedParticipantStopStageDTO{StopId("stop.port"),
+                                           StopGeneration(1U),
+                                           participant.operation_id,
+                                           participant.operation_revision,
+                                           participant.participant_id,
+                                           key.controller_goal_id,
+                                           key.controller_goal_generation,
+                                           participant.controllable_component_id,
+                                           participant.command_target_id,
+                                           participant.capability_id,
+                                           participant.control_domain_id,
+                                           participant.control_domain_revision,
+                                           participant.control_binding_id,
+                                           participant.control_binding_revision,
+                                           participant.active_control_configuration_id,
+                                           participant.active_control_configuration_generation,
+                                           participant.controller_topology_id,
+                                           participant.topology_revision,
+                                           participant.control_route_id,
+                                           std::nullopt,
+                                           std::nullopt,
+                                           participant.control_provider.runtime_epoch,
+                                           participant.resources,
+                                           ContainmentGranularity::kResource,
+                                           participant.stop_evidence_policy_id,
+                                           participant.stop_evidence_policy_revision,
+                                           participant.ordinary_stop_plan,
+                                           index,
+                                           ContentDigest("scope.digest")};
+  }
+
+  /// Q51: the stage's own Stop-time values at the Stop request: a controlled
+  /// command carries its own profile deadline, nothing else is shared.
+  static RemainingStopBudgetDTO BudgetFor(const ResolvedParticipantStopStageDTO& stage) {
+    RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, 0, std::nullopt};
+    const auto& command = stage.participant_stop_plan.stage_commands.at(stage.stage_index);
+    if (command.resolved_stage.containment_command.command_kind ==
+            StopContainmentCommandKind::kMotionControlledStop &&
+        command.validated_contract_parameters.has_value()) {
+      budget.remaining_controlled_deadline_ns =
+          controlled_stop_deadline_from_contract_parameters(*command.validated_contract_parameters);
+    }
+    return budget;
+  }
+
+  /// Dispatch one motion and wait until the controller goal was submitted.
+  Result<std::uint64_t> Start(ExecuteRequestDTO request) {
+    auto accepted = prepare_and_dispatch(*pkernel, std::move(request));
+    if (accepted.ok()) {
+      for (int attempt = 0; attempt < 2000 && !SubmittedKey(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    return accepted;
+  }
+
+  std::string Reason() const {
+    auto error = pkernel->get_execution_snapshot().error;
+    if (!error.has_value() && pkernel->get_status().fact.has_value()) {
+      error = pkernel->get_status().fact->error;
+    }
+    if (!error.has_value()) return "none";
+    auto found = error->details.find("reason_code");
+    if (found == error->details.end()) found = error->details.find("reason");
+    return found == error->details.end() ? error->code : found->second;
+  }
+
+  std::shared_ptr<testing::FakeExecutionPort> port =
+      std::make_shared<testing::FakeExecutionPort>();
+  FakeClock pclock;
+  ThreadSafeManualScheduler pscheduler;
+  TrajectoryCache pcache{CacheConfig{10}};
+  ObservedRobotStatePublication publication{
+      {"joint_1", "joint_2"},
+      {ObservedRobotStateSourceConfig{ObservedRobotStateSourceKind::kJointState,
+                                      "fixture_port_state",
+                                      ObservedRobotStateAuthorityProfile::kMeasured,
+                                      1'000'000'000}}};
+  std::mutex hook_mutex;
+  std::function<void()> tick;
+  std::atomic<int> ticks{0};
+  std::atomic<std::uint64_t> receipts{0U};
+  std::unique_ptr<ExecutionPortParticipant> participant;
+  std::unique_ptr<ExecutionKernel> pkernel;
+};
+
+TEST_F(PortParticipantKernelTest, ExecutesWithCompletePathTimeTrajectoryCursorAndCompletion) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::optional<ExecutionState> state_before_first_fact;
+  double progress_at_half = -1.0;
+  std::int64_t cursor_at_half_ns = -1;
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) {
+      // Item 10: Executing is published at dispatch, before any controller fact.
+      state_before_first_fact = participant->get_execution_snapshot().state;
+      Executing(*key);
+    }
+    pclock.advance(250'000'000);
+    const double cursor = std::min(4.0, 0.25 * step);
+    Sample(cursor, 0.5 * cursor, 0.5);
+    if (step == 9) {
+      progress_at_half = participant->get_execution_snapshot().progress;
+      cursor_at_half_ns = participant->execution_progress_publication()->acquire().trajectory_time_ns;
+    }
+    if (step == 17) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  const auto accepted = Start(PortRequest("port_complete"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+  EXPECT_EQ(state_before_first_fact, ExecutionState::kExecuting);
+  const auto submits = Calls<testing::FakeExecutionPort::SubmitCall>();
+  ASSERT_EQ(submits.size(), 1U);
+  const auto planned = PortTrajectory();
+  ASSERT_EQ(submits.front().trajectory.waypoints.size(), planned.waypoints.size());
+  for (std::size_t index = 0U; index < planned.waypoints.size(); ++index) {
+    const auto& sent = submits.front().trajectory.waypoints[index];
+    EXPECT_EQ(sent.time_from_start_s, planned.waypoints[index].time_from_start_s);
+    EXPECT_EQ(sent.positions_rad, planned.waypoints[index].positions_rad);
+    EXPECT_EQ(sent.velocities_rad_s, planned.waypoints[index].velocities_rad_s);
+    EXPECT_EQ(sent.accelerations_rad_s2, planned.waypoints[index].accelerations_rad_s2);
+  }
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+  // Progress is the controller's own cursor (§3.3), no second clock.
+  EXPECT_DOUBLE_EQ(progress_at_half, 2.0 / 4.0);
+  EXPECT_EQ(cursor_at_half_ns, 2'000'000'000);
+  // Natural completion retains the original path's end for continuation.
+  const auto observed = pkernel->ObservePreparedMotion(accepted.value());
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(observed.value().stopped_trajectory_time_s, 4.0);
+  // Commanded authority (item 20): the commanded end state, no measured check.
+  EXPECT_EQ(participant->get_execution_snapshot().joint_positions_rad,
+            (std::vector<double>{2.0, 2.0}));
+}
+
+TEST_F(PortParticipantKernelTest, MeasuredDispatchChecksTheStartStateBeforeTheGoalIsSent) {
+  // `main`'s observed-robot dispatch: a fresh complete measured sample within
+  // the start tolerance of the first waypoint, else no goal is sent.
+  struct Case {
+    std::optional<double> start_measured;
+    std::string expected;
+    std::string reason;
+  };
+  for (const auto& test : {Case{0.005, "completed", "none"},
+                           Case{0.05, "failed", "start_state_mismatch"},
+                           Case{std::nullopt, "failed", "stale_controller_state"}}) {
+    SCOPED_TRACE(test.reason);
+    Reset();
+    Build(Config(StateAuthorityClass::kMeasured));
+    std::atomic<int> step{0};
+    tick = [&] {
+      pclock.advance(100'000'000);
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      if (step == 1) Executing(*key);
+      if (step < 3) {
+        Sample(0.2 * step, 0.1 * step, 0.5);
+      } else if (step == 3) {
+        port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      } else {
+        Sample(4.0, 2.0, 0.0);
+      }
+    };
+    if (test.start_measured) Sample(0.0, 0.0, 0.0, 1.0, 0.0, test.start_measured);
+    ASSERT_TRUE(prepare_and_dispatch(*pkernel, PortRequest("port_start_state")).ok());
+    ASSERT_TRUE(wait_for_ended(*pkernel, test.expected)) << ended_as(*pkernel) << " " << Reason();
+    EXPECT_EQ(Reason(), test.reason);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(),
+              test.reason == "none" ? 1U : 0U);
+    if (test.reason == "start_state_mismatch") {
+      const auto error = pkernel->get_execution_snapshot().error;
+      ASSERT_TRUE(error.has_value());
+      EXPECT_EQ(error->code, "start_state_mismatch");
+      EXPECT_EQ(error->details.at("start_tolerance_rad"), "0.010000");
+      EXPECT_EQ(error->details.at("max_joint_error_rad"), "0.050000");
+    }
+  }
+}
+
+TEST_F(PortParticipantKernelTest, CommandedDispatchHasNoMeasuredStartStateCheck) {
+  // As `main`'s commanded simulation: the commanded state is the start.
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    pclock.advance(250'000'000);
+    if (step == 1) Executing(*key);
+    if (step < 17) Sample(0.25 * step, 0.125 * step, 0.5);
+    if (step == 17) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  // No sample at all before dispatch, and the measured position far away.
+  ASSERT_TRUE(Start(PortRequest("port_commanded_start")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+}
+
+TEST_F(PortParticipantKernelTest, SampleReceivedBetweenTheClockAndSampleReadsIsNotStale) {
+  // Stage F run 9: a controller_state receipt stamped on the participant's own
+  // monotonic clock just after Evaluate read `now` failed the in-motion
+  // maximum age check (stale_controller_state, sample_age_s=-0.000001). Here
+  // every new sample's receipt lands 1 us after the reader's clock read.
+  auto config = Config(StateAuthorityClass::kCommanded);
+  config.stop.controller_state_max_age_ns = 250'000'000;
+  Build(std::move(config));
+  port->SetOnReadSample(
+      [this, last = std::uint64_t{0}](std::optional<ExecutionControllerSampleDTO>& sample) mutable {
+        if (!sample || sample->local_receipt_count.value() == last) return;
+        last = sample->local_receipt_count.value();
+        pclock.advance(1'000);
+        sample->local_receipt_stamp_ns = pclock.now();
+      });
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    pclock.advance(10'000'000);
+    if (step == 1) Executing(*key);
+    if (step < 17) Sample(0.25 * step, 0.125 * step, 0.5);
+    if (step == 17) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  Sample(0.0, 0.0, 0.0);
+  ASSERT_TRUE(Start(PortRequest("port_receipt_between_reads")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+  EXPECT_EQ(Reason(), "none");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+  port->SetOnReadSample(nullptr);
+}
+
+TEST_F(PortParticipantKernelTest, MeasuredAuthorityRequiresTheStartTolerance) {
+  auto config = Config(StateAuthorityClass::kMeasured);
+  config.start_tolerance_rad.reset();
+  EXPECT_THROW(Build(std::move(config)), std::invalid_argument);
+  auto negative = Config(StateAuthorityClass::kMeasured);
+  negative.start_tolerance_rad = -0.01;
+  EXPECT_THROW(Build(std::move(negative)), std::invalid_argument);
+}
+
+TEST_F(PortParticipantKernelTest, MeasuredCompletionChecksTheFinalToleranceAfterTheResult) {
+  struct Case {
+    std::optional<double> final_measured;
+    std::string expected;
+    std::string reason;
+  };
+  for (const auto& test : {Case{2.005, "completed", "none"},
+                           Case{2.05, "failed", "tracking_error_exceeded"},
+                           Case{std::nullopt, "failed", "stale_controller_state"}}) {
+    SCOPED_TRACE(test.reason);
+    Reset();
+    Build(Config(StateAuthorityClass::kMeasured));
+    std::atomic<int> step{0};
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      pclock.advance(100'000'000);
+      if (step == 1) Executing(*key);
+      if (step < 3) {
+        Sample(0.2 * step, 0.1 * step, 0.5);
+      } else if (step == 3) {
+        // The successful result; the measured gate needs a later sample.
+        port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      } else if (test.final_measured) {
+        Sample(4.0, 2.0, 0.0, 1.0, 0.0, test.final_measured);
+      }
+    };
+    Sample(0.0, 0.0, 0.0);  // the measured start state (start-state check)
+    ASSERT_TRUE(Start(PortRequest("port_measured")).ok());
+    ASSERT_TRUE(wait_for_ended(*pkernel, test.expected)) << ended_as(*pkernel) << " " << Reason();
+    EXPECT_EQ(Reason(), test.reason);
+    if (test.reason != "none") {
+      EXPECT_EQ(pkernel->get_execution_snapshot().error->details.at("phase"),
+                "terminal_result_state_gate");
+    }
+  }
+}
+
+TEST_F(PortParticipantKernelTest, TrackingBreachCancelsTheGoalAndFailsAsMain) {
+  for (const bool tracked : {true, false}) {
+    SCOPED_TRACE(tracked ? "isaac/real lane" : "offline lane");
+    Reset();
+    auto config = Config(StateAuthorityClass::kCommanded);
+    if (tracked) config.tracking = ExecutionTrackingPolicy{0.05, 0.2};
+    Build(config);
+    std::atomic<int> step{0};
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      pclock.advance(100'000'000);
+      if (step == 1) Executing(*key);
+      Sample(0.1 * step, 0.05 * step, 0.5, 1.0, step >= 2 ? 0.1 : 0.0);
+      if (!tracked && step == 8) {
+        port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      }
+      const auto cancels = Calls<testing::FakeExecutionPort::CancelCall>();
+      if (!cancels.empty()) {
+        port->FinishGoal(*key, ExecutionGoalResult::kCanceled, std::nullopt, pclock.now());
+      }
+    };
+    ASSERT_TRUE(Start(PortRequest("port_tracking")).ok());
+    if (tracked) {
+      ASSERT_TRUE(wait_for_ended(*pkernel, "failed")) << ended_as(*pkernel);
+      EXPECT_EQ(Reason(), "tracking_error_exceeded");
+      const auto details = pkernel->get_execution_snapshot().error->details;
+      std::string dump;
+      for (const auto& [key, value] : details) dump += key + "=" + value + " ";
+      ASSERT_TRUE(details.contains("joint_name")) << dump;
+      EXPECT_EQ(details.at("joint_name"), "joint_1");
+      EXPECT_EQ(details.at("tracking_error_tolerance_rad"), std::to_string(0.05));
+      EXPECT_EQ(Calls<testing::FakeExecutionPort::CancelCall>().size(), 1U);
+    } else {
+      // Offline: no feedback, no check (item 13).
+      ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+      EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+    }
+  }
+}
+
+TEST_F(PortParticipantKernelTest, ControllerResultsAndBindingLossMapAsMain) {
+  struct Case {
+    std::optional<ExecutionGoalResult> result;
+    std::string reason;
+  };
+  for (const auto& test :
+       {Case{ExecutionGoalResult::kAbortedGoalTolerance, "controller_result_failed"},
+        Case{ExecutionGoalResult::kAbortedPathTolerance, "controller_result_failed"},
+        Case{ExecutionGoalResult::kCanceled, "backend_stopped_without_addressed_stop"},
+        Case{std::nullopt, "controller_binding_lost"}}) {
+    SCOPED_TRACE(test.reason);
+    Reset();
+    Build(Config(StateAuthorityClass::kCommanded));
+    std::atomic<int> step{0};
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      if (step == 1) Executing(*key);
+      if (step != 3) return;
+      if (test.result) {
+        port->FinishGoal(*key, *test.result, std::nullopt, pclock.now());
+      } else {
+        port->SetReadiness({false, true, true, ExecutionBindingEpoch(1U)});
+      }
+    };
+    ASSERT_TRUE(Start(PortRequest("port_result")).ok());
+    ASSERT_TRUE(wait_for_ended(*pkernel, "failed")) << ended_as(*pkernel);
+    const auto error = pkernel->get_execution_snapshot().error;
+    ASSERT_TRUE(error.has_value());
+    const auto reason = error->details.contains("reason_code") ? error->details.at("reason_code")
+                                                               : error->details.at("reason");
+    EXPECT_EQ(reason, test.reason);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::CancelCall>().size(),
+              test.result.has_value() ? 0U : 1U);
+  }
+}
+
+TEST_F(PortParticipantKernelTest, ExecutionTimeoutRunsOnTheAppliedFactorFromSamples) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    pclock.advance(1'000'000'000);
+    // Item 40: elapsed x applied factor (0.5) -> 2 s of budget per 4 s.
+    Sample(0.5 * step, 0.25 * step, 0.5, 0.5);
+    if (!Calls<testing::FakeExecutionPort::CancelCall>().empty()) {
+      port->FinishGoal(*key, ExecutionGoalResult::kCanceled, std::nullopt, pclock.now());
+    }
+  };
+  auto request = PortRequest("port_timeout");
+  request.timeouts.execution_timeout_s = 2.0;
+  ASSERT_TRUE(Start(request).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "failed")) << ended_as(*pkernel);
+  const auto error = pkernel->get_execution_snapshot().error;
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->code, kErrorExecutionTimeout);
+  // The hard-stop primitive is `main`'s goal cancel.
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::CancelCall>().size(), 1U);
+  EXPECT_GE(step, 4);
+  EXPECT_LE(step, 6);
+}
+
+TEST_F(PortParticipantKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStop) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::mutex events_mu;
+  std::vector<KernelEvent> stop_requests;
+  pkernel->subscribe_events([&](const KernelEvent& event) {
+    if (event.type != KernelEventType::kStopRequested) return;
+    std::lock_guard lock(events_mu);
+    stop_requests.push_back(event);
+  });
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    pclock.advance(1'000'000'000);
+    Sample(1.0, 0.5, 0.0, step >= 6 ? 1.0 : 0.0);  // the slider holds at zero
+    if (step >= 8) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  auto request = PortRequest("port_zero_hold");
+  request.timeouts.execution_timeout_s = 5.0;
+  request.timeouts.zero_speed_hold_timeout_s = 3.0;
+  ASSERT_TRUE(Start(request).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+  std::lock_guard lock(events_mu);
+  ASSERT_EQ(stop_requests.size(), 1U);
+  EXPECT_EQ(stop_requests.front().details.at("reason"), "zero_speed_hold_timeout");
+}
+
+TEST_F(PortParticipantKernelTest, SpeedRampSlewsLinearlyOneValuePerTickAndReadsTheAppliedFactorBack) {
+  // Item 28 / Q11: linear slew at the trajectory's max_rate_per_s (at most
+  // 4/s), one value per controller-rate tick; no rate-change limit applies.
+  struct Case {
+    double max_rate_per_s;
+    double max_rate_change_per_s2;
+    double step;
+  };
+  for (const auto& test : {Case{4.0, 16.0, 0.04}, Case{2.0, 0.5, 0.02}, Case{8.0, 1.0, 0.04}}) {
+    SCOPED_TRACE(test.max_rate_per_s);
+    Reset();
+    Build(Config(StateAuthorityClass::kCommanded));
+    auto trajectory = PortTrajectory();
+    trajectory.runtime_scale_bounds =
+        TrajectoryRuntimeScaleBoundsDTO{test.max_rate_per_s, test.max_rate_change_per_s2};
+    planner.next_result.trajectory = trajectory;
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      Executing(*key);
+      Sample(0.5, 0.25, 0.5, 0.75);
+    };
+    ASSERT_TRUE(Start(PortRequest("port_ramp")).ok());
+    for (int attempt = 0; attempt < 2000 && receipts == 0U; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    participant->set_runtime_velocity_scale(0.5);
+    for (int step = 0; step < 100; ++step) {
+      pclock.advance(10'000'000);
+      pscheduler.advance_to(pclock.now());
+    }
+    const auto scales = Calls<testing::FakeExecutionPort::SetScaleCall>();
+    ASSERT_GE(scales.size(), 2U);
+    double previous = 1.0;
+    for (std::size_t index = 0U; index + 1U < scales.size(); ++index) {
+      EXPECT_NEAR(previous - scales[index].value, test.step, 1e-9) << index;
+      previous = scales[index].value;
+    }
+    EXPECT_NEAR(scales.back().value, 0.5, 1e-12);
+    EXPECT_LE(previous - scales.back().value, test.step + 1e-9);
+    // Published is not applied: the applied factor is the sample's.
+    const auto status = participant->runtime_velocity_scale_status();
+    EXPECT_TRUE(status.supported);
+    EXPECT_DOUBLE_EQ(status.commanded_scale, 0.5);
+    EXPECT_DOUBLE_EQ(status.applied_scale, 0.75);
+    EXPECT_NE(status.acknowledgement_sequence, 0U);
+  }
+}
+
+TEST_F(PortParticipantKernelTest, TimingObservationKeepsLatenessApartFromTelemetryLoss) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    ExecutionTimingDTO timing;
+    timing.binding_epoch = ExecutionBindingEpoch(1U);
+    timing.period_max_s = step == 2 ? 0.014 : 0.01;  // late, within the 15 ms margin
+    timing.max_state_stamp_gap_s = step == 3 ? 0.3 : 0.01;  // telemetry loss
+    timing.received_samples = 1U;
+    port->SetTiming(timing);
+    if (step == 6) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  ASSERT_TRUE(Start(PortRequest("port_timing")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+  const auto metrics = participant->timing_metrics();
+  EXPECT_EQ(metrics.windows_late_beyond_margin, 0U);
+  EXPECT_DOUBLE_EQ(metrics.max_period_s, 0.014);
+  EXPECT_DOUBLE_EQ(metrics.max_state_stamp_gap_s, 0.3);
+  EXPECT_GT(metrics.windows, 0U);
+  // Q50 "measure": the dispatched goal's recognition delay (dispatch to its
+  // own first feedback, local clock).
+  EXPECT_EQ(metrics.goals_recognized, 1U);
+  EXPECT_GE(metrics.last_recognition_delay_ns, 0);
+  EXPECT_EQ(metrics.max_recognition_delay_ns, metrics.last_recognition_delay_ns);
+}
+
+TEST_F(PortParticipantKernelTest, LateControlCycleBeyondTheMarginIsTheItem17Path) {
+  // Q52: a controller cycle later than the lane margin is handled like item
+  // 17: the Kernel issues the lane's hard stop (the goal cancel) and the
+  // motion ends InterventionRequired with `late_control_cycle`.
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    pclock.advance(10'000'000);
+    Sample(0.01 * step, 0.005 * step, 0.5);
+    ExecutionTimingDTO timing;
+    timing.binding_epoch = ExecutionBindingEpoch(1U);
+    timing.period_max_s = step == 3 ? 0.016 : 0.01;  // one cycle beyond the 15 ms margin
+    port->SetTiming(timing);
+  };
+  ASSERT_TRUE(Start(PortRequest("port_late_cycle")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "failed_effect_uncertain")) << ended_as(*pkernel);
+  const auto status = pkernel->get_status();
+  ASSERT_TRUE(status.fact.has_value() && status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->details.at("reason"), "late_control_cycle");
+  EXPECT_EQ(status.fact->error->details.at("late_cycle_margin_s"), std::to_string(0.015));
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::CancelCall>().size(), 1U);
+  EXPECT_EQ(participant->get_execution_snapshot().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(participant->timing_metrics().windows_late_beyond_margin, 1U);
+}
+
+TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultIsTheItem17Path) {
+  // Item 44 / Q41: the host reports the Isaac guard trip before switching the
+  // controller off; the in-flight motion ends InterventionRequired through
+  // the Kernel's hard stop, not as a controller-binding loss.
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    pclock.advance(10'000'000);
+    Sample(0.01 * step, 0.005 * step, 0.5);
+    if (step == 3) {
+      participant->ReportCriticalFault(ErrorDTO{
+          "internal_error", "Isaac command guard tripped", {{"reason", "isaac_guard_tripped"}}});
+      // The controller deactivation the host requests next is observed later.
+      ExecutionReadinessDTO inactive;
+      inactive.binding_epoch = ExecutionBindingEpoch(1U);
+      port->SetReadiness(inactive);
+    }
+  };
+  ASSERT_TRUE(Start(PortRequest("port_guard_trip")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "failed_effect_uncertain")) << ended_as(*pkernel);
+  const auto status = pkernel->get_status();
+  ASSERT_TRUE(status.fact.has_value() && status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->details.at("reason"), "isaac_guard_tripped");
+  EXPECT_EQ(participant->get_execution_snapshot().state, ExecutionState::kInterventionRequired);
+  EXPECT_FALSE(participant->GoalInFlight() &&
+               participant->get_execution_snapshot().state == ExecutionState::kExecuting);
+  // Without motion in flight a report changes nothing.
+  participant->ReportCriticalFault(ErrorDTO{"internal_error", "late", {}});
+  EXPECT_EQ(participant->get_execution_snapshot().error->details.at("reason"),
+            "isaac_guard_tripped");
+}
+
+TEST_F(PortParticipantKernelTest, SoftStopUnderTheAddressedFenceEndsTheExecutionStopped) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<bool> stopping{false};
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    if (!stopping) {
+      ++step;
+      if (step == 1) Executing(*key);
+      Sample(1.0, 0.5, 0.5);
+      return;
+    }
+    const auto replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    if (replaces.empty()) return;
+    const auto next = replaces.back().next_key;
+    const auto goal = port->ReadGoal(next);
+    if (goal && goal->phase == ExecutionGoalPhase::kPending) {
+      Executing(next);
+      port->FinishGoal(*key, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+      Sample(0.01, 0.51, 0.3);
+    } else if (goal && goal->phase != ExecutionGoalPhase::kTerminal) {
+      pclock.advance(10'000'000);
+      port->FinishGoal(next, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      pclock.advance(1);
+      Sample(0.0, 0.6, 0.0);
+    } else {
+      pclock.advance(1);
+      Sample(0.0, 0.6, 0.0);
+    }
+  };
+  const auto accepted = Start(PortRequest("port_soft_stop"));
+  ASSERT_TRUE(accepted.ok());
+  for (int attempt = 0; attempt < 2000 && step < 3; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto stage = StageFor(accepted.value(), 0U);
+  stopping = true;
+  const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->details.at("reason") : "");
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
+  ASSERT_EQ(Calls<testing::FakeExecutionPort::ReplaceCall>().size(), 1U);
+  ASSERT_TRUE(wait_for_ended(*pkernel, "preempted_by_addressed_stop")) << ended_as(*pkernel);
+  EXPECT_EQ(participant->get_execution_snapshot().state, ExecutionState::kStopped);
+  // §3.3: the soft Stop's end on the original path, mapped by the planner,
+  // is retained for continuation (ahead of the 1.0 s trip cursor).
+  const auto observed = pkernel->ObservePreparedMotion(accepted.value());
+  ASSERT_TRUE(observed.ok());
+  ASSERT_TRUE(observed.value().stopped_trajectory_time_s.has_value());
+  EXPECT_GT(*observed.value().stopped_trajectory_time_s, 1.0);
+  EXPECT_LE(*observed.value().stopped_trajectory_time_s, 4.0);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+}
+
+TEST_F(PortParticipantKernelTest, HardStopStageUnderTheFenceBrakesThroughTheHelper) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<bool> stopping{false};
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    if (!stopping) {
+      ++step;
+      if (step == 1) Executing(*key);
+      Sample(1.0, 0.5, 0.5);
+      return;
+    }
+    const auto replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    if (replaces.empty()) return;
+    const auto next = replaces.back().next_key;
+    const auto goal = port->ReadGoal(next);
+    pclock.advance(5'000'000);
+    if (goal && goal->phase == ExecutionGoalPhase::kPending) {
+      Executing(next);
+      port->FinishGoal(*key, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+      Sample(0.004, 0.55, 0.2);  // the brake's own reference, never zero
+    } else if (goal && goal->phase != ExecutionGoalPhase::kTerminal) {
+      port->FinishGoal(next, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    } else {
+      Sample(0.0, BrakeEnd(), 0.0);  // JTC success hold at the brake's end
+    }
+  };
+  const auto accepted = Start(PortRequest("port_hard_stop"));
+  ASSERT_TRUE(accepted.ok());
+  for (int attempt = 0; attempt < 2000 && step < 3; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto stage = StageFor(accepted.value(), 1U);
+  stopping = true;
+  const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->details.at("reason") : "");
+  const auto& evidence = std::get<JsonObjectDTO>(result.evidence_items.front().evidence->value);
+  EXPECT_EQ(std::get<std::string>(evidence.at("hard_stop_level").value), "controlled_hard_stop");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "preempted_by_addressed_stop")) << ended_as(*pkernel);
+}
+
+TEST_F(PortParticipantKernelTest, RebindingTakesANewPortForTheNewEpochOnlyWhenQuiescent) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    if (step == 4) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  const auto first = Start(PortRequest("port_epoch_1"));
+  ASSERT_TRUE(first.ok());
+  auto next_port = std::make_shared<testing::FakeExecutionPort>();
+  next_port->SetLaneFacts(port->ReadLaneFacts());
+  next_port->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  if (ended_as(*pkernel) != "completed") {
+    const auto busy = participant->RebindPort(next_port);
+    ASSERT_FALSE(busy.ok());
+    EXPECT_EQ(busy.error().details.at("reason"), "execution_port_rebind_busy");
+  }
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+  ASSERT_TRUE(pkernel->acknowledge_completed(first.value()).accepted);
+  ASSERT_TRUE(participant->RebindPort(next_port).ok());
+
+  // The next motion runs on the new epoch's port; the old port sees nothing.
+  const auto old_commands = port->commands().size();
+  const auto old_port = port;
+  {
+    std::lock_guard lock(hook_mutex);
+    port = next_port;
+    step = 0;
+  }
+  ASSERT_TRUE(Start(PortRequest("port_epoch_2")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+  EXPECT_EQ(old_port->commands().size(), old_commands);
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+}
+
+TEST_F(PortParticipantKernelTest, RebindKeepsTheOldPreparedMembershipUntilItsOwnerRetiresIt) {
+  // A new binding epoch's port never receives an old prepared goal: its exact
+  // replay returns the old handle, and once its owner retired it nothing of
+  // it dispatches again.
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    if (step == 3) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  const auto accepted = Start(PortRequest("port_membership"));
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+  const auto observed = pkernel->ObservePreparedMotion(accepted.value());
+  ASSERT_TRUE(observed.ok() && observed.value().last_dispatched_participant);
+  const auto dispatched = *observed.value().last_dispatched_participant;
+  const auto key = SubmittedKey().value();
+
+  auto next_port = std::make_shared<testing::FakeExecutionPort>();
+  next_port->SetLaneFacts(port->ReadLaneFacts());
+  next_port->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  ASSERT_TRUE(participant->RebindPort(next_port).ok());
+  const auto replay =
+      participant->Dispatch(dispatched, key.controller_goal_id, key.controller_goal_generation);
+  EXPECT_NE(replay.execution_generation, 0U);
+  EXPECT_TRUE(next_port->commands().empty());
+
+  ASSERT_TRUE(participant->RetirePreparedExecution(accepted.value()).ok());
+  const auto after = participant->Dispatch(dispatched, ControllerGoalId("goal.after.retire"),
+                                           ControllerGoalGeneration(1U));
+  EXPECT_EQ(after.execution_generation, 0U);
+  EXPECT_EQ(after.get_snapshot().error->details.at("reason"), "prepared_participant_not_admitted");
+  EXPECT_TRUE(next_port->commands().empty());
+}
+
+TEST_F(PortParticipantKernelTest, PrepareRequiresTheTrajectorysScaleBoundsAndDispatchIsReplaySafe) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  auto unbounded = PortTrajectory();
+  unbounded.runtime_scale_bounds.reset();
+  planner.next_result.trajectory = unbounded;
+  (void)prepare_and_dispatch(*pkernel, PortRequest("port_unbounded"));
+  ASSERT_TRUE(wait_for_ended(*pkernel, "failed")) << ended_as(*pkernel);
+  const auto status = pkernel->get_status();
+  ASSERT_TRUE(status.fact.has_value() && status.fact->error.has_value());
+  EXPECT_EQ(status.fact->error->details.at("reason"), "prepared_runtime_scale_bounds_missing");
+  EXPECT_EQ(status.fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_TRUE(port->commands().empty());
+}
+
+
+TEST_F(PortParticipantKernelTest, DispatchReplayReturnsTheSameHandleAndRefusesAnotherGeneration) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<bool> finish{false};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    Executing(*key);
+    if (finish) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  };
+  const auto accepted = Start(PortRequest("port_replay"));
+  ASSERT_TRUE(accepted.ok());
+  const auto observed = pkernel->ObservePreparedMotion(accepted.value());
+  ASSERT_TRUE(observed.ok() && observed.value().last_dispatched_participant);
+  const auto& dispatched = *observed.value().last_dispatched_participant;
+  const auto key = SubmittedKey().value();
+  // Exact repetition: the same goal-bound handle, no second goal.
+  const auto again = participant->Dispatch(dispatched, key.controller_goal_id,
+                                           key.controller_goal_generation);
+  EXPECT_NE(again.execution_generation, 0U);
+  EXPECT_FALSE(prepared_execution_handle_field_error(again, dispatched, key.controller_goal_id,
+                                                     key.controller_goal_generation)
+                   .has_value());
+  // Another generation of the same goal is a conflict, refused before effect.
+  const auto conflict = participant->Dispatch(
+      dispatched, key.controller_goal_id,
+      ControllerGoalGeneration(key.controller_goal_generation.value() + 1U));
+  EXPECT_EQ(conflict.execution_generation, 0U);
+  EXPECT_EQ(conflict.get_snapshot().error->details.at("reason"),
+            "controller_goal_identity_conflict");
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+  finish = true;
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+}
+
+TEST_F(PortParticipantKernelTest, StopIntentWinsWhileTheMeasuredCompletionGateIsPending) {
+  Build(Config(StateAuthorityClass::kMeasured));
+  std::atomic<bool> stopping{false};
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) {
+      Executing(*key);
+      Sample(3.9, 1.95, 0.1);
+    } else if (step == 2) {
+      // The successful result; the measured gate waits for a later sample.
+      port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    } else if (stopping) {
+      pclock.advance(1'000'000);
+      Sample(4.0, 2.0, 0.0);  // the post-result sample arrives under the Stop
+    }
+  };
+  Sample(0.0, 0.0, 0.0);  // the measured start state (start-state check)
+  const auto accepted = Start(PortRequest("port_gate_stop"));
+  ASSERT_TRUE(accepted.ok());
+  for (int attempt = 0; attempt < 2000 && step < 4; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(ended_as(*pkernel), "working:Executing");
+  ASSERT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto stage = StageFor(accepted.value(), 0U);
+  stopping = true;
+  const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->details.at("reason") : "");
+  // The goal had already completed: natural completion inside the Stop.
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::ReplaceCall>().empty());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "preempted_by_addressed_stop")) << ended_as(*pkernel);
+  const auto observed = pkernel->ObservePreparedMotion(accepted.value());
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(observed.value().stopped_trajectory_time_s, 4.0);
 }
 
 }  // namespace

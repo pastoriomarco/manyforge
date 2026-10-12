@@ -74,21 +74,6 @@ std::string unique_suffix() {
   return std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
-Ros2ControlExecutionBackendConfig base_config() {
-  const std::string suffix = unique_suffix();
-  Ros2ControlExecutionBackendConfig config;
-  config.node_name = "manyforge_backend_test_" + suffix;
-  config.action_name = "/manyforge_backend_test_fjt_" + suffix;
-  config.joint_state_topic = "/manyforge_backend_test_joint_states_" + suffix;
-  config.controller_state_topic.clear();
-  config.required_joints = {"joint_1"};
-  config.wait_for_state_timeout_s = 0.0;
-  config.wait_for_action_server_timeout_s = 0.0;
-  config.monitor_period_s = 0.01;
-  config.enable_jtc_speed_scaling_input = false;
-  return config;
-}
-
 core::GripperCommandRequestDTO
 make_gripper_request(double target_position, double duration_s,
                      double max_effort, std::string transport_kind,
@@ -473,14 +458,12 @@ private:
   SecondAdapter &second_;
 };
 
-std::unique_ptr<Ros2TransportResources>
-test_transport_resources(std::shared_ptr<core::IExecutionStateSink> sink,
-                         core::IClock &clock, const std::string &group,
-                         const Ros2ControlExecutionBackendConfig &config) {
+std::unique_ptr<Ros2TransportResources> test_transport_resources(
+    std::shared_ptr<core::IExecutionStateSink> sink, core::IClock& clock,
+    const std::string& group) {
   // Transport host setup is independent of adapter config validation tests.
-  return std::make_unique<Ros2TransportResources>(
-      "manyforge_transport_test_" + unique_suffix(), "/", 3,
-      config.command_gate_topic, std::move(sink), group, clock);
+  return std::make_unique<Ros2TransportResources>("manyforge_transport_test_" + unique_suffix(),
+                                                  "/", 3, std::move(sink), group, clock);
 }
 } // namespace
 } // namespace manyforge::ros2_control_execution

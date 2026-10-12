@@ -34,8 +34,6 @@ constexpr std::string_view kFullScopeDigest =
       .proposed_stop_id = stop_id,
       .proposed_stop_generation = StopGeneration(generation),
       .accepted_at_ns = 100,
-      .outer_deadline_ns = 1'100,
-      .full_stop_outer_deadline_ns = 1'100,
       .disposition = StopResolutionDispositionDTO::kExact,
       .captured_scope_digest = kScopeDigest,
       .full_stop_scope_digest = kFullScopeDigest,
@@ -51,7 +49,7 @@ TEST(EmergencyStopAcceptanceReserveTest, RejectsInvalidConstructionBounds) {
 }
 
 TEST(EmergencyStopAcceptanceReserveTest,
-     FreshAcceptanceAndExactDuplicateRetainIdentityAndDeadline) {
+     FreshAcceptanceAndExactDuplicateRetainIdentityAndAcceptanceTime) {
   EmergencyStopAcceptanceReserve reserve(2U);
   const auto request = candidate("request.stop.1");
 
@@ -62,7 +60,6 @@ TEST(EmergencyStopAcceptanceReserveTest,
   EXPECT_EQ(fresh.stop_id(), "stop.1");
   EXPECT_EQ(fresh.stop_generation, StopGeneration(1U));
   EXPECT_EQ(fresh.accepted_at_ns, 100);
-  EXPECT_EQ(fresh.outer_deadline_ns, 1'100);
   EXPECT_EQ(fresh.captured_scope_digest(), kScopeDigest);
   EXPECT_EQ(fresh.work_token, (StopControlWorkToken{0U, 1U}));
   EXPECT_EQ(fresh.correlation_slot, 0U);
@@ -73,8 +70,6 @@ TEST(EmergencyStopAcceptanceReserveTest,
   later_proposal.proposed_stop_id = "stop.must.not.replace";
   later_proposal.proposed_stop_generation = StopGeneration(99U);
   later_proposal.accepted_at_ns = 500;
-  later_proposal.outer_deadline_ns = 9'999;
-  later_proposal.full_stop_outer_deadline_ns = 9'999;
   const auto replay = reserve.reserve_or_join(later_proposal);
   ASSERT_TRUE(replay.accepted());
   EXPECT_EQ(replay.replay_status, RequestReplayStatusDTO::kReplayedExact);
@@ -82,7 +77,6 @@ TEST(EmergencyStopAcceptanceReserveTest,
   EXPECT_EQ(replay.stop_id(), fresh.stop_id());
   EXPECT_EQ(replay.stop_generation, fresh.stop_generation);
   EXPECT_EQ(replay.accepted_at_ns, fresh.accepted_at_ns);
-  EXPECT_EQ(replay.outer_deadline_ns, fresh.outer_deadline_ns);
   EXPECT_EQ(replay.work_token, fresh.work_token);
   EXPECT_EQ(replay.correlation_slot, fresh.correlation_slot);
   EXPECT_EQ(reserve.active_correlation_count(), 1U);
@@ -102,13 +96,11 @@ TEST(EmergencyStopAcceptanceReserveTest, StaleExplicitFullStopRetainsItsResolved
   request.proposed_stop_id = "stop.unused";
   request.proposed_stop_generation = StopGeneration(2U);
   request.accepted_at_ns = 200;
-  request.outer_deadline_ns = 2'000;
-  request.full_stop_outer_deadline_ns = 2'000;
   const auto joined = reserve.reserve_or_join(request);
   ASSERT_TRUE(joined.accepted());
   EXPECT_EQ(joined.stop_id(), first.stop_id());
   EXPECT_EQ(joined.work_token, first.work_token);
-  EXPECT_EQ(joined.outer_deadline_ns, first.outer_deadline_ns);
+  EXPECT_EQ(joined.accepted_at_ns, first.accepted_at_ns);
   EXPECT_EQ(joined.disposition, request.disposition);
 }
 
@@ -119,14 +111,12 @@ TEST(EmergencyStopAcceptanceReserveTest, ConflictingResidentIdentityPromotesAndL
   auto conflicting = candidate("request.conflict", "stop.full.2", 2U);
   conflicting.normalized_request_digest = kDifferentRequestDigest;
   conflicting.captured_scope_digest = kOtherScopeDigest;
-  conflicting.full_stop_outer_deadline_ns = 900;
   const auto promoted = reserve.reserve_or_join(conflicting);
   ASSERT_TRUE(promoted.accepted());
   EXPECT_EQ(promoted.replay_status, RequestReplayStatusDTO::kAcceptedNew);
   EXPECT_EQ(promoted.acceptance_path, EmergencyStopAcceptancePathDTO::kCoalescedFull);
   EXPECT_EQ(promoted.disposition, StopResolutionDispositionDTO::kPromotedToFull);
   EXPECT_TRUE(promoted.full_stop);
-  EXPECT_EQ(promoted.outer_deadline_ns, 900);
   EXPECT_EQ(promoted.captured_scope_digest(), kFullScopeDigest);
   EXPECT_TRUE(reserve.full_stop_active());
 
@@ -141,15 +131,13 @@ TEST(EmergencyStopAcceptanceReserveTest, ConflictingResidentIdentityPromotesAndL
   EXPECT_EQ(found->work_token, promoted.work_token);
 }
 
-TEST(EmergencyStopAcceptanceReserveTest, OverlapJoinsResidentWithoutExtendingDeadline) {
+TEST(EmergencyStopAcceptanceReserveTest, OverlapJoinsResidentKeepingItsAcceptanceTime) {
   EmergencyStopAcceptanceReserve reserve(3U);
   const auto first = reserve.reserve_or_join(candidate("request.first"));
   ASSERT_TRUE(first.accepted());
 
   auto overlapping = candidate("request.overlap", "stop.unused", 2U);
   overlapping.accepted_at_ns = 900;
-  overlapping.outer_deadline_ns = 20'000;
-  overlapping.full_stop_outer_deadline_ns = 20'000;
   overlapping.captured_scope_digest = kOtherScopeDigest;
   overlapping.overlapping_stop_id = first.stop_id();
   const auto joined = reserve.reserve_or_join(overlapping);
@@ -158,7 +146,6 @@ TEST(EmergencyStopAcceptanceReserveTest, OverlapJoinsResidentWithoutExtendingDea
   EXPECT_EQ(joined.stop_id(), first.stop_id());
   EXPECT_EQ(joined.stop_generation, first.stop_generation);
   EXPECT_EQ(joined.accepted_at_ns, first.accepted_at_ns);
-  EXPECT_EQ(joined.outer_deadline_ns, first.outer_deadline_ns);
   EXPECT_EQ(joined.captured_scope_digest(), first.captured_scope_digest());
   EXPECT_EQ(joined.work_token, first.work_token);
   EXPECT_NE(joined.correlation_slot, first.correlation_slot);
@@ -203,7 +190,7 @@ TEST(EmergencyStopAcceptanceReserveTest, CorrelationExhaustionCoalescesWithoutDr
   EXPECT_EQ(additional.work_token, overflow.work_token);
   EXPECT_EQ(additional.correlation_slot, 1U);
   EXPECT_EQ(additional.stop_id(), overflow.stop_id());
-  EXPECT_EQ(additional.outer_deadline_ns, overflow.outer_deadline_ns);
+  EXPECT_EQ(additional.accepted_at_ns, overflow.accepted_at_ns);
 }
 
 TEST(EmergencyStopAcceptanceReserveTest, ExplicitFullStopUsesDedicatedNonEvictableSlot) {

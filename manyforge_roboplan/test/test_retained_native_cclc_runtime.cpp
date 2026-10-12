@@ -1335,10 +1335,7 @@ public:
               64U,
               {},
               nullptr,
-              participants.front().participant_binding.value().graph_revision,
-              participants.front()
-                  .stop_readiness.value()
-                  .resolved_stop_base_plan.deadline_budget});
+              participants.front().participant_binding.value().graph_revision});
     }
     auto published = kernel_->publish_runtime_route_configuration(
         configuration, {std::move(registration)}, {});
@@ -1499,7 +1496,6 @@ void ExpectExactControlledStopPlan(
     EXPECT_DOUBLE_EQ(angular->value_rad_s2, 4.0);
   }
 
-  ASSERT_EQ(plan.deadline_budget.outer_duration_ns, 3'000'000'000);
   ASSERT_EQ(plan.stage_commands.size(), 2U);
   const auto &nominal = plan.stage_commands.front();
   EXPECT_EQ(nominal.resolved_stage.stage_kind,

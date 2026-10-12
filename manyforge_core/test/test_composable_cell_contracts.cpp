@@ -374,22 +374,12 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
       StopEvidencePolicyRevision{kDigest},
       StopEvidenceDisposition::kStoppable,
       ContainmentGranularity::kControlDomain,
-      StopDeadlineBudgetDTO{
-          1'000,
-          100,
-          {
-              {StopBudgetPhaseId{"command"}, 100},
-              {StopBudgetPhaseId{"rest"}, 500},
-              {StopBudgetPhaseId{"hard_command"}, 700},
-          },
-      },
       {
           {
               StopEscalationStageId{"nominal_controlled"},
               StopEscalationStageKind::kNominal,
               ContainmentGranularity::kResource,
               {
-                  StopBudgetPhaseId{"command"},
                   StopContainmentCommandKind::kMotionControlledStop,
                   contract,
                   std::nullopt,
@@ -397,7 +387,6 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
               StopEvidenceConjunction::kAllOf,
               {{
                   StopEvidenceItemId{"rest"},
-                  StopBudgetPhaseId{"rest"},
                   StopEvidenceRequirementKind::kMotionRest,
                   contract,
                   std::nullopt,
@@ -418,7 +407,6 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
               StopEscalationStageKind::kSoftwareHard,
               ContainmentGranularity::kControlDomain,
               {
-                  StopBudgetPhaseId{"hard_command"},
                   StopContainmentCommandKind::kRegistered,
                   contract,
                   RegisteredStopCommandKindId{"software_hard_stop"},
@@ -426,7 +414,6 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
               StopEvidenceConjunction::kAllOf,
               {{
                   StopEvidenceItemId{"hard_acknowledged"},
-                  StopBudgetPhaseId{"hard_command"},
                   StopEvidenceRequirementKind::kDiscreteAcknowledgement,
                   std::nullopt,
                   std::nullopt,
@@ -444,8 +431,6 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
           },
       },
   };
-  ASSERT_TRUE(policy.deadline_budget.has_value());
-  EXPECT_EQ(policy.deadline_budget->phases.size(), 3U);
   ASSERT_EQ(policy.escalation_stages.size(), 2U);
   EXPECT_EQ(policy.escalation_stages.front().stage_kind,
             StopEscalationStageKind::kNominal);

@@ -236,45 +236,13 @@ void register_operation_runtime_bindings(py::module_& module) {
 
   py::class_<StopPredecessorAcceptanceRefDTO>(module, "StopPredecessorAcceptanceRefDTO",
                                               py::is_final())
-      .def(py::init<StopId, StopGeneration, ContentDigest, std::int64_t>(),
-           py::arg("predecessor_stop_id"), py::arg("predecessor_stop_generation"),
-           py::arg("captured_scope_digest"), py::arg("remaining_outer_duration_ns_at_join"))
+      .def(py::init<StopId, StopGeneration, ContentDigest>(), py::arg("predecessor_stop_id"),
+           py::arg("predecessor_stop_generation"), py::arg("captured_scope_digest"))
       .def_readonly("predecessor_stop_id", &StopPredecessorAcceptanceRefDTO::predecessor_stop_id)
       .def_readonly("predecessor_stop_generation",
                     &StopPredecessorAcceptanceRefDTO::predecessor_stop_generation)
       .def_readonly("captured_scope_digest",
                     &StopPredecessorAcceptanceRefDTO::captured_scope_digest)
-      .def_readonly("remaining_outer_duration_ns_at_join",
-                    &StopPredecessorAcceptanceRefDTO::remaining_outer_duration_ns_at_join)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StopAcceptedPhaseBudgetDTO>(module, "StopAcceptedPhaseBudgetDTO", py::is_final())
-      .def(py::init<StopBudgetPhaseId, std::int64_t, std::int64_t>(), py::arg("phase_id"),
-           py::arg("fixed_deadline_offset_ns"), py::arg("remaining_deadline_offset_ns"))
-      .def_readonly("phase_id", &StopAcceptedPhaseBudgetDTO::phase_id)
-      .def_readonly("fixed_deadline_offset_ns",
-                    &StopAcceptedPhaseBudgetDTO::fixed_deadline_offset_ns)
-      .def_readonly("remaining_deadline_offset_ns",
-                    &StopAcceptedPhaseBudgetDTO::remaining_deadline_offset_ns)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StopAcceptedParticipantBudgetDTO>(module, "StopAcceptedParticipantBudgetDTO",
-                                               py::is_final())
-      .def(py::init<StopId, StopGeneration, OperationId, OperationParticipantId, ContentDigest,
-                    std::vector<StopAcceptedPhaseBudgetDTO>>(),
-           py::arg("origin_stop_id"), py::arg("origin_stop_generation"), py::arg("operation_id"),
-           py::arg("participant_id"), py::arg("participant_stop_invocation_plan_digest"),
-           py::arg("phases"))
-      .def_readonly("origin_stop_id", &StopAcceptedParticipantBudgetDTO::origin_stop_id)
-      .def_readonly("origin_stop_generation",
-                    &StopAcceptedParticipantBudgetDTO::origin_stop_generation)
-      .def_readonly("operation_id", &StopAcceptedParticipantBudgetDTO::operation_id)
-      .def_readonly("participant_id", &StopAcceptedParticipantBudgetDTO::participant_id)
-      .def_readonly("participant_stop_invocation_plan_digest",
-                    &StopAcceptedParticipantBudgetDTO::participant_stop_invocation_plan_digest)
-      .def_readonly("phases", &StopAcceptedParticipantBudgetDTO::phases)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -283,16 +251,13 @@ void register_operation_runtime_bindings(py::module_& module) {
                     StopResolutionDispositionDTO, StopScopeResolutionReasonDTO,
                     std::vector<StopScopeStaleDiagnosticDTO>, ContentDigest,
                     std::vector<StopPredecessorAcceptanceRefDTO>,
-                    std::vector<StopAffectedOperationRevisionDTO>, std::int64_t, std::int64_t,
-                    std::int64_t, std::int64_t, std::vector<StopAcceptedParticipantBudgetDTO>>(),
+                    std::vector<StopAffectedOperationRevisionDTO>, std::int64_t>(),
            py::arg("request_id"), py::arg("replay_status"), py::arg("stop_id"),
            py::arg("stop_generation"), py::arg("requested_selector_digest"),
            py::arg("resolution_disposition"), py::arg("resolution_reason"),
            py::arg("stale_diagnostics"), py::arg("captured_scope_digest"),
            py::arg("joined_predecessor_stops"), py::arg("affected_operation_revisions"),
-           py::arg("fixed_outer_duration_ns"), py::arg("fixed_kernel_completion_reserve_ns"),
-           py::arg("remaining_outer_duration_ns"), py::arg("accepted_at_ns"),
-           py::arg("participant_budget_allocations"))
+           py::arg("accepted_at_ns"))
       .def_readonly("request_id", &StopAcceptedDTO::request_id)
       .def_readonly("replay_status", &StopAcceptedDTO::replay_status)
       .def_readonly("stop_id", &StopAcceptedDTO::stop_id)
@@ -304,13 +269,7 @@ void register_operation_runtime_bindings(py::module_& module) {
       .def_readonly("captured_scope_digest", &StopAcceptedDTO::captured_scope_digest)
       .def_readonly("joined_predecessor_stops", &StopAcceptedDTO::joined_predecessor_stops)
       .def_readonly("affected_operation_revisions", &StopAcceptedDTO::affected_operation_revisions)
-      .def_readonly("fixed_outer_duration_ns", &StopAcceptedDTO::fixed_outer_duration_ns)
-      .def_readonly("fixed_kernel_completion_reserve_ns",
-                    &StopAcceptedDTO::fixed_kernel_completion_reserve_ns)
-      .def_readonly("remaining_outer_duration_ns", &StopAcceptedDTO::remaining_outer_duration_ns)
       .def_readonly("accepted_at_ns", &StopAcceptedDTO::accepted_at_ns)
-      .def_readonly("participant_budget_allocations",
-                    &StopAcceptedDTO::participant_budget_allocations)
       .def("field_error",
            [](const StopAcceptedDTO& value) {
              const auto error = stop_accepted_field_error(value);

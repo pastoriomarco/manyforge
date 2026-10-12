@@ -1,0 +1,200 @@
+#pragma once
+
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <manyforge_roboplan/controller_robot_description.hpp>
+
+namespace manyforge::roboplan_backend {
+
+/// Generated controller launch artifacts for the ROS lanes ManyForge starts
+/// itself (design Q63-Q69, Q73, Q74; ROBOT_DESCRIPTION_GENERATION.md). ROS-free:
+/// the inputs are the model URDF, the retained binding facts and the
+/// deployment's values; the outputs are the controller `robot_description`
+/// file, ONE controllers YAML file and the exact launch contract that consumes
+/// them (Track 2's mock launch arguments and Isaac shell environment).
+///
+/// Templates are Track 2's `manyforge_ros_bringup/config` files, embedded at
+/// build time: the UFactory or UR mock arm template by model family, the
+/// generic mock gripper template only when a commanded gripper joint exists,
+/// and the retained Isaac controller file of each Isaac profile.
+
+/// Failure of a controller launch artifact input. Generation fails closed.
+class ControllerLaunchArtifactError final : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+};
+
+/// The closed mock controller profiles (catalog `mock_profile` values).
+[[nodiscard]] std::vector<std::string> mock_controller_profile_ids();
+
+/// The closed Isaac controller profiles (catalog `isaac_profile` values).
+[[nodiscard]] std::vector<std::string> isaac_controller_profile_ids();
+
+/// Build-owned facts of one closed mock controller profile.
+struct MockControllerProfileFacts final {
+  std::string profile_id;
+  /// The generated `<ros2_control>` element name.
+  std::string hardware_component_name;
+  /// The retained arm controller name of the model family's controller file
+  /// (UFactory: xarm_ros2 c3172e57 vendor file; UR: ManyMove retained file).
+  std::string arm_controller_name;
+  /// The commanded gripper controller (Track 2 mapping, SX-280); absent for
+  /// a profile without a model-backed gripper.
+  std::optional<std::string> gripper_controller_name;
+  /// The profile needs a commanded mock gripper joint (fail closed without a
+  /// model-backed gripper binding).
+  bool gripper_required{};
+  /// Q79: Isaac's values per model family (Lite 6 family 1.5 s / 5 s, UR
+  /// family 0.5 s / 15 s): the participant's hard-stop completion timeout and
+  /// the gripper command's result timeout.
+  double hard_stop_completion_timeout_s{};
+  double gripper_result_timeout_s{};
+};
+
+/// The controller cadence of one retained profile, read from its embedded
+/// controller configuration (the controller manager's `update_rate` and the arm
+/// controller's `state_publish_rate` and `action_monitor_rate`), so the
+/// execution participant's lane facts reflect the configured values. Actual
+/// publication cadence is controller-version dependent.
+struct MockControllerLaneRates final {
+  double controller_update_rate_hz{};
+  double state_publish_rate_hz{};
+  double action_monitor_rate_hz{};
+};
+
+[[nodiscard]] MockControllerLaneRates
+mock_controller_lane_rates(std::string_view mock_profile);
+
+[[nodiscard]] MockControllerLaneRates
+isaac_controller_lane_rates(std::string_view isaac_profile);
+
+[[nodiscard]] MockControllerProfileFacts
+mock_controller_profile_facts(std::string_view mock_profile);
+
+/// Q66: the host's fixed controller manager of one controllable component.
+[[nodiscard]] std::string
+controller_runtime_namespace(std::string_view controllable_component_id);
+inline constexpr std::string_view kControllerManagerNodeName =
+    "controller_manager";
+
+/// One mock lane component.
+struct MockControllerArtifactsInput final {
+  std::string mock_profile;
+  /// The deployment's retained `initial_joint_positions_rad` slice of this
+  /// component, paired with `arm_joint_names` by order.
+  std::vector<double> initial_joint_positions_rad;
+  /// Q48: the deployment's operator Stop profile per-joint maximum
+  /// deceleration, by model source joint. Required for every arm joint.
+  std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2;
+  /// The gripper binding as the mock lane sees it; absent without a gripper.
+  std::optional<MockGripperBinding> gripper;
+};
+
+/// One Isaac lane component (Q47/Q73: fixed profile initial values).
+struct IsaacControllerArtifactsInput final {
+  std::string isaac_profile;
+  /// The profile's controller description facts
+  /// (`retained_isaac_controller_lane(isaac_profile)`).
+  IsaacControllerLane lane;
+};
+
+struct ControllerLaunchArtifactsRequest final {
+  /// Host-owned per-activation runtime root (created if absent).
+  std::filesystem::path artifacts_root;
+  std::string controllable_component_id;
+  /// Exact ManyForge model URDF text of the component's model asset.
+  std::string_view model_urdf;
+  /// Ordered arm joints from the retained binding.
+  std::vector<std::string> arm_joint_names;
+  std::variant<MockControllerArtifactsInput, IsaacControllerArtifactsInput>
+      lane;
+  /// Q82: the retained deployment frame prefix, passed literally; empty
+  /// passes no prefix.
+  std::string frame_prefix{};
+};
+
+enum class ControllerLaunchLane { kMock, kIsaac };
+
+struct ControllerLaunchArtifacts final {
+  ControllerLaunchLane lane{};
+  std::string controllable_component_id;
+  std::string controller_profile;
+  std::filesystem::path directory;
+  std::filesystem::path robot_description_file;
+  std::filesystem::path controllers_file;
+  /// Lowercase `sha256:<hex>` of the exact written bytes.
+  std::string robot_description_sha256;
+  std::string controllers_sha256;
+  /// Exact effective controller configuration retained from generation memory.
+  std::string controllers_yaml;
+  std::string runtime_namespace;
+  std::string arm_controller_name;
+  std::optional<std::string> gripper_controller_name;
+  std::string frame_prefix;
+  /// Mock lane: `mock_control.launch.py` arguments (`name:=value`).
+  std::vector<std::string> launch_arguments;
+  /// Isaac lane: `launch-isaac-topic-based-control.sh` environment.
+  std::vector<std::pair<std::string, std::string>> launch_environment;
+};
+
+/// Generate the mock controllers YAML from the embedded templates.
+[[nodiscard]] std::string generate_mock_controllers_yaml(
+    const MockControllerProfileFacts &profile,
+    std::string_view controllable_component_id,
+    const std::vector<std::string> &arm_joint_names,
+    const std::map<std::string, double, std::less<>>
+        &max_deceleration_on_cancel_rad_s2,
+    const std::optional<std::string> &gripper_joint_name);
+
+/// The retained Isaac controller file of one Isaac profile, unchanged.
+[[nodiscard]] std::string_view retained_isaac_controllers_yaml(
+    std::string_view isaac_profile);
+
+/// Generate both files, write them below `artifacts_root/<component>/` and
+/// return their paths, hashes and the launch contract.
+[[nodiscard]] ControllerLaunchArtifacts write_controller_launch_artifacts(
+    const ControllerLaunchArtifactsRequest &request);
+
+/// Host activation input of one ROS component (Q63-Q69): its retained
+/// bindings, controller profile selection and deployment values.
+struct ComponentControllerLaunchInput final {
+  std::filesystem::path artifacts_root;
+  std::optional<core::RuntimeParticipantBinding> gripper_binding;
+  /// The retained model projection of the gripper binding's source joint at
+  /// activation (as `main`'s native lane seeds its gripper); required for a
+  /// model-backed gripper on the mock lane.
+  std::optional<double> gripper_projected_position;
+  /// Exactly one: the component's catalog controller profile.
+  std::optional<std::string> isaac_profile;
+  std::optional<std::string> mock_profile;
+  /// Isaac lane facts of `isaac_profile` (retained_isaac_controller_lane).
+  std::optional<IsaacControllerLane> isaac_lane;
+  /// The component's model asset source URDF.
+  std::string model_urdf;
+  /// Mock lane: the deployment's initial joint positions of this component.
+  std::vector<double> initial_joint_positions_rad;
+  /// Mock lane (Q48): the operator Stop per-resource maximum deceleration.
+  std::vector<std::pair<core::ResourceId, double>>
+      controlled_stop_max_deceleration_rad_s2;
+  /// Q82: this component's retained deployment frame prefix.
+  std::string frame_prefix;
+};
+
+/// Write one ROS component's controller launch artifacts at activation.
+[[nodiscard]] ControllerLaunchArtifacts write_component_controller_launch_artifacts(
+    const core::RuntimeParticipantBinding &motion_binding,
+    const ComponentControllerLaunchInput &input);
+
+/// One-line JSON evidence record of written artifacts (paths, hashes, launch
+/// contract) for activation diagnostics.
+[[nodiscard]] std::string
+controller_launch_artifacts_evidence(const ControllerLaunchArtifacts &value);
+
+} // namespace manyforge::roboplan_backend

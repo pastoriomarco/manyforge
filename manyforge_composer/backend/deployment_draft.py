@@ -332,9 +332,8 @@ def _edit_compiled_controlled_stop_profile(
     *,
     control_binding_id: str,
     control_binding_revision: str,
-    timing: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Edit one exact binding's Stop profile/timing across its derived routes.
+    """Edit one exact binding's Stop profile across its derived routes.
 
     Deployment compilation still validates every expanded row.  This focused
     mutation prevents the browser from editing those compiler-expanded copies
@@ -357,26 +356,10 @@ def _edit_compiled_controlled_stop_profile(
             "Controlled Stop target no longer matches this Deployment Draft",
             status_code=409,
         )
-    if timing is not None and (
-        not isinstance(timing, dict)
-        or set(timing)
-        != {
-            "command_latency_allowance_ns",
-            "settling_allowance_ns",
-            "operational_timeout_ns",
-        }
-        or any(
-            type(value) is not int or not 0 <= value <= 9_007_199_254_740_991
-            for value in timing.values()
-        )
-    ):
+    if profile is None:
         _fail(
             "deployment_controlled_stop_invalid",
-            "Stop timing must contain the three integer nanosecond values",
-        )
-    if profile is None:
-        return _with_stop_timing(
-            document, control_binding_id, control_binding_revision, timing
+            "Controlled Stop profile is required",
         )
 
     expected = {
@@ -386,10 +369,24 @@ def _edit_compiled_controlled_stop_profile(
         "per_resource_limits",
         "stop_mode",
     }
-    if not isinstance(profile, dict) or set(profile) != expected:
+    if (
+        not isinstance(profile, dict)
+        or not expected <= set(profile)
+        or not set(profile) <= expected | {"max_stop_time_s"}
+    ):
         _fail(
             "deployment_controlled_stop_invalid",
             "Controlled Stop profile has an invalid shape",
+        )
+    max_stop_time = profile.get("max_stop_time_s")
+    if max_stop_time is not None and (
+        type(max_stop_time) not in {int, float}
+        or not math.isfinite(float(max_stop_time))
+        or float(max_stop_time) <= 0.0
+    ):
+        _fail(
+            "deployment_controlled_stop_invalid",
+            "Controlled Stop maximum Stop time must be positive and finite",
         )
     if profile["stop_mode"] not in {"soft_on_path", "spring_back_hold"}:
         _fail(
@@ -580,6 +577,8 @@ def _edit_compiled_controlled_stop_profile(
             "per_resource_limits": materialized_limits,
             "stop_mode": profile["stop_mode"],
         }
+        if max_stop_time is not None:
+            row["default_contract_parameters"]["max_stop_time_s"] = float(max_stop_time)
         # This editor does not author provider substitution policy. Preserve an
         # existing qualified Soft substitution while editing its other fields.
         if (
@@ -596,9 +595,7 @@ def _edit_compiled_controlled_stop_profile(
             "Deployment has no editable Controlled Stop stage",
             status_code=409,
         )
-    return _with_stop_timing(
-        candidate, control_binding_id, control_binding_revision, timing
-    )
+    return candidate
 
 
 def _edit_controlled_stop_profile(
@@ -607,7 +604,6 @@ def _edit_controlled_stop_profile(
     *,
     controllable_component_id: str,
     command_target_id: str,
-    timing: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Edit one authored target and let preparation expand its route copies."""
 
@@ -630,73 +626,77 @@ def _edit_controlled_stop_profile(
                 "Controlled Stop target no longer matches this Deployment Draft",
                 status_code=409,
             )
-        current = matches[0]["controlled_stop"]
-        if profile is not None:
-            expected = {
-                "allow_natural_completion_on_short_path",
-                "jerk_limits_enabled",
-                "deceleration_time_s",
-                "per_resource_limits",
-                "stop_mode",
-            }
-            if not isinstance(profile, dict) or set(profile) != expected:
+        if profile is None:
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop profile is required",
+            )
+        expected = {
+            "allow_natural_completion_on_short_path",
+            "jerk_limits_enabled",
+            "deceleration_time_s",
+            "per_resource_limits",
+            "stop_mode",
+        }
+        if (
+            not isinstance(profile, dict)
+            or not expected <= set(profile)
+            or not set(profile) <= expected | {"max_stop_time_s"}
+        ):
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop profile has an invalid shape",
+            )
+        limits = profile["per_resource_limits"]
+        if not isinstance(limits, list):
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop resource limits are malformed",
+            )
+        authored_limits: list[dict[str, Any]] = []
+        for row in limits:
+            if not isinstance(row, dict):
                 _fail(
                     "deployment_controlled_stop_invalid",
-                    "Controlled Stop profile has an invalid shape",
+                    "Controlled Stop resource limit is malformed",
                 )
-            limits = profile["per_resource_limits"]
-            if not isinstance(limits, list):
+            maximum = row.get("max_deceleration")
+            threshold = row.get("settle_velocity_threshold")
+            jerk = row.get("max_jerk")
+            if (
+                not isinstance(row.get("resource_id"), str)
+                or not isinstance(maximum, dict)
+                or maximum.get("coordinate_kind") != "angular_rad_s2"
+                or not isinstance(threshold, dict)
+                or threshold.get("coordinate_kind") != "angular_rad_s"
+                or (jerk is not None and (
+                    not isinstance(jerk, dict)
+                    or jerk.get("coordinate_kind") != "angular_rad_s3"
+                ))
+            ):
                 _fail(
                     "deployment_controlled_stop_invalid",
-                    "Controlled Stop resource limits are malformed",
+                    "Authored Stop limits must use source-joint angular units",
                 )
-            authored_limits: list[dict[str, Any]] = []
-            for row in limits:
-                if not isinstance(row, dict):
-                    _fail(
-                        "deployment_controlled_stop_invalid",
-                        "Controlled Stop resource limit is malformed",
-                    )
-                maximum = row.get("max_deceleration")
-                threshold = row.get("settle_velocity_threshold")
-                jerk = row.get("max_jerk")
-                if (
-                    not isinstance(row.get("resource_id"), str)
-                    or not isinstance(maximum, dict)
-                    or maximum.get("coordinate_kind") != "angular_rad_s2"
-                    or not isinstance(threshold, dict)
-                    or threshold.get("coordinate_kind") != "angular_rad_s"
-                    or (jerk is not None and (
-                        not isinstance(jerk, dict)
-                        or jerk.get("coordinate_kind") != "angular_rad_s3"
-                    ))
-                ):
-                    _fail(
-                        "deployment_controlled_stop_invalid",
-                        "Authored Stop limits must use source-joint angular units",
-                    )
-                authored = {
-                    "source_joint_name": row["resource_id"],
-                    "max_deceleration_rad_s2": maximum.get("value"),
-                    "settle_velocity_threshold_rad_s": threshold.get("value"),
-                }
-                if jerk is not None:
-                    authored["max_jerk_rad_s3"] = jerk.get("value")
-                authored_limits.append(authored)
-            current = {
-                "stop_mode": profile["stop_mode"],
-                "allow_natural_completion_on_short_path": profile[
-                    "allow_natural_completion_on_short_path"
-                ],
-                "jerk_limits_enabled": profile["jerk_limits_enabled"],
-                "deceleration_time_s": profile["deceleration_time_s"],
-                "per_joint_limits": authored_limits,
+            authored = {
+                "source_joint_name": row["resource_id"],
+                "max_deceleration_rad_s2": maximum.get("value"),
+                "settle_velocity_threshold_rad_s": threshold.get("value"),
             }
-        else:
-            current = deepcopy(current)
-            current.pop("timing", None)
-        if timing is not None:
-            current["timing"] = deepcopy(timing)
+            if jerk is not None:
+                authored["max_jerk_rad_s3"] = jerk.get("value")
+            authored_limits.append(authored)
+        current = {
+            "stop_mode": profile["stop_mode"],
+            "allow_natural_completion_on_short_path": profile[
+                "allow_natural_completion_on_short_path"
+            ],
+            "jerk_limits_enabled": profile["jerk_limits_enabled"],
+            "deceleration_time_s": profile["deceleration_time_s"],
+            "per_joint_limits": authored_limits,
+        }
+        if "max_stop_time_s" in profile:
+            current["max_stop_time_s"] = profile["max_stop_time_s"]
         matches[0]["controlled_stop"] = current
         try:
             return validate_deployment_intent(
@@ -740,50 +740,7 @@ def _edit_controlled_stop_profile(
             profile,
             control_binding_id=binding_id,
             control_binding_revision=binding_revision,
-            timing=timing,
         )
-    return candidate
-
-
-def _with_stop_timing(
-    document: dict[str, Any],
-    control_binding_id: str,
-    control_binding_revision: str,
-    timing: dict[str, Any] | None,
-) -> dict[str, Any]:
-    candidate = deepcopy(document)
-    policies = candidate.get("policies")
-    if not isinstance(policies, dict):
-        _fail(
-            "deployment_controlled_stop_unavailable",
-            "Deployment has no Stop policy inventory",
-        )
-    timings = policies.get("stop_timing_parameters", [])
-    if not isinstance(timings, list):
-        _fail(
-            "deployment_controlled_stop_invalid", "Stop timing inventory is malformed"
-        )
-    if any(not isinstance(row, dict) for row in timings):
-        _fail(
-            "deployment_controlled_stop_invalid", "Stop timing inventory is malformed"
-        )
-    timings = [
-        row for row in timings if row.get("control_binding_id") != control_binding_id
-    ]
-    if timing is not None:
-        timings.append(
-            {
-                "control_binding_id": control_binding_id,
-                "control_binding_revision": control_binding_revision,
-                "timing": deepcopy(timing),
-            }
-        )
-    if timings:
-        candidate["policies"]["stop_timing_parameters"] = timings
-    else:
-        candidate["policies"].pop("stop_timing_parameters", None)
-    # The single C++ compiler owns full-profile minimums and qualified phase/
-    # dwell checks; this authoring adapter does not implement timing policy.
     return candidate
 
 
@@ -985,7 +942,6 @@ class DeploymentDraftSession:
         *,
         controllable_component_id: str,
         command_target_id: str,
-        timing: dict[str, Any] | None,
         draft_id: str,
         expected_revision: int,
     ) -> CompiledDeploymentDocument:
@@ -1002,7 +958,6 @@ class DeploymentDraftSession:
                 profile,
                 controllable_component_id=controllable_component_id,
                 command_target_id=command_target_id,
-                timing=timing,
             )
         return self._compiler(_source(candidate))
 

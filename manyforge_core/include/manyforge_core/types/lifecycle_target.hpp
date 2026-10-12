@@ -169,6 +169,10 @@ struct ComponentLifecycleProgressDTO final {
 struct ComponentLifecycleTargetViewDTO final {
   std::optional<ComponentLifecycleTargetDTO> target;
   std::optional<ComponentLifecycleProgressDTO> progress;
+  /// Informational cumulative drops since this host started; host replacement
+  /// resets them. Both absent when unavailable, with no lifecycle/health effect.
+  std::optional<std::uint64_t> dropped_output_lines{};
+  std::optional<std::uint64_t> dropped_output_bytes{};
 
   friend bool operator==(const ComponentLifecycleTargetViewDTO&,
                          const ComponentLifecycleTargetViewDTO&) = default;

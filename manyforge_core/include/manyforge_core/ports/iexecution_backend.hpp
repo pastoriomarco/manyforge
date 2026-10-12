@@ -11,11 +11,28 @@
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <stop_token>
 #include <memory>
+#include <stdexcept>
+#include <utility>
 
 namespace manyforge::core {
 namespace detail {
 class CoordinatedExecutionClock;
 }
+
+/// A critical internal fault of a dispatched execution (item 17; Q52: a
+/// controller cycle later than the lane margin). A backend reports it by
+/// throwing it from the execution handle; the Kernel's item-17 path issues
+/// the lane's hard stop (`stop()`) and ends the motion InterventionRequired
+/// with `error`, exactly as for a worker exception after dispatch.
+class ExecutionCriticalFault final : public std::runtime_error {
+ public:
+  explicit ExecutionCriticalFault(ErrorDTO error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+  [[nodiscard]] const ErrorDTO& error() const noexcept { return error_; }
+
+ private:
+  ErrorDTO error_;
+};
 
 /// Execution backend interface (spec 220 §4)
 ///

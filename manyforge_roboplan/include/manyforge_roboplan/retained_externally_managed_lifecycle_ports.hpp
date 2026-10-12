@@ -27,6 +27,8 @@ struct RetainedExternallyManagedDomainSnapshot final {
       core::ComponentLifecycleStateDTO::kUndeclared};
   bool exact_controller_configuration_active{};
   std::vector<core::LifecycleFactDTO> facts;
+  std::optional<core::ErrorDTO> diagnostic{};
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
@@ -39,11 +41,31 @@ using RetainedExternallyManagedDomainSnapshotSource =
     std::function<core::Result<RetainedExternallyManagedDomainSnapshot>(
         const core::ControlDomainId &, core::TimePoint)>;
 
-/// Observer-only brand lifecycle adapter for an external product owner.
+/// Outcome of one host-owned lifecycle primitive of an externally managed
+/// product (for example a ros2_control controller switch requested by CCLC).
+struct RetainedExternallyManagedPrimitiveOutcome final {
+  core::LifecyclePrimitiveDispatchStateDTO dispatch{
+      core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched};
+  core::LifecyclePrimitiveEffectDTO effect{core::LifecyclePrimitiveEffectDTO::kNone};
+  std::optional<core::LifecyclePrimitiveKnownResultDTO> known{};
+  std::optional<core::ErrorDTO> error{};
+};
+
+/// Executes one lifecycle primitive of the selected product for one control
+/// domain. Its postcondition is then established only by Observe.
+using RetainedExternallyManagedPrimitiveDispatcher =
+    std::function<RetainedExternallyManagedPrimitiveOutcome(
+        const core::ControlDomainId &, const core::LifecyclePrimitiveId &,
+        std::stop_token)>;
+
+/// Brand lifecycle adapter for an externally managed product.
 ///
-/// Observe normalizes the selected product snapshot into CCLC truth. Dispatch
-/// always returns known-no-effect/not-dispatched: only the external owner may
-/// change its controller or transport lifecycle.
+/// Observe normalizes the selected product snapshot into CCLC truth. Without a
+/// dispatcher, Dispatch always returns known-no-effect/not-dispatched: only the
+/// external owner may change its controller or transport lifecycle. With one,
+/// CCLC primitives of the product's catalog reach the host's single owner of
+/// that product's mutations (design R6: controllers loaded inactive, CCLC
+/// activates them).
 class RetainedExternallyManagedBrandLifecyclePort final
     : public core::IBrandLifecyclePort {
 public:
@@ -51,7 +73,8 @@ public:
       std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
   Create(core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
          RetainedExternallyManagedDomainSnapshotSource snapshot_source,
-         core::IClock &clock, core::Duration observation_freshness_ns);
+         core::IClock &clock, core::Duration observation_freshness_ns,
+         RetainedExternallyManagedPrimitiveDispatcher dispatcher = {});
 
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override;

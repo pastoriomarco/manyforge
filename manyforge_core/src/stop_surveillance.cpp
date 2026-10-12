@@ -156,7 +156,6 @@ std::optional<std::string_view> stop_surveillance_source_plan_field_error(
   if (!identity(plan.scope_key.origin_stop_id) ||
       !plan.scope_key.origin_stop_generation.nonzero() ||
       !identity(plan.evidence_requirement.evidence_item_id) ||
-      !identity(plan.evidence_requirement.phase_id) ||
       plan.evidence_requirement.source_requirement.freshness_budget_ns <= 0 ||
       plan.evidence_requirement.source_requirement.source_kind !=
           plan.resolved_source.source_kind ||

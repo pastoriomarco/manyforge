@@ -82,7 +82,6 @@ struct PreparedParticipantStopPlanDTO final {
   ParticipantStopProfilePurposeDTO participant_stop_profile_purpose{
       ParticipantStopProfilePurposeDTO::kOrdinary};
   std::optional<std::string> motion_interrupt_scope_id;
-  StopDeadlineBudgetDTO deadline_budget;
   std::vector<PreparedStopStageCommandDTO> stage_commands;
 
   friend bool operator==(const PreparedParticipantStopPlanDTO&,

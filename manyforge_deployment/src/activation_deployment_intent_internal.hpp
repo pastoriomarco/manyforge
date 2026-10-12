@@ -17,6 +17,7 @@ struct ActivationDeploymentComponent final {
   CanonicalValue target_settings;
   CanonicalValue configuration;
   CapturedComponentModelSource model_source;
+  std::string frame_prefix{};
 };
 
 struct ActivationDeploymentIntent final {
@@ -24,6 +25,7 @@ struct ActivationDeploymentIntent final {
   std::string name;
   std::optional<std::string> description;
   std::optional<std::string> assistant_profile_id;
+  std::optional<std::string> isaac_world;
   CanonicalValue attachments;
   CanonicalValue policies;
   std::optional<CanonicalValue> compatibility;

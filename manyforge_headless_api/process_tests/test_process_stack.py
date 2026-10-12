@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Iterator
 
@@ -38,6 +39,41 @@ def _required_path(name: str) -> Path:
     if not path.exists():
         raise RuntimeError(f"{name} does not exist: {path}")
     return path
+
+
+def keep_failure_evidence(root: Path) -> None:
+    """Copy a failed stack's logs, controller-launch files and SQLite journals
+    out of its temporary root, when the lane names
+    MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT."""
+
+    raw = os.environ.get("MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT")
+    if not raw:
+        return
+    test = os.environ.get("PYTEST_CURRENT_TEST", "unknown").split(" ", 1)[0]
+    target = Path(raw) / test.replace("/", "_").replace("::", "__")
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink() and (
+            path.suffix in {".log", ".sqlite3", ".sqlite3-wal", ".sqlite3-shm"}
+            or path.name.startswith("controller_launch")
+        ):
+            destination = target / path.relative_to(root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+
+
+def _drain_into(source, destination_fd: int) -> None:
+    """Copy one process's piped output into the stack log until EOF."""
+
+    try:
+        with source:
+            while chunk := source.read1(65536):
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(destination_fd, view):]
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(destination_fd)
 
 
 def _free_loopback_port() -> int:
@@ -101,6 +137,7 @@ class ProcessStack:
         self.program_runner: subprocess.Popen[bytes] | None = None
         self.composer: subprocess.Popen[bytes] | None = None
         self.log = (root / "process-stack.log").open("wb")
+        self._log_drains: list[threading.Thread] = []
 
     def prepare_native_manager_fixture(
         self,
@@ -120,8 +157,16 @@ class ProcessStack:
         _required_path(package_environment)
         self.prepare_native_package(self.manager_admission_filename)
 
-    def prepare_native_package(self, admission_filename: str) -> None:
-        """Install one exact retained package's native process executables."""
+    def prepare_native_package(
+        self, admission_filename: str, *, ros2_control: bool = False
+    ) -> None:
+        """Install one exact retained package's native process executables.
+
+        `ros2_control` also installs the ROS execution host beside Manager, for
+        cells whose runtime unit is the ros2_control mock lane. Its caller's
+        environment must already carry the sourced ROS bringup overlay, which
+        Manager's children inherit.
+        """
 
         self.manager_admission_filename = admission_filename
         self.manager_package_root = self.package_root
@@ -136,6 +181,10 @@ class ProcessStack:
                 "MANYFORGE_ROBOPLAN_CANDIDATE_WORKER"
             ),
         }
+        if ros2_control:
+            installed_sources["manyforge_ros2_control_execution_host"] = _required_path(
+                "MANYFORGE_ROS2_CONTROL_EXECUTION_HOST"
+            )
         for installed_name, source in installed_sources.items():
             assert source.is_file() and os.access(source, os.X_OK)
             shutil.copy2(source, installed_root / installed_name)
@@ -182,11 +231,23 @@ class ProcessStack:
                     str(self.program_runner_liveness_socket),
                 )
             )
+        # A pipe, as in production (journald): the execution host inherits
+        # this stdout and forwards its controller-launch children's output
+        # only to a pipe, never to a regular file.
         self.manager = subprocess.Popen(
             command,
-            stdout=self.log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        assert self.manager.stdout is not None
+        drain = threading.Thread(
+            target=_drain_into,
+            args=(self.manager.stdout, os.dup(self.log.fileno())),
+            name="manager-output-drain",
+            daemon=True,
+        )
+        drain.start()
+        self._log_drains.append(drain)
 
     def start_api(self) -> None:
         assert self.api is None
@@ -513,6 +574,10 @@ class ProcessStack:
                     if self.api is not None:
                         self._terminate(self.api)
                     self.api = None
+                    # The pipe ends when Manager and every inheriting
+                    # descendant have exited; a lingering one cannot block.
+                    for drain in self._log_drains:
+                        drain.join(timeout=10.0)
                     self.log.close()
 
 

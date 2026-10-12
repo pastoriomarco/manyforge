@@ -657,6 +657,88 @@ def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None
         assert forbidden not in source
 
 
+
+@pytest.mark.parametrize("name", ("Dockerfile.ros-jazzy", "Dockerfile.ros-jazzy-full"))
+def test_jazzy_images_build_the_selected_picknik_source(name: str) -> None:
+    source = (_REPO_ROOT / name).read_text(encoding="utf-8")
+    assert "https://github.com/PickNikRobotics/topic_based_ros2_control.git" in source
+    assert "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" in source
+    assert 'test "$(git rev-parse HEAD)"' in source
+    assert "colcon build" in source
+    assert source.index("/install/UPSTREAM_COMMIT") > source.index("colcon build")
+    assert "COPY topic_based_ros2_control/" not in source
+    if name.endswith("-full"):
+        assert source.index('git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}"') > source.index(
+            "&& python /tmp/check-roboplan-dependency-stack.py"
+        )
+
+
+@pytest.mark.parametrize("relative", (
+    "scripts/ros/build-ros2-control-runtime.sh",
+    "scripts/ros/launch-isaac-topic-based-control.sh",
+))
+@pytest.mark.parametrize("selected", ("correct", "wrong", "missing"))
+def test_isaac_upstream_source_marker_is_required_before_selection(
+    relative: str, selected: str, tmp_path: Path,
+) -> None:
+    source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+    marker = tmp_path / "UPSTREAM_COMMIT"
+    pin = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"
+    if selected != "missing":
+        marker.write_text((pin if selected == "correct" else "7ee291ab") + "\n", encoding="utf-8")
+    # Execute the actual pre-source check; no ROS graph or native build starts.
+    check = source.split("# Source identity only:", 1)[1].split("set +u", 1)[0]
+    check = check[check.index("if [["):]
+    environment = dict(os.environ)
+    if relative.endswith("build-ros2-control-runtime.sh"):
+        # The Q9 helper takes its selected install as TOPIC_INSTALL and an
+        # optional data overlay as DATA_OVERLAY instead of a literal path.
+        environment.update({"TOPIC_INSTALL": str(tmp_path), "DATA_OVERLAY": ""})
+    else:
+        check = check.replace("/opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT", str(marker))
+    completed = subprocess.run(
+        ["bash", "-eu", "-c", check], env=environment, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == (0 if selected == "correct" else 2)
+    if selected != "correct":
+        assert "missing or has the wrong source pin" in completed.stderr
+
+
+
+@pytest.mark.parametrize("relative", (
+    "scripts/ros/build-ros2-control-runtime.sh",
+    "scripts/ros/launch-isaac-topic-based-control.sh",
+))
+@pytest.mark.parametrize("selected", ("correct", "stale", "missing"))
+def test_isaac_selected_topic_plugin_cannot_be_shadowed(
+    relative: str, selected: str, tmp_path: Path,
+) -> None:
+    source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+    check = source.split("topic_based_prefix=$(", 1)[1].split("\nfi", 1)[0]
+    check = "topic_based_prefix=$(" + check + "\nfi\n"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ros2 = fake_bin / "ros2"
+    ros2.write_text(
+        '#!/bin/bash\n[[ "$*" == "pkg prefix topic_based_ros2_control" ]] || exit 9\n'
+        + ('exit 1\n' if selected == "missing" else 'printf "%s\\n" "$PROBE_PREFIX"\n'),
+        encoding="utf-8",
+    )
+    ros2.chmod(0o755)
+    prefix = "/opt/manyforge/topic_based_ros2_control/install" if selected == "correct" else "/tmp/old-fork/install"
+    environment = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PROBE_PREFIX": prefix}
+    if relative.endswith("build-ros2-control-runtime.sh"):
+        environment["TOPIC_INSTALL"] = "/opt/manyforge/topic_based_ros2_control/install"
+    completed = subprocess.run(
+        ["bash", "-eu", "-c", check],
+        env=environment,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == {"correct": 0, "stale": 2, "missing": 1}[selected]
+    if selected == "stale":
+        assert "actual prefix=" + prefix in completed.stderr
+
+
 def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> None:
     source = (_REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh").read_text(
         encoding="utf-8"
@@ -681,7 +763,7 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
     assert "isaac_topic_based_control.launch.py" in source
     assert "simulation_interfaces" in source
     assert "runtime_namespace:=${runtime_namespace}" in source
-    assert "command_gate_owner_namespace:=${runtime_namespace}" in source
+    assert "command_gate_owner_namespace" not in source
     assert "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}" in source
     assert "MANYFORGE_MANAGER_STATE_ROOT" not in source
     assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
@@ -749,7 +831,6 @@ def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None
         "qualification-all",
         "qualification-native",
         "qualification-soak",
-        "ros",
     ),
 )
 def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
@@ -765,6 +846,34 @@ def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
     )
     assert completed.returncode == 78, suite
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+
+
+def test_ros_selector_builds_and_tests_the_q9_integration_graph() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    body = source.split("run_ros_tests() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
+    assert '"$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh"' in body
+    assert '--source-dir "$WORKSPACE/scripts/ros/ros-integration" --target all' in body
+    assert '--topic-install "$ROS_INTEGRATION_TOPIC_INSTALL"' in body
+    assert '--data-overlay "$ROS_INTEGRATION_DATA_OVERLAY"' in body
+    assert "MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON" in body
+    # Keep-going follows the configured tree's generator, in the same ROS
+    # environment the helper configured it with.
+    assert 'set_build_keep_going_args "$build"' in body
+    assert '-- "${BUILD_KEEP_GOING_ARGS[@]}"' in body
+    assert body.count("source_ros_integration_environment") == 3
+    for suite in (
+        "JtcExecutionPort",
+        "RetainedRos2ControlRuntimeHandleTest",
+        "RetainedIsaacArmGuardBindingTest",
+        "Ros2ControlKernelStopIntegrationTest",
+    ):
+        assert f'"{suite}"' in body
+    assert "ROS_INTEGRATION_TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install" in source
+    assert "ROS_INTEGRATION_DATA_OVERLAY=/opt/manyforge/xarm_description/install" in source
+    # Track 2's guard selection stays as delivered.
+    assert "        exts/manyforge.isaac.command_guard/tests/ \\\n" in source
 
 
 def test_bindings_selector_routes_to_the_real_i2_builder() -> None:

@@ -676,5 +676,37 @@ TEST(RuntimeObservationReducer, MonotonicClockRegressionFailsClosed) {
       std::runtime_error);
 }
 
+TEST(RuntimeObservationReducer, HostNoticeCountersAreOptionalAndInformational) {
+  ManualClock clock;
+  RuntimeObservationReducer subject([&clock] { return clock(); }, {"unit"});
+  ASSERT_TRUE(subject.ObserveProcess(Presence("unit", "epoch")));
+  ASSERT_TRUE(subject.IngestSourceReport(Report("unit", "epoch")));
+  const auto before_snapshot = subject.Evaluate({Expectation("unit")});
+  const auto before = before_snapshot.observations().front();
+  EXPECT_FALSE(before.dropped_host_notice_lines().has_value());
+  EXPECT_FALSE(before.dropped_host_notice_bytes().has_value());
+  const auto make_report = [](const std::optional<std::uint64_t> lines,
+                              const std::optional<std::uint64_t> bytes) {
+    return RuntimeUnitSourceReport(
+        "unit", "epoch", 2U, 1U, RuntimeSourcePhase::kServing,
+        RuntimeSourceHealth::kHealthy, "product-v1", "configuration-v1",
+        {"status"}, ManagedCommandSurfaceState::kClosedNoActiveEffect, {}, {},
+        lines, bytes);
+  };
+  EXPECT_THROW(make_report(1U, std::nullopt), std::invalid_argument);
+  EXPECT_THROW(make_report(std::nullopt, 1U), std::invalid_argument);
+  ASSERT_TRUE(subject.IngestSourceReport(
+      make_report(9007199254740992ULL, 18446744073709551615ULL)));
+  const auto after_snapshot = subject.Evaluate({Expectation("unit")});
+  const auto after = after_snapshot.observations().front();
+  EXPECT_EQ(after.dropped_host_notice_lines(), 9007199254740992ULL);
+  EXPECT_EQ(after.dropped_host_notice_bytes(), 18446744073709551615ULL);
+  EXPECT_EQ(after.derived_state(), before.derived_state());
+  EXPECT_EQ(after.converged(), before.converged());
+  EXPECT_EQ(after.source_health(), before.source_health());
+  EXPECT_EQ(after.source_reason_codes(), before.source_reason_codes());
+  EXPECT_EQ(after.reason_codes(), before.reason_codes());
+}
+
 }  // namespace
 }  // namespace manyforge::component_manager

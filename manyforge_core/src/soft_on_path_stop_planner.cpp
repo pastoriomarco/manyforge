@@ -1294,6 +1294,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       wp.accelerations_rad_s2[j] = lead_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
     }
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
+    plan.replacement_path_time_s.push_back(path_time);
   }
 
   // The ramp loop only appends waypoints to `plan` (its scalar fields and
@@ -1304,6 +1305,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   const auto base_plan_before_ramp = [&]() {
     SoftOnPathStopPlanDTO base = plan;
     base.replacement_trajectory.waypoints.resize(lead_in_waypoint_count);
+    base.replacement_path_time_s.resize(lead_in_waypoint_count);
     return base;
   };
   auto try_jerk_limited_retimer =
@@ -1360,6 +1362,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
           wp.time_from_start_s =
               config.stop_traj_delta_s + ali_profile.samples[i].time_from_ramp_start_s;
           ali_plan.replacement_trajectory.waypoints.push_back(std::move(wp));
+          ali_plan.replacement_path_time_s.push_back(ali_profile.samples[i].path_time_s);
         }
         ali_plan.diagnostics["handoff_path_deviation_max_rad"] =
             format_double(ali_plan.path_deviation_max_rad);
@@ -1419,6 +1422,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       TrajectoryWaypointDTO wp = profile.emitted_trajectory.waypoints[i];
       wp.time_from_start_s = config.stop_traj_delta_s + profile.samples[i].time_from_ramp_start_s;
       retimed_plan.replacement_trajectory.waypoints.push_back(std::move(wp));
+      retimed_plan.replacement_path_time_s.push_back(profile.samples[i].path_time_s);
     }
     retimed_plan.diagnostics["handoff_path_deviation_max_rad"] =
         format_double(retimed_plan.path_deviation_max_rad);
@@ -1484,6 +1488,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     }
     plan.path_deviation_max_rad = std::max(plan.path_deviation_max_rad, projection.distance_rad);
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
+    plan.replacement_path_time_s.push_back(path_time);
   }
 
   plan.diagnostics["handoff_path_deviation_max_rad"] = format_double(plan.path_deviation_max_rad);
@@ -1595,6 +1600,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
       auto hold = forward_end;
       hold.time_from_start_s = phase_time_s;
       plan.replacement_trajectory.waypoints.push_back(std::move(hold));
+      plan.replacement_path_time_s.push_back(plan.replacement_path_time_s.back());
     } else if (forward_end.time_from_start_s <= phase_time_s + kEpsilon) {
       forward_end.time_from_start_s = phase_time_s;
       adjusted_forward_end = plan.replacement_trajectory.waypoints.size() - 1;
@@ -1761,6 +1767,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
                   {"limit", format_double(failure->limit)}});
     }
     plan.replacement_trajectory.waypoints.push_back(std::move(wp));
+    plan.replacement_path_time_s.push_back(path_time);
   }
 
   const double stop_end_s = return_start_s + phase_time_s;

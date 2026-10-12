@@ -45,3 +45,29 @@ def validate_command(command: JointCommand, joint_names: tuple[str, ...]) -> Non
                 (values and len(values) != len(command.names)) or
                 any(type(value) not in (int, float) or not math.isfinite(value) for value in values)):
             raise ValueError("invalid JointState arrays")
+
+
+def project_joint_state(message: Any, joint_names: tuple[str, ...]) -> JointCommand | None:
+    """Select the arm from a shared stream; disjoint gripper packets are ignored.
+
+    Positions are the only SDK effect. Optional arrays are checked but never
+    translated into velocity or effort effects by the receiving writer.
+    """
+    names = tuple(message.name)
+    if not set(joint_names).intersection(names):
+        return None
+    if (any(type(name) is not str or not name for name in names) or
+            len(set(names)) != len(names) or not set(joint_names).issubset(names)):
+        raise ValueError("partial or duplicate configured arm joints")
+    positions, velocities, efforts = (tuple(message.position), tuple(message.velocity),
+                                     tuple(message.effort))
+    for values, required in ((positions, True), (velocities, False), (efforts, False)):
+        if ((required and len(values) != len(names)) or
+                (values and len(values) != len(names)) or
+                any(type(value) not in (int, float) or not math.isfinite(value) for value in values)):
+            raise ValueError("invalid shared JointState arrays")
+    indices = tuple(names.index(name) for name in joint_names)
+    command = JointCommand(stamp_ns(message.header.stamp), joint_names,
+                           tuple(positions[index] for index in indices))
+    validate_command(command, joint_names)
+    return command

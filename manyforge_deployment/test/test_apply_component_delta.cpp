@@ -3,6 +3,7 @@
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <algorithm>
@@ -189,11 +190,114 @@ TEST(ApplyComponentDelta, NativeConfigurationSelectionKeepsExactComponentSetting
   }
 }
 
+TEST(ApplyComponentDelta, RosConfigurationSelectionUsesExactBindingResources) {
+  const auto fixture = test::make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, kFixtureCellId, false, false,
+      "resource", false, {}, {}, true);
+  const auto bundle = Materialize(fixture);
+  const auto &component = bundle->value().cell_graph.controllable_components.front();
+  const auto unit = component.runtime_unit_ids.front();
+  const auto selected = ros2_control_execution_runtime_contract::require_component_configuration(
+      *bundle, unit, component.controllable_component_id);
+  ASSERT_EQ(selected.controller_profiles.size(), 1U);
+  EXPECT_TRUE(selected.controller_profiles.front().frame_prefix.empty());
+  EXPECT_EQ(selected.initial_joint_positions_rad.size(), 6U);
+  ASSERT_EQ(selected.motion_target_limits.size(), 1U);
+  EXPECT_EQ(selected.motion_target_limits.front().controllable_component_id,
+            component.controllable_component_id);
+  const auto projection = ros2_control_execution_runtime_contract::component_configuration_projection(
+      *bundle, unit, component.controllable_component_id);
+  EXPECT_EQ(projection.find_object_member("controller_profiles")->as_array().size(), 1U);
+  EXPECT_THROW(ros2_control_execution_runtime_contract::require_component_configuration(
+                   *bundle, unit, core::ControllableComponentId("missing")), RetainedBundleError);
+}
+
+[[nodiscard]] std::shared_ptr<const RetainedBundle> RosArms(
+    const std::size_t count, std::optional<double> first_position = std::nullopt,
+    const std::string_view first_prefix = {}) {
+  return Materialize(test::make_lite6_controllable_retention_fixture(
+      false, false, count, false, true, kFixtureCellId, false, false,
+      "resource", false, {}, {}, true, false, false, first_position, false,
+      test::kLite6ArmTargetId, std::nullopt, std::nullopt, first_prefix));
+}
+
+TEST(ApplyComponentDelta, RosSharedHostRetainsUnrelatedRobotAndOwnChangesReplace) {
+  const auto one = RosArms(1U);
+  const auto two = RosArms(2U);
+  const auto changed_positions = RosArms(2U, 0.25);
+  const auto changed_prefix = RosArms(2U, std::nullopt, "own/");
+  EXPECT_EQ(Row(derive_apply_component_delta(*one, *two), FirstArm()).disposition,
+            ApplyComponentDisposition::kRetain);
+  EXPECT_EQ(Row(derive_apply_component_delta(*two, *one), FirstArm()).disposition,
+            ApplyComponentDisposition::kRetain);
+  for (const auto &changed : {changed_positions, changed_prefix}) {
+    const auto delta = derive_apply_component_delta(*two, *changed);
+    EXPECT_EQ(Row(delta, FirstArm()).disposition, ApplyComponentDisposition::kReplace);
+    EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
+  }
+  const auto &unit = two->value().cell_graph.runtime_units.front();
+  const auto selected = ros2_control_execution_runtime_contract::require_component_configuration(
+      *changed_positions, unit.runtime_unit_id, FirstArm());
+  EXPECT_EQ(selected.initial_joint_positions_rad.front(), 0.25);
+  const auto peer = ros2_control_execution_runtime_contract::require_component_configuration(
+      *changed_positions, unit.runtime_unit_id, SecondArm());
+  EXPECT_EQ(peer.initial_joint_positions_rad.front(), 0.0);
+  EXPECT_EQ(peer.controller_profiles.front().frame_prefix, SecondArm().value() + "/");
+}
+
+TEST(ApplyComponentDelta,
+     RetainedActivationRefusesExclusiveIsaacTopicCollision) {
+  const auto fixture = test::make_lite6_controllable_retention_fixture(
+      false, false, 2U, false, true, kFixtureCellId, false, false, "resource",
+      false, {}, {}, true, false, false, std::nullopt, false,
+      test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", "lite6_grf_ros2",
+      false);
+  const auto bundle = Materialize(fixture);
+  const auto &unit = bundle->value().cell_graph.runtime_units.front();
+  try {
+    static_cast<void>(
+        ros2_control_execution_runtime_contract::require_configuration(
+            *bundle, unit.runtime_unit_id));
+    FAIL() << "colliding topics must refuse before activation";
+  } catch (const RetainedBundleError &error) {
+    const std::string reason(error.what());
+    EXPECT_NE(reason.find(FirstArm().value()), std::string::npos);
+    EXPECT_NE(reason.find(SecondArm().value()), std::string::npos);
+    EXPECT_NE(reason.find("/isaac_joint_commands"), std::string::npos);
+  }
+}
+
+TEST(ApplyComponentDelta, CellWorldChangeReplacesIsaacAndRetainsMockPeer) {
+  const auto materialize = [](std::string_view world) {
+    return Materialize(test::make_lite6_controllable_retention_fixture(
+        false, false, 2U, false, true, kFixtureCellId, false, false, "resource",
+        false, {}, {}, true, false, false, std::nullopt, false,
+        test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", world, true));
+  };
+  const auto first = materialize("lite6_grf_ros2");
+  const auto next = materialize("test_scene_realsense_foundationpose_trocar");
+  const auto delta = derive_apply_component_delta(*first, *next);
+  EXPECT_EQ(Row(delta, FirstArm()).disposition,
+            ApplyComponentDisposition::kReplace);
+  EXPECT_EQ(Row(delta, SecondArm()).disposition,
+            ApplyComponentDisposition::kRetain);
+  const auto &unit = next->value().cell_graph.runtime_units.front();
+  EXPECT_EQ(
+      ros2_control_execution_runtime_contract::require_component_configuration(
+          *next, unit.runtime_unit_id, FirstArm())
+          .isaac_world,
+      "test_scene_realsense_foundationpose_trocar");
+  EXPECT_FALSE(
+      ros2_control_execution_runtime_contract::require_component_configuration(
+          *next, unit.runtime_unit_id, SecondArm())
+          .isaac_world.has_value());
+}
+
 TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {
   const auto grow = derive_apply_component_delta(OneArm(), TwoArms());
   ASSERT_TRUE(grow.valid());
   ASSERT_EQ(grow.components.size(), 2U);
-  const auto &added = Row(grow, SecondArm());
+  const auto added = Row(grow, SecondArm());
   EXPECT_EQ(added.disposition, ApplyComponentDisposition::kAdd);
   EXPECT_FALSE(added.predecessor_runtime_identity.has_value());
   EXPECT_EQ(added.candidate_runtime_identity,
@@ -202,7 +306,7 @@ TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {
   EXPECT_FALSE(added.candidate_domains.empty());
   // Adding an independent arm changes shared projections, not this arm's
   // controller configuration. Its actual producer identities must stay equal.
-  const auto &kept = Row(grow, FirstArm());
+  const auto kept = Row(grow, FirstArm());
   EXPECT_EQ(kept.predecessor_runtime_identity,
             derive_component_runtime_identity(OneArm(), FirstArm()));
   EXPECT_EQ(kept.candidate_runtime_identity,
@@ -217,7 +321,7 @@ TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {
   ASSERT_TRUE(shrink.valid());
   EXPECT_EQ(Row(shrink, FirstArm()).disposition,
             ApplyComponentDisposition::kRetain);
-  const auto &removed = Row(shrink, SecondArm());
+  const auto removed = Row(shrink, SecondArm());
   EXPECT_EQ(removed.disposition, ApplyComponentDisposition::kRemove);
   EXPECT_EQ(removed.predecessor_runtime_identity,
             derive_component_runtime_identity(TwoArms(), SecondArm()));

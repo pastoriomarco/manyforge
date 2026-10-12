@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/detail/coordinated_execution_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -152,7 +153,6 @@ private:
       core::StopEscalationStageKind::kNominal,
       core::ContainmentGranularity::kResource,
       core::StopContainmentCommandDTO{
-          core::StopBudgetPhaseId("command"),
           core::StopContainmentCommandKind::kControllerGoalCancel, std::nullopt,
           std::nullopt},
       std::nullopt,
@@ -164,7 +164,6 @@ private:
       {core::ResolvedStopEvidenceRequirementDTO{
           core::StopEvidenceRequirementDTO{
               core::StopEvidenceItemId("goal.terminal"),
-              core::StopBudgetPhaseId("terminal"),
               core::StopEvidenceRequirementKind::kControllerGoalTerminal,
               std::nullopt, std::nullopt,
               core::StopEvidenceSourceRequirementDTO{
@@ -218,11 +217,6 @@ private:
           std::nullopt,
           core::ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
-          core::StopDeadlineBudgetDTO{
-              1'000'000'000,
-              100'000'000,
-              {{core::StopBudgetPhaseId("command"), 500'000'000},
-               {core::StopBudgetPhaseId("terminal"), 900'000'000}}},
           {core::PreparedStopStageCommandDTO{std::move(resolved_command),
                                              std::nullopt, std::nullopt}}},
       0U,
@@ -274,14 +268,12 @@ controlled_stage_fixture(double jerk_limit = 1'000'000.0) {
   command.stop_escalation_stage_id =
       core::StopEscalationStageId("motion_controlled_stop");
   command.containment_command = core::StopContainmentCommandDTO{
-      core::StopBudgetPhaseId("command"),
       core::StopContainmentCommandKind::kMotionControlledStop, contract,
       std::nullopt};
   command.default_contract_parameters = parameters;
   command.evidence_requirements = {core::ResolvedStopEvidenceRequirementDTO{
       core::StopEvidenceRequirementDTO{
           core::StopEvidenceItemId("controlled.rest"),
-          core::StopBudgetPhaseId("terminal"),
           core::StopEvidenceRequirementKind::kMotionRest, contract,
           std::nullopt,
           core::StopEvidenceSourceRequirementDTO{
@@ -299,23 +291,23 @@ controlled_stage_fixture(double jerk_limit = 1'000'000.0) {
   prepared.validated_contract_parameters = std::move(parameters);
   prepared.parameter_source =
       core::StopStageParameterSourceDTO::kDeploymentDefault;
-  plan.deadline_budget = core::StopDeadlineBudgetDTO{
-      3'000'000'000,
-      200'000'000,
-      {{core::StopBudgetPhaseId("command"), 300'000'000},
-       {core::StopBudgetPhaseId("terminal"), 1'750'000'000}}};
   return stage;
 }
 
+/// The Kernel's per-robot Stop-time values at the Stop request (Q51): a
+/// controlled stage carries its own profile deadline, nothing else is shared.
 [[nodiscard]] core::RemainingStopBudgetDTO
 remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
-  core::RemainingStopBudgetDTO budget{
-      stage.stop_id,
-      stage.stop_generation,
-      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
-      {}};
-  for (const auto &phase : stage.participant_stop_plan.deadline_budget.phases) {
-    budget.phases.push_back({phase.phase_id, phase.deadline_offset_ns});
+  core::RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, 0,
+                                      std::nullopt};
+  const auto &command =
+      stage.participant_stop_plan.stage_commands.at(stage.stage_index);
+  if (command.resolved_stage.containment_command.command_kind ==
+          core::StopContainmentCommandKind::kMotionControlledStop &&
+      command.validated_contract_parameters.has_value()) {
+    budget.remaining_controlled_deadline_ns =
+        core::controlled_stop_deadline_from_contract_parameters(
+            *command.validated_contract_parameters);
   }
   return budget;
 }
@@ -335,24 +327,15 @@ software_hard_stage_fixture() {
       core::StopEscalationStageId("software_hard");
   command.stage_kind = core::StopEscalationStageKind::kSoftwareHard;
   command.containment_command = {
-      core::StopBudgetPhaseId("hard_command"),
       core::StopContainmentCommandKind::kRegistered, contract,
       core::RegisteredStopCommandKindId("manyforge.stop.software_hard")};
   command.default_contract_parameters = core::JsonObjectDTO{};
   hard.validated_contract_parameters = core::JsonObjectDTO{};
   auto &evidence = command.evidence_requirements.front();
   evidence.requirement.evidence_item_id = core::StopEvidenceItemId("hard.rest");
-  evidence.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
   evidence.requirement.provider_contract_ref = contract;
   evidence.resolved_source.provider_contract_ref = contract;
   stage.participant_stop_plan.stage_commands.push_back(std::move(hard));
-  stage.participant_stop_plan.deadline_budget = {
-      500'000'000,
-      50'000'000,
-      {{core::StopBudgetPhaseId("command"), 50'000'000},
-       {core::StopBudgetPhaseId("terminal"), 150'000'000},
-       {core::StopBudgetPhaseId("hard_command"), 200'000'000},
-       {core::StopBudgetPhaseId("hard_terminal"), 400'000'000}}};
   stage.stage_index = 1U;
   return stage;
 }
@@ -488,7 +471,6 @@ TEST(NativeStopQualificationSeamTest,
   auto terminal = direct_stage_fixture()
                       .participant_stop_plan.stage_commands.front()
                       .resolved_stage.evidence_requirements.front();
-  terminal.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
   stage.participant_stop_plan.stage_commands.back()
       .resolved_stage.evidence_requirements.push_back(std::move(terminal));
 
@@ -786,10 +768,11 @@ TEST(NativeStopQualificationSeamTest,
   RecordingProbe probe;
   auto backend = detail::NativeStopQualificationAccess::construct(
       binding, channel, clock, RoboPlanExecutionBackendConfig{}, probe);
-  const auto stage = direct_stage_fixture();
+  const auto stage = controlled_stage_fixture();
   for (const auto remaining : {0LL, -1LL}) {
     auto budget = remaining_budget(stage);
-    budget.remaining_outer_duration_ns = remaining;
+    ASSERT_TRUE(budget.remaining_controlled_deadline_ns.has_value());
+    budget.remaining_controlled_deadline_ns = remaining;
     const auto result =
         backend->TranslateStopStage(stage, budget, std::stop_token{});
     EXPECT_EQ(result.attempt_disposition,

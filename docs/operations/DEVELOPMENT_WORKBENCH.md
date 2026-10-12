@@ -395,3 +395,33 @@ convergence. It reports a `development_workbench` using repository source, while
 native execution; the explicit ROS option prepares development simulation
 adapters and does not authorize physical equipment. Installed delivery and official
 AMD64/ARM64 packages are separate release/distribution work.
+
+
+## Operator-managed Isaac container
+
+The split Isaac operator reuses this same launcher and resident Workbench in
+one full ROS image on the remote ROS machine. It passes an explicit immutable
+image ID, launch identity/digest, qualified package/admission, DDS topology,
+site path and persistent runtime/evidence roots. This G startup mode keeps its
+existing built-static Composer endpoint at port9000, without Vite/npm startup;
+ordinary commands in this runbook keep their current defaults.
+
+Manager, execution host and observer run together inside that container. The
+observer executable is resolved and verified from the existing built overlay,
+then forwarded to the Manager-owned site check and observer launch. No host
+ROS setup or second component-container launcher is introduced. G readiness
+reads fresh Manager and service health plus the owned Sim; it does not grant
+motion permission or certify all configured components active.
+
+G's runtime-state bind is persistent host storage (not `/tmp` or tmpfs), so
+journals survive removal and reboot. Its plain stop, exited-container reuse
+and owner-controlled failed-start cleanup all preserve runtime evidence and
+Docker logs before removing the exact owned container. An export failure keeps
+the container/logs. Failed startup returns exact metadata to G while retaining
+the ROS client for authenticated own-Sim cleanup, rather than removing it in
+the developer failed-start trap. Normal Workbench cleanup is unchanged.
+Docker logs retain the existing json-file50MiB ×3 bound; G exports to one
+explicit root. Global export/ROS-log/retained-container retention budgets
+remain pending; no new deletion policy is implied. See the
+[operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md#5-split-isaac-topology-and-other-unavailable-lanes)
+for complete inputs, identity and qualification limits.

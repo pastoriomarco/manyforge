@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
-#include <manyforge_core/stop_timing.hpp>
 #include <manyforge_core/types/interrupt.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <optional>
@@ -1405,8 +1404,7 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     const std::vector<core::CatalogRecordRefDTO> &retained_policy_records,
     const CanonicalValue &interrupt_sources,
     const CanonicalValue &interrupt_policies,
-    const CanonicalValue &interrupt_config,
-    const std::vector<core::StopTimingSelectionDTO> &timings) {
+    const CanonicalValue &interrupt_config) {
   CanonicalValue::Object result{
       {"retained_policy_records",
        encode_retained_policy_records(retained_policy_records)},
@@ -1418,85 +1416,7 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
       {"interrupt_policies", interrupt_policies},
       {"interrupt_config", interrupt_config},
   };
-  if (!timings.empty()) {
-    result.emplace_back(
-        "stop_timing_parameters", encode_array(timings, [](const auto &row) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"control_binding_id",
-               CanonicalValue(row.control_binding_id.value())},
-              {"control_binding_revision",
-               CanonicalValue(row.control_binding_revision.value())},
-              {"timing", CanonicalValue(CanonicalValue::Object{
-                             {"command_latency_allowance_ns",
-                              CanonicalValue(static_cast<double>(
-                                  row.timing.command_latency_allowance_ns))},
-                             {"settling_allowance_ns",
-                              CanonicalValue(static_cast<double>(
-                                  row.timing.settling_allowance_ns))},
-                             {"operational_timeout_ns",
-                              CanonicalValue(static_cast<double>(
-                                  row.timing.operational_timeout_ns))}})}});
-        }));
-  }
   return CanonicalValue(std::move(result));
-}
-
-[[nodiscard]] std::vector<core::StopTimingSelectionDTO>
-parse_stop_timings(const CanonicalValue::Object &policies) {
-  const auto *value = find_member(policies, "stop_timing_parameters");
-  if (value == nullptr)
-    return {};
-  const auto &rows = require_array(*value, "$.policies.stop_timing_parameters");
-  if (rows.size() > core::kMaxDeploymentApplicabilityRows)
-    fail("$.policies.stop_timing_parameters",
-         "row count exceeds the deployment ceiling");
-  std::vector<core::StopTimingSelectionDTO> result;
-  for (std::size_t i = 0; i < rows.size(); ++i) {
-    const auto path = index_path("$.policies.stop_timing_parameters", i);
-    const auto &row = require_object(rows[i], path);
-    require_exact_fields(
-        row, {"control_binding_id", "control_binding_revision", "timing"},
-        path);
-    const auto &timing =
-        require_object(require_member(row, "timing", path), path + ".timing");
-    require_exact_fields(timing,
-                         {"command_latency_allowance_ns",
-                          "settling_allowance_ns", "operational_timeout_ns"},
-                         path + ".timing");
-    const auto duration = [&](std::string_view name, std::uint64_t minimum) {
-      return static_cast<std::int64_t>(
-          require_integer_in_range(require_member(timing, name, path), minimum,
-                                   core::kMaxStopEvidencePolicyDurationNs,
-                                   path + ".timing." + std::string(name)));
-    };
-    core::StopTimingParametersDTO parameters{
-        duration("command_latency_allowance_ns", 1),
-        duration("settling_allowance_ns", 0),
-        duration("operational_timeout_ns", 1)};
-    // Even the shortest possible positive profile must fit. Actual profiles
-    // and qualified evidence windows are checked by applicability/Prepare.
-    const auto checked = core::validate_controlled_stop_timing(parameters, 1);
-    if (!checked.ok())
-      fail(path, checked.error().message);
-    result.push_back(
-        {parse_portable_id<ControlBindingId>(
-             require_member(row, "control_binding_id", path), path),
-         parse_digest<ControlBindingRevision>(
-             require_member(row, "control_binding_revision", path), path),
-         parameters});
-  }
-  std::sort(result.begin(), result.end(),
-            [](const auto &left, const auto &right) {
-              return left.control_binding_id < right.control_binding_id;
-            });
-  if (std::adjacent_find(result.begin(), result.end(),
-                         [](const auto &left, const auto &right) {
-                           return left.control_binding_id ==
-                                  right.control_binding_id;
-                         }) != result.end())
-    fail("$.policies.stop_timing_parameters",
-         "duplicate control binding timing");
-  return result;
 }
 
 [[nodiscard]] std::vector<core::CatalogRecordRefDTO>
@@ -2433,7 +2353,6 @@ decode_deployment_applicability_inputs_candidate(
   normalize_external_resources(external_resources, "$.external_resources");
 
   std::vector<StopStageParametersDTO> stop_stage_parameters;
-  std::vector<core::StopTimingSelectionDTO> stop_timing_parameters;
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
   std::vector<core::CatalogRecordRefDTO> retained_policy_records;
   std::optional<CanonicalValue> normalized_policies;
@@ -2444,8 +2363,7 @@ decode_deployment_applicability_inputs_candidate(
                           {"retained_policy_records", "stop_stage_parameters",
                            "commissioned_stop_interfaces", "interrupt_sources",
                            "interrupt_policies", "interrupt_config"},
-                          {"stop_timing_parameters"}, "$.policies");
-    stop_timing_parameters = parse_stop_timings(policies);
+                          {}, "$.policies");
     retained_policy_records = parse_retained_policy_records(policies);
     const CanonicalValue interrupt_config = validate_interrupt_config(policies);
     std::vector<ParsedInterruptSource> parsed_interrupt_sources;
@@ -2487,41 +2405,10 @@ decode_deployment_applicability_inputs_candidate(
     normalize_commissioned_stop_interfaces(
         commissioned_stop_interfaces,
         "$.policies.commissioned_stop_interfaces");
-    // Draft/Save uses this same normalization boundary, before full Apply
-    // qualification. Check the known complete profile against the same Core
-    // timing rule here too; catalog evidence windows remain an Apply check.
-    for (const auto &selected : stop_timing_parameters) {
-      for (const auto &stage : stop_stage_parameters) {
-        if (stage.control_binding_id != selected.control_binding_id ||
-            stage.control_binding_revision !=
-                selected.control_binding_revision ||
-            stage.provider_contract_ref.contract_schema_id.value() !=
-                core::kMotionControlledStopContractSchemaId ||
-            stage.provider_contract_ref.contract_schema_revision.value() !=
-                core::kMotionControlledStopContractSchemaRevision)
-          continue;
-        const auto duration =
-            stage.default_contract_parameters.find("deceleration_time_s");
-        if (duration == stage.default_contract_parameters.end())
-          continue;
-        const auto *seconds = std::get_if<double>(&duration->second.value);
-        if (seconds == nullptr)
-          fail("$.policies.stop_stage_parameters",
-               "controlled Stop duration is outside its qualified range");
-        const auto duration_ns = core::authored_stop_duration_ns(*seconds);
-        if (!duration_ns.ok())
-          fail("$.policies.stop_stage_parameters", duration_ns.error().message);
-        const auto checked = core::validate_controlled_stop_timing(
-            selected.timing, duration_ns.value());
-        if (!checked.ok())
-          fail("$.policies.stop_timing_parameters", checked.error().message);
-      }
-    }
     normalized_policies = encode_supported_policies(
         stop_stage_parameters, commissioned_stop_interfaces,
         retained_policy_records, normalized_interrupt_sources,
-        normalized_interrupt_policies, interrupt_config,
-        stop_timing_parameters);
+        normalized_interrupt_policies, interrupt_config);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
@@ -2551,7 +2438,6 @@ decode_deployment_applicability_inputs_candidate(
       std::move(stop_stage_parameters),
       std::move(commissioned_stop_interfaces),
       std::move(retained_policy_records),
-      std::move(stop_timing_parameters),
   };
   CanonicalValue normalized_desired =
       encode_desired_configurations(value.desired_control_configurations);
@@ -2611,8 +2497,7 @@ compute_capability_provider_binding_revisions(
         value.retained_policy_records,
         require_normalized_policy_member("interrupt_sources"),
         require_normalized_policy_member("interrupt_policies"),
-        require_normalized_policy_member("interrupt_config"),
-        value.stop_timing_parameters);
+        require_normalized_policy_member("interrupt_config"));
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(

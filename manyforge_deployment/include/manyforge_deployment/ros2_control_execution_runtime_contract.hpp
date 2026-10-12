@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <optional>
@@ -24,6 +25,9 @@ inline constexpr std::string_view kProductContractId =
 inline constexpr std::string_view kRuntimeProfileId =
     "manyforge.ros2_control_execution_runtime";
 inline constexpr std::string_view kRuntimeRoleId = "ros2_control_execution";
+/// CellId scopes this shared host role independently of robot membership.
+inline constexpr std::string_view kCellHostRuntimeUnitId =
+    "robot_cell.ros2_control_execution";
 inline constexpr std::string_view kStatusEndpointRoleId =
     "ros2_control_execution_status";
 inline constexpr std::string_view kProjectionEndpointRoleId =
@@ -61,12 +65,54 @@ inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     "manyforge_roboplan_candidate_worker";
 
 struct Configuration final {
-  std::string isaac_profile;
+  /// Deployment-authored fault Stop profile of one motion target, read
+  /// directly as `main` did (design Q37): no derivation from the operator
+  /// profile. `main`'s authored profile has no jerk field and `main` shaped
+  /// every Stop ramp with its default jerk, so the decoded profile enables
+  /// jerk limits with no per-joint override (default derived at Stop time).
+  struct FaultStopProfile final {
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    core::MotionInterruptStopProfileDTO profile;
+
+    friend bool operator==(const FaultStopProfile &,
+                           const FaultStopProfile &) = default;
+  };
+
+  /// Q68: the controller profile each hosted controllable component selects
+  /// inside the one ROS runtime unit (one controller manager per component,
+  /// Q66). Exactly one of the lane selectors is present.
+  struct ControllerProfile final {
+    core::ControllableComponentId controllable_component_id;
+    /// Isaac lane profile (`lite6`, `ur10e`).
+    std::optional<std::string> isaac_profile;
+    /// Offline mock lane profile (one per offline model family).
+    std::optional<std::string> mock_profile;
+    /// Q82 authored literal TF prefix; empty preserves unprefixed frames.
+    std::string frame_prefix{};
+
+    friend bool operator==(const ControllerProfile &,
+                           const ControllerProfile &) = default;
+  };
+
+  /// One row per hosted controllable component, sorted by component.
+  std::vector<ControllerProfile> controller_profiles;
+  /// Q81: one deployment-authored logical world; machine facts stay at the
+  /// site.
+  std::optional<std::string> isaac_world;
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
   std::vector<
       native_execution_runtime_contract::Configuration::MotionTargetLimit>
       motion_target_limits;
+  /// At most one per hosted motion target; absent targets have no fault
+  /// Stop profile (as `main` without `default_fault_stop_profile`).
+  std::vector<FaultStopProfile> default_fault_stop_profiles;
+  /// Authored gripper target configurations (offline mock profiles carry the
+  /// native profiles' values unchanged; Isaac profiles have none).
+  std::vector<
+      native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+      gripper_target_configurations;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};
   std::optional<double> runtime_collision_immediate_query_budget_ms;
@@ -85,6 +131,19 @@ struct Configuration final {
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id);
+
+[[nodiscard]] Configuration require_component_configuration(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id);
+
+[[nodiscard]] CanonicalValue component_configuration_projection(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id);
+
+/// The controller profile row of one hosted component, or none.
+[[nodiscard]] const Configuration::ControllerProfile *
+find_controller_profile(const Configuration &configuration,
+                        const core::ControllableComponentId &component_id);
 
 [[nodiscard]] std::string implementation_revision();
 

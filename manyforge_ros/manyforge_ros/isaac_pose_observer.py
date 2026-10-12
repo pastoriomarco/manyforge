@@ -440,6 +440,24 @@ def unknown_observation_intent(
     )
 
 
+def manager_source_epoch_factory(base: str) -> Callable[[], str]:
+    """DX285: one Manager-owned process base, existing in-process rotation."""
+    base = _text(base, label="source_epoch_base", maximum=256)
+    # Reserve the full existing rotation counter before any process opens.
+    _text(f"{base}.{MAXIMUM_SAFE_INTEGER}", label="source_epoch", maximum=256)
+    rotation = 0
+
+    def next_epoch() -> str:
+        nonlocal rotation
+        if rotation >= MAXIMUM_SAFE_INTEGER:
+            raise IsaacPoseObserverConfigError("Manager source epoch rotation exhausted")
+        epoch = _text(f"{base}.{rotation + 1}", label="source_epoch", maximum=256)
+        rotation += 1
+        return epoch
+
+    return next_epoch
+
+
 class ObservationDispatcher:
     """Capacity-one-per-key nonblocking adapter with exact retry identity."""
 
@@ -524,6 +542,7 @@ class ObservationDispatcher:
         config: IsaacPoseObserverSiteConfig,
         event_callback: Callable[[ObservationDispatchEvent], None] | None = None,
         timeout_s: float = 2.0,
+        source_epoch_factory: Callable[[], str] | None = None,
     ) -> ObservationDispatcher:
         return cls(
             client=ManagerSceneRuntimeClient(
@@ -535,6 +554,7 @@ class ObservationDispatcher:
             allowed_keys=config.keys,
             observer_bindings=config.observer_bindings,
             event_callback=event_callback,
+            source_epoch_factory=source_epoch_factory,
         )
 
     def start(self) -> None:

@@ -1,7 +1,10 @@
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 
+#include <manyforge_roboplan/controller_launch_artifacts.hpp>
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -9,7 +12,6 @@
 #include <string_view>
 #include <vector>
 
-#include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -17,8 +19,8 @@ namespace {
 struct IsaacProfileFacts final {
   std::string_view profile_id;
   std::string_view hardware_component_name;
+  /// The lane controller YAML's per-joint `max_deceleration_on_cancel`.
   double cancel_deceleration_rad_s2;
-  double soft_stop_jerk_rad_s3;
   double stop_completion_timeout_s;
   std::string_view gripper_transport_kind;
   std::string_view gripper_action_name;
@@ -31,13 +33,33 @@ struct IsaacProfileFacts final {
   double gripper_close_effort;
   bool gripper_publish_nominal_position;
   double gripper_result_timeout_s;
+  /// Controller robot_description `initial_value`s, in arm-joint binding
+  /// order: the fixed values the Isaac launch used as its argument defaults
+  /// (no caller overrode them). They carry no behaviour: activation holds at
+  /// Isaac's measured joints and the guard stays closed until authorization
+  /// (Q41, Q47, Q69).
+  std::array<double, 6> initial_joint_positions_rad;
 };
+
+// Lane facts common to both Isaac profiles: the controller YAML
+// (`update_rate`, `state_publish_rate`, `action_monitor_rate`, position-only
+// command, position+velocity state) and the launch's topics. The arm command
+// topic is the one host-side value the Manager passes as the launch argument
+// and the guard derives its authorization/status topics from (Q46).
+constexpr std::string_view kArmControllerName = "isaac_arm_controller";
+constexpr std::string_view kArmJointCommandsTopic = "/isaac_joint_commands";
+constexpr std::string_view kIsaacJointStatesTopic = "/isaac_joint_states";
+/// `main`'s Isaac lane values (retained profile before the cutover).
+constexpr double kJointStateMaxAgeS = 0.25;
+constexpr double kStopTrajDeltaS = 0.1;
+constexpr double kStopSamplePeriodS = 0.01;
+constexpr double kTrackingErrorToleranceRad = 0.05;
+constexpr double kTrackingErrorTimeoutS = 0.0;
 
 constexpr IsaacProfileFacts kLite6Profile{
     "lite6",
     "IsaacLite6TopicBasedSystem",
     8.0,
-    40.0,
     1.5,
     "isaac_joint_state_effort",
     "lite_gripper_controller/gripper_cmd",
@@ -50,13 +72,13 @@ constexpr IsaacProfileFacts kLite6Profile{
     -5.0,
     true,
     5.0,
+    {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
 };
 
 constexpr IsaacProfileFacts kUr10eProfile{
     "ur10e",
     "IsaacUR10eTopicBasedSystem",
     10.0,
-    50.0,
     0.5,
     "ros_gripper_command",
     "robotiq_gripper_controller/gripper_cmd",
@@ -69,6 +91,8 @@ constexpr IsaacProfileFacts kUr10eProfile{
     40.0,
     false,
     15.0,
+    {2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884,
+     -2.038544566},
 };
 
 [[nodiscard]] const IsaacProfileFacts &
@@ -124,37 +148,6 @@ sole_compiled_group(const core::RuntimeParticipantBinding &binding,
   return binding.value().model_groups.front().compiled_group_name;
 }
 
-[[nodiscard]] std::vector<std::string>
-interfaces(const std::vector<std::string> &joints,
-           const std::span<const std::string_view> names) {
-  std::vector<std::string> result;
-  result.reserve(joints.size() * names.size());
-  for (const auto &joint : joints) {
-    for (const auto name : names) {
-      result.push_back(joint + "/" + std::string(name));
-    }
-  }
-  return result;
-}
-
-[[nodiscard]] std::string controller_binding_generation(
-    const IsaacProfileFacts &profile,
-    const std::string_view runtime_namespace,
-    const std::vector<std::string> &transport_joints) {
-  std::string preimage("manyforge.isaac-controller-binding.v2");
-  preimage.push_back('\0');
-  preimage.append(profile.profile_id);
-  preimage.push_back('\0');
-  preimage.append(profile.hardware_component_name);
-  preimage.push_back('\0');
-  preimage.append(runtime_namespace);
-  for (const auto &joint : transport_joints) {
-    preimage.push_back('\0');
-    preimage.append(joint);
-  }
-  return manyforge::content_identity::sha256_digest(preimage);
-}
-
 [[nodiscard]] bool is_ascii_alpha(const char value) noexcept {
   return (value >= 'A' && value <= 'Z') ||
          (value >= 'a' && value <= 'z');
@@ -184,6 +177,60 @@ interfaces(const std::vector<std::string> &joints,
   return result;
 }
 
+// Shared JTC wiring and retained simulation policy. Lane builders still own
+// their validation, cancellation bounds, guard and gripper configuration.
+[[nodiscard]] RetainedRos2ControlBackendConfig
+make_simulation_jtc_config(const std::string &runtime_namespace,
+                           const std::string_view arm_controller_name,
+                           const std::string_view hardware_component_name,
+                           const std::vector<std::string> &transport_joints,
+                           const MockControllerLaneRates &rates,
+                           const double stop_completion_timeout_s) {
+  RetainedRos2ControlBackendConfig config;
+  config.node_name = "manyforge_ros2_control_execution_backend";
+  config.node_namespace = runtime_namespace;
+  config.executor_thread_count = 3U;
+
+  const auto arm_controller =
+      scoped_name(runtime_namespace, arm_controller_name);
+  auto &adapter = config.arm.adapter;
+  adapter.action_name = arm_controller + "/follow_joint_trajectory";
+  adapter.state_topic = arm_controller + "/controller_state";
+  adapter.scale_topic = arm_controller + "/speed_scaling_input";
+  auto &lane = adapter.lane_facts;
+  lane.joint_names = transport_joints;
+  lane.supports_scale = true;
+  lane.has_measured_velocity = true;
+  lane.cancel_semantics = core::ExecutionCancelSemantics::kDecelerate;
+  lane.feedback_rate_hz = rates.action_monitor_rate_hz;
+  lane.state_rate_hz = rates.state_publish_rate_hz;
+  lane.controller_update_rate_hz = rates.controller_update_rate_hz;
+  lane.goal_tolerance_policy = core::ExecutionGoalTolerancePolicy::kErased;
+  config.arm.controller = RetainedRos2ControlArmController{
+      scoped_name(runtime_namespace, kControllerManagerNodeName),
+      std::string(arm_controller_name), std::string(hardware_component_name)};
+
+  auto &participant = config.participant;
+  participant.stop.trip_authority = core::StateAuthorityClass::kCommanded;
+  participant.stop.stop_traj_delta_s = kStopTrajDeltaS;
+  participant.stop.sample_period_s = kStopSamplePeriodS;
+  participant.stop.hard_stop_completion_timeout_ns =
+      static_cast<core::Duration>(stop_completion_timeout_s * 1e9);
+  // Q59 (`main`'s `joint_state_max_age_s`): stale controller state during a
+  // motion or a Stop is a fault on this lane.
+  participant.stop.controller_state_max_age_ns =
+      static_cast<core::Duration>(kJointStateMaxAgeS * 1e9);
+  // Q55: decided simulation-lane allowance and two actual CM periods;
+  // live lanes still require measurement. Q54 keeps ROS timing monitor-only.
+  participant.stop.replacement_start_allowance_s = 0.020;
+  participant.late_cycle_margin_s = 2.0 / rates.controller_update_rate_hz;
+  participant.tracking = core::ExecutionTrackingPolicy{
+      kTrackingErrorToleranceRad, kTrackingErrorTimeoutS};
+  participant.initial_speed_factor = 1.0;
+  config.observed_state_authority_profile_id = "manyforge.commanded_simulation";
+  return config;
+}
+
 } // namespace
 
 std::string retained_isaac_ros_namespace(
@@ -198,13 +245,36 @@ std::string retained_isaac_ros_namespace(
   return "/manyforge/" + component_id;
 }
 
+IsaacControllerLane
+retained_isaac_controller_lane(const std::string_view isaac_profile) {
+  const auto &profile = profile_facts(isaac_profile);
+  return IsaacControllerLane{
+      std::string(profile.hardware_component_name),
+      std::string(kArmJointCommandsTopic), std::string(kIsaacJointStatesTopic),
+      std::vector<double>(profile.initial_joint_positions_rad.begin(),
+                          profile.initial_joint_positions_rad.end())};
+}
+
 RetainedRos2ControlBackendConfig
 make_retained_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
         &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding) {
-  const auto &profile = profile_facts(runtime_configuration.isaac_profile);
+  // Q68: the component's own controller profile inside the one ROS unit.
+  const auto *selected = deployment::ros2_control_execution_runtime_contract::
+      find_controller_profile(runtime_configuration,
+                              motion_binding.value().controllable_component_id);
+  if (selected == nullptr) {
+    throw std::invalid_argument(
+        "retained ROS component has no controller profile");
+  }
+  if (!selected->isaac_profile.has_value()) {
+    throw std::invalid_argument(
+        "retained ROS component selects the offline mock lane; its "
+        "configuration is make_retained_mock_ros2_control_backend_config");
+  }
+  const auto &profile = profile_facts(*selected->isaac_profile);
   const auto runtime_namespace =
       retained_isaac_ros_namespace(motion_binding);
   if (!motion_binding.value().control_path.has_value() ||
@@ -227,9 +297,12 @@ make_retained_isaac_ros2_control_backend_config(
 
   const auto compiled_joints = compiled_resources(motion_binding);
   const auto transport_joints = transport_resources(motion_binding);
+  // A single-component unit's initial state is this component's own; a
+  // grouped unit's is sliced by the host before composition.
   if (compiled_joints.empty() ||
-      compiled_joints.size() !=
-          runtime_configuration.initial_joint_positions_rad.size() ||
+      (runtime_configuration.controller_profiles.size() == 1U &&
+       compiled_joints.size() !=
+           runtime_configuration.initial_joint_positions_rad.size()) ||
       compiled_joints.size() != transport_joints.size()) {
     throw std::invalid_argument(
         "retained Isaac ROS initial state differs from its motion resources");
@@ -240,86 +313,19 @@ make_retained_isaac_ros2_control_backend_config(
         "retained Isaac ROS transport joint identities are duplicated");
   }
 
-  ros2_control_execution::Ros2ControlExecutionBackendConfig execution;
-  execution.node_name = "manyforge_ros2_control_execution_backend";
-  execution.node_namespace = runtime_namespace;
-  execution.action_name = scoped_name(
-      runtime_namespace, "isaac_arm_controller/follow_joint_trajectory");
-  execution.joint_state_topic =
-      scoped_name(runtime_namespace, "joint_states");
-  execution.controller_state_topic = scoped_name(
-      runtime_namespace, "isaac_arm_controller/controller_state");
-  execution.required_joints = compiled_joints;
-  execution.transport_joint_names = transport_joints;
-  execution.observed_state_source_precedence = {
-      "controller_state", "joint_state", "action_feedback"};
-  execution.observed_state_authority_profile_id =
-      "manyforge.commanded_simulation";
-  execution.joint_state_max_age_s = 0.25;
-  execution.wait_for_state_timeout_s = 1.0;
-  execution.wait_for_action_server_timeout_s = 2.0;
-  execution.start_tolerance_rad = 0.15;
-  execution.final_tolerance_rad = 0.15;
-  execution.tracking_error_tolerance_rad = 0.05;
-  execution.tracking_error_timeout_s = 0.0;
-  execution.stop_completion_timeout_s =
-      profile.stop_completion_timeout_s;
-  execution.sim_reset_motion_duration_s = 0.0;
-  execution.require_fresh_state_before_planning = false;
-  execution.disable_controller_path_tolerances = true;
-  execution.execution_state_source_mode = "commanded_sim";
-  execution.initial_joint_positions_rad =
-      runtime_configuration.initial_joint_positions_rad;
-  execution.command_gate_topic = scoped_name(
-      runtime_namespace, "manyforge/isaac_arm_command_enable");
-  execution.require_execution_admission_snapshot = true;
-  // Controller-manager activity invalidates this proof immediately.  The
-  // service timeout is only the bounded fallback refresh path; leave enough
-  // margin for a loaded DDS executor without turning scheduler jitter into a
-  // false lifecycle transition.
-  execution.controller_binding_refresh_timeout_s = 0.5;
-  execution.enable_jtc_speed_scaling_input = false;
-  execution.decelerate_on_cancel = true;
-  execution.velocity_state_interface_joints =
-      std::set<std::string>(compiled_joints.begin(), compiled_joints.end());
+  const auto rates = isaac_controller_lane_rates(*selected->isaac_profile);
+  auto config = make_simulation_jtc_config(
+      runtime_namespace, kArmControllerName, profile.hardware_component_name,
+      transport_joints, rates, profile.stop_completion_timeout_s);
+  auto &participant = config.participant;
   for (const auto &joint : compiled_joints) {
-    execution.max_deceleration_on_cancel_rad_s2.emplace(
+    participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
         joint, profile.cancel_deceleration_rad_s2);
-    execution.soft_on_path_max_jerk_rad_s3.emplace(
-        joint, profile.soft_stop_jerk_rad_s3);
   }
-  execution.enable_soft_on_path_path_ramp = true;
-  execution.soft_on_path_stop_traj_delta_s = 0.1;
-  execution.soft_on_path_sample_period_s = 0.01;
-  execution.prefer_model_anchor_velocity = true;
-
-  ros2_control_execution::ControllerBindingContract controller;
-  controller.generation_id =
-      controller_binding_generation(profile, runtime_namespace,
-                                    transport_joints);
-  controller.controller_manager =
-      scoped_name(runtime_namespace, "controller_manager");
-  controller.activity_topic =
-      scoped_name(runtime_namespace, "controller_manager/activity");
-  controller.hardware_component_name = profile.hardware_component_name;
-  controller.trajectory_controller_manager_name = "isaac_arm_controller";
-  controller.trajectory_controller_ros_name =
-      scoped_name(runtime_namespace, "isaac_arm_controller");
-  controller.trajectory_controller_type =
-      "joint_trajectory_controller/JointTrajectoryController";
-  controller.follow_joint_trajectory_action = execution.action_name;
-  controller.controller_state_topic = execution.controller_state_topic;
-  controller.joint_state_topic = execution.joint_state_topic;
-  controller.required_joints = transport_joints;
-  constexpr std::array<std::string_view, 1U> kCommandInterfaces{"position"};
-  constexpr std::array<std::string_view, 2U> kStateInterfaces{"position",
-                                                              "velocity"};
-  controller.claimed_command_interfaces =
-      interfaces(transport_joints, kCommandInterfaces);
-  controller.required_state_interfaces =
-      interfaces(transport_joints, kStateInterfaces);
-  controller.snapshot_max_age_ns = 2'000'000'000LL;
-  execution.controller_binding = std::move(controller);
+  config.isaac_guard = RetainedIsaacArmGuardBindingConfig{
+      std::string(kArmJointCommandsTopic), std::string(kIsaacJointStatesTopic),
+      static_cast<core::Duration>(kJointStateMaxAgeS * 1e9),
+      static_cast<core::Duration>(1e9 / rates.state_publish_rate_hz)};
 
   const auto &gripper = *gripper_binding;
   if (gripper.value().resources.size() != 1U ||
@@ -354,8 +360,128 @@ make_retained_isaac_ros2_control_backend_config(
   gripper_config.wait_for_action_server_timeout_s = 2.0;
   gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
 
-  return RetainedRos2ControlBackendConfig{std::move(execution),
-                                          std::move(gripper_config)};
+  config.gripper = std::move(gripper_config);
+  return config;
+}
+
+RetainedRos2ControlBackendConfig
+make_retained_mock_ros2_control_backend_config(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &runtime_configuration,
+    const core::RuntimeParticipantBinding &motion_binding,
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+    const std::map<std::string, double, std::less<>>
+        &max_deceleration_on_cancel_by_source_joint) {
+  const auto *selected = deployment::ros2_control_execution_runtime_contract::
+      find_controller_profile(runtime_configuration,
+                              motion_binding.value().controllable_component_id);
+  if (selected == nullptr) {
+    throw std::invalid_argument(
+        "retained ROS component has no controller profile");
+  }
+  if (!selected->mock_profile.has_value()) {
+    throw std::invalid_argument(
+        "retained ROS component does not select the offline mock lane");
+  }
+  const auto profile = mock_controller_profile_facts(*selected->mock_profile);
+  const auto rates = mock_controller_lane_rates(*selected->mock_profile);
+  // Q66: the host's fixed controller-manager rule, as on Isaac.
+  const auto runtime_namespace = retained_isaac_ros_namespace(motion_binding);
+  if (!motion_binding.value().control_path.has_value() ||
+      motion_binding.value().control_path->state_authority_class !=
+          core::StateAuthorityClass::kCommanded) {
+    throw std::invalid_argument(
+        "retained mock ROS profile requires a commanded motion control path");
+  }
+  if (profile.gripper_required != gripper_binding.has_value()) {
+    throw std::invalid_argument(
+        profile.gripper_required
+            ? "retained mock ROS profile requires its gripper binding"
+            : "retained mock ROS profile has no gripper for a gripper binding");
+  }
+  if (gripper_binding.has_value() &&
+      (!gripper_binding->value().control_path.has_value() ||
+       gripper_binding->value().control_path->state_authority_class !=
+           core::StateAuthorityClass::kCommanded ||
+       gripper_binding->value().controllable_component_id !=
+           motion_binding.value().controllable_component_id)) {
+    throw std::invalid_argument(
+        "retained mock ROS gripper must be a commanded path of the same "
+        "controllable component");
+  }
+
+  const auto compiled_joints = compiled_resources(motion_binding);
+  const auto transport_joints = transport_resources(motion_binding);
+  if (compiled_joints.empty() ||
+      (runtime_configuration.controller_profiles.size() == 1U &&
+       compiled_joints.size() !=
+           runtime_configuration.initial_joint_positions_rad.size()) ||
+      compiled_joints.size() != transport_joints.size()) {
+    throw std::invalid_argument(
+        "retained mock ROS initial state differs from its motion resources");
+  }
+  if (std::set<std::string>(transport_joints.begin(), transport_joints.end())
+          .size() != transport_joints.size()) {
+    throw std::invalid_argument(
+        "retained mock ROS transport joint identities are duplicated");
+  }
+  if (max_deceleration_on_cancel_by_source_joint.size() !=
+      transport_joints.size()) {
+    throw std::invalid_argument(
+        "retained mock ROS cancel deceleration does not cover exactly the "
+        "arm joints");
+  }
+
+  auto config = make_simulation_jtc_config(
+      runtime_namespace, profile.arm_controller_name,
+      profile.hardware_component_name, transport_joints, rates,
+      profile.hard_stop_completion_timeout_s);
+  auto &participant = config.participant;
+  for (std::size_t index = 0; index < compiled_joints.size(); ++index) {
+    const auto found =
+        max_deceleration_on_cancel_by_source_joint.find(transport_joints[index]);
+    if (found == max_deceleration_on_cancel_by_source_joint.end() ||
+        !std::isfinite(found->second) || !(found->second > 0.0)) {
+      throw std::invalid_argument(
+          "retained mock ROS arm joint '" + transport_joints[index] +
+          "' has no positive cancel deceleration");
+    }
+    participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
+        compiled_joints[index], found->second);
+  }
+  if (gripper_binding.has_value()) {
+    const auto &gripper = *gripper_binding;
+    if (gripper.value().resources.size() != 1U ||
+        gripper.value().resources.front().compiled_resource_name.empty() ||
+        !gripper.value().resources.front().source_joint_name.has_value() ||
+        gripper.value().resources.front().source_joint_name->empty() ||
+        !profile.gripper_controller_name.has_value()) {
+      throw std::invalid_argument(
+          "retained mock ROS gripper has no exact model-backed joint");
+    }
+    ros2_control_execution::Ros2GripperActionConfig gripper_config;
+    // Q74/Q79: the stock GripperActionController's GripperCommand action.
+    gripper_config.transport_kind = "ros_gripper_command";
+    gripper_config.action_name = scoped_name(
+        runtime_namespace, *profile.gripper_controller_name + "/gripper_cmd");
+    gripper_config.command_joint_names = {
+        *gripper.value().resources.front().source_joint_name};
+    gripper_config.state_joint_name =
+        *gripper.value().resources.front().source_joint_name;
+    gripper_config.group_id =
+        sole_compiled_group(gripper, "retained mock ROS gripper binding");
+    gripper_config.joint_name =
+        gripper.value().resources.front().compiled_resource_name;
+    gripper_config.completion_policy = "position_reached";
+    // Open/closed positions and efforts drive only the Isaac effort topic
+    // transport; the action transport carries the request's own target.
+    gripper_config.publish_nominal_position = false;
+    gripper_config.state_freshness_timeout_s = 1.0;
+    gripper_config.wait_for_action_server_timeout_s = 2.0;
+    gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
+    config.gripper = std::move(gripper_config);
+  }
+  return config;
 }
 
 } // namespace manyforge::roboplan_backend

@@ -761,8 +761,20 @@ private:
         << diagnostic.code << " for " << text;
     EXPECT_FALSE(diagnostic.message.empty()) << text;
     std::size_t characters = 0;
+    std::size_t continuations_remaining = 0;
     for (const char byte : text) {
-      characters += (static_cast<unsigned char>(byte) & 0xC0U) != 0x80U;
+      const auto value = static_cast<unsigned char>(byte);
+      if ((value & 0xC0U) == 0x80U && continuations_remaining > 0) {
+        --continuations_remaining;
+        continue;
+      }
+      // Count a stray continuation byte as the diagnostic's one-byte unit.
+      // Valid multibyte characters still contribute only one unit.
+      ++characters;
+      continuations_remaining = value >= 0xC2U && value <= 0xDFU ? 1U
+                                : value >= 0xE0U && value <= 0xEFU ? 2U
+                                : value >= 0xF0U && value <= 0xF4U ? 3U
+                                                                : 0U;
     }
     EXPECT_LE(diagnostic.position + diagnostic.length,
               std::max(characters, kMaxTextLength))
@@ -866,6 +878,16 @@ const std::vector<std::string> kFragments{"param.",
                                           "..",
                                           "@"};
 
+TEST(ExpressionFuzz, TrailingContinuationByteCountsAsDiagnosticUnit) {
+  const auto text = repeat("\xc3\xa9", kMaxTextLength) + "\xaa";
+  const auto diagnostic = parse_error(text);
+  EXPECT_EQ(diagnostic.code, "invalid_utf8");
+  EXPECT_EQ(diagnostic.position, kMaxTextLength);
+  EXPECT_EQ(diagnostic.length, 1U);
+  Fuzzer fuzzer;
+  fuzzer.run(text);
+}
+
 TEST(ExpressionFuzz, RandomFragmentsAreBoundedAndStructured) {
   std::mt19937_64 random(0x6578707265737331ULL);
   std::uniform_int_distribution<std::size_t> pick(0, kFragments.size() - 1);
@@ -918,7 +940,13 @@ TEST(ExpressionFuzz, MutatedConformanceExpressionsAreBoundedAndStructured) {
         break;
       case 3: {
         const auto span = text.substr(at, below(16) + 1);
-        text.insert(below(text.size() + 1), repeat(span, 1 + below(64)));
+        // Draw in an explicit order: the evaluation order of function
+        // arguments is unspecified and differs between GCC targets, so two
+        // draws inside one call made the corpus architecture dependent. This
+        // is the order the amd64 reference build has always used.
+        const auto copies = 1 + below(64);
+        const auto position = below(text.size() + 1);
+        text.insert(position, repeat(span, copies));
         break;
       }
       default:
@@ -939,18 +967,26 @@ class ExpressionGenerator final {
 public:
   explicit ExpressionGenerator(std::uint64_t seed) : random_(seed) {}
 
+  // Every draw is sequenced explicitly: the operands of one overloaded `+`
+  // expression are unsequenced and GCC orders them differently per target.
+  // The order below is the one the amd64 reference build has always used.
   std::string next(std::size_t depth) {
     if (depth == 0 || below(4) == 0) {
       return below(2) == 0 ? pick(kNames) : pick(kLiterals);
     }
     switch (below(6)) {
-    case 0:
-      return pick(std::vector<std::string>{"-", "!"}) + next(depth - 1);
+    case 0: {
+      const auto operand = next(depth - 1);
+      return pick(std::vector<std::string>{"-", "!"}) + operand;
+    }
     case 1:
       return "(" + next(depth - 1) + ")";
-    case 2:
-      return next(depth - 1) + " ? " + next(depth - 1) + " : " +
-             next(depth - 1);
+    case 2: {
+      const auto otherwise = next(depth - 1);
+      const auto then = next(depth - 1);
+      const auto condition = next(depth - 1);
+      return condition + " ? " + then + " : " + otherwise;
+    }
     case 3: {
       const auto &[name, arity] = kCalls[below(kCalls.size())];
       std::string text = name + "(";
@@ -959,8 +995,12 @@ public:
       }
       return text + ")";
     }
-    default:
-      return next(depth - 1) + " " + pick(kOperators) + " " + next(depth - 1);
+    default: {
+      const auto right = next(depth - 1);
+      const auto op = pick(kOperators);
+      const auto left = next(depth - 1);
+      return left + " " + op + " " + right;
+    }
     }
   }
 

@@ -15,7 +15,7 @@
   "components": [
     {
       "component_id": "ur5_robot",
-      "component_profile_id": "ur5_native_simulated_v0",
+      "component_profile_id": "ur5_mock_commanded_v0",
       "configuration": {
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
@@ -32,7 +32,6 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
-          "direct_control_joint_limits": [],
           "execution_tick_hz": 100,
           "initial_joint_positions_rad": [
             0.0,
@@ -42,11 +41,13 @@
             -1.57,
             0.0
           ],
-          "mode": "simulated",
+          "mock_profile": "ur5_roboplan",
+          "mode": "commanded_sim",
           "planner_rng_seed": 12345
         },
-        "runtime_kind": "native"
+        "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "roboplan_example_models": {
@@ -111,12 +112,7 @@
                 "source_joint_name": "wrist_3_joint"
               }
             ],
-            "stop_mode": "soft_on_path",
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 750000000
-            }
+            "stop_mode": "soft_on_path"
           },
           "maximum_tcp_linear_speed_mps": 0.25
         }

@@ -6,7 +6,6 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/stop_control.hpp>
-#include <manyforge_core/types/stop_timing.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string_view>
@@ -244,7 +243,6 @@ struct DeploymentApplicabilityInputsDTO final {
   /// preserves the strong ID/revision pair; only contact and Stop-evidence
   /// alternatives are legal at this boundary.
   std::vector<CatalogRecordRefDTO> retained_policy_records;
-  std::vector<StopTimingSelectionDTO> stop_timing_parameters{};
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

@@ -17,6 +17,7 @@
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
@@ -407,9 +408,7 @@ derive_route_readiness_projection(
   if (old_readiness.controllable_component_id != next_readiness.controllable_component_id ||
       old_readiness.component_lifecycle_generation !=
           next_readiness.component_lifecycle_generation ||
-      old_readiness.expected_controller_domain != next_readiness.expected_controller_domain ||
-      old_readiness.maximum_controlled_stop_duration_ns !=
-          next_readiness.maximum_controlled_stop_duration_ns) {
+      old_readiness.expected_controller_domain != next_readiness.expected_controller_domain) {
     return false;
   }
   auto old_plan = old_readiness.resolved_stop_base_plan;
@@ -464,14 +463,12 @@ derive_route_readiness_projection(
 struct StopStaticFacts final {
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
-  std::optional<StopDeadlineBudgetDTO> deadline_budget;
   std::vector<StopScopeComponentSnapshotDTO> components;
 };
 
 [[nodiscard]] StopStaticFacts derive_stop_static_facts(
     const std::vector<RuntimeParticipantExecutionRegistration>& registrations,
     const ResourceAddressedExecutionKernelConfig& config,
-    const std::optional<StopDeadlineBudgetDTO>* selected_deadline_budget = nullptr,
     const bool require_bootstrap_graph_revision = true) {
   std::optional<GraphRevision> graph_revision =
       registrations.empty() ? config.empty_runtime_graph_revision
@@ -491,12 +488,6 @@ struct StopStaticFacts final {
       throw std::invalid_argument("empty runtime retained-bundle or graph identity is invalid");
     }
     retained_bundle_id = config.empty_runtime_retained_bundle_id;
-  }
-  std::optional<StopDeadlineBudgetDTO> deadline_budget = selected_deadline_budget == nullptr
-                                                             ? config.cell_stop_deadline_budget
-                                                             : *selected_deadline_budget;
-  if (deadline_budget.has_value()) {
-    deadline_budget->phases.clear();
   }
 
   std::map<ControllableComponentId, StopScopeComponentSnapshotDTO> components;
@@ -524,16 +515,6 @@ struct StopStaticFacts final {
       continue;
     }
     const auto& readiness = registration.stop_readiness->value();
-    const auto& budget = readiness.resolved_stop_base_plan.deadline_budget;
-    if (!deadline_budget.has_value()) {
-      deadline_budget =
-          StopDeadlineBudgetDTO{budget.outer_duration_ns, budget.kernel_completion_reserve_ns, {}};
-    }
-    if (budget.outer_duration_ns != deadline_budget->outer_duration_ns ||
-        budget.kernel_completion_reserve_ns != deadline_budget->kernel_completion_reserve_ns) {
-      throw std::invalid_argument(
-          "runtime participants do not share one cell-wide Stop deadline envelope");
-    }
 
     auto [component, inserted] = components.try_emplace(
         readiness.controllable_component_id,
@@ -558,24 +539,12 @@ struct StopStaticFacts final {
   if (!graph_revision.has_value() || graph_revision->empty()) {
     throw std::invalid_argument("runtime Stop resolution has no current graph revision");
   }
-  if (deadline_budget.has_value() &&
-      (deadline_budget->outer_duration_ns <= 0 ||
-       deadline_budget->outer_duration_ns > kMaximumStopDurationNs ||
-       deadline_budget->kernel_completion_reserve_ns <= 0 ||
-       deadline_budget->kernel_completion_reserve_ns >= deadline_budget->outer_duration_ns)) {
-    throw std::invalid_argument("runtime Stop resolution has no valid cell-wide deadline envelope");
-  }
-  if (!deadline_budget.has_value() && !components.empty()) {
-    throw std::invalid_argument(
-        "Stop-qualified runtime participants have no cell-wide deadline envelope");
-  }
 
   if (!retained_bundle_id.has_value() || retained_bundle_id->empty()) {
     throw std::invalid_argument("runtime Stop terminal truth has no retained-bundle identity");
   }
 
-  StopStaticFacts facts{
-      std::move(*retained_bundle_id), std::move(*graph_revision), std::move(deadline_budget), {}};
+  StopStaticFacts facts{std::move(*retained_bundle_id), std::move(*graph_revision), {}};
   facts.components.reserve(components.size());
   for (auto& [component_id, component] : components) {
     (void)component_id;
@@ -1074,7 +1043,8 @@ struct StopStaticFacts final {
       program_id,     program_revision,   program_binding_id,
       program_run_id, *profile,           ParticipantStopProfilePurposeDTO::kFault,
       std::nullopt,   node_category};
-  auto prepared = MakePreparedParticipantStopPlan(readiness.value(), std::move(context),
+  auto prepared = MakePreparedParticipantStopPlan(readiness.value().resolved_stop_base_plan,
+                                                  std::move(context),
                                                   binding.resources, retained_default_stop_limits);
   if (!prepared.ok()) {
     return Result<std::optional<PreparedParticipantStopPlanDTO>>::Err(prepared.error());
@@ -1517,6 +1487,30 @@ struct ActiveOperationParticipant final {
   /// Runtime collision observed outside an active Stop; its containment Stop
   /// ends this participant InterventionRequired with this cause (item 19).
   std::optional<ErrorDTO> runtime_collision_error{};
+  /// Q58: a Stop that did not wait for this command's still-returning dispatch
+  /// leaves its exact local settlement here; the dispatch return performs it.
+  std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_stop_settlement{};
+  /// Q60: a Stop that closed without waiting for this never-dispatched
+  /// participant's prepared cancellation to return leaves its exact local
+  /// settlement here. The cancellation's own terminal hands it to the Stop
+  /// lane, which performs it; until then the participant stays borrowed, so
+  /// Reset, recovery and the next operation on its resources cannot overtake
+  /// the late reply.
+  struct DeferredPreDispatchCancelSettlement final {
+    AddressedParticipantStopSettlementRequestDTO request;
+    StopControlWorkToken stop_token;
+    std::optional<OperationStateKind> returned_state{};
+    std::optional<ErrorDTO> returned_error{};
+    bool settlement_in_flight{};
+  };
+  std::optional<DeferredPreDispatchCancelSettlement> deferred_cancel_settlement{};
+
+  /// A Prepare call, prepared read or deferred pre-dispatch cancellation
+  /// (Q60) still borrows this participant's engine.
+  [[nodiscard]] bool preparation_borrow_in_flight() const noexcept {
+    return prepare_in_flight || prepared_advance_in_flight ||
+           deferred_cancel_settlement.has_value();
+  }
 };
 
 /// Exact reserved resource set of one operation: the union over its
@@ -1914,14 +1908,17 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
   return degraded;
 }
 
-/// Q33: the Stop planner chose the hard stop as the right Stop (the provider
-/// reports the planner's own disposition). Its hard stop ends Stopped with no
-/// error, as `main`'s ros2_control operator path; a hard stop used as a
-/// fallback after a failed soft Stop or spring-back keeps the degraded error.
+/// The controlled stage reports the hard stop as the right Stop: Q33, the
+/// Stop planner chose it (`main`'s ros2_control operator path); Q45, the
+/// controller reports an applied speed factor of exactly 0, so the Stop is
+/// the plain cancel. That hard stop ends Stopped with no error; a hard stop
+/// used as a fallback after a failed soft Stop or spring-back keeps the
+/// degraded error.
 [[nodiscard]] bool planner_selected_hard_stop(const ErrorDTO& cause) {
   const auto disposition = cause.details.find("stop_disposition");
   return disposition != cause.details.end() &&
-         disposition->second == "planner_selected_hard_stop";
+         (disposition->second == "planner_selected_hard_stop" ||
+          disposition->second == "applied_factor_zero_hard_stop");
 }
 
 /// Q18: a Stop ramp that ended with the robot outside the controller's goal
@@ -1984,7 +1981,9 @@ struct StopParticipantAttempt final {
   std::optional<StopStageAttemptHandle> handle;
   std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
   std::shared_ptr<const RemainingStopBudgetDTO> budget;
-  std::int64_t stage_deadline_ns{};
+  /// The Kernel's own watchdog: only a controlled stage's own deadline (Q51);
+  /// absent for a hard stage (Q57) and a gripper cancel (Q58).
+  std::optional<std::int64_t> stage_deadline_ns;
 };
 
 struct StopParticipantWork final {
@@ -2050,6 +2049,10 @@ struct StopParticipantWork final {
   /// (Q27, Q31; it then starts at the strongest stage) or chosen by the Stop
   /// planner (Q33). Its strongest stage is then not an escalation.
   bool lane_hard_stop_requested{};
+  /// Q60: the never-dispatched participant was closed after its prepared
+  /// cancellation was accepted but before that cancellation's terminal
+  /// returned. Its exact settlement is deferred to that terminal.
+  bool cancel_terminal_deferred{};
 
   /// No subordinate terminal handoff exists for a never-dispatched participant
   /// that either never received an execution identity or whose preparation
@@ -2103,7 +2106,6 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   StopControlWorkToken token;
   std::optional<StopId> stop_id;
   StopGeneration stop_generation{0U};
-  std::int64_t outer_deadline_ns{};
   bool full_stop{};
   bool persistence_degraded{};
   EmergencyStopProjectionStateDTO acceptance_projection_state{
@@ -2186,50 +2188,47 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return now + duration;
 }
 
+/// Q28/Q51: this robot's own controlled-Stop deadline, measured from the Stop
+/// acceptance and computed at Stop time from the stage's exact prepared
+/// controlled-Stop parameters (`max_stop_time_s`, else deceleration time +
+/// 0.5 s). Absent for every other stage: a hard stage is bounded by its
+/// participant with the lane's stop-completion timeout (Q57) and a gripper
+/// cancel is fire-and-forget (Q58).
+[[nodiscard]] std::optional<Duration> controlled_stage_deadline_ns(
+    const PreparedStopStageCommandDTO& command) {
+  if (command.resolved_stage.containment_command.command_kind !=
+          StopContainmentCommandKind::kMotionControlledStop ||
+      !command.validated_contract_parameters.has_value()) {
+    return std::nullopt;
+  }
+  return controlled_stop_deadline_from_contract_parameters(*command.validated_contract_parameters);
+}
+
+/// The per-robot Stop-time values handed with one stage (Q51): no shared
+/// cell-wide budget.
 [[nodiscard]] RemainingStopBudgetDTO remaining_stop_budget(
-    const PreparedParticipantStopPlanDTO& plan, const StopId& stop_id,
+    const PreparedStopStageCommandDTO& command, const StopId& stop_id,
     const StopGeneration stop_generation, const std::int64_t now,
-    const std::int64_t outer_deadline_ns) {
-  const auto remaining_outer = now >= outer_deadline_ns ? 0 : outer_deadline_ns - now;
-  RemainingStopBudgetDTO budget{stop_id, stop_generation, remaining_outer, {}};
-  budget.phases.reserve(plan.deadline_budget.phases.size());
-  const auto elapsed = plan.deadline_budget.outer_duration_ns - remaining_outer;
-  for (const auto& phase : plan.deadline_budget.phases) {
-    const auto remaining =
-        remaining_outer <= plan.deadline_budget.kernel_completion_reserve_ns
-            ? 0
-            : std::max<std::int64_t>(
-                  0, std::min(phase.deadline_offset_ns - elapsed,
-                              remaining_outer - plan.deadline_budget.kernel_completion_reserve_ns));
-    budget.phases.push_back({phase.phase_id, remaining});
+    const std::int64_t accepted_at_ns) {
+  RemainingStopBudgetDTO budget{stop_id, stop_generation,
+                                std::max<std::int64_t>(0, now - accepted_at_ns), std::nullopt};
+  if (const auto deadline = controlled_stage_deadline_ns(command)) {
+    budget.remaining_controlled_deadline_ns =
+        std::max<std::int64_t>(0, *deadline - budget.elapsed_since_stop_ns);
   }
   return budget;
 }
 
-[[nodiscard]] std::optional<std::int64_t> remaining_phase_offset(
-    const RemainingStopBudgetDTO& budget, const StopBudgetPhaseId& phase_id) noexcept {
-  const auto found = std::find_if(budget.phases.begin(), budget.phases.end(),
-                                  [&](const auto& phase) { return phase.phase_id == phase_id; });
-  return found == budget.phases.end() ? std::nullopt
-                                      : std::optional(found->remaining_deadline_offset_ns);
-}
-
+/// The Kernel's own watchdog for one stage: only a controlled stage's own
+/// deadline (as `main`'s controlled-Stop deadline watchdog). The Kernel arms
+/// no watchdog of its own for a hard stage (Q57) or a gripper cancel (Q58).
 [[nodiscard]] std::optional<std::int64_t> stage_watchdog_deadline(
-    const PreparedStopStageCommandDTO& command, const RemainingStopBudgetDTO& budget,
-    const std::int64_t now) noexcept {
-  auto maximum =
-      remaining_phase_offset(budget, command.resolved_stage.containment_command.command_phase_id);
-  if (!maximum.has_value() || *maximum <= 0) {
+    const RemainingStopBudgetDTO& budget, const std::int64_t now) noexcept {
+  if (!budget.remaining_controlled_deadline_ns.has_value()) {
     return std::nullopt;
   }
-  for (const auto& evidence : command.resolved_stage.evidence_requirements) {
-    const auto remaining = remaining_phase_offset(budget, evidence.requirement.phase_id);
-    if (!remaining.has_value()) {
-      return std::nullopt;
-    }
-    maximum = std::max(*maximum, *remaining);
-  }
-  return checked_deadline(now, *maximum);
+  const auto deadline = checked_deadline(now, *budget.remaining_controlled_deadline_ns);
+  return deadline < 0 ? std::nullopt : std::optional(deadline);
 }
 
 [[nodiscard]] Result<ResolvedParticipantStopStageDTO> resolve_participant_stop_stage(
@@ -2395,15 +2394,7 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] StopScopeEntryDTO participant_scope_entry(
     const StopParticipantWork& item, const StopId& stop_id, const StopGeneration stop_generation,
-    const std::int64_t accepted_at_ns, const std::int64_t remaining_outer_duration_ns) {
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
-  phases.reserve(item.plan.deadline_budget.phases.size());
-  const auto elapsed = item.plan.deadline_budget.outer_duration_ns - remaining_outer_duration_ns;
-  for (const auto& phase : item.plan.deadline_budget.phases) {
-    phases.push_back(
-        StopAcceptedPhaseBudgetDTO{phase.phase_id, phase.deadline_offset_ns,
-                                   std::max<std::int64_t>(0, phase.deadline_offset_ns - elapsed)});
-  }
+    const std::int64_t accepted_at_ns) {
   return StopScopeEntryDTO{
       StopScopeEntryKeyDTO{stop_id, stop_generation,
                            StopParticipantScopeKeyDTO{item.operation_id, item.plan.participant_id}},
@@ -2414,9 +2405,7 @@ constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
       item.readiness.value().resolved_stop_base_plan.stop_evidence_policy_id,
       item.readiness.value().resolved_stop_base_plan.stop_evidence_policy_revision,
       item.plan.participant_stop_invocation_plan_digest,
-      accepted_at_ns,
-      remaining_outer_duration_ns,
-      std::move(phases)};
+      accepted_at_ns};
 }
 
 [[nodiscard]] bool stop_scope_entry_key_less(const StopScopeEntryKeyDTO& left,
@@ -3145,7 +3134,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   auto stop_facts = derive_stop_static_facts(registrations_, config_);
   stop_retained_bundle_id_ = std::move(stop_facts.retained_bundle_id);
   stop_graph_revision_ = std::move(stop_facts.graph_revision);
-  cell_stop_deadline_budget_ = std::move(stop_facts.deadline_budget);
   stop_component_scope_ = std::move(stop_facts.components);
   for (const auto& configuration : extract_active_control_configurations(registrations_)) {
     if (!domain_has_complete_stop_readiness(registrations_, configuration.control_domain_id)) {
@@ -4215,24 +4203,21 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver) {
   return reconfigure_runtime_participants_impl(std::move(registrations),
-                                               std::move(participant_resolver), false, nullptr);
+                                               std::move(participant_resolver), false);
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_product(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
-    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
     std::function<Result<void>()> commit_publication) {
   return reconfigure_runtime_participants_impl(
-      std::move(registrations), std::move(participant_resolver), false,
-      &cell_stop_deadline_budget, nullptr, nullptr, nullptr, nullptr, nullptr,
-      commit_publication ? &commit_publication : nullptr);
+      std::move(registrations), std::move(participant_resolver), false, nullptr, nullptr,
+      nullptr, nullptr, nullptr, commit_publication ? &commit_publication : nullptr);
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_component_set(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
-    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
     RetainedBundleId candidate_retained_bundle_id,
     GraphRevision candidate_graph_revision,
     const ConfigurationFenceId& apply_fence_id,
@@ -4248,8 +4233,7 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_component_set
                         "runtime_component_set_scope_invalid", ErrorCode::kInvalidRequest);
   }
   return reconfigure_runtime_participants_impl(
-      std::move(registrations), std::move(participant_resolver), false,
-      &cell_stop_deadline_budget, &apply_fence_id, &scope,
+      std::move(registrations), std::move(participant_resolver), false, &apply_fence_id, &scope,
       &retained_components, &candidate_retained_bundle_id,
       &candidate_graph_revision, commit_publication ? &commit_publication : nullptr);
 }
@@ -4333,7 +4317,6 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
     const bool retain_unready_configuration_facts,
-    const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget,
     const ConfigurationFenceId* apply_fence_id,
     const ConfigurationFenceScopeDTO* apply_scope,
     const std::vector<ControllableComponentId>* retained_components,
@@ -4411,20 +4394,10 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
               : *stop_retained_bundle_id_,
           candidate_graph_revision != nullptr ? *candidate_graph_revision
                                               : *stop_graph_revision_,
-          replacement_stop_deadline_budget == nullptr
-              ? cell_stop_deadline_budget_
-              : *replacement_stop_deadline_budget,
           {}});
     } else {
-      if (replacement_stop_deadline_budget == nullptr) {
-        candidate_stop_facts.emplace(derive_stop_static_facts(
-            registrations, config_, nullptr, apply_scope == nullptr));
-      } else {
-        candidate_stop_facts.emplace(
-            derive_stop_static_facts(registrations, config_,
-                                     replacement_stop_deadline_budget,
-                                     apply_scope == nullptr));
-      }
+      candidate_stop_facts.emplace(
+          derive_stop_static_facts(registrations, config_, apply_scope == nullptr));
       if (candidate_retained_bundle_id != nullptr &&
           (candidate_stop_facts->retained_bundle_id !=
                *candidate_retained_bundle_id ||
@@ -4756,10 +4729,6 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         if (candidate_retained_bundle_id != nullptr) {
           config_.empty_runtime_retained_bundle_id = *candidate_retained_bundle_id;
           config_.empty_runtime_graph_revision = *candidate_graph_revision;
-        }
-        cell_stop_deadline_budget_ = std::move(candidate_stop_facts->deadline_budget);
-        if (replacement_stop_deadline_budget != nullptr) {
-          config_.cell_stop_deadline_budget = *replacement_stop_deadline_budget;
         }
         stop_component_scope_ = std::move(candidate_stop_facts->components);
         config_.participant_resolver = std::move(participant_resolver);
@@ -5388,8 +5357,7 @@ bool ResourceAddressedExecutionKernel::operation_control_reconfiguration_busy_lo
                   item.second->coordinated_cancellation_in_flight ||
                   std::any_of(item.second->participants.begin(), item.second->participants.end(),
                               [](const auto& participant) {
-                                return participant.prepare_in_flight ||
-                                       participant.prepared_advance_in_flight;
+                                return participant.preparation_borrow_in_flight();
                               });
          });
 }
@@ -6818,7 +6786,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       std::nullopt,
       resolved.value().stop_node_category};
   auto ordinary_stop_plan = MakePreparedParticipantStopPlan(
-      resolved.value().stop_readiness->value(), std::move(stop_context), binding.resources,
+      resolved.value().stop_readiness->value().resolved_stop_base_plan, std::move(stop_context),
+      binding.resources,
       resolved.value().retained_default_stop_limits);
   if (!ordinary_stop_plan.ok()) {
     return Result<OperationAcceptedDTO>::Err(ordinary_stop_plan.error());
@@ -7453,9 +7422,9 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             : ParticipantStopProfilePurposeDTO::kOrdinary,
         std::nullopt,
         registration.stop_node_category};
-    auto stop_plan = MakePreparedParticipantStopPlan(registration.stop_readiness->value(),
-                                                     std::move(stop_context), binding.resources,
-                                                     registration.retained_default_stop_limits);
+    auto stop_plan = MakePreparedParticipantStopPlan(
+        registration.stop_readiness->value().resolved_stop_base_plan, std::move(stop_context),
+        binding.resources, registration.retained_default_stop_limits);
     if (!stop_plan.ok()) {
       return Result<OperationAcceptedDTO>::Err(stop_plan.error());
     }
@@ -8154,8 +8123,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
          (terminal(active_operation->state.state) &&
           std::any_of(active_operation->participants.begin(), active_operation->participants.end(),
                       [](const auto& participant) {
-                        return participant.prepare_in_flight ||
-                               participant.prepared_advance_in_flight;
+                        return participant.preparation_borrow_in_flight();
                       })))) {
       return reject<OperationControlAcceptedDTO>(
           "operation settlement cannot overtake an in-flight subordinate effect",
@@ -8503,7 +8471,7 @@ Result<void> ResourceAddressedExecutionKernel::settle_control_operation_locked(
       operation->dispatch_effect_in_flight() || operation->reconciliation_in_flight() ||
       std::any_of(operation->participants.begin(), operation->participants.end(),
                   [](const auto& participant) {
-                    return participant.prepare_in_flight || participant.prepared_advance_in_flight;
+                    return participant.preparation_borrow_in_flight();
                   })) {
     return Result<void>::Ok();
   }
@@ -10125,7 +10093,7 @@ Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
   for (const auto& participant : transaction.participants) {
     entries.push_back(participant_scope_entry(
         participant, *transaction.stop_id, transaction.stop_generation,
-        transaction.accepted->accepted_at_ns, transaction.accepted->remaining_outer_duration_ns));
+        transaction.accepted->accepted_at_ns));
     attempts.insert(attempts.end(), participant.retained_results.begin(),
                     participant.retained_results.end());
   }
@@ -10138,9 +10106,7 @@ Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
         std::nullopt,
         std::nullopt,
         std::nullopt,
-        transaction.accepted->accepted_at_ns,
-        transaction.accepted->remaining_outer_duration_ns,
-        {}});
+        transaction.accepted->accepted_at_ns});
   }
   const auto projection = [&] {
     switch (transaction.acceptance_projection_state) {
@@ -10654,8 +10620,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     return Result<StopAcceptedDTO>::Err(requested_selector_digest.error());
   }
 
-  std::int64_t outer_deadline_ns{};
-
   EmergencyStopAcceptanceOutcome outcome;
   std::optional<StopAcceptedDTO> accepted;
   StopControlWorkToken work_token;
@@ -10663,11 +10627,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   bool handoff_work = false;
   {
     // The caller retains state_mutex_ through selection and acceptance.
-    if (!cell_stop_deadline_budget_.has_value()) {
-      return reject<StopAcceptedDTO>("Stop deadline referent is unavailable",
-                                     "stop_deadline_budget_unavailable",
-                                     ErrorCode::kInvariantViolation);
-    }
     if (ordinary != nullptr && malformed_ingress == nullptr) {
       const auto replay =
           std::find_if(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
@@ -10696,9 +10655,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                        ErrorCode::kInternalError);
       }
     }
-    outer_deadline_ns =
-        checked_deadline(accepted_at_ns, cell_stop_deadline_budget_->outer_duration_ns);
-    if (outer_deadline_ns < 0) {
+    // Every per-robot Stop-time deadline is measured from this acceptance and
+    // must stay representable on the Kernel clock (Q51: there is no shared
+    // outer budget; this is only the representability bound).
+    if (checked_deadline(accepted_at_ns, kMaximumStopDurationNs) < 0) {
       return reject<StopAcceptedDTO>("Stop deadline cannot be represented monotonically",
                                      "stop_deadline_overflow", ErrorCode::kInternalError);
     }
@@ -10966,7 +10926,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       }
     }
     const auto full_predecessors = resident_transactions(full_resolution.value());
-    auto full_outer_deadline_ns = outer_deadline_ns;
     std::vector<StopAcceptedPredecessorInput> full_predecessor_inputs;
     std::vector<StopControlWorkToken> full_predecessor_tokens;
     std::vector<StopCertificateDTO> full_predecessor_certificates;
@@ -10974,18 +10933,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     full_predecessor_tokens.reserve(full_predecessors.size());
     full_predecessor_certificates.reserve(full_predecessors.size());
     for (const auto* predecessor : full_predecessors) {
-      full_outer_deadline_ns = std::min(full_outer_deadline_ns, predecessor->outer_deadline_ns);
-      const auto remaining = std::min(predecessor->accepted->remaining_outer_duration_ns,
-                                      predecessor->outer_deadline_ns <= accepted_at_ns
-                                          ? 0
-                                          : predecessor->outer_deadline_ns - accepted_at_ns);
-      if (remaining <= 0) {
-        motion_admission_closed_ = true;
-        return reject<StopAcceptedDTO>("resident predecessor exhausted before aggregation",
-                                       "stop_predecessor_deadline_exhausted",
-                                       ErrorCode::kInvariantViolation);
-      }
-      full_predecessor_inputs.push_back({*predecessor->accepted, remaining});
+      full_predecessor_inputs.push_back({*predecessor->accepted});
       if (predecessor->certificate.has_value()) {
         full_predecessor_certificates.push_back(*predecessor->certificate);
       } else {
@@ -11007,8 +10955,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         proposed_stop_id.value(),
         proposed_generation,
         accepted_at_ns,
-        outer_deadline_ns,
-        full_outer_deadline_ns,
         resolution.value().disposition,
         captured_digest.value().value(),
         full_digest.value().value(),
@@ -11079,22 +11025,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         }
         accepted->stale_diagnostics = std::move(resolution.value().stale_diagnostics);
       }
-      accepted->remaining_outer_duration_ns =
-          std::max<std::int64_t>(0, transaction.outer_deadline_ns - accepted_at_ns);
       accepted->accepted_at_ns = accepted_at_ns;
-      for (auto& participant : accepted->participant_budget_allocations) {
-        const auto elapsed =
-            accepted->fixed_outer_duration_ns - accepted->remaining_outer_duration_ns;
-        for (auto& phase : participant.phases) {
-          phase.remaining_deadline_offset_ns =
-              accepted->remaining_outer_duration_ns <= accepted->fixed_kernel_completion_reserve_ns
-                  ? 0
-                  : std::max<std::int64_t>(
-                        0, std::min(phase.fixed_deadline_offset_ns - elapsed,
-                                    accepted->remaining_outer_duration_ns -
-                                        accepted->fixed_kernel_completion_reserve_ns));
-        }
-      }
       if (outcome.correlation_retained) {
         stop_correlations_[outcome.correlation_slot] = *accepted;
       }
@@ -11249,30 +11180,24 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           orphan_resources.push_back(resource);
         }
       }
-      const auto remaining_outer_duration_ns =
-          std::max<std::int64_t>(0, outcome.outer_deadline_ns - accepted_at_ns);
       auto made =
           aggregate
               ? (ordinary != nullptr
                      ? MakeAggregatedStopAccepted(*ordinary, StopId(std::string(outcome.stop_id())),
                                                   outcome.stop_generation, acceptance_resolution,
-                                                  affected_revisions, *cell_stop_deadline_budget_,
-                                                  remaining_outer_duration_ns, accepted_at_ns,
-                                                  plans, full_predecessor_inputs)
+                                                  affected_revisions, accepted_at_ns,
+                                                  full_predecessor_inputs)
                      : MakeAggregatedStopAccepted(*full, StopId(std::string(outcome.stop_id())),
                                                   outcome.stop_generation, acceptance_resolution,
-                                                  affected_revisions, *cell_stop_deadline_budget_,
-                                                  remaining_outer_duration_ns, accepted_at_ns,
-                                                  plans, full_predecessor_inputs))
+                                                  affected_revisions, accepted_at_ns,
+                                                  full_predecessor_inputs))
               : (ordinary != nullptr
                      ? MakeStopAccepted(*ordinary, StopId(std::string(outcome.stop_id())),
                                         outcome.stop_generation, acceptance_resolution,
-                                        affected_revisions, *cell_stop_deadline_budget_,
-                                        remaining_outer_duration_ns, accepted_at_ns, plans)
+                                        affected_revisions, accepted_at_ns)
                      : MakeStopAccepted(*full, StopId(std::string(outcome.stop_id())),
                                         outcome.stop_generation, acceptance_resolution,
-                                        affected_revisions, *cell_stop_deadline_budget_,
-                                        remaining_outer_duration_ns, accepted_at_ns, plans));
+                                        affected_revisions, accepted_at_ns));
       if (!made.ok()) {
         return Result<StopAcceptedDTO>::Err(made.error());
       }
@@ -11388,7 +11313,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           outcome.work_token,
           StopId(std::string(outcome.stop_id())),
           outcome.stop_generation,
-          outcome.outer_deadline_ns,
           outcome.full_stop,
           false,
           EmergencyStopProjectionStateDTO::kPending,
@@ -11427,11 +11351,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       projection_state = std::move(affected_state);
       work_token = outcome.work_token;
       handoff_work = true;
-      // All deadline mutation for one physical Stop slot is serialized by
-      // state_mutex_. A predecessor may terminalize as soon as this aggregate
-      // becomes resident and rearm it at `now`; publishing the outer watchdog
-      // later must never overwrite that wakeup.
-      stop_control_executor_->ArmDeadline(work_token, outcome.outer_deadline_ns);
+      // Q51: no shared Stop deadline is armed; the handed-off work starts at
+      // once and every later wakeup is a robot's own stage deadline or a
+      // stage completion.
       next_stop_id_ = proposed_number + 1U;
       cell_stop_generation_ = std::max(cell_stop_generation_, outcome.stop_generation);
       if (outcome.full_stop ||
@@ -11467,7 +11389,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
             accepted->stop_id,
             accepted->stop_generation,
             accepted_at_ns,
-            outcome.outer_deadline_ns,
             accepted->resolution_disposition,
             accepted->captured_scope_digest,
             EmergencyStopEntryStateDTO::kActive,
@@ -12098,7 +12019,7 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
     for (const auto& participant : transaction.participants) {
       entries.push_back(participant_scope_entry(
           participant, *transaction.stop_id, transaction.stop_generation,
-          transaction.accepted->accepted_at_ns, transaction.accepted->remaining_outer_duration_ns));
+          transaction.accepted->accepted_at_ns));
       attempts.insert(attempts.end(), participant.retained_results.begin(),
                       participant.retained_results.end());
     }
@@ -12111,9 +12032,7 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
           std::nullopt,
           std::nullopt,
           std::nullopt,
-          transaction.accepted->accepted_at_ns,
-          transaction.accepted->remaining_outer_duration_ns,
-          {}});
+          transaction.accepted->accepted_at_ns});
     }
     // Fresh operation IDs and orphan resources are already canonical. The key
     // variant orders participant subjects before resource-only subjects.
@@ -12507,6 +12426,9 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
 
 void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken token) noexcept {
   try {
+    // Q60: late cancellation replies of never-dispatched participants whose
+    // Stop already closed are tidied up on this lane, before any Stop work.
+    settle_deferred_pre_dispatch_cancellations();
     struct PreparedCancellation final {
       OperationId operation_id;
       OperationParticipantId participant_id;
@@ -12732,27 +12654,28 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                               item.payload_kind, item.prepared_motion_engine,
                                               item.execution_engine, item.prepared_execution_id});
           }
+          // The bounded, local Prepare/read borrow and the synchronous
+          // cancellation call still finish inside this Stop lane (this pass
+          // issues the call below and re-enters directly). Q60: the
+          // cancellation's own asynchronous terminal is not awaited.
           const bool waiting =
-              preparation_in_flight ||
-              (needs_cancellation &&
-               (!item.prepared_cancel_complete ||
-                (item.payload_kind == OperationParticipantPayloadKind::kMotion &&
-                 !item.prepared_cancel_terminal_observed &&
-                 !item.unclassified_prepared_terminal.has_value())));
-          if ((needs_cancellation || preparation_in_flight) &&
-              now >= transaction.outer_deadline_ns) {
-            // No effect crossed the fence, but cleanup did not settle in the
-            // accepted budget. Keep its outstanding borrows; a late result
-            // cannot rewrite the partial certificate or clear the fault.
-            fail_prepared_cancellation(
-                item, error(std::string(to_string(ErrorCode::kExecutionTimeout)),
-                            "Prepared cancellation did not settle before the Stop deadline",
-                            "prepared_cancellation_deadline_expired"));
-          } else if (waiting) {
-            next_deadline = !next_deadline.has_value()
-                                ? transaction.outer_deadline_ns
-                                : std::min(*next_deadline, transaction.outer_deadline_ns);
+              preparation_in_flight || (needs_cancellation && !item.prepared_cancel_complete);
+          const bool cancel_terminal_outstanding =
+              needs_cancellation && item.prepared_cancel_complete &&
+              item.payload_kind == OperationParticipantPayloadKind::kMotion &&
+              !item.prepared_cancel_terminal_observed &&
+              !item.unclassified_prepared_terminal.has_value();
+          if (waiting) {
+            // Q51: no shared Stop deadline; the never-dispatched participant's
+            // own owner settles it (its completion wakes this Stop).
             continue;
+          } else if (cancel_terminal_outstanding) {
+            // Q60: nothing was dispatched and the dispatch barrier stays
+            // closed, so the Stop closes now. The participant's settlement is
+            // deferred to its cancellation terminal (below).
+            item.cancel_terminal_deferred = true;
+            item.contained = true;
+            item.terminal = true;
           } else if (item.unclassified_prepared_terminal.has_value()) {
             if (item.prepared_motion_engine == nullptr || item.prepared_execution_id == 0U) {
               fail_prepared_cancellation(item, *item.unclassified_prepared_terminal);
@@ -12765,9 +12688,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                      item.prepared_motion_engine, item.execution_engine,
                      item.prepared_execution_id});
               }
-              next_deadline = !next_deadline.has_value()
-                                  ? transaction.outer_deadline_ns
-                                  : std::min(*next_deadline, transaction.outer_deadline_ns);
               continue;
             }
           } else {
@@ -12778,7 +12698,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
 
         const auto expire_attempt = [&](auto& attempt, const TimePoint observed_at) {
           if (!attempt.started || attempt.result_consumed || attempt.superseded ||
-              observed_at < attempt.stage_deadline_ns) {
+              !attempt.stage_deadline_ns.has_value() || observed_at < *attempt.stage_deadline_ns) {
             return false;
           }
           attempt.superseded = true;
@@ -12786,7 +12706,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             static_cast<void>(stop_stage_attempt_executor_->RequestCancel(*attempt.handle));
           }
           retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
-                                   "Stop stage did not prove containment before its phase deadline",
+                                   "Controlled Stop did not prove containment before its deadline",
                                    "participant_stop_stage_deadline_expired"));
           // The deadline watchdog issues the hard floor (as `main`). A
           // contained fallback is a degraded Stop, never a cell-wide latch
@@ -12894,9 +12814,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           auto& attempt = item.attempts[item.current_stage_index];
           if (attempt.started && !attempt.result_consumed) {
             if (expire_attempt(attempt, clock_.now())) continue;
-            next_deadline = !next_deadline.has_value()
-                                ? std::optional(attempt.stage_deadline_ns)
-                                : std::min(*next_deadline, attempt.stage_deadline_ns);
+            if (attempt.stage_deadline_ns.has_value()) {
+              next_deadline = !next_deadline.has_value()
+                                  ? attempt.stage_deadline_ns
+                                  : std::min(*next_deadline, *attempt.stage_deadline_ns);
+            }
             break;
           }
           if (attempt.started) {
@@ -12904,14 +12826,15 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             continue;
           }
           const auto dispatch_now = clock_.now();
-          auto budget = remaining_stop_budget(item.plan, stop_id, stop_generation, dispatch_now,
-                                              transaction.outer_deadline_ns);
-          const auto watchdog = stage_watchdog_deadline(
-              item.plan.stage_commands[item.current_stage_index], budget, dispatch_now);
-          if (!watchdog.has_value() || budget.remaining_outer_duration_ns <= 0) {
+          auto budget = remaining_stop_budget(item.plan.stage_commands[item.current_stage_index],
+                                              stop_id, stop_generation, dispatch_now,
+                                              transaction.accepted->accepted_at_ns);
+          const auto watchdog = stage_watchdog_deadline(budget, dispatch_now);
+          if (budget.remaining_controlled_deadline_ns.has_value() &&
+              *budget.remaining_controlled_deadline_ns <= 0) {
             retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
-                                     "Stop stage command phase expired before dispatch",
-                                     "participant_stop_stage_command_phase_expired"));
+                                     "Controlled Stop deadline passed before its dispatch",
+                                     "participant_stop_stage_deadline_expired"));
             advance_to_strongest();
             continue;
           }
@@ -12946,10 +12869,12 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           }
           attempt.started = true;
           attempt.handle = *started.handle;
-          attempt.stage_deadline_ns = *watchdog;
-          next_deadline = !next_deadline.has_value()
-                              ? watchdog
-                              : std::optional(std::min(*next_deadline, *watchdog));
+          attempt.stage_deadline_ns = watchdog;
+          if (watchdog.has_value()) {
+            next_deadline = !next_deadline.has_value()
+                                ? watchdog
+                                : std::optional(std::min(*next_deadline, *watchdog));
+          }
           break;
         }
 
@@ -12980,25 +12905,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const bool participant_settlement_required = !item.settlement_not_required();
         if (item.contained && participant_settlement_required &&
             !item.participant_settlement_complete) {
-          if (item.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
-              active_participant->dispatch_effect_in_flight) {
-            // Physical containment is already independent of ordinary dispatch.
-            // Local cleanup needs the returned command identity, but must not
-            // keep this Stop transaction alive beyond its existing deadline.
-            // Retain the unresolved dispatch borrow and containment evidence.
-            if (now < transaction.outer_deadline_ns) {
-              next_deadline = !next_deadline.has_value()
-                                  ? transaction.outer_deadline_ns
-                                  : std::min(*next_deadline, transaction.outer_deadline_ns);
-              continue;
-            }
-            item.participant_settlement_complete = true;
-            item.participant_settlement_error =
-                error(std::string(to_string(ErrorCode::kExecutionTimeout)),
-                      "Contained command did not return before the Stop settlement deadline",
-                      "participant_stop_dispatch_settlement_deadline_expired");
-            motion_admission_closed_ = true;
-          }
+          // Q58 (as `main`): the gripper's cancel is fire-and-forget and the
+          // Stop does not wait for the still-returning command; a stuck
+          // gripper cannot hold up the Stop. Its exact local settlement is
+          // handed to the dispatch return (local cleanup needs the returned
+          // command identity); the dispatch borrow stays retained until then.
+          const bool defer_settlement =
+              item.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+              active_participant->dispatch_effect_in_flight;
           if (!item.participant_settlement_complete && !item.participant_settlement_requested) {
             item.participant_settlement_requested = true;
             if (active_participant->engine == nullptr || item.prepared_execution_id == 0U) {
@@ -13011,8 +12925,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             } else {
               std::optional<ParticipantStopStageResultDTO> settlement_evidence;
               if (item.cancelled_pre_dispatch) {
-                auto budget = remaining_stop_budget(item.plan, stop_id, stop_generation, now,
-                                                    transaction.outer_deadline_ns);
+                auto budget = remaining_stop_budget(item.plan.stage_commands.front(), stop_id,
+                                                    stop_generation, now,
+                                                    transaction.accepted->accepted_at_ns);
                 auto stage =
                     resolve_participant_stop_stage(item, stop_id, stop_generation, 0U, budget);
                 if (stage.ok()) {
@@ -13054,15 +12969,28 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                           "participant_stop_containment_result_missing");
                 motion_admission_closed_ = true;
               } else if (settlement_evidence.has_value()) {
-                participant_settlements.push_back(AddressedParticipantStopSettlement{
-                    item.operation_id, item.plan.participant_id, active_participant->engine,
-                    AddressedParticipantStopSettlementRequestDTO{
-                        item.prepared_execution_id,
-                        StopCertificateRefDTO{
-                            StopCertificateId("stop-certificate." + stop_id.value()),
-                            StopCertificateRevision(1U), stop_id, stop_generation},
-                        std::move(*settlement_evidence), item.payload_kind,
-                        item.cancelled_pre_dispatch}});
+                AddressedParticipantStopSettlementRequestDTO settlement_request{
+                    item.prepared_execution_id,
+                    StopCertificateRefDTO{StopCertificateId("stop-certificate." + stop_id.value()),
+                                          StopCertificateRevision(1U), stop_id, stop_generation},
+                    std::move(*settlement_evidence), item.payload_kind,
+                    item.cancelled_pre_dispatch};
+                if (defer_settlement) {
+                  active_participant->deferred_stop_settlement = std::move(settlement_request);
+                  item.participant_settlement_complete = true;
+                } else if (item.cancel_terminal_deferred) {
+                  // Q60: as Q58, the exact settlement waits for the
+                  // cancellation's own terminal; the Stop does not.
+                  active_participant->deferred_cancel_settlement =
+                      ActiveOperationParticipant::DeferredPreDispatchCancelSettlement{
+                          std::move(settlement_request), token, std::nullopt, std::nullopt,
+                          false};
+                  item.participant_settlement_complete = true;
+                } else {
+                  participant_settlements.push_back(AddressedParticipantStopSettlement{
+                      item.operation_id, item.plan.participant_id, active_participant->engine,
+                      std::move(settlement_request)});
+                }
               }
             }
           }
@@ -13173,16 +13101,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                 participant.settlement_not_required() ||
                                 participant.participant_settlement_complete);
                       });
-      const auto expected_participant_count = static_cast<std::size_t>(std::count_if(
-          transaction.accepted->participant_budget_allocations.begin(),
-          transaction.accepted->participant_budget_allocations.end(), [&](const auto& budget) {
-            return budget.origin_stop_id == stop_id &&
-                   budget.origin_stop_generation == stop_generation;
-          }));
-      if (transaction.participants.size() != expected_participant_count) {
-        transaction.fresh_scope_complete = false;
-        motion_admission_closed_ = true;
-      }
       if (transaction.fresh_scope_complete) {
         const bool predecessors_terminal = std::all_of(
             transaction.predecessor_tokens.begin(), transaction.predecessor_tokens.end(),
@@ -14780,8 +14698,7 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
         operation->dispatch_effect_in_flight() || operation->reconciliation_in_flight() ||
         std::any_of(operation->participants.begin(), operation->participants.end(),
                     [](const auto& participant) {
-                      return participant.prepare_in_flight ||
-                             participant.prepared_advance_in_flight;
+                      return participant.preparation_borrow_in_flight();
                     }))
       return reject<KernelRecoveryActionResultDTO>("operation work is still in flight",
                                                    "operation_recovery_busy",
@@ -15135,8 +15052,8 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
         operation->reconciliation_in_flight() ||
         std::any_of(operation->participants.begin(), operation->participants.end(),
                     [](const auto& participant) {
-                      return participant.engine == nullptr || participant.prepare_in_flight ||
-                             participant.prepared_advance_in_flight;
+                      return participant.engine == nullptr ||
+                             participant.preparation_borrow_in_flight();
                     })) {
       return reject<KernelRecoveryActionResultDTO>(
           "coordinated operation recovery fence is stale or busy", "operation_recovery_stale",
@@ -15544,7 +15461,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
   if (operation->dispatch_effect_in_flight() || operation->reconciliation_in_flight() ||
       std::any_of(operation->participants.begin(), operation->participants.end(),
                   [](const auto& participant) {
-                    return participant.prepare_in_flight || participant.prepared_advance_in_flight;
+                    return participant.preparation_borrow_in_flight();
                   })) {
     // A sibling may still hold a borrowed engine from before the abort. Keep
     // the fault resident; existing explicit Reset can retire it after drain.
@@ -15728,6 +15645,132 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
 
   return release_prepared_dispatch_barrier(operation_id, target->engine, target->subordinate_id,
                                            *snapshot.value().participant);
+}
+
+void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
+    const OperationId& operation_id, IResolvedParticipantExecutionEngine* participant_engine,
+    IResolvedParticipantExecutionEngine* settlement_engine,
+    const AddressedParticipantStopSettlementRequestDTO& request) {
+  // The same exact settlement the Stop would have requested had the command
+  // already returned (Q58: the Stop did not wait for it).
+  std::optional<ErrorDTO> failure;
+  if (settlement_engine == nullptr) {
+    failure = error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                    "Stopped participant lost its local execution owner",
+                    "participant_stop_settlement_authority_missing");
+  } else {
+    try {
+      const auto settled = settlement_engine->settle_addressed_participant_stop(request);
+      if (!settled.ok()) {
+        failure = settled.error();
+      } else {
+        const auto& value = settled.value();
+        const auto& recovery = value.recovery_assessment;
+        if (value.execution_id != request.execution_id ||
+            !(value.aggregate_stop_certificate == request.aggregate_stop_certificate) ||
+            recovery.execution_id != request.execution_id ||
+            recovery.status != RecoveryAssessmentStatus::kRetryReady) {
+          failure = error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                          "participant returned a mismatched addressed Stop settlement",
+                          "participant_stop_settlement_mismatch");
+        }
+      }
+    } catch (const std::exception& exception) {
+      failure = error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                      std::string("addressed Stop settlement threw: ") + exception.what(),
+                      "participant_stop_settlement_threw");
+    } catch (...) {
+      failure = error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                      "addressed Stop settlement threw", "participant_stop_settlement_threw");
+    }
+  }
+  if (!failure.has_value()) return;
+  std::lock_guard state_lock(state_mutex_);
+  motion_admission_closed_ = true;
+  auto* operation = find_active_operation_locked(operation_id);
+  auto* participant =
+      operation == nullptr ? nullptr : operation->participant_for(participant_engine);
+  if (participant != nullptr) participant->last_subordinate_error = std::move(failure);
+}
+
+void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellations() noexcept {
+  struct ReturnedCancellation final {
+    OperationId operation_id;
+    IResolvedParticipantExecutionEngine* engine{};
+    IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
+    AddressedParticipantStopSettlementRequestDTO request;
+    OperationStateKind state{OperationStateKind::kStopped};
+    std::optional<ErrorDTO> error;
+  };
+  try {
+    std::vector<ReturnedCancellation> returned;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      for (auto& [operation_id, operation] : active_operations_) {
+        for (auto& participant : operation->participants) {
+          auto& deferred = participant.deferred_cancel_settlement;
+          if (!deferred.has_value() || !deferred->returned_state.has_value() ||
+              deferred->settlement_in_flight) {
+            continue;
+          }
+          deferred->settlement_in_flight = true;
+          returned.push_back(ReturnedCancellation{operation_id, participant.engine,
+                                                  participant.prepared_motion_engine,
+                                                  deferred->request, *deferred->returned_state,
+                                                  deferred->returned_error});
+        }
+      }
+    }
+    for (auto& cancellation : returned) {
+      std::optional<ErrorDTO> failure;
+      bool preparation_failed = false;
+      if (cancellation.state == OperationStateKind::kStopped) {
+        // The same exact settlement the Stop would have requested had the
+        // cancellation already returned; a failed settlement fails closed.
+        settle_deferred_capability_stop(cancellation.operation_id, cancellation.engine,
+                                        cancellation.engine, cancellation.request);
+      } else {
+        // As the synchronous path: only the prepared owner's exact snapshot
+        // proves an already-failed, never-dispatched preparation; anything
+        // else is a failed cancellation.
+        failure = cancellation.error.value_or(
+            error(std::string(to_string(ErrorCode::kExecutionAborted)),
+                  "prepared participant failed while settling pre-dispatch cancellation",
+                  "prepared_cancel_terminal_failed"));
+        if (cancellation.prepared_engine != nullptr) {
+          try {
+            const auto execution_id = cancellation.request.execution_id;
+            const auto snapshot = cancellation.prepared_engine->ObservePreparedMotion(execution_id);
+            preparation_failed =
+                snapshot.ok() && snapshot.value().execution_id == execution_id &&
+                snapshot.value().state ==
+                    ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed &&
+                !snapshot.value().last_dispatched_participant;
+          } catch (...) {
+            preparation_failed = false;
+          }
+        }
+      }
+      std::lock_guard state_lock(state_mutex_);
+      auto* operation = find_active_operation_locked(cancellation.operation_id);
+      auto* participant =
+          operation == nullptr ? nullptr : operation->participant_for(cancellation.engine);
+      if (participant == nullptr || !participant->deferred_cancel_settlement.has_value() ||
+          participant->deferred_cancel_settlement->request.execution_id !=
+              cancellation.request.execution_id) {
+        motion_admission_closed_ = true;
+        continue;
+      }
+      if (failure.has_value()) {
+        participant->last_subordinate_error = std::move(failure);
+        if (!preparation_failed) motion_admission_closed_ = true;
+      }
+      participant->deferred_cancel_settlement.reset();
+    }
+  } catch (...) {
+    std::lock_guard state_lock(state_mutex_);
+    motion_admission_closed_ = true;
+  }
 }
 
 Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier(
@@ -15978,6 +16021,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
   std::vector<OperationParticipantId> attempted_participants;
   for (const auto& dispatch_target : dispatch_targets) {
     std::optional<StopIntentDTO> admission_stop;
+    std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_settlement;
+    IResolvedParticipantExecutionEngine* deferred_settlement_engine{};
     {
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
@@ -16044,6 +16089,11 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           operation == nullptr ? nullptr : operation->participant_for(dispatch_target.engine);
       if (participant != nullptr && participant->subordinate_id == dispatch_target.preparation_id) {
         participant->dispatch_effect_in_flight = false;
+        if (participant->deferred_stop_settlement.has_value()) {
+          deferred_settlement = std::move(participant->deferred_stop_settlement);
+          participant->deferred_stop_settlement.reset();
+          deferred_settlement_engine = participant->engine;
+        }
         if (!dispatched.ok()) {
           participant->last_subordinate_error = dispatched.error();
         } else if (command_result.has_value()) {
@@ -16066,6 +16116,10 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     }
     if (stop_wakeup.has_value()) {
       stop_control_executor_->Publish(*stop_wakeup);
+    }
+    if (deferred_settlement.has_value()) {
+      settle_deferred_capability_stop(operation_id, dispatch_target.engine,
+                                      deferred_settlement_engine, *deferred_settlement);
     }
     if (command_result.has_value() && !stop_wakeup.has_value()) {
       OperationCommitGuard commit(*this, operation_id);
@@ -16795,6 +16849,26 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     operation_id = find_event_operation_locked(engine, event.execution_id);
     auto* operation =
         operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
+    if (auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
+        participant != nullptr && participant->deferred_cancel_settlement.has_value() &&
+        participant->deferred_cancel_settlement->request.execution_id == event.execution_id) {
+      // Q60: the late cancellation reply of a never-dispatched participant
+      // whose Stop already closed. The closed Stop keeps owning this
+      // participant's terminal; only its deferred settlement is tidied up, on
+      // the Stop lane (never inside the subordinate's callback).
+      auto& deferred = *participant->deferred_cancel_settlement;
+      if (terminal(state) && !deferred.returned_state.has_value()) {
+        deferred.returned_state = state;
+        deferred.returned_error = event.error;
+        auto wake = deferred.stop_token;
+        if (wake.slot < stop_transactions_.size() && stop_transactions_[wake.slot] != nullptr &&
+            stop_transactions_[wake.slot]->token.generation > wake.generation) {
+          wake = stop_transactions_[wake.slot]->token;
+        }
+        stop_control_executor_->ArmDeadline(wake, clock_.now());
+      }
+      return;
+    }
     if (operation != nullptr && terminal(state) && state != OperationStateKind::kCompleted &&
         operation->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll &&
         !operation->state.active_stop_id.has_value() &&

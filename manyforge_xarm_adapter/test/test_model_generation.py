@@ -181,6 +181,8 @@ def test_manyforge_jtc_qualification_preserves_vendor_constraints() -> None:
         'lite6_traj_controller': {
             'ros__parameters': {
                 'joints': joints,
+                'command_interfaces': ['position', 'velocity'],
+                'state_interfaces': ['position', 'velocity'],
                 'constraints': {
                     'goal_time': 0.5,
                     **{
@@ -201,6 +203,15 @@ def test_manyforge_jtc_qualification_preserves_vendor_constraints() -> None:
     ]
 
     assert result is not source
+    assert result['lite6_traj_controller']['ros__parameters'][
+        'command_interfaces'
+    ] == ['position']
+    assert result['lite6_traj_controller']['ros__parameters'][
+        'state_interfaces'
+    ] == ['position', 'velocity']
+    assert source['lite6_traj_controller']['ros__parameters'][
+        'command_interfaces'
+    ] == ['position', 'velocity']
     assert 'decelerate_on_cancel' not in source[
         'lite6_traj_controller'
     ]['ros__parameters']['constraints']

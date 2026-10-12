@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -115,16 +116,32 @@ def test_historical_sources_and_all_six_case_families_remain_pinned() -> None:
     }
 
 
-def test_owner_neutral_static_artifact_validation_survives() -> None:
+@pytest.fixture
+def supplied_static_description(tmp_path: Path) -> Path:
     root = _STATIC_VALIDATOR.REPO_ROOT
+    # Explicit static validator fixture, not the host generator or ROS proof.
+    model = ET.parse(root / "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf")
+    for control in model.getroot().findall("ros2_control"):
+        model.getroot().remove(control)
+    control = ET.SubElement(model.getroot(), "ros2_control", name="fixture", type="system")
+    ET.SubElement(ET.SubElement(control, "hardware"), "plugin").text = "topic_based_ros2_control/TopicBasedSystem"
+    for name in _STATIC_VALIDATOR.ARM_JOINTS:
+        joint = ET.SubElement(control, "joint", name=name)
+        ET.SubElement(joint, "command_interface", name="position")
+        for state in ("position", "velocity"):
+            ET.SubElement(joint, "state_interface", name=state)
+    supplied_description = tmp_path / "supplied_description.urdf"
+    model.write(supplied_description, encoding="utf-8", xml_declaration=True)
 
+    return supplied_description
+
+
+def test_owner_neutral_static_artifact_validation_survives(
+    supplied_static_description: Path,
+) -> None:
+    root = _STATIC_VALIDATOR.REPO_ROOT
     report = _STATIC_VALIDATOR.validate_static_artifacts(
-        ros2_control_urdf=(
-            root
-            / "manyforge_ros_bringup"
-            / "urdf"
-            / "isaac_lite6_topic_based.ros2_control.urdf"
-        ),
+        ros2_control_urdf=supplied_static_description,
         controllers=(
             root
             / "manyforge_ros_bringup"
@@ -192,11 +209,18 @@ def test_historical_static_validator_cli_is_typed_unavailable_before_parse(
 
 def test_static_validator_cli_requires_explicit_static_artifact_mode(
     capsys: pytest.CaptureFixture[str],
+    supplied_static_description: Path,
 ) -> None:
     assert _STATIC_VALIDATOR.main(
-        (_STATIC_VALIDATOR.STATIC_ARTIFACT_MODE,)
+        (_STATIC_VALIDATOR.STATIC_ARTIFACT_MODE, "--ros2-control-urdf", str(supplied_static_description))
     ) == 0
     assert (
         "Lite6 static ROS/control/gripper artifacts passed."
         in capsys.readouterr().out
     )
+
+
+def test_static_validator_requires_a_supplied_robot_description() -> None:
+    with pytest.raises(SystemExit) as failure:
+        _STATIC_VALIDATOR.main(["static-artifacts"])
+    assert failure.value.code == 2

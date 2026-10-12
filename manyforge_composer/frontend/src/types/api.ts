@@ -610,6 +610,9 @@ export interface DeploymentCandidateOperationResponse {
 export interface DeploymentControlledStopProfile {
   stop_mode: 'soft_on_path' | 'spring_back_hold';
   deceleration_time_s: number;
+  /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
+   * request; absent uses the deceleration time + 0.5 s. */
+  max_stop_time_s?: number;
   allow_natural_completion_on_short_path: boolean;
   /** null is an older Draft that still requires an explicit migration choice. */
   jerk_limits_enabled: boolean | null;
@@ -627,18 +630,11 @@ export interface DeploymentControlledStopProfile {
   }>;
 }
 
-export interface DeploymentStopTiming {
-  command_latency_allowance_ns: number;
-  settling_allowance_ns: number;
-  operational_timeout_ns: number;
-}
-
 export interface DeploymentControlledStopUpdate {
   controllable_component_id: string;
   command_target_id: string;
   /** null keeps the selected target's profile unchanged (including non-motion targets). */
   profile: DeploymentControlledStopProfile | null;
-  timing: DeploymentStopTiming | null;
 }
 
 export interface CurrentScenarioSelection {

@@ -100,7 +100,12 @@ def test_profile_surface_has_no_retired_fallback_or_timeout_fields() -> None:
 
     assert core.motion_interrupt_stop_profile_field_error(profile) == ""
     assert core.motion_interrupt_deceleration_time_or_default(profile) == 1.0
-    assert not hasattr(profile, "max_stop_time_s")
+    # Q51 (as `main`): the per-profile controlled Stop deadline is restored.
+    assert profile.max_stop_time_s is None
+    profile.max_stop_time_s = 3.0
+    assert core.motion_interrupt_stop_profile_field_error(profile) == ""
+    profile.max_stop_time_s = 0.0
+    assert core.motion_interrupt_stop_profile_field_error(profile) != ""
     assert not hasattr(profile, "allowed_fallback_modes")
     assert not hasattr(profile, "joint_deceleration_profile_id")
     assert not hasattr(profile, "per_joint_max_deceleration_rad_s2")

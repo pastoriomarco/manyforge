@@ -22,7 +22,12 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml,
     raw_sha256_digest,
 )
-from manyforge_behavior.model_source_capture import capture_deployment_model_sources
+from manyforge_behavior.model_source_capture import (
+    MAX_XML_BYTES,
+    capture_deployment_model_sources,
+    decode_model_source_artifact,
+    encode_model_source_artifact,
+)
 from manyforge_behavior.model_source_preparation import prepare_captured_model_source
 
 
@@ -160,10 +165,15 @@ def _native_host_identity(prepared: dict[str, object]) -> str:
     bundle = prepared["activation_payload"]["retained_bundle"]
     runtime_units = bundle["cell_graph"]["runtime_units"]
     if len(runtime_units) != 1:
-        raise AssertionError("prepared Deployment does not have one native host")
+        raise AssertionError("prepared Deployment does not have one execution host")
     runtime = runtime_units[0]
-    if runtime["runtime_profile_id"] != "manyforge.native_execution_runtime":
-        raise AssertionError("prepared Deployment selected a non-native runtime")
+    # Q63-Q66: offline Scenarios run on the mock ROS lane; an empty
+    # Deployment keeps the canonical native host.
+    if runtime["runtime_profile_id"] not in {
+        "manyforge.native_execution_runtime",
+        "manyforge.ros2_control_execution_runtime",
+    }:
+        raise AssertionError("prepared Deployment selected an unknown runtime")
     return runtime["runtime_unit_id"]
 
 
@@ -643,6 +653,51 @@ def _rehash_request(request: dict[str, object]) -> None:
     )
 
 
+def _check_two_ros_robots(
+    args: argparse.Namespace, request: dict[str, object], root: Path
+) -> None:
+    """Q68: two ROS robots with catalog controller profiles compose."""
+    prepared = _run(args, request, root)
+    assert prepared is not None
+    graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
+    components = sorted(
+        row["controllable_component_id"] for row in graph["controllable_components"]
+    )
+    assert components == ["isaac_ur10e_light_robot", "isaac_ur10e_second_robot"]
+    assert len(graph["runtime_units"]) == 1
+    runtime = graph["runtime_units"][0]
+    assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
+    configuration = runtime["configuration"]
+    # Q68: each component carries its own controller profile.
+    assert configuration["controller_profiles"] == [
+        {"controllable_component_id": component,
+         ("isaac_profile" if component == "isaac_ur10e_light_robot" else "mock_profile"):
+             ("ur10e" if component == "isaac_ur10e_light_robot" else "ur10e_robotiq_2f_140"),
+         "frame_prefix": next(row for row in request["deployment"]["components"]
+                              if row["component_id"] == component).get("frame_prefix", "")}
+        for component in components
+    ]
+    assert "isaac_profile" not in configuration
+    authored = [
+        component["configuration"]["runtime_configuration"]
+        for component in request["deployment"]["components"]
+    ]
+    # Each robot keeps its own initial state (component order), TCP-speed
+    # maximum and fault Stop profile; no native-only field is introduced.
+    assert configuration["initial_joint_positions_rad"] == [
+        value for row in authored for value in row["initial_joint_positions_rad"]
+    ]
+    assert [
+        row["controllable_component_id"] for row in configuration["motion_target_limits"]
+    ] == components
+    assert [
+        row["controllable_component_id"]
+        for row in configuration["default_fault_stop_profiles"]
+    ] == components
+    assert "direct_control_joint_limits" not in configuration
+    assert "gripper_target_configurations" not in configuration
+
+
 def _check_ros_preparation(
     args: argparse.Namespace,
     request: dict[str, object],
@@ -650,12 +705,32 @@ def _check_ros_preparation(
     document: dict[str, object],
     root: Path,
 ) -> None:
+    missing_world = copy.deepcopy(request)
+    missing_world["deployment"].pop("isaac_world")
+    _rehash_request(missing_world)
+    _run(args, missing_world, root / "ros-missing-world",
+         expect_error="isaac_world is required when a component uses an Isaac profile")
+    for index, world in enumerate(("/site/world.usda", "file:/world.usda", "", None)):
+        bad_world = copy.deepcopy(request)
+        bad_world["deployment"]["isaac_world"] = world
+        _rehash_request(bad_world)
+        _run(args, bad_world, root / f"ros-invalid-world-{index}",
+             expect_error="isaac_world")
     prepared = _run(args, request, root / "ros-valid")
     assert prepared is not None
     bundle = prepared["activation_payload"]["retained_bundle"]
+    # Q87: older authored projects remain valid; omission materializes the
+    # same empty prefix as current explicit authoring before sealing.
+    old_authored = copy.deepcopy(request)
+    for component in old_authored["deployment"]["components"]:
+        component.pop("frame_prefix", None)
+    _rehash_request(old_authored)
+    old_authored_result = _run(args, old_authored, root / "ros-old-authored")
+    assert old_authored_result is not None
+    assert old_authored_result["activation_payload"]["retained_bundle"] == bundle
     graph = bundle["cell_graph"]
     component_id = "isaac_ur10e_light_robot"
-    runtime_id = f"{component_id}.ros2_control_execution"
+    runtime_id = "robot_cell.ros2_control_execution"
     assert graph["cell_id"] == request["runtime_cell_id"]
     assert len(graph["runtime_units"]) == 1
     runtime = graph["runtime_units"][0]
@@ -671,6 +746,30 @@ def _check_ros_preparation(
         "controllable_component_id": component_id,
         "command_target_id": "arm",
         "maximum_tcp_linear_speed_mps": 0.25,
+    }]
+    # Q68: the authored selector becomes the component's controller profile
+    # row inside the one ROS runtime unit.
+    expected_configuration["isaac_world"] = request["deployment"]["isaac_world"]
+    expected_configuration["controller_profiles"] = [{
+        "controllable_component_id": component_id,
+        "isaac_profile": expected_configuration.pop("isaac_profile"),
+        "frame_prefix": request["deployment"]["components"][0].get("frame_prefix", ""),
+    }]
+    # Q37: the authored fault Stop profile is carried unchanged (its joint map
+    # as canonical-sorted rows) for the arm target.
+    authored_fault = copy.deepcopy(request["deployment"]["components"][0][
+        "configuration"
+    ]["default_fault_stop_profile"])
+    authored_fault["per_joint_max_deceleration_rad_s2"] = [
+        {"source_joint_name": joint, "max_deceleration_rad_s2": limit}
+        for joint, limit in sorted(
+            authored_fault["per_joint_max_deceleration_rad_s2"].items()
+        )
+    ]
+    expected_configuration["default_fault_stop_profiles"] = [{
+        "controllable_component_id": component_id,
+        "command_target_id": "arm",
+        **authored_fault,
     }]
     assert runtime["configuration"] == expected_configuration
     assert runtime["configuration"]["mode"] == "commanded_sim"
@@ -691,7 +790,18 @@ def _check_ros_preparation(
         assert row["state_authority_id"] == f"{component_id}.{target}.commanded_sim_state"
         assert row["control_interface_contract_id"] == f"manyforge.ros2_control_{target}_position"
         assert row["controller_topology_id"] == f"manyforge.ros2_control_{target}_direct"
-        assert not row.get("runtime_scale_route_qualifications")
+        if target == "arm" and row["capability_id"] == "execution.trajectory.execute":
+            assert row["runtime_scale_route_qualifications"] == [{
+                "control_route_id": "arm_position",
+                "scaling_domain_id": f"{component_id}.arm.runtime_scale",
+                "command_endpoint_role_id": "command",
+                "applied_state_endpoint_role_id": "state",
+                "acknowledgement_kind": "applied_state",
+                "maximum_slew_per_second": 4.0,
+                "freshness_budget_ns": 100_000_000,
+            }]
+        else:
+            assert not row.get("runtime_scale_route_qualifications")
         assert row["capability_id"] != "execution.runtime_scale.operation_scoped"
     arm = next(row for row in bindings if row["capability_id"] == "execution.trajectory.execute")
     gripper = next(row for row in bindings if row["capability_id"] == "tool.gripper.command")
@@ -807,19 +917,175 @@ def _check_ros_preparation(
          expect_error="authored ROS ordinary motion jerk is not yet supported")
 
     for scenario, expected_error in (
-        ("examples/lite6_pick_and_place.scenario", "mixed native and ROS runtime compositions"),
-        ("examples/isaac-lite6-pick-place.scenario", "authored ROS composition requires one UR10e aggregate profile"),
+        # Q68 + Q63-Q66: the offline Lite 6 is a mock ROS component now; the
+        # pair is refused only by the existing shared runtime-unit cadence
+        # agreement (50 ms vs the UR10e light scene's 100 ms).
+        (
+            "examples/lite6_pick_and_place.scenario",
+            "disagree on collision_monitor_period_ms",
+        ),
+        # Q68: two ROS robots pass the composition rule; this pair is refused
+        # only by the existing shared runtime-unit cadence agreement.
+        (
+            "examples/isaac-lite6-pick-place.scenario",
+            "exclusive Isaac topic collision",
+        ),
     ):
         _, additional, _ = _scenario_request(args.workspace, scenario)
         unsupported = copy.deepcopy(document)
         unsupported["deployment_draft"]["components"].extend(
             additional["deployment_draft"]["components"]
         )
+        for added in unsupported["deployment_draft"]["components"]:
+            if added["component_id"] != document["deployment_draft"]["components"][0]["component_id"]:
+                added["frame_prefix"] = added["component_id"] + "/"
         unsupported["deployment_draft"]["components"].sort(
             key=lambda component: component["component_id"]
         )
         combined = _request(scenario_path, unsupported, request["program"])
         _run(args, combined, root / Path(scenario).stem, expect_error=expected_error)
+    for index, prefix in enumerate(("second/", "Robot_2/nested/", "0/", "_/", "robot//")):
+        prefixed = copy.deepcopy(request)
+        prefixed["deployment"]["components"][0]["frame_prefix"] = prefix
+        _rehash_request(prefixed)
+        prefixed_result = _run(args, prefixed, root / f"ros-explicit-prefix-{index}")
+        assert prefixed_result is not None
+        assert prefixed_result["activation_payload"]["retained_bundle"]["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0]["frame_prefix"] == prefix
+    for index, prefix in enumerate(("literal prefix/", "/robot/", "/", "robot", "robot-b/", "robot.b/",
+                                    "röbot/", "robot/\n", "robot\\/")):
+        bad_format = copy.deepcopy(request)
+        bad_format["deployment"]["components"][0]["frame_prefix"] = prefix
+        _rehash_request(bad_format)
+        _run(args, bad_format, root / f"ros-invalid-prefix-format-{index}",
+             expect_error="frame_prefix must be empty or use only ASCII letters")
+    bad_prefix = copy.deepcopy(request)
+    bad_prefix["deployment"]["components"][0]["frame_prefix"] = 1
+    _rehash_request(bad_prefix)
+    _run(args, bad_prefix, root / "ros-invalid-prefix", expect_error="frame_prefix must be a string")
+    # Q68: any number of ROS components with catalog controller profiles is
+    # accepted by the compiler (no hard-coded single-UR10e rule).
+    two_robots = copy.deepcopy(document)
+    second_robot = copy.deepcopy(two_robots["deployment_draft"]["components"][0])
+    second_robot["component_id"] = "isaac_ur10e_second_robot"
+    second_robot["frame_prefix"] = "second/"
+    second_robot["root_pose_in_cell"]["position_m"] = [1.5, 0.0, 0.0]
+    two_robots["deployment_draft"]["components"].append(second_robot)
+    two_robots["deployment_draft"]["components"].sort(
+        key=lambda component: component["component_id"]
+    )
+    colliding = copy.deepcopy(two_robots)
+    del colliding["deployment_draft"]["components"][1]["frame_prefix"]
+    _run(args, _request(scenario_path, colliding, request["program"]),
+         root / "ros-colliding-frames", expect_error="published TF frame collision")
+    colliding_custom = copy.deepcopy(two_robots)
+    for component in colliding_custom["deployment_draft"]["components"]:
+        component["frame_prefix"] = "second/"
+    _run(args, _request(scenario_path, colliding_custom, request["program"]),
+         root / "ros-colliding-custom-prefix", expect_error="published TF frame collision")
+    _run(args, _request(scenario_path, two_robots, request["program"]),
+         root / "ros-exclusive-topic-collision",
+         expect_error="exclusive Isaac topic collision between isaac_ur10e_light_robot and isaac_ur10e_second_robot: /isaac_joint_commands")
+    second_robot["component_profile_id"] = "ur10e_robotiq_mock_commanded_v0"
+    second_config = second_robot["configuration"]["runtime_configuration"]
+    second_config.pop("isaac_profile")
+    second_config["mock_profile"] = "ur10e_robotiq_2f_140"
+    _check_two_ros_robots(
+        args, _request(scenario_path, two_robots, request["program"]),
+        root / "ros-two-robots",
+    )
+    # Q68: one ROS runtime unit hosts robots with different controller
+    # profiles (Lite 6 + UR10e) when the cell-wide cadence agrees; each
+    # component carries its own profile.
+    _, lite6_document, _ = _scenario_request(
+        args.workspace, "examples/isaac-lite6-pick-place.scenario"
+    )
+    lite6_robot = copy.deepcopy(lite6_document["deployment_draft"]["components"][0])
+    lite6_robot["frame_prefix"] = "lite6/"
+    lite6_robot["configuration"]["runtime_configuration"][
+        "collision_monitor_period_ms"
+    ] = document["deployment_draft"]["components"][0]["configuration"][
+        "runtime_configuration"
+    ]["collision_monitor_period_ms"]
+    two_profiles = copy.deepcopy(document)
+    ur10e_mock = two_profiles["deployment_draft"]["components"][0]
+    ur10e_mock["component_profile_id"] = "ur10e_robotiq_mock_commanded_v0"
+    ur10e_config = ur10e_mock["configuration"]["runtime_configuration"]
+    ur10e_config.pop("isaac_profile")
+    ur10e_config["mock_profile"] = "ur10e_robotiq_2f_140"
+    two_profiles["deployment_draft"]["components"].append(lite6_robot)
+    two_profiles["deployment_draft"]["components"].sort(
+        key=lambda component: component["component_id"]
+    )
+    mixed = _run(args, _request(scenario_path, two_profiles, request["program"]),
+                 root / "ros-two-controller-profiles")
+    assert mixed is not None
+    mixed_runtime = mixed["activation_payload"]["retained_bundle"]["cell_graph"][
+        "runtime_units"
+    ]
+    assert len(mixed_runtime) == 1
+    assert mixed_runtime[0]["configuration"]["controller_profiles"] == sorted([
+        {"controllable_component_id": "isaac_lite6_robot", "isaac_profile": "lite6", "frame_prefix": "lite6/"},
+        {"controllable_component_id": "isaac_ur10e_light_robot", "mock_profile": "ur10e_robotiq_2f_140", "frame_prefix": ""},
+    ], key=lambda row: row["controllable_component_id"])
+    # Both qualified models have disjoint owned frames. Reserve the Lite6's
+    # shared root world against an owned output; allow another shared root to
+    # use that global parent. The former w + orld alias now fails prefix grammar
+    # first, since a valid non-empty prefix must end in '/'.
+    for name, prefix, extra, expected_error in (
+        ("prefixed-world-alias", "w",
+         '<link name="orld"/><joint name="test_world_alias" type="fixed">'
+         '<parent link="base_link"/><child link="orld"/></joint>',
+         "frame_prefix must be empty or use only ASCII letters"),
+        ("nonroot-world-alias", "",
+         '<link name="world"/><joint name="test_world_alias" type="fixed">'
+         '<parent link="base_link"/><child link="world"/></joint>',
+         "published TF frame collision: world"),
+    ):
+        world_document = copy.deepcopy(two_profiles)
+        for component in world_document["deployment_draft"]["components"]:
+            component["frame_prefix"] = prefix if component["component_id"] == component_id else ""
+        world_request = _request(scenario_path, world_document, request["program"])
+        source = next(row for row in world_request["model_source_closure"]["components"]
+                      if row["component_id"] == component_id)
+        original = decode_model_source_artifact(source["entrypoints"]["urdf"],
+                                               maximum_bytes=MAX_XML_BYTES,
+                                               label="world-collision test URDF")
+        assert original.count(b"</robot>") == 1
+        changed = original.replace(b"</robot>", extra.encode() + b"</robot>")
+        source["entrypoints"]["urdf"] = encode_model_source_artifact(
+            changed, media_type="application/xml")
+        prepared_rows = world_request["prepared_model_closure"]["components"]
+        index = next(index for index, row in enumerate(prepared_rows)
+                     if row["component_id"] == component_id)
+        previous = prepared_rows[index]
+        prepared_rows[index] = prepare_captured_model_source(
+            source, model_asset_id=previous["model_asset_id"],
+            accepted_package_uri_prefix=previous["accepted_package_uri_prefix"])
+        _rehash_request(world_request)
+        _run(args, world_request, root / f"ros-{name}", expect_error=expected_error)
+    # This maintained pair already qualifies both models with root world and
+    # disjoint owned frames; retain its complete model-backed configuration.
+    _, _, repeated_world_request = _scenario_request(
+        args.workspace, "examples/ur5e_lite6_wall_grouped.scenario")
+    assert all(component.get("frame_prefix", "") == ""
+               for component in repeated_world_request["deployment"]["components"])
+    for source in repeated_world_request["model_source_closure"]["components"]:
+        urdf = decode_model_source_artifact(source["entrypoints"]["urdf"],
+                                           maximum_bytes=MAX_XML_BYTES,
+                                           label="shared-world test URDF")
+        assert b'<link name="world"' in urdf
+    _run(args, repeated_world_request, root / "ros-repeated-shared-world")
+    # The cell-wide cadence agreement is unchanged: a mismatched cadence is
+    # still refused.
+    mismatched = copy.deepcopy(two_profiles)
+    for component in mismatched["deployment_draft"]["components"]:
+        if component["component_id"] == "isaac_lite6_robot":
+            component["configuration"]["runtime_configuration"][
+                "execution_tick_hz"
+            ] = 50
+    _run(args, _request(scenario_path, mismatched, request["program"]),
+         root / "ros-two-controller-profiles-cadence",
+         expect_error="disagree on execution_tick_hz")
     for separator in ("-", "."):
         invalid_namespace = copy.deepcopy(document)
         invalid_namespace["deployment_draft"]["components"][0]["component_id"] = (
@@ -934,13 +1200,13 @@ def main() -> int:
             mismatched_runtime_kind = copy.deepcopy(request)
             mismatched_runtime_kind["deployment"]["components"][0][
                 "configuration"
-            ]["runtime_kind"] = "ros2_control"
+            ]["runtime_kind"] = "native"
             _rehash_request(mismatched_runtime_kind)
             _run(
                 args,
                 mismatched_runtime_kind,
                 temporary / "mismatched-runtime-kind",
-                expect_error="ros2_control runtime configuration for native profile",
+                expect_error="native runtime configuration for ros2_control profile",
             )
 
             invalid_policies = copy.deepcopy(request)
@@ -1056,7 +1322,8 @@ def main() -> int:
                 assert dual_prepared is not None
                 single_host_id = _native_host_identity(prepared)
                 dual_host_id = _native_host_identity(dual_prepared)
-                expected_host_id = "robot_cell.native_execution"
+                # The shared ROS host role is independent of component membership.
+                expected_host_id = "robot_cell.ros2_control_execution"
                 if (
                     single_host_id != expected_host_id
                     or dual_host_id != expected_host_id
@@ -1065,12 +1332,18 @@ def main() -> int:
                         "native host identity changed with component membership: "
                         f"single={single_host_id!r}, dual={dual_host_id!r}"
                     )
-                if _native_host_products(prepared) != _native_host_products(
-                    dual_prepared
-                ):
-                    raise AssertionError(
-                        "native host product changed with component membership"
-                    )
+                # The native host product was infrastructure-only and stayed
+                # identical across membership; the ROS runtime product embeds
+                # the unit's component configuration (Q68), so only its
+                # identity, profile and revision stay stable.
+                single_product = _native_host_products(prepared)
+                dual_product = _native_host_products(dual_prepared)
+                for field in ("runtime_unit_id",):
+                    if single_product.get(field) != dual_product.get(field):
+                        raise AssertionError(
+                            "execution host product changed identity with "
+                            "component membership"
+                        )
             changed = _request(
                 scenario_path,
                 document,

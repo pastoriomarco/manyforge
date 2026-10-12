@@ -1,0 +1,35 @@
+# Deployment generator input, not a runnable controller configuration.
+# Replace __arm_controller__/__joint__ with retained binding names/joints,
+# and null with each joint's approved max_deceleration_on_cancel. No fallback.
+# Rename the controller_manager key to the retained manager name if different.
+# UR rates are the retained Isaac UR profile's 100/100 and Q64's mock 20 Hz.
+# Arm interfaces and tolerances retain the plain UR JTC configuration in
+# manymove_bringup/config/ur/ur_with_robotiq_controllers.yaml (six UR joints).
+# Do not import the UFactory tolerance map or Isaac activation-state override.
+# The simulation execution port erases goal tolerances on each goal.
+/**/controller_manager:
+  ros__parameters:
+    update_rate: 100
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    __arm_controller__:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+/**/__arm_controller__:
+  ros__parameters:
+    joints: [__joint__]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 100.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    interpolate_from_desired_state: true
+    allow_trajectory_replacement: false
+    constraints:
+      goal_time: 0.0
+      stopped_velocity_tolerance: 0.2
+      decelerate_on_cancel: true
+      __joint__: {trajectory: 0.2, goal: 0.1, max_deceleration_on_cancel: null}

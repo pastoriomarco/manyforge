@@ -4,7 +4,6 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   DeploymentControlledStopProfile,
-  DeploymentStopTiming,
   JsonValue,
   SourceModelProjection,
 } from '../types/api';
@@ -26,6 +25,7 @@ interface RuntimeConfiguration {
   configuration: Record<string, JsonValue>;
   configurationPath: Array<string | number>;
   intentTargetSettings: Record<string, JsonValue> | null;
+  framePrefix: string | null;
 }
 
 interface MotionTargetLimit {
@@ -101,6 +101,9 @@ function runtimeConfigurations(
         configuration: { ...configuration, motion_target_limits: limits },
         configurationPath: ['components', index, 'configuration'],
         intentTargetSettings: targetSettings,
+        framePrefix: configuration.runtime_kind === 'ros2_control'
+          ? (typeof component?.frame_prefix === 'string' ? component.frame_prefix : '')
+          : null,
       }];
     });
   }
@@ -118,6 +121,7 @@ function runtimeConfigurations(
         configuration,
         configurationPath: ['graph', 'runtime_units', index, 'configuration'],
         intentTargetSettings: null,
+        framePrefix: null,
       }]
       : [];
   });
@@ -258,7 +262,6 @@ interface ControlledStopTarget {
   label: string;
   profile: DeploymentControlledStopProfile | null;
   derivedRows: number;
-  timing: DeploymentStopTiming | null;
 }
 
 function controlledStopTargets(document: Record<string, JsonValue> | null): ControlledStopTarget[] {
@@ -297,16 +300,9 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
           }];
         });
         if (normalizedLimits.length !== limits.length || normalizedLimits.length === 0) return [];
-        const timingValue = stop?.timing === undefined ? null : objectValue(stop.timing);
-        const timing = timingValue !== null
-          && typeof timingValue.command_latency_allowance_ns === 'number'
-          && typeof timingValue.settling_allowance_ns === 'number'
-          && typeof timingValue.operational_timeout_ns === 'number'
-          ? {
-              command_latency_allowance_ns: timingValue.command_latency_allowance_ns,
-              settling_allowance_ns: timingValue.settling_allowance_ns,
-              operational_timeout_ns: timingValue.operational_timeout_ns,
-            } : null;
+        const maxStopTime = stop?.max_stop_time_s === undefined
+          ? undefined : numberValue(stop.max_stop_time_s);
+        if (maxStopTime === null) return [];
         return [{
           key: JSON.stringify([componentId, targetId]),
           componentId,
@@ -318,9 +314,9 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
             allow_natural_completion_on_short_path: natural,
             jerk_limits_enabled: jerkEnabled,
             per_resource_limits: normalizedLimits,
+            ...(maxStopTime === undefined ? {} : { max_stop_time_s: maxStopTime }),
           },
           derivedRows: 1,
-          timing,
         } satisfies ControlledStopTarget];
       });
     });
@@ -337,16 +333,10 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
     group.push(value);
     byBinding.set(row.control_binding_id, group);
   }
-  const timings = new Map<string, Record<string, JsonValue>>();
-  for (const value of Array.isArray(policies?.stop_timing_parameters) ? policies.stop_timing_parameters : []) {
-    const row = objectValue(value);
-    if (typeof row?.control_binding_id === 'string') timings.set(row.control_binding_id, row);
-  }
   const grouped = new Map<string, {
     componentId: string;
     targetId: string;
     rows: JsonValue[];
-    timings: Array<DeploymentStopTiming | null>;
   }>();
   for (const value of graph.control_bindings) {
     const binding = objectValue(value);
@@ -358,34 +348,20 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
     if (!binding || typeof id !== 'string' || typeof revision !== 'string'
       || typeof componentId !== 'string' || typeof targetId !== 'string'
       || !targetRows?.length) continue;
-    const selected = timings.get(id);
-    const timing = selected?.control_binding_revision === revision ? objectValue(selected.timing) : null;
-    if (selected && (!timing
-      || typeof timing.command_latency_allowance_ns !== 'number'
-      || typeof timing.settling_allowance_ns !== 'number'
-      || typeof timing.operational_timeout_ns !== 'number')) continue;
     const key = JSON.stringify([componentId, targetId]);
     const group = grouped.get(key) ?? {
-      componentId, targetId, rows: [], timings: [],
+      componentId, targetId, rows: [],
     };
     group.rows.push(...targetRows.filter((rowValue) => {
       const row = objectValue(rowValue);
       return row?.stop_escalation_stage_id === 'motion_controlled_stop'
         && objectValue(row.provider_contract_ref)?.provider_contract_role_id === 'stop_contract';
     }));
-    group.timings.push(timing ? {
-        command_latency_allowance_ns: timing.command_latency_allowance_ns as number,
-        settling_allowance_ns: timing.settling_allowance_ns as number,
-        operational_timeout_ns: timing.operational_timeout_ns as number,
-      } : null);
     grouped.set(key, group);
   }
   return [...grouped.entries()].flatMap(([key, group]) => {
     const normalized = normalizedStopProfile(group.rows);
     if (group.rows.length === 0) return [];
-    const serializedTimings = group.timings.map((value) => JSON.stringify(value));
-    const timing = serializedTimings.every((value) => value === serializedTimings[0])
-      ? group.timings[0] : null;
     return [{
       key,
       componentId: group.componentId,
@@ -393,7 +369,6 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
       label: `${group.componentId} · ${group.targetId}`,
       profile: normalized?.profile ?? null,
       derivedRows: normalized?.derivedRows ?? group.rows.length,
-      timing,
     }];
   });
 }
@@ -455,6 +430,9 @@ function normalizedStopProfile(
         : [];
     });
     if (normalizedLimits.length !== limits.length || normalizedLimits.length === 0) return [];
+    const maxStopTime = parameters?.max_stop_time_s === undefined
+      ? undefined : numberValue(parameters.max_stop_time_s);
+    if (maxStopTime === null) return [];
     return [{
       stop_mode: mode,
       deceleration_time_s: deceleration,
@@ -462,6 +440,7 @@ function normalizedStopProfile(
       jerk_limits_enabled: typeof parameters?.jerk_limits_enabled === 'boolean'
         ? parameters.jerk_limits_enabled : null,
       per_resource_limits: normalizedLimits,
+      ...(maxStopTime === undefined ? {} : { max_stop_time_s: maxStopTime }),
     } satisfies DeploymentControlledStopProfile];
   });
   if (profiles.length === 0 || profiles.length !== rows.length) return null;
@@ -478,6 +457,66 @@ function format(value: number | null, digits = 3): string {
 function shortIdentity(value: string | null | undefined): string {
   if (!value) return 'not declared';
   return value.length > 38 ? `${value.slice(0, 34)}…` : value;
+}
+
+function FramePrefixDraft({ value, disabled, onCommit }: {
+  value: string;
+  disabled: boolean;
+  onCommit: (value: string) => Promise<unknown> | unknown;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [invalid, setInvalid] = useState(false);
+  useEffect(() => { setDraft(value); setInvalid(false); }, [value]);
+  const formatInvalid = draft !== '' && (draft.startsWith('/') || !draft.endsWith('/')
+    || /[^A-Za-z0-9_/]/.test(draft));
+  const commit = async () => {
+    if (draft === value || formatInvalid) return;
+    setInvalid(await onCommit(draft) === null);
+  };
+  return (
+    <label className={`deployment-focused-field${formatInvalid || invalid ? ' invalid' : ''}`}>
+      <span>TF frame prefix</span>
+      <input value={draft} disabled={disabled} aria-invalid={formatInvalid || invalid}
+        onChange={(event) => { setDraft(event.target.value); setInvalid(false); }}
+        onBlur={() => { void commit(); }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') event.currentTarget.blur();
+          if (event.key === 'Escape') setDraft(value);
+        }} />
+      <small>Empty keeps unprefixed frames. Applying a change restarts this robot holding.</small>
+      {(formatInvalid || invalid) && <small className="deployment-field-error inline-message severity-error">
+        {formatInvalid
+          ? "Frame prefix must be empty or use only ASCII letters, digits, '_' and '/', without a leading '/' and with a trailing '/'."
+          : 'Value was rejected.'}
+      </small>}
+    </label>
+  );
+}
+
+function IsaacWorldDraft({ controller }: { controller: DeploymentWorkspaceController }) {
+  const document = controller.workspace?.draft.document;
+  const value = typeof document?.isaac_world === 'string' ? document.isaac_world : '';
+  const [draft, setDraft] = useState(value);
+  useEffect(() => { setDraft(value); }, [value]);
+  const invalid = draft !== '' && !/^[a-z][a-z0-9._-]{0,127}$/.test(draft);
+  if (document?.api_version !== 'manyforge.deployment_intent.v2') return null;
+  return (
+    <label className="deployment-focused-field">
+      <span>Isaac world</span>
+      <input value={draft} disabled={!controller.mutationAvailable || controller.busy}
+        aria-invalid={invalid}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          if (!invalid && draft !== value) {
+            void controller.mutate(['isaac_world'], draft === '' ? 'remove' : 'set', draft);
+          }
+        }} />
+      <small>Logical world name from the Manager site settings. Required for Isaac robots.</small>
+      {invalid && <small className="deployment-field-error inline-message severity-error">
+        World must be a portable identifier.
+      </small>}
+    </label>
+  );
 }
 
 function NumberDraft({
@@ -1013,6 +1052,10 @@ function NativeRuntimeSection({
             <section className="deployment-runtime-unit" key={runtime.runtimeUnitId}>
               <header><strong>{runtime.runtimeUnitId}</strong><small>Named authored inputs</small></header>
               <div className="deployment-focused-form-grid">
+                {runtime.framePrefix !== null && (
+                  <FramePrefixDraft value={runtime.framePrefix} disabled={disabled}
+                    onCommit={(value) => controller.mutate(['components', runtime.index, 'frame_prefix'], 'set', value)} />
+                )}
                 {numberValue(runtime.configuration.execution_tick_hz) !== null && (
                   <NumberDraft
                     label="Execution cadence"
@@ -1113,15 +1156,12 @@ function ControlledStopEditor({ controller, target }: {
   const [draft, setDraft] = useState<DeploymentControlledStopProfile | null>(
     target.profile,
   );
-  const [timing, setTiming] = useState<DeploymentStopTiming | null>(target.timing);
   useEffect(() => {
     setDraft(target.profile);
-    setTiming(target.timing);
-  }, [target.profile, target.timing]);
+  }, [target.profile]);
   const disabled = !controller.mutationAvailable || controller.busy
     || target.profile?.jerk_limits_enabled == null;
-  const changed = (target.profile !== null && JSON.stringify(draft) !== JSON.stringify(target.profile))
-    || JSON.stringify(timing) !== JSON.stringify(target.timing);
+  const changed = target.profile !== null && JSON.stringify(draft) !== JSON.stringify(target.profile);
   const requiresMigration = target.profile?.jerk_limits_enabled == null;
   const updateLimit = (
     index: number,
@@ -1160,33 +1200,36 @@ function ControlledStopEditor({ controller, target }: {
             max={2}
             disabled={disabled}
             onCommit={(value) => {
-              setDraft({ ...draft, deceleration_time_s: value });
+              // As `main`: an explicit maximum Stop time never stays below the
+              // deceleration time.
+              setDraft({
+                ...draft,
+                deceleration_time_s: value,
+                ...(draft.max_stop_time_s !== undefined && draft.max_stop_time_s < value
+                  ? { max_stop_time_s: value } : {}),
+              });
               return true;
             }}
           />
-          </>}
-          <label className="deployment-focused-checkbox" title="Unselected uses this target's qualified policy timing. Selecting creates explicit editable values in the Draft; Save and Apply are still required.">
-            <input type="checkbox" checked={timing !== null} disabled={disabled}
-              onChange={(event) => setTiming(event.target.checked ? {
-                command_latency_allowance_ns: 250_000_000,
-                settling_allowance_ns: 750_000_000,
-                operational_timeout_ns: 3_000_000_000,
-              } : null)} />
-            Explicit Stop timing
+          <label className="deployment-focused-checkbox" title="Unselected: this robot's controlled Stop must finish within its deceleration time plus 0.5 s. Selecting sets an explicit maximum Stop time for this profile (never below the deceleration time); Save and Apply are still required.">
+            <input type="checkbox" checked={draft.max_stop_time_s !== undefined} disabled={disabled}
+              onChange={(event) => {
+                const next = { ...draft };
+                if (event.target.checked) next.max_stop_time_s = draft.deceleration_time_s + 0.5;
+                else delete next.max_stop_time_s;
+                setDraft(next);
+              }} />
+            Explicit maximum Stop time
           </label>
-          {timing === null ? <p className="muted">Using qualified policy timings.</p> : <>
-            <NumberDraft label="Command latency" value={timing.command_latency_allowance_ns / 1e9}
-              title="Allowance for Stop preparation, delivery and controller handoff. It does not shorten the braking ramp."
+          {draft.max_stop_time_s === undefined
+            ? <p className="muted">{`Automatic: ${Number((draft.deceleration_time_s + 0.5).toFixed(3))} s (deceleration time + 0.5 s).`}</p>
+            : <NumberDraft label="Max Stop time" value={draft.max_stop_time_s}
+              title="This robot's controlled Stop must finish within this time from the Stop request; on overrun its hard stop follows, bounded by the lane's stop-completion timeout."
               unit="s" min={0.001} max={9_007_199} disabled={disabled}
-              onCommit={(value) => { setTiming({ ...timing, command_latency_allowance_ns: Math.round(value * 1e9) }); return true; }} />
-            <NumberDraft label="Settling allowance" value={timing.settling_allowance_ns / 1e9}
-              title="Additional time for motion to settle and fresh rest evidence, after the full commanded ramp."
-              unit="s" min={0} max={9_007_199} disabled={disabled}
-              onCommit={(value) => { setTiming({ ...timing, settling_allowance_ns: Math.round(value * 1e9) }); return true; }} />
-            <NumberDraft label="Stop timeout" value={timing.operational_timeout_ns / 1e9}
-              title="At this time without proven rest, fault and request the strongest authorized stop. Must cover the full profile plus latency and settling."
-              unit="s" min={0.001} max={9_007_199} disabled={disabled}
-              onCommit={(value) => { setTiming({ ...timing, operational_timeout_ns: Math.round(value * 1e9) }); return true; }} />
+              onCommit={(value) => {
+                setDraft({ ...draft, max_stop_time_s: Math.max(draft.deceleration_time_s, value) });
+                return true;
+              }} />}
           </>}
           {draft && <>
           <label className="deployment-focused-checkbox" title={draft.stop_mode === 'spring_back_hold'
@@ -1280,16 +1323,16 @@ function ControlledStopEditor({ controller, target }: {
             onClick={() => { void controller.updateControlledStop({
               controllable_component_id: target.componentId,
               command_target_id: target.targetId,
-              profile: draft, timing,
+              profile: draft,
             }); }}
           >Update Controlled Stop Draft</button>
           <button
             type="button"
             disabled={disabled || !changed}
-            onClick={() => { setDraft(target.profile); setTiming(target.timing); }}
+            onClick={() => { setDraft(target.profile); }}
           >Discard Stop edits</button>
         </div>
-        <p className="field-help" title={`Preparation expands this target profile to ${target.derivedRows} current route row(s). The timeout must cover the complete profile plus latency and settling. Expiry or nominal failure faults and requests strongest authorized containment.`}>
+        <p className="field-help" title={`Preparation expands this target profile to ${target.derivedRows} current route row(s). Each robot's controlled Stop is bounded by its own maximum Stop time; on overrun or nominal failure its hard stop follows.`}>
           Save records these choices; Apply activates them.
         </p>
     </>
@@ -1565,6 +1608,7 @@ export function DeploymentFocusedEditor({
           <h3 id="deployment-focused-title">Robot and runtime configuration</h3>
         </div>
       </header>
+      <IsaacWorldDraft controller={controller} />
       <ModelAndTargetSection
         controller={controller}
         sourceModel={sourceModel}

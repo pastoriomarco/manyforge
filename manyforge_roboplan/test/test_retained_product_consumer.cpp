@@ -17,7 +17,9 @@
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/command_schema.hpp>
@@ -26,10 +28,10 @@
 #include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
-#include <manyforge_deployment/retained_stop_deadline_budget.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
+#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
@@ -1793,11 +1795,6 @@ TEST(RetainedProductRoboPlanConsumer,
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource
       admission_source(package_root);
   const auto admission = admission_source.load_verified();
-  const deployment::FilesystemVerifiedCatalogArtifactSource empty_catalog(
-      package_root);
-  EXPECT_FALSE(deployment::resolve_retained_stop_deadline_budget(
-                   admission.retained_bundle(), empty_catalog)
-                   .has_value());
   const deployment::FilesystemVerifiedRetainedProductArtifactSource
       product_source(package_root);
 
@@ -3518,50 +3515,6 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
-     BootstrapStopEnvelopeFollowsDeclaredCapabilityAndExactArtifacts) {
-  ScopedTemporaryRoot temporary;
-  const auto passive_root = temporary.path() / "not-stoppable";
-  ASSERT_TRUE(std::filesystem::create_directory(passive_root));
-  const auto passive =
-      deployment::test::materialize_lite6_retained_consumer_fixture(
-          passive_root);
-  const deployment::FilesystemVerifiedCatalogArtifactSource passive_catalog(
-      passive_root);
-  EXPECT_FALSE(deployment::resolve_retained_stop_deadline_budget(
-      *passive.bundle, passive_catalog));
-
-  const auto motion_root = temporary.path() / "stoppable";
-  ASSERT_TRUE(std::filesystem::create_directory(motion_root));
-  const auto motion = deployment::test::
-      materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
-          motion_root);
-  const deployment::FilesystemVerifiedCatalogArtifactSource motion_catalog(
-      motion_root);
-  const auto budget = deployment::resolve_retained_stop_deadline_budget(
-      *motion.bundle, motion_catalog);
-  ASSERT_TRUE(budget);
-  EXPECT_GT(budget->outer_duration_ns, budget->kernel_completion_reserve_ns);
-  EXPECT_GT(budget->kernel_completion_reserve_ns, 0);
-  EXPECT_TRUE(budget->phases.empty());
-  class MissingCatalog final : public deployment::ICatalogArtifactSource {
-    std::optional<std::string>
-    get_verified(const core::ContentAddressedStoreKey &,
-                 const core::ContentDigest &,
-                 std::optional<std::uint64_t>) const override {
-      return std::nullopt;
-    }
-  } missing;
-  EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(*motion.bundle,
-                                                                 missing),
-               deployment::RetainedStopDeadlineBudgetError);
-  // Even a non-stoppable capability must prove its exact policy, not treat
-  // missing/tampered artifacts as an empty or passive product.
-  EXPECT_THROW(deployment::resolve_retained_stop_deadline_budget(
-                   *passive.bundle, missing),
-               deployment::RetainedStopDeadlineBudgetError);
-}
-
-TEST(RetainedProductCrossConsumer,
      ProductSelectedStateConfigDoesNotEvaluateNativePredictedFallback) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -3614,7 +3567,14 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(native_default.authority_generation, 1U);
 }
 
-enum class Lite6AggregateCheck { kCompose, kResealInventory, kRefreshCellModel };
+enum class Lite6AggregateCheck {
+  kCompose,
+  kResealInventory,
+  kRefreshCellModel,
+  kDeploymentFaultStopProfile,
+  kExecutionPortParticipant,
+  kSameRoutePredecessorQualification
+};
 
 void check_refreshed_cell_model(
     RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
@@ -3750,7 +3710,6 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
       SimpleSchedulerConfig{},
       10'000'000,
       {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
-      core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
       kMaintainedNativeStopSurveillancePolicy,
       {},
       {},
@@ -3826,13 +3785,159 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
     runtime_input.control_binding_representatives =
         {arm_binding, gripper_binding, representative.value()};
   }
+  // Q37: a Deployment-authored fault profile (as the ROS host reads it) is
+  // the motion target's fault profile; only its load-time defaults resolve.
+  core::MotionInterruptStopProfileDTO authored_fault;
+  authored_fault.profile_id = "fault_spring_back_hold";
+  authored_fault.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  authored_fault.jerk_limits_enabled = true;
+  for (const auto &resource : arm_binding.value().resources)
+    authored_fault.per_joint_max_deceleration.emplace(
+        *resource.source_joint_name,
+        core::CoordinateAccelerationDTO{core::AngularAccelerationDTO{7.0}});
+  if (check == Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+    runtime_input.fault_stop_profile_from_deployment = true;
+    runtime_input.deployment_fault_stop_profile = authored_fault;
+  }
+  // The Core robot participant over an execution port enters through the
+  // existing retained backend seam; the gripper keeps its own backend.
+  // Owned by the runtime (it also owns the clock and scheduler it uses).
+  core::ExecutionPortParticipant *port_participant = nullptr;
+  if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
+    runtime_input.ordinary_motion_jerk.reset();
+    runtime_input.backend_factory =
+        [&port_participant, &scene](
+            const core::RuntimeParticipantBinding &motion,
+            const std::optional<core::RuntimeParticipantBinding> &gripper,
+            const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
+            const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
+            core::IClock &clock, core::IScheduler &scheduler) {
+          auto port = std::make_shared<core::testing::FakeExecutionPort>();
+          core::ExecutionLaneFactsDTO facts;
+          for (const auto &resource : motion.value().resources)
+            facts.joint_names.push_back(resource.compiled_resource_name);
+          facts.supports_scale = true;
+          facts.state_rate_hz = 100.0;
+          facts.controller_update_rate_hz = 150.0;
+          port->SetLaneFacts(facts);
+          core::ExecutionPortParticipantConfig config;
+          config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
+          config.stop.stop_traj_delta_s = 0.05;
+          config.stop.sample_period_s = 0.01;
+          config.stop.replacement_start_allowance_s = 0.02;
+          config.stop.hard_stop_completion_timeout_ns = 500'000'000;
+          config.late_cycle_margin_s = 0.015;
+          auto participant = std::make_shared<core::ExecutionPortParticipant>(
+              motion, port, clock, scheduler,
+              [](core::TimePoint, const std::stop_token &) {},
+              core::ExecutionPortParticipantStateAuthority{
+                  &motion_channel->publication().numeric_publication(),
+                  [] { return core::Result<void>::Ok(); }},
+              std::move(config));
+          port_participant = participant.get();
+          const auto &finger = gripper->value().resources.front();
+          const auto joint = scene->getJointInfo(finger.compiled_resource_name);
+          auto gripper_backend = std::make_shared<RetainedGripperCommandBackend>(
+              *gripper, gripper_channel,
+              RetainedGripperPositionLimits{finger.coordinate_kind,
+                                            joint->limits.min_position[0],
+                                            joint->limits.max_position[0]},
+              clock, scheduler);
+          RetainedRuntimeBackendSet selected;
+          selected.execution = participant;
+          selected.gripper = gripper_backend;
+          selected.gripper_stop_execution_port = gripper_backend.get();
+          selected.rebind_motion_route =
+              [participant](
+                  core::RuntimeParticipantBinding binding,
+                  std::vector<core::RuntimeParticipantBinding> aliases) {
+                return participant->RebindRoute(std::move(binding), std::move(aliases));
+              };
+          selected.rebind_gripper_route =
+              [gripper_backend](core::RuntimeParticipantBinding binding,
+                                std::shared_ptr<IRetainedObservedStateChannel> channel) {
+                return gripper_backend->RebindRoute(std::move(binding), std::move(channel));
+              };
+          return selected;
+        };
+  }
   auto runtime = create_retained_native_runtime(std::move(runtime_input),
                                                 std::move(runtime_config));
+  if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
+    ASSERT_NE(runtime, nullptr);
+    ASSERT_NE(port_participant, nullptr);
+    EXPECT_EQ(runtime->execution.get(), port_participant);
+    std::size_t motion_registrations = 0U;
+    for (const auto &registration : runtime->participant_registrations) {
+      if (registration.binding.value().command_target_id != arm_target_id) continue;
+      ++motion_registrations;
+      // The participant Kernel drives it; its Stop stages reach the helper.
+      EXPECT_EQ(registration.engine, runtime->participant_engine.get());
+      EXPECT_EQ(registration.prepared_motion_engine, runtime->participant_engine.get());
+      EXPECT_EQ(registration.stop_execution_port,
+                static_cast<core::IControlDomainExecutionPort *>(port_participant));
+    }
+    EXPECT_GE(motion_registrations, 1U);
+    return;
+  }
 
   ASSERT_NE(runtime, nullptr);
   ASSERT_NE(runtime->addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
+  if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification) {
+    const auto before = runtime->motion_binding;
+    const auto &path = *before.value().control_path;
+    ASSERT_TRUE(path.runtime_scale_qualification.has_value());
+    const auto qualification = *path.runtime_scale_qualification;
+    const auto execution = runtime->execution;
+    const auto channel = runtime->motion_state_channel;
+    core::ActiveControlConfigurationDTO predecessor{
+        path.active_control_configuration_id,
+        path.control_domain_id,
+        path.control_domain_revision,
+        {{path.control_binding_id, path.control_binding_revision,
+          path.control_route_id}},
+        path.activation_set_id,
+        path.controller_topology_id,
+        path.topology_revision,
+        path.provider_runtime_unit_id,
+        path.provider_runtime_epoch,
+        1,
+        {},
+        path.active_control_configuration_generation,
+        core::ActiveControlConfigurationStateDTO::kReconciled};
+    for (const auto &resource : before.value().resources) {
+      predecessor.kinematic_resource_source_projections.push_back(
+          {resource.resource_id,
+           {{path.control_binding_id, path.control_binding_revision}},
+           path.provider_instance_id, path.provider_manifest_id,
+           path.provider_manifest_revision, path.state_authority_id,
+           path.state_authority_class,
+           channel->source_kind()});
+    }
+    ASSERT_TRUE(runtime->addressed_kernel->SetRouteRecoveryPending(true).ok());
+    auto foreign = predecessor;
+    foreign.binding_routes.front().control_binding_revision =
+        core::ControlBindingRevision("foreign-binding-revision");
+    EXPECT_FALSE(runtime->AdoptAndReadBackRouteConfigurationPredecessor(foreign).ok());
+    EXPECT_EQ(runtime->motion_binding.value(), before.value());
+    EXPECT_EQ(channel->binding().value(), before.value());
+    const auto adopted =
+        runtime->AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+    ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+    EXPECT_EQ(adopted.value().active_configuration, predecessor);
+    EXPECT_FALSE(adopted.value().operation_admission_open);
+    EXPECT_TRUE(adopted.value().readiness_rows.empty());
+    ASSERT_TRUE(runtime->motion_binding.value().control_path->runtime_scale_qualification);
+    EXPECT_EQ(*runtime->motion_binding.value().control_path->runtime_scale_qualification,
+              qualification);
+    EXPECT_EQ(runtime->motion_binding.value(), before.value());
+    EXPECT_EQ(channel->binding().value(), before.value());
+    EXPECT_EQ(runtime->execution, execution);
+    EXPECT_EQ(runtime->motion_state_channel, channel);
+    return;
+  }
   if (reseal_capability_inventory) {
     ASSERT_EQ(runtime->control_binding_representatives.size(), 3U);
     ASSERT_EQ(runtime->participant_registrations.size(), 3U);
@@ -3903,6 +4008,17 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
                    std::string(deployment::test::kLite6ArmTargetId));
       });
   ASSERT_NE(motion_registration, runtime->participant_registrations.end());
+  if (check == Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+    auto expected_fault = authored_fault;
+    expected_fault.deceleration_time_s = core::kDefaultDecelerationTimeS;
+    EXPECT_TRUE(runtime->motion_fault_stop_profile_from_deployment);
+    EXPECT_EQ(runtime->motion_fault_stop_profile,
+              std::optional<core::MotionInterruptStopProfileDTO>(expected_fault));
+    EXPECT_EQ(motion_registration->default_fault_stop_profile,
+              std::optional<core::MotionInterruptStopProfileDTO>(expected_fault));
+    return;
+  }
+  EXPECT_FALSE(runtime->motion_fault_stop_profile_from_deployment);
   ASSERT_TRUE(motion_registration->participant_policy.has_value());
   ASSERT_TRUE(
       motion_registration->deployment_maximum_tcp_linear_speed_mps.has_value());
@@ -4338,6 +4454,11 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
+     SameRoutePredecessorAdoptionPreservesExactScaleQualificationWithoutOpeningReadiness) {
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
+}
+
+TEST(RetainedProductCrossConsumer,
      RetainedControllerRefreshesEveryModelConsumerWithTheCellModel) {
   check_predicted_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
 }
@@ -4345,6 +4466,18 @@ TEST(RetainedProductCrossConsumer,
 TEST(RetainedProductCrossConsumer,
      SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
   check_predicted_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ExecutionPortParticipantRegistersThroughTheRetainedBackendSeam) {
+  check_predicted_lite6_aggregate(
+      Lite6AggregateCheck::kExecutionPortParticipant);
+}
+
+TEST(RetainedProductCrossConsumer,
+     DeploymentAuthoredFaultStopProfileIsTheMotionFaultProfile) {
+  check_predicted_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfile);
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -4501,18 +4634,11 @@ TEST(RetainedProductCrossConsumer,
         SimpleSchedulerConfig{},
         10'000'000,
         std::vector<double>(physical.value().resources.size(), 0.0),
-        core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
-        kMaintainedNativeStopSurveillancePolicy,
+          kMaintainedNativeStopSurveillancePolicy,
         {},
         {},
         {},
         {}};
-    if (index == 0U) {
-      // A retained participant may supply its full phase-bearing Stop budget;
-      // a newly restored owner supplies the same cell envelope without phases.
-      runtime_config.cell_stop_deadline_budget->phases.push_back(
-          {core::StopBudgetPhaseId("phase.component.nominal"), 500'000'000});
-    }
     const auto local_runtime_unit_id = control.provider_runtime_unit_id;
     const auto local_runtime_epoch = control.provider_runtime_epoch;
     const auto local_component_id = physical.value().controllable_component_id;
@@ -4567,12 +4693,6 @@ TEST(RetainedProductCrossConsumer,
           runtimes.front()->clock, runtimes.front()->scheduler);
     }
     ASSERT_NE(runtime, nullptr);
-    ASSERT_TRUE(runtime->cell_stop_deadline_budget.has_value());
-    EXPECT_TRUE(runtime->cell_stop_deadline_budget->phases.empty());
-    EXPECT_EQ(runtime->cell_stop_deadline_budget->outer_duration_ns,
-              1'000'000'000);
-    EXPECT_EQ(runtime->cell_stop_deadline_budget->kernel_completion_reserve_ns,
-              100'000'000);
     ASSERT_TRUE(runtime->motion_participant_policy.has_value());
     EXPECT_FALSE(
         runtime->motion_participant_policy->value().ordinary_motion_jerk);
@@ -4701,8 +4821,7 @@ TEST(RetainedProductCrossConsumer,
           1024U,
           nullptr,
           bundle.value().cell_graph.graph_revision,
-          core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
-          {},
+              {},
           {},
           {},
           {}});
@@ -4780,22 +4899,14 @@ TEST(RetainedProductCrossConsumer,
   const core::ConfigurationFenceId rejoin_fence_id(
       "i6.joined.root-replacement.apply");
   rejoin_gate.RestoreFence(rejoin_fence_id, rejoin_scope);
-  ASSERT_EQ(primary->cell_stop_deadline_budget, peer->cell_stop_deadline_budget);
   ASSERT_TRUE(primary->stop_surveillance_policy.has_value());
-  const auto original_budget = primary->cell_stop_deadline_budget;
   const auto original_surveillance_policy = primary->stop_surveillance_policy;
-  for (const auto changed_fact : {0, 1, 2}) {
-    if (changed_fact == 0)
-      ++primary->cell_stop_deadline_budget->outer_duration_ns;
-    else if (changed_fact == 1)
-      ++primary->cell_stop_deadline_budget->kernel_completion_reserve_ns;
-    else
-      ++primary->stop_surveillance_policy->sample_cadence_ns;
+  {
+    ++primary->stop_surveillance_policy->sample_cadence_ns;
     std::vector<RetainedStopSurveillanceSourceInput> rejected_sources;
     const auto rejected = rejoin_retained_native_runtime_participants(
         peer, {primary}, joined_resolver_factory, stable_stop_observer,
         rejected_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
-    primary->cell_stop_deadline_budget = original_budget;
     primary->stop_surveillance_policy = original_surveillance_policy;
     ASSERT_FALSE(rejected.ok());
     EXPECT_EQ(rejected.error().details.at("reason"),

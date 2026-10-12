@@ -1,4909 +1,1028 @@
-#include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
-#define MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
-#undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
-#include "../src/ros2_control_stop_qualification_probe.hpp"
-#include "../src/scene_projection_worker.hpp"
-#include "ros2_transport_test_support.hpp"
-#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
-
-#include <control_msgs/action/follow_joint_trajectory.hpp>
-#include <controller_manager_msgs/msg/controller_manager_activity.hpp>
-#include <controller_manager_msgs/srv/list_controllers.hpp>
-#include <controller_manager_msgs/srv/list_hardware_components.hpp>
-#include <gtest/gtest.h>
-#include <lifecycle_msgs/msg/state.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <rclcpp_action/rclcpp_action.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <future>
-#include <limits>
-#include <map>
+#include <functional>
+#include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
-#include <string>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace manyforge::ros2_control_execution {
+// Exercise malformed SDK callback inputs unavailable from a well-formed ROS
+// action server. Normal sends, acceptance and positive ACK use the real client.
+class JtcExecutionPortTestPeer {
+public:
+  static bool executor_is_spinning(const Ros2TransportResources &resources) {
+    return resources.executor_->is_spinning();
+  }
+  struct SdkOwners {
+    std::weak_ptr<rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>> client;
+    std::weak_ptr<rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>> subscription;
+    std::weak_ptr<rclcpp::Publisher<control_msgs::msg::SpeedScalingFactor>> publisher;
+    bool expired() const {
+      return client.expired() && subscription.expired() && publisher.expired();
+    }
+  };
+  static SdkOwners sdk_owners(const Ros2ControlExecutionBackend &port) {
+    return {port.action_client_, port.state_sub_, port.scale_pub_};
+  }
+  static auto client(const Ros2ControlExecutionBackend &port) {
+    return port.action_client_;
+  }
+  static bool owns_sdk_entities(const Ros2ControlExecutionBackend &port) {
+    return port.action_client_ && port.state_sub_ && port.scale_pub_;
+  }
+  static void cancel_response(
+      Ros2ControlExecutionBackend &port, const core::ExecutionGoalKey &key,
+      std::uint64_t sequence,
+      const action_msgs::srv::CancelGoal::Response::SharedPtr &response) {
+    Ros2ControlExecutionBackend::ReceiveCancelResponse(port.state_, key,
+                                                       sequence, response);
+  }
+  static void terminal(
+      Ros2ControlExecutionBackend &port, const core::ExecutionGoalKey &key,
+      const rclcpp_action::ClientGoalHandle<
+          control_msgs::action::FollowJointTrajectory>::WrappedResult &result) {
+    Ros2ControlExecutionBackend::ReceiveResult(port.state_, key, result);
+  }
+};
 namespace {
-
 using namespace std::chrono_literals;
-using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
-using ServerGoalHandleFJT =
-    rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
+using namespace core;
+using Action = control_msgs::action::FollowJointTrajectory;
+using ServerGoal = rclcpp_action::ServerGoalHandle<Action>;
 
-class CountingStopProbe final
-    : public detail::IRos2ControlStopQualificationProbe {
+bool wait_until(const std::function<bool()> &condition) {
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (condition())
+      return true;
+    std::this_thread::sleep_for(1ms);
+  }
+  return condition();
+}
+ExecutionGoalKey key(std::uint64_t generation) {
+  return {ControllerGoalId("test.operation.arm"),
+          ControllerGoalGeneration(generation)};
+}
+TrajectoryDTO trajectory() {
+  TrajectoryDTO value;
+  value.joint_names = {"b", "a"};
+  value.waypoints = {{0.0, {0.2, 0.1}, {0.0, 0.0}, {0.0, 0.0}},
+                     {1.0, {0.4, 0.3}, {0.0, 0.0}, {0.0, 0.0}}};
+  return value;
+}
+class Sink final : public IExecutionStateSink {
 public:
-  void observe(detail::Ros2ControlStopQualificationEvent event,
-               std::string_view) override {
-    if (event ==
-        detail::Ros2ControlStopQualificationEvent::kNominalProviderEntry) {
-      nominal_entries_.fetch_add(1U, std::memory_order_relaxed);
-    }
-    if (event ==
-        detail::Ros2ControlStopQualificationEvent::kSoftwareHardIssueAccepted) {
-      hard_issues_.fetch_add(1U, std::memory_order_relaxed);
-    }
+  ExecutionStateSinkResult
+  apply_group_joint_positions(const std::string &, const std::vector<double> &,
+                              ExecutionStateUpdateMode) override {
+    return {};
   }
-
-  [[nodiscard]] std::uint64_t nominal_entries() const noexcept {
-    return nominal_entries_.load(std::memory_order_relaxed);
+  ExecutionStateSinkResult
+  apply_group_joint_position(const std::string &, const std::string &, double,
+                             ExecutionStateUpdateMode) override {
+    return {};
   }
-  [[nodiscard]] std::uint64_t hard_issues() const noexcept {
-    return hard_issues_.load(std::memory_order_relaxed);
+  std::optional<double>
+  group_joint_position(const std::string &,
+                       const std::string &) const override {
+    return std::nullopt;
   }
-
-private:
-  std::atomic<std::uint64_t> nominal_entries_{0U};
-  std::atomic<std::uint64_t> hard_issues_{0U};
 };
 
-// Drives producer samples and the existing manual scheduler at receiver-clock
-// reads. Nested publisher clock reads cannot advance time recursively. Tests
-// enable the hook only after the exact terminal/dispatch setup is complete.
-class StopEvidenceClock final : public core::IClock {
+class Rig {
 public:
-  core::TimePoint now() const override {
-    if (on_read && !reading_) {
-      reading_ = true;
-      time_ns_ += 5'000'000;
-      on_read(time_ns_);
-      reading_ = false;
-    }
-    return time_ns_;
-  }
-  std::function<void(core::TimePoint)> on_read;
+  FakeClock clock;
+  std::shared_ptr<Sink> sink = std::make_shared<Sink>();
+  Ros2TransportResources resources;
+  std::unique_ptr<Ros2ControlExecutionBackend> adapter;
+  std::unique_ptr<Ros2ControlExecutionBackend> successor;
+  std::atomic<std::uint64_t> cancel_count{0};
+  std::atomic<std::uint64_t> scale_count{0};
+  std::atomic<double> last_scale{-1.0};
+  std::atomic<bool> reject_next{false};
+  std::atomic<bool> reject_cancel{false};
+  std::atomic<bool> delay_next_response{false};
+  std::atomic<bool> response_blocked{false};
+  std::atomic<bool> delay_next_cancel{false};
+  std::atomic<bool> cancel_blocked{false};
+  std::atomic<bool> accepted_callback_context_valid{false};
 
-private:
-  mutable core::TimePoint time_ns_ = 1'000'000'000;
-  mutable bool reading_ = false;
-};
-
-core::RuntimeParticipantBinding
-motion_binding(std::string program_id,
-               core::StateAuthorityClass authority =
-                   core::StateAuthorityClass::kCommanded) {
-  core::RuntimeParticipantBindingDTO value{
-      core::ProgramId(std::move(program_id)),
-      core::ProgramRevision("program-revision"),
-      core::ProgramBindingId("program-binding"),
-      core::RetainedBundleId("bundle"),
-      core::GraphRevision("graph"),
-      core::ComponentRoleId("robot"),
-      core::TargetRoleId("arm"),
-      core::ControllableComponentId("robot.1"),
-      core::ComponentTypeId("robot.type"),
-      core::ComponentTypeRevision("robot-type-revision"),
-      core::CommandTargetId("arm.target"),
-      core::CapabilityId("execution.trajectory.execute"),
-      core::CapabilityDefinitionRevision("capability-revision"),
-      std::nullopt,
-      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
-                                        core::ModelInstanceId("robot.model"),
-                                        core::ModelRevision("model-revision")}},
-      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
-                                         core::ModelInstanceId("robot.model"),
-                                         "arm",
-                                         {"joint_1"}}},
-      {core::ProgramFrameRoleBindingDTO{
-          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
-          core::ModelRevision("model-revision"), "tcp"}},
-      {core::RuntimeResourceBindingDTO{
-          core::ResourceRoleId("joint_1"), core::ResourceId("robot.joint.1"),
-          "source_joint_1", "joint_1", core::CoordinateKind::kAngular}},
-      {},
-      core::RuntimeControlPathDTO{
-          core::ControlDomainId("domain.arm"),
-          core::ControlDomainRevision("domain-revision"),
-          core::ControlBindingId("binding.arm"),
-          core::ControlBindingRevision("binding-revision"),
-          core::ControlInterfaceContractId("interface.trajectory"),
-          core::ControlInterfaceRevision("interface-revision"),
-          core::ControllerTopologyId("topology.ros2_control"),
-          core::TopologyRevision("topology-revision"),
-          core::ControlRouteId("route.ros2_control"),
-          core::ActivationSetId("activation.ros2_control"),
-          core::ActiveControlConfigurationId("active.ros2_control"),
-          core::ActiveControlConfigurationGeneration(1U),
-          core::ProviderInstanceId("provider.ros2_control"),
-          core::ProviderManifestId("provider-manifest.ros2_control"),
-          core::ProviderManifestRevision("provider-manifest-revision"),
-          core::RuntimeUnitId("runtime.ros2_control"),
-          core::RuntimeEpoch("runtime-epoch.1"),
-          core::StateAuthorityId(authority ==
-                                         core::StateAuthorityClass::kMeasured
-                                     ? "state.measured"
-                                     : "state.commanded"),
-          authority,
-          core::StopEvidencePolicyId("stop.ros2_control"),
-          core::StopEvidencePolicyRevision("stop-revision"),
-          core::ContainmentGranularity::kResource,
-          std::nullopt},
-      std::nullopt,
-      {},
-      {core::RuntimeUnitEpochBindingDTO{
-          core::RuntimeUnitId("runtime.ros2_control"),
-          core::RuntimeEpoch("runtime-epoch.1")}}};
-  auto sealed = core::verify_runtime_participant_binding(std::move(value));
-  if (!sealed.ok()) {
-    throw std::logic_error(sealed.error().message);
-  }
-  return std::move(sealed.value());
-}
-
-core::RuntimeParticipantBinding
-program_alias(const core::RuntimeParticipantBinding &physical) {
-  auto value = physical.value();
-  value.program_id = core::ProgramId("program.alias");
-  value.program_revision = core::ProgramRevision("program-alias-revision");
-  value.program_binding_id = core::ProgramBindingId("program-alias-binding");
-  value.component_role_id = core::ComponentRoleId("alias_robot");
-  value.target_role_id = core::TargetRoleId("alias_arm");
-  auto sealed = core::verify_runtime_participant_binding(std::move(value));
-  if (!sealed.ok()) {
-    throw std::logic_error(sealed.error().message);
-  }
-  return std::move(sealed.value());
-}
-
-core::ResolvedParticipantStopStageDTO
-direct_stage_fixture(core::StateAuthorityClass authority =
-                         core::StateAuthorityClass::kCommanded) {
-  const core::OperationId operation_id("operation.direct");
-  const core::OperationRevision operation_revision(1U);
-  const core::OperationParticipantId participant_id("participant.direct");
-  const auto binding = motion_binding("program.direct", authority);
-  const auto &value = binding.value();
-  const auto &path = *value.control_path;
-  const std::vector<core::ResourceId> resources{
-      value.resources.front().resource_id};
-  core::ResolvedStopRuntimeTargetDTO target{
-      path.provider_instance_id,
-      path.provider_manifest_id,
-      path.provider_manifest_revision,
-      path.provider_runtime_unit_id,
-      core::ProductId("product.ros2_control"),
-      core::ProductContractId("product.contract.ros2_control"),
-      core::ProductContractRevision("product-contract-revision"),
-      core::ContentDigest("runtime-target-digest"),
-      path.provider_runtime_epoch,
-      path.provider_runtime_epoch,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt};
-  core::ResolvedStopEscalationStageDTO resolved_command{
-      0U,
-      core::StopEscalationStageId("stage.cancel"),
-      core::StopEscalationStageKind::kNominal,
-      core::ContainmentGranularity::kResource,
-      core::StopContainmentCommandDTO{
-          core::StopBudgetPhaseId("command"),
-          core::StopContainmentCommandKind::kControllerGoalCancel, std::nullopt,
-          std::nullopt},
-      std::nullopt,
-      core::ResolvedStopCommandQualificationDTO{},
-      target,
-      core::ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
-                                                    resources},
-      core::StopEvidenceConjunction::kAllOf,
-      {core::ResolvedStopEvidenceRequirementDTO{
-          core::StopEvidenceRequirementDTO{
-              core::StopEvidenceItemId("goal.terminal"),
-              core::StopBudgetPhaseId("terminal"),
-              core::StopEvidenceRequirementKind::kControllerGoalTerminal,
-              std::nullopt, std::nullopt,
-              core::StopEvidenceSourceRequirementDTO{
-                  core::StopEvidenceSourceKind::kControllerGoalStatus,
-                  100'000'000,
-                  std::nullopt,
-                  {}},
-              core::StopEvidenceObservationDTO{
-                  core::StopEvidenceObservationKind::kPostCommandSample,
-                  std::nullopt}},
-          core::ResolvedStopEvidenceSourceDTO{
-              core::StopEvidenceSourceKind::kControllerGoalStatus, target,
-              std::nullopt, std::nullopt, std::nullopt}}}};
-  return core::ResolvedParticipantStopStageDTO{
-      core::StopId("stop.direct"),
-      core::StopGeneration(1U),
-      operation_id,
-      operation_revision,
-      participant_id,
-      core::ControllerGoalId("goal.direct"),
-      core::ControllerGoalGeneration(1U),
-      value.controllable_component_id,
-      value.command_target_id,
-      value.capability_id,
-      path.control_domain_id,
-      path.control_domain_revision,
-      path.control_binding_id,
-      path.control_binding_revision,
-      path.active_control_configuration_id,
-      path.active_control_configuration_generation,
-      path.controller_topology_id,
-      path.topology_revision,
-      path.control_route_id,
-      std::nullopt,
-      std::nullopt,
-      path.provider_runtime_epoch,
-      resources,
-      core::ContainmentGranularity::kResource,
-      path.stop_evidence_policy_id,
-      path.stop_evidence_policy_revision,
-      core::PreparedParticipantStopPlanDTO{
-          core::ContentDigest("plan.digest"),
-          core::ResolvedStopBasePlanId("base.plan"),
-          operation_id,
-          operation_revision,
-          participant_id,
-          value.program_id,
-          value.program_revision,
-          value.program_binding_id,
-          core::ProgramRunId("program.run"),
-          std::nullopt,
-          core::ParticipantStopProfilePurposeDTO::kOrdinary,
-          std::nullopt,
-          core::StopDeadlineBudgetDTO{
-              1'000'000'000,
-              100'000'000,
-              {{core::StopBudgetPhaseId("command"), 500'000'000},
-               {core::StopBudgetPhaseId("terminal"), 900'000'000}}},
-          {core::PreparedStopStageCommandDTO{std::move(resolved_command),
-                                             std::nullopt, std::nullopt}}},
-      0U,
-      core::ContentDigest("scope.digest")};
-}
-
-core::ResolvedParticipantStopStageDTO
-software_hard_stage_fixture(core::StateAuthorityClass authority =
-                                core::StateAuthorityClass::kCommanded) {
-  auto stage = direct_stage_fixture(authority);
-  auto &command =
-      stage.participant_stop_plan.stage_commands.front().resolved_stage;
-  command.stop_escalation_stage_id =
-      core::StopEscalationStageId("stage.software_hard");
-  command.stage_kind = core::StopEscalationStageKind::kSoftwareHard;
-  command.containment_command = core::StopContainmentCommandDTO{
-      core::StopBudgetPhaseId("hard_command"),
-      core::StopContainmentCommandKind::kRegistered, std::nullopt,
-      core::RegisteredStopCommandKindId("manyforge.stop.software_hard")};
-  auto &evidence = command.evidence_requirements.front();
-  evidence.requirement.evidence_item_id = core::StopEvidenceItemId("hard.rest");
-  evidence.requirement.phase_id = core::StopBudgetPhaseId("hard_terminal");
-  evidence.requirement.evidence_kind =
-      core::StopEvidenceRequirementKind::kMotionRest;
-  evidence.requirement.source_requirement =
-      core::StopEvidenceSourceRequirementDTO{
-          core::StopEvidenceSourceKind::kBindingStateAuthority,
-          100'000'000,
-          std::nullopt,
-          {authority}};
-  evidence.requirement.observation_semantics = core::StopEvidenceObservationDTO{
-      core::StopEvidenceObservationKind::kPostCommandDwell, 10'000'000};
-  const auto binding = motion_binding("program.direct", authority);
-  const auto &path = *binding.value().control_path;
-  evidence.resolved_source.source_kind =
-      core::StopEvidenceSourceKind::kBindingStateAuthority;
-  evidence.resolved_source.state_authority_id = path.state_authority_id;
-  evidence.resolved_source.state_authority_class = path.state_authority_class;
-  stage.participant_stop_plan.deadline_budget.phases = {
-      {core::StopBudgetPhaseId("hard_command"), 500'000'000},
-      {core::StopBudgetPhaseId("hard_terminal"), 900'000'000}};
-  return stage;
-}
-
-core::ResolvedParticipantStopStageDTO
-controlled_stage_fixture(core::StateAuthorityClass authority =
-                             core::StateAuthorityClass::kCommanded) {
-  auto stage = direct_stage_fixture(authority);
-  auto &plan = stage.participant_stop_plan;
-  auto &prepared = plan.stage_commands.front();
-  auto &command = prepared.resolved_stage;
-  const auto binding = motion_binding("program.direct", authority);
-  const auto &value = binding.value();
-  const auto &path = *value.control_path;
-  const core::ProviderContractRefDTO contract{
-      core::ProviderContractRoleId("stop_contract"),
-      core::SchemaId(std::string(core::kMotionControlledStopContractSchemaId)),
-      core::SchemaRevision(
-          std::string(core::kMotionControlledStopContractSchemaRevision))};
-  core::JsonValueDTO::Array limits;
-  limits.emplace_back(core::JsonObjectDTO{
-      {"resource_id",
-       core::JsonValueDTO{value.resources.front().resource_id.value()}},
-      {"max_deceleration",
-       core::JsonValueDTO{core::JsonObjectDTO{
-           {"coordinate_kind", core::JsonValueDTO{"angular_rad_s2"}},
-           {"value_rad_s2", core::JsonValueDTO{4.0}},
-       }}},
-      {"settle_velocity_threshold",
-       core::JsonValueDTO{core::JsonObjectDTO{
-           {"coordinate_kind", core::JsonValueDTO{"angular_rad_s"}},
-           {"value_rad_s", core::JsonValueDTO{0.01}},
-       }}},
-  });
-  core::JsonObjectDTO parameters{
-      {"stop_mode", core::JsonValueDTO{"soft_on_path"}},
-      {"jerk_limits_enabled", core::JsonValueDTO{false}},
-      {"deceleration_time_s", core::JsonValueDTO{1.0}},
-      {"per_resource_limits", core::JsonValueDTO{std::move(limits)}},
-      {"allow_natural_completion_on_short_path", core::JsonValueDTO{true}},
-  };
-  command.stop_escalation_stage_id =
-      core::StopEscalationStageId("stage.controlled");
-  command.containment_command = core::StopContainmentCommandDTO{
-      core::StopBudgetPhaseId("command"),
-      core::StopContainmentCommandKind::kMotionControlledStop, contract,
-      std::nullopt};
-  command.default_contract_parameters = parameters;
-  command.evidence_requirements = {core::ResolvedStopEvidenceRequirementDTO{
-      core::StopEvidenceRequirementDTO{
-          core::StopEvidenceItemId("controlled.rest"),
-          core::StopBudgetPhaseId("terminal"),
-          core::StopEvidenceRequirementKind::kMotionRest, contract,
-          std::nullopt,
-          core::StopEvidenceSourceRequirementDTO{
-              core::StopEvidenceSourceKind::kBindingStateAuthority,
-              100'000'000,
-              core::EndpointRoleId("state"),
-              {authority}},
-          core::StopEvidenceObservationDTO{
-              core::StopEvidenceObservationKind::kPostCommandDwell,
-              10'000'000}},
-      core::ResolvedStopEvidenceSourceDTO{
-          core::StopEvidenceSourceKind::kBindingStateAuthority,
-          command.command_target, path.state_authority_id,
-          path.state_authority_class, contract}}};
-  prepared.validated_contract_parameters = std::move(parameters);
-  prepared.parameter_source =
-      core::StopStageParameterSourceDTO::kDeploymentDefault;
-  plan.deadline_budget = core::StopDeadlineBudgetDTO{
-      3'000'000'000,
-      200'000'000,
-      {{core::StopBudgetPhaseId("command"), 300'000'000},
-       {core::StopBudgetPhaseId("terminal"), 1'750'000'000}}};
-  return stage;
-}
-
-core::RemainingStopBudgetDTO
-remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
-  core::RemainingStopBudgetDTO budget{
-      stage.stop_id,
-      stage.stop_generation,
-      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
-      {}};
-  for (const auto &phase : stage.participant_stop_plan.deadline_budget.phases) {
-    budget.phases.push_back({phase.phase_id, phase.deadline_offset_ns});
-  }
-  return budget;
-}
-
-ControllerBindingContract
-binding_contract_for(const Ros2ControlExecutionBackendConfig &config,
-                     const std::string &controller_manager) {
-  ControllerBindingContract contract;
-  contract.generation_id = "binding-" + unique_suffix();
-  contract.controller_manager = controller_manager;
-  contract.activity_topic = controller_manager + "/activity";
-  contract.hardware_component_name = "test_hardware";
-  contract.trajectory_controller_manager_name = "test_trajectory_controller";
-  contract.trajectory_controller_ros_name =
-      controller_manager.substr(
-          0, controller_manager.rfind("/controller_manager")) +
-      "/test_trajectory_controller";
-  contract.trajectory_controller_type =
-      "joint_trajectory_controller/JointTrajectoryController";
-  contract.follow_joint_trajectory_action = config.action_name;
-  contract.controller_state_topic = config.controller_state_topic;
-  contract.joint_state_topic = config.joint_state_topic;
-  contract.required_joints = config.required_joints;
-  for (const auto &joint : config.required_joints) {
-    contract.claimed_command_interfaces.push_back(joint + "/position");
-    contract.claimed_command_interfaces.push_back(joint + "/velocity");
-    contract.required_state_interfaces.push_back(joint + "/position");
-    contract.required_state_interfaces.push_back(joint + "/velocity");
-  }
-  contract.snapshot_max_age_ns = 2'000'000'000;
-  return contract;
-}
-
-ExecutionAdmissionSnapshot
-admitted_snapshot_for(const ControllerBindingContract &contract,
-                      std::int64_t now_ns, std::uint64_t generation = 1,
-                      std::uint64_t lifecycle_generation = 1) {
-  ExecutionAdmissionSnapshot admission;
-  admission.generation = generation;
-  admission.lifecycle_generation = lifecycle_generation;
-  admission.robot_id = "lite6-a";
-  admission.binding_contract_generation_id = contract.generation_id;
-  admission.runtime_generation_id = "runtime-1";
-  admission.provider_component_epoch = "provider-epoch-1";
-  admission.transport_owner_component_epoch = "owner-epoch-1";
-  admission.authority_component_epoch = "authority-epoch-1";
-  admission.cell_supervisor_component_epoch = "supervisor-epoch-1";
-  admission.observed_timestamp_ns = now_ns;
-  admission.received_timestamp_ns = now_ns;
-  admission.fresh_until_ns = now_ns + 10'000'000'000;
-  admission.controller_ready = true;
-  admission.motion_admitted = true;
-  return admission;
-}
-
-core::TrajectoryDTO make_single_joint_trajectory(double start, double finish) {
-  core::TrajectoryDTO trajectory;
-  trajectory.joint_names = {"joint_1"};
-  core::TrajectoryWaypointDTO first;
-  first.time_from_start_s = 0.0;
-  first.positions_rad = {start};
-  first.velocities_rad_s = {0.0};
-  trajectory.waypoints.push_back(std::move(first));
-  core::TrajectoryWaypointDTO last;
-  last.time_from_start_s = 0.1;
-  last.positions_rad = {finish};
-  last.velocities_rad_s = {0.0};
-  trajectory.waypoints.push_back(std::move(last));
-  return trajectory;
-}
-
-class FakeFjtServer {
-public:
-  explicit FakeFjtServer(const std::string &action_name) {
-    context_ = std::make_shared<rclcpp::Context>();
-    int argc = 0;
-    char **argv = nullptr;
-    context_->init(argc, argv);
-
-    rclcpp::NodeOptions options;
-    options.context(context_);
-    node_ = std::make_shared<rclcpp::Node>(
-        "manyforge_fjt_server_test_" + unique_suffix(), options);
-    server_ = rclcpp_action::create_server<FollowJointTrajectory>(
-        node_, action_name,
+  explicit Rig(bool two_bindings = false)
+      : resources("jtc_adapter_test_" + std::to_string(++sequence_), "", 2,
+                  sink, "arm", clock) {
+    route_ = "/adapter_test_" + std::to_string(sequence_.load());
+    server_ = rclcpp_action::create_server<Action>(
+        resources.node(), route_ + "/fjt",
         [this](const rclcpp_action::GoalUUID &,
-               std::shared_ptr<const FollowJointTrajectory::Goal>) {
-          std::unique_lock<std::mutex> lock(goal_response_mutex_);
-          if (block_goal_response_) {
-            goal_response_entered_ = true;
-            goal_response_cv_.notify_all();
-            goal_response_cv_.wait_for(
-                lock, 2s, [this]() { return release_goal_response_; });
+               std::shared_ptr<const Action::Goal>) {
+          if (delay_next_response.exchange(false)) {
+            std::unique_lock lock(response_mutex_);
+            response_blocked = true;
+            response_cv_.wait_for(lock, 3s,
+                                  [this] { return response_released_; });
           }
-          return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+          return reject_next.exchange(false)
+                     ? rclcpp_action::GoalResponse::REJECT
+                     : rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
         },
-        [this](const std::shared_ptr<ServerGoalHandleFJT>) {
-          cancel_requests_.fetch_add(1, std::memory_order_relaxed);
-          return rclcpp_action::CancelResponse::ACCEPT;
-        },
-        [this](const std::shared_ptr<ServerGoalHandleFJT> goal_handle) {
-          {
-            std::lock_guard<std::mutex> lock(mutex_);
-            goal_handle_ = goal_handle;
-            ++goal_count_;
+        [this](std::shared_ptr<ServerGoal>) {
+          ++cancel_count;
+          if (delay_next_cancel.exchange(false)) {
+            std::unique_lock lock(response_mutex_);
+            cancel_blocked = true;
+            response_cv_.wait_for(lock, 3s,
+                                  [this] { return response_released_; });
           }
-          cv_.notify_all();
+          return reject_cancel.load() ? rclcpp_action::CancelResponse::REJECT
+                                      : rclcpp_action::CancelResponse::ACCEPT;
+        },
+        [this](std::shared_ptr<ServerGoal> handle) {
+          accepted_callback_context_valid =
+              resources.node()->get_node_base_interface()->get_context()->is_valid();
+          std::lock_guard lock(mutex_);
+          goals_.push_back(std::move(handle));
         });
-
-    rclcpp::ExecutorOptions executor_options;
-    executor_options.context = context_;
-    executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>(
-        executor_options);
-    executor_->add_node(node_);
-    spin_thread_ = std::thread([this]() { executor_->spin(); });
+    state_pub_ = resources.node()
+                     ->create_publisher<
+                         control_msgs::msg::JointTrajectoryControllerState>(
+                         route_ + "/state", rclcpp::QoS(10).reliable());
+    scale_sub_ =
+        resources.node()
+            ->create_subscription<control_msgs::msg::SpeedScalingFactor>(
+                route_ + "/scale", rclcpp::QoS(1).reliable().transient_local(),
+                [this](control_msgs::msg::SpeedScalingFactor::ConstSharedPtr
+                           value) {
+                  last_scale = value->factor;
+                  ++scale_count;
+                });
+    clock.set(42);
+    adapter = std::make_unique<Ros2ControlExecutionBackend>(resources, clock,
+                                                            config(1));
+    if (two_bindings)
+      successor = std::make_unique<Ros2ControlExecutionBackend>(
+          resources, clock, config(2));
+    adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{1}});
+    resources.start();
   }
-
-  ~FakeFjtServer() {
-    release_goal_response();
-    server_.reset();
-    if (executor_) {
-      executor_->cancel();
-    }
-    if (spin_thread_.joinable()) {
-      spin_thread_.join();
-    }
-    if (executor_ && node_) {
-      executor_->remove_node(node_);
-    }
-    node_.reset();
-    executor_.reset();
-    if (context_) {
-      context_->shutdown("test shutdown");
-      context_.reset();
-    }
+  ~Rig() {
+    release_response();
+    if (adapter)
+      adapter->shutdown();
+    if (successor)
+      successor->shutdown();
+    resources.quiesce();
+    adapter.reset();
+    successor.reset();
   }
-
-  bool wait_for_goal() const { return wait_for_goal_count(1); }
-
-  bool wait_for_goal_count(std::uint64_t expected) const {
-    std::unique_lock<std::mutex> lock(mutex_);
-    return cv_.wait_for(lock, 2s,
-                        [this, expected]() { return goal_count_ >= expected; });
+  void release_response() {
+    std::lock_guard lock(response_mutex_);
+    response_released_ = true;
+    response_cv_.notify_all();
   }
-
-  bool succeed_current_goal() {
-    std::shared_ptr<ServerGoalHandleFJT> goal_handle;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      goal_handle = goal_handle_;
-    }
-    if (!goal_handle) {
-      return false;
-    }
-    auto result = std::make_shared<FollowJointTrajectory::Result>();
-    result->error_code = FollowJointTrajectory::Result::SUCCESSFUL;
-    goal_handle->succeed(result);
-    return true;
+  void remove_action_server() { server_.reset(); }
+  JtcExecutionAdapterConfig config(std::uint64_t epoch) const {
+    JtcExecutionAdapterConfig config;
+    config.action_name = route_ + "/fjt";
+    config.state_topic = route_ + "/state";
+    config.scale_topic = route_ + "/scale";
+    config.binding_epoch = ExecutionBindingEpoch(epoch);
+    config.lane_facts.joint_names = {"a", "b"};
+    config.lane_facts.supports_scale = true;
+    config.lane_facts.has_measured_velocity = true;
+    config.lane_facts.controller_update_rate_hz = 100;
+    return config;
   }
-
-  bool publish_feedback(double actual_position) {
-    std::shared_ptr<ServerGoalHandleFJT> goal_handle;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      goal_handle = goal_handle_;
-    }
-    if (!goal_handle) {
-      return false;
-    }
-    auto feedback = std::make_shared<FollowJointTrajectory::Feedback>();
-    feedback->joint_names = {"joint_1"};
-    feedback->desired.positions = {actual_position};
-    feedback->actual.positions = {actual_position};
-    feedback->error.positions = {0.0};
-    goal_handle->publish_feedback(feedback);
-    return true;
+  ExecutionPortCommandResultDTO submit(const ExecutionGoalKey &goal_key) {
+    // Test waits for ROS discovery outside the port; port calls never wait.
+    ExecutionPortCommandResultDTO result;
+    EXPECT_TRUE(wait_until([&] {
+      result = adapter->Submit(goal_key, trajectory());
+      return result.dispatch != ExecutionPortDispatch::kNotDispatched ||
+             result.refusal != ExecutionPortRefusal::kNotReady;
+    }));
+    return result;
   }
-
-  bool cancel_current_goal() {
-    std::shared_ptr<ServerGoalHandleFJT> goal_handle;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      goal_handle = goal_handle_;
-    }
-    if (!goal_handle) {
-      return false;
-    }
-    auto result = std::make_shared<FollowJointTrajectory::Result>();
-    goal_handle->canceled(result);
-    return true;
+  bool accepted(const ExecutionGoalKey &goal_key,
+                Ros2ControlExecutionBackend *port = nullptr) {
+    if (!port)
+      port = adapter.get();
+    return wait_until([&] {
+      const auto goal = port->ReadGoal(goal_key);
+      return goal && goal->accepted_stamp_ns.has_value();
+    });
   }
-
-  std::uint64_t goal_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return goal_count_;
+  std::shared_ptr<ServerGoal> handle(std::size_t index = 0) {
+    std::shared_ptr<ServerGoal> result;
+    const bool received = wait_until([&] {
+      std::lock_guard lock(mutex_);
+      if (goals_.size() <= index)
+        return false;
+      result = goals_[index];
+      return true;
+    });
+    if (!received)
+      throw std::runtime_error("Fake FJT server did not receive goal");
+    return result;
   }
-
-  std::uint64_t cancel_requests() const {
-    return cancel_requests_.load(std::memory_order_relaxed);
+  std::size_t goal_count() {
+    std::lock_guard lock(mutex_);
+    return goals_.size();
   }
-
-  bool has_goal() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return goal_handle_ != nullptr;
-  }
-
-  void block_goal_response() {
-    std::lock_guard<std::mutex> lock(goal_response_mutex_);
-    block_goal_response_ = true;
-    goal_response_entered_ = false;
-    release_goal_response_ = false;
-  }
-
-  bool wait_for_goal_response_entry() const {
-    std::unique_lock<std::mutex> lock(goal_response_mutex_);
-    return goal_response_cv_.wait_for(
-        lock, 2s, [this]() { return goal_response_entered_; });
-  }
-
-  void release_goal_response() {
-    {
-      std::lock_guard<std::mutex> lock(goal_response_mutex_);
-      release_goal_response_ = true;
-      block_goal_response_ = false;
-    }
-    goal_response_cv_.notify_all();
+  void state(double factor = 0.25, std::uint32_t nanosecond = 0) {
+    EXPECT_TRUE(
+        wait_until([&] { return state_pub_->get_subscription_count() > 0; }));
+    control_msgs::msg::JointTrajectoryControllerState sample;
+    sample.header.stamp.sec = 10;
+    sample.header.stamp.nanosec = nanosecond;
+    sample.joint_names = {"b", "a"};
+    sample.reference.positions = {0.2, 0.1};
+    sample.reference.velocities = {0.02, 0.01};
+    sample.reference.accelerations = {0.002, 0.001};
+    sample.reference.time_from_start.sec = 1;
+    sample.output.positions = {0.21, 0.11};
+    sample.feedback.positions = {0.19, 0.09};
+    sample.feedback.velocities = {0.03, 0.04};
+    sample.error.positions = {0.01, 0.01};
+    sample.speed_scaling_factor = factor;
+    state_pub_->publish(sample);
+    EXPECT_TRUE(wait_until([&] {
+      const auto observed = adapter->ReadSample();
+      return observed &&
+             observed->source_stamp_ns == 10'000'000'000 + nanosecond;
+    }));
   }
 
 private:
-  std::shared_ptr<rclcpp::Context> context_;
-  rclcpp::Node::SharedPtr node_;
-  rclcpp_action::Server<FollowJointTrajectory>::SharedPtr server_;
-  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
-  std::thread spin_thread_;
-  mutable std::mutex mutex_;
-  mutable std::condition_variable cv_;
-  std::shared_ptr<ServerGoalHandleFJT> goal_handle_;
-  std::uint64_t goal_count_ = 0;
-  std::atomic<std::uint64_t> cancel_requests_{0};
-  mutable std::mutex goal_response_mutex_;
-  mutable std::condition_variable goal_response_cv_;
-  bool block_goal_response_ = false;
-  mutable bool goal_response_entered_ = false;
-  bool release_goal_response_ = false;
+  static std::atomic<std::uint64_t> sequence_;
+  std::string route_;
+  std::mutex mutex_;
+  std::mutex response_mutex_;
+  std::condition_variable response_cv_;
+  bool response_released_{false};
+  std::vector<std::shared_ptr<ServerGoal>> goals_;
+  rclcpp_action::Server<Action>::SharedPtr server_;
+  rclcpp::Publisher<
+      control_msgs::msg::JointTrajectoryControllerState>::SharedPtr state_pub_;
+  rclcpp::Subscription<control_msgs::msg::SpeedScalingFactor>::SharedPtr
+      scale_sub_;
 };
-
-class FakeControllerManager {
-public:
-  FakeControllerManager(std::string controller_manager,
-                        ControllerBindingContract contract,
-                        bool publish_initial_activity = true)
-      : controller_manager_(std::move(controller_manager)),
-        contract_(std::move(contract)) {
-    context_ = std::make_shared<rclcpp::Context>();
-    int argc = 0;
-    char **argv = nullptr;
-    context_->init(argc, argv);
-
-    rclcpp::NodeOptions options;
-    options.context(context_);
-    node_ = std::make_shared<rclcpp::Node>(
-        "manyforge_controller_manager_test_" + unique_suffix(), options);
-    activity_publisher_ = node_->create_publisher<
-        controller_manager_msgs::msg::ControllerManagerActivity>(
-        contract_.activity_topic, rclcpp::QoS(1).reliable().transient_local());
-    list_controllers_service_ =
-        node_->create_service<controller_manager_msgs::srv::ListControllers>(
-            controller_manager_ + "/list_controllers",
-            [this](const std::shared_ptr<
-                       controller_manager_msgs::srv::ListControllers::Request>,
-                   std::shared_ptr<
-                       controller_manager_msgs::srv::ListControllers::Response>
-                       response) { fill_controllers(*response); });
-    list_hardware_service_ = node_->create_service<
-        controller_manager_msgs::srv::ListHardwareComponents>(
-        controller_manager_ + "/list_hardware_components",
-        [this](
-            const std::shared_ptr<
-                controller_manager_msgs::srv::ListHardwareComponents::Request>,
-            std::shared_ptr<
-                controller_manager_msgs::srv::ListHardwareComponents::Response>
-                response) { fill_hardware(*response); });
-
-    rclcpp::ExecutorOptions executor_options;
-    executor_options.context = context_;
-    executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>(
-        executor_options);
-    executor_->add_node(node_);
-    spin_thread_ = std::thread([this]() { executor_->spin(); });
-    if (publish_initial_activity) {
-      publish_activity();
-    }
-  }
-
-  ~FakeControllerManager() {
-    if (executor_) {
-      executor_->cancel();
-    }
-    if (spin_thread_.joinable()) {
-      spin_thread_.join();
-    }
-    if (executor_ && node_) {
-      executor_->remove_node(node_);
-    }
-    list_controllers_service_.reset();
-    list_hardware_service_.reset();
-    activity_publisher_.reset();
-    node_.reset();
-    executor_.reset();
-    if (context_) {
-      context_->shutdown("test shutdown");
-      context_.reset();
-    }
-  }
-
-  void set_controller_active(bool active) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      controller_active_ = active;
-    }
-    publish_activity();
-  }
-
-  void set_conflicting_claim(bool conflicting) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      conflicting_claim_ = conflicting;
-    }
-    publish_activity();
-  }
-
-  bool wait_for_activity_subscription() const {
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (activity_publisher_->get_subscription_count() > 0) {
-        return true;
-      }
-      std::this_thread::sleep_for(10ms);
-    }
-    return activity_publisher_->get_subscription_count() > 0;
-  }
-
-  void announce_activity() { publish_activity(); }
-
-  void replay_last_activity() {
-    controller_manager_msgs::msg::ControllerManagerActivity activity;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      ASSERT_TRUE(last_activity_.has_value());
-      activity = *last_activity_;
-    }
-    activity_publisher_->publish(activity);
-  }
-
-  void stop_services_without_activity() {
-    list_controllers_service_.reset();
-    list_hardware_service_.reset();
-  }
-
-private:
-  void fill_controllers(
-      controller_manager_msgs::srv::ListControllers::Response &response) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    controller_manager_msgs::msg::ControllerState selected;
-    selected.name = contract_.trajectory_controller_manager_name;
-    selected.state = controller_active_ ? "active" : "inactive";
-    selected.type = contract_.trajectory_controller_type;
-    selected.claimed_interfaces = contract_.claimed_command_interfaces;
-    response.controller.push_back(std::move(selected));
-    if (conflicting_claim_) {
-      controller_manager_msgs::msg::ControllerState conflict;
-      conflict.name = "conflicting_controller";
-      conflict.state = "active";
-      conflict.type = "test/ConflictingController";
-      conflict.claimed_interfaces = {
-          contract_.claimed_command_interfaces.front()};
-      response.controller.push_back(std::move(conflict));
-    }
-  }
-
-  void
-  fill_hardware(controller_manager_msgs::srv::ListHardwareComponents::Response
-                    &response) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    controller_manager_msgs::msg::HardwareComponentState component;
-    component.name = contract_.hardware_component_name;
-    component.type = "system";
-    component.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
-    component.state.label = "active";
-    for (const auto &name : contract_.claimed_command_interfaces) {
-      controller_manager_msgs::msg::HardwareInterface interface;
-      interface.name = name;
-      interface.is_available = true;
-      interface.is_claimed = true;
-      component.command_interfaces.push_back(std::move(interface));
-    }
-    for (const auto &name : contract_.required_state_interfaces) {
-      controller_manager_msgs::msg::HardwareInterface interface;
-      interface.name = name;
-      interface.is_available = true;
-      component.state_interfaces.push_back(std::move(interface));
-    }
-    response.component.push_back(std::move(component));
-  }
-
-  void publish_activity() {
-    controller_manager_msgs::msg::ControllerManagerActivity activity;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      activity.header.stamp.nanosec = ++activity_sequence_;
-      controller_manager_msgs::msg::NamedLifecycleState controller;
-      controller.name = contract_.trajectory_controller_manager_name;
-      controller.state.id =
-          controller_active_
-              ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
-              : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
-      controller.state.label = controller_active_ ? "active" : "inactive";
-      activity.controllers.push_back(std::move(controller));
-      if (conflicting_claim_) {
-        controller_manager_msgs::msg::NamedLifecycleState conflict;
-        conflict.name = "conflicting_controller";
-        conflict.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
-        conflict.state.label = "active";
-        activity.controllers.push_back(std::move(conflict));
-      }
-      controller_manager_msgs::msg::NamedLifecycleState hardware;
-      hardware.name = contract_.hardware_component_name;
-      hardware.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
-      hardware.state.label = "active";
-      activity.hardware_components.push_back(std::move(hardware));
-      last_activity_ = activity;
-    }
-    activity_publisher_->publish(activity);
-  }
-
-  std::string controller_manager_;
-  ControllerBindingContract contract_;
-  std::shared_ptr<rclcpp::Context> context_;
-  rclcpp::Node::SharedPtr node_;
-  rclcpp::Publisher<controller_manager_msgs::msg::ControllerManagerActivity>::
-      SharedPtr activity_publisher_;
-  rclcpp::Service<controller_manager_msgs::srv::ListControllers>::SharedPtr
-      list_controllers_service_;
-  rclcpp::Service<controller_manager_msgs::srv::ListHardwareComponents>::
-      SharedPtr list_hardware_service_;
-  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
-  std::thread spin_thread_;
-  mutable std::mutex mutex_;
-  bool controller_active_ = true;
-  bool conflicting_claim_ = false;
-  std::uint32_t activity_sequence_ = 0;
-  std::optional<controller_manager_msgs::msg::ControllerManagerActivity>
-      last_activity_;
-};
-
-template <typename Predicate>
-std::optional<ControllerBindingSnapshot>
-wait_for_binding_snapshot(const Ros2ControlExecutionBackend &backend,
-                          Predicate predicate,
-                          std::chrono::milliseconds timeout = 4s) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto snapshot = backend.controller_binding_snapshot();
-    if (snapshot.has_value() && predicate(*snapshot)) {
-      return snapshot;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  return std::nullopt;
-}
-
-bool has_reason(const ControllerBindingSnapshot &snapshot,
-                const std::string &reason) {
-  return std::find(snapshot.reason_codes.begin(), snapshot.reason_codes.end(),
-                   reason) != snapshot.reason_codes.end();
-}
-
-TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_1 =
-      test_transport_resources(std::make_shared<RecordingExecutionStateSink>(),
-                               clock, "arm", base_config());
-  EXPECT_THROW(Ros2ControlExecutionBackend(*transport_resources_1, nullptr,
-                                           "arm", clock, scheduler,
-                                           base_config()),
-               std::invalid_argument);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControlledStageAfterRacingNaturalCompletionSettlesForEachStateAuthority) {
-  for (const auto authority : {core::StateAuthorityClass::kCommanded,
-                               core::StateAuthorityClass::kMeasured}) {
-    for (const auto mode : {"soft_on_path", "spring_back_hold"}) {
-      SCOPED_TRACE(mode);
-      SCOPED_TRACE(static_cast<int>(authority));
-      auto config = base_config();
-      config.execution_state_source_mode =
-          authority == core::StateAuthorityClass::kMeasured ? "observed_ros2"
-                                                            : "commanded_sim";
-      config.initial_joint_positions_rad = {0.0};
-      config.prepared_participant_binding =
-          motion_binding("program.direct", authority);
-      config.transport_joint_names = {"source_joint_1"};
-      config.enable_soft_on_path_path_ramp = true;
-      core::ObservedRobotStatePublication publication(
-          config.required_joints, ros2_control_addressed_state_sources(config));
-      auto sink = std::make_shared<RecordingExecutionStateSink>();
-      StopEvidenceClock clock;
-      core::ManualScheduler scheduler;
-      auto transport_resources_2 =
-          test_transport_resources(sink, clock, "arm", config);
-      Ros2ControlExecutionBackend backend(
-          *transport_resources_2,
-          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
-          sink, "arm", clock, scheduler, std::move(config));
-      TestTransportLifetime transport_lifetime_2(*transport_resources_2,
-                                                 backend);
-      auto stage = controlled_stage_fixture(authority);
-      auto &prepared = stage.participant_stop_plan.stage_commands.front();
-      prepared.validated_contract_parameters->at("stop_mode") =
-          core::JsonValueDTO{mode};
-      CountingStopProbe probe;
-      detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
-      backend.testing_set_running_state(true);
-      ASSERT_TRUE(backend.testing_publish_snapshot(
-          core::ExecutionState::kExecuting, {0.0}));
-      backend.testing_install_prepared_goal_membership(
-          stage, core::ContentDigest("prepared.natural"));
-      ASSERT_TRUE(backend.testing_publish_snapshot(
-          core::ExecutionState::kCompleted, 1.0, {0.4}, std::nullopt));
-      backend.testing_set_running_state(false);
-      const auto completed = backend.get_execution_snapshot();
-      clock.on_read = [&](const auto now_ns) {
-        if (authority == core::StateAuthorityClass::kMeasured) {
-          const std::vector<std::string> names{"joint_1"};
-          const std::vector<double> positions{0.4}, velocities{0.0};
-          EXPECT_TRUE(
-              publication
-                  .publish(core::ObservedRobotStateSourceKind::kJointState,
-                           names, positions, velocities, now_ns, now_ns)
-                  .published);
-        } else {
-          scheduler.advance_to(now_ns,
-                               core::SchedulerPriority::ControllerCommand);
-        }
-      };
-      const auto result =
-          backend.TranslateStopStage(stage, remaining_budget(stage), {});
-      clock.on_read = {};
-      ASSERT_EQ(result.outcome,
-                core::ParticipantStopStageOutcomeDTO::kSucceeded)
-          << (result.error ? result.error->message : "no diagnostic");
-      EXPECT_EQ(probe.nominal_entries(), 0U);
-      EXPECT_EQ(probe.hard_issues(), 0U);
-      EXPECT_EQ(result.actual_provider_contract_mode,
-                std::string_view(mode) == "soft_on_path"
-                    ? core::MotionControlledStopMode::kSoftOnPath
-                    : core::MotionControlledStopMode::kSpringBackHold);
-      ASSERT_EQ(result.evidence_items.size(), 1U);
-      ASSERT_TRUE(result.evidence_items.front().evidence);
-      const auto &evidence = std::get<core::JsonObjectDTO>(
-          result.evidence_items.front().evidence->value);
-      EXPECT_TRUE(
-          std::get<bool>(evidence.at("completed_by_natural_completion").value));
-      const auto &rest =
-          std::get<core::JsonObjectDTO>(evidence.at("post_command_rest").value);
-      EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
-      EXPECT_GT(
-          std::get<double>(rest.at("first_sample_after_acceptance_ns").value),
-          0.0);
-      const auto after = backend.get_execution_snapshot();
-      EXPECT_EQ(after.state, completed.state);
-      EXPECT_EQ(after.sequence_number, completed.sequence_number);
-      EXPECT_EQ(after.timestamp_ns, completed.timestamp_ns);
-      EXPECT_EQ(after.joint_positions_rad, completed.joint_positions_rad);
-    }
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControlledStageRejectsOtherTerminalsDisabledPolicyReplacementAndReset) {
-  enum class End { kDisabled, kStopped, kFailed, kReplaced, kReset };
-  for (const auto end : {End::kDisabled, End::kStopped, End::kFailed,
-                         End::kReplaced, End::kReset}) {
-    SCOPED_TRACE(static_cast<int>(end));
-    auto config = base_config();
-    config.execution_state_source_mode = "commanded_sim";
-    config.initial_joint_positions_rad = {0.0};
-    config.prepared_participant_binding = motion_binding("program.direct");
-    config.transport_joint_names = {"source_joint_1"};
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    core::FakeClock clock;
-    core::ManualScheduler scheduler;
-    auto transport_resources_3 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(
-        *transport_resources_3,
-        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
-        clock, scheduler, std::move(config));
-    TestTransportLifetime transport_lifetime_3(*transport_resources_3, backend);
-    auto stage = controlled_stage_fixture();
-    if (end == End::kDisabled) {
-      stage.participant_stop_plan.stage_commands.front()
-          .validated_contract_parameters->at(
-              "allow_natural_completion_on_short_path") =
-          core::JsonValueDTO{false};
-    }
-    backend.testing_set_running_state(true);
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kExecuting, {0.0}));
-    backend.testing_install_prepared_goal_membership(
-        stage, core::ContentDigest("prepared.other-terminal"));
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        end == End::kStopped  ? core::ExecutionState::kStopped
-        : end == End::kFailed ? core::ExecutionState::kFailed
-                              : core::ExecutionState::kCompleted,
-        {0.4}));
-    backend.testing_set_running_state(false);
-    if (end == End::kReplaced) {
-      backend.testing_set_running_state(true);
-      ASSERT_TRUE(backend.testing_publish_snapshot(
-          core::ExecutionState::kExecuting, {0.5}));
-    } else if (end == End::kReset) {
-      (void)backend.reset();
-    }
-    const auto before = backend.get_execution_snapshot();
-    const auto result =
-        backend.TranslateStopStage(stage, remaining_budget(stage), {});
-    EXPECT_EQ(result.attempt_disposition,
-              core::StopStageAttemptDispositionDTO::kNotDispatched);
-    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error);
-    EXPECT_EQ(result.error->details.at("reason"), "prepared_goal_not_active");
-    EXPECT_EQ(backend.get_execution_snapshot().state, before.state);
-    EXPECT_EQ(backend.get_execution_snapshot().sequence_number,
-              before.sequence_number);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     SoftwareHardObservesAnAlreadyTerminalGoalWithoutRewritingItsState) {
-  for (const auto authority : {core::StateAuthorityClass::kCommanded,
-                               core::StateAuthorityClass::kMeasured}) {
-    for (const auto state :
-         {core::ExecutionState::kCompleted, core::ExecutionState::kStopped,
-          core::ExecutionState::kFailed}) {
-      SCOPED_TRACE(static_cast<int>(authority));
-      SCOPED_TRACE(static_cast<int>(state));
-      auto config = base_config();
-      config.execution_state_source_mode =
-          authority == core::StateAuthorityClass::kMeasured ? "observed_ros2"
-                                                            : "commanded_sim";
-      config.initial_joint_positions_rad = {0.0};
-      config.prepared_participant_binding =
-          motion_binding("program.direct", authority);
-      config.transport_joint_names = {"source_joint_1"};
-      core::ObservedRobotStatePublication publication(
-          config.required_joints, ros2_control_addressed_state_sources(config));
-      auto sink = std::make_shared<RecordingExecutionStateSink>();
-      StopEvidenceClock clock;
-      core::ManualScheduler scheduler;
-      auto transport_resources_4 =
-          test_transport_resources(sink, clock, "arm", config);
-      Ros2ControlExecutionBackend backend(
-          *transport_resources_4,
-          Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
-          sink, "arm", clock, scheduler, std::move(config));
-      TestTransportLifetime transport_lifetime_4(*transport_resources_4,
-                                                 backend);
-      const auto stage = software_hard_stage_fixture(authority);
-      CountingStopProbe probe;
-      detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
-      backend.testing_set_running_state(true);
-      ASSERT_TRUE(backend.testing_publish_snapshot(
-          core::ExecutionState::kExecuting, {0.0}));
-      backend.testing_install_prepared_goal_membership(
-          stage, core::ContentDigest("prepared.terminal-hard"));
-      ASSERT_TRUE(backend.testing_publish_snapshot(state, {0.4}));
-      backend.testing_set_running_state(false);
-      const auto terminal = backend.get_execution_snapshot();
-      clock.on_read = [&](const auto now_ns) {
-        if (authority == core::StateAuthorityClass::kMeasured) {
-          const std::vector<std::string> names{"joint_1"};
-          const std::vector<double> positions{0.4}, velocities{0.0};
-          EXPECT_TRUE(
-              publication
-                  .publish(core::ObservedRobotStateSourceKind::kJointState,
-                           names, positions, velocities, now_ns, now_ns)
-                  .published);
-        } else {
-          scheduler.advance_to(now_ns,
-                               core::SchedulerPriority::ControllerCommand);
-        }
-      };
-      const auto result =
-          backend.TranslateStopStage(stage, remaining_budget(stage), {});
-      clock.on_read = {};
-      ASSERT_EQ(result.outcome,
-                core::ParticipantStopStageOutcomeDTO::kSucceeded)
-          << (result.error ? result.error->message : "no diagnostic");
-      EXPECT_EQ(probe.hard_issues(), 0U);
-      EXPECT_EQ(backend.get_execution_snapshot().state, terminal.state);
-      EXPECT_EQ(backend.get_execution_snapshot().sequence_number,
-                terminal.sequence_number);
-    }
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     StopRestRejectsSingleSamplesMovingIncompleteAndWrongAuthority) {
-  enum class Sample {
-    kNoneAfterObservation,
-    kSingleAfterObservation,
-    kMoving,
-    kNoVelocity,
-    kWrongAuthority
-  };
-  for (const auto sample :
-       {Sample::kNoneAfterObservation, Sample::kSingleAfterObservation,
-        Sample::kMoving, Sample::kNoVelocity, Sample::kWrongAuthority}) {
-    SCOPED_TRACE(static_cast<int>(sample));
-    const auto authority = sample == Sample::kWrongAuthority
-                               ? core::StateAuthorityClass::kCommanded
-                               : core::StateAuthorityClass::kMeasured;
-    auto config = base_config();
-    config.execution_state_source_mode = "observed_ros2";
-    config.prepared_participant_binding =
-        motion_binding("program.direct", authority);
-    config.transport_joint_names = {"source_joint_1"};
-    core::ObservedRobotStatePublication publication(
-        config.required_joints, ros2_control_addressed_state_sources(config));
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    StopEvidenceClock clock;
-    core::ManualScheduler scheduler;
-    auto transport_resources_5 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(
-        *transport_resources_5,
-        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
-        sink, "arm", clock, scheduler, std::move(config));
-    TestTransportLifetime transport_lifetime_5(*transport_resources_5, backend);
-    auto stage = controlled_stage_fixture(authority);
-    if (sample == Sample::kMoving) {
-      auto &limits = std::get<core::JsonValueDTO::Array>(
-          stage.participant_stop_plan.stage_commands.front()
-              .validated_contract_parameters->at("per_resource_limits")
-              .value);
-      auto &row = std::get<core::JsonObjectDTO>(limits.front().value);
-      auto &settle = std::get<core::JsonObjectDTO>(
-          row.at("settle_velocity_threshold").value);
-      settle.at("value_rad_s") = core::JsonValueDTO{0.001};
-    }
-    backend.testing_set_running_state(true);
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kExecuting, {0.0}));
-    backend.testing_install_prepared_goal_membership(
-        stage, core::ContentDigest("prepared.invalid-rest"));
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kCompleted, {0.4}));
-    backend.testing_set_running_state(false);
-    const std::vector<std::string> names{"joint_1"};
-    const std::vector<double> positions{0.4}, resting{0.0};
-    ASSERT_TRUE(publication
-                    .publish(core::ObservedRobotStateSourceKind::kJointState,
-                             names, positions, resting, clock.now(),
-                             clock.now())
-                    .published);
-    unsigned observations = 0U;
-    clock.on_read = [&](const auto now_ns) {
-      // The first three reads are stage start, natural outcome, and the
-      // post-observation boundary. Start the source strictly after that edge.
-      if (++observations <= 3U || sample == Sample::kNoneAfterObservation ||
-          (sample == Sample::kSingleAfterObservation && observations != 4U)) {
-        return;
-      }
-      const std::vector<double> velocities =
-          sample == Sample::kNoVelocity
-              ? std::vector<double>{}
-              // This is below the default threshold but above this exact
-              // source-addressed profile's configured settle threshold.
-              : std::vector<double>{sample == Sample::kMoving ? 0.005 : 0.0};
-      EXPECT_TRUE(publication
-                      .publish(core::ObservedRobotStateSourceKind::kJointState,
-                               names, positions, velocities, now_ns, now_ns)
-                      .published);
-    };
-    auto budget = remaining_budget(stage);
-    budget.remaining_outer_duration_ns = 50'000'000;
-    for (auto &phase : budget.phases) {
-      phase.remaining_deadline_offset_ns =
-          phase.phase_id == core::StopBudgetPhaseId("command") ? 10'000'000
-                                                               : 20'000'000;
-    }
-    const auto result = backend.TranslateStopStage(stage, budget, {});
-    clock.on_read = {};
-    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error);
-    EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_not_at_rest");
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     StopRestCannotCertifyAReplacementOrResetCrossingItsObservation) {
-  for (const bool reset : {false, true}) {
-    SCOPED_TRACE(reset);
-    auto config = base_config();
-    config.execution_state_source_mode = "observed_ros2";
-    config.prepared_participant_binding =
-        motion_binding("program.direct", core::StateAuthorityClass::kMeasured);
-    config.transport_joint_names = {"source_joint_1"};
-    core::ObservedRobotStatePublication publication(
-        config.required_joints, ros2_control_addressed_state_sources(config));
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    StopEvidenceClock clock;
-    core::ManualScheduler scheduler;
-    auto transport_resources_6 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(
-        *transport_resources_6,
-        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
-        sink, "arm", clock, scheduler, std::move(config));
-    TestTransportLifetime transport_lifetime_6(*transport_resources_6, backend);
-    const auto stage =
-        controlled_stage_fixture(core::StateAuthorityClass::kMeasured);
-    backend.testing_set_running_state(true);
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kExecuting, {0.0}));
-    backend.testing_install_prepared_goal_membership(
-        stage, core::ContentDigest("prepared.crossing-rest"));
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kCompleted, {0.4}));
-    backend.testing_set_running_state(false);
-    unsigned observations = 0U;
-    bool crossed = false;
-    clock.on_read = [&](const auto now_ns) {
-      const std::vector<std::string> names{"joint_1"};
-      const std::vector<double> positions{0.4}, velocities{0.0};
-      EXPECT_TRUE(publication
-                      .publish(core::ObservedRobotStateSourceKind::kJointState,
-                               names, positions, velocities, now_ns, now_ns)
-                      .published);
-      // The fifth clock read is the first independent rest observation,
-      // outside the backend's execution and presentation locks.
-      if (++observations == 5U) {
-        crossed = true;
-        if (reset) {
-          EXPECT_TRUE(backend.reset().accepted);
-        } else {
-          backend.testing_set_running_state(true);
-          EXPECT_TRUE(backend.testing_publish_snapshot(
-              core::ExecutionState::kExecuting, {0.5}));
-        }
-      }
-    };
-    const auto result =
-        backend.TranslateStopStage(stage, remaining_budget(stage), {});
-    clock.on_read = {};
-    EXPECT_TRUE(crossed);
-    EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error);
-    EXPECT_EQ(result.error->details.at("reason"),
-              "stop_evidence_execution_changed");
-    EXPECT_EQ(backend.get_execution_snapshot().state,
-              reset ? core::ExecutionState::kIdle
-                    : core::ExecutionState::kExecuting);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandedIdlePublisherFencesQueuedCallbacksAtDispatchResetAndDestruction) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  core::ObservedRobotStatePublication publication(
-      config.required_joints, ros2_control_addressed_state_sources(config));
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
-  QueuedCallbackScheduler scheduler;
-  auto transport_resources_7 =
-      test_transport_resources(sink, clock, "arm", config);
-  auto backend = std::make_unique<Ros2ControlExecutionBackend>(
-      *transport_resources_7,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
-      "arm", clock, scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_7(*transport_resources_7, *backend);
-  auto initial_callbacks = scheduler.take_callbacks();
-  ASSERT_FALSE(initial_callbacks.empty());
-  const auto initial_sequence = publication.acquire(clock.now()).sequence();
-  backend->testing_set_running_state(true);
-  clock.advance(20'000'000);
-  for (auto &callback : initial_callbacks)
-    callback();
-  EXPECT_EQ(publication.acquire(clock.now()).sequence(), initial_sequence);
-  ASSERT_TRUE(backend->testing_publish_snapshot(
-      core::ExecutionState::kCompleted, {0.4}));
-  backend->testing_set_running_state(false);
-  auto terminal_callbacks = scheduler.take_callbacks();
-  ASSERT_FALSE(terminal_callbacks.empty());
-  (void)backend->reset(); // No ROS startup: reset is correctly unavailable.
-  const auto reset_sequence = publication.acquire(clock.now()).sequence();
-  clock.advance(20'000'000);
-  for (auto &callback : terminal_callbacks)
-    callback();
-  EXPECT_EQ(publication.acquire(clock.now()).sequence(), reset_sequence);
-  auto reset_callbacks = scheduler.take_callbacks();
-  ASSERT_FALSE(reset_callbacks.empty());
-  transport_lifetime_7.close();
-  backend.reset();
-  clock.advance(20'000'000);
-  for (auto &callback : reset_callbacks)
-    callback();
-  EXPECT_EQ(publication.acquire(clock.now()).sequence(), reset_sequence);
-  EXPECT_TRUE(scheduler.take_callbacks().empty());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     DelayedOldTerminalCannotArmAnIdlePublisherAcrossReplacementOrReset) {
-  for (const bool reset : {false, true}) {
-    SCOPED_TRACE(reset);
-    auto config = base_config();
-    config.execution_state_source_mode = "commanded_sim";
-    config.initial_joint_positions_rad = {0.0};
-    core::ObservedRobotStatePublication publication(
-        config.required_joints, ros2_control_addressed_state_sources(config));
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    core::FakeClock clock;
-    clock.set(1'000'000'000);
-    core::ManualScheduler scheduler;
-    auto transport_resources_8 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(
-        *transport_resources_8,
-        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication,
-        sink, "arm", clock, scheduler, std::move(config));
-    TestTransportLifetime transport_lifetime_8(*transport_resources_8, backend);
-    backend.testing_set_running_state(true);
-    ASSERT_TRUE(backend.testing_publish_snapshot(
-        core::ExecutionState::kCompleted, {0.4}));
-    backend.testing_set_running_state(false);
-    const auto old_generation = backend.testing_running_generation();
-    if (reset) {
-      (void)backend.reset();
-    } else {
-      backend.testing_set_running_state(true);
-      ASSERT_TRUE(backend.testing_publish_snapshot(
-          core::ExecutionState::kCompleted, {0.7}));
-      backend.testing_set_running_state(false);
-    }
-    const auto successor = publication.snapshot(clock.now());
-    ASSERT_TRUE(successor);
-    // Resume the old terminal publisher only at its delayed arming edge.
-    backend.testing_arm_commanded_idle_heartbeat({9.0}, {0.0}, old_generation);
-    clock.advance(20'000'000);
-    scheduler.advance_to(clock.now(),
-                         core::SchedulerPriority::ControllerCommand);
-    const auto observed = publication.snapshot(clock.now());
-    ASSERT_TRUE(observed);
-    EXPECT_GT(observed->sequence, successor->sequence);
-    EXPECT_EQ(observed->positions_rad, successor->positions_rad);
-    EXPECT_EQ(
-        scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
-        1U);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     FailedTerminalPublicationCannotRefreshAnEarlierCommandedPose) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  core::ObservedRobotStatePublication publication(
-      config.required_joints, ros2_control_addressed_state_sources(config));
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
-  core::ManualScheduler scheduler;
-  auto transport_resources_9 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_9,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
-      "arm", clock, scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_9(*transport_resources_9, backend);
-  backend.testing_set_running_state(true);
-  const std::vector<std::string> names{"joint_1"};
-  const std::vector<double> positions{0.2}, velocities{0.0};
-  ASSERT_TRUE(publication
-                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
-                           names, positions, velocities, clock.now(),
-                           clock.now())
-                  .published);
-  auto first = publication.acquire(clock.now());
-  ASSERT_TRUE(publication
-                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
-                           names, positions, velocities, clock.now(),
-                           clock.now())
-                  .published);
-  auto second = publication.acquire(clock.now());
-  ASSERT_TRUE(publication
-                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
-                           names, positions, velocities, clock.now(),
-                           clock.now())
-                  .published);
-  auto third = publication.acquire(clock.now());
-  const auto previous_sequence = third.sequence();
-  EXPECT_FALSE(backend.testing_publish_snapshot(
-      core::ExecutionState::kCompleted, {0.4}));
-  backend.testing_set_running_state(false);
-  first = {};
-  clock.advance(20'000'000);
-  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
-  EXPECT_EQ(publication.acquire(clock.now()).sequence(), previous_sequence);
-  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
-            0U);
-  ASSERT_NE(backend.authored_state_authority_epoch(), nullptr);
-  EXPECT_NE(backend.authored_state_authority_epoch()->load(
-                std::memory_order_acquire) &
-                1U,
-            0U);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandedIdlePublisherRetriesBoundedPublicationContention) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  core::ObservedRobotStatePublication publication(
-      config.required_joints, ros2_control_addressed_state_sources(config));
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
-  core::ManualScheduler scheduler;
-  auto transport_resources_10 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_10,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
-      "arm", clock, scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_10(*transport_resources_10, backend);
-  auto first = publication.acquire(clock.now());
-  const std::vector<std::string> names{"joint_1"};
-  const std::vector<double> positions{0.0}, velocities{0.0};
-  ASSERT_TRUE(publication
-                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
-                           names, positions, velocities, clock.now(),
-                           clock.now())
-                  .published);
-  auto second = publication.acquire(clock.now());
-  ASSERT_TRUE(publication
-                  .publish(core::ObservedRobotStateSourceKind::kCommandedState,
-                           names, positions, velocities, clock.now(),
-                           clock.now())
-                  .published);
-  auto third = publication.acquire(clock.now());
-  const auto blocked_sequence = third.sequence();
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
-  EXPECT_GT(publication.metrics().slot_exhausted_total, 0U);
-  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
-            1U);
-  first = {};
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now(), core::SchedulerPriority::ControllerCommand);
-  EXPECT_GT(publication.acquire(clock.now()).sequence(), blocked_sequence);
-  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
-            1U);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     InjectedAddressedPublicationIsTheSoleCommandedStateChannel) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.25};
-  core::ObservedRobotStatePublication publication(
-      config.required_joints, ros2_control_addressed_state_sources(config));
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(123'000'000);
-  core::ManualScheduler scheduler;
-
-  auto transport_resources_11 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_11,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
-      "arm", clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_11(*transport_resources_11, backend);
-
-  EXPECT_EQ(backend.observed_robot_state_publication(), &publication);
-  const auto snapshot = publication.snapshot(clock.now());
-  ASSERT_TRUE(snapshot.has_value());
-  EXPECT_EQ(snapshot->source_kind,
-            core::ObservedRobotStateSourceKind::kCommandedState);
-  EXPECT_EQ(snapshot->source_id, "commanded_state");
-  EXPECT_EQ(snapshot->authority_profile, "ros2_control_commanded_sim_v1");
-  ASSERT_EQ(snapshot->positions_rad.size(), 1U);
-  EXPECT_DOUBLE_EQ(snapshot->positions_rad.front(), 0.25);
-
-  backend.testing_store_latest_joint_sample(
-      config.required_joints, {9.0},
-      std::chrono::steady_clock::time_point(std::chrono::milliseconds(124)));
-  const auto after_feedback = publication.snapshot(clock.now());
-  ASSERT_TRUE(after_feedback.has_value());
-  ASSERT_EQ(after_feedback->positions_rad.size(), 1U);
-  EXPECT_DOUBLE_EQ(after_feedback->positions_rad.front(), 0.25);
-  const auto metrics = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics.observed_state_published_total, 2U);
-  ASSERT_EQ(metrics.observed_state_sources.size(), 4U);
-  EXPECT_EQ(metrics.observed_state_sources.front().source_kind,
-            core::ObservedRobotStateSourceKind::kCommandedState);
-  EXPECT_EQ(metrics.observed_state_sources[2].source_kind,
-            core::ObservedRobotStateSourceKind::kJointState);
-  EXPECT_EQ(metrics.observed_state_sources[2].published_total, 1U);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     InjectedAddressedPublicationRejectsAnySourceOrJointMismatch) {
-  auto config = base_config();
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  core::ObservedRobotStatePublication wrong_joints(
-      {"different_joint"}, ros2_control_addressed_state_sources(config));
-  auto transport_resources_12 =
-      test_transport_resources(sink, clock, "arm", config);
-  EXPECT_THROW(Ros2ControlExecutionBackend(
-                   *transport_resources_12,
-                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-                   wrong_joints, sink, "arm", clock, scheduler, config),
-               std::invalid_argument);
-
-  auto wrong_sources = ros2_control_addressed_state_sources(config);
-  wrong_sources.front().source_id = "different_source";
-  core::ObservedRobotStatePublication wrong_source(config.required_joints,
-                                                   wrong_sources);
-  auto transport_resources_13 =
-      test_transport_resources(sink, clock, "arm", config);
-  EXPECT_THROW(Ros2ControlExecutionBackend(
-                   *transport_resources_13,
-                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-                   wrong_source, sink, "arm", clock, scheduler, config),
-               std::invalid_argument);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     TransportJointNamesMapIntoCompiledAddressedStateIdentity) {
-  auto config = base_config();
-  config.required_joints = {"joint_1"};
-  config.transport_joint_names = {"source_joint_1"};
-  config.prepared_participant_binding = motion_binding("program.physical");
-  core::ObservedRobotStatePublication publication(
-      config.required_joints, ros2_control_addressed_state_sources(config));
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(123'000'000);
-  core::ManualScheduler scheduler;
-  auto transport_resources_14 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_14,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, publication, sink,
-      "arm", clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_14(*transport_resources_14, backend);
-
-  backend.testing_store_latest_joint_sample(
-      {"source_joint_1"}, {0.75},
-      std::chrono::steady_clock::time_point(std::chrono::milliseconds(123)));
-
-  const auto snapshot = publication.snapshot(clock.now());
-  ASSERT_TRUE(snapshot.has_value());
-  const auto canonical_names = publication.canonical_joint_names();
-  ASSERT_EQ(canonical_names.size(), 1U);
-  EXPECT_EQ(canonical_names.front(), "joint_1");
-  ASSERT_EQ(snapshot->positions_rad.size(), 1U);
-  EXPECT_DOUBLE_EQ(snapshot->positions_rad.front(), 0.75);
-
-  auto crossed = config;
-  crossed.transport_joint_names = {"different_source_joint"};
-  auto transport_resources_15 =
-      test_transport_resources(sink, clock, "arm", crossed);
-  EXPECT_THROW(Ros2ControlExecutionBackend(
-                   *transport_resources_15,
-                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-                   publication, sink, "arm", clock, scheduler,
-                   std::move(crossed)),
-               std::invalid_argument);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     RouteRebindAcceptsContainedAliasesAndRejectsCrossedRuntimeFacts) {
-  auto binding = motion_binding("program.physical");
-  auto config = base_config();
-  config.prepared_participant_binding = binding;
-  config.transport_joint_names = {"source_joint_1"};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_16 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_16,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_16(*transport_resources_16, backend);
-
-  auto alias = program_alias(binding);
-  auto accepted = backend.RebindRoute(binding, {alias});
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-
-  auto crossed_alias_value = alias.value();
-  crossed_alias_value.control_path->provider_runtime_epoch =
-      core::RuntimeEpoch("runtime-epoch.2");
-  crossed_alias_value.runtime_unit_epochs.front().runtime_epoch =
-      core::RuntimeEpoch("runtime-epoch.2");
-  auto crossed_alias =
-      core::verify_runtime_participant_binding(std::move(crossed_alias_value));
-  ASSERT_TRUE(crossed_alias.ok()) << crossed_alias.error().message;
-  auto alias_rejected = backend.RebindRoute(binding, {crossed_alias.value()});
-  ASSERT_FALSE(alias_rejected.ok());
-  EXPECT_EQ(alias_rejected.error().details.at("reason"),
-            "ros2_control_motion_program_alias_mismatch");
-
-  auto crossed_binding_value = binding.value();
-  crossed_binding_value.resources.front().compiled_resource_name =
-      "different_joint";
-  auto crossed_binding = core::verify_runtime_participant_binding(
-      std::move(crossed_binding_value));
-  ASSERT_TRUE(crossed_binding.ok()) << crossed_binding.error().message;
-  auto binding_rejected = backend.RebindRoute(crossed_binding.value(), {});
-  ASSERT_FALSE(binding_rejected.ok());
-  EXPECT_EQ(binding_rejected.error().details.at("reason"),
-            "ros2_control_motion_route_rebind_mismatch");
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     DirectStageFailsBeforeEffectWhenPreparedGoalMembershipIsUnavailable) {
-  auto config = base_config();
-  config.prepared_participant_binding = motion_binding("program.direct");
-  config.transport_joint_names = {"source_joint_1"};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_17 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_17,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_17(*transport_resources_17, backend);
-  const auto stage = direct_stage_fixture();
-  const core::RemainingStopBudgetDTO budget{
-      stage.stop_id,
-      stage.stop_generation,
-      1'000'000'000,
-      {{core::StopBudgetPhaseId("command"), 500'000'000}}};
-
-  const auto result =
-      backend.TranslateStopStage(stage, budget, std::stop_token{});
-
-  EXPECT_EQ(result.request.stop_id, stage.stop_id);
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kNotDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"),
-            "resolved_stop_stage_dispatch_membership_unavailable");
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kIdle);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ExactPreparedGoalCancelReturnsTerminalEvidenceAndCannotCrossDrive) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  config.prepared_participant_binding = motion_binding("program.direct");
-  config.transport_joint_names = {"source_joint_1"};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
-  core::ManualScheduler scheduler;
-  auto transport_resources_18 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_18,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_18(*transport_resources_18, backend);
-  const auto stage = direct_stage_fixture();
-
-  backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.0}));
-  backend.testing_install_prepared_goal_membership(
-      stage, core::ContentDigest("prepared.direct"));
-  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
-                                                 std::stop_token{});
-
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
-  ASSERT_EQ(result.evidence_items.size(), 1U);
-  EXPECT_EQ(result.evidence_items.front().state,
-            core::StopEvidenceItemStateDTO::kSatisfied);
-  ASSERT_TRUE(result.controller_acknowledgement_sequence.has_value());
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kStopped);
-
-  backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.25}));
-  const auto crossed = backend.TranslateStopStage(
-      stage, remaining_budget(stage), std::stop_token{});
-  EXPECT_EQ(crossed.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kNotDispatched);
-  EXPECT_EQ(crossed.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-  ASSERT_TRUE(crossed.error.has_value());
-  EXPECT_EQ(crossed.error->details.at("reason"), "prepared_goal_not_active");
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kExecuting);
-  EXPECT_TRUE(backend.stop().accepted);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ExactPreparedSoftwareHardStopRequiresBoundedAddressedRestEvidence) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  config.prepared_participant_binding = motion_binding("program.direct");
-  config.transport_joint_names = {"source_joint_1"};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  StopEvidenceClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_19 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_19,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_19(*transport_resources_19, backend);
-  const auto stage = software_hard_stage_fixture();
-
-  backend.testing_set_running_state(true);
-  ASSERT_TRUE(
-      backend.testing_publish_snapshot(core::ExecutionState::kStopping, {0.0}));
-  backend.testing_install_prepared_goal_membership(
-      stage, core::ContentDigest("prepared.software_hard"));
-  clock.on_read = [&scheduler](const auto now_ns) {
-    scheduler.advance_to(now_ns, core::SchedulerPriority::ControllerCommand);
-  };
-  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
-                                                 std::stop_token{});
-  clock.on_read = {};
-
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kSucceeded);
-  ASSERT_EQ(result.evidence_items.size(), 1U);
-  EXPECT_EQ(result.evidence_items.front().required_class,
-            core::StopEvidenceRequirementKind::kMotionRest);
-  EXPECT_EQ(result.evidence_items.front().state,
-            core::StopEvidenceItemStateDTO::kSatisfied);
-  ASSERT_TRUE(result.source_epoch.has_value());
-  ASSERT_TRUE(result.source_sequence.has_value());
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kStopped);
-  const auto &evidence = std::get<core::JsonObjectDTO>(
-      result.evidence_items.front().evidence->value);
-  const auto &rest =
-      std::get<core::JsonObjectDTO>(evidence.at("post_command_rest").value);
-  EXPECT_GE(std::get<double>(rest.at("dwell_ns").value), 10'000'000.0);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ExactPreparedControlledStageProjectsSourceScopeAndInvokesProviderOnce) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  config.prepared_participant_binding = motion_binding("program.direct");
-  config.transport_joint_names = {"source_joint_1"};
-  config.enable_soft_on_path_path_ramp = true;
-  config.soft_on_path_max_jerk_rad_s3 = {{"joint_1", 1'000'000.0}};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000'000'000);
-  core::ManualScheduler scheduler;
-  auto transport_resources_20 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_20,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_20(*transport_resources_20, backend);
-  CountingStopProbe probe;
-  detail::Ros2ControlStopQualificationAccess::install_probe(backend, probe);
-  const auto stage = controlled_stage_fixture();
-
-  backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.0}));
-  backend.testing_install_prepared_goal_membership(
-      stage, core::ContentDigest("prepared.controlled"));
-  const auto result = backend.TranslateStopStage(stage, remaining_budget(stage),
-                                                 std::stop_token{});
-
-  EXPECT_EQ(result.attempt_disposition,
-            core::StopStageAttemptDispositionDTO::kNotDispatched);
-  EXPECT_EQ(result.outcome, core::ParticipantStopStageOutcomeDTO::kFailed);
-  ASSERT_TRUE(result.error.has_value());
-  // Reaching the provider's observed-state gate proves the source-addressed
-  // retained profile was projected to the compiled controller scope first.
-  EXPECT_EQ(result.error->details.at("reason"),
-            "controlled_stop_no_observed_state");
-  EXPECT_EQ(probe.nominal_entries(), 1U);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ForcedManagedGoalTerminalStopsOnlyItsExecutionGeneration) {
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_21 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_21,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_21(*transport_resources_21, backend);
-
-  backend.testing_set_running_state(true);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kStopping,
-                                               {0.25}));
-  const auto execution_generation = backend.testing_running_generation();
-  rclcpp_action::GoalUUID goal_id{};
-  goal_id.front() = 7U;
-  constexpr std::uint64_t managed_generation = 11U;
-  backend.testing_begin_managed_fjt_terminal_session(managed_generation,
-                                                     goal_id);
-  detail::Ros2ControlStopQualificationAccess::
-      arm_forced_managed_terminal_for_test(backend, execution_generation - 1U,
-                                           managed_generation);
-  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult stale;
-  stale.goal_id = goal_id;
-  stale.code = rclcpp_action::ResultCode::CANCELED;
-  stale.result = std::make_shared<FollowJointTrajectory::Result>();
-  backend.testing_on_managed_fjt_terminal_result(stale, managed_generation);
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kStopping);
-
-  rclcpp_action::GoalUUID replacement_goal_id{};
-  replacement_goal_id.front() = 8U;
-  backend.testing_begin_managed_fjt_terminal_session(managed_generation + 1U,
-                                                     replacement_goal_id);
-  detail::Ros2ControlStopQualificationAccess::
-      arm_forced_managed_terminal_for_test(backend, execution_generation,
-                                           managed_generation + 1U);
-  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult current;
-  current.goal_id = replacement_goal_id;
-  current.code = rclcpp_action::ResultCode::CANCELED;
-  current.result = std::make_shared<FollowJointTrajectory::Result>();
-  backend.testing_on_managed_fjt_terminal_result(current,
-                                                 managed_generation + 1U);
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kStopped);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControlledStopRejectsWrongCoordinateAndInexactJointScopeBeforeEffect) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_22 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_22,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_22(*transport_resources_22, backend);
-
-  core::MotionInterruptStopProfileDTO wrong_settle;
-  wrong_settle.profile_id = "hard.profile";
-  wrong_settle.stop_mode = core::MotionInterruptStopMode::kHardDeceleration;
-  wrong_settle.per_joint_settle_velocity_threshold =
-      std::map<std::string, core::CoordinateVelocityDTO>{
-          {"joint_1", core::LinearVelocityDTO{0.01}}};
-  const auto rejected_settle = backend.execute_controlled_stop(wrong_settle);
-  ASSERT_TRUE(rejected_settle.error.has_value());
-  EXPECT_EQ(rejected_settle.error->details.at("reason"),
-            "settle_velocity_threshold_coordinate_kind_mismatch");
-
-  core::MotionInterruptStopProfileDTO wrong_scope;
-  wrong_scope.profile_id = "soft.profile";
-  wrong_scope.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
-  wrong_scope.deceleration_time_s = 0.5;
-  wrong_scope.per_joint_max_deceleration = {
-      {"different_joint", core::AngularAccelerationDTO{1.0}}};
-  const auto rejected_scope = backend.execute_controlled_stop(wrong_scope);
-  ASSERT_TRUE(rejected_scope.error.has_value());
-  EXPECT_EQ(rejected_scope.error->details.at("reason"),
-            "stop_acceleration_scope_coverage_mismatch");
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     PortableSpringProfileProjectsToCompiledScopeBeforeStateRead) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.prepared_participant_binding = motion_binding("program.direct");
-  config.transport_joint_names = {"source_joint_1"};
-  auto transport_resources_23 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_23,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, std::move(config));
-  TestTransportLifetime transport_lifetime_23(*transport_resources_23, backend);
-
-  core::MotionInterruptStopProfileDTO profile;
-  profile.profile_id = "spring.profile";
-  profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
-  profile.per_joint_max_deceleration = {
-      {"source_joint_1", core::AngularAccelerationDTO{1.0}}};
-  const auto result = backend.execute_controlled_stop(profile);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"),
-            "controlled_stop_no_observed_state");
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     MissingControllerManagerPublishesInvalidBinding) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto config = base_config();
-  config.controller_state_topic =
-      "/manyforge_missing_manager_controller_state_" + unique_suffix();
-  config.controller_binding =
-      binding_contract_for(config, "/manyforge_missing_manager_" +
-                                       unique_suffix() + "/controller_manager");
-  config.controller_binding_refresh_timeout_s = 0.05;
-  auto transport_resources_24 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_24, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_24(*transport_resources_24, backend);
-  transport_lifetime_24.start();
-
-  const auto snapshot = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return !candidate.valid &&
-               has_reason(candidate, "controller_list_service_unavailable");
-      });
-  ASSERT_TRUE(snapshot.has_value());
-  EXPECT_FALSE(snapshot->valid);
-  EXPECT_GT(backend.controller_progress_metrics()
-                .controller_binding_refresh_failures_total,
-            0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControllerManagerServicesCannotBypassInitialActivityFence) {
-  const std::string suffix = unique_suffix();
-  const std::string controller_manager =
-      "/manyforge_binding_activity_fence_" + suffix + "/controller_manager";
-  auto config = base_config();
-  config.action_name = "/manyforge_binding_activity_fence_" + suffix +
-                       "/follow_joint_trajectory";
-  config.joint_state_topic =
-      "/manyforge_binding_activity_fence_" + suffix + "/joint_states";
-  config.controller_state_topic =
-      "/manyforge_binding_activity_fence_" + suffix + "/controller_state";
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeControllerManager manager(controller_manager, *config.controller_binding,
-                                /*publish_initial_activity=*/false);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_25 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_25, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_25(*transport_resources_25, backend);
-  transport_lifetime_25.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-
-  const auto fenced = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return !candidate.valid &&
-               has_reason(candidate, "controller_activity_unobserved");
-      });
-  ASSERT_TRUE(fenced.has_value());
-
-  manager.announce_activity();
-  const auto admitted = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > 0 && candidate.valid;
-      });
-  ASSERT_TRUE(admitted.has_value());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     EquivalentActivitySnapshotsDoNotFenceDispatch) {
-  const std::string suffix = unique_suffix();
-  const std::string controller_manager =
-      "/manyforge_binding_activity_replay_" + suffix + "/controller_manager";
-  auto config = base_config();
-  config.action_name = "/manyforge_binding_activity_replay_" + suffix +
-                       "/follow_joint_trajectory";
-  config.joint_state_topic =
-      "/manyforge_binding_activity_replay_" + suffix + "/joint_states";
-  config.controller_state_topic =
-      "/manyforge_binding_activity_replay_" + suffix + "/controller_state";
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_26 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_26, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_26(*transport_resources_26, backend);
-  transport_lifetime_26.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-
-  const auto admitted = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > 0 && candidate.valid;
-      });
-  ASSERT_TRUE(admitted.has_value());
-  const auto metrics_before = backend.controller_progress_metrics();
-
-  // A controller-manager publication carries a fresh header timestamp even
-  // when its lifecycle snapshot is unchanged. It and an exact transient-local
-  // replay are both observations of the same authority generation.
-  manager.announce_activity();
-  const auto duplicate_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < duplicate_deadline &&
-         backend.controller_progress_metrics()
-                 .controller_binding_activity_duplicates_total ==
-             metrics_before.controller_binding_activity_duplicates_total) {
-    std::this_thread::sleep_for(10ms);
-  }
-
-  const auto metrics_after = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics_after.controller_binding_activity_duplicates_total,
-            metrics_before.controller_binding_activity_duplicates_total + 1);
-  EXPECT_EQ(metrics_after.controller_binding_activity_events_total,
-            metrics_before.controller_binding_activity_events_total);
-
-  manager.replay_last_activity();
-  const auto replay_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < replay_deadline &&
-         backend.controller_progress_metrics()
-                 .controller_binding_activity_duplicates_total ==
-             metrics_after.controller_binding_activity_duplicates_total) {
-    std::this_thread::sleep_for(10ms);
-  }
-  const auto metrics_after_replay = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics_after_replay.controller_binding_activity_duplicates_total,
-            metrics_before.controller_binding_activity_duplicates_total + 2);
-  EXPECT_EQ(metrics_after_replay.controller_binding_activity_events_total,
-            metrics_before.controller_binding_activity_events_total);
-  const auto after_replay = backend.controller_binding_snapshot();
-  ASSERT_TRUE(after_replay.has_value());
-  EXPECT_TRUE(after_replay->valid);
-  EXPECT_EQ(after_replay->activity_generation, admitted->activity_generation);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControllerManagerMonitorRejectsConflictAndRestartChurn) {
-  const std::string suffix = unique_suffix();
-  const std::string controller_manager =
-      "/manyforge_binding_matrix_" + suffix + "/controller_manager";
-  auto config = base_config();
-  config.action_name =
-      "/manyforge_binding_matrix_" + suffix + "/follow_joint_trajectory";
-  config.joint_state_topic =
-      "/manyforge_binding_matrix_" + suffix + "/joint_states";
-  config.controller_state_topic =
-      "/manyforge_binding_matrix_" + suffix + "/controller_state";
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_27 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_27, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_27(*transport_resources_27, backend);
-  transport_lifetime_27.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-
-  const auto initial = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.valid;
-      });
-  ASSERT_TRUE(initial.has_value());
-
-  manager.set_conflicting_claim(true);
-  const auto conflict = wait_for_binding_snapshot(
-      backend, [initial](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > initial->activity_generation &&
-               !candidate.valid &&
-               has_reason(candidate, "trajectory_controller_claim_conflict");
-      });
-  ASSERT_TRUE(conflict.has_value());
-  EXPECT_FALSE(conflict->conflicting_claims_absent);
-
-  manager.set_conflicting_claim(false);
-  const auto recovered = wait_for_binding_snapshot(
-      backend, [conflict](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > conflict->activity_generation &&
-               candidate.valid;
-      });
-  ASSERT_TRUE(recovered.has_value());
-
-  manager.set_controller_active(false);
-  const auto inactive = wait_for_binding_snapshot(
-      backend, [recovered](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > recovered->activity_generation &&
-               !candidate.valid &&
-               has_reason(candidate, "trajectory_controller_inactive");
-      });
-  ASSERT_TRUE(inactive.has_value());
-  EXPECT_FALSE(inactive->controller_active);
-
-  manager.set_controller_active(true);
-  const auto restarted = wait_for_binding_snapshot(
-      backend, [inactive](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > inactive->activity_generation &&
-               candidate.valid;
-      });
-  ASSERT_TRUE(restarted.has_value());
-  EXPECT_TRUE(restarted->controller_active);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControllerManagerRefreshFailureUsesOnlyRemainingFreshLease) {
-  const std::string suffix = unique_suffix();
-  const std::string controller_manager =
-      "/manyforge_binding_refresh_grace_" + suffix + "/controller_manager";
-  auto config = base_config();
-  config.action_name =
-      "/manyforge_binding_refresh_grace_" + suffix + "/follow_joint_trajectory";
-  config.joint_state_topic =
-      "/manyforge_binding_refresh_grace_" + suffix + "/joint_states";
-  config.controller_state_topic =
-      "/manyforge_binding_refresh_grace_" + suffix + "/controller_state";
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.controller_binding_refresh_timeout_s = 0.05;
-
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_28 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_28, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_28(*transport_resources_28, backend);
-  transport_lifetime_28.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-
-  const auto initial = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.valid;
-      });
-  ASSERT_TRUE(initial.has_value());
-  const auto failures_before = backend.controller_progress_metrics()
-                                   .controller_binding_refresh_failures_total;
-  const auto attempts_before = backend.controller_progress_metrics()
-                                   .controller_binding_refresh_attempts_total;
-
-  manager.stop_services_without_activity();
-  const auto failure_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < failure_deadline &&
-         backend.controller_progress_metrics()
-                 .controller_binding_refresh_failures_total ==
-             failures_before) {
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_GT(backend.controller_progress_metrics()
-                .controller_binding_refresh_failures_total,
-            failures_before);
-  const auto immediate_retry_deadline =
-      std::chrono::steady_clock::now() + 300ms;
-  while (std::chrono::steady_clock::now() < immediate_retry_deadline &&
-         backend.controller_progress_metrics()
-                 .controller_binding_refresh_attempts_total <
-             attempts_before + 2U) {
-    std::this_thread::sleep_for(10ms);
-  }
-  EXPECT_GE(backend.controller_progress_metrics()
-                .controller_binding_refresh_attempts_total,
-            attempts_before + 2U)
-      << "a retained lease must be retried before the next periodic edge";
-  const auto retained = backend.controller_binding_snapshot();
-  ASSERT_TRUE(retained.has_value());
-  EXPECT_TRUE(retained->valid);
-  EXPECT_EQ(retained->generation, initial->generation);
-
-  clock.set(initial->fresh_until_ns + 1);
-  const auto expired = wait_for_binding_snapshot(
-      backend, [initial](const ControllerBindingSnapshot &candidate) {
-        return candidate.generation > initial->generation && !candidate.valid &&
-               has_reason(candidate, "controller_list_service_unavailable");
-      });
-  ASSERT_TRUE(expired.has_value());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandedSimControllerReadinessResetsBeforeOpeningGateAndOnRecovery) {
-  const std::string suffix = unique_suffix();
-  const std::string controller_manager =
-      "/manyforge_commanded_sim_readiness_" + suffix + "/controller_manager";
-  auto config = base_config();
-  config.action_name = "/manyforge_commanded_sim_readiness_" + suffix +
-                       "/follow_joint_trajectory";
-  config.joint_state_topic =
-      "/manyforge_commanded_sim_readiness_" + suffix + "/joint_states";
-  config.controller_state_topic =
-      "/manyforge_commanded_sim_readiness_" + suffix + "/controller_state";
-  config.command_gate_topic =
-      "/manyforge_commanded_sim_readiness_" + suffix + "/command_gate";
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.25};
-  config.sim_reset_motion_duration_s = 0.0;
-  config.wait_for_action_server_timeout_s = 1.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(config.action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_29 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_29, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_29(*transport_resources_29, backend);
-  transport_lifetime_29.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.succeed_current_goal());
-  const auto initialized = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.valid;
-      });
-  ASSERT_TRUE(initialized.has_value());
-  EXPECT_TRUE(backend.command_gate_enabled());
-
-  manager.set_controller_active(false);
-  const auto inactive = wait_for_binding_snapshot(
-      backend, [initialized](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation >
-                   initialized->activity_generation &&
-               !candidate.valid &&
-               has_reason(candidate, "trajectory_controller_inactive");
-      });
-  ASSERT_TRUE(inactive.has_value());
-  EXPECT_FALSE(backend.command_gate_enabled());
-
-  manager.set_controller_active(true);
-  ASSERT_TRUE(server.wait_for_goal_count(2));
-  ASSERT_TRUE(server.succeed_current_goal());
-  const auto recovered = wait_for_binding_snapshot(
-      backend, [inactive](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > inactive->activity_generation &&
-               candidate.valid;
-      });
-  ASSERT_TRUE(recovered.has_value());
-  EXPECT_TRUE(backend.command_gate_enabled());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ManagedCommandedSimControllerReadinessKeepsSeedAndGateClosedWithoutHome) {
-  const std::string suffix = unique_suffix();
-  const std::string root = "/manyforge_managed_no_home_" + suffix;
-  auto config = base_config();
-  config.action_name = root + "/follow_joint_trajectory";
-  config.joint_state_topic = root + "/joint_states";
-  config.controller_state_topic = root + "/controller_state";
-  config.command_gate_topic = root + "/command_gate";
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.25};
-  config.initialize_commanded_sim_on_controller_ready = false;
-  config.controller_binding =
-      binding_contract_for(config, root + "/controller_manager");
-  config.controller_binding_refresh_timeout_s = 1.0;
-  FakeFjtServer server(config.action_name);
-  FakeControllerManager manager(root + "/controller_manager",
-                                *config.controller_binding);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_30 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_30, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_30(*transport_resources_30, backend);
-  transport_lifetime_30.start();
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  const auto ready = wait_for_binding_snapshot(
-      backend, [](const ControllerBindingSnapshot &candidate) {
-        return candidate.valid;
-      });
-  ASSERT_TRUE(ready.has_value());
-  EXPECT_FALSE(backend.command_gate_enabled());
-  EXPECT_EQ(server.goal_count(), 0U);
-  const auto *publication = backend.observed_robot_state_publication();
-  ASSERT_NE(publication, nullptr);
-  const auto seeded = publication->snapshot(clock.now());
-  ASSERT_TRUE(seeded.has_value());
-  EXPECT_EQ(seeded->source_kind, core::ObservedRobotStateSourceKind::kCommandedState);
-  EXPECT_EQ(seeded->positions_rad, (std::vector<double>{0.25}));
-  manager.set_controller_active(false);
-  const auto inactive = wait_for_binding_snapshot(
-      backend, [ready](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > ready->activity_generation &&
-               !candidate.valid;
-      });
-  ASSERT_TRUE(inactive.has_value());
-  manager.set_controller_active(true);
-  const auto recovered = wait_for_binding_snapshot(
-      backend, [inactive](const ControllerBindingSnapshot &candidate) {
-        return candidate.activity_generation > inactive->activity_generation &&
-               candidate.valid;
-      });
-  ASSERT_TRUE(recovered.has_value());
-  EXPECT_FALSE(backend.command_gate_enabled());
-  EXPECT_EQ(server.goal_count(), 0U);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     AdmissionPublicationIsMonotonicAndIdempotent) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000);
-  auto config = base_config();
-  config.controller_state_topic =
-      "/manyforge_admission_controller_state_" + unique_suffix();
-  config.controller_binding =
-      binding_contract_for(config, "/manyforge_admission/controller_manager");
-  config.require_execution_admission_snapshot = true;
-  auto transport_resources_31 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_31,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_31(*transport_resources_31, backend);
-
-  ExecutionAdmissionSnapshot admission;
-  admission.generation = 4;
-  admission.lifecycle_generation = 2;
-  admission.robot_id = "lite6-a";
-  admission.binding_contract_generation_id =
-      config.controller_binding->generation_id;
-  admission.runtime_generation_id = "runtime-1";
-  admission.provider_component_epoch = "provider-epoch-1";
-  admission.transport_owner_component_epoch = "owner-epoch-1";
-  admission.authority_component_epoch = "authority-epoch-1";
-  admission.cell_supervisor_component_epoch = "supervisor-epoch-1";
-  admission.observed_timestamp_ns = clock.now();
-  admission.received_timestamp_ns = clock.now();
-  admission.fresh_until_ns = clock.now() + 10'000;
-  admission.controller_ready = true;
-  admission.motion_admitted = true;
-
-  auto malformed = admission;
-  malformed.robot_id.clear();
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
-  malformed = admission;
-  malformed.observed_timestamp_ns = malformed.received_timestamp_ns + 1;
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
-  malformed = admission;
-  malformed.controller_ready = false;
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
-  malformed = admission;
-  malformed.reason_codes = {"duplicate", "duplicate"};
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
-  malformed = admission;
-  malformed.binding_contract_generation_id = "another-robot-binding";
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
-
-  EXPECT_TRUE(backend.publish_execution_admission_snapshot(admission));
-  EXPECT_TRUE(backend.publish_execution_admission_snapshot(admission))
-      << "an exact retry is idempotent";
-
-  auto conflicting = admission;
-  conflicting.motion_admitted = false;
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(conflicting))
-      << "one generation cannot describe two lifecycle states";
-
-  auto older = admission;
-  older.generation -= 1;
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(older));
-
-  auto semantic_change_without_lifecycle_generation = admission;
-  semantic_change_without_lifecycle_generation.generation += 1;
-  semantic_change_without_lifecycle_generation.received_timestamp_ns += 1;
-  semantic_change_without_lifecycle_generation.fresh_until_ns += 1;
-  semantic_change_without_lifecycle_generation.motion_admitted = false;
-  semantic_change_without_lifecycle_generation.reason_codes = {
-      "operator_gate_closed"};
-  EXPECT_FALSE(backend.publish_execution_admission_snapshot(
-      semantic_change_without_lifecycle_generation));
-
-  auto refreshed = admission;
-  refreshed.generation += 1;
-  refreshed.observed_timestamp_ns += 1;
-  refreshed.received_timestamp_ns += 1;
-  refreshed.fresh_until_ns += 1;
-  EXPECT_TRUE(backend.publish_execution_admission_snapshot(refreshed))
-      << "one lifecycle generation may renew its observation lease";
-
-  auto regressed_lifecycle = refreshed;
-  regressed_lifecycle.generation += 1;
-  regressed_lifecycle.lifecycle_generation -= 1;
-  regressed_lifecycle.observed_timestamp_ns += 1;
-  regressed_lifecycle.received_timestamp_ns += 1;
-  regressed_lifecycle.fresh_until_ns += 1;
-  EXPECT_FALSE(
-      backend.publish_execution_admission_snapshot(regressed_lifecycle));
-
-  auto newer = refreshed;
-  newer.generation += 1;
-  newer.lifecycle_generation += 1;
-  newer.observed_timestamp_ns += 1;
-  newer.received_timestamp_ns += 1;
-  newer.fresh_until_ns += 1;
-  newer.motion_admitted = false;
-  newer.reason_codes = {"operator_gate_closed"};
-  EXPECT_TRUE(backend.publish_execution_admission_snapshot(newer));
-
-  const auto observed = backend.execution_admission_snapshot();
-  ASSERT_TRUE(observed.has_value());
-  EXPECT_EQ(observed->generation, newer.generation);
-  EXPECT_EQ(observed->lifecycle_generation, newer.lifecycle_generation);
-  EXPECT_FALSE(observed->motion_admitted);
-  EXPECT_EQ(observed->reason_codes,
-            (std::vector<std::string>{"operator_gate_closed"}));
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     MissingAdmissionRejectsBeforeFjtDispatch) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_binding_reject_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_binding_reject_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_binding_reject_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_binding_reject_" + suffix + "/controller_manager";
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, [&]() {
-    auto provisional = base_config();
-    provisional.action_name = action_name;
-    provisional.joint_state_topic = joint_state_topic;
-    provisional.controller_state_topic = controller_state_topic;
-    return binding_contract_for(provisional, controller_manager);
-  }());
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-  auto transport_resources_32 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_32, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_32(*transport_resources_32, backend);
-  transport_lifetime_32.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  const auto binding_deadline = std::chrono::steady_clock::now() + 4s;
-  while (std::chrono::steady_clock::now() < binding_deadline) {
-    const auto binding = backend.controller_binding_snapshot();
-    if (binding.has_value() && binding->valid) {
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  const auto binding = backend.controller_binding_snapshot();
-  ASSERT_TRUE(binding.has_value());
-  ASSERT_TRUE(binding->valid);
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool preplanning_rejection_observed = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    const auto sync = backend.sync_observed_state_before_planning();
-    if (!sync.ok() && sync.error().details.contains("reason") &&
-        sync.error().details.at("reason") ==
-            "execution_admission_unavailable") {
-      preplanning_rejection_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(preplanning_rejection_observed);
-  EXPECT_FALSE(backend.testing_planning_environment_pin().has_value());
-
-  const auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
-  const auto snapshot = handle.get_snapshot();
-  EXPECT_EQ(snapshot.state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->details.at("reason_code"),
-            ros2_control_fault_reason::kExecutionAdmissionRejected);
-  EXPECT_EQ(snapshot.error->details.at("admission_failure_reason"),
-            "execution_admission_unavailable");
-  EXPECT_FALSE(server.has_goal());
-  EXPECT_EQ(backend.controller_progress_metrics()
-                .execution_admission_dispatch_rejections_total,
-            1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ComponentEpochChangeBetweenPlanningAndDispatchRejectsWithoutFjtGoal) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_environment_change_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_environment_change_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_environment_change_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_environment_change_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_33 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_33, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_33(*transport_resources_33, backend);
-  transport_lifetime_33.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend,
-                                [](const ControllerBindingSnapshot &candidate) {
-                                  return candidate.valid;
-                                })
-          .has_value());
-
-  auto admission =
-      admitted_snapshot_for(*config.controller_binding, clock.now());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool environment_pinned = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      environment_pinned = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(environment_pinned);
-  ASSERT_TRUE(backend.testing_planning_environment_pin().has_value());
-
-  admission.generation += 1;
-  admission.lifecycle_generation += 1;
-  admission.observed_timestamp_ns += 1;
-  admission.received_timestamp_ns += 1;
-  admission.fresh_until_ns += 1;
-  admission.transport_owner_component_epoch = "owner-epoch-2";
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-
-  const auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
-  const auto terminal = handle.get_snapshot();
-  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(terminal.error.has_value());
-  EXPECT_EQ(terminal.error->details.at("reason_code"),
-            ros2_control_fault_reason::kExecutionAdmissionRejected);
-  EXPECT_EQ(terminal.error->details.at("phase"),
-            "planning_to_dispatch_environment_pin");
-  EXPECT_EQ(terminal.error->details.at("reason"),
-            "execution_environment_epoch_changed");
-  EXPECT_EQ(terminal.error->details.at("changed_dimensions"),
-            "lifecycle_generation,transport_owner_component_epoch");
-  EXPECT_EQ(terminal.error->details.at("planning_lifecycle_generation"), "1");
-  EXPECT_EQ(terminal.error->details.at("dispatch_lifecycle_generation"), "2");
-  EXPECT_EQ(
-      terminal.error->details.at("planning_transport_owner_component_epoch"),
-      "owner-epoch-1");
-  EXPECT_EQ(
-      terminal.error->details.at("dispatch_transport_owner_component_epoch"),
-      "owner-epoch-2");
-  EXPECT_EQ(server.goal_count(), 0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ActivityChangeCancelsActiveFjtAndFailsClosed) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_binding_loss_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_binding_loss_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_binding_loss_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_binding_loss_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_34 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_34, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_34(*transport_resources_34, backend);
-  transport_lifetime_34.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  const auto binding_deadline = std::chrono::steady_clock::now() + 4s;
-  while (std::chrono::steady_clock::now() < binding_deadline) {
-    const auto binding = backend.controller_binding_snapshot();
-    if (binding.has_value() && binding->valid) {
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  const auto binding = backend.controller_binding_snapshot();
-  ASSERT_TRUE(binding.has_value());
-  ASSERT_TRUE(binding->valid);
-
-  auto admission =
-      admitted_snapshot_for(*config.controller_binding, clock.now());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  const auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.publish_feedback(0.0));
-
-  manager.set_controller_active(false);
-  std::optional<core::ExecutionSnapshot> terminal;
-  const auto terminal_deadline = std::chrono::steady_clock::now() + 3s;
-  while (std::chrono::steady_clock::now() < terminal_deadline) {
-    const auto snapshot = handle.get_snapshot();
-    if (snapshot.state == core::ExecutionState::kFailed) {
-      terminal = snapshot;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(terminal.has_value());
-  ASSERT_TRUE(terminal->error.has_value());
-  EXPECT_EQ(terminal->error->details.at("reason_code"),
-            ros2_control_fault_reason::kControllerBindingLost);
-  EXPECT_EQ(terminal->error->details.at("admission_failure_reason"),
-            "controller_binding_invalid");
-  const auto cancellation_deadline = std::chrono::steady_clock::now() + 2s;
-  while (server.cancel_requests() == 0 &&
-         std::chrono::steady_clock::now() < cancellation_deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  EXPECT_GT(server.cancel_requests(), 0u);
-  EXPECT_EQ(
-      backend.controller_progress_metrics().dispatch_authority_losses_total,
-      1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     LifecycleAdmissionLossCancelsActiveFjtAndFailsClosed) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_admission_loss_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_admission_loss_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_admission_loss_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_admission_loss_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_35 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_35, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_35(*transport_resources_35, backend);
-  transport_lifetime_35.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend,
-                                [](const ControllerBindingSnapshot &candidate) {
-                                  return candidate.valid;
-                                })
-          .has_value());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(
-      admitted_snapshot_for(*config.controller_binding, clock.now())));
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  const auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.publish_feedback(0.0));
-
-  auto revoked =
-      admitted_snapshot_for(*config.controller_binding, clock.now(),
-                            /*generation=*/2, /*lifecycle_generation=*/2);
-  revoked.controller_ready = false;
-  revoked.motion_admitted = false;
-  revoked.reason_codes = {"operator_gate_closed"};
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(revoked));
-
-  std::optional<core::ExecutionSnapshot> terminal;
-  const auto terminal_deadline = std::chrono::steady_clock::now() + 3s;
-  while (std::chrono::steady_clock::now() < terminal_deadline) {
-    const auto snapshot = handle.get_snapshot();
-    if (snapshot.state == core::ExecutionState::kFailed) {
-      terminal = snapshot;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(terminal.has_value());
-  ASSERT_TRUE(terminal->error.has_value());
-  EXPECT_EQ(terminal->error->details.at("reason_code"),
-            ros2_control_fault_reason::kExecutionAdmissionLost);
-  EXPECT_EQ(terminal->error->details.at("admission_failure_reason"),
-            "execution_controller_not_ready");
-  const auto cancellation_deadline = std::chrono::steady_clock::now() + 2s;
-  while (server.cancel_requests() == 0 &&
-         std::chrono::steady_clock::now() < cancellation_deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  EXPECT_GT(server.cancel_requests(), 0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     LifecycleGenerationChangeCannotCommitSuccessfulTerminalResult) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_terminal_authority_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_terminal_authority_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_terminal_authority_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_terminal_authority_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  // Keep the periodic monitor asleep so this case exercises the terminal
-  // result boundary itself rather than relying on the next monitor tick.
-  config.monitor_period_s = 5.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_36 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_36, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_36(*transport_resources_36, backend);
-  transport_lifetime_36.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend,
-                                [](const ControllerBindingSnapshot &candidate) {
-                                  return candidate.valid;
-                                })
-          .has_value());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(
-      admitted_snapshot_for(*config.controller_binding, clock.now())));
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  const auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.publish_feedback(0.0));
-
-  auto changed =
-      admitted_snapshot_for(*config.controller_binding, clock.now(),
-                            /*generation=*/2, /*lifecycle_generation=*/2);
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(changed));
-  ASSERT_TRUE(server.succeed_current_goal());
-  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
-
-  const auto terminal = handle.get_snapshot();
-  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(terminal.error.has_value());
-  EXPECT_EQ(terminal.error->details.at("reason_code"),
-            ros2_control_fault_reason::kExecutionAdmissionLost);
-  EXPECT_EQ(terminal.error->details.at("admission_failure_reason"),
-            "execution_admission_generation_changed");
-  ASSERT_TRUE(terminal.error->details.contains("phase"));
-  const auto &phase = terminal.error->details.at("phase");
-  EXPECT_TRUE(phase == "active_goal_authority" ||
-              phase == "terminal_result_authority");
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ActivityChangeDuringGoalResponseCannotEscapeGenerationFence) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_binding_goal_race_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_binding_goal_race_joint_states_" + suffix;
-  const std::string controller_state_topic =
-      "/manyforge_binding_goal_race_controller_state_" + suffix;
-  const std::string controller_manager =
-      "/manyforge_binding_goal_race_" + suffix + "/controller_manager";
-
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.controller_state_topic = controller_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.controller_binding = binding_contract_for(config, controller_manager);
-  config.require_execution_admission_snapshot = true;
-  config.controller_binding_refresh_timeout_s = 1.0;
-
-  FakeFjtServer server(action_name);
-  server.block_goal_response();
-  FakeControllerManager manager(controller_manager, *config.controller_binding);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000'000);
-  auto transport_resources_37 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_37, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_37(*transport_resources_37, backend);
-  transport_lifetime_37.start();
-
-  ASSERT_TRUE(manager.wait_for_activity_subscription());
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend,
-                                [](const ControllerBindingSnapshot &candidate) {
-                                  return candidate.valid;
-                                })
-          .has_value());
-
-  auto admission =
-      admitted_snapshot_for(*config.controller_binding, clock.now());
-  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  auto dispatch = std::async(std::launch::async, [&backend]() {
-    return backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
-  });
-  ASSERT_TRUE(server.wait_for_goal_response_entry());
-  manager.set_controller_active(false);
-  ASSERT_TRUE(
-      wait_for_binding_snapshot(backend, [](const ControllerBindingSnapshot
-                                                &candidate) {
-        return !candidate.valid &&
-               (has_reason(candidate, "controller_activity_changed") ||
-                has_reason(candidate, "trajectory_controller_inactive"));
-      }).has_value());
-  server.release_goal_response();
-
-  ASSERT_EQ(dispatch.wait_for(3s), std::future_status::ready);
-  const auto handle = dispatch.get();
-  ASSERT_TRUE(handle.wait_for_completion(3'000'000'000));
-  const auto terminal = handle.get_snapshot();
-  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(terminal.error.has_value());
-  EXPECT_EQ(terminal.error->details.at("reason_code"),
-            ros2_control_fault_reason::kControllerBindingLost);
-  EXPECT_EQ(terminal.error->details.at("phase"), "goal_response_authority");
-  const auto cancellation_deadline = std::chrono::steady_clock::now() + 2s;
-  while (server.cancel_requests() == 0 &&
-         std::chrono::steady_clock::now() < cancellation_deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
-  EXPECT_GT(server.cancel_requests(), 0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     RejectsExecutorThreadCountBelowCallbackGroupMinimum) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.executor_thread_count = 2;
-
-  auto transport_resources_38 =
-      test_transport_resources(sink, clock, "arm", config);
-  EXPECT_THROW(Ros2ControlExecutionBackend(
-                   *transport_resources_38,
-                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
-                   "arm", clock, scheduler, config),
-               std::invalid_argument);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     RejectsLossyOrRelativeRuntimeNodeIdentityBeforeRosStartup) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-
-  for (const std::string invalid_name : {"", "node/name", "9node"}) {
-    auto config = base_config();
-    config.node_name = invalid_name;
-    auto transport_resources_39 =
-        test_transport_resources(sink, clock, "arm", config);
-    EXPECT_THROW((Ros2ControlExecutionBackend(
-                     *transport_resources_39,
-                     Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-                     sink, "arm", clock, scheduler, config)),
-                 std::invalid_argument);
-  }
-  for (const std::string invalid_namespace :
-       {"", "manyforge/robot", "/manyforge/robot/", "/manyforge/robot.1",
-        "/manyforge//robot"}) {
-    auto config = base_config();
-    config.node_namespace = invalid_namespace;
-    auto transport_resources_40 =
-        test_transport_resources(sink, clock, "arm", config);
-    EXPECT_THROW((Ros2ControlExecutionBackend(
-                     *transport_resources_40,
-                     Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
-                     sink, "arm", clock, scheduler, config)),
-                 std::invalid_argument);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedModeRequiresPassivePostResultStateSource) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  config.observed_state_source_precedence = {"action_feedback"};
-  auto transport_resources_41 =
-      test_transport_resources(sink, clock, "arm", config);
-  EXPECT_THROW((Ros2ControlExecutionBackend(
-                   *transport_resources_41,
-                   Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink,
-                   "arm", clock, scheduler, config)),
-               std::invalid_argument);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-TEST(Ros2ControlExecutionBackendTest,
-     ResetFencesDequeuedSceneProjectionBeforeReturningIdle) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_42 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_42,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_42(*transport_resources_42, backend);
-
-  sink->block_group_update();
-  backend.testing_schedule_active_scene_projection({0.25}, clock.now());
-  ASSERT_TRUE(sink->wait_for_group_update());
-
-  auto reset =
-      std::async(std::launch::async, [&]() { return backend.reset(); });
-  EXPECT_EQ(reset.wait_for(20ms), std::future_status::timeout)
-      << "reset must not return while a pre-reset scene write is still active";
-  backend.testing_schedule_active_scene_projection({0.5}, clock.now());
-
-  sink->release_group_update();
-  const auto result = reset.get();
-  EXPECT_TRUE(result.accepted) << (result.error ? result.error->message : "");
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kIdle);
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  EXPECT_EQ(sink->group_updates().size(), 1u)
-      << "a frame submitted after reset suspension must not land";
-  EXPECT_EQ(backend.scene_projection_metrics()
-                .requests_rejected_while_suspended_total,
-            1u);
-}
-
-
-
-
-
-
-
-
-
-
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedStateSyncAppliesGroupPositionsThroughExecutionStateSink) {
-  const std::string topic =
-      "/manyforge_joint_state_projection_" + unique_suffix();
-
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.required_joints = {"joint_1", "joint_2"};
-  config.joint_state_topic = topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.joint_state_max_age_s = 5.0;
-  auto transport_resources_43 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_43, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_43(*transport_resources_43, backend);
-  transport_lifetime_43.start();
-  JointStatePublisher publisher(topic);
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  for (int i = 0; i < 5; ++i) {
-    publisher.publish({"joint_2", "joint_1"}, {0.2, 0.1});
-    std::this_thread::sleep_for(20ms);
-  }
-
-  const auto result = backend.sync_observed_state_before_planning();
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  const auto updates = sink->group_updates();
-  ASSERT_FALSE(updates.empty());
-  bool saw_blocking_pre_plan_update = false;
-  bool saw_best_effort_idle_mirror = false;
-  for (const auto &update : updates) {
-    EXPECT_EQ(update.group_id, "arm");
-    EXPECT_EQ(update.positions_rad, (std::vector<double>{0.1, 0.2}));
-    if (update.mode == core::ExecutionStateUpdateMode::kBlocking) {
-      saw_blocking_pre_plan_update = true;
-    }
-    if (update.mode == core::ExecutionStateUpdateMode::kBestEffort) {
-      saw_best_effort_idle_mirror = true;
-    }
-  }
-  EXPECT_TRUE(saw_blocking_pre_plan_update);
-  EXPECT_TRUE(saw_best_effort_idle_mirror);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CompletionFreshSampleWaitDoesNotSelfStallActionResultCallback) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_e2_fjt_" + suffix;
-  const std::string joint_state_topic = "/manyforge_e2_joint_states_" + suffix;
-
-  FakeFjtServer server(action_name);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.executor_thread_count = 3;
-  auto transport_resources_44 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_44, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_44(*transport_resources_44, backend);
-  transport_lifetime_44.start();
-  EXPECT_TRUE(backend.testing_action_progress_has_dedicated_callback_group());
-  const auto *execution_progress = backend.execution_progress_publication();
-  ASSERT_NE(execution_progress, nullptr);
-  EXPECT_EQ(execution_progress->source_kind(),
-            core::ExecutionProgressSourceKind::kMeasuredProjection);
-  EXPECT_EQ(execution_progress->authority_profile(),
-            core::ExecutionProgressAuthorityProfile::kMeasuredPhysical);
-  EXPECT_GT(execution_progress->freshness_budget_ns(), 0);
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto initial_sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < initial_sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    auto sync = backend.sync_observed_state_before_planning();
-    if (sync.ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-
-  ASSERT_TRUE(server.publish_feedback(0.0));
-  bool feedback_observed = false;
-  const auto feedback_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < feedback_deadline) {
-    const auto metrics = backend.controller_progress_metrics();
-    if (metrics.action_feedback_callbacks_total > 0 &&
-        metrics.command_progress_samples_total > 0) {
-      feedback_observed = true;
-      break;
-    }
-    ASSERT_TRUE(server.publish_feedback(0.0));
-    std::this_thread::sleep_for(5ms);
-  }
-  ASSERT_TRUE(feedback_observed)
-      << "backend did not consume an explicitly published action feedback";
-
-  core::ExecutionProgressCursorSnapshotDTO measured_progress;
-  const auto progress_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < progress_deadline) {
-    measured_progress = execution_progress->acquire();
-    if (measured_progress.valid) {
-      break;
-    }
-    std::this_thread::sleep_for(5ms);
-  }
-  ASSERT_TRUE(measured_progress.valid);
-  EXPECT_EQ(measured_progress.execution_generation,
-            handle.execution_generation);
-  EXPECT_EQ(measured_progress.source_kind,
-            core::ExecutionProgressSourceKind::kMeasuredProjection);
-
-  ASSERT_TRUE(server.succeed_current_goal());
-  const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
-  while (!backend.testing_completion_gate_pending() &&
-         std::chrono::steady_clock::now() < gate_deadline) {
-    std::this_thread::sleep_for(1ms);
-  }
-  ASSERT_TRUE(backend.testing_completion_gate_pending())
-      << "the action result callback did not return and hand completion to "
-         "the NRT gate promptly";
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kExecuting);
-  EXPECT_FALSE(handle.wait_for_completion(1'000'000));
-
-  const auto completion_wait_started = std::chrono::steady_clock::now();
-  std::optional<core::ExecutionSnapshot> terminal_snapshot;
-  const auto deadline = completion_wait_started + 2s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    publisher.publish({"joint_1"}, {0.1});
-    auto snapshot = backend.get_execution_snapshot();
-    if (snapshot.state == core::ExecutionState::kCompleted ||
-        snapshot.state == core::ExecutionState::kFailed ||
-        snapshot.state == core::ExecutionState::kInterventionRequired) {
-      terminal_snapshot = std::move(snapshot);
-      break;
-    }
-    std::this_thread::sleep_for(5ms);
-  }
-  const auto completion_wait_duration =
-      std::chrono::steady_clock::now() - completion_wait_started;
-  ASSERT_TRUE(terminal_snapshot.has_value())
-      << "backend did not publish a terminal snapshot";
-  ASSERT_TRUE(handle.wait_for_completion(0));
-
-  EXPECT_LT(completion_wait_duration, 500ms)
-      << "completion should consume state callbacks while the action result "
-         "callback waits, not sleep until wait_for_state_timeout_s";
-  const auto &snapshot = *terminal_snapshot;
-  EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
-  const auto terminal_progress = execution_progress->acquire();
-  EXPECT_TRUE(terminal_progress.valid);
-  EXPECT_TRUE(terminal_progress.terminal);
-  EXPECT_EQ(terminal_progress.execution_generation,
-            handle.execution_generation);
-  backend.retire_execution_progress_generation(handle.execution_generation);
-  EXPECT_FALSE(execution_progress->acquire().valid);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.1, 1e-9);
-
-  const auto metrics = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics.executor_thread_count, 3u);
-  EXPECT_GT(metrics.state_callbacks_total, 0u);
-  EXPECT_GT(metrics.action_feedback_callbacks_total, 0u);
-  EXPECT_GT(metrics.action_result_callbacks_total, 0u);
-  // Explicit feedback must count as command progress before terminal delivery.
-  EXPECT_GT(metrics.command_progress_samples_total, 0u);
-  EXPECT_GT(metrics.last_action_result_latency_ns, 0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     NaturalCompletionRejectsFreshMeasuredStateOutsideFinalTolerance) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name = "/manyforge_final_state_gate_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_final_state_gate_joint_states_" + suffix;
-
-  FakeFjtServer server(action_name);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.wait_for_state_timeout_s = 1.0;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 5.0;
-  config.final_tolerance_rad = 0.01;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  config.executor_thread_count = 3;
-  auto transport_resources_45 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_45, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_45(*transport_resources_45, backend);
-  transport_lifetime_45.start();
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool initial_sample_observed = false;
-  const auto initial_sample_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < initial_sample_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    if (backend.sync_observed_state_before_planning().ok()) {
-      initial_sample_observed = true;
-      break;
-    }
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_TRUE(initial_sample_observed);
-
-  auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.publish_feedback(0.0));
-
-  const auto feedback_deadline = std::chrono::steady_clock::now() + 2s;
-  while (
-      backend.controller_progress_metrics().action_feedback_callbacks_total ==
-          0u &&
-      std::chrono::steady_clock::now() < feedback_deadline) {
-    ASSERT_TRUE(server.publish_feedback(0.0));
-    std::this_thread::sleep_for(5ms);
-  }
-  ASSERT_GT(
-      backend.controller_progress_metrics().action_feedback_callbacks_total,
-      0u);
-
-  ASSERT_TRUE(server.succeed_current_goal());
-  std::optional<core::ExecutionSnapshot> terminal_snapshot;
-  const auto terminal_deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < terminal_deadline) {
-    publisher.publish({"joint_1"}, {0.2});
-    auto snapshot = backend.get_execution_snapshot();
-    if (snapshot.state == core::ExecutionState::kCompleted ||
-        snapshot.state == core::ExecutionState::kFailed ||
-        snapshot.state == core::ExecutionState::kInterventionRequired) {
-      terminal_snapshot = std::move(snapshot);
-      break;
-    }
-    std::this_thread::sleep_for(5ms);
-  }
-
-  ASSERT_TRUE(terminal_snapshot.has_value());
-  EXPECT_EQ(terminal_snapshot->state, core::ExecutionState::kFailed);
-  ASSERT_TRUE(terminal_snapshot->error.has_value());
-  EXPECT_EQ(terminal_snapshot->error->details.at("reason_code"),
-            ros2_control_fault_reason::kTrackingErrorExceeded);
-  EXPECT_EQ(terminal_snapshot->error->details.at("phase"),
-            "terminal_result_state_gate");
-  EXPECT_EQ(terminal_snapshot->error->details.at("final_tolerance_rad"),
-            "0.01");
-  EXPECT_NE(terminal_snapshot->error->message.find("Final state mismatch"),
-            std::string::npos);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     StopIntentWinsWhileMeasuredCompletionGateIsPending) {
-  {
-    const std::string suffix = unique_suffix();
-    const std::string action_name = "/manyforge_terminal_intent_fjt_" + suffix;
-    const std::string joint_state_topic =
-        "/manyforge_terminal_intent_joint_states_" + suffix;
-
-    FakeFjtServer server(action_name);
-    JointStatePublisher publisher(joint_state_topic);
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    core::FakeClock clock;
-    core::ManualScheduler scheduler;
-    auto config = base_config();
-    config.action_name = action_name;
-    config.joint_state_topic = joint_state_topic;
-    config.wait_for_state_timeout_s = 1.0;
-    config.wait_for_action_server_timeout_s = 2.0;
-    config.joint_state_max_age_s = 5.0;
-    config.tracking_error_tolerance_rad = 10.0;
-    config.tracking_error_timeout_s = 10.0;
-    auto transport_resources_46 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(*transport_resources_46, sink, "arm",
-                                        clock, scheduler, config);
-    TestTransportLifetime transport_lifetime_46(*transport_resources_46,
-                                                backend);
-    transport_lifetime_46.start();
-
-    ASSERT_TRUE(publisher.wait_for_subscription());
-    bool synced = false;
-    const auto sync_deadline = std::chrono::steady_clock::now() + 2s;
-    while (!synced && std::chrono::steady_clock::now() < sync_deadline) {
-      publisher.publish({"joint_1"}, {0.0});
-      synced = backend.sync_observed_state_before_planning().ok();
-      if (!synced) {
-        std::this_thread::sleep_for(10ms);
-      }
-    }
-    ASSERT_TRUE(synced);
-
-    auto handle =
-        backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-    ASSERT_TRUE(server.wait_for_goal());
-    ASSERT_TRUE(server.publish_feedback(0.0));
-    const auto feedback_deadline = std::chrono::steady_clock::now() + 1s;
-    while (
-        backend.controller_progress_metrics().action_feedback_callbacks_total ==
-            0u &&
-        std::chrono::steady_clock::now() < feedback_deadline) {
-      ASSERT_TRUE(server.publish_feedback(0.0));
-      std::this_thread::sleep_for(2ms);
-    }
-    ASSERT_TRUE(server.succeed_current_goal());
-    const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
-    while (!backend.testing_completion_gate_pending() &&
-           std::chrono::steady_clock::now() < gate_deadline) {
-      std::this_thread::sleep_for(1ms);
-    }
-    ASSERT_TRUE(backend.testing_completion_gate_pending());
-
-    EXPECT_TRUE(backend.stop().accepted);
-    ASSERT_TRUE(handle.wait_for_completion(500'000'000));
-    EXPECT_EQ(backend.get_execution_snapshot().state,
-              core::ExecutionState::kStopped);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ResetFencesPendingCompletionBeforeReplacementExecution) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name =
-      "/manyforge_completion_replacement_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_completion_replacement_joint_states_" + suffix;
-
-  FakeFjtServer server(action_name);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.wait_for_state_timeout_s = 0.2;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.stop_completion_timeout_s = 1.0;
-  config.joint_state_max_age_s = 5.0;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  auto transport_resources_47 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_47, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_47(*transport_resources_47, backend);
-  transport_lifetime_47.start();
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  const auto sync_state = [&]() {
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() < deadline) {
-      publisher.publish({"joint_1"}, {0.0});
-      if (backend.sync_observed_state_before_planning().ok()) {
-        return true;
-      }
-      std::this_thread::sleep_for(10ms);
-    }
-    return false;
-  };
-  ASSERT_TRUE(sync_state());
-
-  auto first =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
-  ASSERT_TRUE(server.wait_for_goal_count(1));
-  ASSERT_TRUE(server.publish_feedback(0.0));
-  ASSERT_TRUE(server.succeed_current_goal());
-  const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
-  while (!backend.testing_completion_gate_pending() &&
-         std::chrono::steady_clock::now() < gate_deadline) {
-    std::this_thread::sleep_for(1ms);
-  }
-  ASSERT_TRUE(backend.testing_completion_gate_pending());
-  ASSERT_TRUE(backend.reset().accepted);
-  EXPECT_FALSE(backend.testing_completion_gate_pending());
-
-  ASSERT_TRUE(sync_state());
-  auto second =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.2));
-  ASSERT_GT(second.execution_generation, first.execution_generation);
-  ASSERT_TRUE(server.wait_for_goal_count(2));
-  ASSERT_TRUE(server.publish_feedback(0.0));
-  ASSERT_TRUE(server.succeed_current_goal());
-  const auto terminal_deadline = std::chrono::steady_clock::now() + 1s;
-  while (!second.wait_for_completion(1'000'000) &&
-         std::chrono::steady_clock::now() < terminal_deadline) {
-    publisher.publish({"joint_1"}, {0.2});
-  }
-  ASSERT_TRUE(second.wait_for_completion(0));
-  auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.state, core::ExecutionState::kCompleted);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
-
-  std::this_thread::sleep_for(250ms);
-  snapshot = backend.get_execution_snapshot();
-  EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedMonitorNeverProjectsPredictionWhenMeasurementBecomesStale) {
-  const std::string suffix = unique_suffix();
-  const std::string action_name =
-      "/manyforge_observed_no_prediction_fjt_" + suffix;
-  const std::string joint_state_topic =
-      "/manyforge_observed_no_prediction_joint_states_" + suffix;
-
-  FakeFjtServer server(action_name);
-  JointStatePublisher publisher(joint_state_topic);
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.action_name = action_name;
-  config.joint_state_topic = joint_state_topic;
-  config.wait_for_state_timeout_s = 0.5;
-  config.wait_for_action_server_timeout_s = 2.0;
-  config.joint_state_max_age_s = 0.02;
-  config.tracking_error_tolerance_rad = 10.0;
-  config.tracking_error_timeout_s = 10.0;
-  auto transport_resources_48 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(*transport_resources_48, sink, "arm",
-                                      clock, scheduler, config);
-  TestTransportLifetime transport_lifetime_48(*transport_resources_48, backend);
-  transport_lifetime_48.start();
-
-  ASSERT_TRUE(publisher.wait_for_subscription());
-  bool synced = false;
-  const auto sync_deadline = std::chrono::steady_clock::now() + 2s;
-  while (!synced && std::chrono::steady_clock::now() < sync_deadline) {
-    publisher.publish({"joint_1"}, {0.0});
-    synced = backend.sync_observed_state_before_planning().ok();
-    if (!synced) {
-      std::this_thread::sleep_for(5ms);
-    }
-  }
-  ASSERT_TRUE(synced);
-
-  auto handle =
-      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.5));
-  ASSERT_NE(handle.execution_generation, 0u);
-  ASSERT_TRUE(server.wait_for_goal());
-  ASSERT_TRUE(server.publish_feedback(0.0));
-  const auto feedback_deadline = std::chrono::steady_clock::now() + 1s;
-  while (
-      backend.controller_progress_metrics().action_feedback_callbacks_total ==
-          0u &&
-      std::chrono::steady_clock::now() < feedback_deadline) {
-    ASSERT_TRUE(server.publish_feedback(0.0));
-    std::this_thread::sleep_for(2ms);
-  }
-  ASSERT_GT(
-      backend.controller_progress_metrics().action_feedback_callbacks_total,
-      0u);
-
-  // Both the joint-state sample and the one action-feedback sample are now
-  // stale while the controller goal remains active. The trajectory sampler
-  // reaches 0.5 rad, but that value is intent only on an observed lane.
-  std::this_thread::sleep_for(150ms);
-  const auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.0);
-  EXPECT_EQ(snapshot.state_source, "observed_ros2");
-  for (const auto &update : sink->group_updates()) {
-    ASSERT_EQ(update.positions_rad.size(), 1u);
-    EXPECT_DOUBLE_EQ(update.positions_rad.front(), 0.0);
-  }
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandProgressMetricsPublishCoherentCountLastAndMaximum) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_49 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_49,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_49(*transport_resources_49, backend);
-
-  auto metrics = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics.command_progress_samples_total, 0u);
-  EXPECT_EQ(metrics.last_command_progress_latency_ns, 0u);
-  EXPECT_EQ(metrics.max_command_progress_latency_ns, 0u);
-
-  backend.testing_record_command_progress_latency_ns(25);
-  backend.testing_record_command_progress_latency_ns(10);
-  backend.testing_record_command_progress_latency_ns(-1);
-
-  metrics = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics.command_progress_samples_total, 3u);
-  EXPECT_EQ(metrics.last_command_progress_latency_ns, 0u);
-  EXPECT_EQ(metrics.max_command_progress_latency_ns, 25u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandProgressMetricsReaderWaitsForCompletePublication) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_50 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_50,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_50(*transport_resources_50, backend);
-
-  backend.testing_record_command_progress_latency_ns(10);
-  backend.testing_begin_command_progress_metrics_publication(20);
-
-  std::promise<void> reader_started;
-  auto reader_started_future = reader_started.get_future();
-  auto reader = std::async(std::launch::async, [&]() {
-    reader_started.set_value();
-    return backend.controller_progress_metrics();
-  });
-  EXPECT_EQ(reader_started_future.wait_for(1s), std::future_status::ready);
-  EXPECT_EQ(reader.wait_for(50ms), std::future_status::timeout)
-      << "reader exposed count/latency fields while their sequence was odd";
-
-  backend.testing_finish_command_progress_metrics_publication();
-  ASSERT_EQ(reader.wait_for(1s), std::future_status::ready);
-  const auto metrics = reader.get();
-  EXPECT_EQ(metrics.command_progress_samples_total, 2u);
-  EXPECT_EQ(metrics.last_command_progress_latency_ns, 20u);
-  EXPECT_EQ(metrics.max_command_progress_latency_ns, 20u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ControlledStopCommandReferenceValidatesOnceAndPublishesSamples) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_51 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_51,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_51(*transport_resources_51, backend);
-
-  const auto started_at = std::chrono::steady_clock::now();
-  ASSERT_TRUE(backend.testing_install_controlled_stop_command_reference(
-      make_single_joint_trajectory(0.0, 1.0), started_at));
-  ASSERT_TRUE(
-      backend.testing_publish_controlled_stop_command_reference_snapshot(
-          started_at + 50ms));
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-
-  const auto updates = sink->group_updates();
-  ASSERT_EQ(updates.size(), 1u);
-  EXPECT_EQ(updates.front().group_id, "arm");
-  ASSERT_EQ(updates.front().positions_rad.size(), 1u);
-  EXPECT_NEAR(updates.front().positions_rad.front(), 0.5, 1e-9);
-  EXPECT_EQ(updates.front().mode, core::ExecutionStateUpdateMode::kBestEffort);
-
-  const auto snapshot = backend.get_execution_snapshot();
-  EXPECT_EQ(snapshot.state, core::ExecutionState::kStopping);
-  EXPECT_NEAR(snapshot.progress, 0.5, 1e-9);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.5, 1e-9);
-
-  auto invalid = make_single_joint_trajectory(0.0, 1.0);
-  invalid.waypoints.back().time_from_start_s =
-      invalid.waypoints.front().time_from_start_s;
-  EXPECT_FALSE(backend.testing_install_controlled_stop_command_reference(
-      invalid, started_at));
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedControlledStopCommandReferenceNeverBecomesRobotPose) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_52 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_52,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_52(*transport_resources_52, backend);
-
-  const auto measured_at = std::chrono::steady_clock::now();
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.2}, measured_at,
-                                            {0.0}, 100);
-  backend.testing_sync_idle_scene_from_latest_sample();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  ASSERT_EQ(sink->group_updates().size(), 1u);
-
-  const auto started_at = measured_at;
-  ASSERT_TRUE(backend.testing_install_controlled_stop_command_reference(
-      make_single_joint_trajectory(0.0, 1.0), started_at));
-  EXPECT_FALSE(
-      backend.testing_publish_controlled_stop_command_reference_snapshot(
-          started_at + 50ms));
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-
-  const auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
-  EXPECT_EQ(snapshot.source_timestamp_ns, 100);
-  EXPECT_EQ(snapshot.state_source, "observed_ros2");
-  ASSERT_EQ(sink->group_updates().size(), 1u);
-  EXPECT_DOUBLE_EQ(sink->group_updates().front().positions_rad.front(), 0.2);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     IdleSceneSyncRateLimitsAndSkipsWhileRunning) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_53 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_53,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_53(*transport_resources_53, backend);
-
-  const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.1}, t0);
-  backend.testing_sync_idle_scene_from_latest_sample();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  ASSERT_EQ(sink->group_updates().size(), 1u);
-
-  backend.testing_sync_idle_scene_from_latest_sample();
-  EXPECT_EQ(sink->group_updates().size(), 1u)
-      << "same sample should not be mirrored repeatedly";
-
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.2}, t0 + 10ms);
-  backend.testing_sync_idle_scene_from_latest_sample();
-  EXPECT_EQ(sink->group_updates().size(), 1u)
-      << "new samples inside the idle projection period are rate limited";
-
-  std::this_thread::sleep_for(120ms);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.3},
-                                            std::chrono::steady_clock::now());
-  backend.testing_sync_idle_scene_from_latest_sample();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  ASSERT_EQ(sink->group_updates().size(), 2u);
-
-  backend.testing_set_running_state(true);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.4},
-                                            std::chrono::steady_clock::now());
-  backend.testing_sync_idle_scene_from_latest_sample();
-  EXPECT_EQ(sink->group_updates().size(), 2u)
-      << "running executions must not mirror passive idle scene updates";
-
-  backend.testing_set_running_state(false);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.5},
-                                            std::chrono::steady_clock::now());
-  backend.testing_sync_idle_scene_from_latest_sample();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  ASSERT_EQ(sink->group_updates().size(), 3u)
-      << "the first sample after an execution generation is not rate limited";
-  EXPECT_NEAR(sink->group_updates().back().positions_rad.front(), 0.5, 1e-9);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     TerminalObservedStateRefreshPreservesLifecycleMetadataAndAges) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_54 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_54,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_54(*transport_resources_54, backend);
-
-  backend.testing_set_running_state(true);
-  backend.testing_set_running_state(false);
-  clock.set(1'000'000);
-  const core::ErrorDTO terminal_error{
-      "test_terminal_failure",
-      "terminal metadata must survive measured-state refresh",
-      {{"reason", "test"}}};
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kFailed,
-                                               0.75, {0.1}, terminal_error));
-  const auto terminal = backend.get_execution_snapshot();
-
-  const auto now = std::chrono::steady_clock::now();
-  clock.set(1'500'000);
-  backend.testing_store_action_feedback_sample({"joint_1"}, {9.0}, {0.0},
-                                               now - 1ms);
-  clock.set(2'000'000);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.42}, now, {-0.03},
-                                            2'000'000);
-  backend.testing_sync_idle_scene_from_latest_sample();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-
-  const auto refreshed = backend.get_execution_snapshot();
-  EXPECT_EQ(refreshed.state, core::ExecutionState::kFailed);
-  EXPECT_DOUBLE_EQ(refreshed.progress, 0.75);
-  ASSERT_TRUE(refreshed.error.has_value());
-  EXPECT_EQ(refreshed.error->code, terminal_error.code);
-  EXPECT_EQ(refreshed.error->message, terminal_error.message);
-  EXPECT_EQ(refreshed.error->details, terminal_error.details);
-  EXPECT_GT(refreshed.sequence_number, terminal.sequence_number);
-  ASSERT_EQ(refreshed.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(refreshed.joint_positions_rad[0], 0.42);
-  ASSERT_EQ(refreshed.joint_velocities_rad_s.size(), 1u);
-  EXPECT_DOUBLE_EQ(refreshed.joint_velocities_rad_s[0], -0.03);
-  EXPECT_EQ(refreshed.state_source, "observed_ros2");
-  EXPECT_EQ(refreshed.source_timestamp_ns, 2'000'000);
-  EXPECT_EQ(refreshed.source_age_ns, 0);
-  ASSERT_EQ(sink->group_updates().size(), 1u);
-  EXPECT_DOUBLE_EQ(sink->group_updates().front().positions_rad.front(), 0.42);
-
-  clock.advance(250'000);
-  const auto aged = backend.get_execution_snapshot();
-  EXPECT_EQ(aged.source_timestamp_ns, refreshed.source_timestamp_ns);
-  EXPECT_EQ(aged.source_age_ns, 250'000);
-  EXPECT_EQ(aged.state, core::ExecutionState::kFailed);
-  EXPECT_DOUBLE_EQ(aged.progress, 0.75);
-  ASSERT_TRUE(aged.error.has_value());
-  EXPECT_EQ(aged.error->code, terminal_error.code);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     AuthoredSimulationSnapshotRetainsNonExpiringAuthoritySemantics) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  clock.set(1'000'000);
-  auto transport_resources_55 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_55,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_55(*transport_resources_55, backend);
-
-  const auto initial = backend.get_execution_snapshot();
-  ASSERT_EQ(initial.state_source, "commanded_sim_predicted");
-  clock.advance(250'000);
-  const auto later = backend.get_execution_snapshot();
-  EXPECT_EQ(later.source_timestamp_ns, initial.source_timestamp_ns);
-  EXPECT_EQ(later.source_age_ns, 0);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ActiveSceneProjectionIsAsyncAndCoalescesToLatestState) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_56 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_56,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_56(*transport_resources_56, backend);
-
-  sink->block_group_update();
-  backend.testing_schedule_active_scene_projection({0.1}, 1);
-  ASSERT_TRUE(sink->wait_for_group_update());
-
-  const auto submitted_at = std::chrono::steady_clock::now();
-  backend.testing_schedule_active_scene_projection({0.2}, 2);
-  backend.testing_schedule_active_scene_projection({0.3}, 3);
-  EXPECT_LT(std::chrono::steady_clock::now() - submitted_at, 20ms)
-      << "controller progress must not wait for an in-flight scene projection";
-
-  sink->release_group_update();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-
-  const auto updates = sink->group_updates();
-  ASSERT_EQ(updates.size(), 2u);
-  EXPECT_EQ(updates.front().positions_rad, (std::vector<double>{0.1}));
-  EXPECT_EQ(updates.back().positions_rad, (std::vector<double>{0.3}));
-  EXPECT_EQ(updates.back().mode, core::ExecutionStateUpdateMode::kBestEffort);
-
-  const auto metrics = backend.scene_projection_metrics();
-  EXPECT_EQ(metrics.active_requests_total, 3u);
-  EXPECT_EQ(metrics.requests_coalesced_total, 1u);
-  EXPECT_EQ(metrics.successful_updates_total, 2u);
-  EXPECT_GT(metrics.apply_duration_max_ns, 0u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ArmAndGripperProjectionUseIndependentLatestOnlySlots) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  sink->set_joint_position("gripper", "finger_joint", 0.7);
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_57 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_57,
-      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
-      clock, scheduler, base_config());
-  Ros2GripperCommandBackend gripper_backend(*transport_resources_57, sink,
-                                            clock, scheduler, false);
-  TestSharedTransportLifetime lifetime(*transport_resources_57, backend,
-                                       gripper_backend);
-  gripper_backend.configure_gripper_action(
-      "tool", isaac_gripper_config("/manyforge_independent_projection_slots_" +
-                                   unique_suffix()));
-  const auto gripper = gripper_backend.command_gripper(make_gripper_request(
-      0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
-  ASSERT_TRUE(gripper.accepted);
-
-  sink->block_group_update();
-  backend.testing_schedule_active_scene_projection({0.1}, 1);
-  ASSERT_TRUE(sink->wait_for_group_update());
-  scheduler.advance_to(clock.now());
-  backend.testing_schedule_active_scene_projection({0.2}, 2);
-  backend.testing_schedule_active_scene_projection({0.3}, 3);
-
-  sink->release_group_update();
-  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
-  const auto group_updates = sink->group_updates();
-  const auto joint_updates = sink->single_updates();
-  ASSERT_EQ(group_updates.size(), 2u);
-  EXPECT_EQ(group_updates.front().positions_rad, (std::vector<double>{0.1}));
-  EXPECT_EQ(group_updates.back().positions_rad, (std::vector<double>{0.3}));
-  ASSERT_EQ(joint_updates.size(), 1u);
-  EXPECT_DOUBLE_EQ(joint_updates.front().position_rad, 0.0);
-  EXPECT_EQ(gripper_backend.get_gripper_status("tool").state,
-            core::GripperCommandState::kCompleted);
-
-  const auto metrics = backend.scene_projection_metrics();
-  EXPECT_EQ(metrics.joint_requests_total, 1u);
-  EXPECT_EQ(metrics.requests_coalesced_total, 1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ActionFeedbackSampleStorageReusesVectorCapacity) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_58 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_58,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_58(*transport_resources_58, backend);
-
-  std::vector<std::string> names;
-  std::vector<double> positions;
-  names.reserve(64);
-  positions.reserve(64);
-  for (int i = 0; i < 64; ++i) {
-    names.push_back("joint_" + std::to_string(i));
-    positions.push_back(static_cast<double>(i));
-  }
-  const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_action_feedback_sample(names, positions, {}, t0);
-  const auto first_capacity =
-      backend.testing_latest_action_feedback_position_capacity();
-  ASSERT_GE(first_capacity, positions.size());
-
-  backend.testing_store_action_feedback_sample({"joint_1"}, {1.0}, {},
-                                               t0 + 1ms);
-  EXPECT_GE(backend.testing_latest_action_feedback_position_capacity(),
-            first_capacity);
-}
-
-TEST(SceneProjectionWorkerTest,
-     CompletionCallbackExceptionIsContainedAndMetriced) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  detail::SceneProjectionWorker worker(sink, "arm", clock);
-  const auto slot = worker.register_joint_slot(
-      "gripper", "finger_joint", [](const detail::SceneProjectionCompletion &) {
-        throw std::runtime_error("injected completion callback failure");
-      });
-
-  ASSERT_TRUE(worker.submit_active_joint(
-      slot, 0.25, clock.now(), detail::SceneProjectionToken{1, 2, 3}));
-  ASSERT_TRUE(worker.drain_for(1s));
-
-  const auto metrics = worker.metrics();
-  EXPECT_EQ(metrics.successful_updates_total, 1U);
-  EXPECT_EQ(metrics.completion_callback_exceptions_total, 1U);
-  EXPECT_EQ(sink->single_updates().size(), 1U);
-  EXPECT_TRUE(worker.stop_and_join_for(1s));
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     TerminalSceneProjectionMissIsMetricedAndRetriedAfterSnapshot) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  clock.set(1'000'000);
-  auto transport_resources_59 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_59,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_59(*transport_resources_59, backend);
-
-  const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.42}, t0);
-  sink->fail_next_group_updates(1);
-
-  backend.testing_complete_execution();
-
-  const auto terminal = backend.get_execution_snapshot();
-  EXPECT_EQ(terminal.state, core::ExecutionState::kCompleted);
-  ASSERT_EQ(terminal.joint_positions_rad.size(), 1u);
-  EXPECT_NEAR(terminal.joint_positions_rad.front(), 0.42, 1e-9);
-
-  auto metrics = backend.scene_projection_metrics();
-  const auto deadline = std::chrono::steady_clock::now() + 1s;
-  while (metrics.terminal_retry_successes_total == 0u &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(5ms);
-    metrics = backend.scene_projection_metrics();
-  }
-
-  EXPECT_EQ(metrics.misses_total, 1u);
-  EXPECT_EQ(metrics.terminal_retries_scheduled_total, 1u);
-  EXPECT_EQ(metrics.terminal_retry_successes_total, 1u);
-  EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
-  EXPECT_GE(metrics.successful_updates_total, 1u);
-  EXPECT_GT(metrics.last_success_timestamp_ns, 0);
-
-  const auto updates = sink->group_updates();
-  ASSERT_GE(updates.size(), 2u);
-  EXPECT_EQ(updates.front().mode, core::ExecutionStateUpdateMode::kBestEffort);
-  EXPECT_EQ(updates.back().mode, core::ExecutionStateUpdateMode::kBestEffort);
-  ASSERT_EQ(updates.back().positions_rad.size(), 1u);
-  EXPECT_NEAR(updates.back().positions_rad.front(), 0.42, 1e-9);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ManagedFjtTerminalResultRequiresCurrentGenerationAndGoalId) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_60 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_60,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_60(*transport_resources_60, backend);
-
-  rclcpp_action::GoalUUID old_goal{};
-  old_goal[0] = 1;
-  rclcpp_action::GoalUUID current_goal{};
-  current_goal[0] = 2;
-
-  backend.testing_begin_managed_fjt_terminal_session(
-      /*generation=*/2, current_goal);
-
-  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult stale;
-  stale.goal_id = old_goal;
-  stale.code = rclcpp_action::ResultCode::SUCCEEDED;
-  stale.result = std::make_shared<
-      Ros2ControlExecutionBackend::TestingFollowJointTrajectory::Result>();
-  stale.result->error_code = Ros2ControlExecutionBackend::
-      TestingFollowJointTrajectory::Result::SUCCESSFUL;
-
-  backend.testing_on_managed_fjt_terminal_result(stale, /*generation=*/1);
-
-  EXPECT_FALSE(backend.testing_managed_fjt_terminal_received())
-      << "late result from a previous replacement dispatch must not satisfy "
-         "the current managed-stop waiter";
-
-  Ros2ControlExecutionBackend::TestingGoalHandleFJT::WrappedResult current;
-  current.goal_id = current_goal;
-  current.code = rclcpp_action::ResultCode::SUCCEEDED;
-  current.result = std::make_shared<
-      Ros2ControlExecutionBackend::TestingFollowJointTrajectory::Result>();
-  current.result->error_code = Ros2ControlExecutionBackend::
-      TestingFollowJointTrajectory::Result::SUCCESSFUL;
-
-  backend.testing_on_managed_fjt_terminal_result(current, /*generation=*/2);
-
-  EXPECT_TRUE(backend.testing_managed_fjt_terminal_received());
-  EXPECT_TRUE(backend.testing_managed_fjt_terminal_success());
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ManagedTerminalWaitWakesOnStopTokenWithoutNotify) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto transport_resources_61 =
-      test_transport_resources(sink, clock, "arm", base_config());
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_61,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, base_config());
-  TestTransportLifetime transport_lifetime_61(*transport_resources_61, backend);
-
-  std::stop_source stop_source;
-  const auto started = std::chrono::steady_clock::now();
-  auto future = std::async(std::launch::async, [&]() {
-    return backend.testing_wait_for_managed_terminal_or_stop(
-        stop_source.get_token(), 5s);
-  });
-
-  std::this_thread::sleep_for(20ms);
-  stop_source.request_stop();
-  ASSERT_EQ(future.wait_for(500ms), std::future_status::ready)
-      << "token-aware managed-stop waits must not sleep until deadline";
-  EXPECT_FALSE(future.get());
-  EXPECT_LT(std::chrono::steady_clock::now() - started, 1s);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     FreshPassiveSampleWaitWakesOnStateNotificationBeforeDeadline) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.joint_state_max_age_s = 5.0;
-  auto transport_resources_62 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_62,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_62(*transport_resources_62, backend);
-
-  const auto not_before = std::chrono::steady_clock::now();
-  std::promise<void> waiter_started;
-  auto waiter_started_future = waiter_started.get_future();
-  auto sample_future = std::async(std::launch::async, [&]() {
-    waiter_started.set_value();
-    return backend.testing_wait_for_fresh_passive_sample_after(not_before, 5s);
-  });
-  ASSERT_EQ(waiter_started_future.wait_for(500ms), std::future_status::ready);
-  std::this_thread::sleep_for(20ms);
-  ASSERT_EQ(sample_future.wait_for(0ms), std::future_status::timeout);
-
-  backend.testing_store_latest_controller_sample(
-      {"joint_1"}, {0.42}, std::chrono::steady_clock::now(), {0.0});
-
-  ASSERT_EQ(sample_future.wait_for(500ms), std::future_status::ready)
-      << "a fresh post-result sample notification must not wait for the "
-         "controlled-stop deadline";
-  const auto source = sample_future.get();
-  ASSERT_TRUE(source.has_value());
-  EXPECT_EQ(*source, "controller_state");
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedStatePublicationFallsBackWhenActionFeedbackStops) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.joint_state_max_age_s = 0.1;
-  auto transport_resources_63 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_63,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_63(*transport_resources_63, backend);
-  const auto *progress = backend.execution_progress_publication();
-  ASSERT_NE(progress, nullptr);
-  EXPECT_EQ(progress->source_kind(),
-            core::ExecutionProgressSourceKind::kMeasuredProjection);
-  EXPECT_EQ(progress->authority_profile(),
-            core::ExecutionProgressAuthorityProfile::kMeasuredPhysical);
-  EXPECT_GT(progress->freshness_budget_ns(), 0);
-
-  const auto base = std::chrono::steady_clock::time_point{1s};
-  backend.testing_store_action_feedback_sample({"joint_1"}, {0.25}, {0.5},
-                                               base);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.75}, base + 150ms);
-
-  const auto *publication = backend.observed_robot_state_publication();
-  ASSERT_NE(publication, nullptr);
-  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          (base + 160ms).time_since_epoch())
-                          .count();
-  auto selected = publication->acquire(now_ns);
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_kind(),
-            core::ObservedRobotStateSourceKind::kJointState);
-  EXPECT_EQ(selected.source_id(), "joint_state");
-  ASSERT_EQ(selected.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
-  EXPECT_EQ(selected.received_timestamp_ns(),
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                (base + 150ms).time_since_epoch())
-                .count());
-  const auto metrics = backend.controller_progress_metrics();
-  ASSERT_EQ(metrics.observed_state_sources.size(), 3u);
-  EXPECT_EQ(metrics.observed_state_sources[1].source_kind,
-            core::ObservedRobotStateSourceKind::kJointState);
-  EXPECT_EQ(metrics.observed_state_sources[1].published_total, 1u);
-  EXPECT_EQ(metrics.observed_state_sources[2].source_kind,
-            core::ObservedRobotStateSourceKind::kActionFeedback);
-  EXPECT_EQ(metrics.observed_state_sources[2].published_total, 1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedStateSourcePrecedenceIsDeploymentDeclared) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.observed_state_source_precedence = {"joint_state", "action_feedback"};
-  auto transport_resources_64 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_64,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_64(*transport_resources_64, backend);
-  const auto now = std::chrono::steady_clock::time_point{1s};
-  backend.testing_store_action_feedback_sample({"joint_1"}, {0.25}, {0.0}, now);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.75}, now);
-
-  auto selected = backend.observed_robot_state_publication()->acquire(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          now.time_since_epoch())
-          .count());
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_kind(),
-            core::ObservedRobotStateSourceKind::kJointState);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     PassivePoseSelectionUsesDeclaredPrecedenceAndExcludesRetiredFeedback) {
-  const auto verify = [](std::vector<std::string> precedence,
-                         double expected_position) {
-    auto sink = std::make_shared<RecordingExecutionStateSink>();
-    core::FakeClock clock;
-    core::ManualScheduler scheduler;
-    auto config = base_config();
-    config.observed_state_source_precedence = std::move(precedence);
-    config.joint_state_max_age_s = 10.0;
-    auto transport_resources_65 =
-        test_transport_resources(sink, clock, "arm", config);
-    Ros2ControlExecutionBackend backend(
-        *transport_resources_65,
-        Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
-        clock, scheduler, config);
-    TestTransportLifetime transport_lifetime_65(*transport_resources_65,
-                                                backend);
-
-    const auto now = std::chrono::steady_clock::now();
-    backend.testing_store_action_feedback_sample({"joint_1"}, {9.0}, {0.0},
-                                                 now);
-    backend.testing_store_latest_controller_sample({"joint_1"}, {0.4}, now,
-                                                   {0.0}, 400);
-    backend.testing_store_latest_joint_sample({"joint_1"}, {0.7}, now, {0.0},
-                                              700);
-    backend.testing_sync_idle_scene_from_latest_sample();
-
-    const auto snapshot = backend.get_execution_snapshot();
-    ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-    EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), expected_position);
-    EXPECT_NE(snapshot.joint_positions_rad.front(), 9.0);
-  };
-
-  verify({"controller_state", "joint_state", "action_feedback"}, 0.4);
-  verify({"joint_state", "controller_state", "action_feedback"}, 0.7);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     MalformedHigherPrecedenceSampleFallsBackToCompletePhysicalSource) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  config.observed_state_source_precedence = {"controller_state", "joint_state",
-                                             "action_feedback"};
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_66 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_66,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_66(*transport_resources_66, backend);
-
-  const auto now = std::chrono::steady_clock::now();
-  backend.testing_store_latest_controller_sample(
-      {"joint_1"}, {std::numeric_limits<double>::quiet_NaN()}, now, {0.0}, 100);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.75}, now, {0.01},
-                                            200);
-  backend.testing_sync_idle_scene_from_latest_sample();
-
-  const auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.75);
-  ASSERT_EQ(snapshot.joint_velocities_rad_s.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_velocities_rad_s.front(), 0.01);
-  EXPECT_EQ(snapshot.source_timestamp_ns, 200);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     PrePlanningStateGateNeverUsesActionFeedbackFromRetiredGoal) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  config.observed_state_source_precedence = {"action_feedback",
-                                             "controller_state", "joint_state"};
-  config.wait_for_state_timeout_s = 0.001;
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_67 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_67,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_67(*transport_resources_67, backend);
-
-  const auto now = std::chrono::steady_clock::now();
-  backend.testing_store_action_feedback_sample({"joint_1"}, {9.0}, {0.0}, now);
-  const auto action_only = backend.sync_observed_state_before_planning();
-  EXPECT_FALSE(action_only.ok());
-
-  backend.testing_store_latest_joint_sample(
-      {"joint_1"}, {0.25}, std::chrono::steady_clock::now(), {0.0}, 250);
-  const auto passive = backend.sync_observed_state_before_planning();
-  ASSERT_TRUE(passive.ok()) << passive.error().message;
-  const auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.25);
-  EXPECT_EQ(snapshot.source_timestamp_ns, 250);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ManagedStopRetiresOriginalGoalActionFeedbackAuthority) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.observed_state_source_precedence = {"action_feedback", "joint_state"};
-  config.joint_state_max_age_s = 10.0;
-  auto transport_resources_68 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_68,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_68(*transport_resources_68, backend);
-
-  const auto now = std::chrono::steady_clock::now();
-  backend.testing_set_action_feedback_authority(true);
-  backend.testing_store_action_feedback_sample({"joint_1"}, {9.0}, {0.0}, now);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.5}, now, {0.0},
-                                            500);
-  ASSERT_EQ(backend.testing_selected_sample_source(now),
-            std::optional<std::string>("action_feedback"));
-
-  // Mirrors the managed-stop preemption callback: the execution remains
-  // running, but the original FJT goal has terminalized.
-  backend.testing_set_action_feedback_authority(false);
-  EXPECT_EQ(backend.testing_selected_sample_source(now),
-            std::optional<std::string>("joint_state"));
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     PassiveObservedRefreshCannotRegressPhysicalSampleTimestamp) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  auto transport_resources_69 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_69,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_69(*transport_resources_69, backend);
-  const auto generation = backend.testing_running_generation();
-
-  ASSERT_TRUE(backend.testing_publish_passive_observed_snapshot(
-      {0.6}, {0.01}, 600, generation));
-  EXPECT_FALSE(backend.testing_publish_passive_observed_snapshot(
-      {0.2}, {-0.01}, 200, generation));
-
-  const auto snapshot = backend.get_execution_snapshot();
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.6);
-  ASSERT_EQ(snapshot.joint_velocities_rad_s.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_velocities_rad_s.front(), 0.01);
-  EXPECT_EQ(snapshot.source_timestamp_ns, 600);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     AuthoredPreviewPublishesCommandedNotMeasuredAuthority) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "authored_preview";
-  auto transport_resources_70 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_70,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_70(*transport_resources_70, backend);
-  const auto *progress = backend.execution_progress_publication();
-  ASSERT_NE(progress, nullptr);
-  EXPECT_EQ(progress->source_kind(),
-            core::ExecutionProgressSourceKind::kBackendCommanded);
-  EXPECT_EQ(progress->authority_profile(),
-            core::ExecutionProgressAuthorityProfile::kCommandedSimulation);
-  EXPECT_EQ(progress->freshness_budget_ns(), 0);
-  const auto now = std::chrono::steady_clock::time_point{1s};
-  backend.testing_store_action_feedback_sample({"joint_1"}, {0.25}, {0.0}, now);
-  ASSERT_TRUE(
-      backend.testing_publish_snapshot(core::ExecutionState::kIdle, {0.75}));
-
-  auto selected = backend.observed_robot_state_publication()->acquire(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          now.time_since_epoch())
-          .count());
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_kind(),
-            core::ObservedRobotStateSourceKind::kPredictedState);
-  EXPECT_EQ(selected.source_id(), "authored_preview_state");
-  EXPECT_EQ(selected.authority_profile(),
-            core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
-  EXPECT_EQ(selected.authority_profile_id(),
-            "ros2_control_authored_preview_v1");
-  ASSERT_EQ(selected.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
-  ASSERT_EQ(selected.velocities_rad_s().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.0);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandedSimKeepsCommandReferenceAuthoritativeOverMeasuredUpdates) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_71 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_71,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_71(*transport_resources_71, backend);
-  const auto *progress = backend.execution_progress_publication();
-  ASSERT_NE(progress, nullptr);
-  EXPECT_EQ(progress->source_kind(),
-            core::ExecutionProgressSourceKind::kBackendCommanded);
-  EXPECT_EQ(progress->authority_profile(),
-            core::ExecutionProgressAuthorityProfile::kCommandedSimulation);
-  EXPECT_EQ(progress->freshness_budget_ns(), 0);
-
-  auto initial =
-      backend.observed_robot_state_publication()->acquire(clock.now());
-  ASSERT_TRUE(initial);
-  EXPECT_EQ(initial.source_kind(),
-            core::ObservedRobotStateSourceKind::kCommandedState);
-  ASSERT_EQ(initial.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(initial.positions_rad()[0], 0.0);
-
-  ASSERT_TRUE(
-      backend.testing_publish_snapshot(core::ExecutionState::kIdle, {0.75}));
-  const auto now = std::chrono::steady_clock::time_point{1s};
-  backend.testing_store_action_feedback_sample({"joint_1"}, {0.25}, {0.5}, now);
-  backend.testing_store_latest_joint_sample({"joint_1"}, {0.5}, now);
-
-  auto selected = backend.observed_robot_state_publication()->acquire(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          now.time_since_epoch())
-          .count());
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_kind(),
-            core::ObservedRobotStateSourceKind::kCommandedState);
-  EXPECT_EQ(selected.source_id(), "commanded_state");
-  EXPECT_EQ(selected.authority_profile(),
-            core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
-  EXPECT_EQ(selected.authority_profile_id(), "ros2_control_commanded_sim_v1");
-  ASSERT_EQ(selected.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
-  ASSERT_EQ(selected.velocities_rad_s().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.0);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     CommandedSimPublishesJtcCancelReferenceWithScopedToken) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.required_joints = {"joint_1", "joint_2"};
-  config.initial_joint_positions_rad = {0.0, 0.0};
-  auto transport_resources_72 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_72,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_72(*transport_resources_72, backend);
-  backend.testing_set_running_state(true);
-
-  const auto first_token =
-      backend.testing_begin_jtc_cancel_reference_authority();
-  ASSERT_NE(first_token, 0u);
-  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
-      {"joint_2", "joint_1"}, {0.8, 0.4}, {0.2, 0.1}, 100, first_token));
-
-  auto selected = backend.observed_robot_state_publication()->acquire(100);
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_kind(),
-            core::ObservedRobotStateSourceKind::kCommandedState);
-  ASSERT_EQ(selected.positions_rad().size(), 2u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.4);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[1], 0.8);
-  ASSERT_EQ(selected.velocities_rad_s().size(), 2u);
-  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.1);
-  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[1], 0.2);
-
-  backend.testing_end_jtc_cancel_reference_authority(first_token);
-  const auto second_token =
-      backend.testing_begin_jtc_cancel_reference_authority();
-  ASSERT_NE(second_token, 0u);
-  ASSERT_NE(second_token, first_token);
-  EXPECT_FALSE(backend.testing_publish_jtc_cancel_reference(
-      {"joint_1", "joint_2"}, {0.9, 0.9}, {0.0, 0.0}, 200, first_token));
-  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
-      {"joint_1", "joint_2"}, {0.5, 0.6}, {0.0, 0.0}, 201, second_token));
-  backend.testing_end_jtc_cancel_reference_authority(second_token);
-
-  selected = backend.observed_robot_state_publication()->acquire(201);
-  ASSERT_TRUE(selected);
-  ASSERT_EQ(selected.positions_rad().size(), 2u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.5);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[1], 0.6);
-  const auto metrics = backend.controller_progress_metrics();
-  EXPECT_EQ(metrics.jtc_cancel_reference_publications_total, 2u);
-  EXPECT_EQ(metrics.jtc_cancel_reference_rejections_total, 1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     AuthoredWriterSerializationKeepsDelayedSourceProvenance) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  clock.set(1'000);
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_73 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_73,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_73(*transport_resources_73, backend);
-  backend.testing_set_running_state(true);
-
-  clock.set(2'000);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.5}));
-  const auto token = backend.testing_begin_jtc_cancel_reference_authority();
-  ASSERT_NE(token, 0u);
-
-  // This reference was received before the preceding authored snapshot but
-  // reached the serialized publication lane afterwards. Its source time must
-  // remain intact while its local publication-receipt time reflects that
-  // serialization order.
-  clock.set(3'000);
-  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
-      {"joint_1"}, {0.25}, {0.0}, 1'500, token));
-
-  auto selected = backend.observed_robot_state_publication()->acquire(3'000);
-  ASSERT_TRUE(selected);
-  EXPECT_EQ(selected.source_timestamp_ns(), 1'500);
-  EXPECT_EQ(selected.received_timestamp_ns(), 3'000);
-  ASSERT_EQ(selected.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.25);
-  backend.testing_end_jtc_cancel_reference_authority(token);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     ObservedRos2NeverDelegatesAuthorityToJtcCommandReference) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  auto transport_resources_74 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_74,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_74(*transport_resources_74, backend);
-  backend.testing_set_running_state(true);
-
-  EXPECT_EQ(backend.testing_begin_jtc_cancel_reference_authority(), 0u);
-  EXPECT_FALSE(backend.testing_publish_jtc_cancel_reference({"joint_1"}, {0.5},
-                                                            {0.0}, 100, 1));
-  EXPECT_EQ(backend.controller_progress_metrics()
-                .jtc_cancel_reference_publications_total,
-            0u);
-  EXPECT_EQ(backend.controller_progress_metrics()
-                .jtc_cancel_reference_rejections_total,
-            1u);
-}
-
-TEST(Ros2ControlExecutionBackendTest,
-     TerminalGenerationRejectsLateMonitorSnapshotAndCommandAuthority) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_75 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_75,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_75(*transport_resources_75, backend);
-
-  backend.testing_set_running_state(true);
-  const auto execution_generation = backend.testing_running_generation();
-  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kExecuting, {0.5}, execution_generation));
-
-  backend.testing_set_running_state(false);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kCompleted,
-                                               {1.0}));
-  EXPECT_FALSE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kExecuting, {0.75}, execution_generation));
-
-  const auto snapshot = backend.get_execution_snapshot();
-  EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[0], 1.0);
-  auto observed =
-      backend.observed_robot_state_publication()->acquire(clock.now());
+std::atomic<std::uint64_t> Rig::sequence_{0};
+
+TEST(JtcExecutionPort, SubmitMapsFullPvaAndReportsLocalAcceptanceAndUuid) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto observation = rig.adapter->ReadGoal(key(1));
+  ASSERT_TRUE(observation);
+  EXPECT_EQ(observation->binding_epoch, ExecutionBindingEpoch{1});
+  EXPECT_EQ(observation->accepted_stamp_ns, TimePoint{42});
+  EXPECT_FALSE(observation->mechanism_goal_id.empty());
+  EXPECT_FALSE(observation->result);
+  const auto actual = rig.handle()->get_goal();
+  EXPECT_EQ(actual->trajectory.joint_names,
+            (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(actual->trajectory.points[0].positions,
+            (std::vector<double>{0.1, 0.2}));
+  EXPECT_EQ(actual->trajectory.points[0].accelerations.size(), 2U);
+  ASSERT_EQ(actual->goal_tolerance.size(), 2U);
+  EXPECT_EQ(actual->goal_tolerance[0].position, -1.0);
+}
+
+TEST(JtcExecutionPort, RefusesInvalidPvaAndReplayedKeyBeforeEffect) {
+  Rig rig;
+  auto invalid = trajectory();
+  invalid.waypoints[0].accelerations_rad_s2.clear();
+  EXPECT_EQ(rig.adapter->Submit(key(1), invalid).refusal,
+            ExecutionPortRefusal::kInvalidInput);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1)));
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  EXPECT_EQ(rig.adapter->Submit(key(1), trajectory()).refusal,
+            ExecutionPortRefusal::kStaleKey);
+  EXPECT_EQ(rig.adapter->Cancel(key(9)).refusal,
+            ExecutionPortRefusal::kStaleKey);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+}
+
+TEST(JtcExecutionPort, PendingCancelIsRetainedAndSentOnAcceptance) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  const auto pending = rig.adapter->ReadGoal(key(1));
+  ASSERT_TRUE(pending);
+  EXPECT_TRUE(pending->mechanism_goal_id.empty());
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp);
+  rig.release_response();
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))
+        ->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp,
+            TimePoint{42});
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  EXPECT_FALSE(rig.adapter->ReadSample());
+}
+
+TEST(JtcExecutionPort, RejectedPendingCancelSendsNothing) {
+  Rig rig;
+  rig.delay_next_response = true;
+  rig.reject_next = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  rig.release_response();
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kRejected;
+  }));
+  EXPECT_TRUE(rig.adapter->ReadGoal(key(1))->mechanism_goal_id.empty());
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+}
+
+TEST(JtcExecutionPort, RetiredPendingCancelCannotSendOnLateAcceptance) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  rig.release_response();
+  (void)rig.handle();
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+}
+
+TEST(JtcExecutionPort, ShutdownReleasesSdkOwnersWithoutSendingPendingCancel) {
+  Rig rig;
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  rig.adapter->shutdown();
+  EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
+  EXPECT_FALSE(rig.adapter->ReadReadiness().controller_active);
+  EXPECT_EQ(rig.adapter->SetScale(0.5).dispatch,
+            ExecutionPortDispatch::kNotDispatched);
+  rig.release_response();
+  (void)rig.handle();
+  ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+  const auto observed = rig.adapter->ReadGoal(key(1));
   ASSERT_TRUE(observed);
-  ASSERT_EQ(observed.positions_rad().size(), 1u);
-  EXPECT_DOUBLE_EQ(observed.positions_rad()[0], 1.0);
+  EXPECT_EQ(observed->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_FALSE(observed->accepted_stamp_ns);
+  EXPECT_FALSE(observed->cancel_sent_local_stamp);
+  EXPECT_FALSE(observed->cancel_ack_local_receipt_stamp);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.scale_count.load(), 0U);
+  rig.adapter.reset();
 }
 
-TEST(Ros2ControlExecutionBackendTest,
-     SameGenerationStoppingCannotRegressAuthoredTerminalSnapshot) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_76 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_76,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_76(*transport_resources_76, backend);
-
-  backend.testing_set_running_state(true);
-  const auto execution_generation = backend.testing_running_generation();
-  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kExecuting, {0.5}, execution_generation));
-  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kStopped, {0.5}, execution_generation));
-  const auto terminal = backend.get_execution_snapshot();
-
-  EXPECT_FALSE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kStopping, {0.25}, execution_generation));
-  const auto retained = backend.get_execution_snapshot();
-  EXPECT_EQ(retained.state, core::ExecutionState::kStopped);
-  EXPECT_EQ(retained.sequence_number, terminal.sequence_number);
-  EXPECT_EQ(retained.joint_positions_rad, terminal.joint_positions_rad);
-
-  backend.testing_set_running_state(false);
-  backend.testing_set_running_state(true);
-  const auto replacement_generation = backend.testing_running_generation();
-  ASSERT_GT(replacement_generation, execution_generation);
-  EXPECT_TRUE(backend.testing_publish_snapshot_for_generation(
-      core::ExecutionState::kStopping, {0.75}, replacement_generation));
-  EXPECT_EQ(backend.get_execution_snapshot().state,
-            core::ExecutionState::kStopping);
+TEST(JtcExecutionPort, IdleShutdownReclaimsEntitiesWhileSharedExecutorRuns) {
+  Rig rig;
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  // No publisher/controller traffic wakes this node after retirement.
+  rig.adapter->shutdown();
+  EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
+  ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+  EXPECT_TRUE(rig.resources.started());
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.scale_count.load(), 0U);
 }
 
-TEST(Ros2ControlExecutionBackendTest,
-     SameGenerationStoppingCannotRegressObservedTerminalMetadata) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "observed_ros2";
-  auto transport_resources_77 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_77,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_77(*transport_resources_77, backend);
-
-  backend.testing_set_running_state(true);
-  const auto execution_generation = backend.testing_running_generation();
-  ASSERT_TRUE(backend.testing_publish_observed_metadata_for_generation(
-      core::ExecutionState::kExecuting, execution_generation));
-  ASSERT_TRUE(backend.testing_publish_observed_metadata_for_generation(
-      core::ExecutionState::kStopped, execution_generation));
-  const auto terminal = backend.get_execution_snapshot();
-
-  EXPECT_FALSE(backend.testing_publish_observed_metadata_for_generation(
-      core::ExecutionState::kStopping, execution_generation));
-  const auto retained = backend.get_execution_snapshot();
-  EXPECT_EQ(retained.state, core::ExecutionState::kStopped);
-  EXPECT_EQ(retained.sequence_number, terminal.sequence_number);
+TEST(JtcExecutionPort, PendingCancelResponseCannotReviveRetiredFactsOrNewEpoch) {
+  Rig rig(true);
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  rig.delay_next_cancel = true;
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_blocked.load(); }));
+  rig.adapter->shutdown();
+  rig.successor->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
+  rig.release_response();
+  ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+  const auto old = rig.adapter->ReadGoal(key(1));
+  ASSERT_TRUE(old);
+  EXPECT_EQ(old->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_FALSE(old->cancel_ack_local_receipt_stamp);
+  EXPECT_FALSE(rig.successor->ReadGoal(key(1)));
+  EXPECT_TRUE(rig.successor->ReadReadiness().controller_active);
+  EXPECT_EQ(rig.cancel_count.load(), 1U); // Only the cancel sent before closure.
+  EXPECT_EQ(rig.scale_count.load(), 0U);
 }
 
-TEST(Ros2ControlExecutionBackendTest,
-     TerminalCommandPublicationFailureInvalidatesPlanningAuthority) {
-  auto sink = std::make_shared<RecordingExecutionStateSink>();
-  core::FakeClock clock;
-  core::ManualScheduler scheduler;
-  auto config = base_config();
-  config.execution_state_source_mode = "commanded_sim";
-  config.initial_joint_positions_rad = {0.0};
-  auto transport_resources_78 =
-      test_transport_resources(sink, clock, "arm", config);
-  Ros2ControlExecutionBackend backend(
-      *transport_resources_78,
-      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm", clock,
-      scheduler, config);
-  TestTransportLifetime transport_lifetime_78(*transport_resources_78, backend);
+TEST(JtcExecutionPort, ExecutorKeepsSdkAliveThroughExecutingFeedbackCallback) {
+  Rig rig;
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+  };
+  auto gate = std::make_shared<Gate>();
+  auto client = JtcExecutionPortTestPeer::client(*rig.adapter);
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  // Use this actual SDK client's feedback callback as a deterministic barrier
+  // inside Client::execute, without blocking an adapter facts/command lock.
+  rclcpp_action::Client<Action>::SendGoalOptions options;
+  options.feedback_callback = [gate](auto, auto) {
+    std::unique_lock lock(gate->mutex);
+    gate->entered = true;
+    gate->cv.notify_all();
+    gate->cv.wait_for(lock, 3s, [&] { return gate->released; });
+  };
+  Action::Goal goal;
+  auto future = client->async_send_goal(goal, options);
+  ASSERT_TRUE(wait_until([&] { return future.wait_for(0s) == std::future_status::ready; }));
+  ASSERT_TRUE(future.get());
+  client.reset(); // Only adapter and SDK execution ownership remain.
+  rig.handle()->publish_feedback(std::make_shared<Action::Feedback>());
+  {
+    std::unique_lock lock(gate->mutex);
+    ASSERT_TRUE(gate->cv.wait_for(lock, 3s, [&] { return gate->entered; }));
+  }
+  rig.adapter->shutdown();
+  EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
+  EXPECT_FALSE(sdk.client.expired()); // Actual executor-owned raw-this callback.
+  rig.adapter.reset();
+  {
+    std::lock_guard lock(gate->mutex);
+    gate->released = true;
+  }
+  gate->cv.notify_all();
+  ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.scale_count.load(), 0U);
+}
 
-  const auto *publication = backend.observed_robot_state_publication();
-  ASSERT_NE(publication, nullptr);
-  auto first = publication->acquire(clock.now());
-  ASSERT_TRUE(first);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.25}));
-  auto second = publication->acquire(clock.now());
-  ASSERT_TRUE(second);
-  ASSERT_TRUE(backend.testing_publish_snapshot(core::ExecutionState::kExecuting,
-                                               {0.5}));
+TEST(JtcExecutionPort, ConcurrentShutdownIsIdempotentAndDoesNotTouchNewEpoch) {
+  Rig rig(true);
+  const auto old_sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  rig.successor->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
+  std::thread first([&] { rig.adapter->shutdown(); });
+  std::thread second([&] { rig.adapter->shutdown(); });
+  first.join();
+  second.join();
+  ASSERT_TRUE(wait_until([&] { return old_sdk.expired(); }));
+  EXPECT_TRUE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.successor));
+  EXPECT_TRUE(rig.successor->ReadReadiness().controller_active);
+  EXPECT_EQ(rig.adapter->SetScale(0.5).dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.scale_count.load(), 0U);
+}
 
-  // The current slot is never overwritten and both older slots are pinned.
-  // A terminal authority replacement must fail closed instead of leaving the
-  // non-expiring 0.5 command reference admissible for the next plan.
-  EXPECT_FALSE(backend.testing_publish_snapshot(
-      core::ExecutionState::kCompleted, {1.0}));
-  ASSERT_NE(backend.authored_state_authority_epoch(), nullptr);
-  const auto invalid_epoch =
-      backend.authored_state_authority_epoch()->load(std::memory_order_acquire);
-  EXPECT_NE(invalid_epoch & 1u, 0u);
+TEST(JtcExecutionPort, RepeatedBindingsReturnAllSdkEntityCountsToBaseline) {
+  Rig rig;
+  auto assert_no_entities = [&] {
+    return rig.resources.node()->count_subscribers(rig.config(1).state_topic) == 0U &&
+           rig.resources.node()->count_publishers(rig.config(1).scale_topic) == 0U &&
+           rig.resources.node()->count_subscribers(rig.config(1).action_name + "/_action/feedback") == 0U &&
+           rig.resources.node()->count_subscribers(rig.config(1).action_name + "/_action/status") == 0U;
+  };
+  for (std::uint64_t epoch = 1; epoch <= 20; ++epoch) { // Fixture count, never a product cap.
+    const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+    rig.adapter->shutdown();
+    rig.adapter.reset();
+    ASSERT_TRUE(wait_until([&] { return sdk.expired() && assert_no_entities(); }));
+    if (epoch < 20) {
+      rig.adapter = std::make_unique<Ros2ControlExecutionBackend>(rig.resources, rig.clock,
+                                                                 rig.config(epoch + 1));
+      rig.adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{epoch + 1}});
+    }
+  }
+}
 
-  first = {};
-  second = {};
-  EXPECT_TRUE(
-      backend.testing_publish_snapshot(core::ExecutionState::kIdle, {1.0}));
-  const auto restored_epoch =
-      backend.authored_state_authority_epoch()->load(std::memory_order_acquire);
-  EXPECT_EQ(restored_epoch & 1u, 0u);
-  EXPECT_GT(restored_epoch, invalid_epoch);
+TEST(JtcExecutionPort, QuiescenceDrainsInFlightGoalResponseBeforeContextShutdown) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  rig.adapter->shutdown();
+  std::atomic<bool> quiesced{false};
+  std::thread shutdown([&] {
+    rig.resources.quiesce();
+    quiesced = true;
+  });
+  // The SDK goal callback holds the real executor worker. Observe cancellation
+  // through the SDK predicate, then release that callback without a delay.
+  EXPECT_TRUE(wait_until([&] {
+    return !JtcExecutionPortTestPeer::executor_is_spinning(rig.resources);
+  }));
+  EXPECT_FALSE(quiesced.load());
+  EXPECT_TRUE(rig.resources.node()->get_node_base_interface()->get_context()->is_valid());
+  rig.release_response();
+  shutdown.join();
+  EXPECT_TRUE(quiesced.load());
+  EXPECT_EQ(rig.goal_count(), 1U);
+  EXPECT_TRUE(rig.accepted_callback_context_valid.load());
+  EXPECT_FALSE(rig.resources.node()->get_node_base_interface()->get_context()->is_valid());
+}
+
+TEST(JtcExecutionPort, ImmediateQuiescenceAfterStartCannotLoseExecutorCancellation) {
+  FakeClock clock;
+  const auto sink = std::make_shared<Sink>();
+  for (unsigned iteration = 0; iteration < 8U; ++iteration) {
+    Ros2TransportResources resources("jtc_immediate_quiescence_" + std::to_string(iteration),
+                                    "", 2, sink, "arm", clock);
+    resources.start();
+    EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+    resources.quiesce();
+    EXPECT_FALSE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+    EXPECT_FALSE(resources.node()->get_node_base_interface()->get_context()->is_valid());
+  }
+}
+
+TEST(JtcExecutionPort, ShutdownAfterContextStoppedNeedsNoNotificationOrCommands) {
+  Rig rig;
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  rig.resources.quiesce();
+  rig.adapter->shutdown();
+  rig.adapter->shutdown();
+  EXPECT_FALSE(JtcExecutionPortTestPeer::owns_sdk_entities(*rig.adapter));
+  EXPECT_TRUE(sdk.expired());
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_EQ(rig.scale_count.load(), 0U);
+}
+
+TEST(JtcExecutionPort, CancelAcknowledgementDoesNotEndGoalOrManufactureRest) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))
+        ->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp,
+            TimePoint{42});
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  EXPECT_FALSE(rig.adapter->ReadSample());
+  ASSERT_TRUE(wait_until([&] { return rig.handle()->is_canceling(); }));
+  rig.handle()->canceled(std::make_shared<Action::Result>());
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kCanceled;
+  }));
+  EXPECT_FALSE(rig.adapter->ReadSample());
+}
+
+TEST(JtcExecutionPort, ReplacementPreservesMultiplePastPointsAndPvaOnWire) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  auto past = trajectory();
+  past.waypoints = {{-0.125, {0.0, 0.0}, {0.2, 0.1}, {0.3, 0.4}},
+                    {-0.01, {0.02, 0.01}, {0.2, 0.1}, {0.3, 0.4}},
+                    {0.2, {0.04, 0.03}, {0.0, 0.0}, {0.0, 0.0}}};
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), past).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  const auto wire = rig.handle(1)->get_goal()->trajectory;
+  ASSERT_EQ(wire.points.size(), 3U);
+  EXPECT_EQ(wire.points[0].time_from_start.sec, -1);
+  EXPECT_EQ(wire.points[0].time_from_start.nanosec, 875'000'000U);
+  EXPECT_EQ(wire.points[1].time_from_start.sec, -1);
+  EXPECT_EQ(wire.points[1].time_from_start.nanosec, 990'000'000U);
+  EXPECT_EQ(wire.points[0].velocities, (std::vector<double>{0.1, 0.2}));
+  EXPECT_EQ(wire.points[0].accelerations, (std::vector<double>{0.4, 0.3}));
+  EXPECT_EQ(rig.adapter->Replace(key(1), key(3), past).refusal,
+            ExecutionPortRefusal::kStaleKey);
+}
+
+TEST(JtcExecutionPort,
+     ScaleSendDoesNotClaimAppliedAndSamplesFollowControllerOrder) {
+  Rig rig;
+  rig.state();
+  ASSERT_EQ(rig.adapter->SetScale(0.5).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.scale_count.load() > 0; }));
+  EXPECT_EQ(rig.last_scale.load(), 0.5);
+  const auto sample = rig.adapter->ReadSample();
+  ASSERT_TRUE(sample);
+  EXPECT_EQ(sample->applied_factor, 0.25);
+  EXPECT_EQ(sample->reference_positions_rad, (std::vector<double>{0.1, 0.2}));
+  EXPECT_EQ(sample->reference_velocities_rad_s,
+            (std::vector<double>{0.01, 0.02}));
+  EXPECT_FALSE(sample->command_velocities_rad_s);
+  ASSERT_TRUE(sample->measured_velocities_rad_s);
+  EXPECT_EQ(*sample->measured_velocities_rad_s,
+            (std::vector<double>{0.04, 0.03}));
+  EXPECT_EQ(rig.adapter->SetScale(2).refusal,
+            ExecutionPortRefusal::kInvalidInput);
+  rig.state(0.5, 20'000'000);
+  const auto timing = rig.adapter->ReadTiming();
+  ASSERT_TRUE(timing.max_state_stamp_gap_s);
+  EXPECT_NEAR(*timing.max_state_stamp_gap_s, 0.02, 1e-10);
+  EXPECT_EQ(timing.received_samples, 2U);
+  EXPECT_FALSE(timing.period_mean_s);
+  EXPECT_FALSE(rig.adapter->ReadTiming().received_samples);
+}
+
+TEST(JtcExecutionPort, LaterActionDiscoveryLossDoesNotChangePortReadiness) {
+  Rig rig;
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ActionServerIsReady(); }));
+  const auto before = rig.adapter->ReadReadiness();
+  ASSERT_TRUE(before.controller_bound);
+  ASSERT_TRUE(before.controller_active);
+  ASSERT_TRUE(before.hardware_active);
+  rig.remove_action_server();
+  ASSERT_TRUE(wait_until([&] { return !rig.adapter->ActionServerIsReady(); }));
+  const auto after = rig.adapter->ReadReadiness();
+  EXPECT_EQ(after, before);
+}
+
+TEST(JtcExecutionPort, BindingLossDoesNotIssueCancelAndRejectsLateSuccess) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{9}});
+  EXPECT_TRUE(rig.adapter->ReadReadiness().controller_active);
+  rig.adapter->ObserveReadiness({false, true, true, ExecutionBindingEpoch{1}});
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::SUCCESSFUL;
+  rig.handle()->succeed(result);
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+}
+
+TEST(JtcExecutionPort, OldCallbacksCannotCompleteNewBindingWithReusedKey) {
+  Rig rig(true);
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto old = rig.handle();
+  rig.adapter.reset();
+  rig.successor->ObserveReadiness({true, true, true, ExecutionBindingEpoch{2}});
+  ExecutionPortCommandResultDTO dispatched;
+  ASSERT_TRUE(wait_until([&] {
+    dispatched = rig.successor->Submit(key(1), trajectory());
+    return dispatched.dispatch != ExecutionPortDispatch::kNotDispatched ||
+           dispatched.refusal != ExecutionPortRefusal::kNotReady;
+  }));
+  ASSERT_EQ(dispatched.dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1), rig.successor.get()));
+  const auto current = rig.successor->ReadGoal(key(1));
+  ASSERT_TRUE(current);
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::SUCCESSFUL;
+  old->succeed(result);
+  EXPECT_EQ(rig.successor->ReadGoal(key(1))->binding_epoch,
+            ExecutionBindingEpoch{2});
+  EXPECT_FALSE(rig.successor->ReadGoal(key(1))->result);
+  rig.handle(1)->succeed(result);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.successor->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kSucceeded;
+  }));
+}
+
+TEST(JtcExecutionPort, ActionRefusalIsGoalScopedAndNeverSucceeded) {
+  Rig rig;
+  rig.reject_next = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kRejected;
+  }));
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->accepted_stamp_ns);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(9)));
+}
+
+TEST(JtcExecutionPort,
+     RejectedReplacementLeavesPredecessorCurrentAndCancelable) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.reject_next = true;
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(2))->result ==
+           ExecutionGoalResult::kRejected;
+  }));
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  EXPECT_EQ(rig.adapter->Cancel(key(2)).refusal,
+            ExecutionPortRefusal::kStaleKey);
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1; }));
+}
+
+TEST(JtcExecutionPort,
+     ReportsControllerPathAndGoalToleranceAbortsAsDistinctFacts) {
+  for (const auto &[code, expected] :
+       {std::pair{Action::Result::PATH_TOLERANCE_VIOLATED,
+                  ExecutionGoalResult::kAbortedPathTolerance},
+        std::pair{Action::Result::GOAL_TOLERANCE_VIOLATED,
+                  ExecutionGoalResult::kAbortedGoalTolerance}}) {
+    Rig rig;
+    ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(rig.accepted(key(1)));
+    auto result = std::make_shared<Action::Result>();
+    result->error_code = code;
+    rig.handle()->abort(result);
+    ASSERT_TRUE(wait_until(
+        [&] { return rig.adapter->ReadGoal(key(1))->result == expected; }));
+    EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->preempted_by);
+  }
+}
+
+TEST(JtcExecutionPort, TwoUnfinishedRecordsRefuseNewGoalsBeforeEffect) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  EXPECT_EQ(rig.adapter->Submit(key(3), trajectory()).refusal,
+            ExecutionPortRefusal::kNotReady);
+  EXPECT_EQ(rig.adapter->Replace(key(2), key(3), trajectory()).refusal,
+            ExecutionPortRefusal::kNotReady);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(3)));
+  EXPECT_EQ(rig.goal_count(), 2U);
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).refusal,
+            ExecutionPortRefusal::kStaleKey);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+}
+
+TEST(JtcExecutionPort,
+     NewGoalEvictsOnlyOldestFinishedRecordAndIgnoresLateCallback) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto old_handle = rig.handle();
+  auto success = std::make_shared<Action::Result>();
+  success->error_code = Action::Result::SUCCESSFUL;
+  old_handle->succeed(success);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kSucceeded;
+  }));
+  ASSERT_EQ(rig.adapter->Submit(key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  ASSERT_EQ(rig.adapter->Replace(key(2), key(3), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(3)));
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1)));
+  EXPECT_TRUE(rig.adapter->ReadGoal(key(2)));
+  EXPECT_TRUE(rig.adapter->ReadGoal(key(3)));
+  const auto before = rig.adapter->ReadGoal(key(3));
+  rclcpp_action::ClientGoalHandle<Action>::WrappedResult late;
+  late.goal_id = old_handle->get_goal_id();
+  late.code = rclcpp_action::ResultCode::SUCCEEDED;
+  late.result = success;
+  JtcExecutionPortTestPeer::terminal(*rig.adapter, key(1), late);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1)));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(3)), before);
+}
+
+TEST(JtcExecutionPort, AcceptedSuccessorFactSurvivesItsFinishedRecordEviction) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto old = rig.handle();
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  auto success = std::make_shared<Action::Result>();
+  success->error_code = Action::Result::SUCCESSFUL;
+  rig.handle(1)->succeed(success);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(2))->result ==
+           ExecutionGoalResult::kSucceeded;
+  }));
+  ASSERT_EQ(rig.adapter->Submit(key(3), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(3)));
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(2)));
+  auto preempted = std::make_shared<Action::Result>();
+  preempted->error_code = Action::Result::INVALID_GOAL;
+  preempted->error_string = "Current goal preempted by new incoming action.";
+  old->abort(preempted);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kPreemptedBy;
+  }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->preempted_by, key(2));
+}
+
+TEST(JtcExecutionPort,
+     ActionFeedbackIsGoalScopedAndMappedToControllerJointOrder) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->latest_feedback);
+  auto feedback = std::make_shared<Action::Feedback>();
+  feedback->header.stamp.sec = 8;
+  feedback->header.stamp.nanosec = 7;
+  feedback->joint_names = {"b", "a"};
+  feedback->desired.positions = {0.2, 0.1};
+  feedback->desired.velocities = {2.0, 1.0};
+  feedback->desired.accelerations = {20.0, 10.0};
+  feedback->desired.time_from_start.nanosec = 250'000'000;
+  feedback->actual.positions = {0.19, 0.09};
+  rig.clock.set(84);
+  rig.handle()->publish_feedback(feedback);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->latest_feedback.has_value();
+  }));
+  const auto observed = *rig.adapter->ReadGoal(key(1))->latest_feedback;
+  EXPECT_EQ(observed.source_stamp_ns, TimePoint{8'000'000'007});
+  EXPECT_EQ(observed.local_receipt_stamp_ns, TimePoint{84});
+  EXPECT_DOUBLE_EQ(observed.cursor_s, 0.25);
+  EXPECT_EQ(observed.desired_positions_rad, (std::vector<double>{0.1, 0.2}));
+  EXPECT_EQ(observed.desired_velocities_rad_s, (std::vector<double>{1.0, 2.0}));
+  EXPECT_EQ(observed.desired_accelerations_rad_s2,
+            (std::vector<double>{10.0, 20.0}));
+  EXPECT_EQ(observed.actual_positions_rad, (std::vector<double>{0.09, 0.19}));
+  EXPECT_FALSE(
+      rig.adapter->ReadSample()); // Feedback is never a controller-wide sample.
+}
+
+TEST(JtcExecutionPort,
+     AppliedZeroOrPartialFactorDoesNotSuppressExplicitCancel) {
+  for (const double factor : {0.0, 0.25, 0.5, 0.75}) {
+    Rig rig;
+    ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(rig.accepted(key(1)));
+    rig.state(factor);
+    const auto applied = rig.adapter->ReadSample()->applied_factor;
+    ASSERT_TRUE(applied);
+    EXPECT_EQ(rig.adapter->SetScale(*applied).dispatch,
+              ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(wait_until([&] { return rig.scale_count.load() == 1; }));
+    EXPECT_DOUBLE_EQ(rig.last_scale.load(), factor);
+    EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+              ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(wait_until([&] {
+      return rig.adapter->ReadGoal(key(1))
+          ->cancel_ack_local_receipt_stamp.has_value();
+    }));
+    EXPECT_EQ(rig.cancel_count.load(), 1U);
+    EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+    EXPECT_EQ(rig.adapter->ReadSample()->reference_velocities_rad_s,
+              (std::vector<double>{0.01, 0.02}));
+  }
+}
+
+TEST(JtcExecutionPort, NegativeCancelResponseCannotSetPositiveAcknowledgement) {
+  Rig rig;
+  rig.reject_cancel = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  rig.clock.set(91);
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.cancel_count.load() == 1; }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp,
+            TimePoint{91});
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_ack_local_receipt_stamp);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+}
+
+TEST(JtcExecutionPort,
+     AmbiguousWrongUuidAndNegativeCallbacksNeverManufactureAck) {
+  Rig rig;
+  rig.reject_cancel = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  auto response = std::make_shared<action_msgs::srv::CancelGoal::Response>();
+  response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1,
+                                            response); // Empty.
+  action_msgs::msg::GoalInfo info;
+  info.goal_id.uuid = rig.handle()->get_goal_id();
+  auto wrong = info;
+  wrong.goal_id.uuid[0] ^= 1;
+  response->goals_canceling = {wrong};
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1, response);
+  response->goals_canceling = {info, wrong};
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1,
+                                            response); // Ambiguous list.
+  response->goals_canceling = {info};
+  response->return_code =
+      action_msgs::srv::CancelGoal::Response::ERROR_REJECTED;
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1, response);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_ack_local_receipt_stamp);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->terminal_local_receipt_stamp);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+}
+
+TEST(JtcExecutionPort, TerminalResultMayPrecedeAckWithoutManufacturedFinish) {
+  Rig rig;
+  rig.reject_cancel = true; // Real server emits no positive ACK; inject
+                            // callback ordering explicitly.
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto uuid = rig.handle()->get_goal_id();
+  rig.clock.set(101);
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  rclcpp_action::ClientGoalHandle<Action>::WrappedResult terminal;
+  terminal.goal_id = uuid;
+  terminal.code = rclcpp_action::ResultCode::CANCELED;
+  terminal.result = std::make_shared<Action::Result>();
+  rig.clock.set(102);
+  JtcExecutionPortTestPeer::terminal(*rig.adapter, key(1), terminal);
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->terminal_local_receipt_stamp,
+            TimePoint{102});
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_ack_local_receipt_stamp);
+  auto response = std::make_shared<action_msgs::srv::CancelGoal::Response>();
+  response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
+  action_msgs::msg::GoalInfo info;
+  info.goal_id.uuid = uuid;
+  response->goals_canceling = {info};
+  rig.clock.set(103);
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1, response);
+  const auto observed = rig.adapter->ReadGoal(key(1));
+  EXPECT_EQ(observed->cancel_sent_local_stamp, TimePoint{101});
+  EXPECT_EQ(observed->cancel_ack_local_receipt_stamp, TimePoint{103});
+  EXPECT_EQ(observed->result, ExecutionGoalResult::kCanceled);
+  EXPECT_FALSE(rig.adapter->ReadSample());
+}
+
+TEST(JtcExecutionPort,
+     ObsoleteCancelRequestCallbackCannotAcknowledgeLaterRequest) {
+  Rig rig;
+  rig.reject_cancel = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  rig.clock.set(93);
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  auto response = std::make_shared<action_msgs::srv::CancelGoal::Response>();
+  response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
+  action_msgs::msg::GoalInfo info;
+  info.goal_id.uuid = rig.handle()->get_goal_id();
+  response->goals_canceling = {info};
+  JtcExecutionPortTestPeer::cancel_response(*rig.adapter, key(1), 1, response);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_ack_local_receipt_stamp);
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp,
+            TimePoint{93});
+}
+
+TEST(JtcExecutionPort, PreemptionRequiresAcceptedSuccessorOnSameActiveBinding) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  auto old = rig.handle();
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::INVALID_GOAL;
+  result->error_string = "Current goal preempted by new incoming action.";
+  old->abort(result);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->result ==
+           ExecutionGoalResult::kPreemptedBy;
+  }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->preempted_by, key(2));
+}
+
+TEST(JtcExecutionPort, DeactivationErrorIsNotMisclassifiedAsPreemption) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::INVALID_GOAL;
+  result->error_string = "Current goal cancelled during deactivate transition.";
+  rig.handle()->abort(result);
+  ASSERT_TRUE(wait_until([&] {
+    return rig.adapter->ReadGoal(key(1))->phase ==
+           ExecutionGoalPhase::kTerminal;
+  }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->result,
+            ExecutionGoalResult::kEndedUnknown);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->preempted_by);
 }
 
 } // namespace

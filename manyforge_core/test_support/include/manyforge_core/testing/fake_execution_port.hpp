@@ -3,6 +3,7 @@
 #include <manyforge_core/ports/iexecution_port.hpp>
 #include <algorithm>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -96,6 +97,7 @@ class FakeExecutionPort final : public IExecutionPort {
 
   std::optional<ExecutionControllerSampleDTO> ReadSample() const override {
     std::lock_guard lock(mutex_);
+    if (on_read_sample_) on_read_sample_(sample_);
     return sample_;
   }
 
@@ -174,6 +176,15 @@ class FakeExecutionPort final : public IExecutionPort {
   void SetSample(std::optional<ExecutionControllerSampleDTO> sample) {
     std::lock_guard lock(mutex_);
     sample_ = std::move(sample);
+  }
+
+  /// Runs inside every `ReadSample`, under the port lock, before the stored
+  /// sample is returned; it may change the stored sample (e.g. a receipt that
+  /// lands between a reader's clock read and its sample read). Must not call
+  /// back into the port.
+  void SetOnReadSample(std::function<void(std::optional<ExecutionControllerSampleDTO>&)> hook) {
+    std::lock_guard lock(mutex_);
+    on_read_sample_ = std::move(hook);
   }
 
   void SetReadiness(ExecutionReadinessDTO readiness) {
@@ -278,7 +289,8 @@ class FakeExecutionPort final : public IExecutionPort {
   std::map<ExecutionGoalKey, ExecutionGoalObservationDTO> goals_;
   /// Keys of `goals_`, oldest first.
   std::deque<ExecutionGoalKey> record_order_;
-  std::optional<ExecutionControllerSampleDTO> sample_;
+  mutable std::optional<ExecutionControllerSampleDTO> sample_;
+  std::function<void(std::optional<ExecutionControllerSampleDTO>&)> on_read_sample_;
   ExecutionReadinessDTO readiness_{true, true, true, ExecutionBindingEpoch{1U}};
   ExecutionTimingDTO timing_{};
   ExecutionLaneFactsDTO lane_facts_{};

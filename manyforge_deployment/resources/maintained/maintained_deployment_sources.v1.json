@@ -127,27 +127,27 @@
       ]
     },
     {
-      "runtime_restoration_profile_id": "lite6_native_simulated_v0",
+      "runtime_restoration_profile_id": "lite6_mock_commanded_v0",
       "model_family_id": "lite6_lite_gripper",
       "source_fields": {
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
-        "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
-        "mode": "adapters.execution.config.mode",
+        "mock_profile": "maintainer_decision.Q69.model_family_id",
+        "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
         "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
-      "native_runtime": {
+      "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
-        "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
         "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "Native simulated UFACTORY lite pneumatic gripper.", "mount_frame": "link_eef", "open_state_ref": "open", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"]}],
         "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
-        "mode": "simulated",
+        "mock_profile": "lite6_lite_gripper",
+        "mode": "commanded_sim",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "lite6_robot", "maximum_tcp_linear_speed_mps": 0.15}],
         "planner_rng_seed": 12345
       },
@@ -303,25 +303,25 @@
       ]
     },
     {
-      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_mock_commanded_v0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "source_fields": {
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
-        "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
-        "mode": "adapters.execution.config.mode",
+        "mock_profile": "maintainer_decision.Q69.model_family_id",
+        "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
         "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
-      "native_runtime": {
+      "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
-        "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
-        "mode": "simulated",
+        "mock_profile": "ur10e_robotiq_2f_140",
+        "mode": "commanded_sim",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur10e_robot", "maximum_tcp_linear_speed_mps": 0.25}],
         "planner_rng_seed": 12345
       },
@@ -475,25 +475,25 @@
       ]
     },
     {
-      "runtime_restoration_profile_id": "ur10e_robotiq_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur10e_robotiq_mock_commanded_v0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "source_fields": {
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
-        "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
-        "mode": "adapters.execution.config.mode",
+        "mock_profile": "maintainer_decision.Q69.model_family_id",
+        "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
         "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
-      "native_runtime": {
+      "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
-        "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
-        "mode": "simulated",
+        "mock_profile": "ur10e_robotiq_2f_140",
+        "mode": "commanded_sim",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur10e_robot", "maximum_tcp_linear_speed_mps": 0.25}],
         "planner_rng_seed": 12345
       },
@@ -560,25 +560,25 @@
       ]
     },
     {
-      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
       "model_family_id": "ur5_roboplan",
       "source_fields": {
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
-        "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
-        "mode": "adapters.execution.config.mode",
+        "mock_profile": "maintainer_decision.Q69.model_family_id",
+        "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
         "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
-      "native_runtime": {
+      "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
-        "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
-        "mode": "simulated",
+        "mock_profile": "ur5_roboplan",
+        "mode": "commanded_sim",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur5_robot", "maximum_tcp_linear_speed_mps": 0.25}],
         "planner_rng_seed": 12345
       },
@@ -631,27 +631,27 @@
       ]
     },
     {
-      "runtime_restoration_profile_id": "ur5e_robotiq_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5e_robotiq_mock_commanded_v0",
       "model_family_id": "ur5e_robotiq_2f_85",
       "source_fields": {
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
-        "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
-        "mode": "adapters.execution.config.mode",
+        "mock_profile": "maintainer_decision.Q69.model_family_id",
+        "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
         "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
-      "native_runtime": {
+      "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
-        "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
         "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
-        "mode": "simulated",
+        "mock_profile": "ur5e_robotiq_2f_85",
+        "mode": "commanded_sim",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur5e_robot", "maximum_tcp_linear_speed_mps": 0.25}],
         "planner_rng_seed": 12345
       },
@@ -968,7 +968,7 @@
       "assistant_profile_id": "assistant_scene_authoring",
       "historical_blob": "7149aba89619f3f1c426148ef2f2972cd0c730f0",
       "model_family_id": "ur10e_robotiq_2f_140",
-      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_mock_commanded_v0",
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
@@ -985,6 +985,7 @@
     },
     {
       "deployment_source": "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
+      "isaac_world": "lite6_grf_ros2",
       "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
       "cell_id": "isaac_lite6_pick_place_cell",
       "name": "isaac_lite6_lite_gripper_pick_and_place",
@@ -1037,6 +1038,7 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
+      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
       "cell_id": "isaac_ur10e_assistant_cell",
       "name": "isaac_manipulator_scene_light_assistant",
@@ -1091,6 +1093,7 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
+      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
       "cell_id": "isaac_ur10e_light_cell",
       "name": "isaac_manipulator_scene_light_ros2_control",
@@ -1143,6 +1146,7 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
+      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
       "cell_id": "isaac_ur10e_collision_cell",
       "name": "isaac_manipulator_scene_light_ros2_control_collision",
@@ -1212,7 +1216,7 @@
       "assistant_profile_id": null,
       "historical_blob": "d0141f0042f3b7af5850e651befb3e2550d907c0",
       "model_family_id": "lite6_lite_gripper",
-      "runtime_restoration_profile_id": "lite6_native_simulated_v0",
+      "runtime_restoration_profile_id": "lite6_mock_commanded_v0",
       "component_occurrence_id": "lite6_robot",
       "program_role_assignments": [
         {
@@ -1244,7 +1248,7 @@
       "assistant_profile_id": null,
       "historical_blob": "bee699e23c42a7b8810dbf27b1f8bd261f514834",
       "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -1287,7 +1291,7 @@
       "assistant_profile_id": null,
       "historical_blob": "f31c1af91814b9da7a1d121531c0c3c814001781",
       "model_family_id": "ur10e_robotiq_2f_140",
-      "runtime_restoration_profile_id": "ur10e_robotiq_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur10e_robotiq_mock_commanded_v0",
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
@@ -1321,7 +1325,7 @@
       "assistant_profile_id": "semantic_shape_selection",
       "historical_blob": "115ab078116696847a9c037f0b20d5b3e39b1741",
       "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -1338,6 +1342,7 @@
     },
     {
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
+      "isaac_world": "test_scene_realsense_foundationpose_trocar",
       "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
       "cell_id": "isaac_lite6_trocar_cell",
       "name": "trocar_lite6_foundationpose_pick",
@@ -1410,7 +1415,7 @@
       "assistant_profile_id": "vision_bin_selection",
       "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
       "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -1444,7 +1449,7 @@
       "assistant_profile_id": "vision_pose_selection",
       "historical_blob": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
       "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {

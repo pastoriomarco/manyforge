@@ -106,9 +106,6 @@ void assign(std::array<char, Size>& destination, std::size_t& used,
          bounded_optional(candidate.malformed_reason, kMaximumEmergencyStopMalformedReasonBytes) &&
          portable_token(candidate.proposed_stop_id, kMaximumEmergencyStopIdentityBytes) &&
          candidate.proposed_stop_generation.nonzero() && candidate.accepted_at_ns >= 0 &&
-         candidate.outer_deadline_ns > candidate.accepted_at_ns &&
-         candidate.full_stop_outer_deadline_ns > candidate.accepted_at_ns &&
-         candidate.full_stop_outer_deadline_ns <= candidate.outer_deadline_ns &&
          known_disposition(candidate.disposition) &&
          sha256_digest(candidate.captured_scope_digest) &&
          sha256_digest(candidate.full_stop_scope_digest) &&
@@ -171,7 +168,6 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
     result.disposition = slot.disposition;
     result.stop_generation = slot.stop_generation;
     result.accepted_at_ns = slot.accepted_at_ns;
-    result.outer_deadline_ns = slot.outer_deadline_ns;
     result.work_token = slot.work_token;
     result.correlation_slot = correlation_slot;
     result.correlation_retained = correlation_retained;
@@ -214,9 +210,6 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
     slot.stop_generation =
         joined != nullptr ? joined->stop_generation : candidate.proposed_stop_generation;
     slot.accepted_at_ns = joined != nullptr ? joined->accepted_at_ns : candidate.accepted_at_ns;
-    slot.outer_deadline_ns = joined != nullptr ? joined->outer_deadline_ns
-                                               : (full_stop ? candidate.full_stop_outer_deadline_ns
-                                                            : candidate.outer_deadline_ns);
     slot.work_token = joined != nullptr ? joined->work_token : mint_work_token(physical_slot);
     assign(slot.request_id, slot.request_id_size, candidate.request_id);
     if (candidate.normalized_request_digest.has_value()) {
@@ -353,7 +346,6 @@ std::optional<EmergencyStopAcceptanceOutcome> EmergencyStopAcceptanceReserve::fi
     result.disposition = slot.disposition;
     result.stop_generation = slot.stop_generation;
     result.accepted_at_ns = slot.accepted_at_ns;
-    result.outer_deadline_ns = slot.outer_deadline_ns;
     result.work_token = slot.work_token;
     result.correlation_slot = correlation_slot;
     result.correlation_retained = true;

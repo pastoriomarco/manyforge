@@ -30,9 +30,10 @@ source-matched build/package record; do not invent or reuse values:
 `package_aggregate_sha256`, `compiler_build_manifest_sha256`, and
 `node_environment_sha256`. O1.3 native records a `mounted_install`, not a
 container image, so no container image ID is supplied to this native command.
-The split Isaac profile records a mounted remote install and a mounted local
-world; its exact source/package/world identity must be published in the dated
-O1 evidence before live use.
+The split Isaac profile also records its exact full ROS container image and
+container ID alongside the mounted remote package and local world. Its exact
+source/package/image/world identity must be published in dated qualification
+evidence before live use.
 
 ### Prepare the immutable package root
 
@@ -283,15 +284,26 @@ failure reasons. In particular:
 
 ## 5. Split Isaac topology and other unavailable lanes
 
-The implemented Isaac profile is a laptop-owned outer lifecycle around the
-source-matched Orin runtime. It is intentionally still a live-qualification
-gate. The laptop starts `${HOME}/isaac-sim/isaac-sim.sh` headless with
-`isaacsim.ros2.bridge` and `isaacsim.ros2.sim_control`; SSH starts the retained
-ROS bridge and native ManyForge operator on Orin. The bridge barrier loads and
-reads back the retained UR10 world, verifies the five
-`simulation_interfaces` services and required topics, and leaves simulation
-stopped. The outer owner records exact local and remote process identities,
-source/artifact/world identities, readiness, failures, and cleanup results.
+The Isaac profile keeps the outer lifecycle on the laptop and starts one
+source-matched full ROS image container on the remote ROS machine through the
+existing `scripts/compose-dev.sh` / `scripts/dev-workbench.py` route. Manager,
+ROS execution host and cell pose observer share that container; components
+remain managed processes. ROS is not installed or sourced on either host.
+Isaac Sim stays on the laptop, using its bundled ROS environment and existing
+`isaacsim.ros2.bridge` / `isaacsim.ros2.sim_control` extensions.
+
+The container retains Headless on port9010 and Runner on9011 (loopback), and
+Composer with its built static frontend on port9000 (all interfaces). It does
+not start Vite or run `npm ci`. Normal developer Workbench defaults are
+unchanged. G READY requires its authenticated Sim, fresh Manager-ready status
+and actual service health. It does not certify Apply/CCLC convergence, fresh
+poses, Program execution or motion permission. Build time and readiness time
+are reported separately; this source wiring is not live qualification.
+
+When a site file is configured, G forwards its explicit path and the verified
+absolute observer executable from the same built overlay to Manager. The
+Manager-owned check/observer path uses the retained site snapshot before world
+effects; it creates no host ROS dependency or second observer owner.
 
 Use the same global state root/instance ID and provide every source-matched
 remote path and digest. The command shape is:
@@ -306,6 +318,12 @@ python3 -m manyforge_operator \
   --local-ros-environment-script "$MANYFORGE_ROOT/config/ros/isaac_i9.env.sh" \
   --remote-target tndlux@192.168.1.68 \
   --remote-source-root /mnt/nova_ssd/codex-manyforge/runners/manyforge \
+  --remote-container-image-id "$FULL_ROS_IMAGE_ID" \
+  --remote-container-name manyforge-isaac-runtime \
+  --remote-cache-root /mnt/nova_ssd/codex-manyforge/cache/isaac-runtime \
+  --remote-runtime-root /mnt/nova_ssd/codex-manyforge/state/isaac-runtime \
+  --remote-evidence-root /mnt/nova_ssd/codex-manyforge/evidence/isaac-runtime \
+  --remote-isaac-site-settings "$REMOTE_ISAAC_SITE_SETTINGS" \
   --remote-manager-executable /mnt/nova_ssd/codex-manyforge/builds/current/package/bin/manyforge_manager_daemon \
   --remote-install-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
   --remote-node-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/node_catalog.yaml \
@@ -323,18 +341,43 @@ python3 -m manyforge_operator \
   --expected-head-tree "$MANYFORGE_TREE"
 ```
 
-The Isaac topology is fixed to `ROS_DOMAIN_ID=0`,
-`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`,
-`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, and static peers
-`192.168.1.132;192.168.1.68`. Source `config/ros/isaac_i9.env.sh` for every
-participant. Isaac never auto-plays, selects a scenario, Applies a graph, or
-Runs a Program. Explicit `status` and `stop` use the persisted profile and
-identity; startup failure, Orin/simulator loss, explicit stop, and cleanup
-failure are reported as typed stopped/degraded outcomes rather than inferred
-from a port. A stopped Isaac record is re-probed against Orin before
-idempotent status/stop is reported; if Orin is unreachable, the result is
-`runtime_host_unavailable` rather than an unverified stopped claim. Do not
-recreate this lifecycle with a historical script.
+`FULL_ROS_IMAGE_ID` is the full immutable `sha256:<64 lowercase hex>` ID of
+an already present, qualified full ROS image. G does not pull or build an image.
+The qualified package/admission and catalogs are mounted read-only at their
+explicit absolute paths. An optional `--remote-composer-static-dir` overrides
+the image's existing built frontend. The older executable/state/setup path
+arguments remain recorded compatibility inputs; the Workbench builds and stages
+its resident runtime from the verified source and image. Host ROS setup paths
+are not sourced. The topology inputs remain the existing explicit domain, RMW,
+discovery range and static peers, forwarded into the same container. The
+example's site file must be an actual configured source, not a placeholder.
+
+The runtime root must be persistent absolute host storage, outside `/tmp`,
+`/run` and tmpfs. Manager, Scene, cycle and incident journals survive container
+removal and reboot. Build caches and existing Composer/Runner persistent values
+are retained separately. Status and stop authenticate the original full
+container ID, immutable image and launch labels; replacement names are not
+ownership proof. A failed inspection or unreachable Docker/SSH endpoint is
+unknown, not proof of absence.
+
+G keeps Docker's `json-file` logs at50MiB ×3 and records the exact
+`docker logs <full-container-id>` reference. Its plain stop and reuse of an
+exited owned container first export through the existing `stop_with_evidence`
+path into the one configured evidence root. Export failure retains the
+container and its logs. Failed startup first leaves the exact container
+available to G: if usable, G requests SimulationStop only for its authenticated
+own Sim, then stops/exports/removes the container. If unusable or unknown it
+reports that limitation; it does not create a temporary ROS client or claim
+Sim Stop succeeded. Existing owned local Sim process cleanup remains bounded.
+
+The global size/count policy for exported bundles, failed-export retained
+containers, ROS home logs and per-launch records is still pending. Do not add
+an automatic rotator or delete uncaptured evidence. Explicit `status` and
+`stop` use the persisted profile and identity; Isaac never auto-plays, selects
+a Scenario, Applies a graph or Runs a Program. Startup/cleanup failure and
+host/Sim loss remain typed stopped/degraded outcomes. Restore an unavailable
+host before reconciling the matching record; never use broad process kills,
+an unowned Sim or historical launchers as a fallback.
 
 The physical ROS/real-robot lane, assistant-provider bring-up, packaged
 installation, historical aggregate launchers, and old Isaac recipes are not

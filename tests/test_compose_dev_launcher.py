@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import re
 import subprocess
 from pathlib import Path
@@ -24,9 +26,14 @@ command=${1:-}
 shift || true
 case "$command" in
   inspect)
-    [[ ${FAKE_CONTAINER_PRESENT:-true} == true ]] || exit 1
-    if [[ ${1:-} == -f ]]; then
-      if [[ -e "$FAKE_DOCKER_STOPPED" && ${FAKE_STILL_RUNNING:-false} != true ]]; then
+    [[ ${FAKE_INSPECT_FAIL:-false} != true ]] || exit 1
+    [[ ${FAKE_CONTAINER_PRESENT:-true} == true || -e ${FAKE_DOCKER_STARTED:-/nonexistent} ]] || exit 1
+    if [[ ${1:-} == --format && ${2:-} == '{{json .}}' ]]; then
+      python3 -c 'import json,os;print(json.dumps({"Id":os.environ.get("FAKE_ACTUAL_ID","d"*64),"Image":os.environ["MANYFORGE_DEV_IMAGE"],"Config":{"Labels":{"manyforge.launch-instance":os.environ.get("FAKE_ACTUAL_INSTANCE",os.environ["MANYFORGE_DEV_LAUNCH_INSTANCE_ID"]),"manyforge.launch-input-digest":os.environ["MANYFORGE_DEV_LAUNCH_INPUT_DIGEST"]}},"State":{"Running":os.environ.get("FAKE_EXIT_AFTER_RUN")!="true" and os.environ.get("FAKE_INITIAL_EXITED")!="true" and not os.path.exists(os.environ["FAKE_DOCKER_STOPPED"])}}))'
+    elif [[ ${1:-} == -f && ${2:-} == *Config.Labels* ]]; then
+      printf '%s\\n' "${FAKE_ROS_LABEL:-true}"
+    elif [[ ${1:-} == -f ]]; then
+      if [[ ( -e "$FAKE_DOCKER_STOPPED" && ${FAKE_STILL_RUNNING:-false} != true ) || ${FAKE_INITIAL_EXITED:-false} == true || ${FAKE_EXIT_AFTER_RUN:-false} == true ]]; then
         printf 'false\\n'
       else
         printf 'true\\n'
@@ -36,6 +43,20 @@ case "$command" in
     else
       printf '[{"State":{"Status":"exited","Running":false}}]\\n'
     fi
+    ;;
+  container)
+    [[ ${FAKE_LIST_FAIL:-false} != true ]] || exit 1
+    if [[ ${FAKE_CONTAINER_LISTED:-false} == true ]]; then
+      printf '%s %s\\n' "${FAKE_ACTUAL_ID:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}" "$MANYFORGE_DEV_CONTAINER_NAME"
+    fi
+    ;;
+  image) printf '%s\\n' "$MANYFORGE_DEV_IMAGE" ;;
+  run)
+    : > "$FAKE_DOCKER_STARTED"
+    printf '%s\\n' "${FAKE_ACTUAL_ID:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
+    ;;
+  exec)
+    printf '{"ready":true}\\n'
     ;;
   stop)
     [[ ${FAKE_STOP_FAIL:-false} != true ]] || exit 1
@@ -98,6 +119,7 @@ esac
         "FAKE_DOCKER_CALLS": str(tmp_path / "docker-calls"),
         "FAKE_DOCKER_STOPPED": str(tmp_path / "docker-stopped"),
         "FAKE_DOCKER_REMOVED": str(tmp_path / "docker-removed"),
+        "FAKE_DOCKER_STARTED": str(tmp_path / "docker-started"),
         **settings,
     }
     return environment
@@ -332,16 +354,8 @@ esac
 
 
 def test_ros_start_refuses_an_existing_native_workbench(tmp_path: Path) -> None:
-    environment = _fake_docker_environment(tmp_path)
+    environment = _fake_docker_environment(tmp_path, FAKE_ROS_LABEL="false")
 
-    # The existing fake container has no ROS capability label.
-    docker = tmp_path / "bin/docker"
-    docker.write_text(docker.read_text().replace(
-        "if [[ ${1:-} == -f ]]; then",
-        "if [[ ${1:-} == -f && ${2:-} == *Config.Labels* ]]; then\n"
-        "      printf 'false\\n'\n"
-        "    elif [[ ${1:-} == -f ]]; then",
-    ))
     completed = subprocess.run(
         ["/bin/bash", str(LAUNCHER), "start", "--ros2-control",
          "--bootstrap-project", "examples/first.scenario"],
@@ -367,3 +381,144 @@ def test_invalid_ros_selection_is_refused_before_docker(
     assert completed.returncode == 64
     assert error in completed.stderr
     assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
+
+
+def _g_environment(tmp_path, **settings):
+    return _fake_docker_environment(tmp_path,
+        MANYFORGE_DEV_CONTAINER_NAME="manyforge-g-fixture",
+        MANYFORGE_DEV_IMAGE="sha256:" + "e" * 64,
+        MANYFORGE_DEV_LAUNCH_INSTANCE_ID="isaac-fixture",
+        MANYFORGE_DEV_LAUNCH_INPUT_DIGEST="a" * 64,
+        MANYFORGE_DEV_EXPECTED_CONTAINER_ID="d" * 64,
+        MANYFORGE_DEV_EVIDENCE_ROOT=str(tmp_path / "single-evidence-root"),
+        **settings)
+
+
+def _invoke_g(environment, *arguments, launcher=LAUNCHER):
+    return subprocess.run(["bash", str(launcher), *arguments], cwd=launcher.parents[1],
+                          env=environment, capture_output=True, text=True, check=False)
+
+
+def test_g_plain_stop_exports_exact_container_logs_before_removal(tmp_path):
+    environment = _g_environment(tmp_path)
+    completed = _invoke_g(environment, "stop")
+    assert completed.returncode == 0, completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert next(c for c in calls if c.startswith("cp ")).startswith("cp " + "d" * 64 + ":")
+    assert calls[-1] == "rm " + "d" * 64
+    evidence = next(Path(environment["MANYFORGE_DEV_EVIDENCE_ROOT"]).iterdir())
+    assert (evidence / "docker-logs-reference.txt").read_text() == "docker logs " + "d" * 64 + "\n"
+    assert (evidence / "manyforge-state/manager/journal.sqlite3").read_text() == "manager evidence"
+
+
+@pytest.mark.parametrize("operation", ["stop", "reuse_exited"])
+def test_g_export_failure_keeps_container_and_never_starts_replacement(tmp_path, operation):
+    environment = _g_environment(tmp_path, FAKE_COPY_FAIL="true", FAKE_INITIAL_EXITED="true")
+    completed = _invoke_g(environment, *(["stop"] if operation == "stop" else ["start", "--ros2-control"]))
+    assert completed.returncode == 69, completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert any(c.startswith("cp ") for c in calls)
+    assert not any(c.startswith(("rm ", "run ")) for c in calls)
+    assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
+    assert len(list(Path(environment["MANYFORGE_DEV_EVIDENCE_ROOT"]).glob("*.partial"))) == 1
+
+
+def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_cleanup(tmp_path):
+    environment = _g_environment(tmp_path, FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true")
+    # Fixture storage is owned scratch under HOME, representing persistent host
+    # storage. Production rejects /tmp and tmpfs; no test-only bypass is used.
+    with tempfile.TemporaryDirectory(prefix="manyforge-q93-fixture-", dir=Path.home()) as persistent:
+        install = tmp_path / "qualified-package"
+        install.mkdir()
+        workspace = tmp_path / "workspace"
+        launcher = workspace / "scripts/compose-dev.sh"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text(LAUNCHER.read_text())
+        environment.update(MANYFORGE_DEV_RUNTIME_STATE_ROOT=persistent,
+            MANYFORGE_DEV_OPERATOR_INSTALL_ROOT=str(install), MANYFORGE_DEV_OPERATOR_CELL_ID="fixture_cell",
+            MANYFORGE_DEV_OPERATOR_ADMISSION="canonical-empty-admission.fixture_cell.json",
+            MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256="b" * 64, ROS_DOMAIN_ID="17", ROS_STATIC_PEERS="one;two")
+        completed = _invoke_g(environment, "start", "--ros2-control", launcher=launcher)
+    assert completed.returncode == 69, completed.stderr
+    row = json.loads(completed.stdout)
+    assert row["container_id"] == "d" * 64 and row["running"] is False
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    command = next(c for c in calls if c.startswith("run "))
+    assert "--network host" in command
+    assert "--log-driver json-file" in command and "--log-opt max-size=50m --log-opt max-file=3" in command
+    assert "--env ROS_DOMAIN_ID" in command and "--env ROS_STATIC_PEERS" in command
+    assert f"-v {persistent}:/tmp/manyforge-state" in command
+    assert "--operator-runtime" in command and "--composer-port 9000 --composer-bind-host 0.0.0.0" in command
+    assert "--project" not in command and "npm" not in command and "Vite" not in command
+    assert not any(c.startswith(("stop ", "cp ", "rm ")) for c in calls)
+
+
+@pytest.mark.parametrize("operation", ["stop", "start", "status"])
+def test_g_refuses_foreign_occurrence_without_mutation(tmp_path, operation):
+    environment = _g_environment(tmp_path, FAKE_ACTUAL_ID="f" * 64)
+    completed = _invoke_g(environment, operation, *(["--ros2-control"] if operation == "start" else []))
+    assert completed.returncode != 0
+    assert "Refusing foreign" in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert not any(c.startswith(("run ", "stop ", "cp ", "rm ", "exec ")) for c in calls)
+
+
+@pytest.mark.parametrize("expected_id", ["", "d" * 64])
+def test_g_failed_inspect_does_not_claim_absence_for_listed_name_or_id(tmp_path, expected_id):
+    environment = _g_environment(tmp_path, FAKE_INSPECT_FAIL="true", FAKE_CONTAINER_LISTED="true")
+    environment["MANYFORGE_DEV_EXPECTED_CONTAINER_ID"] = expected_id
+    completed = _invoke_g(environment, "status")
+    assert completed.returncode == 75
+    assert completed.stdout == ""
+    assert "listed occurrence" in completed.stderr
+
+
+def test_g_daemon_list_failure_is_unknown_not_absent(tmp_path):
+    environment = _g_environment(tmp_path, FAKE_INSPECT_FAIL="true", FAKE_LIST_FAIL="true")
+    completed = _invoke_g(environment, "status")
+    assert completed.returncode != 0 and completed.stdout == ""
+
+
+def test_g_exited_status_crosses_real_ssh_boundary_as_authenticated_facts(tmp_path, monkeypatch):
+    from manyforge_operator.isaac import IsaacLauncher, IsaacLauncherConfig, RemoteNativeConfig
+
+    environment = _g_environment(tmp_path, FAKE_INITIAL_EXITED="true")
+    workspace = tmp_path / "workspace"
+    launcher_path = workspace / "scripts/compose-dev.sh"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_text(LAUNCHER.read_text())
+    # Exercise _ssh's subprocess/nonzero policy with the real compose command;
+    # the fixture SSH transport executes locally and the Docker daemon is fake.
+    ssh = tmp_path / "ssh"
+    ssh.write_text('#!/bin/bash\nexec bash -c "${@: -1}"\n')
+    ssh.chmod(0o755)
+    for name, value in environment.items():
+        if name.startswith("FAKE_") or name == "PATH":
+            monkeypatch.setenv(name, value)
+    remote = RemoteNativeConfig(target="fixture", source_root=str(workspace),
+        manager_executable="/qualified/manager", install_root="/qualified/package",
+        node_catalog_path="/qualified/nodes", alarm_catalog_path="/qualified/alarms",
+        state_root="/srv/state", simulation_control_config="/qualified/simulation.json",
+        ros_environment_script="/qualified/topology.sh", package_aggregate_sha256="a" * 64,
+        compiler_build_manifest_sha256="b" * 64, node_environment_sha256="c" * 64,
+        container_image_id=environment["MANYFORGE_DEV_IMAGE"], container_name=environment["MANYFORGE_DEV_CONTAINER_NAME"],
+        cache_root=str(tmp_path / "cache"), runtime_root="/srv/runtime", evidence_root=str(tmp_path / "evidence"))
+    simulator = tmp_path / "isaac-sim.sh"
+    simulator.write_text("#!/bin/bash\n")
+    simulator.chmod(0o755)
+    (tmp_path / "setup_ros_env.sh").write_text("# fixture\n")
+    world = tmp_path / "world.usda"
+    world.write_text("#usda 1.0\n")
+    topology = tmp_path / "topology.sh"
+    topology.write_text("# fixture\n")
+    config = IsaacLauncherConfig(source_root=workspace, isaac_executable=simulator,
+        world_path=world, remote=remote, state_root=tmp_path / "outer-state",
+        instance_id="isaac-fixture", ssh_executable=ssh,
+        local_ros_environment_script=topology)
+    # Docker returns the exact digest forwarded by the production shell.
+    outer = IsaacLauncher(config)
+    status = outer._remote_container_operation("status")
+    assert status["state"] == "degraded"
+    assert status["container_running"] is False
+    assert status["owned_resources"][0]["container_id"] == "d" * 64
+    assert status["resource_observations"][0]["presence"] == "present"

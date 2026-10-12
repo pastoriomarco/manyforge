@@ -11,6 +11,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,21 @@ namespace manyforge::roboplan_backend {
 [[nodiscard]] bool retained_bindings_share_backend_owner(
     const core::RuntimeParticipantBinding& primary,
     const core::RuntimeParticipantBinding& representative) noexcept;
+
+/// Product resealing preserves the complete physical/provider occurrence.
+/// Authored Program/product seal fields may differ; this does not replace
+/// route admission, Program alias validation or observation authority checks.
+[[nodiscard]] bool
+retained_bindings_preserve_physical_owner_after_product_reseal(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate);
+
+/// First differing physical-owner field after the same product-seal normalization.
+/// Empty means exact equality; this grants no route or epoch permission.
+[[nodiscard]] std::string_view
+retained_product_reseal_physical_owner_difference(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate);
 
 class RetainedObservedStateChannelTestAccess;
 

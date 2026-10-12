@@ -53,10 +53,15 @@ def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
 
 
 def _import_jerk_source():
+    # Ordinary-motion jerk is a native-runtime field; the maintained offline
+    # examples moved to the mock ROS lane (Q63-Q66), so the native import path
+    # uses the frozen pre-cutover native Lite 6 deployment until the native
+    # executor goes.
     document = json.loads(
         (
             Path(__file__).resolve().parents[2]
-            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+            / "manyforge_deployment/test/fixtures/native_execution/"
+            "lite6_lite_gripper_pick_and_place.native.deployment.yaml"
         ).read_text()
     )
     runtime = document["graph"]["runtime_units"][0]
@@ -221,7 +226,12 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
     source = json.loads(
         (
             Path(__file__).resolve().parents[2]
-            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+            # Ordinary-motion jerk is a native-runtime field; the maintained
+            # offline examples moved to the mock ROS lane (Q63-Q66), so this
+            # native authoring path uses the frozen pre-cutover native Lite 6
+            # deployment until the native executor goes.
+            / "manyforge_deployment/test/fixtures/native_execution/"
+            "lite6_lite_gripper_pick_and_place.native.deployment.yaml"
         ).read_text()
     )
     if two_robots:
@@ -446,54 +456,42 @@ def test_explicit_stop_jerk_migration_recompiles_and_preserves_existing_settings
         manyforge_headless_py.migrate_controlled_stop_jerk_choice(original, "on")
 
 
-def test_cpp_draft_normalizer_reports_minimum_for_a_decimal_stop_duration():
+def test_explicit_max_stop_time_is_profile_owned_and_not_refused_at_apply():
+    # Q51/item 24 (as `main`): the robot's own `max_stop_time_s` is part of its
+    # controlled-Stop profile; a value shorter than the deceleration is not an
+    # Apply-time refusal, and the cell-wide timing table is gone.
     document = json.loads(
         (
             Path(__file__).resolve().parents[2]
             / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
         ).read_text()
     )
-    binding_revisions = {
-        row["control_binding_id"]: row["control_binding_revision"]
-        for row in document["graph"]["control_bindings"]
-    }
-    assert document["policies"]["stop_timing_parameters"]
-    for selected in document["policies"]["stop_timing_parameters"]:
-        assert (
-            selected["control_binding_revision"]
-            == binding_revisions[selected["control_binding_id"]]
-        )
+    assert "stop_timing_parameters" not in document["policies"]
     binding = next(
         row
         for row in document["graph"]["control_bindings"]
         if row["capability_id"] == "execution.trajectory.execute"
     )
-    for row in document["policies"]["stop_stage_parameters"]:
+    rows = [
+        row
+        for row in document["policies"]["stop_stage_parameters"]
+        if row["control_binding_id"] == binding["control_binding_id"]
+        and row["stop_escalation_stage_id"] == "motion_controlled_stop"
+    ]
+    assert rows
+    for row in rows:
+        assert "max_stop_time_s" not in row["default_contract_parameters"]
+        row["default_contract_parameters"]["deceleration_time_s"] = 1.1
+        row["default_contract_parameters"]["max_stop_time_s"] = 0.5
+    compiled = compile_deployment_document(json.dumps(document))
+    for row in compiled.document["policies"]["stop_stage_parameters"]:
         if (
             row["control_binding_id"] == binding["control_binding_id"]
             and row["stop_escalation_stage_id"] == "motion_controlled_stop"
         ):
-            row["default_contract_parameters"]["deceleration_time_s"] = 1.1
-    document["policies"]["stop_timing_parameters"] = [
-        {
-            "control_binding_id": binding["control_binding_id"],
-            "control_binding_revision": binding["control_binding_revision"],
-            "timing": {
-                "command_latency_allowance_ns": 250_000_000,
-                "settling_allowance_ns": 750_000_000,
-                "operational_timeout_ns": 2_100_000_000,
-            },
-        }
-    ]
-    compiled = compile_deployment_document(json.dumps(document))
-    assert (
-        compiled.document["policies"]["stop_timing_parameters"]
-        == document["policies"]["stop_timing_parameters"]
-    )
-    document["policies"]["stop_timing_parameters"][0]["timing"][
-        "operational_timeout_ns"
-    ] -= 1
-    with pytest.raises(DeploymentDraftError, match="minimum 2.100000000 s"):
+            assert row["default_contract_parameters"]["max_stop_time_s"] == 0.5
+    document["policies"]["stop_timing_parameters"] = []
+    with pytest.raises(DeploymentDraftError):
         compile_deployment_document(json.dumps(document))
 
 
@@ -524,7 +522,6 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
     selection = {
         "controllable_component_id": "robot",
         "command_target_id": "arm",
-        "timing": None,
     }
     result = _edit_controlled_stop_profile(source, profile, **selection)
     for row in result["policies"]["stop_stage_parameters"][:2]:
@@ -544,7 +541,7 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
         _edit_controlled_stop_profile(source, profile, **selection)
 
 
-def test_stop_timing_edit_converges_all_bindings_for_one_authored_target():
+def test_max_stop_time_edit_converges_all_bindings_for_one_authored_target():
     source = _focused_document()
     other_binding = deepcopy(source["graph"]["control_bindings"][0])
     other_binding["control_binding_id"] = "other_binding"
@@ -552,48 +549,52 @@ def test_stop_timing_edit_converges_all_bindings_for_one_authored_target():
     other_stage = deepcopy(source["policies"]["stop_stage_parameters"][0])
     other_stage["control_binding_id"] = "other_binding"
     source["policies"]["stop_stage_parameters"].append(other_stage)
-    timing = {
-        "command_latency_allowance_ns": 250_000_000,
-        "settling_allowance_ns": 750_000_000,
-        "operational_timeout_ns": 3_000_000_000,
-    }
-    other = {
-        "control_binding_id": "other_binding",
-        "control_binding_revision": _DIGEST,
-        "timing": timing,
-    }
-    source["policies"]["stop_timing_parameters"] = [deepcopy(other)]
     saved_source = deepcopy(source)
     selection = {"controllable_component_id": "robot", "command_target_id": "arm"}
-    # A timing-only edit does not require a fictitious motion profile.
-    result = _edit_controlled_stop_profile(source, None, **selection, timing=timing)
+    profile = {
+        "stop_mode": "soft_on_path",
+        "deceleration_time_s": 1.0,
+        "max_stop_time_s": 3.0,
+        "allow_natural_completion_on_short_path": True,
+        "jerk_limits_enabled": False,
+        "per_resource_limits": [
+            {
+                "resource_id": "robot.arm.coordinate.000000",
+                "max_deceleration": {"coordinate_kind": "angular_rad_s2", "value": 4.0},
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.01,
+                },
+            }
+        ],
+    }
+    result = _edit_controlled_stop_profile(source, profile, **selection)
     assert source == saved_source
-    assert (
-        result["policies"]["stop_stage_parameters"]
-        == source["policies"]["stop_stage_parameters"]
-    )
-    assert result["policies"]["stop_timing_parameters"] == [
-        {
-            "control_binding_id": "arm_binding",
-            "control_binding_revision": _DIGEST,
-            "timing": timing,
-        },
-        other,
-    ]
-    restored = _edit_controlled_stop_profile(result, None, **selection, timing=None)
-    assert "stop_timing_parameters" not in restored["policies"]
+    assert "stop_timing_parameters" not in result["policies"]
+    for row in result["policies"]["stop_stage_parameters"]:
+        if row.get("control_binding_id") == "arm_binding" and row.get(
+            "stop_escalation_stage_id"
+        ) == source["policies"]["stop_stage_parameters"][0]["stop_escalation_stage_id"]:
+            assert row["default_contract_parameters"]["max_stop_time_s"] == 3.0
+    cleared = dict(profile)
+    del cleared["max_stop_time_s"]
+    restored = _edit_controlled_stop_profile(result, cleared, **selection)
+    for row in restored["policies"]["stop_stage_parameters"]:
+        assert "max_stop_time_s" not in row["default_contract_parameters"]
     with pytest.raises(DeploymentDraftError, match="no longer matches"):
         _edit_controlled_stop_profile(
             source,
-            None,
+            profile,
             controllable_component_id="other",
             command_target_id="arm",
-            timing=timing,
         )
-    with pytest.raises(DeploymentDraftError, match="integer nanosecond"):
-        _edit_controlled_stop_profile(
-            source, None, **selection, timing={**timing, "settling_allowance_ns": True}
-        )
+    for invalid in (0.0, -1.0, float("inf"), True, "3"):
+        with pytest.raises(DeploymentDraftError):
+            _edit_controlled_stop_profile(
+                source, {**profile, "max_stop_time_s": invalid}, **selection
+            )
+    with pytest.raises(DeploymentDraftError):
+        _edit_controlled_stop_profile(source, None, **selection)
 
 
 def _compile(source: str) -> CompiledDeploymentDocument:
@@ -1920,11 +1921,6 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
             kind="controlled-stop",
             controllable_component_id="robot",
             command_target_id="arm",
-            timing={
-                "command_latency_allowance_ns": 250_000_000,
-                "settling_allowance_ns": 750_000_000,
-                "operational_timeout_ns": 3_000_000_000,
-            },
         ),
     )
     assert updated.status_code == 200, updated.text

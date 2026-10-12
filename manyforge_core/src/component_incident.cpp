@@ -1,7 +1,9 @@
-#include <manyforge_core/types/component_incident.hpp>
-
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/component_incident.hpp>
 #include <string>
 #include <utility>
 
@@ -20,6 +22,15 @@ using content_identity::CanonicalValue;
   constexpr std::uint64_t kMaximumSafe = 9'007'199'254'740'991ULL;
   return value <= kMaximumSafe ? CanonicalValue(static_cast<double>(value))
                                : CanonicalValue(std::to_string(value));
+}
+
+[[nodiscard]] CanonicalValue DiagnosticValue(const ErrorDTO& diagnostic) {
+  CanonicalValue::Object details;
+  for (const auto& [key, value] : diagnostic.details)
+    details.emplace_back(key, CanonicalValue(value));
+  return CanonicalValue(CanonicalValue::Object{{"code", CanonicalValue(diagnostic.code)},
+                                               {"message", CanonicalValue(diagnostic.message)},
+                                               {"details", CanonicalValue(std::move(details))}});
 }
 
 [[nodiscard]] CanonicalValue OptionalText(const std::optional<std::string>& value) {
@@ -185,7 +196,9 @@ std::vector<std::string> ComponentIncidentVendorCodes(const std::vector<Lifecycl
 
 std::string ComponentIncidentEventPayload(const ComponentLifecycleIncidentDTO& incident,
                                           const LifecycleIncidentRecoveryPolicyDTO& policy,
-                                          const std::string_view event_kind) {
+                                          const std::string_view event_kind,
+                                          const std::optional<ErrorDTO>& diagnostic,
+                                          std::shared_ptr<const CanonicalValue> snapshot) {
   CanonicalValue::Array operations;
   std::optional<std::string> program_run_id;
   CanonicalValue stop(nullptr);
@@ -247,6 +260,10 @@ std::string ComponentIncidentEventPayload(const ComponentLifecycleIncidentDTO& i
                        incident.detected_at_ns, incident.cause_class, incident.vendor_codes)})},
       {"vendor_codes", Strings(incident.vendor_codes)},
   };
+  if (diagnostic)
+    fields.emplace_back("diagnostic",
+                        ComponentIncidentDiagnosticValue(
+                            *diagnostic, snapshot ? *snapshot : CanonicalValue(nullptr)));
   return content_identity::canonical_json(CanonicalValue(std::move(fields)));
 }
 
@@ -277,7 +294,9 @@ std::string ComponentIncidentRecordWithContainment(
 std::string ComponentIncidentRecordWithChange(const std::string_view record_json,
                                               const std::int64_t at_ns,
                                               const LifecycleBlockingCauseClassDTO cause,
-                                              const std::vector<std::string>& vendor_codes) {
+                                              const std::vector<std::string>& vendor_codes,
+                                              const std::optional<ErrorDTO>& diagnostic,
+                                              std::shared_ptr<const CanonicalValue> snapshot) {
   const auto root = content_identity::parse_canonical_json(record_json);
   CanonicalValue::Array timeline;
   if (const auto* existing = root.find_object_member("timeline");
@@ -289,10 +308,258 @@ std::string ComponentIncidentRecordWithChange(const std::string_view record_json
     timeline.erase(timeline.begin() + 1);
   }
   timeline.push_back(TimelineEntry(at_ns, cause, vendor_codes));
+  CanonicalValue::Object updates{{"cause_class", CanonicalValue(std::string(to_string(cause)))},
+                                 {"timeline", CanonicalValue(std::move(timeline))},
+                                 {"vendor_codes", Strings(vendor_codes)}};
+  if (diagnostic)
+    updates.emplace_back("diagnostic",
+                         ComponentIncidentDiagnosticValue(
+                             *diagnostic, snapshot ? *snapshot : CanonicalValue(nullptr)));
+  return Patched(record_json, std::move(updates));
+}
+
+bool ComponentIncidentDiagnosticIsValid(const ErrorDTO& diagnostic) noexcept {
+  try {
+    if (diagnostic.code.empty() || diagnostic.code.size() > kMaxLifecycleErrorCodeBytes ||
+        diagnostic.message.size() > kMaxLifecycleErrorMessageBytes ||
+        diagnostic.details.size() > kMaxLifecycleErrorDetails ||
+        !content_identity::is_utf8_nfc(diagnostic.code) ||
+        !content_identity::is_utf8_nfc(diagnostic.message))
+      return false;
+    return std::all_of(
+        diagnostic.details.begin(), diagnostic.details.end(), [](const auto& detail) {
+          return !detail.first.empty() && detail.first.size() <= kMaxLifecycleErrorDetailKeyBytes &&
+                 detail.second.size() <= kMaxLifecycleErrorDetailValueBytes &&
+                 content_identity::is_utf8_nfc(detail.first) &&
+                 content_identity::is_utf8_nfc(detail.second);
+        });
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ComponentIncidentDiagnosticSnapshotShapeIsValid(const CanonicalValue& snapshot) noexcept {
+  try {
+    const auto exact = [](const CanonicalValue& value,
+                          std::initializer_list<std::string_view> keys) {
+      return value.is_object() && value.as_object().size() == keys.size() &&
+             std::all_of(keys.begin(), keys.end(),
+                         [&](auto key) { return value.find_object_member(key); });
+    };
+    const auto text = [](const CanonicalValue& value, std::size_t limit, bool nullable = true) {
+      return (nullable && value.is_null()) ||
+             (value.is_string() && value.as_string().size() <= limit);
+    };
+    const auto boolean = [](const CanonicalValue& value) {
+      return value.is_null() || value.is_bool();
+    };
+    const auto owner_unsigned = [](const CanonicalValue& value, bool nullable = true) {
+      if (value.is_null()) return nullable;
+      if (value.is_number())
+        return value.as_number() >= 0.0 && value.as_number() <= 9007199254740991.0 &&
+               std::floor(value.as_number()) == value.as_number();
+      if (!value.is_string() || value.as_string().empty() ||
+          (value.as_string().size() > 1U && value.as_string().front() == '0'))
+        return false;
+      std::uint64_t parsed{};
+      const auto& token = value.as_string();
+      const auto [last, error] = std::from_chars(token.data(), token.data() + token.size(), parsed);
+      return error == std::errc{} && last == token.data() + token.size();
+    };
+    if (!exact(snapshot, {"exit", "context", "readiness", "settings", "generated", "output",
+                          "core_dump_link"}))
+      return false;
+    const auto& exit = *snapshot.find_object_member("exit");
+    if (!exact(exit, {"status", "signal", "core_dumped", "observed_utc"})) return false;
+    for (auto key : {"status", "signal"}) {
+      const auto& value = *exit.find_object_member(key);
+      if (!value.is_null() &&
+          (!value.is_number() || value.as_number() < 0.0 || value.as_number() > 255.0 ||
+           std::floor(value.as_number()) != value.as_number()))
+        return false;
+    }
+    if (!exit.find_object_member("core_dumped")->is_bool() ||
+        !text(*exit.find_object_member("observed_utc"), 128U, false))
+      return false;
+    const auto& context = *snapshot.find_object_member("context");
+    if (!exact(context, {"component_id", "request_context", "runtime_unit_id", "runtime_epoch",
+                         "bundle_id", "graph_revision", "generator_identity", "launch_identity"}))
+      return false;
+    for (const auto& [key, value] : context.as_object())
+      if (!text(value, key == "request_context" || key == "generator_identity" ? 1024U : 128U))
+        return false;
+    const auto& readiness = *snapshot.find_object_member("readiness");
+    if (!exact(readiness,
+               {"known", "controller_manager_present", "controller_observed", "controller_loaded",
+                "controller_bound", "arm_controller_active", "hardware_ready",
+                "joint_sample_available", "binding_epoch", "sample_age_ns", "captured_utc"}))
+      return false;
+    for (auto key :
+         {"known", "controller_manager_present", "controller_observed", "controller_loaded",
+          "controller_bound", "arm_controller_active", "hardware_ready", "joint_sample_available"})
+      if (!boolean(*readiness.find_object_member(key))) return false;
+    if (!owner_unsigned(*readiness.find_object_member("binding_epoch")) ||
+        !text(*readiness.find_object_member("captured_utc"), 128U))
+      return false;
+    const auto& age = *readiness.find_object_member("sample_age_ns");
+    if (!age.is_null()) static_cast<void>(content_identity::parse_nonnegative_int64(age));
+    const auto& settings = *snapshot.find_object_member("settings");
+    if (!exact(settings, {"argv", "controller_profile", "runtime_namespace", "arm_controller_name",
+                          "gripper_controller_name", "frame_prefix", "controllers_yaml",
+                          "retained_configuration_json"}))
+      return false;
+    for (const auto& [key, value] : settings.as_object()) {
+      if (key == "argv") {
+        if (!value.is_array()) return false;
+        for (const auto& argument : value.as_array())
+          if (!text(argument, kMaxComponentIncidentRecordBytes, false)) return false;
+      } else if (!text(value, kMaxComponentIncidentRecordBytes))
+        return false;
+    }
+    const auto& generated = *snapshot.find_object_member("generated");
+    if (!exact(generated, {"robot_description_sha256", "controllers_sha256"})) return false;
+    for (const auto& [key, value] : generated.as_object()) {
+      if (value.is_null()) continue;
+      if (!value.is_string() || value.as_string().size() != 71U ||
+          !value.as_string().starts_with("sha256:"))
+        return false;
+      for (const char digit : value.as_string().substr(7U))
+        if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) return false;
+    }
+    const auto& output = *snapshot.find_object_member("output");
+    if (!exact(output, {"tail", "line_count", "truncated", "dropped_forward_lines",
+                        "dropped_forward_bytes", "invalid_text_bytes"}))
+      return false;
+    const auto& tail = *output.find_object_member("tail");
+    const auto& lines = *output.find_object_member("line_count");
+    if (!tail.is_string() || content_identity::canonical_json(tail).size() > 128U * 1024U ||
+        !lines.is_number() || lines.as_number() < 0.0 || lines.as_number() > 2000.0 ||
+        std::floor(lines.as_number()) != lines.as_number() ||
+        !output.find_object_member("truncated")->is_bool())
+      return false;
+    const auto& bytes = tail.as_string();
+    const auto count =
+        bytes.empty() ? 0U
+                      : static_cast<std::size_t>(std::count(bytes.begin(), bytes.end(), '\n')) +
+                            (bytes.back() == '\n' ? 0U : 1U);
+    if (lines.as_number() != static_cast<double>(count)) return false;
+    for (auto key : {"dropped_forward_lines", "dropped_forward_bytes", "invalid_text_bytes"})
+      if (!owner_unsigned(*output.find_object_member(key), false)) return false;
+    return text(*snapshot.find_object_member("core_dump_link"), 1024U);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ComponentIncidentDiagnosticSnapshotIsValid(const CanonicalValue& snapshot) noexcept {
+  try {
+    return ComponentIncidentDiagnosticSnapshotShapeIsValid(snapshot) &&
+           content_identity::canonical_json(snapshot).size() <= kMaxComponentIncidentRecordBytes;
+  } catch (...) {
+    return false;
+  }
+}
+
+CanonicalValue ComponentIncidentDiagnosticValue(const ErrorDTO& diagnostic,
+                                                const CanonicalValue& snapshot) {
+  if (!ComponentIncidentDiagnosticIsValid(diagnostic) ||
+      (!snapshot.is_null() && !ComponentIncidentDiagnosticSnapshotIsValid(snapshot)))
+    throw std::invalid_argument("component incident diagnostic is outside its closed bound");
+  return CanonicalValue(
+      CanonicalValue::Object{{"error", DiagnosticValue(diagnostic)}, {"snapshot", snapshot}});
+}
+
+std::string ComponentIncidentRecordWithDiagnostic(const std::string_view record_json,
+                                                  const ErrorDTO& diagnostic,
+                                                  std::shared_ptr<const CanonicalValue> snapshot) {
   return Patched(record_json,
-                 {{"cause_class", CanonicalValue(std::string(to_string(cause)))},
-                  {"timeline", CanonicalValue(std::move(timeline))},
-                  {"vendor_codes", Strings(vendor_codes)}});
+                 {{"diagnostic", ComponentIncidentDiagnosticValue(
+                                     diagnostic, snapshot ? *snapshot : CanonicalValue(nullptr))}});
+}
+
+std::optional<ErrorDTO> ComponentIncidentDiagnosticFromRecord(
+    const std::string_view record_json, std::shared_ptr<const CanonicalValue>* snapshot) noexcept {
+  try {
+    if (snapshot) snapshot->reset();
+    const auto root = content_identity::parse_canonical_json(record_json);
+    const auto* envelope = root.find_object_member("diagnostic");
+    if (!envelope || !envelope->is_object() || envelope->as_object().size() != 2U)
+      return std::nullopt;
+    const auto* value = envelope->find_object_member("error");
+    const auto* captured = envelope->find_object_member("snapshot");
+    if (!value || !value->is_object() || value->as_object().size() != 3U || !captured ||
+        (!captured->is_null() && !ComponentIncidentDiagnosticSnapshotIsValid(*captured)))
+      return std::nullopt;
+    const auto* code = value->find_object_member("code");
+    const auto* message = value->find_object_member("message");
+    const auto* details = value->find_object_member("details");
+    if (!code || !code->is_string() || !message || !message->is_string() || !details ||
+        !details->is_object())
+      return std::nullopt;
+    ErrorDTO diagnostic{code->as_string(), message->as_string(), {}};
+    for (const auto& [key, item] : details->as_object()) {
+      if (!item.is_string()) return std::nullopt;
+      diagnostic.details.emplace(key, item.as_string());
+    }
+    if (!ComponentIncidentDiagnosticIsValid(diagnostic)) return std::nullopt;
+    if (snapshot && !captured->is_null())
+      *snapshot = std::make_shared<const CanonicalValue>(*captured);
+    return diagnostic;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<ComponentIncidentContainmentReceiptDTO> ComponentIncidentContainmentReceiptFromRecord(
+    const std::string_view record_json, std::optional<std::string>* containment_error) noexcept {
+  try {
+    const auto root = content_identity::parse_canonical_json(record_json);
+    if (containment_error) {
+      containment_error->reset();
+      const auto* error = root.find_object_member("containment_error");
+      if (error && error->is_string()) *containment_error = error->as_string();
+    }
+    const auto* stop = root.find_object_member("stop");
+    const auto* operations = root.find_object_member("active_operation_ids");
+    const auto* program = root.find_object_member("program_run_id");
+    if (!stop || !stop->is_object() || stop->as_object().size() != 2U || !operations ||
+        !operations->is_array() || !program)
+      return std::nullopt;
+    const auto identity = [](const CanonicalValue* value) {
+      return value && value->is_string() && !value->as_string().empty() &&
+             value->as_string().size() <= kMaxLifecycleIdentityBytes;
+    };
+    const auto* id = stop->find_object_member("stop_id");
+    const auto* generation = stop->find_object_member("stop_generation");
+    if (!identity(id) || !generation) return std::nullopt;
+    std::uint64_t counter{};
+    if (generation->is_number()) {
+      const auto number = generation->as_number();
+      if (number < 1.0 || number > 9007199254740991.0 || std::floor(number) != number)
+        return std::nullopt;
+      counter = static_cast<std::uint64_t>(number);
+    } else if (generation->is_string()) {
+      const auto& token = generation->as_string();
+      if (token.empty() || token.front() == '0') return std::nullopt;
+      const auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), counter);
+      if (error != std::errc{} || end != token.data() + token.size()) return std::nullopt;
+    } else {
+      return std::nullopt;
+    }
+    ComponentIncidentContainmentReceiptDTO receipt{
+        StopId(id->as_string()), StopGeneration(counter), {}, std::nullopt};
+    for (const auto& operation : operations->as_array()) {
+      if (!identity(&operation)) return std::nullopt;
+      receipt.affected_operation_ids.emplace_back(operation.as_string());
+    }
+    if (!program->is_null()) {
+      if (!identity(program)) return std::nullopt;
+      receipt.program_run_id = ProgramRunId(program->as_string());
+    }
+    return receipt;
+  } catch (...) {
+    return std::nullopt;
+  }
 }
 
 std::string ComponentIncidentAcknowledgedPayload(

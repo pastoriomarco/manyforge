@@ -10,6 +10,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -204,7 +205,8 @@ Relations(const core::RetainedBundleDTO &bundle,
   for (auto &row : rows) {
     const auto *profile = row.find_object_member("runtime_profile_id");
     if (profile == nullptr || !profile->is_string() ||
-        profile->as_string() != native_execution_runtime_contract::kRuntimeProfileId) {
+        (profile->as_string() != native_execution_runtime_contract::kRuntimeProfileId &&
+         profile->as_string() != ros2_control_execution_runtime_contract::kRuntimeProfileId)) {
       continue;
     }
     const auto *id = row.find_object_member("runtime_unit_id");
@@ -214,9 +216,11 @@ Relations(const core::RetainedBundleDTO &bundle,
     auto fields = row.as_object();
     for (auto &[name, value] : fields) {
       if (name == "configuration") {
-        value =
-            native_execution_runtime_contract::component_configuration_projection(
-                bundle, core::RuntimeUnitId(id->as_string()), component);
+        value = profile->as_string() == native_execution_runtime_contract::kRuntimeProfileId
+            ? native_execution_runtime_contract::component_configuration_projection(
+                  bundle, core::RuntimeUnitId(id->as_string()), component)
+            : ros2_control_execution_runtime_contract::component_configuration_projection(
+                  bundle, core::RuntimeUnitId(id->as_string()), component);
       }
     }
     row = CanonicalValue(std::move(fields));
@@ -229,8 +233,10 @@ Relations(const core::RetainedBundleDTO &bundle,
   auto selected = units;
   for (const auto &unit : bundle.value().cell_graph.runtime_units) {
     if (unit.runtime_profile_id.value() ==
-        native_execution_runtime_contract::kRuntimeProfileId) {
-      // A native host's requirement is the union of all installed components.
+        native_execution_runtime_contract::kRuntimeProfileId ||
+        unit.runtime_profile_id.value() ==
+            ros2_control_execution_runtime_contract::kRuntimeProfileId) {
+      // The host's requirement is the union of all installed components.
       // The verified host offer covers that union; each component's actual
       // requirements are already bound by its own bindings/providers below.
       // Hashing the derived union again would couple unrelated controllers.
@@ -268,9 +274,6 @@ RuntimeFamilies(const RetainedBundle &bundle,
       CanonicalValue(Object{
           {"control_bindings",
            Select(MemberArray(graph, "control_bindings"), "control_binding_id", bindings)},
-          {"stop_timing_parameters",
-           Select(MemberArray(root, "stop_timing_parameters"), "control_binding_id",
-                  bindings)},
       }));
   families.emplace(
       kApplyComponentReasonDomains,

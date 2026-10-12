@@ -490,8 +490,7 @@ StopReadinessFor(const core::RuntimeParticipantBinding &binding,
                    stop_generation, core::ContentDigest(StopDigest('1')),
                    core::StopResolutionDispositionDTO::kExact,
                    core::StopScopeResolutionReasonDTO::kExplicitFullStop,
-                   {}, core::ContentDigest(StopDigest('2')), {}, {}, 1'000,
-                   100, 900, 10, {}},
+                   {}, core::ContentDigest(StopDigest('2')), {}, {}, 10},
       .state = core::StopStatusStateDTO::kSucceeded,
       .scope_entries = certificate.scope_entries,
       .current_stages = {},
@@ -605,6 +604,74 @@ TEST(RetainedNativeCellRuntimeTest,
                std::invalid_argument);
   EXPECT_FALSE(std::filesystem::exists(journal_path));
   RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     ProductResealPreservesExactPhysicalProviderFactsAndStrictAliasOwnership) {
+  const auto before = qualification_fixture::make_binding();
+  auto value = before.value();
+  value.program_id = core::ProgramId("candidate.program");
+  value.program_revision = core::ProgramRevision("candidate.program-revision");
+  value.program_binding_id =
+      core::ProgramBindingId("candidate.program-binding");
+  value.retained_bundle_id = core::RetainedBundleId("candidate.bundle");
+  value.graph_revision = core::GraphRevision("candidate.graph");
+  value.component_role_id = core::ComponentRoleId("candidate.robot");
+  value.target_role_id = core::TargetRoleId("candidate.arm");
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+  const auto candidate = std::move(sealed.value());
+  EXPECT_TRUE(retained_bindings_preserve_physical_owner_after_product_reseal(
+      before, candidate));
+  EXPECT_TRUE(retained_bindings_preserve_physical_owner_after_product_reseal(
+      candidate, before));
+  // The capability-alias classifier still requires the same product seal.
+  EXPECT_FALSE(retained_bindings_share_backend_owner(before, candidate));
+
+  const std::vector<std::function<void(core::RuntimeParticipantBindingDTO &)>>
+      foreign_facts{[](auto &v) {
+                      v.resources.front().resource_id =
+                          core::ResourceId("foreign.joint");
+                    },
+                    [](auto &v) {
+                      v.frame_bindings.front().compiled_frame_name =
+                          "foreign.base";
+                    },
+                    [](auto &v) {
+                      v.control_path->control_binding_id =
+                          core::ControlBindingId("foreign.binding");
+                    },
+                    [](auto &v) {
+                      v.control_path->provider_instance_id =
+                          core::ProviderInstanceId("foreign.provider");
+                    },
+                    [](auto &v) {
+                      v.capability_definition_revision =
+                          core::CapabilityDefinitionRevision(
+                              "foreign.capability-revision");
+                    },
+                    [](auto &v) {
+                      v.supporting_capability_provider_paths.front()
+                          .provider_instance_id =
+                          core::ProviderInstanceId("foreign.planner");
+                    },
+                    [](auto &v) {
+                      const core::RuntimeEpoch epoch("foreign.epoch");
+                      v.control_path->provider_runtime_epoch = epoch;
+                      v.supporting_capability_provider_paths.front()
+                          .provider_runtime_epoch = epoch;
+                      v.runtime_unit_epochs.front().runtime_epoch = epoch;
+                    }};
+  for (std::size_t index = 0; index < foreign_facts.size(); ++index) {
+    SCOPED_TRACE(index);
+    auto foreign_value = candidate.value();
+    foreign_facts[index](foreign_value);
+    auto foreign =
+        core::verify_runtime_participant_binding(std::move(foreign_value));
+    ASSERT_TRUE(foreign.ok()) << foreign.error().message;
+    EXPECT_FALSE(retained_bindings_preserve_physical_owner_after_product_reseal(
+        before, foreign.value()));
+  }
 }
 
 TEST(RetainedNativeCellRuntimeTest,
@@ -1056,7 +1123,7 @@ TEST(RetainedNativeCellRuntimeTest,
         retained_binding.value().controllable_component_id};
     const auto wrong_fence = cell.reconfigure_runtime_component_set(
         {TestRegistration(retained_binding, &retained_engine)}, resolver,
-        {StopSourceFor(retained_binding)}, std::nullopt,
+        {StopSourceFor(retained_binding)},
         retained_binding.value().retained_bundle_id,
         retained_binding.value().graph_revision,
         core::ConfigurationFenceId("fence.native-cell.wrong"), scope,
@@ -1073,7 +1140,7 @@ TEST(RetainedNativeCellRuntimeTest,
     EXPECT_EQ(cell.stop_surveillance_owner()->SnapshotSources().size(), 2U);
     const auto changed = cell.reconfigure_runtime_component_set(
         {TestRegistration(retained_binding, &retained_engine)}, resolver,
-        {StopSourceFor(retained_binding)}, std::nullopt,
+        {StopSourceFor(retained_binding)},
         retained_binding.value().retained_bundle_id,
         retained_binding.value().graph_revision, fence_id, scope,
         retained_components, [&commit_calls] {
@@ -1213,7 +1280,7 @@ TEST(RetainedNativeCellRuntimeTest,
       int commit_calls = 0;
       const auto changed = cell.reconfigure_runtime_component_set(
           {TestRegistration(retained, retained_engine)}, resolver,
-          {StopSourceFor(retained)}, std::nullopt,
+          {StopSourceFor(retained)},
           retained.value().retained_bundle_id,
           retained.value().graph_revision, fence_id, scope,
           retained_components, [&commit_calls] {
@@ -1269,7 +1336,7 @@ TEST(RetainedNativeCellRuntimeTest,
       const auto restored = cell.reconfigure_runtime_component_set(
           {TestRegistration(arm, &arm_engine),
            TestRegistration(gripper, &gripper_engine)},
-          resolver, {StopSourceFor(arm), StopSourceFor(gripper)}, std::nullopt,
+          resolver, {StopSourceFor(arm), StopSourceFor(gripper)},
           retained.value().retained_bundle_id,
           retained.value().graph_revision, add_fence_id, add_scope,
           {removed.value().controllable_component_id},
@@ -1348,7 +1415,7 @@ TEST(RetainedNativeCellRuntimeTest,
     int commit_calls = 0;
     const auto failed = cell.reconfigure_runtime_component_set(
         {TestRegistration(arm, &arm_engine)}, resolver,
-        {StopSourceFor(arm)}, std::nullopt,
+        {StopSourceFor(arm)},
         arm.value().retained_bundle_id, arm.value().graph_revision,
         fence_id, scope, {arm.value().controllable_component_id},
         [&commit_calls] {
@@ -1423,8 +1490,7 @@ TEST(RetainedNativeCellRuntimeTest,
     const auto changed = cell.reconfigure_runtime_component_set(
         {TestRegistration(arm, &arm_engine),
          TestRegistration(new_gripper, &new_gripper_engine)},
-        resolver, {StopSourceFor(arm), StopSourceFor(new_gripper)},
-        std::nullopt, arm.value().retained_bundle_id,
+        resolver, {StopSourceFor(arm), StopSourceFor(new_gripper)}, arm.value().retained_bundle_id,
         arm.value().graph_revision, fence_id, scope,
         {arm.value().controllable_component_id}, [&commit_calls] {
           ++commit_calls;

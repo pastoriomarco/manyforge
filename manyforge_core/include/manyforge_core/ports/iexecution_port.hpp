@@ -129,6 +129,26 @@ enum class ExecutionGoalResult {
   kEndedUnknown,
 };
 
+[[nodiscard]] inline const char* to_string(ExecutionGoalResult result) noexcept {
+  switch (result) {
+    case ExecutionGoalResult::kSucceeded:
+      return "succeeded";
+    case ExecutionGoalResult::kAbortedPathTolerance:
+      return "aborted_path_tolerance";
+    case ExecutionGoalResult::kAbortedGoalTolerance:
+      return "aborted_goal_tolerance";
+    case ExecutionGoalResult::kCanceled:
+      return "canceled";
+    case ExecutionGoalResult::kRejected:
+      return "rejected";
+    case ExecutionGoalResult::kPreemptedBy:
+      return "preempted_by";
+    case ExecutionGoalResult::kEndedUnknown:
+      return "ended_unknown";
+  }
+  return "unknown";
+}
+
 /// One action-feedback message of one goal (FollowJointTrajectory feedback
 /// on JTC). Unlike `ExecutionControllerSampleDTO` it is attributed to its goal
 /// by the mechanism itself. Every joint vector follows

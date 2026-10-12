@@ -516,7 +516,8 @@ runtime_registration(
     std::optional<core::MotionInterruptStopProfileDTO>
         default_fault_stop_profile = std::nullopt,
     std::optional<double> deployment_maximum_tcp_linear_speed_mps =
-        std::nullopt) {
+        std::nullopt,
+    const bool fault_stop_profile_from_deployment = false) {
   if (participant_policy.has_value() &&
       (participant_policy->value().controllable_component_id !=
            binding.value().controllable_component_id ||
@@ -533,13 +534,17 @@ runtime_registration(
       throw std::invalid_argument(
           "runtime operator Stop profile differs from retained Stop authority");
     }
-    if (default_fault_stop_profile.has_value() &&
-        *default_fault_stop_profile != retained_profiles->fault_profile) {
-      throw std::invalid_argument(
-          "runtime fault Stop profile differs from retained Stop authority");
-    }
     default_operator_stop_profile = retained_profiles->operator_profile;
-    default_fault_stop_profile = retained_profiles->fault_profile;
+    // Q37: a Deployment-authored fault profile is the authority as given;
+    // only the native lane still derives it from the operator profile.
+    if (!fault_stop_profile_from_deployment) {
+      if (default_fault_stop_profile.has_value() &&
+          *default_fault_stop_profile != retained_profiles->fault_profile) {
+        throw std::invalid_argument(
+            "runtime fault Stop profile differs from retained Stop authority");
+      }
+      default_fault_stop_profile = retained_profiles->fault_profile;
+    }
   }
   auto defaults = retained_default_stop_limits(binding, readiness);
   return core::RuntimeParticipantExecutionRegistration{
@@ -574,15 +579,6 @@ representative_participant_policy(
     return policy;
   }
   return std::nullopt;
-}
-
-[[nodiscard]] std::optional<core::StopDeadlineBudgetDTO>
-cell_stop_envelope(std::optional<core::StopDeadlineBudgetDTO> budget) {
-  // Phase rows belong to each participant's sealed Stop plan. The cell cache
-  // retains only the shared outer envelope and Kernel completion reserve.
-  if (budget.has_value())
-    budget->phases.clear();
-  return budget;
 }
 
 [[nodiscard]] std::vector<core::ResourceId>
@@ -936,7 +932,15 @@ rebase_runtime_binding_to_predecessor(
       configuration.active_control_configuration_id;
   candidate.control_path->active_control_configuration_generation =
       configuration.active_control_configuration_generation;
-  candidate.control_path->runtime_scale_qualification.reset();
+  // Qualification comes from this already verified binding's retained route,
+  // not from the durable configuration or its generation. Re-adopting that
+  // same route must preserve the exact proof; another route stays unqualified
+  // until the retained readiness resolver supplies its own route proof.
+  if (candidate.control_path->runtime_scale_qualification.has_value() &&
+      candidate.control_path->runtime_scale_qualification->control_route_id !=
+          selected->control_route_id) {
+    candidate.control_path->runtime_scale_qualification.reset();
+  }
   auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
   if (!sealed.ok()) {
     return route_publication_error<core::RuntimeParticipantBinding>(
@@ -991,7 +995,10 @@ make_kernel_participant_resolver(
           physical->engine, physical->stop_execution_port,
           physical->participant_policy, physical->default_operator_stop_profile,
           physical->default_fault_stop_profile,
-          physical->deployment_maximum_tcp_linear_speed_mps);
+          physical->deployment_maximum_tcp_linear_speed_mps,
+          // The physical registration already settled the fault profile from
+          // the same readiness (derived or Deployment-authored); keep it.
+          true);
       registration.intrinsic_direct_control =
           binding.value().intrinsic_direct_control;
       registration.direct_control_joint_limits =
@@ -1006,27 +1013,6 @@ make_kernel_participant_resolver(
   };
 }
 
-[[nodiscard]] bool same_binding_after_product_reseal(
-    const core::RuntimeParticipantBinding &predecessor,
-    const core::RuntimeParticipantBinding &candidate) {
-  const auto &before = predecessor.value();
-  auto after = candidate.value();
-  // These fields describe the authored Program/product seal, not the physical
-  // controller. The resolved model, frame, resource, route, provider and
-  // runtime-unit facts remain byte-for-byte equal below. Contact/grasp
-  // templates are consumed by admitted Program operations and do not alter
-  // the retained controller itself.
-  after.program_id = before.program_id;
-  after.program_revision = before.program_revision;
-  after.program_binding_id = before.program_binding_id;
-  after.retained_bundle_id = before.retained_bundle_id;
-  after.graph_revision = before.graph_revision;
-  after.component_role_id = before.component_role_id;
-  after.target_role_id = before.target_role_id;
-  after.contact_grasp_bindings = before.contact_grasp_bindings;
-  return after == before;
-}
-
 [[nodiscard]] bool same_readiness_after_product_reseal(
     const std::optional<core::RuntimeParticipantStopReadiness> &predecessor,
     const std::optional<core::RuntimeParticipantStopReadiness> &candidate) {
@@ -1037,9 +1023,7 @@ make_kernel_participant_resolver(
   if (before.controllable_component_id != after.controllable_component_id ||
       before.component_lifecycle_generation !=
           after.component_lifecycle_generation ||
-      before.expected_controller_domain != after.expected_controller_domain ||
-      before.maximum_controlled_stop_duration_ns !=
-          after.maximum_controlled_stop_duration_ns) {
+      before.expected_controller_domain != after.expected_controller_domain) {
     return false;
   }
   auto prior_plan = before.resolved_stop_base_plan;
@@ -1060,10 +1044,10 @@ make_kernel_participant_resolver(
       (!predecessor.participant_policy.has_value() ||
        predecessor.participant_policy->value() ==
            candidate.participant_policy->value());
-  return same_binding_after_product_reseal(predecessor.binding,
-                                           candidate.binding) &&
+  return retained_bindings_preserve_physical_owner_after_product_reseal(
+             predecessor.binding, candidate.binding) &&
          same_readiness_after_product_reseal(predecessor.stop_readiness,
-                                              candidate.stop_readiness) &&
+                                             candidate.stop_readiness) &&
          predecessor.retained_default_stop_limits ==
              candidate.retained_default_stop_limits &&
          predecessor.stop_node_category == candidate.stop_node_category &&
@@ -1146,14 +1130,6 @@ create_retained_native_runtime_participants(
     throw std::invalid_argument(
         "native runtime composition input is incomplete or unbounded");
   }
-  if (!config.cell_stop_deadline_budget.has_value() &&
-      input.motion_stop_readiness.has_value()) {
-    config.cell_stop_deadline_budget =
-        input.motion_stop_readiness->value()
-            .resolved_stop_base_plan.deadline_budget;
-  }
-  config.cell_stop_deadline_budget =
-      cell_stop_envelope(std::move(config.cell_stop_deadline_budget));
   const auto controlled_stop_profiles = retained_controlled_stop_profiles(
       input.motion_binding, input.motion_stop_readiness);
   std::optional<core::MotionInterruptStopProfileDTO>
@@ -1162,6 +1138,21 @@ create_retained_native_runtime_participants(
   if (controlled_stop_profiles.has_value()) {
     motion_operator_stop_profile = controlled_stop_profiles->operator_profile;
     motion_fault_stop_profile = controlled_stop_profiles->fault_profile;
+  }
+  // Q37 (as main): the Deployment-authored fault profile is read directly,
+  // with its defaults resolved once at load (item 24); nothing is derived.
+  if (input.fault_stop_profile_from_deployment) {
+    motion_fault_stop_profile.reset();
+    if (input.deployment_fault_stop_profile.has_value()) {
+      auto resolved = core::resolve_motion_interrupt_stop_jerk_limits(
+          *input.deployment_fault_stop_profile);
+      if (!resolved.ok()) {
+        throw std::invalid_argument(
+            "Deployment fault Stop profile is invalid: " +
+            resolved.error().message);
+      }
+      motion_fault_stop_profile = std::move(resolved.value());
+    }
   }
   const auto current_inventory =
       input.collision_publisher->current_scene_snapshot_lease_inventory();
@@ -1302,6 +1293,8 @@ create_retained_native_runtime_participants(
       std::move(input.control_binding_representatives);
   runtime->motion_operator_stop_profile = motion_operator_stop_profile;
   runtime->motion_fault_stop_profile = motion_fault_stop_profile;
+  runtime->motion_fault_stop_profile_from_deployment =
+      input.fault_stop_profile_from_deployment;
   runtime->motion_participant_policy = motion_participant_policy;
   runtime->deployment_maximum_tcp_linear_speed_mps =
       input.deployment_maximum_tcp_linear_speed_mps;
@@ -1592,7 +1585,8 @@ create_retained_native_runtime_participants(
           representative_participant_policy(primary, true,
                                             motion_participant_policy),
           motion_operator_stop_profile, motion_fault_stop_profile,
-          input.deployment_maximum_tcp_linear_speed_mps));
+          input.deployment_maximum_tcp_linear_speed_mps,
+          input.fault_stop_profile_from_deployment));
     } else {
       registrations.push_back(gripper_runtime_registration(
           representative,
@@ -1606,7 +1600,8 @@ create_retained_native_runtime_participants(
         alias, input.motion_stop_readiness, runtime->participant_engine.get(),
         runtime->execution.get(), motion_participant_policy,
         motion_operator_stop_profile, motion_fault_stop_profile,
-        input.deployment_maximum_tcp_linear_speed_mps));
+        input.deployment_maximum_tcp_linear_speed_mps,
+        input.fault_stop_profile_from_deployment));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(gripper_runtime_registration(
@@ -1621,7 +1616,8 @@ create_retained_native_runtime_participants(
       runtime->participant_engine.get(), runtime->execution.get(),
       motion_participant_policy, motion_operator_stop_profile,
       motion_fault_stop_profile,
-      input.deployment_maximum_tcp_linear_speed_mps));
+      input.deployment_maximum_tcp_linear_speed_mps,
+      input.fault_stop_profile_from_deployment));
   physical_registrations.back().direct_control_joint_limits =
       runtime->direct_control_joint_limits;
   if (runtime->gripper_binding.has_value()) {
@@ -1642,7 +1638,6 @@ create_retained_native_runtime_participants(
   }
   auto participant_resolver = make_kernel_participant_resolver(
       std::move(binding_resolver), std::move(physical_registrations));
-  runtime->cell_stop_deadline_budget = config.cell_stop_deadline_budget;
   runtime->stop_surveillance_policy = config.stop_surveillance_policy;
   runtime->participant_registrations = std::move(registrations);
   runtime->participant_resolver = std::move(participant_resolver);
@@ -1740,17 +1735,6 @@ void join_retained_native_runtime_participants(
         !peer->participant_peers.empty()) {
       throw std::invalid_argument("native participant join crosses runtime ownership");
     }
-    if (peer->cell_stop_deadline_budget.has_value() !=
-            primary->cell_stop_deadline_budget.has_value() ||
-        (peer->cell_stop_deadline_budget.has_value() &&
-         (peer->cell_stop_deadline_budget->outer_duration_ns !=
-              primary->cell_stop_deadline_budget->outer_duration_ns ||
-          peer->cell_stop_deadline_budget->kernel_completion_reserve_ns !=
-              primary->cell_stop_deadline_budget
-                  ->kernel_completion_reserve_ns))) {
-      throw std::invalid_argument(
-          "native participant join has inconsistent cell Stop envelopes");
-    }
     runtimes.push_back(peer);
   }
 
@@ -1811,7 +1795,6 @@ core::Result<void> rejoin_retained_native_runtime_participants(
   std::vector<RetainedStopSurveillanceSourceInput> surveillance_sources;
   std::size_t addressed_kernel_owners = 0U;
   std::size_t journal_owners = 0U;
-  std::optional<core::StopDeadlineBudgetDTO> stop_budget;
   std::optional<core::StopSurveillancePolicyDTO> surveillance_policy;
   std::set<RetainedNativeRuntime *> predecessor_roots;
 
@@ -1854,12 +1837,7 @@ core::Result<void> rejoin_retained_native_runtime_participants(
       return fail("native_participant_rejoin_time_owner_mismatch",
                   "candidate component engines do not share the cell clock and scheduler");
     }
-    if (runtime->cell_stop_deadline_budget.has_value() !=
-            primary->cell_stop_deadline_budget.has_value() ||
-        (runtime->cell_stop_deadline_budget.has_value() &&
-         runtime->cell_stop_deadline_budget !=
-             primary->cell_stop_deadline_budget) ||
-        runtime->stop_surveillance_policy.has_value() !=
+    if (runtime->stop_surveillance_policy.has_value() !=
             primary->stop_surveillance_policy.has_value() ||
         (runtime->stop_surveillance_policy.has_value() &&
          runtime->stop_surveillance_policy !=
@@ -1867,8 +1845,6 @@ core::Result<void> rejoin_retained_native_runtime_participants(
       return fail("native_participant_rejoin_stop_policy_mismatch",
                   "candidate component owners disagree on the cell Stop policy");
     }
-    if (!stop_budget.has_value())
-      stop_budget = runtime->cell_stop_deadline_budget;
     if (!surveillance_policy.has_value())
       surveillance_policy = runtime->stop_surveillance_policy;
     for (const auto &binding : runtime->control_binding_representatives) {
@@ -2048,7 +2024,6 @@ core::Result<void> rejoin_retained_native_runtime_participants(
   primary->participant_resolver = std::move(aggregate_resolver);
   primary->participant_resolver_factory =
       std::move(participant_resolver_factory);
-  primary->cell_stop_deadline_budget = stop_budget;
   primary->stop_surveillance_policy = surveillance_policy;
   primary->stop_surveillance_owner = std::move(stable_stop_observer);
   for (const auto &runtime : runtimes) {
@@ -2102,15 +2077,15 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
             input.motion_binding.value().retained_bundle_id ||
         input.gripper_binding->value().graph_revision !=
             input.motion_binding.value().graph_revision)) ||
-      !same_binding_after_product_reseal(runtime.motion_binding,
-                                         input.motion_binding) ||
+      !retained_bindings_preserve_physical_owner_after_product_reseal(
+          runtime.motion_binding, input.motion_binding) ||
       input.gripper_binding.has_value() !=
           runtime.gripper_binding.has_value() ||
       (input.gripper_binding.has_value() &&
-       (runtime.gripper_state_channel == nullptr || runtime.gripper == nullptr ||
-        !runtime.rebind_gripper_route ||
-        !same_binding_after_product_reseal(*runtime.gripper_binding,
-                                           *input.gripper_binding)))) {
+       (runtime.gripper_state_channel == nullptr ||
+        runtime.gripper == nullptr || !runtime.rebind_gripper_route ||
+        !retained_bindings_preserve_physical_owner_after_product_reseal(
+            *runtime.gripper_binding, *input.gripper_binding)))) {
     return fail("native_product_reseal_physical_identity_changed",
                 "candidate product changes the retained component's physical controller identity");
   }
@@ -3046,14 +3021,16 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           motion_owner ? motion_fault_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? deployment_maximum_tcp_linear_speed_mps
-                       : std::optional<double>{}));
+                       : std::optional<double>{},
+          motion_owner && motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
           motion_participant_policy, motion_operator_stop_profile,
           motion_fault_stop_profile,
-          deployment_maximum_tcp_linear_speed_mps));
+          deployment_maximum_tcp_linear_speed_mps,
+          motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -3244,13 +3221,6 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
           std::move(stable_cell_registrations),
           std::move(stable_cell_resolver));
-    }
-    if (motion_readiness.has_value()) {
-      cell_stop_deadline_budget = cell_stop_envelope(
-          motion_readiness->value().resolved_stop_base_plan.deadline_budget);
-    } else if (gripper_readiness.has_value()) {
-      cell_stop_deadline_budget = cell_stop_envelope(
-          gripper_readiness->value().resolved_stop_base_plan.deadline_budget);
     }
 
     return readback;
@@ -3686,14 +3656,16 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           motion_owner ? motion_fault_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? deployment_maximum_tcp_linear_speed_mps
-                       : std::optional<double>{}));
+                       : std::optional<double>{},
+          motion_owner && motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
           motion_participant_policy, motion_operator_stop_profile,
           motion_fault_stop_profile,
-          deployment_maximum_tcp_linear_speed_mps));
+          deployment_maximum_tcp_linear_speed_mps,
+          motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -4176,7 +4148,6 @@ void attach_retained_native_addressed_owner(
         std::move(runtime->participant_resolver),
         config.operation_admission_gate,
         std::move(config.graph_revision),
-        std::move(config.cell_stop_deadline_budget),
         core::kMaximumEmergencyStopCorrelationEntries,
         std::min(kNativeMaximumLiveStopParticipants,
                  runtime->participant_registrations.size()),
@@ -4214,12 +4185,6 @@ void attach_retained_native_addressed_owner(
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
                                RetainedNativeRuntimeConfig config) {
-  auto stop_budget = config.cell_stop_deadline_budget;
-  if (!stop_budget.has_value() && input.motion_stop_readiness.has_value()) {
-    stop_budget = input.motion_stop_readiness->value()
-                      .resolved_stop_base_plan.deadline_budget;
-  }
-  config.cell_stop_deadline_budget = stop_budget;
   RetainedNativeAddressedOwnerConfig owner_config{
       std::move(config.request_owner_epoch),
       std::move(config.cell_id),
@@ -4227,7 +4192,6 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       config.request_replay_capacity,
       input.operation_admission_gate,
       input.motion_binding.value().graph_revision,
-      std::move(stop_budget),
       std::move(config.cell_admission_intervention_validator),
       std::move(config.cell_admission_settlement_validator),
       std::move(config.cell_admission_reconcile_validator),

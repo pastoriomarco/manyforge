@@ -219,10 +219,6 @@ inline constexpr char kDigestC[] =
 [[nodiscard]] StopScopeEntryDTO ScopeEntry(
     StopScopeDispatchStateDTO dispatch_state = StopScopeDispatchStateDTO::kDispatched) {
   const auto stage = Stage();
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
-  for (const auto& phase : stage.participant_stop_plan.deadline_budget.phases) {
-    phases.push_back({phase.phase_id, phase.deadline_offset_ns, phase.deadline_offset_ns});
-  }
   return StopScopeEntryDTO{
       ParticipantKey(stage),
       StopParticipantScopeFactsDTO{
@@ -239,9 +235,7 @@ inline constexpr char kDigestC[] =
       stage.stop_evidence_policy_id,
       stage.stop_evidence_policy_revision,
       stage.participant_stop_plan.participant_stop_invocation_plan_digest,
-      10,
-      stage.participant_stop_plan.deadline_budget.outer_duration_ns,
-      std::move(phases)};
+      10};
 }
 
 [[nodiscard]] StopRequestedSelectorSnapshotDTO OperationSelector() {
@@ -465,7 +459,7 @@ TEST(StopTerminalReducerTest, ExplicitFullMergesPredecessorWithoutRepeatingStage
   ASSERT_TRUE(predecessor.ok());
   const StopPredecessorAcceptanceRefDTO predecessor_acceptance{predecessor.value().stop_id,
                                                                predecessor.value().stop_generation,
-                                                               ContentDigest(kDigestB), 500};
+                                                               ContentDigest(kDigestB)};
   auto input = StopTerminalReductionInputDTO{
       StopCertificateId("certificate.full"),
       StopCertificateRevision(1U),
@@ -511,9 +505,7 @@ TEST(StopTerminalReducerTest, ExternalUncontainedResourceFailsWithoutInventedPar
                         std::nullopt,
                         std::nullopt,
                         std::nullopt,
-                        10,
-                        500,
-                        {}}};
+                        10}};
   input.newly_completed_stage_results.clear();
   input.fault_latch_id = StopFaultLatchId("stop-fault.1");
   input.fault_latch_generation = StopFaultLatchGeneration(1U);

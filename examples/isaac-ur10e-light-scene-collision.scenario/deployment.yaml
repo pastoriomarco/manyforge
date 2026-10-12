@@ -59,6 +59,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {
@@ -123,12 +124,7 @@
                 "source_joint_name": "wrist_3_joint"
               }
             ],
-            "stop_mode": "soft_on_path",
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 1500000000
-            }
+            "stop_mode": "soft_on_path"
           },
           "maximum_tcp_linear_speed_mps": 0.25
         }
@@ -137,6 +133,7 @@
   ],
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
+  "isaac_world": "isaac_manipulator_scene_light",
   "name": "isaac_manipulator_scene_light_ros2_control_collision",
   "policies": {
     "interrupt_config": {

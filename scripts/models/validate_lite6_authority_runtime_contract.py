@@ -238,7 +238,10 @@ def validate_static_artifacts(
 
     controller_document = _load_yaml(controllers)
     arm_controller = _mapping(
-        controller_document.get("isaac_arm_controller"),
+        controller_document.get(
+            "isaac_arm_controller",
+            controller_document.get("/**/isaac_arm_controller"),
+        ),
         label="isaac_arm_controller",
     )
     arm_params = _mapping(
@@ -377,12 +380,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--ros2-control-urdf",
         type=Path,
-        default=(
-            REPO_ROOT
-            / "manyforge_ros_bringup"
-            / "urdf"
-            / "isaac_lite6_topic_based.ros2_control.urdf"
-        ),
+        required=True,
+        help="Host-generated Lite6 robot description to inspect (no stored fallback).",
     )
     parser.add_argument(
         "--controllers",

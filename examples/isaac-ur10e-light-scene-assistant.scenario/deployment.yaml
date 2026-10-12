@@ -61,6 +61,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {
@@ -125,12 +126,7 @@
                 "source_joint_name": "wrist_3_joint"
               }
             ],
-            "stop_mode": "soft_on_path",
-            "timing": {
-              "command_latency_allowance_ns": 250000000,
-              "operational_timeout_ns": 3000000000,
-              "settling_allowance_ns": 1500000000
-            }
+            "stop_mode": "soft_on_path"
           },
           "maximum_tcp_linear_speed_mps": 0.25
         }
@@ -139,6 +135,7 @@
   ],
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
+  "isaac_world": "isaac_manipulator_scene_light",
   "name": "isaac_manipulator_scene_light_assistant",
   "policies": {
     "interrupt_config": {

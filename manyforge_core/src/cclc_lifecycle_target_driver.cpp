@@ -541,13 +541,28 @@ void CCLCLifecycleTargetDriver::Publish(ComponentState& state, const LifecyclePr
 
 void CCLCLifecycleTargetDriver::PublishIncident(ComponentState& state,
                                                 const ComponentLifecycleIncidentDTO& incident,
-                                                const std::int64_t now_ns) const {
+                                                const std::int64_t now_ns,
+                                                const std::optional<ErrorDTO>& diagnostic,
+                                                const bool diagnostic_loaded) const {
+  // Routine durable facts omit expensive auxiliary decoding. Preserve only
+  // the immutable enrichment of this exact incident, never its cause or
+  // containment columns from an earlier read.
+  const auto previous_incident = state.progress ? state.progress->incident : std::nullopt;
+  auto visible = incident;
+  if (!diagnostic_loaded && !visible.diagnostic_snapshot && previous_incident &&
+      previous_incident->incident_id == visible.incident_id) {
+    visible.diagnostic = previous_incident->diagnostic;
+    visible.diagnostic_snapshot = previous_incident->diagnostic_snapshot;
+  }
   // Nothing proceeds while an incident is open; the operator's Recover is the
-  // next intent.
+  // next intent. The short reason retains its set-once diagnostic too.
+  const auto& reason_diagnostic = visible.diagnostic ? visible.diagnostic : diagnostic;
   Publish(state, LifecycleProgressPhaseDTO::kBlocked, ComponentLifecycleIntentKindDTO::kRecover,
           incident.cause_class,
-          "incident_open:" + std::string(to_string(incident.cause_class)), now_ns);
-  state.progress->incident = incident;
+          Bounded("incident_open:" + std::string(to_string(incident.cause_class)) + ":" +
+                  incident.summary + (reason_diagnostic ? " " + reason_diagnostic->message : "")),
+          now_ns);
+  state.progress->incident = std::move(visible);
 }
 
 std::vector<CCLCLifecycleTargetDriver::DomainCondition> CCLCLifecycleTargetDriver::ObserveAllDomains(
@@ -706,22 +721,24 @@ bool CCLCLifecycleTargetDriver::ApplyReplacesComponent(const ControllableCompone
 
 void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ComponentState& state,
                                                          const std::int64_t now_ns) {
-  const auto incident = *state.unrecorded_incident;
+  auto incident = *state.unrecorded_incident;
   // Containment never depends on, waits for or is delayed by the record. Its
   // outcome is remembered and written into the record by RecordContainment.
   static_cast<void>(Contain(incident));
+  // Malformed optional text never prevents the original fault record.
+  if (incident.diagnostic && !ComponentIncidentDiagnosticIsValid(*incident.diagnostic))
+    incident.diagnostic.reset();
   Result<ComponentIncidentRecordDTO> stored = Result<ComponentIncidentRecordDTO>::Err(
       driver_error("lifecycle_incident_invalid", "the incident record is invalid",
                    "incident_invalid"));
   try {
     if (incident.locally_valid()) {
       stored = store_.OpenComponentIncident(
-          {incident,
-           ComponentIncidentEventPayload(
-               incident,
-               LifecycleIncidentRecoveryPolicyFor(config_.incident_recovery_policy,
-                                                  incident.cause_class),
-               kComponentIncidentEventKind)},
+          {incident, ComponentIncidentEventPayload(
+                         incident,
+                         LifecycleIncidentRecoveryPolicyFor(config_.incident_recovery_policy,
+                                                            incident.cause_class),
+                         kComponentIncidentEventKind, incident.diagnostic)},
           state.unrecorded_incident_generation);
     }
   } catch (const std::exception& exception) {
@@ -753,7 +770,7 @@ void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ComponentState& state,
   }
   state.unrecorded_incident.reset();
   RecordContainment(stored.value(), now_ns);
-  PublishIncident(state, stored.value().incident, now_ns);
+  PublishIncident(state, stored.value().incident, now_ns, stored.value().diagnostic);
 }
 
 bool CCLCLifecycleTargetDriver::EvaluateIncident(
@@ -771,6 +788,8 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   bool lost = false;
   std::vector<std::string> codes;
   std::optional<ControlDomainId> trigger;
+  std::optional<ErrorDTO> diagnostic;
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
   for (const auto& condition : conditions) {
     const auto& observed = condition.observed;
     const bool fresh = observed.observation.has_value();
@@ -781,6 +800,8 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
       intervention = observed.cause;
       intervention_fresh = reported_now;
       trigger = condition.control_domain_id;
+      diagnostic = reported_now ? observed.observation->diagnostic : std::nullopt;
+      diagnostic_snapshot = reported_now ? observed.observation->diagnostic_snapshot : nullptr;
       codes = reported_now ? ComponentIncidentVendorCodes(observed.observation->facts)
                            : std::vector<std::string>{};
       continue;
@@ -830,6 +851,33 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   if (replaced) cause = LifecycleBlockingCauseClassDTO::kNone;
 
   if (open) {
+    // A guard/readiness incident can precede the launch's exit evidence. The
+    // same owner keeps that first record; one later diagnostic is set once.
+    const bool already_enriched =
+        open->diagnostic_snapshot ||
+        (state.progress && state.progress->incident &&
+         state.progress->incident->incident_id == open->incident.incident_id &&
+         state.progress->incident->diagnostic_snapshot);
+    const bool already_has_error =
+        open->diagnostic || (state.progress && state.progress->incident &&
+                             state.progress->incident->incident_id == open->incident.incident_id &&
+                             state.progress->incident->diagnostic);
+    if (diagnostic && diagnostic->code == "controller_launch_exited" &&
+        (diagnostic_snapshot ? !already_enriched : !already_has_error)) {
+      // A replacement owner may find pending containment. Request it before
+      // any new diagnostic read/write; auxiliary IO never gates the Stop.
+      RecordContainment(*open, now_ns);
+      try {
+        const auto appended = store_.AppendComponentIncidentDiagnostic(
+            open->incident.incident_id, now_ns, *diagnostic, diagnostic_snapshot);
+        if (appended.ok()) {
+          const auto reloaded = store_.LoadOpenComponentIncident(target.controllable_component_id);
+          if (reloaded.ok() && reloaded.value()) open = reloaded.value();
+        }
+      } catch (...) {
+        // Containment and the primary incident are independent of evidence.
+      }
+    }
     // One open incident per component: a further unrequested change is
     // appended and its cause becomes the incident's (most recent wins).
     if (cause != LifecycleBlockingCauseClassDTO::kNone && cause != open->incident.cause_class) {
@@ -857,7 +905,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
       }
     }
     RecordContainment(*open, now_ns);
-    PublishIncident(state, open->incident, now_ns);
+    PublishIncident(state, open->incident, now_ns, open->diagnostic, open->diagnostic_loaded);
     return true;
   }
   if (replaced && loss) {
@@ -901,6 +949,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                                   occurrence.provider_runtime_unit_id,
                                   occurrence.provider_runtime_epoch});
   }
+  incident.diagnostic = diagnostic;
   state.unrecorded_incident = std::move(incident);
   state.unrecorded_incident_generation = state.recovery_generation;
   ContainAndRecordIncident(state, now_ns);
@@ -1116,7 +1165,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
   const auto snapshot = ports_.ReadCurrentComponent(component);
   if (!snapshot.ok()) {
     if (open) {
-      PublishIncident(state, open->incident, now_ns);
+      PublishIncident(state, open->incident, now_ns, open->diagnostic, open->diagnostic_loaded);
       return true;
     }
     Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites,
@@ -1380,6 +1429,16 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
         "lifecycle_target_clock_invalid", "the owner clock is negative", "owner_clock_invalid"));
   }
   ComponentLifecycleTargetViewDTO view;
+  if (config_.read_output_drop_counts) {
+    try {
+      if (const auto counts = config_.read_output_drop_counts(component)) {
+        view.dropped_output_lines = counts->first;
+        view.dropped_output_bytes = counts->second;
+      }
+    } catch (...) {
+      // Optional observation never breaks lifecycle or control status.
+    }
+  }
   if (!target.value()) return Result<ComponentLifecycleTargetViewDTO>::Ok(view);
   view.target = target.value();
   {
@@ -1421,7 +1480,9 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
     view.progress->phase = LifecycleProgressPhaseDTO::kBlocked;
     view.progress->next_intent = ComponentLifecycleIntentKindDTO::kRecover;
     view.progress->blocking_cause_class = incident.cause_class;
-    view.progress->blocking_reason = "incident_open:" + std::string(to_string(incident.cause_class));
+    view.progress->blocking_reason = Bounded(
+        "incident_open:" + std::string(to_string(incident.cause_class)) + ":" + incident.summary +
+        (open.value()->diagnostic ? " " + open.value()->diagnostic->message : ""));
     if (!view.progress->waiting_since_ns) {
       view.progress->waiting_since_ns = incident.detected_at_ns;
     }

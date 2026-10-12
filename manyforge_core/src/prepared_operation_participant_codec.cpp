@@ -1357,7 +1357,7 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         std::nullopt,
         node_category};
     auto ordinary =
-        MakePreparedParticipantStopPlan(readiness, std::move(ordinary_context),
+        MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan, std::move(ordinary_context),
                                         binding_resource_span(binding), retained_default_limits);
     if (!ordinary.ok()) fail("ordinary_stop_plan_make_failed");
     candidate.ordinary_stop_plan = std::move(ordinary.value());
@@ -1375,7 +1375,8 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
           fault.participant_stop_profile_purpose != ParticipantStopProfilePurposeDTO::kFault ||
           fault.motion_interrupt_scope_id.has_value() ||
           !fault.participant_stop_profile.has_value() ||
-          !VerifyPreparedParticipantStopPlan(readiness, fault, binding_resource_span(binding),
+          !VerifyPreparedParticipantStopPlan(readiness.resolved_stop_base_plan, fault,
+                                             binding_resource_span(binding),
                                              retained_default_limits, node_category)
                .ok()) {
         fail("fault_stop_plan_invalid");

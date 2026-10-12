@@ -1,5 +1,7 @@
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 
+#include <manyforge_core/types/component_incident.hpp>
+
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -187,8 +189,18 @@ participant_resources(const core::RuntimeParticipantBindingDTO &binding) {
       candidate.source_generation < last_generation) {
     return false;
   }
-  return candidate.source_generation != last_generation || !last.has_value() ||
-         candidate == *last;
+  if (candidate.source_generation != last_generation || !last.has_value())
+    return true;
+  const auto &previous = *last;
+  return candidate.source_generation == previous.source_generation &&
+         candidate.component_state == previous.component_state &&
+         candidate.exact_controller_configuration_active ==
+             previous.exact_controller_configuration_active &&
+         candidate.facts == previous.facts &&
+         candidate.diagnostic == previous.diagnostic &&
+         (candidate.diagnostic_snapshot == previous.diagnostic_snapshot ||
+          (candidate.diagnostic_snapshot && previous.diagnostic_snapshot &&
+           *candidate.diagnostic_snapshot == *previous.diagnostic_snapshot));
 }
 
 [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
@@ -237,12 +249,15 @@ bool RetainedExternallyManagedDomainSnapshot::locally_valid() const noexcept {
 struct RetainedExternallyManagedBrandLifecyclePort::State final {
   State(core::ResolvedLifecycleProviderOccurrenceDTO occurrence_in,
         RetainedExternallyManagedDomainSnapshotSource source_in,
-        core::IClock &clock_in, const core::Duration freshness_ns_in)
+        core::IClock &clock_in, const core::Duration freshness_ns_in,
+        RetainedExternallyManagedPrimitiveDispatcher dispatcher_in)
       : occurrence(std::move(occurrence_in)), source(std::move(source_in)),
-        clock(&clock_in), freshness_ns(freshness_ns_in) {}
+        dispatcher(std::move(dispatcher_in)), clock(&clock_in),
+        freshness_ns(freshness_ns_in) {}
 
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
   RetainedExternallyManagedDomainSnapshotSource source;
+  RetainedExternallyManagedPrimitiveDispatcher dispatcher;
   core::IClock *clock;
   core::Duration freshness_ns;
   std::uint64_t next_source_sequence{1U};
@@ -259,7 +274,8 @@ core::Result<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
 RetainedExternallyManagedBrandLifecyclePort::Create(
     core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
     RetainedExternallyManagedDomainSnapshotSource snapshot_source,
-    core::IClock &clock, const core::Duration observation_freshness_ns) {
+    core::IClock &clock, const core::Duration observation_freshness_ns,
+    RetainedExternallyManagedPrimitiveDispatcher dispatcher) {
   if (!provider_occurrence.locally_valid() || !snapshot_source ||
       observation_freshness_ns <= 0 ||
       observation_freshness_ns > core::kMaxLifecycleTransactionTimeoutNs) {
@@ -273,7 +289,8 @@ RetainedExternallyManagedBrandLifecyclePort::Create(
               new RetainedExternallyManagedBrandLifecyclePort(
                   std::make_shared<State>(std::move(provider_occurrence),
                                           std::move(snapshot_source), clock,
-                                          observation_freshness_ns))));
+                                          observation_freshness_ns,
+                                          std::move(dispatcher)))));
 }
 
 core::Result<core::BrandLifecycleObservationDTO>
@@ -336,7 +353,17 @@ RetainedExternallyManagedBrandLifecyclePort::Observe(
       now,
       now + state_->freshness_ns,
       sampled.value().component_state,
-      sampled.value().facts};
+      sampled.value().facts,
+      sampled.value().diagnostic,
+      sampled.value().diagnostic_snapshot};
+  // Diagnostic capture is auxiliary: malformed/oversized evidence must never
+  // turn the primary fault observation into unavailable status.
+  if (result.diagnostic &&
+      (!core::ComponentIncidentDiagnosticIsValid(*result.diagnostic) ||
+       !result.locally_valid())) {
+    result.diagnostic.reset();
+    result.diagnostic_snapshot.reset();
+  }
   if (!result.locally_valid()) {
     return reject<core::BrandLifecycleObservationDTO>(
         "external_brand_lifecycle_observation_invalid",
@@ -359,9 +386,28 @@ RetainedExternallyManagedBrandLifecyclePort::Dispatch(
     return brand_result(intent, "external_brand_lifecycle_cancelled",
                         "external lifecycle observation was cancelled");
   }
-  return brand_result(
-      intent, "external_brand_lifecycle_observer_only",
-      "ManyForge observes but does not mutate the external product lifecycle");
+  if (!state_->dispatcher) {
+    return brand_result(
+        intent, "external_brand_lifecycle_observer_only",
+        "ManyForge observes but does not mutate the external product lifecycle");
+  }
+  RetainedExternallyManagedPrimitiveOutcome outcome;
+  try {
+    outcome = state_->dispatcher(state_->occurrence.control_domain_id,
+                                 intent.lifecycle_primitive_id, cancellation);
+  } catch (...) {
+    // An exception after a possible send cannot prove no effect.
+    outcome = {core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain,
+               core::LifecyclePrimitiveEffectDTO::kPossible, std::nullopt,
+               transition_error("external_brand_lifecycle_dispatch_exception",
+                                "external lifecycle primitive raised an exception")};
+  }
+  auto result = brand_result(intent, "unused", "unused");
+  result.dispatch_state = outcome.dispatch;
+  result.effect = outcome.effect;
+  result.known_result = outcome.known;
+  result.error = std::move(outcome.error);
+  return result;
 }
 
 RetainedExternallyManagedControllerLifecyclePort::

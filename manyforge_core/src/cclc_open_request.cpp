@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/cclc_open_request.hpp>
 #include <stdexcept>
@@ -814,6 +815,11 @@ template <typename StrongCounter>
       {"acknowledged", CanonicalValue(false)},
       {"cause_class", CanonicalValue(std::string(to_string(value->cause_class)))},
       {"detected_at_ns", content_identity::nonnegative_int64_value(value->detected_at_ns)},
+      {"diagnostic", value->diagnostic ? ComponentIncidentDiagnosticValue(
+                                             *value->diagnostic, value->diagnostic_snapshot
+                                                                     ? *value->diagnostic_snapshot
+                                                                     : CanonicalValue(nullptr))
+                                       : CanonicalValue(nullptr)},
       {"incident_id", CanonicalValue(value->incident_id)},
       {"summary", CanonicalValue(value->summary)},
       {"vendor_codes", CanonicalValue(std::move(codes))}});
@@ -888,7 +894,7 @@ template <typename StrongCounter>
         {"provider_runtime_unit_id", CanonicalValue(provider.provider_runtime_unit_id.value())}});
   }
   const auto& publication = value.active_publication_receipt;
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"active_public_pointer_digest",
        CanonicalValue(publication.durable_public_pointer_content_digest.value())},
       {"component_lifecycle_generation",
@@ -904,7 +910,18 @@ template <typename StrongCounter>
       {"publication_generation", safe_unsigned(publication.publication_generation.value())},
       {"retained_bundle_id",
        CanonicalValue(publication.request.candidate_retained_bundle_id.value())},
-      {"snapshot_digest", CanonicalValue(value.snapshot_digest.value())}});
+      {"snapshot_digest", CanonicalValue(value.snapshot_digest.value())}};
+  if (target_view.dropped_output_lines.has_value() != target_view.dropped_output_bytes.has_value())
+    throw std::invalid_argument("component output drop counters are incomplete");
+  if (target_view.dropped_output_lines) {
+    const auto count_value = [](std::uint64_t count) {
+      return count <= kMaximumSafeUnsignedInteger ? safe_unsigned(count)
+                                                  : CanonicalValue(std::to_string(count));
+    };
+    fields.emplace_back("dropped_output_lines", count_value(*target_view.dropped_output_lines));
+    fields.emplace_back("dropped_output_bytes", count_value(*target_view.dropped_output_bytes));
+  }
+  return CanonicalValue(std::move(fields));
 }
 
 [[nodiscard]] CanonicalValue response_value(const std::string_view command, CanonicalValue result) {
@@ -1149,18 +1166,35 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
       }
       CanonicalValue::Array events;
       auto through = static_cast<std::uint64_t>(after);
+      const auto envelope_bytes =
+          content_identity::canonical_json(
+              response_value(
+                  command, CanonicalValue(CanonicalValue::Object{
+                               {"events", CanonicalValue(CanonicalValue::Array{})},
+                               {"through_sequence", safe_unsigned(kMaximumSafeUnsignedInteger)}})))
+              .size();
+      auto remaining_bytes = kMaximumCCLCOpenResponseBytes - envelope_bytes;
       for (const auto& event : result.value()) {
         // Owner-side shape: a negative time is an owner failure, not a
         // caller error, and is never clamped.
         if (event.occurred_at_ns < 0) {
           throw std::invalid_argument("incident event is outside its closed shape");
         }
-        events.emplace_back(CanonicalValue::Object{
+        auto value = CanonicalValue(CanonicalValue::Object{
             {"event_kind", CanonicalValue(event.event_kind)},
             {"event_sequence", safe_unsigned(event.sequence)},
             {"incident_id", CanonicalValue(event.incident_id)},
             {"occurred_at_ns", content_identity::nonnegative_int64_value(event.occurred_at_ns)},
             {"payload", content_identity::parse_canonical_json(event.payload_json)}});
+        const auto value_bytes =
+            content_identity::canonical_json(value).size() + (events.empty() ? 0U : 1U);
+        if (value_bytes > remaining_bytes) {
+          if (events.empty())
+            throw std::invalid_argument("one incident event exceeds the response bound");
+          break;  // At-most-limit page: complete events, with the last emitted cursor.
+        }
+        remaining_bytes -= value_bytes;
+        events.push_back(std::move(value));
         through = std::max(through, event.sequence);
       }
       return encode_response(response_value(

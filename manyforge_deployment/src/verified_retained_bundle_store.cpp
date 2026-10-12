@@ -2021,7 +2021,9 @@ read_verified_planning_resources(
     const std::filesystem::path &trusted_root,
     const std::filesystem::path &raw_data,
     const core::RetainedBundleDTO &bundle,
-    std::span<const detail::PlanningResourceMapRow> resource_map) {
+    std::span<const detail::PlanningResourceMapRow> resource_map,
+    std::vector<VerifiedRetainedModelSourceUrdf> *model_source_urdfs =
+        nullptr) {
   const std::set<ModelIdentity> selected =
       graph_selected_model_identities(bundle.cell_graph);
   const auto records = require_exact_selected_model_records(bundle, selected);
@@ -2083,6 +2085,7 @@ read_verified_planning_resources(
 
     std::vector<ResolvedModelSourceArtifactCandidate> candidates;
     candidates.reserve(plan.artifacts().size());
+    std::optional<std::string> source_urdf;
     for (const auto &artifact : plan.artifacts()) {
       checked_accumulate(
           complete_source_bytes, artifact.byte_size,
@@ -2093,11 +2096,30 @@ read_verified_planning_resources(
       std::string bytes = read_verified_raw_reference(
           raw_data, artifact.expected_store_key, artifact.content_digest,
           artifact.byte_size, reference_label);
+      if (model_source_urdfs != nullptr &&
+          artifact.artifact_kind ==
+              ModelSourceArtifactKind::kUrdfXmlEntrypoint) {
+        if (source_urdf.has_value()) {
+          detail::fail_retained_bundle(
+              "retained model source closure has more than one URDF "
+              "entrypoint");
+        }
+        source_urdf = bytes;
+      }
       candidates.push_back({artifact.logical_uri, artifact.expected_store_key,
                             std::move(bytes)});
     }
     const SourceVerifiedModelAsset verified =
         reverify_model_source(plan, std::move(candidates));
+    if (model_source_urdfs != nullptr) {
+      if (!source_urdf.has_value()) {
+        detail::fail_retained_bundle(
+            "retained model source closure has no URDF entrypoint");
+      }
+      model_source_urdfs->push_back(VerifiedRetainedModelSourceUrdf{
+          core::ModelAssetId(identity.first),
+          core::ModelRevision(identity.second), std::move(*source_urdf)});
+    }
     if (verified.qualified_asset().reference() != *reference ||
         verified.value() != qualified.value() ||
         verified.verified_artifacts().size() != plan.artifacts().size()) {
@@ -2966,9 +2988,11 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
 
   const std::vector<detail::PlanningResourceMapRow> resource_map =
       detail::parse_and_verify_planning_resource_map(resource_map_bytes);
+  std::vector<VerifiedRetainedModelSourceUrdf> model_source_urdfs;
   std::vector<VerifiedRetainedPlanningResource> resources =
       read_verified_planning_resources(current_root, paths.raw_data,
-                                       bundle->value(), resource_map);
+                                       bundle->value(), resource_map,
+                                       &model_source_urdfs);
   std::uint64_t result_bytes = static_cast<std::uint64_t>(urdf.size());
   checked_accumulate(result_bytes, static_cast<std::uint64_t>(srdf.size()),
                      kMaxModelSourceClosureBytes,
@@ -2980,7 +3004,8 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
   }
 
   return VerifiedRetainedPlanningModel(query, std::move(urdf), std::move(srdf),
-                                       std::move(resources));
+                                       std::move(resources),
+                                       std::move(model_source_urdfs));
 }
 
 FilesystemVerifiedRetainedViewerModelSource::

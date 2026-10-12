@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
@@ -10,36 +12,15 @@
 
 namespace manyforge::roboplan_backend::detail {
 
-// This provider qualifies only the first aggregate installation. The caller
-// independently verifies both bundles and derives their exact component delta.
-inline void RequireInitialRos2ComponentInstallation(
-    const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
-        &request,
-    const core::CellGraphDTO &predecessor,
-    const core::CellGraphDTO &candidate) {
-  const auto &rows = request.component_delta.components;
-  if (request.valid() && predecessor.controllable_components.empty() &&
-      candidate.controllable_components.empty() && rows.empty() &&
-      predecessor.cell_id == candidate.cell_id &&
-      predecessor.graph_revision ==
-          request.predecessor_projection_revision.graph_revision &&
-      candidate.graph_revision ==
-          request.candidate_projection_revision.graph_revision)
-    return;
-  if (!request.valid() || !predecessor.controllable_components.empty() ||
-      candidate.controllable_components.size() != 1U || rows.size() != 1U ||
-      rows.front().disposition != deployment::ApplyComponentDisposition::kAdd ||
-      rows.front().controllable_component_id !=
-          candidate.controllable_components.front().controllable_component_id ||
-      predecessor.cell_id != candidate.cell_id ||
-      predecessor.graph_revision !=
-          request.predecessor_projection_revision.graph_revision ||
-      candidate.graph_revision !=
-          request.candidate_projection_revision.graph_revision) {
-    throw std::invalid_argument(
-        "ros2_component_delta_not_qualified: only empty-to-one aggregate "
-        "installation is supported; retain, removal and replacement remain "
-        "unavailable");
+// Interim Apply guard until selected component bring-up supplies Q86 recovery.
+// A known exited Retain cannot restart its launch or clear the existing incident.
+inline void RefuseExitedRos2Retain(
+    const core::ControllableComponentId &component_id,
+    const std::optional<std::string> &exit_reason) {
+  if (exit_reason) {
+    throw std::invalid_argument("ROS Apply cannot retain component " +
+                                component_id.value() + ": " + *exit_reason +
+                                "; bring-up required");
   }
 }
 
@@ -47,38 +28,58 @@ inline void RequireInitialRos2ComponentInstallation(
 // Readiness is a separate lifecycle observation, never invented by this
 // ownership receipt.
 inline component_manager::ManagerRuntimeComponentReceiptDTO
-ReadInitialRos2ComponentReceipt(
+ReadRos2ComponentReceipt(
     const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
         &request,
+    const core::ControllableComponentId &component_id,
     const core::ContentDigest &installed_runtime_identity,
     const RetainedRos2ControlRuntimeHandle &handle,
     const core::IExecutionBackend *execution,
     const core::IGripperCommandBackend *gripper,
     const core::RuntimeParticipantBinding &motion,
-    const core::RuntimeParticipantBinding &tool,
+    const std::optional<core::RuntimeParticipantBinding> &tool,
     const std::vector<core::RuntimeParticipantExecutionRegistration>
         &registrations,
     const core::IResolvedParticipantExecutionEngine *motion_engine,
-    const core::IResolvedParticipantExecutionEngine *gripper_engine) {
+    const core::IResolvedParticipantExecutionEngine *gripper_engine,
+    const RetainedRos2ControlRuntimeHandle *predecessor_handle,
+    const std::optional<std::string> &retained_process_exit = std::nullopt) {
   const auto require = [](const bool condition, const char *message) {
     if (!condition)
       throw std::invalid_argument(message);
   };
   const auto &rows = request.component_delta.components;
-  require(request.valid() && rows.size() == 1U &&
-              rows.front().disposition ==
-                  deployment::ApplyComponentDisposition::kAdd,
-          "ROS installed receipt requires one exact initial Add");
-  const auto &component_id = rows.front().controllable_component_id;
-  require(
-      rows.front().candidate_runtime_identity == installed_runtime_identity &&
-          handle.OwnsBackend(execution, motion, tool) && execution != nullptr &&
-          handle.OwnsGripper(gripper, tool),
-      "ROS installed receipt has no exact live factory-bound adapters");
-  require(motion_engine != nullptr && gripper_engine != nullptr &&
-              motion_engine != gripper_engine,
+  const auto row =
+      std::find_if(rows.begin(), rows.end(), [&](const auto &entry) {
+        return entry.controllable_component_id == component_id;
+      });
+  require(request.valid() && row != rows.end() &&
+              row->disposition !=
+                  deployment::ApplyComponentDisposition::kRemove,
+          "ROS installed receipt requires an exact candidate component");
+  const bool retained =
+      row->disposition == deployment::ApplyComponentDisposition::kRetain;
+  if (retained)
+    RefuseExitedRos2Retain(component_id, retained_process_exit);
+  require(retained ? predecessor_handle == &handle
+          : row->disposition == deployment::ApplyComponentDisposition::kAdd
+              ? predecessor_handle == nullptr
+              : predecessor_handle != nullptr && predecessor_handle != &handle,
+          "ROS installed receipt disagrees with the physical handle lifetime");
+  require(row->candidate_runtime_identity == installed_runtime_identity &&
+              execution != nullptr &&
+              handle.OwnsBackend(execution, motion, tool) &&
+              (tool ? handle.OwnsGripper(gripper, *tool) : gripper == nullptr),
+          "ROS installed receipt has no exact live factory-bound adapters");
+  require(motion_engine != nullptr &&
+              (!tool ||
+               (gripper_engine != nullptr && motion_engine != gripper_engine)),
           "ROS installed receipt has no distinct owned participant engines");
-  for (const auto *physical : {&motion, &tool}) {
+  std::vector<const core::RuntimeParticipantBinding *> physical_bindings{
+      &motion};
+  if (tool)
+    physical_bindings.push_back(&*tool);
+  for (const auto *physical : physical_bindings) {
     const auto &binding = physical->value();
     require(binding.controllable_component_id == component_id &&
                 binding.retained_bundle_id ==
@@ -96,10 +97,11 @@ ReadInitialRos2ComponentReceipt(
                     request.runtime_epoch,
             "ROS installed participant has another control owner");
     for (const auto &resource : binding.resources) {
-      require(std::binary_search(
-                  request.configuration_fence_scope.resources.begin(),
-                  request.configuration_fence_scope.resources.end(),
-                  resource.resource_id),
+      require(retained ||
+                  std::binary_search(
+                      request.configuration_fence_scope.resources.begin(),
+                      request.configuration_fence_scope.resources.end(),
+                      resource.resource_id),
               "ROS installed participant resource is outside its Apply fence");
     }
     const auto expected_engine =
@@ -119,6 +121,8 @@ ReadInitialRos2ComponentReceipt(
   }
   for (const auto &registration : registrations) {
     const auto &binding = registration.binding.value();
+    if (binding.controllable_component_id != component_id)
+      continue;
     const bool is_motion =
         binding.command_target_id == motion.value().command_target_id;
     require(
@@ -128,8 +132,8 @@ ReadInitialRos2ComponentReceipt(
             binding.graph_revision ==
                 request.candidate_projection_revision.graph_revision &&
             binding.runtime_unit_epochs == motion.value().runtime_unit_epochs &&
-            (is_motion ||
-             binding.command_target_id == tool.value().command_target_id) &&
+            (is_motion || (tool && binding.command_target_id ==
+                                       tool->value().command_target_id)) &&
             registration.engine ==
                 (is_motion ? motion_engine : gripper_engine) &&
             registration.stop_execution_port ==
@@ -137,15 +141,19 @@ ReadInitialRos2ComponentReceipt(
                     execution),
         "ROS installed registration crosses its owned component or adapter");
   }
+  const bool product_changed =
+      request.predecessor_projection_revision.retained_bundle_id !=
+          request.candidate_projection_revision.retained_bundle_id ||
+      request.predecessor_projection_revision.graph_revision !=
+          request.candidate_projection_revision.graph_revision;
   component_manager::ManagerRuntimeComponentReceiptDTO receipt{
       component_id,
-      deployment::ApplyComponentDisposition::kAdd,
+      row->disposition,
       installed_runtime_identity,
       motion.value().runtime_unit_epochs,
-      false,
-      false};
-  require(component_manager::ComponentReceiptsMatchRequest(request, {receipt}),
-          "ROS installed receipt differs from its exact Apply request");
+      retained,
+      retained && product_changed};
+  require(receipt.valid(), "ROS installed receipt is invalid");
   return receipt;
 }
 

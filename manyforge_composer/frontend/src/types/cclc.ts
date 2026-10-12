@@ -80,6 +80,71 @@ export type CCLCBlockingCauseClass =
 /** Cause of an open incident; never `none` or `availability`. */
 export type CCLCIncidentCauseClass = Exclude<CCLCBlockingCauseClass, 'none' | 'availability'>;
 
+/** Exact observed uint64 wire scalar; this carries no runtime authority. */
+export type CCLCUnsigned64 = number | string;
+
+/** Stored evidence retains its wire field names for faithful readback. */
+export interface CCLCIncidentDiagnosticSnapshot {
+  exit: {
+    status: number | null;
+    signal: number | null;
+    core_dumped: boolean;
+    observed_utc: string;
+  };
+  context: {
+    component_id: string | null;
+    request_context: string | null;
+    runtime_unit_id: string | null;
+    runtime_epoch: string | null;
+    bundle_id: string | null;
+    graph_revision: string | null;
+    generator_identity: string | null;
+    launch_identity: string | null;
+  };
+  readiness: {
+    known: boolean | null;
+    controller_manager_present: boolean | null;
+    controller_observed: boolean | null;
+    controller_loaded: boolean | null;
+    controller_bound: boolean | null;
+    arm_controller_active: boolean | null;
+    hardware_ready: boolean | null;
+    joint_sample_available: boolean | null;
+    binding_epoch: CCLCUnsigned64 | null;
+    sample_age_ns: Nanoseconds | null;
+    captured_utc: string | null;
+  };
+  settings: {
+    argv: string[];
+    controller_profile: string | null;
+    runtime_namespace: string | null;
+    arm_controller_name: string | null;
+    gripper_controller_name: string | null;
+    frame_prefix: string | null;
+    controllers_yaml: string | null;
+    /** Effective settings text; the client does not interpret configuration. */
+    retained_configuration_json: string | null;
+  };
+  generated: {
+    robot_description_sha256: string | null;
+    controllers_sha256: string | null;
+  };
+  output: {
+    tail: string;
+    line_count: number;
+    truncated: boolean;
+    dropped_forward_lines: CCLCUnsigned64;
+    dropped_forward_bytes: CCLCUnsigned64;
+    invalid_text_bytes: CCLCUnsigned64;
+  };
+  core_dump_link: string | null;
+}
+
+export interface CCLCIncidentDiagnostic {
+  error: NonNullable<CCLCTransactionStatus['error']>;
+  snapshot: CCLCIncidentDiagnosticSnapshot | null;
+}
+
 /**
  * An unexpected change after the component reached its target. It stays
  * open until the operator's `recover` acknowledgement is accepted; the full
@@ -92,6 +157,7 @@ export interface CCLCComponentIncident {
   detectedAtNs: Nanoseconds;
   summary: string;
   acknowledged: false;
+  diagnostic?: CCLCIncidentDiagnostic | null;
 }
 
 /** CCLC-issued progress toward the requested target; presentation only. */
@@ -115,6 +181,9 @@ export interface CCLCComponentSnapshot {
   providers: CCLCProviderOccurrence[];
   lifecycleTarget: CCLCLifecycleTarget | null;
   lifecycleProgress: CCLCLifecycleProgress | null;
+  /** Informational host output losses; unavailable observations stay absent. */
+  droppedOutputLines?: CCLCUnsigned64;
+  droppedOutputBytes?: CCLCUnsigned64;
 }
 
 export interface CCLCExpectedActiveConfiguration {

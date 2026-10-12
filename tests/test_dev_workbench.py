@@ -370,8 +370,7 @@ def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
     (None, None, True, "requires --bootstrap-project or --project"),
     (None, "first", False, "requires --ros2-control"),
     ("first", "second", True, "excludes --project"),
-    (str(REPOSITORY_ROOT / "examples/lite6_pick_and_place.scenario"), None, True,
-     "only ros2_control execution components"),
+    ("non_ros_fixture", None, True, "only ros2_control execution components"),
 ])
 def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
     monkeypatch: Any, project: str | None, bootstrap: str | None, ros: bool, error: str
@@ -380,6 +379,13 @@ def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
         pytest.fail("invalid selection must fail before build")
 
     monkeypatch.setattr(dev_workbench, "_ensure_current_backend", unexpected_build)
+    if project == "non_ros_fixture":
+        # Maintained examples now use ROS. Supply an explicitly non-ROS
+        # Scenario through the actual capture seam to retain this guard case.
+        from manyforge_composer.backend import scenario_artifacts
+        monkeypatch.setattr(scenario_artifacts, "capture_scenario_artifact",
+            lambda *args, **kwargs: ({"deployment_draft": {"components": [
+                {"configuration": {"runtime_kind": "native"}}]}}, project, "fixture_digest"))
     workbench = dev_workbench.Workbench(
         project_path=project, bootstrap_project_path=bootstrap,
         artifact_root=REPOSITORY_ROOT / "examples", ros2_control=ros,
@@ -651,3 +657,157 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
         "Program runner",
         "Headless API",
     ]
+
+
+def test_g_static_composer_preserves_endpoint_and_forwards_exact_site_executable(tmp_path, monkeypatch):
+    static = tmp_path / "frontend"
+    static.mkdir()
+    (static / "index.html").write_text("built fixture frontend")
+    observer = tmp_path / "build/isaac/ros-overlay/install/manyforge_ros_bringup/lib/manyforge_ros_bringup/pose_source_snapshot_publisher"
+    observer.parent.mkdir(parents=True)
+    observer.write_text("#!/bin/sh\n")
+    observer.chmod(0o755)
+    monkeypatch.setattr(dev_workbench, "BUILD_ROOT", tmp_path / "build")
+    site = tmp_path / "site.json"
+    site.write_text("{}")
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=9010, runner_port=9011, composer_port=9000, frontend_port=3000,
+        composer_static_dir=static, composer_bind_host="0.0.0.0", isaac_site_settings=site)
+    command = workbench._composer_command("http://127.0.0.1:9010")
+    assert command[command.index("--host") + 1] == "0.0.0.0"
+    assert command[command.index("--port") + 1] == "9000"
+    assert command[command.index("--static-dir") + 1] == str(static)
+    assert workbench._isaac_manager_arguments() == (
+        "--isaac-site-settings", str(site), "--isaac-pose-observer-executable", str(observer))
+    observer.unlink()
+    with pytest.raises(dev_workbench.WorkbenchError, match="installed Isaac pose observer"):
+        workbench._isaac_manager_arguments()
+    workbench.isaac_site_settings = None
+    assert workbench._isaac_manager_arguments() == ()
+
+
+@pytest.mark.parametrize("fresh,manager_ready,expected", [(True, True, True), (False, True, False), (True, False, False)])
+def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_path, monkeypatch, fresh, manager_ready, expected):
+    manager = {"source": {"available": True, "freshness": "fresh" if fresh else "stale", "known_gaps": []},
+               "status": {"manager_ready": manager_ready, "components": [{"lifecycle_state": "inactive"}]}}
+    class Client:
+        def __init__(self, url, **kwargs):
+            self.url = url
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def manager_status(self):
+            return manager
+        def health(self):
+            return {"status": "ready", "headless_projection_ready": True}
+        def request(self, method, path):
+            assert (method, path) == ("GET", "/api/program/health")
+            return {"started": True, "closed": False}
+    monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
+    (tmp_path / "workbench-startup-timing.json").write_text('{"build_elapsed_seconds":999,"readiness_elapsed_seconds":null}')
+    status = dev_workbench.query_operator_status(headless_port=9010, runner_port=9011, composer_port=9000)
+    assert status["ready"] is expected
+    assert status["manager"] == manager
+    assert status["timing"]["build_elapsed_seconds"] == 999
+
+
+def test_g_package_mismatch_refuses_before_build_or_process_start(tmp_path, monkeypatch):
+    from manyforge_operator.package_aggregate import package_aggregate_sha256
+    install = tmp_path / "package"
+    install.mkdir()
+    (install / "empty.json").write_text("{}")
+    digest = package_aggregate_sha256(install)
+    (install / "empty.json").write_text('{"changed":true}')
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        operator_install_root=install, operator_cell_id="fixture_cell",
+        canonical_empty_admission_filename="empty.json", package_aggregate_digest=digest)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: pytest.fail("must not build changed package"))
+    with pytest.raises(dev_workbench.WorkbenchError, match="aggregate mismatch"):
+        workbench.start()
+    assert workbench.processes == []
+
+
+def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_path, monkeypatch):
+    from manyforge_operator.package_aggregate import package_aggregate_sha256
+    monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
+    install = tmp_path / "package"
+    install.mkdir()
+    (install / "empty.json").write_text("{}")
+    manager_binary = tmp_path / "manager"
+    manager_binary.write_bytes(b"fixture executable")
+    manager_binary.chmod(0o755)
+    extension = tmp_path / "extension.so"
+    extension.write_bytes(b"fixture extension")
+    clock = [0.0]
+    def backend():
+        clock[0] += 120.0  # Arbitrary fixture duration, not a runtime claim.
+        return extension
+    monkeypatch.setattr(dev_workbench.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager_binary)
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", backend)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
+    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    monkeypatch.setattr(dev_workbench, "_port_available", lambda port: port != 3000)
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: pytest.fail("G must not npm ci"))
+    monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: pytest.fail("G must use its qualified package"))
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=9010, runner_port=9011, composer_port=9000, frontend_port=3000,
+        operator_install_root=install, operator_cell_id="fixture_cell",
+        operator_instance_id="fixture-instance", canonical_empty_admission_filename="empty.json",
+        package_aggregate_digest=package_aggregate_sha256(install), operator_readiness_timeout=5,
+        composer_bind_host="0.0.0.0")
+    monkeypatch.setattr(workbench, "_simulation_control_arguments", lambda: ())
+    commands = []
+    socket_owner = socket.socket(socket.AF_UNIX)
+    def spawn(name, command):
+        commands.append((name, tuple(command)))
+        workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
+        if name == "Manager":
+            index = command.index("--manager-run-root")
+            socket_owner.bind(str(Path(command[index + 1]) / "manager-command.sock"))
+    monkeypatch.setattr(workbench, "_spawn", spawn)
+    def popen(command, **kwargs):
+        commands.append(("Composer backend", tuple(command)))
+        return SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def request(self, *args):
+            return {"started": True}
+        def runtime(self):
+            return {"schema_version": "fixture"}
+        def manager_status(self):
+            return {"source": {"available": True, "freshness": "fresh", "known_gaps": []},
+                    "status": {"manager_ready": True}}
+        def manager_diff(self):
+            pytest.fail("G must not wait for Apply/CCLC convergence")
+        def program_cycle_status(self):
+            pytest.fail("G READY must not wait for Program containment")
+        def authoring_admission(self):
+            pytest.fail("G READY must not imply authoring permission")
+        def health(self):
+            return {"status": "ready"}
+    monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    try:
+        workbench.start()
+    finally:
+        socket_owner.close()
+    assert [name for name, _ in commands] == ["Program runner", "Headless API", "Manager", "Composer backend"]
+    assert workbench._readiness_deadline == 125.0  # Build duration is outside readiness budget.
+    timing = json.loads((tmp_path / "state/workbench-startup-timing.json").read_text())
+    assert timing == {"build_elapsed_seconds": 120.0, "readiness_elapsed_seconds": 0.0}
+    for name, command in commands[:2]:
+        assert command[command.index("--cell-id") + 1] == "fixture_cell"
+        assert command[command.index("--owner-id") + 1].endswith("fixture-instance")
+    manager_command = dict(commands)["Manager"]
+    assert manager_command[manager_command.index("--install-root") + 1] == str(install)
+    assert manager_command[manager_command.index("--canonical-empty-admission-filename") + 1] == "empty.json"

@@ -142,6 +142,26 @@ void expect_schema_rejection(CanonicalValue identity) {
                ClosedSchemaError);
 }
 
+TEST(RuntimeProfileCodec, OldSealedRosSchemaRefusesWithRecompileGuidance) {
+  ProfileSpec old;
+  old.profile_id = "manyforge.ros2_control_execution_runtime";
+  old.configuration_schema_id = "manyforge.value_schema.runtime.ros2_control_execution.v1";
+  old.configuration_schema_revision =
+      "sha256:f927705d80b40e266f3c62341911a223de2a3811188a2c4656d4bee98f81c30b";
+  old.status_endpoint_role = "ros2_control_execution_status";
+  old.runtime_roles = {"ros2_control_execution"};
+  old.endpoint_roles = {"logical_scene_services", "planner_scene_projection",
+                        "ros2_control_execution_status"};
+  EXPECT_NE(profile_document(old).find("sha256:0f916fb469d27a221a97cf72737e006c4c4fc566752ea477a141847a0012fef5"),
+            std::string::npos);
+  try {
+    static_cast<void>(qualify(old));
+    FAIL() << "old sealed ROS schema must not enter the current registry";
+  } catch (const RuntimeProfileCodecError &error) {
+    EXPECT_NE(std::string(error.what()).find("recompile"), std::string::npos);
+  }
+}
+
 TEST(RuntimeProfileCodec,
      QualifiesManagerManagedProfileAndCanonicalizesBothRoleSets) {
   ProfileSpec spec;

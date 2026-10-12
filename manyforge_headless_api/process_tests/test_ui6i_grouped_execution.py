@@ -17,7 +17,9 @@ from typing import Any, Callable, Iterator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.models import TargetObservationQuery
 from manyforge_headless_api.process_tests.test_process_stack import (
+    keep_failure_evidence,
     ProcessStack,
     _composer_fence,
     _composer_snapshot_stream,
@@ -58,7 +60,7 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 enable_program_runner=True,
             )
             try:
-                stack.prepare_native_package(ADMISSION_FILENAME)
+                stack.prepare_native_package(ADMISSION_FILENAME, ros2_control=True)
                 stack.start_manager()
                 stack.start_program_runner()
                 stack.start_api()
@@ -70,6 +72,7 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 yield stack
             except BaseException:
                 stack.log.flush()
+                keep_failure_evidence(root)
                 log_path = stack_root / "process-stack.log"
                 if log_path.is_file():
                     print(
@@ -80,6 +83,48 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 raise
             finally:
                 stack.close()
+
+
+def _wait_components_reached_requested_target(
+    stack: ProcessStack, timeout_seconds: float = 60.0
+) -> None:
+    """Wait until every deployed component reached its requested lifecycle target.
+
+    Apply success records the requested target; CCLC reports the achieved
+    state separately (ADR-0026), and motion stays closed until it is reached.
+    """
+    with (
+        HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as composer,
+        HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
+    ):
+        document = composer.request("GET", "/api/deployment/workspace")["draft"]["document"]
+        component_ids = sorted(row["component_id"] for row in document["components"])
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            states: dict[str, Any] = {}
+            for component_id in component_ids:
+                snapshot = headless.cclc_component(component_id)
+                target = snapshot.get("lifecycle_target")
+                progress = snapshot.get("lifecycle_progress")
+                states[component_id] = {
+                    "state": snapshot.get("component_lifecycle_state"),
+                    "generation": snapshot.get("component_lifecycle_generation"),
+                    "target": target,
+                    "progress": progress,
+                }
+            if all(
+                row["target"] is not None
+                and row["state"] == row["target"]["requested_state"]
+                and (row["progress"] is None or row["progress"]["phase"] == "satisfied")
+                for row in states.values()
+            ):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "deployed components did not reach their requested lifecycle "
+                    f"target within {timeout_seconds:.0f} s: {states!r}"
+                )
+            time.sleep(0.1)
 
 
 def _load_scenario(
@@ -199,6 +244,7 @@ def _load_scenario(
                         f"Scenario activation did not settle: {status!r}"
                     )
                 time.sleep(0.02)
+        _wait_components_reached_requested_target(stack)
         stack.wait_authoring_admission(expected_allowed=True)
         deployment = composer.request("GET", "/api/deployment/workspace")
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
@@ -340,6 +386,7 @@ def _save_and_reopen_current_scenario(
                         "reopened Scenario Apply did not settle: " f"{status!r}"
                     )
                 time.sleep(0.02)
+        _wait_components_reached_requested_target(stack)
         stack.wait_authoring_admission(expected_allowed=True)
         manager_after = composer.manager_status()["status"]["active"]
         for key in ("retained_bundle_id", "graph_revision", "cell_graph"):
@@ -660,11 +707,11 @@ def _write_mixed_variants(
         candidate["scenario_id"] = f"mixed_{kind}"
         candidate["name"] = f"Mixed Apply {kind}"
         components = candidate["deployment_draft"]["components"]
-        if kind in ("single", "solo"):
+        if kind in ("single", "solo", "solo_cartesian"):
             candidate["deployment_draft"]["components"] = [
                 row for row in components if row["component_id"] == "lite6_robot"
             ]
-        if kind == "solo":
+        if kind in ("solo", "solo_cartesian"):
             program = candidate["program_draft"]
             for root in program["forest"]:
                 root["children"] = [
@@ -682,6 +729,40 @@ def _write_mixed_variants(
                 row for row in assignment["target_roles"]
                 if row["target_role_id"] != "ur5e_arm"
             ]
+            # The survivor's frame_pose query needs FK; native refuses identically without it.
+            fk_role = program["target_roles"]["lite6_arm"]
+            fk_role["required_capabilities"].append({
+                "capability_id": "model.kinematics.fk",
+                "parameters": {}, "disposition": "required",
+            })
+            fk_role["required_capabilities"].sort(key=lambda row: row["capability_id"])
+            if kind == "solo_cartesian":
+                # Same single-robot Deployment; only the Program changes.
+                # Its frame/path reads must use the retained commanded source.
+                role = program["target_roles"]["lite6_arm"]
+                role["required_capabilities"].append({
+                    "capability_id": "planning.motion.cartesian_path",
+                    "parameters": {}, "disposition": "required",
+                })
+                role["required_capabilities"].sort(key=lambda row: row["capability_id"])
+                motion = next(child for root in program["forest"] for child in root["children"]
+                              if child["instance_id"] == "lite6_joint_motion")
+                motion["node_id"] = "motion.follow_cartesian_path"
+                # Authoring rule: value_sources is omitted when empty; unset motion defaults must reference the Program parameter.
+                motion["value_sources"] = {
+                    key: {"kind": "program_parameter", "reference": key}
+                    for key in ("max_blend_deviation_rad", "translation_tol_m")
+                }
+                motion["parameters"] = {
+                    "target_role": "lite6_arm", "base_frame_role": "base", "tcp_frame_role": "tcp",
+                    "target_mode": "relative",
+                    "target_reference": {"type": "frame_role", "frame_role_id": "tcp"},
+                    "path": [{"position_m": xyz, "orientation": {"rpy_deg": [0, 0, 0]}}
+                             for xyz in ([0, 0, 0], [0, 0, 0.01])],
+                    "velocity_scale": 0.2, "acceleration_scale": 0.25,
+                    "max_tcp_linear_speed_mps": 0.05, "execution_timeout_s": 30,
+                }
+
         elif kind == "move":
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
             ur5e["root_pose_in_cell"]["position_m"] = list(MOVED_UR5E_ROOT_POSITION_M)
@@ -866,13 +947,26 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
         _load_scenario(stack, GROUPED_SCENARIO)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             survivor = headless.cclc_component("lite6_robot")
-        paths = _write_mixed_variants(stack, ("solo",))
+        paths = _write_mixed_variants(stack, ("solo", "solo_cartesian"))
         applied, source_document_digest = _load_scenario(
             stack, "mixed_solo", scenario_path=paths["solo"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             retained = headless.cclc_component("lite6_robot")
         assert retained["provider_occurrences"] == survivor["provider_occurrences"]
+        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        owner_epoch = native.identity()["identity"]["owner_epoch"]
+        for frame_role in ("base", "tcp"):
+            response = native.query_target(TargetObservationQuery.model_validate({
+                "schema_version": "manyforge.target_observation_query.v1",
+                "owner_epoch": owner_epoch,
+                "program_binding_id": applied["program_binding_id"],
+                "target_role_id": "lite6_arm", "kind": "frame_pose", "frame_role_id": frame_role,
+            }))
+            assert response["target_observation"]["source_sequence"] > 0, response
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            assert headless.scene()["scene_runtime"]["payload"]["state"]["state"] == "open"
+
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(
                 stack,
@@ -898,6 +992,25 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
             )
             assert terminal["state"] == "succeeded", terminal
             _reset_cycle(client, program_run_id)
+
+        # A Program-only Apply after the peer removal must preserve the same
+        # physical owner and use that owner's commanded frame/path publication.
+        cartesian, digest = _load_scenario(
+            stack, "mixed_solo_cartesian", scenario_path=paths["solo_cartesian"]
+        )
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            assert headless.cclc_component("lite6_robot")["provider_occurrences"] == survivor["provider_occurrences"]
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(stack, scenario_id=cartesian["scenario_id"],
+                                 source_document_digest=digest, applied=cartesian)
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id="ui6i.solo.cartesian.motion-start")
+            terminal = _wait_run_state(client, program_run_id,
+                                      {"succeeded", "failed", "intervention_required", "stopped"})
+            assert terminal["state"] == "succeeded", terminal
+            _reset_cycle(client, program_run_id)
+
 
 
 def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:

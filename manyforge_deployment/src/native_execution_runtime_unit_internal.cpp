@@ -754,6 +754,122 @@ decode_execution_motion_target_limits(
   return result;
 }
 
+std::vector<
+    native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+decode_execution_gripper_target_configurations(
+    const core::JsonValueDTO::Array &gripper_target_configurations,
+    const std::string_view label) {
+  using native_execution_runtime_contract::Configuration;
+  std::vector<Configuration::GripperTargetConfiguration> result;
+  result.reserve(
+      gripper_target_configurations.size());
+  for (const auto &entry : gripper_target_configurations) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+    if (object == nullptr || (object->size() != 12U && object->size() != 13U)) {
+      throw RetainedBundleError(
+          std::string(label) + " has an invalid gripper target configuration");
+    }
+    const auto string_member = [&](const std::string_view name) -> std::string {
+      const auto found = object->find(name);
+      if (found == object->end()) {
+        throw RetainedBundleError(
+            std::string(label) + " has an incomplete gripper target configuration");
+      }
+      const auto *value = std::get_if<std::string>(&found->second.value);
+      if (value == nullptr || value->empty()) {
+        throw RetainedBundleError(
+            std::string(label) + " has an invalid gripper target string");
+      }
+      return *value;
+    };
+    const auto string_array_member =
+        [&](const std::string_view name, const bool require_nonempty) {
+          const auto found = object->find(name);
+          const auto *values = found == object->end()
+                                   ? nullptr
+                                   : std::get_if<core::JsonValueDTO::Array>(
+                                         &found->second.value);
+          if (values == nullptr || (require_nonempty && values->empty())) {
+            throw RetainedBundleError(
+                std::string(label) + " has an invalid gripper target list");
+          }
+          std::vector<std::string> result_values;
+          result_values.reserve(values->size());
+          for (const auto &value : *values) {
+            const auto *text = std::get_if<std::string>(&value.value);
+            if (text == nullptr || text->empty()) {
+              throw RetainedBundleError(
+                  std::string(label) + " has an invalid gripper target list item");
+            }
+            result_values.push_back(*text);
+          }
+          if (!std::is_sorted(result_values.begin(), result_values.end()) ||
+              std::adjacent_find(result_values.begin(), result_values.end()) !=
+                  result_values.end()) {
+            throw RetainedBundleError(
+                std::string(label) + " has a noncanonical gripper target list");
+          }
+          return result_values;
+        };
+    const auto duration = object->find("command_duration_s");
+    const auto *duration_s =
+        duration == object->end()
+            ? nullptr
+            : std::get_if<double>(&duration->second.value);
+    const auto component_id = string_member("controllable_component_id");
+    const auto target_id = string_member("command_target_id");
+    const auto actuation_kind = string_member("actuation_kind");
+    std::optional<std::int64_t> confirmation_validity_ns;
+    const auto confirmation = object->find("operator_confirmation_validity_ns");
+    if (confirmation != object->end()) {
+      const auto* value = std::get_if<double>(&confirmation->second.value);
+      if (value == nullptr || !std::isfinite(*value) || std::trunc(*value) != *value ||
+          *value < 1.0 || *value > 3'600'000'000'000.0) {
+        throw RetainedBundleError(
+            std::string(label) + " has invalid "
+            "operator confirmation validity");
+      }
+      confirmation_validity_ns = static_cast<std::int64_t>(*value);
+    } else if (object->size() != 12U) {
+      throw RetainedBundleError(
+          std::string(label) + " has an unknown gripper target field");
+    }
+    if (duration_s == nullptr || !std::isfinite(*duration_s) ||
+        *duration_s <= 0.0 || *duration_s > 60.0 ||
+        (actuation_kind != "position_commanded" &&
+         actuation_kind != "pneumatic")) {
+      throw RetainedBundleError(
+          std::string(label) + " has invalid gripper target semantics");
+    }
+    result.push_back(Configuration::GripperTargetConfiguration{
+        core::ControllableComponentId(component_id), core::CommandTargetId(target_id),
+        string_member("description"), actuation_kind, string_member("open_state_ref"),
+        string_member("closed_state_ref"), *duration_s, string_array_member("touch_links", true),
+        string_member("mount_frame"), string_member("attach_frame"), string_member("tcp_frame"),
+        string_array_member("auxiliary_frames", false), confirmation_validity_ns});
+  }
+  std::sort(result.begin(),
+            result.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.controllable_component_id,
+                              left.command_target_id) <
+                     std::tie(right.controllable_component_id,
+                              right.command_target_id);
+            });
+  if (std::adjacent_find(
+          result.begin(),
+          result.end(),
+          [](const auto &left, const auto &right) {
+            return left.controllable_component_id ==
+                       right.controllable_component_id &&
+                   left.command_target_id == right.command_target_id;
+          }) != result.end()) {
+    throw RetainedBundleError(
+        std::string(label) + " repeats a gripper target configuration");
+  }
+  return result;
+}
+
 native_execution_runtime_contract::Configuration
 decode_native_execution_runtime_configuration(
     const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
@@ -949,112 +1065,9 @@ decode_native_execution_runtime_configuration(
         "native runtime configuration has invalid gripper target configurations");
   }
   if (gripper_target_configurations != nullptr) {
-    result.gripper_target_configurations.reserve(
-        gripper_target_configurations->size());
-    for (const auto &entry : *gripper_target_configurations) {
-      const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
-      if (object == nullptr || (object->size() != 12U && object->size() != 13U)) {
-        throw RetainedBundleError(
-            "native runtime configuration has an invalid gripper target configuration");
-      }
-      const auto string_member = [&](const std::string_view name) -> std::string {
-        const auto found = object->find(name);
-        if (found == object->end()) {
-          throw RetainedBundleError(
-              "native runtime configuration has an incomplete gripper target configuration");
-        }
-        const auto *value = std::get_if<std::string>(&found->second.value);
-        if (value == nullptr || value->empty()) {
-          throw RetainedBundleError(
-              "native runtime configuration has an invalid gripper target string");
-        }
-        return *value;
-      };
-      const auto string_array_member =
-          [&](const std::string_view name, const bool require_nonempty) {
-            const auto found = object->find(name);
-            const auto *values = found == object->end()
-                                     ? nullptr
-                                     : std::get_if<core::JsonValueDTO::Array>(
-                                           &found->second.value);
-            if (values == nullptr || (require_nonempty && values->empty())) {
-              throw RetainedBundleError(
-                  "native runtime configuration has an invalid gripper target list");
-            }
-            std::vector<std::string> result_values;
-            result_values.reserve(values->size());
-            for (const auto &value : *values) {
-              const auto *text = std::get_if<std::string>(&value.value);
-              if (text == nullptr || text->empty()) {
-                throw RetainedBundleError(
-                    "native runtime configuration has an invalid gripper target list item");
-              }
-              result_values.push_back(*text);
-            }
-            if (!std::is_sorted(result_values.begin(), result_values.end()) ||
-                std::adjacent_find(result_values.begin(), result_values.end()) !=
-                    result_values.end()) {
-              throw RetainedBundleError(
-                  "native runtime configuration has a noncanonical gripper target list");
-            }
-            return result_values;
-          };
-      const auto duration = object->find("command_duration_s");
-      const auto *duration_s =
-          duration == object->end()
-              ? nullptr
-              : std::get_if<double>(&duration->second.value);
-      const auto component_id = string_member("controllable_component_id");
-      const auto target_id = string_member("command_target_id");
-      const auto actuation_kind = string_member("actuation_kind");
-      std::optional<std::int64_t> confirmation_validity_ns;
-      const auto confirmation = object->find("operator_confirmation_validity_ns");
-      if (confirmation != object->end()) {
-        const auto* value = std::get_if<double>(&confirmation->second.value);
-        if (value == nullptr || !std::isfinite(*value) || std::trunc(*value) != *value ||
-            *value < 1.0 || *value > 3'600'000'000'000.0) {
-          throw RetainedBundleError(
-              "native runtime configuration has invalid "
-              "operator confirmation validity");
-        }
-        confirmation_validity_ns = static_cast<std::int64_t>(*value);
-      } else if (object->size() != 12U) {
-        throw RetainedBundleError(
-            "native runtime configuration has an unknown gripper target field");
-      }
-      if (duration_s == nullptr || !std::isfinite(*duration_s) ||
-          *duration_s <= 0.0 || *duration_s > 60.0 ||
-          (actuation_kind != "position_commanded" &&
-           actuation_kind != "pneumatic")) {
-        throw RetainedBundleError(
-            "native runtime configuration has invalid gripper target semantics");
-      }
-      result.gripper_target_configurations.push_back(Configuration::GripperTargetConfiguration{
-          core::ControllableComponentId(component_id), core::CommandTargetId(target_id),
-          string_member("description"), actuation_kind, string_member("open_state_ref"),
-          string_member("closed_state_ref"), *duration_s, string_array_member("touch_links", true),
-          string_member("mount_frame"), string_member("attach_frame"), string_member("tcp_frame"),
-          string_array_member("auxiliary_frames", false), confirmation_validity_ns});
-    }
-    std::sort(result.gripper_target_configurations.begin(),
-              result.gripper_target_configurations.end(),
-              [](const auto &left, const auto &right) {
-                return std::tie(left.controllable_component_id,
-                                left.command_target_id) <
-                       std::tie(right.controllable_component_id,
-                                right.command_target_id);
-              });
-    if (std::adjacent_find(
-            result.gripper_target_configurations.begin(),
-            result.gripper_target_configurations.end(),
-            [](const auto &left, const auto &right) {
-              return left.controllable_component_id ==
-                         right.controllable_component_id &&
-                     left.command_target_id == right.command_target_id;
-            }) != result.gripper_target_configurations.end()) {
-      throw RetainedBundleError(
-          "native runtime configuration repeats a gripper target configuration");
-    }
+    result.gripper_target_configurations =
+        decode_execution_gripper_target_configurations(
+            *gripper_target_configurations, "native runtime configuration");
   }
   // Each gripper configuration names a gripper target this unit hosts, on
   // its own component; it never borrows an arm's identity.

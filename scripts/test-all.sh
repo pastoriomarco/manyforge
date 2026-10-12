@@ -503,6 +503,8 @@ run_headless_python_tests() {
         FAIL=$((FAIL + 1))
         return
     fi
+    # The UI6-I cell is a ros2_control mock cell: its process tests need the
+    # ROS image and run in the `ros-e2e` suite, never here.
     if MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
@@ -520,6 +522,7 @@ run_headless_python_tests() {
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
             manyforge_program_runner/tests/ \
+            "${UI6I_ROS_PROCESS_TESTS[@]/#/--ignore=}" \
             -p no:cacheprovider \
             -v; then
         PASS=$((PASS + 1))
@@ -576,7 +579,7 @@ run_python_tests() {
         tests/test_public_contract_entrypoint_reconciliation.py \
         tests/test_qualification_wrapper_entrypoints.py \
         tests/test_ros_qualification_helpers.py \
-        exts/manyforge.isaac.command_guard/tests/test_command_guard.py \
+        exts/manyforge.isaac.command_guard/tests/ \
         tests/test_grouped_gtest_runner.py \
         tests/test_release_golden_workflow.py \
         tests/test_test_all_script_contract.py \
@@ -723,9 +726,149 @@ run_qualification_soak_tests() {
     manyforge_fail_composable_cell_runtime_unavailable
 }
 
+# The ROS image's environment the Q9 build helper selects: ROS, the pinned
+# stock topic_based_ros2_control install, the xarm_description data overlay and
+# the application venv. Re-entering a configured tree needs the same one.
+ROS_INTEGRATION_TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install
+ROS_INTEGRATION_DATA_OVERLAY=/opt/manyforge/xarm_description/install
+
+source_ros_integration_environment() {
+    set +u
+    # shellcheck disable=SC1090
+    source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+    # shellcheck disable=SC1091
+    source "$ROS_INTEGRATION_TOPIC_INSTALL/setup.bash"
+    # shellcheck disable=SC1091
+    source "$ROS_INTEGRATION_DATA_OVERLAY/setup.bash"
+    if [[ -d "${MANYFORGE_VENV:-/opt/manyforge/venv}" ]]; then
+        # shellcheck disable=SC1091
+        source "${MANYFORGE_VENV:-/opt/manyforge/venv}/bin/activate"
+    fi
+    set -u
+}
+
+# Q9: one ROS integration graph (Core, deployment, the JTC adapter and gripper,
+# the ROS execution host) built by the ROS image's helper, then its CTest.
 run_ros_tests() {
-    section "ROS adapter/runtime"
-    manyforge_fail_composable_cell_runtime_unavailable
+    section "ROS integration graph (Core, deployment, JTC adapter, ROS host)"
+    local build_root="$BUILD_DIR/ros-integration"
+    local build="$build_root/roboplan"
+    local helper_status=0
+    MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON \
+    MANYFORGE_ROS2_CONTROL_BUILD_ROOT="$build_root" \
+    CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_PARALLEL_LEVEL" \
+        bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
+            --source-dir "$WORKSPACE/scripts/ros/ros-integration" --target all \
+            --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
+            --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY" || helper_status=$?
+    if (( helper_status != 0 )); then
+        # Report every failing target of the configured tree, not only the first.
+        if [[ -f "$build/CMakeCache.txt" ]] && set_build_keep_going_args "$build"; then
+            ( source_ros_integration_environment
+              cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
+                  -- "${BUILD_KEEP_GOING_ARGS[@]}" ) || true
+        fi
+        echo -e "${RED}  FAIL: ROS integration build failed${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    cd "$build"
+    if ! ( source_ros_integration_environment
+           require_ctest_tests "ROS integration graph" \
+               "JtcExecutionPort" "Ros2GripperCommandBackendTest" \
+               "RetainedRos2ControlBackendFactoryTest" \
+               "RetainedRos2ControlRuntimeHandleTest" \
+               "RetainedIsaacArmGuardBindingTest" \
+               "Ros2ControlKernelStopIntegrationTest" ); then
+        FAIL=$((FAIL + 1))
+    elif ( source_ros_integration_environment
+           ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S" ); then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# UI6-I process tests whose cell is the ros2_control mock lane. They need the
+# ROS image: Manager beside the real ROS execution host, which starts its
+# Manager-owned mock controller launches from the sourced bringup overlay.
+UI6I_ROS_PROCESS_TESTS=(
+    manyforge_headless_api/process_tests/test_ui6i_grouped_execution.py
+    manyforge_headless_api/process_tests/test_operator_alarm_motion_attention.py
+)
+
+run_ros_e2e_tests() {
+    section "UI6-I mock cell: Manager, ROS execution host, mock ros2_control"
+    local build_root="$BUILD_DIR/ros-e2e"
+    local ros_build="$build_root/roboplan"
+    local overlay="$build_root/ros-overlay/install/setup.bash"
+    local headless="$BUILD_DIR/headless"
+    local helper_status=0
+    # One ROS-enabled graph supplies the ROS host and, like the workbench's
+    # ROS mode, the native host and planner worker installed beside it. The
+    # Headless build that supplies Manager requires the test-only planning
+    # fixture host beside its configured native host, hence BUILD_TESTING=ON;
+    # only the named targets are built.
+    MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON \
+    MANYFORGE_ROS2_CONTROL_BUILD_ROOT="$build_root" \
+    CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_PARALLEL_LEVEL" \
+        bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
+            --target manyforge_ros2_control_execution_host \
+            --target manyforge_roboplan_candidate_worker \
+            --target manyforge_native_execution_host \
+            --target manyforge_native_execution_host_pick_place_planning_fixture \
+            --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
+            --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY" || helper_status=$?
+    if (( helper_status != 0 )); then
+        echo -e "${RED}  FAIL: ROS execution host build failed${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    # Same configuration as build_manyforge_headless, with its full output
+    # kept: this lane's evidence must show any configure or build error.
+    local pybind11_cmake_dir
+    pybind11_cmake_dir="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+    if ! cmake -S "$WORKSPACE/manyforge_headless" -B "$headless" -G "$BUILD_GENERATOR" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
+            -DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="$ros_build/manyforge_native_execution_host" \
+            -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
+        || ! cmake --build "$headless" --parallel "$BUILD_PARALLEL_LEVEL"; then
+        echo -e "${RED}  FAIL: Headless build failed${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if ! prepare_ui6i_cell_bootstrap; then
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    # A failing test copies its stack's logs and controller-launch files here.
+    # One fresh folder per run; earlier runs' evidence is kept, not deleted.
+    local evidence
+    evidence="$BUILD_DIR/ros-e2e-evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    mkdir -p "$evidence"
+    cd "$WORKSPACE"
+    if ( source_ros_integration_environment
+         set +u
+         # shellcheck disable=SC1090
+         source "$overlay"
+         set -u
+         setup_pythonpath
+         export PYTHONPATH="$headless:$PYTHONPATH"
+         MANYFORGE_MANAGER_DAEMON="$headless/manyforge_manager_daemon" \
+         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$headless/canonical-empty-test-package" \
+         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+         MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
+         MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
+         MANYFORGE_NATIVE_EXECUTION_HOST="$ros_build/manyforge_native_execution_host" \
+         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$ros_build/manyforge_roboplan_candidate_worker" \
+         MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
+         MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT="$evidence" \
+         pytest "${UI6I_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
 }
 
 case "$FILTER" in
@@ -769,6 +912,9 @@ case "$FILTER" in
     ros)
         run_ros_tests
         ;;
+    ros-e2e)
+        run_ros_e2e_tests
+        ;;
     qualification-all)
         run_qualification_tests
         run_qualification_native_tests
@@ -791,7 +937,7 @@ case "$FILTER" in
         run_composer_frontend_tests
         ;;
     *)
-        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-native|qualification-soak|qualification-all|integration|ros|ros-e2e]"
         exit 1
         ;;
 esac

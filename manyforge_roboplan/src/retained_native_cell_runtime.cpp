@@ -363,7 +363,6 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_product(
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations,
     core::RuntimeParticipantAdmissionResolver participant_resolver,
     std::vector<RetainedStopSurveillanceSourceInput> candidate_stop_sources,
-    std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget,
     std::function<core::Result<void>()> commit_publication) {
   try {
     ValidateRegistrations(registrations, participant_resolver);
@@ -391,8 +390,7 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_product(
     return observer->ReplaceSources(std::move(sources));
   };
   auto result = addressed_kernel_->reconfigure_runtime_product(
-      registrations, participant_resolver,
-      std::move(cell_stop_deadline_budget), std::move(publish));
+      registrations, participant_resolver, std::move(publish));
   if (!result.ok()) {
     return result;
   }
@@ -405,7 +403,6 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_component_set(
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations,
     core::RuntimeParticipantAdmissionResolver participant_resolver,
     std::vector<RetainedStopSurveillanceSourceInput> candidate_stop_sources,
-    std::optional<core::StopDeadlineBudgetDTO> cell_stop_deadline_budget,
     core::RetainedBundleId candidate_retained_bundle_id,
     core::GraphRevision candidate_graph_revision,
     const core::ConfigurationFenceId &apply_fence_id,
@@ -439,7 +436,6 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_component_set(
   };
   auto result = addressed_kernel_->reconfigure_runtime_component_set(
       registrations, participant_resolver,
-      std::move(cell_stop_deadline_budget),
       std::move(candidate_retained_bundle_id),
       std::move(candidate_graph_revision), apply_fence_id, scope,
       retained_components, std::move(publish));

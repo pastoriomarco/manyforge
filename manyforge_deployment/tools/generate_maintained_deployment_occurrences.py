@@ -52,7 +52,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:9d37332a6f3c943e2f1811b5009c329d24248665f4ec14924a5ca437510c6905"
+    "sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -64,7 +64,7 @@ MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
 )
 MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
-    "sha256:58ec6382a268329e9d8001eb53aac31259b5eb95a3690095aa4bbe12ac51d83b"
+    "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27"
 )
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
 LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
@@ -1396,60 +1396,106 @@ def native_lifecycle_provider_manifest(
 
 
 def ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
-    ready = lifecycle_predicate(
+    """Controllers load inactive; CCLC activates them (design R6, section 7.5)."""
+    ready = "external.controller_configuration_ready"
+    loaded = "external.controller_loaded"
+    fault = "external.fault_present"
+    transport = "external.transport_ready"
+    boolean = lifecycle_boolean
+    prepared = lifecycle_predicate(
         ["prepared", "active"],
-        {
-            "external.controller_configuration_ready": lifecycle_boolean(True),
-            "external.fault_present": lifecycle_boolean(False),
-            "external.transport_ready": lifecycle_boolean(True),
-        },
+        {loaded: boolean(True), fault: boolean(False), transport: boolean(True)},
     )
     active = lifecycle_predicate(
         ["active"],
         {
-            "external.controller_configuration_ready": lifecycle_boolean(True),
-            "external.fault_present": lifecycle_boolean(False),
-            "external.transport_ready": lifecycle_boolean(True),
+            ready: boolean(True),
+            loaded: boolean(True),
+            fault: boolean(False),
+            transport: boolean(True),
         },
     )
     disabled = lifecycle_predicate(
         ["disabled"],
-        {
-            "external.controller_configuration_ready": lifecycle_boolean(False),
-            "external.fault_present": lifecycle_boolean(False),
-            "external.transport_ready": lifecycle_boolean(True),
-        },
+        {ready: boolean(False), fault: boolean(False), transport: boolean(True)},
     )
     timeout_ns = 30_000_000_000
     return [
         {
             "intent": "prepare",
             "requested_state": "prepared",
-            "requested_postcondition": ready,
+            "requested_postcondition": prepared,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [],
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.prepare",
+                    lifecycle_predicate(
+                        ["declared", "disabled"],
+                        {
+                            loaded: boolean(True),
+                            fault: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    prepared,
+                )
+            ],
         },
         {
             "intent": "enable",
             "requested_state": "active",
             "requested_postcondition": active,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [],
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.activate",
+                    lifecycle_predicate(
+                        ["prepared"],
+                        {
+                            ready: boolean(False),
+                            loaded: boolean(True),
+                            fault: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    active,
+                )
+            ],
         },
         {
             "intent": "disable",
             "requested_state": "disabled",
             "requested_postcondition": disabled,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [],
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.deactivate",
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded"],
+                        {transport: boolean(True)},
+                    ),
+                    disabled,
+                )
+            ],
         },
         {
             "intent": "recover",
-            "requested_state": "disabled",
-            "recover_target_eligibility": disabled,
-            "requested_postcondition": disabled,
+            "requested_state": "prepared",
+            "recover_target_eligibility": lifecycle_predicate(
+                ["prepared", "active", "degraded", "faulted"],
+                {transport: boolean(True)},
+            ),
+            "requested_postcondition": prepared,
             "timeout_duration_ns": timeout_ns,
-            "transitions": [],
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.recover",
+                    lifecycle_predicate(
+                        ["degraded", "faulted"], {transport: boolean(True)}
+                    ),
+                    prepared,
+                )
+            ],
         },
     ]
 
@@ -1533,41 +1579,24 @@ def lite6_lifecycle_identity_header(
     ).encode("utf-8")
 
 
-def cell_controlled_stop_deadline_budget() -> dict[str, Any]:
-    """One outer transaction envelope shared by every cell participant."""
-    return {
-        "outer_duration_ns": 3_000_000_000,
-        "kernel_completion_reserve_ns": 200_000_000,
-        "phases": [
-            {"phase_id": "command", "deadline_offset_ns": 300_000_000},
-            {"phase_id": "terminal", "deadline_offset_ns": 1_750_000_000},
-            {"phase_id": "hard_command", "deadline_offset_ns": 1_900_000_000},
-            {"phase_id": "hard_terminal", "deadline_offset_ns": 2_700_000_000},
-        ],
-    }
-
-
 def controller_goal_cancel_stop_policy() -> dict[str, Any]:
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
         "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
         "disposition": "stoppable",
         "containment_granularity": "resource",
-        "deadline_budget": cell_controlled_stop_deadline_budget(),
         "escalation_stages": [
             {
                 "stop_escalation_stage_id": "nominal_controller_goal_cancel",
                 "stage_kind": "nominal",
                 "containment_granularity": "resource",
                 "containment_command": {
-                    "command_phase_id": "command",
                     "command": {"command_kind": "controller_goal_cancel"},
                 },
                 "evidence_conjunction": "all_of",
                 "evidence_requirements": [
                     {
                         "evidence_item_id": "goal_terminal",
-                        "phase_id": "terminal",
                         "evidence": {"evidence_kind": "controller_goal_terminal"},
                         "source_requirement": {
                             "source_kind": "controller_goal_status",
@@ -1584,7 +1613,6 @@ def controller_goal_cancel_stop_policy() -> dict[str, Any]:
                 "stage_kind": "software_hard",
                 "containment_granularity": "resource",
                 "containment_command": {
-                    "command_phase_id": "hard_command",
                     "command": {
                         "command_kind": "registered",
                         "provider_contract_ref": software_hard_provider_contract_ref(),
@@ -1595,7 +1623,6 @@ def controller_goal_cancel_stop_policy() -> dict[str, Any]:
                 "evidence_requirements": [
                     {
                         "evidence_item_id": "hard_rest",
-                        "phase_id": "hard_terminal",
                         "evidence": {
                             "evidence_kind": "motion_rest",
                             "provider_contract_ref": software_hard_provider_contract_ref(),
@@ -1634,14 +1661,12 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
         "stop_evidence_policy_id": "manyforge.arm_motion_controlled_stop",
         "disposition": "stoppable",
         "containment_granularity": "resource",
-        "deadline_budget": cell_controlled_stop_deadline_budget(),
         "escalation_stages": [
             {
                 "stop_escalation_stage_id": "motion_controlled_stop",
                 "stage_kind": "nominal",
                 "containment_granularity": "resource",
                 "containment_command": {
-                    "command_phase_id": "command",
                     "command": {
                         "command_kind": "motion_controlled_stop",
                         "provider_contract_ref": controlled_ref,
@@ -1651,7 +1676,6 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
                 "evidence_requirements": [
                     {
                         "evidence_item_id": "controlled_rest",
-                        "phase_id": "terminal",
                         "evidence": {
                             "evidence_kind": "motion_rest",
                             "provider_contract_ref": controlled_ref,
@@ -1678,7 +1702,6 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
                 "stage_kind": "software_hard",
                 "containment_granularity": "resource",
                 "containment_command": {
-                    "command_phase_id": "hard_command",
                     "command": {
                         "command_kind": "registered",
                         "provider_contract_ref": software_hard_provider_contract_ref(),
@@ -1689,7 +1712,6 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
                 "evidence_requirements": [
                     {
                         "evidence_item_id": "hard_rest",
-                        "phase_id": "hard_terminal",
                         "evidence": {
                             "evidence_kind": "motion_rest",
                             "provider_contract_ref": software_hard_provider_contract_ref(),
@@ -2020,15 +2042,13 @@ def catalog_sources(
     )
 
     component_references: dict[str, dict[str, str]] = {}
-    fixed_scale_profiles = {
-        profile["runtime_restoration_profile_id"]
+    # Every family with a ROS controller profile (Isaac or offline mock, also
+    # those only composed by generated multi-robot cells) has the fixed-scale
+    # ROS component type.
+    fixed_scale_families = {
+        profile["model_family_id"]
         for profile in description["runtime_restoration_profiles"]
         if "ros2_control_runtime" in profile
-    }
-    fixed_scale_families = {
-        deployment["model_family_id"]
-        for deployment in description["deployments"]
-        if deployment["runtime_restoration_profile_id"] in fixed_scale_profiles
     }
     for family in description["model_families"]:
         document = component_type_document(family)
@@ -2145,6 +2165,44 @@ def domain_id(occurrence: str, target: str) -> str:
     return f"{occurrence}.{target}.control"
 
 
+FAULT_STOP_PROFILE_FIELDS: Final = frozenset(
+    {
+        "profile_id",
+        "stop_mode",
+        "deceleration_time_s",
+        "per_joint_max_deceleration_rad_s2",
+        "allow_natural_completion_on_short_path",
+        "require_backend_confirmation",
+    }
+)
+
+
+def fault_stop_profile_row(occurrence: str, profile: dict[str, Any]) -> dict[str, Any]:
+    """Project main's authored fault Stop profile into the ROS runtime row.
+
+    The fields are copied unchanged; only the source-joint map becomes sorted
+    rows because the closed runtime schema has no map form.
+    """
+    unknown = set(profile) - FAULT_STOP_PROFILE_FIELDS
+    if unknown:
+        raise GenerationError(
+            f"default_fault_stop_profile has unsupported fields {sorted(unknown)}"
+        )
+    row: dict[str, Any] = {
+        "controllable_component_id": occurrence,
+        "command_target_id": "arm",
+    }
+    for name, value in profile.items():
+        if name == "per_joint_max_deceleration_rad_s2":
+            row[name] = [
+                {"source_joint_name": joint, "max_deceleration_rad_s2": limit}
+                for joint, limit in sorted(value.items())
+            ]
+        else:
+            row[name] = copy.deepcopy(value)
+    return row
+
+
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
@@ -2158,9 +2216,40 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ])
     if ros2_control:
+        if "isaac_world" in deployment:
+            runtime_configuration["isaac_world"] = deployment["isaac_world"]
         # The source cap is explicit demo policy; bind it to this occurrence.
         for limit in runtime_configuration["motion_target_limits"]:
             limit["controllable_component_id"] = occurrence
+        # Q37: the authored fault Stop profile is read directly, as main.
+        runtime_configuration["default_fault_stop_profiles"] = [
+            fault_stop_profile_row(
+                occurrence,
+                runtime_restoration_profile["stop_profiles"][
+                    "default_fault_stop_profile"
+                ],
+            )
+        ]
+        # Q68: the runtime unit carries each component's own controller
+        # profile (Isaac or offline mock), as the activation compiler emits.
+        selectors = [
+            name
+            for name in ("isaac_profile", "mock_profile")
+            if name in runtime_configuration
+        ]
+        if len(selectors) != 1:
+            raise GenerationError(
+                "maintained ROS profile must select exactly one controller profile"
+            )
+        runtime_configuration["controller_profiles"] = [
+            {
+                "controllable_component_id": occurrence,
+                "frame_prefix": "",
+                selectors[0]: runtime_configuration.pop(selectors[0]),
+            }
+        ]
+        for row in runtime_configuration.get("gripper_target_configurations", []):
+            row["controllable_component_id"] = occurrence
     key_prefix = "ros2_control:" if ros2_control else ""
     component_ref = refs[
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"
@@ -2175,7 +2264,7 @@ def graph_and_applicability(
     ]
     logical_scene_ref = refs["provider:logical_scene"]
     runtime_unit_id = (
-        f"{occurrence}.ros2_control_execution"
+        "robot_cell.ros2_control_execution"
         if ros2_control
         else "robot_cell.native_execution"
     )
@@ -2259,8 +2348,7 @@ def graph_and_applicability(
                 "containment_granularity": "resource",
             }
             if (
-                not ros2_control
-                and target == "arm"
+                target == "arm"
                 and capability_id
                 in {
                     "execution.trajectory.execute",
@@ -2463,17 +2551,27 @@ def operator_stop_contract_parameters(
         fault_profile = runtime_restoration_profile["stop_profiles"][
             "default_fault_stop_profile"
         ]
+        # The native runtime still derives its fault profile from the
+        # operator profile, so its authored copy must equal that derivation.
+        # The ROS runtime reads the authored fault profile directly (Q37).
+        fault_profile_derived = "ros2_control_runtime" not in runtime_restoration_profile
         if (
             profile.get("deceleration_time_s") != 1.0
             or profile.get("allow_natural_completion_on_short_path") is not True
             or "recoverable_substitution_mode" in profile
             or acceleration != expected_acceleration
-            or fault_profile.get("profile_id") != "fault_spring_back_hold"
-            or fault_profile.get("stop_mode") != "spring_back_hold"
-            or fault_profile.get("deceleration_time_s") != 1.0
-            or fault_profile.get("per_joint_max_deceleration_rad_s2")
-            != expected_acceleration
-            or fault_profile.get("require_backend_confirmation", True) is not True
+            or (
+                fault_profile_derived
+                and (
+                    fault_profile.get("profile_id") != "fault_spring_back_hold"
+                    or fault_profile.get("stop_mode") != "spring_back_hold"
+                    or fault_profile.get("deceleration_time_s") != 1.0
+                    or fault_profile.get("per_joint_max_deceleration_rad_s2")
+                    != expected_acceleration
+                    or fault_profile.get("require_backend_confirmation", True)
+                    is not True
+                )
+            )
         ):
             raise GenerationError(
                 "Lite6 retained Stop profiles differ from the qualified "
@@ -2582,27 +2680,6 @@ def stop_policy_projection(
     return {
         "retained_policy_records": [],
         "stop_stage_parameters": stop_stage_parameters,
-        # Explicit new example settings, not a reinterpretation of the old
-        # catalog's outer envelope. ROS/controller-backed examples retain a
-        # larger settling allowance; provider qualification is still required.
-        "stop_timing_parameters": [
-            {
-                "control_binding_id": binding["control_binding_id"],
-                "control_binding_revision": binding["control_binding_revision"],
-                "timing": {
-                    "command_latency_allowance_ns": 250_000_000,
-                    "settling_allowance_ns": (
-                        1_500_000_000
-                        if "ros2_control_runtime" in runtime_restoration_profile
-                        else 750_000_000
-                    ),
-                    "operational_timeout_ns": 3_000_000_000,
-                },
-            }
-            for binding in sorted(
-                graph["control_bindings"], key=lambda row: row["control_binding_id"]
-            )
-        ],
         "commissioned_stop_interfaces": [],
         "interrupt_sources": [],
         "interrupt_policies": [],
@@ -2873,10 +2950,6 @@ def refresh_cross_revisions(path: Path) -> None:
         domain = domains[parameters["control_domain_id"]]
         parameters["control_binding_revision"] = binding["control_binding_revision"]
         parameters["control_domain_revision"] = domain["control_domain_revision"]
-    for selected in value["policies"].get("stop_timing_parameters", []):
-        selected["control_binding_revision"] = bindings[selected["control_binding_id"]][
-            "control_binding_revision"
-        ]
     replace_file(path, pretty_bytes(value))
 
 
@@ -3037,13 +3110,6 @@ def _deployment_intent(
             }
             for joint in source_joints
         ],
-        "timing": {
-            "command_latency_allowance_ns": 250_000_000,
-            "settling_allowance_ns": (
-                1_500_000_000 if runtime_kind == "ros2_control" else 750_000_000
-            ),
-            "operational_timeout_ns": 3_000_000_000,
-        },
     }
 
     model_source: dict[str, Any] = {
@@ -3075,6 +3141,7 @@ def _deployment_intent(
         "components": [
             {
                 "component_id": deployment["component_occurrence_id"],
+                "frame_prefix": "",
                 "component_profile_id": deployment[
                     "runtime_restoration_profile_id"
                 ],
@@ -3104,6 +3171,8 @@ def _deployment_intent(
         "assistant_profile_id": deployment["assistant_profile_id"],
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
+    if "isaac_world" in deployment:
+        result["isaac_world"] = deployment["isaac_world"]
     return result
 
 

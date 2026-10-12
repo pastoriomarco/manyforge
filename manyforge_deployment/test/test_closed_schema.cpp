@@ -594,7 +594,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970");
+          "d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -675,8 +675,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                 core::SchemaId("manyforge.value_schema.provider_contract."
                                "motion_controlled_stop.v1"),
                 core::SchemaRevision("sha256:"
-                                     "58ec6382a268329e9d8001eb53aac31259b5eb95a"
-                                     "3690095aa4bbe12ac51d83b")),
+                                     "fa6d62df17f87b231e2002bc38de0ecac9c6aa4da"
+                                     "23f29f572b2a2780b481c27")),
             nullptr);
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
@@ -1288,7 +1288,7 @@ TEST(ClosedSchema,
       } else {
         expected_revision =
             "sha256:"
-            "c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970";
+            "d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13";
         expected_path = "catalog/manyforge.stop_evidence_policy.v2.yaml";
       }
       EXPECT_EQ(

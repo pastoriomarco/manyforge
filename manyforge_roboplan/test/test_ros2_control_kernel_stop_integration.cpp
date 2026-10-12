@@ -1,17 +1,21 @@
-// Kernel-to-ros2_control Stop integration.
+// Kernel-to-ros2_control Stop integration over the execution port.
 //
 // Joins the real ResourceAddressedExecutionKernel (with its real SQLite
-// operation journal and real StopControl/stage-attempt machinery) to a real
-// Ros2ControlExecutionBackend whose FollowJointTrajectory goal is held active
-// by an in-process ROS action server. The only test-owned seam is the thin
-// prepared-motion engine below: it replaces planning/validation (it seals a
-// fixed trajectory into the Kernel-minted prepared participant) and then calls
-// the real backend Prepare/Dispatch. The Kernel's Stop-stage port is the real
-// backend, observed through a forwarding recorder.
-#include "ros2_control_stop_qualification_fixture.hpp"
+// operation journal and real StopControl/stage-attempt machinery) to the Core
+// participant (`ExecutionPortParticipant`) over the real thin JTC adapter,
+// whose FollowJointTrajectory goal runs on an in-process stand-in of the stock
+// controller. The only test-owned seam is the thin prepared-motion engine
+// below: it replaces planning/validation (it seals a fixed trajectory into the
+// Kernel-minted prepared participant) and then calls the real participant
+// Prepare/Dispatch. The Kernel's Stop-stage port is the real participant (its
+// Core Stop-stage helper), observed through a forwarding recorder.
+#include "ros2_control_fake_controller.hpp"
 
 #include <gtest/gtest.h>
 
+#include <manyforge_core/execution_sample_association.hpp>
+#include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
@@ -24,6 +28,7 @@
 #include <manyforge_core/types/controller_lifecycle.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
@@ -52,10 +57,113 @@ namespace manyforge::roboplan_backend {
 namespace {
 
 using namespace std::chrono_literals;
-namespace fixture = manyforge::ros2_control_execution::qualification_fixture;
+namespace fake = manyforge::ros2_control_execution::fake_controller;
 using manyforge::ros2_control_execution::Ros2ControlExecutionBackend;
 
-constexpr std::uint64_t kExecutionId = 1U;
+class StateSink final : public core::IExecutionStateSink {
+public:
+  core::ExecutionStateSinkResult apply_group_joint_positions(
+      const std::string &group_id, const std::vector<double> &positions_rad,
+      core::ExecutionStateUpdateMode) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (group_id != "arm" || positions_rad.size() != 1U) {
+      return {core::ExecutionStateSinkStatus::kInvalidPositions};
+    }
+    position_ = positions_rad.front();
+    return {};
+  }
+
+  [[nodiscard]] std::optional<double>
+  group_joint_position(const std::string &group_id,
+                       const std::string &joint_name) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (group_id != "arm" || joint_name != "joint_1") {
+      return std::nullopt;
+    }
+    return position_;
+  }
+
+  core::ExecutionStateSinkResult apply_group_joint_position(
+      const std::string &group_id, const std::string &joint_name,
+      double position_rad, core::ExecutionStateUpdateMode) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (group_id != "arm" || joint_name != "joint_1") {
+      return {core::ExecutionStateSinkStatus::kInvalidJoint};
+    }
+    position_ = position_rad;
+    return {};
+  }
+
+private:
+  mutable std::mutex mutex_;
+  double position_{};
+};
+
+[[nodiscard]] core::RuntimeParticipantBinding FixtureBinding() {
+  core::RuntimeParticipantBindingDTO value{
+      core::ProgramId("program.ros2_control.stop_qualification"),
+      core::ProgramRevision("program-revision"),
+      core::ProgramBindingId("program-binding"),
+      core::RetainedBundleId("bundle"),
+      core::GraphRevision("graph"),
+      core::ComponentRoleId("robot"),
+      core::TargetRoleId("arm"),
+      core::ControllableComponentId("robot.1"),
+      core::ComponentTypeId("robot.type"),
+      core::ComponentTypeRevision("robot-type-revision"),
+      core::CommandTargetId("arm.target"),
+      core::CapabilityId("execution.trajectory.execute"),
+      core::CapabilityDefinitionRevision("capability-revision"),
+      std::nullopt,
+      {core::ProgramModelRoleBindingDTO{core::ModelRoleId("body"),
+                                        core::ModelInstanceId("robot.model"),
+                                        core::ModelRevision("model-revision")}},
+      {core::RuntimeModelGroupBindingDTO{core::ModelGroupRoleId("arm_group"),
+                                         core::ModelInstanceId("robot.model"),
+                                         "arm", {"joint_1"}}},
+      {core::ProgramFrameRoleBindingDTO{
+          core::FrameRoleId("tcp"), core::ModelInstanceId("robot.model"),
+          core::ModelRevision("model-revision"), "tcp"}},
+      {core::RuntimeResourceBindingDTO{
+          core::ResourceRoleId("joint_1"), core::ResourceId("robot.joint.1"),
+          "source_joint_1", "joint_1", core::CoordinateKind::kAngular}},
+      {},
+      core::RuntimeControlPathDTO{
+          core::ControlDomainId("domain.arm"),
+          core::ControlDomainRevision("domain-revision"),
+          core::ControlBindingId("binding.arm"),
+          core::ControlBindingRevision("binding-revision"),
+          core::ControlInterfaceContractId("interface.trajectory"),
+          core::ControlInterfaceRevision("interface-revision"),
+          core::ControllerTopologyId("topology.ros2_control"),
+          core::TopologyRevision("topology-revision"),
+          core::ControlRouteId("route.ros2_control"),
+          core::ActivationSetId("activation.ros2_control"),
+          core::ActiveControlConfigurationId("active.ros2_control"),
+          core::ActiveControlConfigurationGeneration(1U),
+          core::ProviderInstanceId("provider.ros2_control"),
+          core::ProviderManifestId("manyforge.provider.ros2_control"),
+          core::ProviderManifestRevision("provider-manifest-revision"),
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1"),
+          core::StateAuthorityId("state.commanded"),
+          core::StateAuthorityClass::kCommanded,
+          core::StopEvidencePolicyId("stop.ros2_control"),
+          core::StopEvidencePolicyRevision("stop-revision"),
+          core::ContainmentGranularity::kResource,
+          std::nullopt},
+      std::nullopt,
+      {},
+      {core::RuntimeUnitEpochBindingDTO{
+          core::RuntimeUnitId("runtime.ros2_control"),
+          core::RuntimeEpoch("runtime-epoch.1")}}};
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 constexpr const char *kOwnerEpoch = "kernel.ros2_control.stop.1";
 constexpr const char *kCellId = "cell.ros2_control.stop";
 
@@ -80,7 +188,7 @@ template <typename Predicate>
 // resolved Stop plan requires and the base frame / joint-goal planner path
 // that ordinary motion admission requires.
 [[nodiscard]] core::RuntimeParticipantBinding KernelBinding() {
-  auto value = fixture::make_binding().value();
+  auto value = FixtureBinding().value();
   value.program_revision = core::ProgramRevision(Sha('0'));
   value.program_binding_id = core::ProgramBindingId(Sha('1'));
   value.retained_bundle_id = core::RetainedBundleId(Sha('6'));
@@ -294,12 +402,12 @@ StopReadiness(const core::RuntimeParticipantBinding &binding,
   return std::move(readiness.value());
 }
 
-// Forwards every Kernel Stop stage to the real ros2_control backend port and
-// records what the backend returned.
+// Forwards every Kernel Stop stage to the real Core participant and records
+// what it returned.
 class RecordingRos2ControlStopPort final
     : public core::IControlDomainExecutionPort {
 public:
-  explicit RecordingRos2ControlStopPort(Ros2ControlExecutionBackend &backend)
+  explicit RecordingRos2ControlStopPort(core::ExecutionPortParticipant &backend)
       : backend_(backend) {}
 
   [[nodiscard]] core::ParticipantStopStageResultDTO
@@ -319,7 +427,7 @@ public:
   }
 
 private:
-  Ros2ControlExecutionBackend &backend_;
+  core::ExecutionPortParticipant &backend_;
   mutable std::mutex mutex_;
   std::vector<core::ParticipantStopStageResultDTO> results_;
 };
@@ -327,13 +435,14 @@ private:
 // Test replacement for the planner/validator-backed ExecutionKernel only. The
 // prepared product is sealed with the Kernel's authority exactly as the
 // retained CCLC admission fake does; Prepare and Dispatch are the real
-// ros2_control backend.
+// Core participant over the JTC adapter. Each prepared motion takes the next
+// execution ID (the participant's membership never revives a retired one).
 class Ros2ControlPreparedMotionEngine final
     : public core::IResolvedParticipantExecutionEngine,
       public core::IResolvedPreparedParticipantExecutionEngine {
 public:
   explicit Ros2ControlPreparedMotionEngine(
-      Ros2ControlExecutionBackend &backend)
+      core::ExecutionPortParticipant &backend)
       : backend_(backend) {}
 
   [[nodiscard]] core::Result<std::uint64_t> PrepareMotion(
@@ -345,7 +454,8 @@ public:
     auto retained =
         std::make_shared<const core::PreparedOperationParticipantDTO>(
             std::move(participant.value()));
-    auto backend_prepared = backend_.Prepare(*retained, kExecutionId);
+    const auto execution_id = next_execution_id_++;
+    auto backend_prepared = backend_.Prepare(*retained, execution_id);
     if (backend_prepared.state !=
         core::PrepareParticipantResultStateDTO::kPrepared) {
       return core::Result<std::uint64_t>::Err(backend_prepared.error.value_or(
@@ -357,18 +467,18 @@ public:
       std::lock_guard lock(mutex_);
       request_ = std::move(request);
       snapshot_ = core::ResolvedPreparedMotionExecutionSnapshotDTO{
-          kExecutionId, core::ResolvedPreparedMotionExecutionStateDTO::kPrepared,
+          execution_id, core::ResolvedPreparedMotionExecutionStateDTO::kPrepared,
           retained, std::move(backend_prepared), std::nullopt};
     }
     Deliver(core::KernelEvent{core::KernelEventType::kParticipantPrepared,
-                              kExecutionId,
+                              execution_id,
                               0,
                               {},
                               {},
                               std::nullopt,
                               {{"prepared_contract_digest",
                                 retained->prepared_contract_digest.value()}}});
-    return core::Result<std::uint64_t>::Ok(kExecutionId);
+    return core::Result<std::uint64_t>::Ok(execution_id);
   }
 
   [[nodiscard]] core::Result<core::ResolvedPreparedMotionExecutionSnapshotDTO>
@@ -428,7 +538,7 @@ public:
           core::ResolvedPreparedMotionExecutionStateDTO::kDispatched;
       snapshot_->last_dispatched_participant = participant;
       status_.state = core::ExecutionState::kPlanning;
-      status_.execution_id = kExecutionId;
+      status_.execution_id = execution_id;
     }
     dispatched_.store(true, std::memory_order_release);
     return core::Result<void>::Ok();
@@ -479,7 +589,7 @@ public:
   core::AddressedParticipantStopFenceDisposition
   fence_addressed_participant_stop(std::uint64_t execution_id) noexcept override {
     fence_calls_.fetch_add(1U, std::memory_order_relaxed);
-    return execution_id == kExecutionId &&
+    return execution_id == current_execution_id() &&
                    dispatched_.load(std::memory_order_acquire)
                ? core::AddressedParticipantStopFenceDisposition::
                      kDispatchCommitted
@@ -499,7 +609,7 @@ public:
                   core::StopStageAttemptDispositionDTO::kNotDispatched
             : request.containment.attempt_disposition !=
                   core::StopStageAttemptDispositionDTO::kNotDispatched;
-    if (request.execution_id != kExecutionId || !certificate.locally_valid() ||
+    if (request.execution_id != current_execution_id() || !certificate.locally_valid() ||
         request.containment.outcome !=
             core::ParticipantStopStageOutcomeDTO::kSucceeded ||
         !expected_disposition || stage.stop_id != certificate.stop_id ||
@@ -531,8 +641,7 @@ public:
         core::AddressedParticipantStopSettlementDTO{
             request.execution_id, certificate, stage.operation_id,
             stage.participant_id, stage.controller_goal_id,
-            stage.controller_goal_generation, core::ExecutionState::kStopped,
-            recovery_});
+            stage.controller_goal_generation, recovery_});
   }
 
   [[nodiscard]] core::ResetResultDTO
@@ -600,11 +709,11 @@ public:
     {
       std::lock_guard lock(mutex_);
       status_.state = to;
-      status_.execution_id = kExecutionId;
+      status_.execution_id = current_execution_id();
       status_.progress = 0.1;
     }
     Deliver(core::KernelEvent{core::KernelEventType::kStateTransition,
-                              kExecutionId,
+                              current_execution_id(),
                               0,
                               from,
                               to,
@@ -849,7 +958,12 @@ private:
         authority.retained_default_stop_limits, authority.stop_node_category);
   }
 
-  Ros2ControlExecutionBackend &backend_;
+  [[nodiscard]] std::uint64_t current_execution_id() const noexcept {
+    return next_execution_id_.load() - 1U;
+  }
+
+  core::ExecutionPortParticipant &backend_;
+  std::atomic<std::uint64_t> next_execution_id_{1U};
   mutable std::mutex mutex_;
   std::optional<core::ResolvedPreparedMotionExecutionRequestDTO> request_;
   std::optional<core::ResolvedPreparedMotionExecutionSnapshotDTO> snapshot_;
@@ -897,7 +1011,8 @@ Registration(const core::RuntimeParticipantBinding &binding,
 }
 
 [[nodiscard]] core::OperationIntentDTO
-MotionOperation(const core::RuntimeParticipantBinding &binding) {
+MotionOperation(const core::RuntimeParticipantBinding &binding,
+                const std::string &suffix = "1") {
   const auto &value = binding.value();
   std::vector<std::string> source_joint_names;
   std::vector<double> goal_positions;
@@ -911,7 +1026,7 @@ MotionOperation(const core::RuntimeParticipantBinding &binding) {
   const core::JointGoalDTO joint_goal{std::move(source_joint_names),
                                       std::move(goal_positions)};
   const core::MotionParticipantIntentDTO motion{
-      core::MoveId("move.ros2_control.stop.1"),
+      core::MoveId("move.ros2_control.stop." + suffix),
       core::FrameRoleId("base"),
       core::FrameRoleId("tcp"),
       core::TolerancesDTO{0.01, 0.001, 0.01},
@@ -931,20 +1046,17 @@ MotionOperation(const core::RuntimeParticipantBinding &binding) {
       value.component_role_id, value.target_role_id, value.capability_id,
       std::nullopt, motion};
   std::vector<core::OperationParticipantIntentDTO> participants{participant};
-  return {Context("execute.ros2_control.stop"),
+  return {Context(suffix == "1" ? std::string("execute.ros2_control.stop")
+                                 : "execute.ros2_control.stop." + suffix),
           value.program_id,
           value.program_revision,
           value.program_binding_id,
-          core::ProgramRunId("run.ros2_control.stop.1"),
+          core::ProgramRunId("run.ros2_control.stop." + suffix),
           value.graph_revision,
           value.retained_bundle_id,
           std::nullopt,
           std::move(participants),
           core::OperationCoordinationPolicy::kIndependent};
-}
-
-[[nodiscard]] bool FinishCancelledGoal(fixture::FakeFjtServer &server) {
-  return WaitUntil([&] { return server.cancel_current_goal(); });
 }
 
 [[nodiscard]] std::optional<core::StopStatusDTO>
@@ -986,6 +1098,91 @@ void RemoveJournalFiles(const std::filesystem::path &path) {
 
 enum class StopKind { kFullStop, kOperationStop };
 
+/// The Isaac lane's participant inputs with test values where no lane value
+/// is decided yet (replacement allowance, late-cycle margin).
+[[nodiscard]] core::ExecutionPortParticipantConfig ParticipantConfig() {
+  core::ExecutionPortParticipantConfig config;
+  config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
+  config.stop.stop_traj_delta_s = 0.1;
+  config.stop.sample_period_s = 0.01;
+  config.stop.replacement_start_allowance_s = 0.02;
+  config.stop.hard_stop_completion_timeout_ns = 1'000'000'000;
+  config.late_cycle_margin_s = 0.5;
+  config.initial_speed_factor = 1.0;
+  return config;
+}
+
+[[nodiscard]] ros2_control_execution::JtcExecutionAdapterConfig
+AdapterConfig(const std::string &controller) {
+  ros2_control_execution::JtcExecutionAdapterConfig config;
+  config.action_name = controller + "/follow_joint_trajectory";
+  config.state_topic = controller + "/controller_state";
+  config.scale_topic = controller + "/speed_scaling_input";
+  config.binding_epoch = core::ExecutionBindingEpoch(1U);
+  config.lane_facts.joint_names = {"source_joint_1"};
+  config.lane_facts.supports_scale = true;
+  config.lane_facts.has_measured_velocity = true;
+  config.lane_facts.feedback_rate_hz = 100.0;
+  config.lane_facts.state_rate_hz = 100.0;
+  config.lane_facts.controller_update_rate_hz = 100.0;
+  return config;
+}
+
+/// Sleeps until the deadline or the next controller sample period.
+[[nodiscard]] core::StopStageWaiter SamplePeriodWaiter(const core::IClock &clock) {
+  return [&clock](const core::TimePoint deadline, const std::stop_token &) {
+    std::this_thread::sleep_for(std::chrono::nanoseconds(
+        std::clamp<core::Duration>(deadline - clock.now(), 0, 10'000'000)));
+  };
+}
+
+/// The participant binding's compiled names over the controller's names (the
+/// host's coordinate map, as the runtime handle applies it).
+class CompiledNamePort final : public core::IExecutionPort {
+public:
+  explicit CompiledNamePort(Ros2ControlExecutionBackend &adapter) : adapter_(adapter) {}
+  core::ExecutionPortCommandResultDTO Submit(const core::ExecutionGoalKey &key,
+                                             const core::TrajectoryDTO &trajectory) override {
+    return adapter_.Submit(key, Rename(trajectory));
+  }
+  core::ExecutionPortCommandResultDTO Replace(const core::ExecutionGoalKey &active,
+                                              const core::ExecutionGoalKey &next,
+                                              const core::TrajectoryDTO &trajectory) override {
+    return adapter_.Replace(active, next, Rename(trajectory));
+  }
+  core::ExecutionPortCommandResultDTO Cancel(const core::ExecutionGoalKey &key) override {
+    return adapter_.Cancel(key);
+  }
+  core::ExecutionPortCommandResultDTO SetScale(double value) override {
+    return adapter_.SetScale(value);
+  }
+  std::optional<core::ExecutionGoalObservationDTO>
+  ReadGoal(const core::ExecutionGoalKey &key) const override {
+    return adapter_.ReadGoal(key);
+  }
+  std::optional<core::ExecutionControllerSampleDTO> ReadSample() const override {
+    return adapter_.ReadSample();
+  }
+  core::ExecutionReadinessDTO ReadReadiness() const override {
+    return adapter_.ReadReadiness();
+  }
+  core::ExecutionTimingDTO ReadTiming() override { return adapter_.ReadTiming(); }
+  core::ExecutionLaneFactsDTO ReadLaneFacts() const override {
+    auto facts = adapter_.ReadLaneFacts();
+    facts.joint_names = {"joint_1"};
+    return facts;
+  }
+
+private:
+  static core::TrajectoryDTO Rename(core::TrajectoryDTO trajectory) {
+    for (auto &name : trajectory.joint_names) {
+      if (name == "joint_1") name = "source_joint_1";
+    }
+    return trajectory;
+  }
+  Ros2ControlExecutionBackend &adapter_;
+};
+
 void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
   WallClock clock;
   SimpleScheduler scheduler;
@@ -994,36 +1191,45 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
   const auto domain = ExpectedDomain(binding);
   auto readiness = StopReadiness(binding, domain);
 
-  const std::string action_name =
-      "/manyforge_kernel_ros2_control_stop_fjt_" + fixture::unique_suffix();
-  fixture::FakeFjtServer server(action_name);
-  auto sink = std::make_shared<fixture::StateSink>();
-  // As in the Isaac commanded-simulation profile: no controller
-  // speed-scaling input, so bounded trajectories run at nominal timing.
-  auto config = fixture::backend_config(binding, action_name);
-  config.enable_jtc_speed_scaling_input = false;
+  const std::string controller =
+      "/manyforge_kernel_ros2_control_stop_" + fake::unique_suffix() + "/arm_controller";
+  fake::FakeJtc server(controller, {"source_joint_1"});
+  server.SetActive(true);
+  auto sink = std::make_shared<StateSink>();
   ros2_control_execution::Ros2TransportResources resources(
-      config.node_name, config.node_namespace, config.executor_thread_count,
-      config.command_gate_topic, sink, "arm", clock);
-  Ros2ControlExecutionBackend backend(resources, sink, "arm", clock, scheduler,
-                                      config);
-  RecordingRos2ControlStopPort port(backend);
+      "manyforge_kernel_ros2_control_stop_" + fake::unique_suffix(), "/", 3U, sink,
+      "arm", clock);
+  Ros2ControlExecutionBackend adapter(resources, clock, AdapterConfig(controller));
+  // CCLC activated this binding (the readiness the host feeds the adapter).
+  adapter.ObserveReadiness({true, true, true, core::ExecutionBindingEpoch(1U)});
+  auto port = std::make_shared<CompiledNamePort>(adapter);
+  core::ObservedRobotStatePublication publication{
+      {"joint_1"},
+      {core::ObservedRobotStateSourceConfig{
+          core::ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+          core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}}};
+  core::ExecutionPortParticipant backend(
+      binding, port, clock, scheduler, SamplePeriodWaiter(clock),
+      {&publication, [] { return core::Result<void>::Ok(); }}, ParticipantConfig());
+  RecordingRos2ControlStopPort stop_port(backend);
   Ros2ControlPreparedMotionEngine engine(backend);
-  // Quiesce callbacks while the adapter and its test ports are still alive,
-  // including fatal assertion returns. Resources outlive the adapter.
+  // Quiesce callbacks while the adapter is still alive, including fatal
+  // assertion returns. Resources outlive the adapter.
   struct TransportLifetime final {
     ros2_control_execution::Ros2TransportResources &resources;
-    Ros2ControlExecutionBackend &backend;
+    Ros2ControlExecutionBackend &adapter;
     ~TransportLifetime() {
-      backend.shutdown();
+      adapter.shutdown();
       resources.quiesce();
     }
-  } transport_lifetime{resources, backend};
+  } transport_lifetime{resources, adapter};
   resources.start();
+  ASSERT_TRUE(fake::WaitUntil([&] { return adapter.ReadSample().has_value(); }))
+      << "the controller's state never reached the adapter";
 
   const auto journal_path =
       std::filesystem::temp_directory_path() /
-      ("manyforge-ros2-control-kernel-stop-" + fixture::unique_suffix() + "-" +
+      ("manyforge-ros2-control-kernel-stop-" + fake::unique_suffix() + "-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()) +
        ".sqlite");
@@ -1031,7 +1237,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     const core::CellId cell_id(kCellId);
     core::SqliteOperationJournal journal(journal_path, cell_id, 16U);
     core::ResourceAddressedExecutionKernel kernel(
-        {Registration(binding, std::move(readiness), engine, port)}, clock,
+        {Registration(binding, std::move(readiness), engine, stop_port)}, clock,
         scheduler, journal,
         core::ResourceAddressedExecutionKernelConfig{
             core::RequestOwnerEpoch(kOwnerEpoch), cell_id, 16U});
@@ -1040,13 +1246,12 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     const auto operation = kernel.execute(MotionOperation(binding));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     const auto &operation_id = operation.value().operation_id;
-    ASSERT_TRUE(server.wait_for_goal_count(1U, 5s))
+    ASSERT_TRUE(fake::WaitUntil([&] { return server.goals_received() >= 1U; }, 5s))
         << "Kernel dispatch did not reach the ros2_control action server";
     ASSERT_TRUE(WaitUntil([&] {
       return backend.get_execution_snapshot().state ==
              core::ExecutionState::kExecuting;
     }));
-    ASSERT_TRUE(server.publish_feedback());
     engine.EmitTransition(core::ExecutionState::kPlanning,
                           core::ExecutionState::kExecuting);
     std::optional<core::OperationStateDTO> before;
@@ -1063,7 +1268,23 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     const auto goal_generation =
         before->participants.front().controller_goal_generation;
     EXPECT_EQ(server.cancel_requests(), 0U);
-    EXPECT_TRUE(port.results().empty());
+    EXPECT_TRUE(stop_port.results().empty());
+
+    // The controller has advanced on this goal (a mid-motion Stop: its
+    // cancel then visibly restarts the cursor, the switch the cancel finish
+    // associates). Only evidence the Q50 association attributes to the
+    // dispatched goal counts: its own feedback and the controller samples
+    // anchored by it, never a hold sample from before the goal.
+    const core::ExecutionGoalKey dispatched_key{goal_id, goal_generation};
+    core::ExecutionSampleAssociation association(adapter.ReadReadiness().binding_epoch,
+                                                 std::nullopt, 0);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto goal = adapter.ReadGoal(dispatched_key);
+      const auto sample = adapter.ReadSample();
+      return goal.has_value() && goal->latest_feedback.has_value() &&
+             goal->latest_feedback->cursor_s > 0.2 && sample.has_value() &&
+             association.Observe(*sample, goal) && sample->cursor_s > 0.2;
+    })) << "the dispatched goal never advanced beyond 0.2 s on its own evidence";
 
     // 2. Stop is accepted while that goal is active.
     auto stopping = std::async(std::launch::async, [&] {
@@ -1079,14 +1300,14 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
               core::StopGeneration(0U)}},
           std::nullopt});
     });
-    // The Kernel's Stop stage must reach the ROS controller as a goal cancel.
-    const bool cancel_requested = server.wait_for_cancel_requests(1U, 5s);
-    const bool cancel_completed = cancel_requested && FinishCancelledGoal(server);
+    // The Kernel's Stop stage must reach the ROS controller as a goal cancel;
+    // the controller brakes and reports the goal cancelled.
+    const bool cancel_requested =
+        fake::WaitUntil([&] { return server.cancel_requests() >= 1U; }, 5s);
     const auto accepted = stopping.get();
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     ASSERT_TRUE(cancel_requested)
         << "Kernel Stop never cancelled the ros2_control goal";
-    ASSERT_TRUE(cancel_completed);
     const auto &stop_id = accepted.value().stop_id;
 
     // 3. Captured scope: the active operation and its exact revision.
@@ -1101,11 +1322,22 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     const auto status = WaitForTerminalStop(kernel, stop_id);
     ASSERT_TRUE(status.has_value()) << "Stop did not reach a terminal state";
 
-    // 4. The ros2_control port realized exactly the nominal stage.
-    const auto results = port.results();
+    // 4. The Core participant realized exactly the nominal stage.
+    const auto results = stop_port.results();
+    const auto goal = adapter.ReadGoal({goal_id, goal_generation});
+    const auto sample = adapter.ReadSample();
     ASSERT_EQ(results.size(), 1U)
         << "unexpected escalation: "
-        << (results.empty() ? std::string("none") : StageReason(results.front()));
+        << (results.empty() ? std::string("none") : StageReason(results.front()))
+        << "; goal phase "
+        << (goal ? static_cast<int>(goal->phase) : -1) << " result "
+        << (goal && goal->result ? core::to_string(*goal->result) : "none")
+        << " cancel sent " << (goal && goal->cancel_sent_local_stamp.has_value())
+        << " acknowledged " << (goal && goal->cancel_ack_local_receipt_stamp.has_value())
+        << "; sample cursor " << (sample ? sample->cursor_s : -1.0) << " velocity "
+        << (sample && !sample->reference_velocities_rad_s.empty()
+                ? sample->reference_velocities_rad_s.front()
+                : -1.0);
     const auto &stage_result = results.front();
     EXPECT_EQ(stage_result.attempt_disposition,
               core::StopStageAttemptDispositionDTO::kDispatched);
@@ -1134,7 +1366,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     EXPECT_EQ(stage_result.evidence_items.front().state,
               core::StopEvidenceItemStateDTO::kSatisfied);
     EXPECT_GE(server.cancel_requests(), 1U);
-    EXPECT_EQ(server.goal_count(), 1U) << "Stop dispatched a second goal";
+    EXPECT_EQ(server.goals_received(), 1U) << "Stop dispatched a second goal";
     EXPECT_EQ(backend.get_execution_snapshot().state,
               core::ExecutionState::kStopped);
     EXPECT_GE(engine.fence_calls(), 1U);
@@ -1210,6 +1442,297 @@ TEST(Ros2ControlKernelStopIntegrationTest,
      OperationStopDuringActiveRos2ControlMotionCancelsGoalAndCertifiesParticipant) {
   RunStopDuringActiveRos2ControlMotion(StopKind::kOperationStop);
 }
+
+/// Executes one Kernel motion and waits until the participant reports it.
+[[nodiscard]] core::OperationStateDTO
+ExecuteUntilActive(core::ResourceAddressedExecutionKernel &kernel,
+                   Ros2ControlPreparedMotionEngine &engine,
+                   const core::RuntimeParticipantBinding &binding,
+                   const std::string &suffix) {
+  const auto operation = kernel.execute(MotionOperation(binding, suffix));
+  if (!operation.ok()) throw std::logic_error(operation.error().message);
+  engine.EmitTransition(core::ExecutionState::kPlanning, core::ExecutionState::kExecuting);
+  std::optional<core::OperationStateDTO> state;
+  if (!WaitUntil([&] {
+        auto current = kernel.get_operation_state(operation.value().operation_id);
+        if (!current.ok()) return false;
+        state = std::move(current.value());
+        return state->state == core::OperationStateKind::kExecuting;
+      })) {
+    throw std::logic_error("the Kernel operation never executed on the controller");
+  }
+  return *state;
+}
+
+void StopAndCertify(core::ResourceAddressedExecutionKernel &kernel,
+                    const core::OperationStateDTO &operation, const std::string &request) {
+  const auto accepted = kernel.stop(core::StopIntentDTO{
+      Context(request),
+      std::vector<core::StopOperationTargetDTO>{core::StopOperationTargetDTO{
+          operation.operation_id, operation.operation_revision, core::StopGeneration(0U)}},
+      std::nullopt});
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto status = WaitForTerminalStop(kernel, accepted.value().stop_id);
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->state, core::StopStatusStateDTO::kSucceeded);
+}
+
+TEST(Ros2ControlKernelStopIntegrationTest,
+     ReactivationRetiresTheOldAdapterAndDispatchesOnlyThroughTheNewEpoch) {
+  // Design §3.1 and the port contract: a controller reactivated through CCLC
+  // is a new binding epoch served by a new adapter instance; the old one is
+  // shut down first and the participant is rebound before the switch.
+  WallClock clock;
+  SimpleScheduler scheduler;
+  const auto binding = KernelBinding();
+  const auto domain = ExpectedDomain(binding);
+  auto readiness = StopReadiness(binding, domain);
+  const std::string prefix = "/manyforge_epoch_cutover_" + fake::unique_suffix();
+  fake::FakeJtc jtc(prefix + "/arm_controller", {"source_joint_1"});
+  fake::FakeControllerManager manager(prefix + "/controller_manager", "arm_controller",
+                                      "TestSystem", &jtc);
+  core::ObservedRobotStatePublication publication{
+      {"joint_1"},
+      {core::ObservedRobotStateSourceConfig{
+          core::ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+          core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}}};
+  RetainedRos2ControlArmTransport arm;
+  arm.adapter = AdapterConfig(prefix + "/arm_controller");
+  arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
+  arm.compiled_joint_names = {"joint_1"};
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(handle
+                  ->Bind(std::make_unique<ros2_control_execution::Ros2TransportResources>(
+                             "manyforge_epoch_cutover_" + fake::unique_suffix(), "/", 3U,
+                             std::make_shared<StateSink>(), "arm", clock),
+                         clock, arm,
+                         [&](std::shared_ptr<core::IExecutionPort> port) {
+                           return std::make_shared<core::ExecutionPortParticipant>(
+                               binding, std::move(port), clock, scheduler,
+                               SamplePeriodWaiter(clock),
+                               core::ExecutionPortParticipantStateAuthority{
+                                   &publication, [] { return core::Result<void>::Ok(); }},
+                               ParticipantConfig());
+                         },
+                         nullptr, binding, std::nullopt)
+                  .ok());
+  handle->StartBackend();
+  auto &participant = *handle->participant();
+  RecordingRos2ControlStopPort stop_port(participant);
+  Ros2ControlPreparedMotionEngine engine(participant);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = handle->arm_activity();
+    return activity.observed && activity.controller_loaded && activity.hardware_active;
+  }));
+  ASSERT_EQ(handle->PrepareArmController().outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
+  ASSERT_EQ(handle->ActivateArmController({}).outcome,
+            RetainedRos2ControlSwitchOutcome::kSucceeded);
+  const auto first = handle->current_port();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto sample = first->ReadSample();
+    const auto ready = first->ReadReadiness();
+    return ready.controller_active && ready.controller_bound && ready.hardware_active &&
+           sample.has_value() && sample->binding_epoch == core::ExecutionBindingEpoch(1U);
+  }));
+
+  const auto journal_path =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-ros2-control-epoch-cutover-" + fake::unique_suffix() + "-" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
+  {
+    const core::CellId cell_id(kCellId);
+    core::SqliteOperationJournal journal(journal_path, cell_id, 16U);
+    core::ResourceAddressedExecutionKernel kernel(
+        {Registration(binding, std::move(readiness), engine, stop_port)}, clock, scheduler,
+        journal,
+        core::ResourceAddressedExecutionKernelConfig{core::RequestOwnerEpoch(kOwnerEpoch),
+                                                     cell_id, 16U});
+
+    // A goal running on epoch 1 when CCLC switches the controller off.
+    core::TrajectoryDTO hold;
+    hold.joint_names = {"joint_1"};
+    hold.waypoints = {{0.0, {0.0}, {0.0}, {0.0}}, {8.0, {0.0}, {0.0}, {0.0}}};
+    const core::ExecutionGoalKey pending{core::ControllerGoalId("goal.epoch1.pending"),
+                                         core::ControllerGoalGeneration(1U)};
+    ASSERT_NE(first->Submit(pending, hold).dispatch, core::ExecutionPortDispatch::kNotDispatched);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto goal = first->ReadGoal(pending);
+      return goal.has_value() && goal->phase == core::ExecutionGoalPhase::kExecuting;
+    }));
+    // The pending goal's result stays outstanding across the rotation: a
+    // callback still in flight on the old instance when it is retired.
+    jtc.HoldResultOnDeactivate(true);
+    ASSERT_EQ(handle->DeactivateArmController({}).outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    ASSERT_TRUE(fake::WaitUntil([&] { return !first->ReadReadiness().controller_active; }));
+    ASSERT_EQ(handle->PrepareArmController().outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    ASSERT_EQ(handle->ActivateArmController({}).outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    const auto second = handle->current_port();
+    ASSERT_NE(second, first);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto sample = second->ReadSample();
+      const auto ready = second->ReadReadiness();
+      return ready.binding_epoch == core::ExecutionBindingEpoch(2U) && ready.controller_active &&
+             ready.controller_bound && sample.has_value() &&
+             sample->binding_epoch == core::ExecutionBindingEpoch(2U);
+    }));
+
+    // The retired instance released its SDK entities at shutdown: exactly
+    // one controller-state subscription remains (the new epoch's).
+    EXPECT_TRUE(fake::WaitUntil([&] {
+      return jtc.node()->count_subscribers(prefix + "/arm_controller/controller_state") == 1U;
+    }));
+    // Its late result callback arrives now: retired safely, nothing reaches
+    // the new epoch's port.
+    const auto second_goal_count_before = jtc.goals_received();
+    ASSERT_TRUE(jtc.ReleaseHeldResult());
+    const auto late_samples = jtc.samples_published();
+    ASSERT_TRUE(fake::WaitUntil([&] { return jtc.samples_published() > late_samples + 5U; }));
+    EXPECT_FALSE(second->ReadGoal(pending).has_value());
+    EXPECT_EQ(second->ReadReadiness().binding_epoch, core::ExecutionBindingEpoch(2U));
+    EXPECT_TRUE(second->ReadReadiness().controller_active);
+    EXPECT_TRUE(second->ReadReadiness().controller_bound);
+    EXPECT_EQ(second->ReadSample()->binding_epoch, core::ExecutionBindingEpoch(2U));
+    EXPECT_EQ(jtc.goals_received(), second_goal_count_before);
+
+    // The retired instance: its pending goal ended without a reported cause
+    // and stays so; late controller samples and callbacks change nothing;
+    // every command is refused.
+    const auto samples_before = jtc.samples_published();
+    ASSERT_TRUE(fake::WaitUntil([&] { return jtc.samples_published() > samples_before + 5U; }));
+    EXPECT_FALSE(first->ReadSample().has_value());
+    EXPECT_EQ(first->ReadReadiness().binding_epoch, core::ExecutionBindingEpoch(1U));
+    EXPECT_FALSE(first->ReadReadiness().controller_active);
+    const auto ended = first->ReadGoal(pending);
+    ASSERT_TRUE(ended.has_value());
+    EXPECT_EQ(ended->result, core::ExecutionGoalResult::kEndedUnknown);
+    EXPECT_EQ(first->Submit({core::ControllerGoalId("goal.epoch1.late"),
+                             core::ControllerGoalGeneration(1U)},
+                            hold)
+                  .refusal,
+              core::ExecutionPortRefusal::kNotReady);
+    EXPECT_EQ(first->SetScale(0.3).refusal, core::ExecutionPortRefusal::kNotReady);
+
+    // Speed values and dispatch go only through the new epoch's port.
+    participant.set_runtime_velocity_scale(0.4);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto values = jtc.scale_values();
+      return std::find(values.begin(), values.end(), 0.4) != values.end();
+    }));
+    const auto goals_before = jtc.goals_received();
+    const auto second_operation = ExecuteUntilActive(kernel, engine, binding, "epoch2");
+    ASSERT_TRUE(fake::WaitUntil([&] { return jtc.goals_received() == goals_before + 1U; }));
+    const core::ExecutionGoalKey second_key{
+        second_operation.participants.front().controller_goal_id,
+        second_operation.participants.front().controller_goal_generation};
+    const auto dispatched = second->ReadGoal(second_key);
+    ASSERT_TRUE(dispatched.has_value());
+    EXPECT_EQ(dispatched->binding_epoch, core::ExecutionBindingEpoch(2U));
+    EXPECT_FALSE(first->ReadGoal(second_key).has_value());
+    StopAndCertify(kernel, second_operation, "stop.epoch2");
+  }
+  RemoveJournalFiles(journal_path);
+}
+
+/// Live SDK entities of this host on the fake controller's routes, as the
+/// ROS graph reports them.
+struct HostEntityCounts final {
+  std::size_t state_subscriptions{};
+  std::size_t scale_publishers{};
+  std::size_t action_feedback_subscriptions{};
+  std::size_t action_status_subscriptions{};
+  friend bool operator==(const HostEntityCounts &, const HostEntityCounts &) = default;
+};
+
+[[nodiscard]] HostEntityCounts HostEntities(const rclcpp::Node &peer, const std::string &controller) {
+  return {peer.count_subscribers(controller + "/controller_state"),
+          peer.count_publishers(controller + "/speed_scaling_input"),
+          peer.count_subscribers(controller + "/follow_joint_trajectory/_action/feedback"),
+          peer.count_subscribers(controller + "/follow_joint_trajectory/_action/status")};
+}
+
+TEST(Ros2ControlKernelStopIntegrationTest,
+     RepeatedRotationKeepsOneSetOfAdapterEntitiesAndShutsDownClean) {
+  // Twenty Disable/Enable cycles: every reactivation retires the previous
+  // adapter instance (shutdown detaches and releases its SDK entities) and
+  // binds a new epoch. The host's live entities on the controller's routes
+  // stay one set; per-sample delivery does not grow with the epochs.
+  WallClock clock;
+  SimpleScheduler scheduler;
+  const auto binding = KernelBinding();
+  const std::string prefix = "/manyforge_epoch_cycles_" + fake::unique_suffix();
+  const std::string controller = prefix + "/arm_controller";
+  fake::FakeJtc jtc(controller, {"source_joint_1"});
+  fake::FakeControllerManager manager(prefix + "/controller_manager", "arm_controller",
+                                      "TestSystem", &jtc);
+  core::ObservedRobotStatePublication publication{
+      {"joint_1"},
+      {core::ObservedRobotStateSourceConfig{
+          core::ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+          core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}}};
+  RetainedRos2ControlArmTransport arm;
+  arm.adapter = AdapterConfig(controller);
+  arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
+  arm.compiled_joint_names = {"joint_1"};
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  ASSERT_TRUE(handle
+                  ->Bind(std::make_unique<ros2_control_execution::Ros2TransportResources>(
+                             "manyforge_epoch_cycles_" + fake::unique_suffix(), "/", 3U,
+                             std::make_shared<StateSink>(), "arm", clock),
+                         clock, arm,
+                         [&](std::shared_ptr<core::IExecutionPort> port) {
+                           return std::make_shared<core::ExecutionPortParticipant>(
+                               binding, std::move(port), clock, scheduler,
+                               SamplePeriodWaiter(clock),
+                               core::ExecutionPortParticipantStateAuthority{
+                                   &publication, [] { return core::Result<void>::Ok(); }},
+                               ParticipantConfig());
+                         },
+                         nullptr, binding, std::nullopt)
+                  .ok());
+  handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = handle->arm_activity();
+    return activity.observed && activity.controller_loaded && activity.hardware_active;
+  }));
+  ASSERT_EQ(handle->PrepareArmController().outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
+  ASSERT_EQ(handle->ActivateArmController({}).outcome,
+            RetainedRos2ControlSwitchOutcome::kSucceeded);
+  const HostEntityCounts one_set{1U, 1U, 1U, 1U};
+  ASSERT_TRUE(fake::WaitUntil([&] { return HostEntities(*jtc.node(), controller) == one_set; }));
+
+  constexpr std::uint64_t kCycles = 20U;
+  for (std::uint64_t cycle = 1U; cycle <= kCycles; ++cycle) {
+    SCOPED_TRACE(cycle);
+    ASSERT_EQ(handle->DeactivateArmController({}).outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    ASSERT_TRUE(fake::WaitUntil([&] { return !handle->arm_activity().controller_active; }));
+    ASSERT_EQ(handle->PrepareArmController().outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    ASSERT_EQ(handle->ActivateArmController({}).outcome,
+              RetainedRos2ControlSwitchOutcome::kSucceeded);
+    const auto port = handle->current_port();
+    const core::ExecutionBindingEpoch epoch(cycle + 1U);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto sample = port->ReadSample();
+      const auto ready = port->ReadReadiness();
+      return ready.binding_epoch == epoch && ready.controller_active && ready.controller_bound &&
+             sample.has_value() && sample->binding_epoch == epoch;
+    }));
+    // One subscription per route means one adapter callback per controller
+    // sample, whatever the number of retired epochs.
+    ASSERT_TRUE(fake::WaitUntil([&] { return HostEntities(*jtc.node(), controller) == one_set; }))
+        << "state subscriptions " << HostEntities(*jtc.node(), controller).state_subscriptions;
+  }
+
+  // Final shutdown: every child shut down, the transport quiesced, nothing of
+  // this host left on the controller's routes.
+  handle.reset();
+  EXPECT_TRUE(fake::WaitUntil([&] { return HostEntities(*jtc.node(), controller) == HostEntityCounts{}; }));
+}
+
 
 } // namespace
 } // namespace manyforge::roboplan_backend

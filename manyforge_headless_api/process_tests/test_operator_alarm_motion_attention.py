@@ -38,6 +38,7 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionEventPump
 from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 from manyforge_headless_api.process_tests.test_process_stack import (
+    keep_failure_evidence,
     CATALOG,
     NODE_CATALOG,
     NODE_ENVIRONMENT_MANIFEST,
@@ -446,7 +447,7 @@ def _native_host_stack() -> Iterator[ProcessStack]:
                 freshness_milliseconds=120_000,
             )
             try:
-                stack.prepare_native_package(ADMISSION_FILENAME)
+                stack.prepare_native_package(ADMISSION_FILENAME, ros2_control=True)
                 stack.start_manager()
                 admission = CellAdmissionClient(stack.execution_run_root, timeout_seconds=1.0)
 
@@ -461,6 +462,7 @@ def _native_host_stack() -> Iterator[ProcessStack]:
                 yield stack
             except BaseException:
                 stack.log.flush()
+                keep_failure_evidence(root)
                 log_path = stack_root / "process-stack.log"
                 if log_path.is_file():
                     print(

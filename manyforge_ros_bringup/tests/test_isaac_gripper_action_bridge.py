@@ -184,3 +184,24 @@ def test_completion_mapping_rejects_non_finite_evidence() -> None:
 
     with pytest.raises(ValueError, match="command_position must be finite"):
         map_gripper_positions(float("nan"), [1.0], [0.0])
+
+
+def test_gripper_hold_and_readiness_no_longer_depend_on_arm_gate() -> None:
+    from types import SimpleNamespace
+    import threading
+    from manyforge_ros_bringup.isaac_gripper_action_bridge import IsaacGripperActionBridge
+
+    writes: list[list[float]] = []
+    ready_updates: list[bool] = []
+    bridge = SimpleNamespace(
+        _lock=threading.Lock(), _active_target_positions=[0.25],
+        _publish_command=writes.append,
+        _publish_readiness_if_due=lambda: ready_updates.append(True),
+    )
+    IsaacGripperActionBridge._reconcile(bridge)
+    assert writes == [[0.25]]
+    assert ready_updates == [True]
+    bridge._active_target_positions = None
+    IsaacGripperActionBridge._reconcile(bridge)
+    assert writes == [[0.25]]
+    assert ready_updates == [True, True]

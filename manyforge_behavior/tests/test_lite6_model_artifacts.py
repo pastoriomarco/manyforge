@@ -57,12 +57,6 @@ _OWNED_MOVEIT_JOINT_LIMITS_PATH = (
     / "lite6"
     / "joint_limits.yaml"
 )
-_ISAAC_ROS2_CONTROL_URDF_PATH = (
-    _REPO_ROOT
-    / "manyforge_ros_bringup"
-    / "urdf"
-    / "isaac_lite6_topic_based.ros2_control.urdf"
-)
 _LIMITED_ARM_BOUNDS = {
     "joint1": ("-3.1101767270538954", "3.1101767270538954"),
     "joint2": ("-2.61799", "2.61799"),
@@ -230,7 +224,6 @@ def test_retained_lite6_model_outputs_do_not_use_rejected_rewrites() -> None:
     retained_paths = (
         _MODEL_DIR / "lite6_lite_gripper.urdf",
         _MODEL_DIR / "lite6_lite_gripper.srdf",
-        _ISAAC_ROS2_CONTROL_URDF_PATH,
         _MODEL_EXPORT_SCRIPT,
     )
     for path in retained_paths:
@@ -239,6 +232,30 @@ def test_retained_lite6_model_outputs_do_not_use_rejected_rewrites() -> None:
             assert term not in text, f"{term} present in {path}"
 
     assert not list(_MODEL_DIR.glob("*roboplan_compat*"))
+
+
+def test_lite6_export_preserves_the_full_model_for_activation_time_generation(
+    tmp_path: Path,
+) -> None:
+    """Retiring the lane exporter must not alter the stored robot model."""
+
+    spec = importlib.util.spec_from_file_location(
+        "export_lite6_full_model", _MODEL_EXPORT_SCRIPT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    output = tmp_path / "lite6_lite_gripper.urdf"
+    module.write_urdf(_RUNTIME_CAPTURE_URDF_PATH, output, _ARM_JOINT_DYNAMICS)
+
+    assert ET.canonicalize(from_file=output, strip_text=True, with_comments=True) == (
+        ET.canonicalize(
+            from_file=_MODEL_DIR / "lite6_lite_gripper.urdf",
+            strip_text=True,
+            with_comments=True,
+        )
+    )
+    assert list(tmp_path.iterdir()) == [output]
 
 
 def test_lite6_static_manifest_validator_accepts_and_rejects_drift(

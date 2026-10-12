@@ -324,19 +324,6 @@ template <typename T, typename Decode>
                                      stale_value_from(f[3])};
 }
 
-[[nodiscard]] V phase_budget_value(const StopAcceptedPhaseBudgetDTO& value) {
-  return arr({enc(value.phase_id),
-              content_identity::nonnegative_int64_value(value.fixed_deadline_offset_ns),
-              content_identity::nonnegative_int64_value(value.remaining_deadline_offset_ns)});
-}
-
-[[nodiscard]] StopAcceptedPhaseBudgetDTO phase_budget_from(const V& value) {
-  const auto& f = exact(value, 3U, "accepted phase budget");
-  return StopAcceptedPhaseBudgetDTO{did<StopBudgetPhaseId>(f[0], "phase ID"),
-                                    i64(f[1], "fixed phase offset"),
-                                    i64(f[2], "remaining phase offset")};
-}
-
 [[nodiscard]] V accepted_value(const StopAcceptedDTO& value) {
   return arr(
       {enc(value.request_id), enc(value.replay_status), enc(value.stop_id),
@@ -346,37 +333,25 @@ template <typename T, typename Decode>
        vec(value.joined_predecessor_stops,
            [](const auto& row) {
              return arr({enc(row.predecessor_stop_id), enc(row.predecessor_stop_generation),
-                         enc(row.captured_scope_digest),
-                         content_identity::nonnegative_int64_value(
-                             row.remaining_outer_duration_ns_at_join)});
+                         enc(row.captured_scope_digest)});
            }),
        vec(value.affected_operation_revisions,
            [](const auto& row) {
              return arr({enc(row.operation_id), enc(row.operation_revision_after_acceptance)});
            }),
-       content_identity::nonnegative_int64_value(value.fixed_outer_duration_ns),
-       content_identity::nonnegative_int64_value(value.fixed_kernel_completion_reserve_ns),
-       content_identity::nonnegative_int64_value(value.remaining_outer_duration_ns),
-       content_identity::nonnegative_int64_value(value.accepted_at_ns),
-       vec(value.participant_budget_allocations, [](const auto& row) {
-         return arr({enc(row.origin_stop_id), enc(row.origin_stop_generation),
-                     enc(row.operation_id), enc(row.participant_id),
-                     enc(row.participant_stop_invocation_plan_digest),
-                     vec(row.phases, phase_budget_value)});
-       })});
+       content_identity::nonnegative_int64_value(value.accepted_at_ns)});
 }
 
 [[nodiscard]] StopAcceptedDTO accepted_from(const V& value) {
-  const auto& f = exact(value, 16U, "Stop accepted");
+  const auto& f = exact(value, 12U, "Stop accepted");
   auto predecessors = dvec<StopPredecessorAcceptanceRefDTO>(
       f[9],
       [](const V& item) {
-        const auto& row = exact(item, 4U, "predecessor acceptance");
+        const auto& row = exact(item, 3U, "predecessor acceptance");
         return StopPredecessorAcceptanceRefDTO{
             did<StopId>(row[0], "predecessor Stop ID"),
             did<StopGeneration>(row[1], "predecessor Stop generation"),
-            did<ContentDigest>(row[2], "predecessor scope digest"),
-            i64(row[3], "predecessor remaining duration")};
+            did<ContentDigest>(row[2], "predecessor scope digest")};
       },
       "predecessors");
   auto affected = dvec<StopAffectedOperationRevisionDTO>(
@@ -388,19 +363,6 @@ template <typename T, typename Decode>
             did<OperationRevision>(row[1], "affected operation revision")};
       },
       "affected operation revisions");
-  auto budgets = dvec<StopAcceptedParticipantBudgetDTO>(
-      f[15],
-      [](const V& item) {
-        const auto& row = exact(item, 6U, "participant budget");
-        return StopAcceptedParticipantBudgetDTO{
-            did<StopId>(row[0], "origin Stop ID"),
-            did<StopGeneration>(row[1], "origin Stop generation"),
-            did<OperationId>(row[2], "operation ID"),
-            did<OperationParticipantId>(row[3], "participant ID"),
-            did<ContentDigest>(row[4], "participant plan digest"),
-            dvec<StopAcceptedPhaseBudgetDTO>(row[5], phase_budget_from, "participant phases")};
-      },
-      "participant budgets");
   return StopAcceptedDTO{
       did<RequestId>(f[0], "request ID"),
       den<RequestReplayStatusDTO>(f[1], 5U, "replay status"),
@@ -413,11 +375,7 @@ template <typename T, typename Decode>
       did<ContentDigest>(f[8], "captured scope digest"),
       std::move(predecessors),
       std::move(affected),
-      i64(f[11], "fixed outer duration"),
-      i64(f[12], "completion reserve"),
-      i64(f[13], "remaining outer duration"),
-      i64(f[14], "accepted time"),
-      std::move(budgets)};
+      i64(f[11], "accepted time")};
 }
 
 [[nodiscard]] V participant_state_value(const OperationParticipantStateDTO& value) {
@@ -669,18 +627,16 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V containment_command_value(const StopContainmentCommandDTO& v) {
-  return arr({enc(v.command_phase_id), enc(v.command_kind),
-              opt(v.provider_contract_ref, contract_ref_value),
+  return arr({enc(v.command_kind), opt(v.provider_contract_ref, contract_ref_value),
               opt(v.registered_command_kind_id, id_value)});
 }
 
 [[nodiscard]] StopContainmentCommandDTO containment_command_from(const V& v) {
-  const auto& f = exact(v, 4U, "containment command");
+  const auto& f = exact(v, 3U, "containment command");
   return StopContainmentCommandDTO{
-      did<StopBudgetPhaseId>(f[0], "command phase ID"),
-      den<StopContainmentCommandKind>(f[1], 5U, "containment command kind"),
-      dopt<ProviderContractRefDTO>(f[2], contract_ref_from),
-      dopt<RegisteredStopCommandKindId>(f[3], [](const V& item) {
+      den<StopContainmentCommandKind>(f[0], 5U, "containment command kind"),
+      dopt<ProviderContractRefDTO>(f[1], contract_ref_from),
+      dopt<RegisteredStopCommandKindId>(f[2], [](const V& item) {
         return did<RegisteredStopCommandKindId>(item, "registered command kind");
       })};
 }
@@ -704,7 +660,7 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V evidence_requirement_value(const StopEvidenceRequirementDTO& v) {
-  return arr({enc(v.evidence_item_id), enc(v.phase_id), enc(v.evidence_kind),
+  return arr({enc(v.evidence_item_id), enc(v.evidence_kind),
               opt(v.provider_contract_ref, contract_ref_value),
               opt(v.registered_evidence_kind_id, id_value),
               evidence_source_requirement_value(v.source_requirement),
@@ -715,19 +671,18 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] StopEvidenceRequirementDTO evidence_requirement_from(const V& v) {
-  const auto& f = exact(v, 7U, "evidence requirement");
-  const auto& observation = exact(f[6], 2U, "evidence observation");
+  const auto& f = exact(v, 6U, "evidence requirement");
+  const auto& observation = exact(f[5], 2U, "evidence observation");
   return StopEvidenceRequirementDTO{
       did<StopEvidenceItemId>(f[0], "evidence item ID"),
-      did<StopBudgetPhaseId>(f[1], "phase ID"),
-      den<StopEvidenceRequirementKind>(f[2], 5U, "evidence kind"),
-      dopt<ProviderContractRefDTO>(f[3], contract_ref_from),
-      dopt<RegisteredStopEvidenceKindId>(f[4],
+      den<StopEvidenceRequirementKind>(f[1], 5U, "evidence kind"),
+      dopt<ProviderContractRefDTO>(f[2], contract_ref_from),
+      dopt<RegisteredStopEvidenceKindId>(f[3],
                                          [](const V& item) {
                                            return did<RegisteredStopEvidenceKindId>(
                                                item, "registered evidence kind");
                                          }),
-      evidence_source_requirement_from(f[5]),
+      evidence_source_requirement_from(f[4]),
       StopEvidenceObservationDTO{
           den<StopEvidenceObservationKind>(observation[0], 2U, "observation kind"),
           dopt<std::int64_t>(observation[1],
@@ -857,29 +812,6 @@ template <typename T, typename Decode>
           "resolved evidence requirements")};
 }
 
-[[nodiscard]] V deadline_budget_value(const StopDeadlineBudgetDTO& v) {
-  return arr({content_identity::nonnegative_int64_value(v.outer_duration_ns),
-              content_identity::nonnegative_int64_value(v.kernel_completion_reserve_ns),
-              vec(v.phases, [](const StopBudgetPhaseDTO& phase) {
-                return arr({enc(phase.phase_id),
-                            content_identity::nonnegative_int64_value(phase.deadline_offset_ns)});
-              })});
-}
-
-[[nodiscard]] StopDeadlineBudgetDTO deadline_budget_from(const V& v) {
-  const auto& f = exact(v, 3U, "deadline budget");
-  return StopDeadlineBudgetDTO{i64(f[0], "outer duration"), i64(f[1], "completion reserve"),
-                               dvec<StopBudgetPhaseDTO>(
-                                   f[2],
-                                   [](const V& item) {
-                                     const auto& row = exact(item, 2U, "deadline phase");
-                                     return StopBudgetPhaseDTO{
-                                         did<StopBudgetPhaseId>(row[0], "phase ID"),
-                                         i64(row[1], "phase offset")};
-                                   },
-                                   "deadline phases")};
-}
-
 [[nodiscard]] V coordinate_acceleration_value(const CoordinateAccelerationDTO& v) {
   return std::visit(
       [](const auto& current) -> V {
@@ -992,10 +924,13 @@ template <typename T, typename Decode>
                  return V(std::move(rows));
                }),
            structured_value(v.diagnostics)};
-  // Preserve the exact nine-field historical record. It is read-only history,
-  // not permission to prepare a new Stop with an implicit jerk policy.
-  if (v.jerk_limits_enabled) {
-    fields.emplace_back(*v.jerk_limits_enabled);
+  // Q51 journal layout: twelve fields (jerk activation, jerk limits and the
+  // per-profile `max_stop_time_s` always present); older layouts are refused.
+  if (!v.jerk_limits_enabled && !v.per_joint_max_jerk.empty()) {
+    bad("unreviewed Stop profile cannot carry new jerk limits");
+  }
+  fields.emplace_back(opt(v.jerk_limits_enabled, [](const bool item) { return V(item); }));
+  {
     A limits;
     for (const auto& [joint, limit] : v.per_joint_max_jerk) {
       limits.emplace_back(arr({V(joint), std::visit(
@@ -1008,20 +943,17 @@ template <typename T, typename Decode>
                                              limit)}));
     }
     fields.emplace_back(std::move(limits));
-  } else if (!v.per_joint_max_jerk.empty()) {
-    bad("unreviewed Stop profile cannot carry new jerk limits");
   }
+  fields.emplace_back(opt(v.max_stop_time_s, [](const double item) { return V(item); }));
   return V(std::move(fields));
 }
 
 [[nodiscard]] MotionInterruptStopProfileDTO motion_profile_from(const V& v) {
-  if (!v.is_array() || (v.as_array().size() != 9U && v.as_array().size() != 11U))
-    bad("motion interrupt Stop profile has the wrong structural arity");
-  const auto& f = v.as_array();
-  std::optional<bool> enabled;
+  const auto& f = exact(v, 12U, "motion interrupt Stop profile");
+  std::optional<bool> enabled =
+      dopt<bool>(f[9], [](const V& item) { return boolean(item, "Stop jerk activation"); });
   std::map<std::string, CoordinateJerkDTO> jerk;
-  if (f.size() == 11U) {
-    enabled = boolean(f[9], "Stop jerk activation");
+  {
     if (!f[10].is_array()) bad("per-joint jerk is not an array");
     for (const auto& item : f[10].as_array()) {
       const auto& row = exact(item, 2U, "per-joint jerk row");
@@ -1035,6 +967,7 @@ template <typename T, typename Decode>
                .second)
         bad("per-joint jerk contains duplicate joints");
     }
+    if (!enabled.has_value() && !jerk.empty()) bad("unreviewed Stop profile carries jerk limits");
   }
   if (!f[3].is_array()) bad("per-joint deceleration is not an array");
   std::map<std::string, CoordinateAccelerationDTO> acceleration;
@@ -1060,6 +993,7 @@ template <typename T, typename Decode>
       str(f[0], "profile ID"),
       den<MotionInterruptStopMode>(f[1], 2U, "interrupt Stop mode"),
       dopt<double>(f[2], [](const V& item) { return number(item, "deceleration time"); }),
+      dopt<double>(f[11], [](const V& item) { return number(item, "maximum Stop time"); }),
       std::move(acceleration),
       boolean(f[4], "allow natural completion"),
       dopt<MotionInterruptStopMode>(f[5],
@@ -1104,12 +1038,11 @@ template <typename T, typename Decode>
               enc(v.program_run_id), opt(v.participant_stop_profile, motion_profile_value),
               enc(v.participant_stop_profile_purpose),
               opt(v.motion_interrupt_scope_id, [](const std::string& item) { return V(item); }),
-              deadline_budget_value(v.deadline_budget),
               vec(v.stage_commands, prepared_stage_value)});
 }
 
 [[nodiscard]] PreparedParticipantStopPlanDTO prepared_plan_from(const V& v) {
-  const auto& f = exact(v, 14U, "prepared participant Stop plan");
+  const auto& f = exact(v, 13U, "prepared participant Stop plan");
   return PreparedParticipantStopPlanDTO{
       did<ContentDigest>(f[0], "participant plan digest"),
       did<ResolvedStopBasePlanId>(f[1], "resolved base-plan ID"),
@@ -1123,8 +1056,7 @@ template <typename T, typename Decode>
       dopt<MotionInterruptStopProfileDTO>(f[9], motion_profile_from),
       den<ParticipantStopProfilePurposeDTO>(f[10], 3U, "profile purpose"),
       dopt<std::string>(f[11], [](const V& item) { return str(item, "interrupt scope ID"); }),
-      deadline_budget_from(f[12]),
-      dvec<PreparedStopStageCommandDTO>(f[13], prepared_stage_from, "prepared stage commands")};
+      dvec<PreparedStopStageCommandDTO>(f[12], prepared_stage_from, "prepared stage commands")};
 }
 
 [[nodiscard]] V resolved_participant_stage_value(const ResolvedParticipantStopStageDTO& v) {
@@ -1460,13 +1392,11 @@ template <typename T, typename Decode>
               enc(v.dispatch_state), opt(v.stop_evidence_policy_id, id_value),
               opt(v.stop_evidence_policy_revision, id_value),
               opt(v.participant_stop_invocation_plan_digest, id_value),
-              content_identity::nonnegative_int64_value(v.accepted_at_ns),
-              content_identity::nonnegative_int64_value(v.remaining_outer_duration_ns),
-              vec(v.phases, phase_budget_value)});
+              content_identity::nonnegative_int64_value(v.accepted_at_ns)});
 }
 
 [[nodiscard]] StopScopeEntryDTO scope_entry_from(const V& v) {
-  const auto& f = exact(v, 10U, "Stop scope entry");
+  const auto& f = exact(v, 8U, "Stop scope entry");
   return StopScopeEntryDTO{
       scope_key_from(f[0]),
       scope_facts_from(f[1]),
@@ -1479,9 +1409,7 @@ template <typename T, typename Decode>
           [](const V& item) { return did<StopEvidencePolicyRevision>(item, "policy revision"); }),
       dopt<ContentDigest>(
           f[6], [](const V& item) { return did<ContentDigest>(item, "participant plan digest"); }),
-      i64(f[7], "accepted time"),
-      i64(f[8], "remaining outer duration"),
-      dvec<StopAcceptedPhaseBudgetDTO>(f[9], phase_budget_from, "scope phases")};
+      i64(f[7], "accepted time")};
 }
 
 [[nodiscard]] V attempted_result_value(const StopAttemptedStageResultDTO& v) {
@@ -1530,9 +1458,7 @@ template <typename T, typename Decode>
               vec(v.predecessor_stops,
                   [](const StopPredecessorAcceptanceRefDTO& row) {
                     return arr({enc(row.predecessor_stop_id), enc(row.predecessor_stop_generation),
-                                enc(row.captured_scope_digest),
-                                content_identity::nonnegative_int64_value(
-                                    row.remaining_outer_duration_ns_at_join)});
+                                enc(row.captured_scope_digest)});
                   }),
               vec(v.newly_fenced_operation_revisions,
                   [](const StopAffectedOperationRevisionDTO& row) {
@@ -1552,12 +1478,11 @@ template <typename T, typename Decode>
       dvec<StopPredecessorAcceptanceRefDTO>(
           f[4],
           [](const V& item) {
-            const auto& row = exact(item, 4U, "capture predecessor");
+            const auto& row = exact(item, 3U, "capture predecessor");
             return StopPredecessorAcceptanceRefDTO{
                 did<StopId>(row[0], "predecessor Stop ID"),
                 did<StopGeneration>(row[1], "predecessor Stop generation"),
-                did<ContentDigest>(row[2], "predecessor scope digest"),
-                i64(row[3], "predecessor remaining duration")};
+                did<ContentDigest>(row[2], "predecessor scope digest")};
           },
           "capture predecessors"),
       dvec<StopAffectedOperationRevisionDTO>(
@@ -1684,26 +1609,18 @@ template <typename T, typename Decode>
 
 [[nodiscard]] V remaining_budget_value(const RemainingStopBudgetDTO& v) {
   return arr({enc(v.stop_id), enc(v.stop_generation),
-              content_identity::nonnegative_int64_value(v.remaining_outer_duration_ns),
-              vec(v.phases, [](const RemainingStopPhaseBudgetDTO& phase) {
-                return arr({enc(phase.phase_id), content_identity::nonnegative_int64_value(
-                                                     phase.remaining_deadline_offset_ns)});
+              content_identity::nonnegative_int64_value(v.elapsed_since_stop_ns),
+              opt(v.remaining_controlled_deadline_ns, [](const std::int64_t item) {
+                return content_identity::nonnegative_int64_value(item);
               })});
 }
 
 [[nodiscard]] RemainingStopBudgetDTO remaining_budget_from(const V& v) {
-  const auto& f = exact(v, 4U, "remaining Stop budget");
+  const auto& f = exact(v, 4U, "per-robot Stop timing");
   return RemainingStopBudgetDTO{
       did<StopId>(f[0], "Stop ID"), did<StopGeneration>(f[1], "Stop generation"),
-      i64(f[2], "remaining outer duration"),
-      dvec<RemainingStopPhaseBudgetDTO>(
-          f[3],
-          [](const V& item) {
-            const auto& row = exact(item, 2U, "remaining phase budget");
-            return RemainingStopPhaseBudgetDTO{did<StopBudgetPhaseId>(row[0], "phase ID"),
-                                               i64(row[1], "remaining phase offset")};
-          },
-          "remaining phase budgets")};
+      i64(f[2], "elapsed since Stop"),
+      dopt<std::int64_t>(f[3], [](const V& item) { return i64(item, "controlled deadline"); })};
 }
 
 [[nodiscard]] V current_stage_value(const StopCurrentStageDTO& v) {
@@ -1953,18 +1870,20 @@ template <typename T, typename Decode>
   const bool ordered =
       std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
                   [](const auto& row) { return row.journal_capture_order != 0U; });
-  return arr({V(scoped    ? "manyforge.internal.stop-journal-acceptance-projection.v3"
-                : ordered ? "manyforge.internal.stop-journal-acceptance-projection.v2"
-                          : "manyforge.internal.stop-journal-acceptance-projection.v1"),
+  // Q51/Q53: the per-robot Stop timing changed every shape; earlier versions
+  // (v1-v3) are refused, never converted.
+  return arr({V(scoped    ? "manyforge.internal.stop-journal-acceptance-projection.v6"
+                : ordered ? "manyforge.internal.stop-journal-acceptance-projection.v5"
+                          : "manyforge.internal.stop-journal-acceptance-projection.v4"),
               accepted_value(value.accepted), affected_value(value.affected_state)});
 }
 
 [[nodiscard]] StopJournalAcceptanceProjectionDTO acceptance_root_from(const V& value) {
   const auto& f = exact(value, 3U, "Stop journal acceptance projection");
   const auto version = str(f[0], "acceptance API version");
-  if (version != "manyforge.internal.stop-journal-acceptance-projection.v1" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v2" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v3") {
+  if (version != "manyforge.internal.stop-journal-acceptance-projection.v4" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v5" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v6") {
     bad("Stop journal acceptance projection API version is unsupported");
   }
   auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};

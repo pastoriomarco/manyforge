@@ -3,6 +3,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
+#include <manyforge_core/stop_timing.hpp>
 #include <map>
 #include <set>
 #include <string>
@@ -310,6 +311,7 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
   if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
     SoftOnPathStopParametersDTO mapped;
     mapped.deceleration_time_s = *profile.deceleration_time_s;
+    mapped.max_stop_time_s = profile.max_stop_time_s;
     mapped.per_resource_limits = std::move(limits);
     mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
     mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
@@ -322,6 +324,7 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
 
   SpringBackHoldStopParametersDTO mapped;
   mapped.deceleration_time_s = motion_interrupt_deceleration_time_or_default(profile);
+  mapped.max_stop_time_s = profile.max_stop_time_s;
   mapped.per_resource_limits = std::move(limits);
   mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
   mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
@@ -385,6 +388,14 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
                              "controlled Stop duration is invalid");
     }
     profile.deceleration_time_s = *duration;
+    if (const auto* encoded_max = member(parameters, "max_stop_time_s")) {
+      const auto* max_stop = number(encoded_max);
+      if (max_stop == nullptr || !std::isfinite(*max_stop) || *max_stop <= 0.0) {
+        return invalid_profile("motion_controlled_stop_max_stop_time_invalid",
+                               "controlled Stop maximum Stop time is invalid");
+      }
+      profile.max_stop_time_s = *max_stop;
+    }
   }
   if (profile.stop_mode != MotionInterruptStopMode::kHardDeceleration) {
     const auto* natural = boolean(member(parameters, "allow_natural_completion_on_short_path"));
@@ -563,6 +574,24 @@ JsonValueDTO motion_controlled_stop_evidence(const MotionInterruptStopProfileDTO
     evidence.emplace("provider_diagnostics", JsonValueDTO{std::move(diagnostics)});
   }
   return JsonValueDTO{std::move(evidence)};
+}
+
+std::optional<Duration> controlled_stop_deadline_from_contract_parameters(
+    const JsonObjectDTO& parameters) {
+  const auto* mode = text(member(parameters, "stop_mode"));
+  if (mode == nullptr || (*mode != "soft_on_path" && *mode != "spring_back_hold")) {
+    return std::nullopt;
+  }
+  MotionInterruptStopProfileDTO profile;
+  const auto* duration = number(member(parameters, "deceleration_time_s"));
+  if (duration == nullptr || !std::isfinite(*duration) || *duration <= 0.0) return std::nullopt;
+  profile.deceleration_time_s = *duration;
+  if (const auto* encoded_max = member(parameters, "max_stop_time_s")) {
+    const auto* max_stop = number(encoded_max);
+    if (max_stop == nullptr || !max_stop_time_valid(*max_stop)) return std::nullopt;
+    profile.max_stop_time_s = *max_stop;
+  }
+  return controlled_stop_deadline_ns(profile);
 }
 
 }  // namespace manyforge::core

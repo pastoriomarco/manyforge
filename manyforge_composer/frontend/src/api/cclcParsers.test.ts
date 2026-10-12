@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { CCLCIncidentDiagnostic } from '../types/cclc';
 
 import {
   parseCCLCAdmission,
@@ -68,7 +69,165 @@ function lifecycleAcceptance(): Record<string, unknown> {
   };
 }
 
+function incidentDiagnostic(): CCLCIncidentDiagnostic & {
+  snapshot: NonNullable<CCLCIncidentDiagnostic['snapshot']>;
+} {
+  return {
+    error: {
+      code: 'controller_launch_exited', message: 'm'.repeat(1024),
+      details: { component_id: 'component.arm' },
+    },
+    snapshot: {
+      exit: { status: null, signal: 11, core_dumped: false, observed_utc: '2026-10-11T18:00:00Z' },
+      context: {
+        component_id: 'component.arm', request_context: 'Apply request.1', runtime_unit_id: 'runtime.arm',
+        runtime_epoch: 'epoch.1', bundle_id: 'bundle.1', graph_revision: 'graph.1',
+        generator_identity: null, launch_identity: 'launch.1',
+      },
+      readiness: {
+        known: true, controller_manager_present: true, controller_observed: true,
+        controller_loaded: true, controller_bound: false, arm_controller_active: null,
+        hardware_ready: null, joint_sample_available: false, binding_epoch: '18446744073709551615',
+        sample_age_ns: '9223372036854775807', captured_utc: null,
+      },
+      settings: {
+        argv: ['ros2', 'launch'], controller_profile: 'lite6', runtime_namespace: '',
+        arm_controller_name: 'arm_controller', gripper_controller_name: null, frame_prefix: '',
+        controllers_yaml: 'controllers: {}\n', retained_configuration_json: '{"effective":true}',
+      },
+      generated: { robot_description_sha256: `sha256:${'a'.repeat(64)}`, controllers_sha256: null },
+      output: {
+        tail: 'first "line"\nCafé\n', line_count: 2, truncated: true,
+        dropped_forward_lines: '18446744073709551615', dropped_forward_bytes: 0, invalid_text_bytes: 0,
+      },
+      core_dump_link: null,
+    },
+  };
+}
+
+function componentWithDiagnostic(diagnostic: unknown): Record<string, unknown> {
+  const value = componentSnapshot();
+  (value.lifecycle_progress as Record<string, unknown>).incident = {
+    acknowledged: false, cause_class: 'provider_lost', detected_at_ns: 1000,
+    incident_id: 'incident.arm.1', summary: 'Controller launch exited', vendor_codes: [], diagnostic,
+  };
+  return value;
+}
+
 describe('CCLC closed response parsers', () => {
+  it('preserves closed rich incident evidence and exact full-width scalars', () => {
+    const diagnostic = incidentDiagnostic();
+    const incident = parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic)).lifecycleProgress?.incident;
+    expect(incident?.summary).toBe('Controller launch exited');
+    expect(incident?.diagnostic).toEqual(diagnostic);
+    expect(incident?.diagnostic?.snapshot?.readiness.sample_age_ns).toBe('9223372036854775807');
+    expect(incident?.diagnostic?.snapshot?.output.dropped_forward_lines).toBe('18446744073709551615');
+    const bom = incidentDiagnostic();
+    bom.snapshot.settings.controllers_yaml = '\ufeffcontrollers: {}\n';
+    bom.error.details = Object.fromEntries([['__proto__', 'observed']]);
+    const preserved = parseCCLCComponentSnapshot(componentWithDiagnostic(bom)).lifecycleProgress?.incident?.diagnostic;
+    expect(preserved).toEqual(bom);
+    expect(Object.keys(preserved!.error.details)).toEqual(['__proto__']);
+    expect(parseCCLCComponentSnapshot(componentWithDiagnostic(null)).lifecycleProgress?.incident?.diagnostic).toBeNull();
+    const unknownFacts = incidentDiagnostic();
+    for (const key of Object.keys(unknownFacts.snapshot.readiness)) {
+      (unknownFacts.snapshot.readiness as unknown as Record<string, unknown>)[key] = null;
+    }
+    expect(parseCCLCComponentSnapshot(componentWithDiagnostic(unknownFacts)).lifecycleProgress?.incident?.diagnostic).toEqual(unknownFacts);
+  });
+
+  it('preserves a short-only diagnostic before a real snapshot is available', () => {
+    const rich = incidentDiagnostic();
+    const short = { error: rich.error, snapshot: null };
+    const parsedShort = parseCCLCComponentSnapshot(componentWithDiagnostic(short)).lifecycleProgress?.incident;
+    expect(parsedShort?.summary).toBe('Controller launch exited');
+    expect(parsedShort?.diagnostic).toEqual(short);
+    expect(parseCCLCComponentSnapshot(componentWithDiagnostic(rich)).lifecycleProgress?.incident?.diagnostic?.error).toEqual(parsedShort?.diagnostic?.error);
+    for (const malformed of [
+      { error: null, snapshot: null },
+      { error: rich.error },
+      { ...short, extra: true },
+    ]) {
+      expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(malformed))).toThrow();
+    }
+  });
+
+  it('preserves paired informational output drop counters with exact uint64 values', () => {
+    const absent = parseCCLCComponentSnapshot(componentSnapshot());
+    expect(absent).not.toHaveProperty('droppedOutputLines');
+    expect(absent).not.toHaveProperty('droppedOutputBytes');
+    for (const [lines, bytes] of [
+      [0, 0], [Number.MAX_SAFE_INTEGER, '9007199254740992'],
+      ['18446744073709551615', '18446744073709551615'],
+    ]) {
+      const parsed = parseCCLCComponentSnapshot({
+        ...componentSnapshot(), dropped_output_lines: lines, dropped_output_bytes: bytes,
+      });
+      expect(parsed.droppedOutputLines).toBe(lines);
+      expect(parsed.droppedOutputBytes).toBe(bytes);
+    }
+    for (const field of ['dropped_output_lines', 'dropped_output_bytes']) {
+      for (const invalid of [null, true, -1, 1.5, 2 ** 53, '01', '18446744073709551616']) {
+        expect(() => parseCCLCComponentSnapshot({
+          ...componentSnapshot(), dropped_output_lines: 0, dropped_output_bytes: 0, [field]: invalid,
+        })).toThrow('uint64');
+      }
+      expect(() => parseCCLCComponentSnapshot({ ...componentSnapshot(), [field]: 0 })).toThrow('closed fields');
+    }
+  });
+
+  it('rejects unknown fields and malformed typed nullable evidence', () => {
+    const invalidFacts: Array<[string[], unknown]> = [
+      [['extra'], true],
+      [['error', 'message'], 'm'.repeat(1025)],
+      [['error', 'details'], Object.fromEntries(Array.from({ length: 9 }, (_, i) => [String(i), 'value']))],
+      [['error', 'details'], { '': 'value' }],
+      [['snapshot', 'extra'], {}],
+      [['snapshot', 'exit', 'signal'], true],
+      [['snapshot', 'exit', 'status'], 256],
+      [['snapshot', 'context', 'component_id'], 'x'.repeat(129)],
+      [['snapshot', 'readiness', 'controller_bound'], 'unknown'],
+      [['snapshot', 'readiness', 'sample_age_ns'], 2 ** 53],
+      [['snapshot', 'readiness', 'sample_age_ns'], '9223372036854775808'],
+      [['snapshot', 'readiness', 'binding_epoch'], '18446744073709551616'],
+      [['snapshot', 'settings', 'retained_configuration_json'], { escape: true }],
+      [['snapshot', 'settings', 'frame_prefix'], 'Cafe\u0301'],
+      [['snapshot', 'settings', 'argv'], ['\ud800']],
+      [['snapshot', 'generated', 'controllers_sha256'], `sha256:${'A'.repeat(64)}`],
+      [['snapshot', 'output', 'tail'], 'Cafe\u0301\n'],
+      [['snapshot', 'output', 'line_count'], 1],
+      [['snapshot', 'output', 'truncated'], 1],
+      [['snapshot', 'output', 'dropped_forward_bytes'], '01'],
+    ];
+    for (const [path, invalid] of invalidFacts) {
+      const diagnostic = incidentDiagnostic();
+      let cursor = diagnostic as unknown as Record<string, unknown>;
+      for (const key of path.slice(0, -1)) cursor = cursor[key] as Record<string, unknown>;
+      cursor[path.at(-1)!] = invalid;
+      expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
+    }
+    const missing = incidentDiagnostic();
+    delete (missing.snapshot.readiness as unknown as Record<string, unknown>).known;
+    expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(missing))).toThrow('closed fields');
+  });
+
+  it('enforces both tail caps including escaping and the diagnostic JSON budget', () => {
+    const diagnostic = incidentDiagnostic();
+    for (const [tail, lines] of [['', 0], ['a\nb', 2], ['a\n'.repeat(2000), 2000], ['"'.repeat(65535), 1]] as const) {
+      Object.assign(diagnostic.snapshot.output, { tail, line_count: lines });
+      expect(parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic)).lifecycleProgress?.incident?.diagnostic?.snapshot?.output.tail).toBe(tail);
+    }
+    for (const [tail, lines] of [['"'.repeat(65536), 1], ['a\n'.repeat(2001), 2001], ['😀'.repeat(32768), 1]] as const) {
+      Object.assign(diagnostic.snapshot.output, { tail, line_count: lines });
+      expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
+    }
+    Object.assign(diagnostic.snapshot.output, { tail: '', line_count: 0 });
+    diagnostic.snapshot.settings.controllers_yaml = 'x'.repeat(300 * 1024);
+    expect(parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic)).lifecycleProgress?.incident?.diagnostic).toEqual(diagnostic);
+    diagnostic.snapshot.settings.controllers_yaml = 'x'.repeat(512 * 1024);
+    expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow('512 KiB');
+  });
+
   it('parses only the sole CCLC owner identity field', () => {
     expect(parseCCLCOwnerIdentity({
       request_owner_epoch: 'cclc-owner.1',

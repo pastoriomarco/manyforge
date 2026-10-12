@@ -1737,6 +1737,12 @@ describe('Deployment workspace parser', () => {
     const parsed = parseDeploymentWorkspaceResponse(fixture);
     expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
     expect(parsed.draft.graphRevision).toBeNull();
+    const authored = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
+    authored.isaac_world = 'lite6_grf_ros2';
+    expect(parseDeploymentWorkspaceResponse(fixture).draft.document?.isaac_world).toBe('lite6_grf_ros2');
+    authored.isaac_world = 'file:/machine/world.usda';
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('portable identifier');
+    delete authored.isaac_world;
     expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
     expect(parsed.saved.deploymentRevision).toBeNull();
     const intent = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;

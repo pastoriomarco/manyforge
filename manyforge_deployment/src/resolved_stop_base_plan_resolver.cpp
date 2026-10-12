@@ -324,28 +324,11 @@ parse_external_kind(std::string_view value) {
 [[nodiscard]] core::StopContainmentCommandDTO
 parse_command(const CanonicalValue &value, std::string_view path) {
   return {
-      core::StopBudgetPhaseId(
-          text(member(value, "command_phase_id", path), path)),
       parse_command_kind(text(member(value, "command_kind", path), path)),
       optional_contract(member(value, "provider_contract_ref", path), path),
       optional_strong<core::RegisteredStopCommandKindId>(
           member(value, "registered_command_kind_id", path), path),
   };
-}
-
-[[nodiscard]] core::StopDeadlineBudgetDTO
-parse_budget(const CanonicalValue &value, std::string_view path) {
-  core::StopDeadlineBudgetDTO result;
-  result.outer_duration_ns =
-      integer(member(value, "outer_duration_ns", path), path);
-  result.kernel_completion_reserve_ns =
-      integer(member(value, "kernel_completion_reserve_ns", path), path);
-  for (const auto &phase : array(member(value, "phases", path), path)) {
-    result.phases.push_back(
-        {core::StopBudgetPhaseId(text(member(phase, "phase_id", path), path)),
-         integer(member(phase, "deadline_offset_ns", path), path)});
-  }
-  return result;
 }
 
 [[nodiscard]] core::StopEvidenceRequirementDTO
@@ -361,7 +344,6 @@ parse_evidence(const CanonicalValue &value, std::string_view path) {
   return {
       core::StopEvidenceItemId(
           text(member(value, "evidence_item_id", path), path)),
-      core::StopBudgetPhaseId(text(member(value, "phase_id", path), path)),
       parse_evidence_kind(text(member(value, "evidence_kind", path), path)),
       optional_contract(member(value, "provider_contract_ref", path), path),
       optional_strong<core::RegisteredStopEvidenceKindId>(
@@ -720,6 +702,105 @@ parse_commissioned(const CanonicalValue &value, std::string_view path) {
 
 } // namespace
 
+std::vector<std::pair<core::ResourceId, double>>
+retained_controlled_stop_max_deceleration_rad_s2(
+    const RetainedBundle &retained_bundle,
+    const IVerifiedRetainedProductArtifactSource &artifact_source,
+    const core::RuntimeParticipantBinding &participant_binding) {
+  if (!verify_retained_bundle_identity(retained_bundle)) {
+    fail("retained bundle identity is invalid");
+  }
+  const auto &binding = participant_binding.value();
+  if (!binding.control_path.has_value() ||
+      binding.retained_bundle_id != retained_bundle.retained_bundle_id() ||
+      binding.graph_revision !=
+          retained_bundle.value().cell_graph.graph_revision) {
+    fail("runtime participant does not belong to the retained bundle");
+  }
+  const auto &control_path = *binding.control_path;
+  const auto &product =
+      require_control_product(retained_bundle, control_path.control_domain_id);
+  const auto &artifact = require_control_artifact(product);
+  const RetainedProductArtifactQuery query{
+      retained_bundle.retained_bundle_id(), product.product_id,
+      product.product_kind, artifact.artifact_role_id};
+  const auto loaded = artifact_source.get_verified(query);
+  if (!loaded.has_value() || loaded->query() != query ||
+      loaded->product_contract_id() != product.product_contract_id ||
+      loaded->product_contract_revision() !=
+          product.product_contract_revision ||
+      loaded->artifact_ref() != artifact) {
+    fail("exact retained control-domain artifact is absent or mismatched");
+  }
+  detail::require_control_domain_control_matches_retained_bundle(
+      loaded->bytes(), retained_bundle.value(), control_path.control_domain_id);
+  const auto root =
+      detail::parse_and_verify_control_domain_control(loaded->bytes());
+  const CanonicalValue *selected_stop = nullptr;
+  for (const auto &candidate :
+       array(member(root, "stop_applicability", "control"), "control")) {
+    if (text(member(candidate, "control_binding_id", "stop"), "stop") ==
+            control_path.control_binding_id.value() &&
+        text(member(candidate, "control_binding_revision", "stop"), "stop") ==
+            control_path.control_binding_revision.value() &&
+        text(member(candidate, "control_route_id", "stop"), "stop") ==
+            control_path.control_route_id.value()) {
+      if (selected_stop != nullptr) {
+        fail("control artifact duplicates the selected Stop row");
+      }
+      selected_stop = &candidate;
+    }
+  }
+  if (selected_stop == nullptr ||
+      text(member(*selected_stop, "disposition", "stop"), "stop") !=
+          "stoppable") {
+    fail("participant route has no stoppable retained plan");
+  }
+  const CanonicalValue *controlled = nullptr;
+  for (const auto &stage :
+       array(member(*selected_stop, "escalation_stages", "stop"), "stop")) {
+    const auto command =
+        parse_command(member(stage, "containment_command", "stage"),
+                      "stage.command");
+    if (command.command_kind !=
+        core::StopContainmentCommandKind::kMotionControlledStop) {
+      continue;
+    }
+    if (controlled != nullptr) {
+      fail("participant route has more than one motion-controlled Stop stage");
+    }
+    controlled = &member(stage, "default_contract_parameters", "stage");
+  }
+  if (controlled == nullptr || is_null(*controlled)) {
+    fail("participant route has no authored motion-controlled Stop limits");
+  }
+  std::vector<std::pair<core::ResourceId, double>> result;
+  std::set<std::string> seen;
+  for (const auto &row : array(member(*controlled, "per_resource_limits",
+                                      "controlled Stop parameters"),
+                               "controlled Stop parameters")) {
+    const auto &resource =
+        text(member(row, "resource_id", "controlled Stop limit"),
+             "controlled Stop limit");
+    const auto *value = std::get_if<double>(
+        &member(member(row, "max_deceleration", "controlled Stop limit"),
+                "value_rad_s2", "controlled Stop deceleration")
+             .storage());
+    if (value == nullptr || !std::isfinite(*value) || !(*value > 0.0) ||
+        !seen.insert(resource).second) {
+      fail("controlled Stop limit for " + resource + " is invalid");
+    }
+    result.emplace_back(core::ResourceId(resource), *value);
+  }
+  for (const auto &resource : binding.resources) {
+    if (!seen.contains(resource.resource_id.value())) {
+      fail("controlled Stop limits miss participant resource " +
+           resource.resource_id.value());
+    }
+  }
+  return result;
+}
+
 core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
     const RetainedBundle &retained_bundle,
     const IVerifiedRetainedProductArtifactSource &artifact_source,
@@ -834,8 +915,6 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
                "stop")),
       parse_granularity(text(
           member(*selected_stop, "containment_granularity", "stop"), "stop")),
-      parse_budget(member(*selected_stop, "deadline_budget", "stop"),
-                   "stop.deadline_budget"),
       {},
   };
   if (plan.stop_evidence_policy_id != control_path.stop_evidence_policy_id ||
@@ -1296,18 +1375,6 @@ store_and_verify_runtime_participant_stop_readiness(
     return readiness_error<core::RuntimeParticipantStopReadiness>(
         "stop_readiness_retained_timing_mismatch",
         "Stop readiness requires the exact retained bundle");
-  std::optional<std::int64_t> maximum_duration;
-  for (const auto &selected : retained_bundle.value().stop_timing_parameters) {
-    if (selected.control_binding_id != plan.control_binding_id)
-      continue;
-    if (selected.control_binding_revision != plan.control_binding_revision)
-      return readiness_error<core::RuntimeParticipantStopReadiness>(
-          "stop_readiness_retained_timing_mismatch",
-          "Stop timing differs from the exact binding revision");
-    // Items 1/26 and 24: no settling dwell is reserved inside the timeout.
-    maximum_duration = selected.timing.operational_timeout_ns -
-                       selected.timing.command_latency_allowance_ns;
-  }
   const auto verified = core::VerifyResolvedStopBasePlan(plan);
   if (!verified.ok()) {
     return core::Result<core::RuntimeParticipantStopReadiness>::Err(
@@ -1344,7 +1411,7 @@ store_and_verify_runtime_participant_stop_readiness(
       core::RuntimeParticipantStopReadinessDTO{
           participant_binding.value().controllable_component_id,
           component_lifecycle_generation, expected_domain.value(),
-          std::move(loaded.value()), maximum_duration},
+          std::move(loaded.value())},
       participant_binding, expected_domain);
 }
 
@@ -1415,7 +1482,6 @@ resolve_store_and_verify_route_readiness_batch(
 
     std::vector<Pending> pending;
     pending.reserve(desired.binding_routes.size());
-    std::optional<std::pair<std::int64_t, std::int64_t>> shared_envelope;
     for (const auto &selected : desired.binding_routes) {
       const core::RuntimeParticipantBinding *representative = nullptr;
       for (const auto &candidate : participant_bindings) {
@@ -1463,15 +1529,6 @@ resolve_store_and_verify_route_readiness_batch(
       auto plan = resolve_verified_stop_base_plan(
           retained_bundle, artifact_source, expected_domain,
           active_configuration, rebound.value());
-      const auto envelope =
-          std::pair(plan.deadline_budget.outer_duration_ns,
-                    plan.deadline_budget.kernel_completion_reserve_ns);
-      if (shared_envelope.has_value() && *shared_envelope != envelope) {
-        return readiness_error<std::vector<VerifiedRouteReadinessParticipant>>(
-            "route_readiness_stop_envelope_mismatch",
-            "selected participant Stop plans disagree on the cell envelope");
-      }
-      shared_envelope = envelope;
       pending.push_back(Pending{
           std::move(rebound.value()),
           component->expected_component_lifecycle_generation, std::move(plan)});

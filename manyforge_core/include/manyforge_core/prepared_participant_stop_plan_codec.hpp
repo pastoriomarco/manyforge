@@ -37,20 +37,6 @@ struct PreparedParticipantStopPlanContextDTO final {
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category);
 
-/// Authoritative Prepare variants also enforce the exact retained full-profile
-/// ceiling. The base-only codecs above remain usable for historical evidence.
-[[nodiscard]] Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
-    const RuntimeParticipantStopReadinessDTO& readiness,
-    PreparedParticipantStopPlanContextDTO context,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits);
-
-[[nodiscard]] Result<void> VerifyPreparedParticipantStopPlan(
-    const RuntimeParticipantStopReadinessDTO& readiness, const PreparedParticipantStopPlanDTO& plan,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits,
-    MotionInterruptNodeCategory node_category);
-
 [[nodiscard]] Result<std::string> EncodePreparedParticipantStopPlan(
     const ResolvedStopBasePlanDTO& verified_base_plan, const PreparedParticipantStopPlanDTO& plan,
     std::span<const RuntimeResourceBindingDTO> resources,

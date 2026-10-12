@@ -97,9 +97,7 @@ template <typename Identity>
   return bounded_identity(predecessor.predecessor_stop_id) &&
          predecessor.predecessor_stop_id != current_stop &&
          predecessor.predecessor_stop_generation.nonzero() &&
-         digest_valid(predecessor.captured_scope_digest) &&
-         predecessor.remaining_outer_duration_ns_at_join > 0 &&
-         predecessor.remaining_outer_duration_ns_at_join <= kMaximumStopDurationNs;
+         digest_valid(predecessor.captured_scope_digest);
 }
 
 [[nodiscard]] bool reason_matches_disposition(StopResolutionDispositionDTO disposition,
@@ -174,30 +172,6 @@ template <typename Identity>
          reason != StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent;
 }
 
-[[nodiscard]] bool phase_rows_valid(
-    const std::vector<StopAcceptedPhaseBudgetDTO>& phases) noexcept {
-  if (phases.empty() || phases.size() > kMaximumStopAcceptedPhases) {
-    return false;
-  }
-  std::int64_t prior_fixed = 0;
-  for (std::size_t index = 0U; index < phases.size(); ++index) {
-    const auto& phase = phases[index];
-    if (!bounded_identity(phase.phase_id) || phase.fixed_deadline_offset_ns <= prior_fixed ||
-        phase.fixed_deadline_offset_ns > kMaximumStopDurationNs ||
-        phase.remaining_deadline_offset_ns < 0 ||
-        phase.remaining_deadline_offset_ns > phase.fixed_deadline_offset_ns) {
-      return false;
-    }
-    for (std::size_t prior = 0U; prior < index; ++prior) {
-      if (phases[prior].phase_id == phase.phase_id) {
-        return false;
-      }
-    }
-    prior_fixed = phase.fixed_deadline_offset_ns;
-  }
-  return true;
-}
-
 [[nodiscard]] bool participant_facts_valid(const StopParticipantScopeFactsDTO& facts) noexcept {
   return facts.operation_revision_after_acceptance.nonzero() &&
          bounded_identity(facts.controllable_component_id) &&
@@ -221,8 +195,7 @@ template <typename Identity>
 }
 
 [[nodiscard]] bool scope_entry_valid(const StopScopeEntryDTO& entry) noexcept {
-  if (!key_valid(entry.key) || entry.accepted_at_ns < 0 || entry.remaining_outer_duration_ns < 0 ||
-      entry.remaining_outer_duration_ns > kMaximumStopDurationNs ||
+  if (!key_valid(entry.key) || entry.accepted_at_ns < 0 ||
       (entry.stop_evidence_policy_id.has_value() !=
        entry.stop_evidence_policy_revision.has_value())) {
     return false;
@@ -234,12 +207,12 @@ template <typename Identity>
     return false;
   }
   if (participant_facts != nullptr) {
-    if (!participant_facts_valid(*participant_facts) || !phase_rows_valid(entry.phases)) {
+    if (!participant_facts_valid(*participant_facts)) {
       return false;
     }
   } else {
     if (std::get<ResourceId>(entry.key.subject) != std::get<ResourceId>(entry.facts) ||
-        entry.disposition != StopScopeEntryDispositionDTO::kNotStoppable || !entry.phases.empty()) {
+        entry.disposition != StopScopeEntryDispositionDTO::kNotStoppable) {
       return false;
     }
   }

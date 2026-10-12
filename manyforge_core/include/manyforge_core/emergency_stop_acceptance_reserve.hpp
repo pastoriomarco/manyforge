@@ -42,7 +42,7 @@ enum class EmergencyStopReserveError {
 /// Allocation-free view prepared by the Stop ingress/resolver before it enters
 /// the reserve-or-join critical section. The proposed Stop identity is used
 /// only for a fresh transaction; exact replay and overlap joins retain the
-/// already-resident identity and deadline.
+/// already-resident identity.
 struct EmergencyStopAcceptanceCandidate final {
   std::string_view request_id;
   std::optional<std::string_view> normalized_request_digest;
@@ -53,11 +53,6 @@ struct EmergencyStopAcceptanceCandidate final {
   std::string_view proposed_stop_id;
   StopGeneration proposed_stop_generation{0U};
   std::int64_t accepted_at_ns{};
-  std::int64_t outer_deadline_ns{};
-  /// Earliest complete-Full deadline sampled from the new proposal and every
-  /// resident predecessor. Used only if this candidate is promoted/coalesced
-  /// to the dedicated Full slot.
-  std::int64_t full_stop_outer_deadline_ns{};
   StopResolutionDispositionDTO disposition{StopResolutionDispositionDTO::kPromotedToFull};
   std::string_view captured_scope_digest;
   /// Exact current Full-Stop capture. It is prepared for every recognized
@@ -78,7 +73,6 @@ struct EmergencyStopAcceptanceOutcome final {
   StopResolutionDispositionDTO disposition{StopResolutionDispositionDTO::kPromotedToFull};
   StopGeneration stop_generation{0U};
   std::int64_t accepted_at_ns{};
-  std::int64_t outer_deadline_ns{};
   /// Physical Stop transaction slot/generation handed to StopControl. Joined
   /// request correlations retain the already-resident transaction token.
   StopControlWorkToken work_token;
@@ -157,8 +151,7 @@ class EmergencyStopAcceptanceReserve final {
     EmergencyStopProjectionStateDTO projection_state{EmergencyStopProjectionStateDTO::kPending};
     StopGeneration stop_generation{0U};
     std::int64_t accepted_at_ns{};
-    std::int64_t outer_deadline_ns{};
-    StopControlWorkToken work_token;
+      StopControlWorkToken work_token;
     std::array<char, kMaximumEmergencyStopRequestIdBytes> request_id{};
     std::size_t request_id_size{};
     std::array<char, kMaximumEmergencyStopDigestBytes> request_digest{};

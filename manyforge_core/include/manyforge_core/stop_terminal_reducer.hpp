@@ -115,8 +115,6 @@ struct StopScopeEntryDTO final {
   std::optional<StopEvidencePolicyRevision> stop_evidence_policy_revision;
   std::optional<ContentDigest> participant_stop_invocation_plan_digest;
   std::int64_t accepted_at_ns{};
-  std::int64_t remaining_outer_duration_ns{};
-  std::vector<StopAcceptedPhaseBudgetDTO> phases;
 
   friend bool operator==(const StopScopeEntryDTO&, const StopScopeEntryDTO&) = default;
 };

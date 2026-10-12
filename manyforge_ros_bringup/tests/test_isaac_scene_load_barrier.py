@@ -130,6 +130,7 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
         simulator = Node("manyforge_fake_simulation_interfaces_owner")
         publishers = []
         state_transitions: list[int] = []
+        load_requests = []
 
         def publish_loaded_world_topics() -> None:
             if publishers:
@@ -147,6 +148,7 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
         _install_fake_simulator(
             simulator,
             on_play=publish_loaded_world_topics,
+            on_load_request=load_requests.append,
             state_transitions=state_transitions,
         )
         executor.add_node(simulator)
@@ -171,6 +173,12 @@ def test_scene_barrier_runs_against_typed_fake_simulator() -> None:
             ]
         )
         result = barrier.run()
+
+        assert len(load_requests) == 1
+        assert load_requests[0].world_resource.uri == barrier.world_uri
+        assert load_requests[0].world_resource.resource_string == ""
+        assert load_requests[0].fail_on_unsupported_element is True
+        assert load_requests[0].ignore_missing_or_unsupported_assets is False
 
         assert result["world_name"] == "retained_world"
         assert result["world_uri"] == (
@@ -325,23 +333,158 @@ def test_existing_world_join_never_loads_and_contains_only_its_own_playback(
         rclpy.shutdown()
 
 
+@pytest.mark.parametrize(
+    "world_uri,world_name,initial_state,topic,failure",
+    [
+        (WORLD_URI, "retained_world", SimulationState.STATE_PLAYING, "/clock", None),
+        (WORLD_URI, "retained_world", SimulationState.STATE_STOPPED, "/clock", None),
+        ("file:/opt/isaac/worlds/wrong.usda", "retained_world", SimulationState.STATE_PLAYING, "/clock", "passive join world"),
+        (WORLD_URI, "wrong_world", SimulationState.STATE_PLAYING, "/clock", "passive join world"),
+        (WORLD_URI, "retained_world", SimulationState.STATE_PLAYING, "/missing_passive_topic", "topic readiness timed out"),
+    ],
+)
+def test_passive_join_preserves_running_world_on_success_and_refusal(
+    world_uri, world_name, initial_state, topic, failure, monkeypatch
+) -> None:
+    rclpy.init()
+    simulator = Node("manyforge_fake_passive_world_owner")
+    executor = SingleThreadedExecutor()
+    loads: list[bool] = []
+    transitions: list[int] = []
+    _install_fake_simulator(
+        simulator,
+        on_load=lambda: loads.append(True),
+        state_transitions=transitions,
+        world_uri=world_uri,
+        world_name=world_name,
+        initial_state=initial_state,
+    )
+    publisher = simulator.create_publisher(Clock, "/clock", 1)
+    executor.add_node(simulator)
+    worker = threading.Thread(target=executor.spin, daemon=True)
+    worker.start()
+    barrier = IsaacSceneLoadBarrier(parameter_overrides=[
+        Parameter("world_uri", value=WORLD_URI),
+        Parameter("expected_world_name", value="retained_world"),
+        Parameter("passive_join", value=True),
+        Parameter("startup_timeout_s", value=1.0),
+        Parameter("service_timeout_s", value=0.5),
+        Parameter("required_topics", value=[topic]),
+    ])
+    calls = []
+    original_call = barrier._call
+
+    def record_call(service_name, service_type, request, **kwargs):
+        calls.append(service_type)
+        return original_call(service_name, service_type, request, **kwargs)
+
+    monkeypatch.setattr(barrier, "_call", record_call)
+    try:
+        if failure is None:
+            result = barrier.run()
+            assert result["readiness_probe"] == {"mode": "passive", "observed_topics": ["/clock"]}
+            assert result["simulation_state"] == "unchanged"
+        else:
+            with pytest.raises((RuntimeError, TimeoutError), match=failure):
+                barrier.run()
+        assert calls == [GetSimulatorFeatures, GetCurrentWorld]
+        assert loads == transitions == []
+    finally:
+        barrier.destroy_node()
+        executor.shutdown()
+        worker.join(timeout=2.0)
+        simulator.destroy_node()
+        rclpy.shutdown()
+
+
+def test_passive_join_requires_only_read_only_services() -> None:
+    rclpy.init()
+    simulator = Node("manyforge_read_only_world_owner")
+    executor = SingleThreadedExecutor()
+    _install_fake_simulator(simulator, read_only=True)
+    publisher = simulator.create_publisher(Clock, "/clock", 1)
+    executor.add_node(simulator)
+    worker = threading.Thread(target=executor.spin, daemon=True)
+    worker.start()
+    barrier = IsaacSceneLoadBarrier(parameter_overrides=[
+        Parameter("world_uri", value=WORLD_URI),
+        Parameter("expected_world_name", value="retained_world"),
+        Parameter("passive_join", value=True),
+        Parameter("startup_timeout_s", value=1.0),
+        Parameter("service_timeout_s", value=0.5),
+        Parameter("required_topics", value=["/clock"]),
+    ])
+    try:
+        assert set(barrier.run()["services"]) == {"features", "current_world"}
+    finally:
+        barrier.destroy_node()
+        executor.shutdown()
+        worker.join(timeout=2.0)
+        simulator.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("failure_stage", ["services", "features", "current_world", "topics"])
+def test_passive_join_exceptions_never_run_stopped_cleanup(failure_stage) -> None:
+    # Exercise dispatch exceptions without relying on middleware timing.
+    barrier = SimpleNamespace()
+    barrier.passive_join = True
+    barrier.startup_timeout_s = 1.0
+    barrier.world_uri = WORLD_URI
+    barrier.expected_world_name = "retained_world"
+    barrier.required_topics = ("/clock",)
+    calls = []
+
+    def services(_deadline):
+        if failure_stage == "services":
+            raise RuntimeError("injected services failure")
+        return {"features": "features", "current_world": "current_world"}
+
+    def call(name, _type, _request, **_kwargs):
+        calls.append(name)
+        if name == failure_stage:
+            raise RuntimeError(f"injected {name} failure")
+        if name == "features":
+            return SimpleNamespace(features=SimpleNamespace(features=[SimulatorFeatures.WORLD_INFO_GETTING]))
+        return SimpleNamespace(
+            result=SimpleNamespace(result=1, RESULT_OK=1),
+            world=SimpleNamespace(name="retained_world", world_resource=SimpleNamespace(uri=WORLD_URI)),
+        )
+
+    def topics(_deadline):
+        raise RuntimeError("injected topics failure")
+
+    barrier._wait_for_services = services
+    barrier._call = call
+    barrier._wait_for_required_topics = topics
+    barrier._set_state = lambda *a, **k: calls.append("forbidden mutation")
+    barrier._require_ok = IsaacSceneLoadBarrier._require_ok
+    barrier._run_passive_join = lambda services, deadline: IsaacSceneLoadBarrier._run_passive_join(barrier, services, deadline)
+    with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+        IsaacSceneLoadBarrier.run(barrier)
+    assert "forbidden mutation" not in calls
+    assert set(calls) <= {"features", "current_world"}
+
+
 def _install_fake_simulator(
     node: Node,
     *,
     on_load: Callable[[], None] | None = None,
+    on_load_request: Callable[[LoadWorld.Request], None] | None = None,
     on_play: Callable[[], None] | None = None,
     state_transitions: list[int] | None = None,
     world_uri: str = "file:/opt/isaac/worlds/retained scene.usda",
     world_name: str = "retained_world",
     initial_state: int = SimulationState.STATE_STOPPED,
     play_result: int = 1,
+    read_only: bool = False,
 ) -> None:
     feature_values = [
         int(SimulatorFeatures.WORLD_LOADING),
         int(SimulatorFeatures.WORLD_INFO_GETTING),
         int(SimulatorFeatures.SIMULATION_STATE_GETTING),
         int(SimulatorFeatures.SIMULATION_STATE_SETTING),
-    ]
+    ] if not read_only else [int(SimulatorFeatures.WORLD_INFO_GETTING)]
 
     def features(_request, response):
         response.features.features = feature_values
@@ -372,7 +515,9 @@ def _install_fake_simulator(
             response.result.result = play_result
         return response
 
-    def load_world(_request, response):
+    def load_world(request, response):
+        if on_load_request is not None:
+            on_load_request(request)
         if on_load is not None:
             on_load()
         return populate_world(response)
@@ -382,11 +527,13 @@ def _install_fake_simulator(
         "/get_simulator_features",
         features,
     )
-    node.create_service(LoadWorld, "/load_world", load_world)
+    if not read_only:
+        node.create_service(LoadWorld, "/load_world", load_world)
     node.create_service(
         GetCurrentWorld,
         "/get_current_world",
         lambda _r, value: populate_world(value),
     )
-    node.create_service(GetSimulationState, "/get_simulation_state", state)
-    node.create_service(SetSimulationState, "/set_simulation_state", set_state)
+    if not read_only:
+        node.create_service(GetSimulationState, "/get_simulation_state", state)
+        node.create_service(SetSimulationState, "/set_simulation_state", set_state)

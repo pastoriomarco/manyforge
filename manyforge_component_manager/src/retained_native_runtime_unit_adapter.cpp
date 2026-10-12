@@ -499,26 +499,6 @@ void WaitForAll(std::vector<pollfd> &descriptors, const short event,
   }
 }
 
-[[nodiscard]] std::uint64_t
-ParseCanonicalUnsigned(const std::string_view value,
-                       const std::string_view label) {
-  if (value.empty() || (value.size() > 1U && value.front() == '0')) {
-    Fail(std::string(label) + " is not a canonical unsigned integer");
-  }
-  std::uint64_t result = 0U;
-  for (const char digit : value) {
-    if (digit < '0' || digit > '9') {
-      Fail(std::string(label) + " is not a canonical unsigned integer");
-    }
-    const auto next = static_cast<std::uint64_t>(digit - '0');
-    if (result > (std::numeric_limits<std::uint64_t>::max() - next) / 10U) {
-      Fail(std::string(label) + " overflows");
-    }
-    result = result * 10U + next;
-  }
-  return result;
-}
-
 [[nodiscard]] const manyforge::core::RuntimeUnitDTO &
 FindRuntimeUnit(const RetainedBundle &bundle,
                 const manyforge::core::RuntimeUnitId &runtime_unit_id) {
@@ -1961,30 +1941,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       EraseChild(found);
       return std::nullopt;
     }
-    std::istringstream stream(*packet);
-    std::vector<std::string> fields;
-    std::string field;
-    while (stream >> field) {
-      fields.push_back(std::move(field));
+    try {
+      return admission.parse_status_packet(runtime_epoch, *packet);
+    } catch (const NativeExecutionRuntimeUnitAdmissionError &error) {
+      Fail(error.what());
     }
-    if (fields.size() != 12U) {
-      Fail("native execution child emitted a malformed status field count");
-    }
-    const auto sequence =
-        ParseCanonicalUnsigned(fields[3], "native source-report sequence");
-    if (sequence == 0U ||
-        *packet != admission.expected_status_packet(runtime_epoch, sequence)) {
-      Fail("native execution child emitted a malformed or foreign status");
-    }
-    return RuntimeUnitSourceReport(
-        query.plan.runtime_unit_id.value(), runtime_epoch.value(), sequence, 1U,
-        RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
-        query.plan.product_identity.value(),
-        query.plan.configuration_identity.value(),
-        std::vector<std::string>{
-            std::string(admission.product().runtime_role_id())},
-        ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
-        admission.runtime_contract_offer_digest());
   }
 
   [[nodiscard]] manyforge::core::Result<

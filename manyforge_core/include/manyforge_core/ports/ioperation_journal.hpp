@@ -37,7 +37,6 @@ struct EmergencyStopAcceptanceRecordDTO final {
   StopId stop_id;
   StopGeneration stop_generation{0U};
   std::int64_t accepted_at_ns{};
-  std::int64_t outer_deadline_ns{};
   StopResolutionDispositionDTO resolution_disposition{
       StopResolutionDispositionDTO::kPromotedToFull};
   ContentDigest captured_scope_digest;

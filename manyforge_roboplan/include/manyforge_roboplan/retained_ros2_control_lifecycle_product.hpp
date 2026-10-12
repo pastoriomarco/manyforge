@@ -16,9 +16,11 @@ namespace manyforge::roboplan_backend {
 inline constexpr std::string_view kRos2ControlLifecycleProviderManifestId =
     "manyforge.provider.ros2_control";
 
-/// Closed observer-only lifecycle plans for the externally managed
-/// ros2_control product. The plans can accept already-observed external truth,
-/// but contain no primitive that could mutate controller_manager.
+/// Closed lifecycle plans of the ros2_control product (design R6, §7.5): the
+/// trajectory controller is loaded inactive by its spawner and CCLC owns its
+/// activation. Primitives `ros2_control.controller.{prepare,activate,
+/// deactivate,recover}` reach the runtime handle; postconditions are proven
+/// only by the controller manager's own activity facts.
 [[nodiscard]] std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_lifecycle_plans();
 
@@ -28,19 +30,22 @@ retained_ros2_control_lifecycle_plans();
 make_retained_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest);
 
-/// Lifetime owner for the ROS provider catalog and observer-only brand ports
-/// selected from one exact retained runtime.
+/// Lifetime owner for the ROS provider catalog and brand ports selected from
+/// one exact retained runtime.
 class RetainedRos2ControlLifecycleProduct final {
 public:
   [[nodiscard]] static core::Result<
       std::unique_ptr<RetainedRos2ControlLifecycleProduct>>
-  Create(
-      std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
-      const deployment::IVerifiedRetainedProviderManifestSource
-          &provider_manifest_source,
-      const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
-      std::shared_ptr<RetainedRos2ControlRuntimeHandle> runtime_handle,
-      core::IClock &clock, core::Duration observation_freshness_ns);
+  Create(std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
+         const deployment::IVerifiedRetainedProviderManifestSource
+             &provider_manifest_source,
+         const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
+         const std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>>
+             &runtime_handles,
+         core::IClock &clock, core::Duration observation_freshness_ns);
+
+  [[nodiscard]] RetainedExternallyManagedDomainSnapshotSource
+  lifecycle_snapshot_source() const;
 
   [[nodiscard]] const core::BuildOwnedLifecyclePlanCatalogSource &
   catalog_source() const noexcept;
@@ -51,8 +56,10 @@ public:
 private:
   RetainedRos2ControlLifecycleProduct(
       core::BuildOwnedLifecyclePlanCatalogSource catalog_source,
-      std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports);
+      std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+      RetainedExternallyManagedDomainSnapshotSource snapshot_source);
 
+  RetainedExternallyManagedDomainSnapshotSource snapshot_source_;
   core::BuildOwnedLifecyclePlanCatalogSource catalog_source_;
   std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports_;
 };

@@ -2,7 +2,9 @@
 
 The launch owns no motion or lifecycle policy. It first proves that Isaac's
 ``simulation_interfaces`` owner loaded the selected world and left it stopped.
-Only then does it expose the retained JTC transport and the two thin mechanical
+The Manager-owned cell mode receives that preflight from the host and starts
+component infrastructure without another world barrier or cell pose observer.
+The standalone mode then exposes the retained JTC transport and the two thin mechanical
 adapters around the C++ execution backend's single command-admission fact.
 """
 
@@ -69,6 +71,11 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("scene_service_timeout_s", default_value="120.0"),
             DeclareLaunchArgument(
+                "manager_cell_world_owned",
+                default_value="false",
+                description="The Manager host already owns the qualified cell world and pose observer.",
+            ),
+            DeclareLaunchArgument(
                 "pose_observer_site_config",
                 default_value="",
                 description=(
@@ -133,6 +140,14 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "robot_description_file",
+                description="Host-generated complete robot description file.",
+            ),
+            DeclareLaunchArgument(
+                "controllers_file",
+                description="Host-generated controller parameters file.",
+            ),
+            DeclareLaunchArgument(
                 "joint_commands_topic", default_value="/isaac_joint_commands"
             ),
             DeclareLaunchArgument(
@@ -153,46 +168,6 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "arm_controller_name", default_value="isaac_arm_controller"
             ),
-            DeclareLaunchArgument(
-                "trigger_joint_command_threshold", default_value="-1.0"
-            ),
-            DeclareLaunchArgument(
-                "command_gate_enable_topic",
-                default_value="manyforge/isaac_arm_command_enable",
-            ),
-            DeclareLaunchArgument(
-                "command_gate_owner_node",
-                default_value="manyforge_ros2_control_execution_backend",
-            ),
-            DeclareLaunchArgument(
-                "command_gate_owner_namespace",
-                default_value="",
-                description=(
-                    "Optional exact owner namespace assertion. Empty selects "
-                    "runtime_namespace; any crossed value is rejected."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "stop_joint_commands_topic", default_value="/stop_joint_commands"
-            ),
-            DeclareLaunchArgument(
-                "command_gate_publish_rate_hz", default_value="20.0"
-            ),
-            DeclareLaunchArgument("sum_wrapped_joint_states", default_value="false"),
-            DeclareLaunchArgument("shoulder_pan_initial", default_value="2.63422544"),
-            DeclareLaunchArgument(
-                "shoulder_lift_initial", default_value="-0.875980752"
-            ),
-            DeclareLaunchArgument("elbow_initial", default_value="1.551074106"),
-            DeclareLaunchArgument("wrist_1_initial", default_value="-2.29231544"),
-            DeclareLaunchArgument("wrist_2_initial", default_value="-1.560498884"),
-            DeclareLaunchArgument("wrist_3_initial", default_value="-2.038544566"),
-            DeclareLaunchArgument("joint1_initial", default_value="0.0"),
-            DeclareLaunchArgument("joint2_initial", default_value="0.0"),
-            DeclareLaunchArgument("joint3_initial", default_value="1.57"),
-            DeclareLaunchArgument("joint4_initial", default_value="0.0"),
-            DeclareLaunchArgument("joint5_initial", default_value="0.0"),
-            DeclareLaunchArgument("joint6_initial", default_value="0.0"),
             DeclareLaunchArgument(
                 "gripper_action_name",
                 default_value="robotiq_gripper_controller/gripper_cmd",
@@ -217,6 +192,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("base_parent_frame", default_value="universe"),
             DeclareLaunchArgument("base_child_frame", default_value="world"),
+            DeclareLaunchArgument("frame_prefix", default_value=""),
             DeclareLaunchArgument("base_xyz", default_value="0 0 0"),
             DeclareLaunchArgument("base_rpy", default_value="0 0 0"),
             OpaqueFunction(function=_launch_setup),
@@ -225,6 +201,10 @@ def generate_launch_description() -> LaunchDescription:
 
 
 def _launch_setup(context, *_, **__) -> list[object]:
+    manager_cell_world_owned = _parse_bool_launch_value(
+        LaunchConfiguration("manager_cell_world_owned").perform(context),
+        name="manager_cell_world_owned",
+    )
     package_share = Path(
         FindPackageShare("manyforge_ros_bringup").find("manyforge_ros_bringup")
     )
@@ -270,73 +250,19 @@ def _launch_setup(context, *_, **__) -> list[object]:
         }
     )
 
-    urdf_template = (
-        package_share / "urdf" / profile["urdf_file"]
-    ).read_text(encoding="utf-8")
-    robot_description = urdf_template.format(
-        joint_commands_topic=joint_commands_topic,
-        joint_states_topic=joint_states_topic,
-        trigger_joint_command_threshold=_bounded_float_text(
-            LaunchConfiguration("trigger_joint_command_threshold").perform(context),
-            name="trigger_joint_command_threshold",
-            minimum=-1.0,
-            maximum=1.0e9,
-        ),
-        sum_wrapped_joint_states=str(
-            _parse_bool_launch_value(
-                LaunchConfiguration("sum_wrapped_joint_states").perform(context),
-                name="sum_wrapped_joint_states",
-            )
-        ).lower(),
-        shoulder_pan_initial=_finite_float_text(
-            LaunchConfiguration("shoulder_pan_initial").perform(context),
-            name="shoulder_pan_initial",
-        ),
-        shoulder_lift_initial=_finite_float_text(
-            LaunchConfiguration("shoulder_lift_initial").perform(context),
-            name="shoulder_lift_initial",
-        ),
-        elbow_initial=_finite_float_text(
-            LaunchConfiguration("elbow_initial").perform(context),
-            name="elbow_initial",
-        ),
-        wrist_1_initial=_finite_float_text(
-            LaunchConfiguration("wrist_1_initial").perform(context),
-            name="wrist_1_initial",
-        ),
-        wrist_2_initial=_finite_float_text(
-            LaunchConfiguration("wrist_2_initial").perform(context),
-            name="wrist_2_initial",
-        ),
-        wrist_3_initial=_finite_float_text(
-            LaunchConfiguration("wrist_3_initial").perform(context),
-            name="wrist_3_initial",
-        ),
-        joint1_initial=_finite_float_text(
-            LaunchConfiguration("joint1_initial").perform(context),
-            name="joint1_initial",
-        ),
-        joint2_initial=_finite_float_text(
-            LaunchConfiguration("joint2_initial").perform(context),
-            name="joint2_initial",
-        ),
-        joint3_initial=_finite_float_text(
-            LaunchConfiguration("joint3_initial").perform(context),
-            name="joint3_initial",
-        ),
-        joint4_initial=_finite_float_text(
-            LaunchConfiguration("joint4_initial").perform(context),
-            name="joint4_initial",
-        ),
-        joint5_initial=_finite_float_text(
-            LaunchConfiguration("joint5_initial").perform(context),
-            name="joint5_initial",
-        ),
-        joint6_initial=_finite_float_text(
-            LaunchConfiguration("joint6_initial").perform(context),
-            name="joint6_initial",
-        ),
+    robot_description_path = Path(
+        LaunchConfiguration("robot_description_file").perform(context)
     )
+    controllers_path = Path(
+        LaunchConfiguration("controllers_file").perform(context)
+    )
+    # The host owns generation and validation. Read supplied artifacts before
+    # constructing any runtime action; never select a stored profile fallback.
+    robot_description = _read_artifact(
+        robot_description_path, name="robot_description_file"
+    )
+    _read_artifact(controllers_path, name="controllers_file")
+    frame_prefix = LaunchConfiguration("frame_prefix").perform(context)
 
     controller_manager_name = _relative_ros_name(
         LaunchConfiguration("controller_manager_name").perform(context),
@@ -367,41 +293,13 @@ def _launch_setup(context, *_, **__) -> list[object]:
     if affinity:
         controller_manager_resources["cpu_affinity"] = affinity
 
-    owner_node = _relative_ros_name(
-        LaunchConfiguration("command_gate_owner_node").perform(context),
-        name="command_gate_owner_node",
-    )
-    requested_owner_namespace = LaunchConfiguration(
-        "command_gate_owner_namespace"
-    ).perform(context).strip()
-    owner_namespace = (
-        runtime_namespace
-        if not requested_owner_namespace
-        else _instance_namespace(
-            requested_owner_namespace,
-            name="command_gate_owner_namespace",
-        )
-    )
-    if owner_namespace != runtime_namespace:
-        raise ValueError(
-            "command_gate_owner_namespace must equal runtime_namespace"
-        )
-    enable_topic = _scoped_ros_name(
-        LaunchConfiguration("command_gate_enable_topic").perform(context),
-        runtime_namespace=runtime_namespace,
-        name="command_gate_enable_topic",
-    )
-    stop_topic = _absolute_ros_name(
-        LaunchConfiguration("stop_joint_commands_topic").perform(context),
-        name="stop_joint_commands_topic",
-    )
-
     scene_barrier = Node(
         package="manyforge_ros_bringup",
         executable="isaac_scene_load_barrier",
         name="manyforge_isaac_scene_load_barrier",
         namespace=runtime_namespace,
         output="screen",
+        ros_arguments=["--disable-external-lib-logs"],
         parameters=[
             {
                 "world_uri": LaunchConfiguration("world_uri").perform(context),
@@ -428,36 +326,15 @@ def _launch_setup(context, *_, **__) -> list[object]:
             }
         ],
     )
-    topic_command_gate = Node(
-        package="manyforge_ros_bringup",
-        executable="isaac_topic_command_gate",
-        name="manyforge_isaac_topic_command_gate",
-        namespace=runtime_namespace,
-        output="screen",
-        parameters=[
-            {
-                "enable_topic": enable_topic,
-                "stop_topic": stop_topic,
-                "expected_owner_node": owner_node,
-                "expected_owner_namespace": owner_namespace,
-                "publish_rate_hz": _bounded_float(
-                    LaunchConfiguration("command_gate_publish_rate_hz").perform(
-                        context
-                    ),
-                    name="command_gate_publish_rate_hz",
-                    minimum=1.0,
-                    maximum=200.0,
-                ),
-            }
-        ],
-        on_exit=_shutdown("Isaac command-gate adapter exited"),
-    )
     robot_state_publisher = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
         namespace=runtime_namespace,
         output="screen",
-        parameters=[{"robot_description": robot_description}],
+        ros_arguments=["--disable-external-lib-logs"],
+        parameters=[{
+            "robot_description": robot_description, "frame_prefix": frame_prefix,
+        }],
     )
     base_xyz = _parse_vector3(
         LaunchConfiguration("base_xyz").perform(context), name="base_xyz"
@@ -471,6 +348,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         name="manyforge_static_base_tf",
         namespace=runtime_namespace,
         output="screen",
+        ros_arguments=["--disable-external-lib-logs"],
         arguments=[
             "--x",
             base_xyz[0],
@@ -487,7 +365,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
             "--frame-id",
             LaunchConfiguration("base_parent_frame"),
             "--child-frame-id",
-            LaunchConfiguration("base_child_frame"),
+            frame_prefix + LaunchConfiguration("base_child_frame").perform(context),
         ],
     )
     controller_manager = Node(
@@ -496,10 +374,11 @@ def _launch_setup(context, *_, **__) -> list[object]:
         name=controller_manager_name,
         namespace=runtime_namespace,
         output="screen",
+        ros_arguments=["--disable-external-lib-logs"],
         parameters=[
             {"robot_description": robot_description},
             controller_manager_resources,
-            str(package_share / "config" / profile["controller_config_file"]),
+            str(controllers_path),
         ],
         on_exit=_shutdown("Isaac controller_manager exited"),
     )
@@ -511,6 +390,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         executable="spawner",
         namespace=runtime_namespace,
         output="screen",
+        ros_arguments=["--disable-external-lib-logs"],
         arguments=[
             "joint_state_broadcaster",
             "--controller-manager",
@@ -524,8 +404,12 @@ def _launch_setup(context, *_, **__) -> list[object]:
         executable="spawner",
         namespace=runtime_namespace,
         output="screen",
+        ros_arguments=["--disable-external-lib-logs"],
         arguments=[
             arm_controller_name,
+            "--inactive",
+            "--param-file",
+            str(controllers_path),
             "--controller-manager",
             controller_manager_path,
             "--controller-manager-timeout",
@@ -534,7 +418,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
     )
 
     control_actions: list[object] = [
-        topic_command_gate,
         robot_state_publisher,
         static_base_tf,
     ]
@@ -550,6 +433,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 name="manyforge_isaac_gripper_action_bridge",
                 namespace=runtime_namespace,
                 output="screen",
+                ros_arguments=["--disable-external-lib-logs"],
                 parameters=[
                     str(
                         package_share
@@ -583,14 +467,12 @@ def _launch_setup(context, *_, **__) -> list[object]:
                             runtime_namespace=runtime_namespace,
                             name="gripper_readiness_topic",
                         ),
-                        "command_enable_topic": enable_topic,
-                        "expected_owner_node": owner_node,
-                        "expected_owner_namespace": owner_namespace,
                     },
                 ],
                 on_exit=_shutdown("Isaac gripper transport adapter exited"),
             )
         )
+    pose_observer_action = None
     if pose_observer_site_config:
         control_actions.append(
             Node(
@@ -599,6 +481,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 name="manyforge_isaac_pose_observer",
                 namespace=runtime_namespace,
                 output="screen",
+                ros_arguments=["--disable-external-lib-logs"],
                 parameters=[
                     {
                         "site_config_path": pose_observer_site_config,
@@ -632,6 +515,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 on_exit=_shutdown("Isaac pose-observer adapter exited"),
             )
         )
+        pose_observer_action = control_actions[-1]
     pointcloud_topic_raw = LaunchConfiguration("pointcloud_topic").perform(
         context
     ).strip()
@@ -652,6 +536,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 name="manyforge_isaac_pointcloud_observer_bridge",
                 namespace=runtime_namespace,
                 output="screen",
+                ros_arguments=["--disable-external-lib-logs"],
                 parameters=[
                     {
                         "pointcloud_topic": pointcloud_topic,
@@ -711,9 +596,8 @@ def _launch_setup(context, *_, **__) -> list[object]:
             )
         )
 
-    # The gate publishes its fail-closed state before hardware activation. The
-    # repeated transient-local Stop sample then reaches the topic-based system
-    # during its configure/activate sequence.
+    # Start the ROS stack after the scene barrier. The existing host/CCLC
+    # owner activates the configured JTC after observing real Isaac state.
     control_actions.extend(
         [
             TimerAction(period=0.5, actions=[controller_manager]),
@@ -721,6 +605,8 @@ def _launch_setup(context, *_, **__) -> list[object]:
             TimerAction(period=3.5, actions=[arm_controller]),
         ]
     )
+    if manager_cell_world_owned:
+        return [action for action in control_actions if action is not pose_observer_action]
     return [
         scene_barrier,
         RegisterEventHandler(
@@ -747,19 +633,22 @@ def _shutdown(reason: str) -> EmitEvent:
     return EmitEvent(event=Shutdown(reason=reason))
 
 
+def _read_artifact(path: Path, *, name: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"{name} must be a readable UTF-8 file: {path}") from error
+
+
 def _profile_configuration(value: str) -> dict[str, str]:
     normalized = value.strip().lower()
     profiles = {
         "ur10e": {
             "name": "ur10e",
-            "urdf_file": "isaac_ur10e_topic_based.ros2_control.urdf",
-            "controller_config_file": "isaac_ur10e_topic_based_controllers.yaml",
             "raw_gripper_topic": "/isaac_gripper_state",
         },
         "lite6": {
             "name": "lite6",
-            "urdf_file": "isaac_lite6_topic_based.ros2_control.urdf",
-            "controller_config_file": "isaac_lite6_topic_based_controllers.yaml",
             "raw_gripper_topic": "/isaac_joint_commands_gripper",
         },
     }
@@ -930,19 +819,6 @@ def _finite_float_text(value: str, *, name: str) -> str:
         maximum=1.0e12,
     )
     return format(parsed, ".17g")
-
-
-def _bounded_float_text(
-    value: str,
-    *,
-    name: str,
-    minimum: float,
-    maximum: float,
-) -> str:
-    return format(
-        _bounded_float(value, name=name, minimum=minimum, maximum=maximum),
-        ".17g",
-    )
 
 
 def _bounded_float(

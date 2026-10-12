@@ -51,7 +51,7 @@ constexpr std::string_view kProviderManifestSchemaRevision =
 constexpr std::string_view kRuntimeProfileSchemaRevision =
     "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
 constexpr std::string_view kStopEvidencePolicySchemaRevision =
-    "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970";
+    "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13";
 constexpr std::string_view kEmptyRuntimeConfigurationSchemaRevision =
     "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785";
 constexpr std::string_view kEmptyProviderContractSchemaRevision =
@@ -1056,48 +1056,11 @@ enum class BindingStateStopCase : std::uint8_t {
     if (binding_state) {
       observation.emplace_back("minimum_dwell_ns", CanonicalValue(10.0));
     }
-    const bool distinct_nominal_evidence_phase =
-        form == StopForm::kProviderDefined || binding_state;
     const bool requires_hard_floor =
         form != StopForm::kNotStoppable && !omit_software_hard_floor;
-    const std::string nominal_command_phase =
-        distinct_nominal_evidence_phase ? "nominal_command" : "command";
-    const std::string nominal_evidence_phase =
-        distinct_nominal_evidence_phase ? "nominal_terminal" : "command";
-    CanonicalValue::Array phases{
-        CanonicalValue(CanonicalValue::Object{
-            {"phase_id", CanonicalValue(nominal_command_phase)},
-            {"deadline_offset_ns", CanonicalValue(100.0)},
-        })};
-    if (distinct_nominal_evidence_phase) {
-      phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue(nominal_evidence_phase)},
-          {"deadline_offset_ns", CanonicalValue(300.0)},
-      });
-    }
-    if (requires_hard_floor) {
-      phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue("hard_command")},
-          {"deadline_offset_ns", CanonicalValue(500.0)},
-      });
-      phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue("hard_terminal")},
-          {"deadline_offset_ns", CanonicalValue(800.0)},
-      });
-    }
-    if (include_safety_stage) {
-      if (!requires_hard_floor) {
-        throw std::logic_error(
-            "safety-stage fixture requires the complete motion Stop chain");
-      }
-      phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue("safety_command")},
-          {"deadline_offset_ns", CanonicalValue(1000.0)},
-      });
-      phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue("safety_terminal")},
-          {"deadline_offset_ns", CanonicalValue(1200.0)},
-      });
+    if (include_safety_stage && !requires_hard_floor) {
+      throw std::logic_error(
+          "safety-stage fixture requires the complete motion Stop chain");
     }
     CanonicalValue::Array stages;
     stages.emplace_back(CanonicalValue::Object{
@@ -1107,7 +1070,6 @@ enum class BindingStateStopCase : std::uint8_t {
          CanonicalValue(std::string(containment_granularity))},
         {"containment_command",
          CanonicalValue(CanonicalValue::Object{
-             {"command_phase_id", CanonicalValue(nominal_command_phase)},
              {"command", stop_command(form, compatibility_case)},
          })},
         {"evidence_conjunction", CanonicalValue("all_of")},
@@ -1115,7 +1077,6 @@ enum class BindingStateStopCase : std::uint8_t {
          CanonicalValue(CanonicalValue::Array{CanonicalValue(
              CanonicalValue::Object{
                  {"evidence_item_id", CanonicalValue("nominal_evidence")},
-                 {"phase_id", CanonicalValue(nominal_evidence_phase)},
                  {"evidence", stop_evidence(form, compatibility_case)},
                  {"source_requirement", CanonicalValue(std::move(source))},
                  {"observation_semantics",
@@ -1130,7 +1091,6 @@ enum class BindingStateStopCase : std::uint8_t {
            CanonicalValue(std::string(containment_granularity))},
           {"containment_command",
            CanonicalValue(CanonicalValue::Object{
-               {"command_phase_id", CanonicalValue("hard_command")},
                {"command",
                 CanonicalValue(CanonicalValue::Object{
                     {"command_kind", CanonicalValue("registered")},
@@ -1144,7 +1104,6 @@ enum class BindingStateStopCase : std::uint8_t {
            CanonicalValue(CanonicalValue::Array{CanonicalValue(
                CanonicalValue::Object{
                    {"evidence_item_id", CanonicalValue("hard_rest")},
-                   {"phase_id", CanonicalValue("hard_terminal")},
                    {"evidence",
                     CanonicalValue(CanonicalValue::Object{
                         {"evidence_kind", CanonicalValue("motion_rest")},
@@ -1177,7 +1136,6 @@ enum class BindingStateStopCase : std::uint8_t {
            CanonicalValue(std::string(containment_granularity))},
           {"containment_command",
            CanonicalValue(CanonicalValue::Object{
-               {"command_phase_id", CanonicalValue("safety_command")},
                {"command",
                 CanonicalValue(CanonicalValue::Object{
                     {"command_kind", CanonicalValue("registered")},
@@ -1192,7 +1150,6 @@ enum class BindingStateStopCase : std::uint8_t {
            CanonicalValue(CanonicalValue::Array{CanonicalValue(
                CanonicalValue::Object{
                    {"evidence_item_id", CanonicalValue("safety_ack")},
-                   {"phase_id", CanonicalValue("safety_terminal")},
                    {"evidence",
                     CanonicalValue(CanonicalValue::Object{
                         {"evidence_kind",
@@ -1232,13 +1189,6 @@ enum class BindingStateStopCase : std::uint8_t {
         {"disposition", CanonicalValue("stoppable")},
         {"containment_granularity",
          CanonicalValue(std::string(containment_granularity))},
-        {"deadline_budget",
-         CanonicalValue(CanonicalValue::Object{
-             {"outer_duration_ns",
-              CanonicalValue(include_safety_stage ? 1400.0 : 1000.0)},
-             {"kernel_completion_reserve_ns", CanonicalValue(100.0)},
-             {"phases", CanonicalValue(std::move(phases))},
-         })},
         {"escalation_stages", CanonicalValue(std::move(stages))},
     });
   }();

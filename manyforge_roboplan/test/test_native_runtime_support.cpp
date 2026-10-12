@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "../src/execution_motion_target_limits_internal.hpp"
+
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_native_view_predecessor.hpp>
 #include <manyforge_roboplan/writer_preferring_shared_gate.hpp>
@@ -623,4 +625,58 @@ TEST(RetainedNativeViewPredecessor, AnotherDeploymentCrossesThePredecessor) {
       bundle, published, bundle, other_bundle));
   EXPECT_FALSE(RetainedNativeViewFollowsPredecessor(
       bundle, published, RetainedBundleId("bundle.other"), published));
+}
+
+TEST(ExecutionMotionTargetLimitsTest,
+     SharedRuntimeRequiresBothRobotsAndExcludesForeignUnit) {
+  const RuntimeUnitId shared("runtime.shared");
+  const ControllableComponentId first("robot.first");
+  const ControllableComponentId second("robot.second");
+  const CommandTargetId arm("arm");
+  const ControlBindingDTO first_binding{
+      ControlBindingId("binding.first"), ControlBindingRevision("binding-revision"),
+      first, arm, CapabilityId("execution.trajectory.execute"),
+      CapabilityDefinitionRevision("capability-revision"), ControlDomainId("domain"),
+      {}, ControlInterfaceContractId("interface"), ControlInterfaceRevision("interface-revision"),
+      ControllerTopologyId("topology"), TopologyRevision("topology-revision"),
+      {ControlRouteId("route")}, {}, ProviderInstanceId("provider"), shared,
+      ProviderManifestId("manifest"), ProviderManifestRevision("manifest-revision"),
+      StateAuthorityId("state"), StateAuthorityClass::kCommanded,
+      StopEvidencePolicyId("stop"), StopEvidencePolicyRevision("stop-revision"),
+      ContainmentGranularity::kResource, {}};
+  auto second_binding = first_binding;
+  second_binding.controllable_component_id = second;
+  auto foreign_binding = first_binding;
+  foreign_binding.controllable_component_id = ControllableComponentId("robot.foreign");
+  foreign_binding.provider_runtime_unit_id = RuntimeUnitId("runtime.foreign");
+  const std::vector<ControlBindingDTO> bindings{
+      first_binding, second_binding, foreign_binding};
+  const std::vector<ExecutionMotionTargetKey> both{{first, arm}, {second, arm}};
+  for (const auto &selected : {first, second}) {
+    EXPECT_TRUE(execution_motion_target_limit_keys_match(
+        bindings, both, shared, selected, true));
+    EXPECT_FALSE(execution_motion_target_limit_keys_match(
+        bindings, std::vector<ExecutionMotionTargetKey>{{selected, arm}},
+        shared, selected, true));
+  }
+  auto unknown = both;
+  unknown.emplace_back(foreign_binding.controllable_component_id, arm);
+  EXPECT_FALSE(execution_motion_target_limit_keys_match(
+      bindings, unknown, shared, first, true));
+  auto duplicate = both;
+  duplicate.insert(duplicate.begin(), both.front());
+  EXPECT_FALSE(execution_motion_target_limit_keys_match(
+      bindings, duplicate, shared, first, true));
+  EXPECT_FALSE(execution_motion_target_limit_keys_match(
+      bindings, std::vector<ExecutionMotionTargetKey>{{first, CommandTargetId("unknown")},
+                                                     {second, arm}},
+      shared, first, true));
+  // Native configuration remains an exact selected-component slice.
+  for (const auto &selected : {first, second}) {
+    EXPECT_TRUE(execution_motion_target_limit_keys_match(
+        bindings, std::vector<ExecutionMotionTargetKey>{{selected, arm}},
+        shared, selected, false));
+    EXPECT_FALSE(execution_motion_target_limit_keys_match(
+        bindings, both, shared, selected, false));
+  }
 }

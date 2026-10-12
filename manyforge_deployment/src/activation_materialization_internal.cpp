@@ -98,38 +98,42 @@ struct Scenario final {
   bool assistant_enabled;
   bool ros2_control_execution;
   std::string_view isaac_profile;
+  /// Q63-Q66: the offline mock controller profile replacing the native
+  /// simulated executor (empty for Isaac).
+  std::string_view mock_profile;
 };
 
 constexpr std::array<Scenario, 12U> kScenarios{{
     {"examples/assistant_modes_scene_authoring.deployment.yaml",
-     "ur10e_robotiq_2f_140", true, false, ""},
+     "ur10e_robotiq_2f_140", true, true, "", "ur10e_robotiq_2f_140"},
     {"examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6_lite_gripper", false, true, "lite6"},
+     "lite6_lite_gripper", false, true, "lite6", ""},
     {"examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
-     "ur10e_robotiq_2f_140", true, true, "ur10e"},
+     "ur10e_robotiq_2f_140", true, true, "ur10e", ""},
     {"examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, true, "ur10e"},
+     "ur10e_robotiq_2f_140", false, true, "ur10e", ""},
     {"examples/"
      "isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, true, "ur10e"},
+     "ur10e_robotiq_2f_140", false, true, "ur10e", ""},
     {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6_lite_gripper", false, false, ""},
-    {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false, false,
-     ""},
+     "lite6_lite_gripper", false, true, "", "lite6_lite_gripper"},
+    {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false, true,
+     "", "ur5_roboplan"},
     {"examples/pick_and_place_ur10e_robotiq.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, false, ""},
+     "ur10e_robotiq_2f_140", false, true, "", "ur10e_robotiq_2f_140"},
     {"examples/semantic_shape_pick.deployment.yaml", "ur5_roboplan", true,
-     false, ""},
+     true, "", "ur5_roboplan"},
     {"examples/trocar_lite6_foundationpose_pick.deployment.yaml",
-     "lite6_lite_gripper", false, true, "lite6"},
+     "lite6_lite_gripper", false, true, "lite6", ""},
     {"examples/vision_guided_bin_pick.deployment.yaml", "ur5_roboplan", true,
-     false, ""},
+     true, "", "ur5_roboplan"},
     {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true,
-     false, ""},
+     true, "", "ur5_roboplan"},
 }};
 
 constexpr std::array<Scenario, 1U> kComposedScenarios{{
-    {"examples/ur5e_lite6_wall.deployment.yaml", "", false, false, ""},
+    {"examples/ur5e_lite6_wall.deployment.yaml", "", false, true, "",
+     "mixed"},
 }};
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
@@ -1572,7 +1576,9 @@ qualify_catalog(const std::filesystem::path &root,
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
-  constexpr std::size_t kMaintainedComponentTypeCount = 7U;
+  // Five native component types plus the fixed-scale ROS type of every
+  // family with an Isaac or offline mock controller profile (Q63-Q68).
+  constexpr std::size_t kMaintainedComponentTypeCount = 9U;
   for (const auto &path :
        source_files(catalog_root / "component_type",
                     kMaintainedComponentTypeCount)) {
@@ -2055,6 +2061,20 @@ void verify_scenarios(const std::filesystem::path &root,
              scenario.ros2_control_execution ? "commanded_sim" : "simulated")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
+    // Q81: retained Isaac configurations include the approved logical cell
+    // world. Keep this exact maintained-input check alongside the old facts.
+    if (scenario.ros2_control_execution && !scenario.isaac_profile.empty()) {
+      const std::string world =
+          scenario.source ==
+                  std::string_view("examples/trocar_lite6_foundationpose_pick."
+                                   "deployment.yaml")
+              ? "test_scene_realsense_foundationpose_trocar"
+              : scenario.isaac_profile == std::string_view("lite6")
+                    ? "lite6_grf_ros2"
+                    : "isaac_manipulator_scene_light";
+      expected_runtime_configuration.emplace("isaac_world",
+                                             core::JsonValueDTO{world});
+    }
     const auto motion_targets =
         runtime.configuration.find("motion_target_limits");
     const auto *motion_target_rows =
@@ -2106,6 +2126,10 @@ void verify_scenarios(const std::filesystem::path &root,
         expected_runtime_configuration.emplace(
             "direct_control_joint_limits",
             core::JsonValueDTO{core::JsonValueDTO::Array{}});
+      }
+      // The offline mock lane keeps the native profile's authored gripper
+      // targets unchanged (Q63-Q66); Isaac profiles have none.
+      if (!scenario.ros2_control_execution || !scenario.mock_profile.empty()) {
         if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
           expected_runtime_configuration.emplace(
               "gripper_target_configurations",
@@ -2149,9 +2173,79 @@ void verify_scenarios(const std::filesystem::path &root,
         }
       }
     if (scenario.ros2_control_execution) {
+      const auto &component_id = graph.controllable_components.front()
+                                     .controllable_component_id.value();
+      // Q68: the component's own controller profile row.
       expected_runtime_configuration.emplace(
-          "isaac_profile",
-          core::JsonValueDTO{std::string(scenario.isaac_profile)});
+          "controller_profiles",
+          core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
+              core::JsonObjectDTO{
+                  {"controllable_component_id",
+                   core::JsonValueDTO{component_id}},
+                  {"frame_prefix", core::JsonValueDTO{std::string{}}},
+                  {scenario.mock_profile.empty() ? "isaac_profile"
+                                                 : "mock_profile",
+                   core::JsonValueDTO{std::string(
+                       scenario.mock_profile.empty()
+                           ? scenario.isaac_profile
+                           : scenario.mock_profile)}}}}}});
+      // Q37: main's authored `default_fault_stop_profile`, read directly.
+      // The offline mock profiles carry the native profiles' authored values
+      // unchanged: the UR10e assistant and UR5 profiles name
+      // `default_fault_spring_back` without backend confirmation, and the
+      // UR10e Robotiq profile also lists its six gripper joints.
+      const bool lite6 =
+          scenario.family_id == std::string_view("lite6_lite_gripper");
+      const bool legacy_default_fault =
+          scenario.source == std::string_view("examples/assistant_modes_scene_"
+                                              "authoring.deployment.yaml") ||
+          scenario.family_id == std::string_view("ur5_roboplan");
+      const bool ur10e_mock_with_fingers =
+          scenario.source == std::string_view("examples/pick_and_place_ur10e_"
+                                              "robotiq.deployment.yaml");
+      std::vector<std::string_view> fault_joints;
+      if (lite6) {
+        fault_joints = {"joint1", "joint2", "joint3",
+                        "joint4", "joint5", "joint6"};
+      } else {
+        fault_joints = {"elbow_joint",   "shoulder_lift_joint",
+                        "shoulder_pan_joint", "wrist_1_joint",
+                        "wrist_2_joint", "wrist_3_joint"};
+        if (ur10e_mock_with_fingers) {
+          fault_joints.insert(fault_joints.end(),
+                              {"finger_joint", "left_inner_finger_joint",
+                               "left_inner_knuckle_joint",
+                               "right_inner_finger_joint",
+                               "right_inner_knuckle_joint",
+                               "right_outer_knuckle_joint"});
+          std::sort(fault_joints.begin(), fault_joints.end());
+        }
+      }
+      core::JsonValueDTO::Array limits;
+      for (const std::string_view joint : fault_joints) {
+        limits.push_back(core::JsonValueDTO{core::JsonObjectDTO{
+            {"max_deceleration_rad_s2", core::JsonValueDTO{10.0}},
+            {"source_joint_name", core::JsonValueDTO{std::string(joint)}}}});
+      }
+      core::JsonObjectDTO fault_row{
+          {"command_target_id", core::JsonValueDTO{std::string("arm")}},
+          {"controllable_component_id", core::JsonValueDTO{component_id}},
+          {"deceleration_time_s", core::JsonValueDTO{1.0}},
+          {"per_joint_max_deceleration_rad_s2",
+           core::JsonValueDTO{std::move(limits)}},
+          {"profile_id",
+           core::JsonValueDTO{std::string(legacy_default_fault
+                                              ? "default_fault_spring_back"
+                                              : "fault_spring_back_hold")}},
+          {"stop_mode", core::JsonValueDTO{std::string("spring_back_hold")}}};
+      if (!legacy_default_fault) {
+        fault_row.emplace("require_backend_confirmation",
+                          core::JsonValueDTO{true});
+      }
+      expected_runtime_configuration.emplace(
+          "default_fault_stop_profiles",
+          core::JsonValueDTO{core::JsonValueDTO::Array{
+              core::JsonValueDTO{std::move(fault_row)}}});
     }
     if (mesh_heavy_isaac_runtime) {
       expected_runtime_configuration.emplace(
@@ -2321,7 +2415,9 @@ void verify_scenarios(const std::filesystem::path &root,
           "same-family profiles select different models");
     }
   }
-  if (family_identities.size() != 5U || family_models.size() != 3U) {
+  // Q63-Q66: every maintained scenario selects its family's fixed-scale ROS
+  // component (Isaac or offline mock) of the three maintained families.
+  if (family_identities.size() != 3U || family_models.size() != 3U) {
     throw std::logic_error("maintained scenarios do not cover three families");
   }
 }
@@ -2389,6 +2485,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
       family_id,
       false,
       runtime_profile_id == "manyforge.ros2_control_execution_runtime",
+      "",
       "",
   };
   const std::array<Scenario, 1U> selected{scenario};

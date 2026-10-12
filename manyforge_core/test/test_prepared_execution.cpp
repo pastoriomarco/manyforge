@@ -32,8 +32,6 @@ namespace {
       std::nullopt,
       ParticipantStopProfilePurposeDTO::kOrdinary,
       std::nullopt,
-      StopDeadlineBudgetDTO{
-          1'000'000'000LL, 100'000'000LL, {{StopBudgetPhaseId("completion"), 900'000'000LL}}},
       {}};
   PreparedCapabilityCommandDTO payload{
       CommandSchemaId("command.schema"),

@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/observed_robot_state_provider.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <string>
@@ -58,6 +60,46 @@ TEST(ObservedRobotStatePublicationTest, SelectsFreshSourceByPrecedenceWithoutMix
   EXPECT_EQ(dto->authority_profile, "measured");
   ASSERT_TRUE(dto->velocities_rad_s.has_value());
   EXPECT_EQ(*dto->velocities_rad_s, joint_velocities);
+}
+
+TEST(ObservedRobotStatePublicationTest, NegativeZeroObservationsArePublishedAsPositiveZero) {
+  // Stage F: a resumed motion's plan start state is the observed state, and
+  // canonical prepared data refuses -0.0 (content identity). A sample may
+  // carry -0.0 (e.g. a Stop ramp's rest velocity, negative path slope x zero
+  // path rate); the observed state stores the equal +0.0.
+  ObservedRobotStatePublication publication(
+      {"j1", "j2"}, {source(ObservedRobotStateSourceKind::kJointState, "joint")});
+  const std::vector<std::string> joints{"j1", "j2"};
+  const std::vector<double> positions{-0.0, -0.25};
+  const std::vector<double> velocities{-0.0, -0.5 * 0.0};
+  ASSERT_TRUE(std::signbit(velocities[1]));
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints, positions,
+                           velocities, 10, 10)
+                  .published);
+  {
+    auto view = publication.acquire(10);
+    ASSERT_TRUE(view);
+    ASSERT_TRUE(view.velocities_complete());
+    EXPECT_EQ(view.positions_rad()[0], 0.0);
+    EXPECT_FALSE(std::signbit(view.positions_rad()[0]));
+    EXPECT_EQ(view.positions_rad()[1], -0.25);
+    for (const double velocity : view.velocities_rad_s()) {
+      EXPECT_EQ(velocity, 0.0);
+      EXPECT_FALSE(std::signbit(velocity));
+    }
+  }
+
+  PublishedObservedRobotStateProvider provider(publication);
+  const auto state = provider.current_state(10);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  for (const auto& values : {state.value().positions_rad, state.value().velocities_rad_s}) {
+    for (const double value : values) {
+      EXPECT_FALSE(value == 0.0 && std::signbit(value));
+      EXPECT_NO_THROW(static_cast<void>(
+          content_identity::canonical_json(content_identity::CanonicalValue(value))));
+    }
+  }
 }
 
 TEST(ObservedRobotStatePublicationTest, IncompleteHigherPrioritySourceFallsBackToCompleteSource) {

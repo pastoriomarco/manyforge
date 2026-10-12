@@ -295,6 +295,7 @@ def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
             "allow_natural_completion_on_short_path": False,
             "jerk_limits_enabled": False,
             "deceleration_time_s": 1.25,
+            "max_stop_time_s": 3.0,
             "per_resource_limits": [
                 {
                     "resource_id": "joint1",
@@ -311,11 +312,6 @@ def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
         },
         controllable_component_id="robot_b",
         command_target_id="arm",
-        timing={
-            "command_latency_allowance_ns": 250_000_000,
-            "settling_allowance_ns": 750_000_000,
-            "operational_timeout_ns": 3_000_000_000,
-        },
         draft_id=current["draft_id"],
         expected_revision=current["draft_revision"],
     )
@@ -331,4 +327,69 @@ def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
             "settle_velocity_threshold_rad_s": 0.02,
         }
     ]
-    assert stop["timing"]["operational_timeout_ns"] == 3_000_000_000
+    # Q51: the robot's own explicit maximum Stop time lives in its profile.
+    assert stop["max_stop_time_s"] == 3.0
+    assert "timing" not in stop
+
+
+def test_frame_prefix_has_empty_default_and_preserves_authored_literal() -> None:
+    intent = _intent()
+    normalized = validate_deployment_intent(intent, source="test")
+    assert all(component["frame_prefix"] == "" for component in normalized["components"])
+    intent["components"][0]["frame_prefix"] = "second/"
+    normalized = validate_deployment_intent(intent, source="test")
+    assert next(component for component in normalized["components"] if component["component_id"] == "robot_b")["frame_prefix"] == "second/"
+    intent["components"][0]["frame_prefix"] = 1
+    with pytest.raises(DeploymentIntentError, match="frame_prefix must be a string"):
+        validate_deployment_intent(intent, source="test")
+
+
+@pytest.mark.parametrize("prefix", ["", "second/", "Robot_2/nested/", "0/", "_/", "robot//"])
+def test_frame_prefix_preserves_valid_custom_text(prefix: str) -> None:
+    intent = _intent()
+    intent["components"][0]["frame_prefix"] = prefix
+    normalized = validate_deployment_intent(intent, source="test")
+    assert next(component for component in normalized["components"]
+                if component["component_id"] == "robot_b")["frame_prefix"] == prefix
+
+
+@pytest.mark.parametrize("prefix", [
+    "literal prefix/", "/robot/", "/", "robot", "robot-b/", "robot.b/",
+    "röbot/", "robot/\n", "robot\\/",
+])
+def test_frame_prefix_refuses_invalid_format_with_reason(prefix: str) -> None:
+    intent = _intent()
+    intent["components"][0]["frame_prefix"] = prefix
+    with pytest.raises(DeploymentIntentError, match="frame_prefix must be empty or use only ASCII letters"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_existing_robot_prefix_edit_preserves_peers_and_add_boundary() -> None:
+    from copy import deepcopy
+    from manyforge_composer.backend.state import _controllable_composition_change_kinds
+    before = validate_deployment_intent(_intent(), source="test")
+    changed = deepcopy(before)
+    changed["components"][0]["frame_prefix"] = "robot_a/"
+    assert _controllable_composition_change_kinds(before, changed) == ()
+    assert changed["components"][1] == before["components"][1]
+    newcomer = deepcopy(changed["components"][0])
+    newcomer["component_id"] = "robot_c"
+    changed["components"].append(newcomer)
+    assert "controllable_components" in _controllable_composition_change_kinds(before, changed)
+
+
+def test_isaac_world_is_one_optional_logical_cell_reference() -> None:
+    intent = _intent()
+    assert "isaac_world" not in validate_deployment_intent(intent, source="test")
+    intent["isaac_world"] = "isaac_manipulator_scene_light"
+    normalized = validate_deployment_intent(intent, source="test")
+    assert normalized["isaac_world"] == "isaac_manipulator_scene_light"
+    assert all("isaac_world" not in component for component in normalized["components"])
+
+
+@pytest.mark.parametrize("world", [None, "", 1, "/site/world.usda", "file:/world.usda", "World", "a" * 129])
+def test_isaac_world_refuses_machine_paths_and_invalid_ids(world: object) -> None:
+    intent = _intent()
+    intent["isaac_world"] = world
+    with pytest.raises(DeploymentIntentError, match="isaac_world must be a portable identifier"):
+        validate_deployment_intent(intent, source="test")

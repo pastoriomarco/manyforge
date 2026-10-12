@@ -718,3 +718,39 @@ def test_readiness_uses_local_bind_addresses_for_publicly_advertised_stack(
         "http://127.0.0.1:9011/api/program/health",
         "http://127.0.0.1:9000/api/health",
     ]
+
+
+@pytest.mark.parametrize("cat_present,socket_present", [(False, True), (True, False)])
+def test_detached_start_refuses_missing_journald_before_spawn(tmp_path, monkeypatch,
+                                                           cat_present, socket_present):
+    from manyforge_operator.orchestrator import _journal_command
+    monkeypatch.setattr("manyforge_operator.orchestrator.shutil.which", lambda name: "/usr/bin/systemd-cat" if cat_present else None)
+    monkeypatch.setattr(Path, "is_socket", lambda path: socket_present)
+    with pytest.raises(LauncherError, match="requires systemd-cat and the journald stream socket") as raised:
+        _journal_command("cell-a", "manager", ["/bin/true"])
+    assert raised.value.code == "journald_unavailable"
+
+
+def test_detached_spawn_routes_to_journal_and_keeps_target_identity(tmp_path, monkeypatch):
+    from manyforge_operator.orchestrator import ProcessSpec
+    config = _config(tmp_path)
+    launcher = NativeLauncher(config)
+    captured = {}
+    monkeypatch.setattr("manyforge_operator.orchestrator.shutil.which", lambda name: "/usr/bin/systemd-cat")
+    monkeypatch.setattr(Path, "is_socket", lambda path: True)
+    def popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return type("Process", (), {"pid": 123})()
+    monkeypatch.setattr("manyforge_operator.orchestrator.subprocess.Popen", popen)
+    monkeypatch.setattr("manyforge_operator.orchestrator._proc_observation", lambda pid: (456, "S"))
+    monkeypatch.setattr("manyforge_operator.orchestrator._boot_id", lambda: "boot")
+    monkeypatch.setattr("manyforge_operator.orchestrator.os.getpgid", lambda pid: pid)
+    spec = ProcessSpec("manager", ("/bin/echo", "some value"), {"CUSTOM": "value"}, tmp_path)
+    managed = launcher._spawn(spec)
+    assert captured["argv"] == ["/usr/bin/systemd-cat", "-t", "manyforge-native-manager", "--", *spec.argv]
+    assert captured["kwargs"]["stdout"] == -3
+    assert captured["kwargs"]["env"]["CUSTOM"] == "value"
+    assert managed.argv == spec.argv
+    assert managed.log_path == "journalctl -t manyforge-native-manager"
+    assert not (launcher.store.root / "logs").exists()

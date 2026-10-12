@@ -72,7 +72,6 @@ struct Ros2ControlExecutionBackendConfig {
   bool disable_controller_path_tolerances = false;
   std::string execution_state_source_mode = "observed_robot";
   std::vector<double> initial_joint_positions_rad;
-  std::string command_gate_topic;
   // Phase 2.7A physical-controller admission. No contract means the existing
   // non-physical/static action binding remains in use. A present contract
   // enables event-invalidated, NRT controller-manager verification.

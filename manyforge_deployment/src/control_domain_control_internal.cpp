@@ -624,33 +624,12 @@ template <typename Strong>
 [[nodiscard]] CanonicalValue stop_command_projection(
     const core::StopContainmentCommandDTO& command) {
   return CanonicalValue(CanonicalValue::Object{
-      {"command_phase_id", CanonicalValue(command.command_phase_id.value())},
       {"command_kind",
        CanonicalValue(std::string(core::to_string(command.command_kind)))},
       {"provider_contract_ref",
        optional_contract_projection(command.provider_contract_ref)},
       {"registered_command_kind_id",
        optional_strong_projection(command.registered_command_kind_id)},
-  });
-}
-
-[[nodiscard]] CanonicalValue stop_budget_projection(
-    const core::StopDeadlineBudgetDTO& budget) {
-  CanonicalValue::Array phases;
-  phases.reserve(budget.phases.size());
-  for (const auto& phase : budget.phases) {
-    phases.emplace_back(CanonicalValue::Object{
-        {"phase_id", CanonicalValue(phase.phase_id.value())},
-        {"deadline_offset_ns",
-         CanonicalValue(static_cast<double>(phase.deadline_offset_ns))},
-    });
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"outer_duration_ns",
-       CanonicalValue(static_cast<double>(budget.outer_duration_ns))},
-      {"kernel_completion_reserve_ns",
-       CanonicalValue(static_cast<double>(budget.kernel_completion_reserve_ns))},
-      {"phases", CanonicalValue(std::move(phases))},
   });
 }
 
@@ -689,7 +668,6 @@ template <typename Strong>
   });
   return CanonicalValue(CanonicalValue::Object{
       {"evidence_item_id", CanonicalValue(evidence.evidence_item_id.value())},
-      {"phase_id", CanonicalValue(evidence.phase_id.value())},
       {"evidence_kind",
        CanonicalValue(std::string(core::to_string(evidence.evidence_kind)))},
       {"provider_contract_ref",
@@ -886,8 +864,6 @@ template <typename Stop>
           }
           fields.emplace_back("logical_stop_symbol",
                               CanonicalValue(stop.logical_stop_symbol));
-          fields.emplace_back("deadline_budget",
-                              stop_budget_projection(stop.deadline_budget));
           fields.emplace_back("escalation_stages",
                               CanonicalValue(std::move(stages)));
         }
@@ -1099,7 +1075,7 @@ CanonicalValue stop_policy_applicability_projection(
   if (policy.disposition == core::StopEvidenceDisposition::kNotStoppable) {
     return CanonicalValue(std::move(fields));
   }
-  if (!policy.deadline_budget.has_value() || policy.escalation_stages.empty()) {
+  if (policy.escalation_stages.empty()) {
     fail_retained_bundle(
         "qualified stoppable policy lost its complete declarative semantics");
   }
@@ -1127,8 +1103,6 @@ CanonicalValue stop_policy_applicability_projection(
         {"all_of_evidence_requirements", CanonicalValue(std::move(evidence))},
     });
   }
-  fields.emplace_back("deadline_budget",
-                      stop_budget_projection(*policy.deadline_budget));
   fields.emplace_back("escalation_stages", CanonicalValue(std::move(stages)));
   return CanonicalValue(std::move(fields));
 }

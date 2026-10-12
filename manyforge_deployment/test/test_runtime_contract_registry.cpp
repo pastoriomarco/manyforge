@@ -12,9 +12,26 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 
 namespace manyforge::deployment {
 namespace {
+
+TEST(RuntimeContractRegistry, OldSealedRosProfileRefusesWithRecompileGuidance) {
+  const auto &contracts = runtime_contract_declaration_registry().contracts();
+  const auto current = std::find_if(contracts.begin(), contracts.end(), [](const auto &row) {
+    return row.runtime_profile_id().value() == "manyforge.ros2_control_execution_runtime";
+  });
+  ASSERT_NE(current, contracts.end());
+  try {
+    static_cast<void>(detail::require_runtime_contract(current->runtime_profile_id(),
+        core::RuntimeProfileRevision("sha256:0f916fb469d27a221a97cf72737e006c4c4fc566752ea477a141847a0012fef5"),
+        current->runtime_product_id(), current->runtime_product_revision()));
+    FAIL() << "old sealed ROS profile must not enter the current build contract";
+  } catch (const RetainedBundleError &error) {
+    EXPECT_NE(std::string(error.what()).find("recompile"), std::string::npos);
+  }
+}
 
 TEST(RuntimeContractRegistry, PackageAndEmbeddedOffersAreOneExactValue) {
   const auto &registry = runtime_contract_declaration_registry();

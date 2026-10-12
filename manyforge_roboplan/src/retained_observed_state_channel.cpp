@@ -56,6 +56,128 @@ namespace manyforge::roboplan_backend {
          left_path.containment_granularity == right_path.containment_granularity;
 }
 
+[[nodiscard]] std::string_view
+retained_product_reseal_physical_owner_difference(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate) {
+  const auto &before = predecessor.value();
+  auto after = candidate.value();
+  // These fields describe the authored Program/product seal, not the physical
+  // controller. The resolved model, frame, resource, route, provider and
+  // runtime-unit facts remain byte-for-byte equal below. Contact/grasp
+  // templates are consumed by admitted Program operations and do not alter
+  // the retained controller itself.
+  after.program_id = before.program_id;
+  after.program_revision = before.program_revision;
+  after.program_binding_id = before.program_binding_id;
+  after.retained_bundle_id = before.retained_bundle_id;
+  after.graph_revision = before.graph_revision;
+  after.component_role_id = before.component_role_id;
+  after.target_role_id = before.target_role_id;
+  after.contact_grasp_bindings = before.contact_grasp_bindings;
+
+  if (after.controllable_component_id != before.controllable_component_id)
+    return "controllable_component_id";
+  if (after.component_type_id != before.component_type_id) return "component_type_id";
+  if (after.component_type_revision != before.component_type_revision)
+    return "component_type_revision";
+  if (after.command_target_id != before.command_target_id) return "command_target_id";
+  if (after.capability_id != before.capability_id) return "capability_id";
+  if (after.capability_definition_revision != before.capability_definition_revision)
+    return "capability_definition_revision";
+  if (after.command_schema != before.command_schema) return "command_schema";
+  if (after.model_bindings != before.model_bindings) return "model_bindings";
+  if (after.model_groups != before.model_groups) return "model_groups";
+  if (after.frame_bindings != before.frame_bindings) return "frame_bindings";
+  if (after.resources != before.resources) return "resources";
+  if (after.collision_body_bindings != before.collision_body_bindings)
+    return "collision_body_bindings";
+  if (after.control_path.has_value() != before.control_path.has_value())
+    return "control_path";
+  if (after.control_path && before.control_path) {
+    if (after.control_path->control_domain_id != before.control_path->control_domain_id)
+      return "control_path.control_domain_id";
+    if (after.control_path->control_domain_revision !=
+        before.control_path->control_domain_revision)
+      return "control_path.control_domain_revision";
+    if (after.control_path->control_binding_id != before.control_path->control_binding_id)
+      return "control_path.control_binding_id";
+    if (after.control_path->control_binding_revision !=
+        before.control_path->control_binding_revision)
+      return "control_path.control_binding_revision";
+    if (after.control_path->control_interface_contract_id !=
+        before.control_path->control_interface_contract_id)
+      return "control_path.control_interface_contract_id";
+    if (after.control_path->control_interface_revision !=
+        before.control_path->control_interface_revision)
+      return "control_path.control_interface_revision";
+    if (after.control_path->controller_topology_id !=
+        before.control_path->controller_topology_id)
+      return "control_path.controller_topology_id";
+    if (after.control_path->topology_revision != before.control_path->topology_revision)
+      return "control_path.topology_revision";
+    if (after.control_path->control_route_id != before.control_path->control_route_id)
+      return "control_path.control_route_id";
+    if (after.control_path->activation_set_id != before.control_path->activation_set_id)
+      return "control_path.activation_set_id";
+    if (after.control_path->active_control_configuration_id !=
+        before.control_path->active_control_configuration_id)
+      return "control_path.active_control_configuration_id";
+    if (after.control_path->active_control_configuration_generation !=
+        before.control_path->active_control_configuration_generation)
+      return "control_path.active_control_configuration_generation";
+    if (after.control_path->provider_instance_id !=
+        before.control_path->provider_instance_id)
+      return "control_path.provider_instance_id";
+    if (after.control_path->provider_manifest_id !=
+        before.control_path->provider_manifest_id)
+      return "control_path.provider_manifest_id";
+    if (after.control_path->provider_manifest_revision !=
+        before.control_path->provider_manifest_revision)
+      return "control_path.provider_manifest_revision";
+    if (after.control_path->provider_runtime_unit_id !=
+        before.control_path->provider_runtime_unit_id)
+      return "control_path.provider_runtime_unit_id";
+    if (after.control_path->provider_runtime_epoch !=
+        before.control_path->provider_runtime_epoch)
+      return "control_path.provider_runtime_epoch";
+    if (after.control_path->state_authority_id != before.control_path->state_authority_id)
+      return "control_path.state_authority_id";
+    if (after.control_path->state_authority_class !=
+        before.control_path->state_authority_class)
+      return "control_path.state_authority_class";
+    if (after.control_path->stop_evidence_policy_id !=
+        before.control_path->stop_evidence_policy_id)
+      return "control_path.stop_evidence_policy_id";
+    if (after.control_path->stop_evidence_policy_revision !=
+        before.control_path->stop_evidence_policy_revision)
+      return "control_path.stop_evidence_policy_revision";
+    if (after.control_path->containment_granularity !=
+        before.control_path->containment_granularity)
+      return "control_path.containment_granularity";
+    if (after.control_path->runtime_scale_qualification !=
+        before.control_path->runtime_scale_qualification)
+      return "control_path.runtime_scale_qualification";
+  }
+  if (after.capability_provider_path != before.capability_provider_path)
+    return "capability_provider_path";
+  if (after.supporting_capability_provider_paths !=
+      before.supporting_capability_provider_paths)
+    return "supporting_capability_provider_paths";
+  if (after.runtime_unit_epochs != before.runtime_unit_epochs)
+    return "runtime_unit_epochs";
+  // Keep the exact DTO equality as the final check, including future fields.
+  return after == before ? std::string_view{} : "binding";
+}
+
+[[nodiscard]] bool
+retained_bindings_preserve_physical_owner_after_product_reseal(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate) {
+  return retained_product_reseal_physical_owner_difference(predecessor, candidate)
+      .empty();
+}
+
 namespace {
 
 [[nodiscard]] core::ObservedRobotStateSourceKind

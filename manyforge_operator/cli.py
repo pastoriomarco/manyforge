@@ -57,6 +57,10 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--manager-timeout-s", type=float, default=60.0)
     start.add_argument("--isaac-executable", type=Path)
     start.add_argument("--world-path", type=Path)
+    start.add_argument("--guard-startup-config", type=Path,
+                       help="Explicit scene-owned Kit TOML merged at Isaac startup; no default")
+    start.add_argument("--joint-commands-topic",
+                       help="Arm command topic from the retained host profile; omission keeps the launch default")
     start.add_argument("--expected-world-name", default=DEFAULT_WORLD_NAME)
     start.add_argument("--simulator-host", default=DEFAULT_SIMULATOR_HOST)
     start.add_argument("--control-host", default="")
@@ -68,6 +72,12 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--remote-alarm-catalog-path")
     start.add_argument("--remote-state-root")
     start.add_argument("--remote-composer-static-dir")
+    start.add_argument("--remote-container-image-id")
+    start.add_argument("--remote-container-name")
+    start.add_argument("--remote-cache-root")
+    start.add_argument("--remote-runtime-root")
+    start.add_argument("--remote-evidence-root")
+    start.add_argument("--remote-isaac-site-settings")
     start.add_argument("--remote-simulation-control-config")
     start.add_argument("--remote-bridge-state-root")
     start.add_argument("--local-ros-setup-script", type=Path)
@@ -146,6 +156,11 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         "isaac_executable",
         "world_path",
         "remote_source_root",
+        "remote_container_image_id",
+        "remote_container_name",
+        "remote_cache_root",
+        "remote_runtime_root",
+        "remote_evidence_root",
         "remote_manager_executable",
         "remote_install_root",
         "remote_node_catalog_path",
@@ -173,6 +188,12 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         alarm_catalog_path=args.remote_alarm_catalog_path,
         state_root=args.remote_state_root,
         composer_static_dir=args.remote_composer_static_dir or "",
+        container_image_id=args.remote_container_image_id,
+        container_name=args.remote_container_name,
+        cache_root=args.remote_cache_root,
+        runtime_root=args.remote_runtime_root,
+        evidence_root=args.remote_evidence_root,
+        isaac_site_settings=args.remote_isaac_site_settings or "",
         simulation_control_config=args.remote_simulation_control_config,
         bridge_state_root=args.remote_bridge_state_root or "/mnt/nova_ssd/codex-manyforge/runners/isaac-bridge",
         ros_setup_script=args.remote_ros_setup_script or "/opt/ros/jazzy/setup.bash",
@@ -190,6 +211,8 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         source_root=args.source_root,
         isaac_executable=args.isaac_executable,
         world_path=args.world_path,
+        guard_startup_config=args.guard_startup_config,
+        joint_commands_topic=args.joint_commands_topic,
         state_root=args.state_root,
         instance_id=args.instance_id,
         remote=remote,

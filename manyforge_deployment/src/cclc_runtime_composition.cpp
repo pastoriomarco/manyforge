@@ -223,9 +223,9 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
     std::vector<core::ControllerLifecyclePortRegistrationDTO> controller_ports,
     std::vector<core::KinematicResourceSourceProjectionDTO> source_projections,
-    std::function<core::Result<
-        std::optional<core::ActiveControlConfigurationDTO>>(
-        const core::ControlDomainId &)>
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
         kernel_current_configuration_source,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
@@ -235,7 +235,8 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
     : config_(std::move(config)), retained_bundle_(std::move(retained_bundle)),
       journal_(config_.state_root / std::string(core::kCCLCJournalFilename),
                config_.cell_id, config_.exact_result_history_capacity,
-               config_.terminal_result_bytes_capacity),
+               config_.terminal_result_bytes_capacity,
+               config_.on_incidents_pruned),
       port_registry_(std::move(brand_ports), std::move(controller_ports)),
       plan_repository_(config_.run_root,
                        config_.maximum_resolved_stop_plan_count,
@@ -255,8 +256,7 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                               [&clock] { return clock.now(); }),
       coordinator_(config_.coordinator, journal_, domain_reservations_,
                    lifecycle_snapshot_source_, lifecycle_catalog_source,
-                   port_registry_, kernel_cell_admission_port, clock,
-                   scheduler,
+                   port_registry_, kernel_cell_admission_port, clock, scheduler,
                    core::ComponentLifecycleCoordinatorRouteServices{
                        &route_snapshot_source_, &port_registry_,
                        &kernel_route_fence_port, &route_publication_port_},

@@ -238,28 +238,41 @@ native_execution_configuration(std::string_view controllable_component_id,
 }
 
 [[nodiscard]] inline CanonicalValue ros2_control_execution_configuration(
-    std::string_view motion_limit_target_id = kLite6ArmTargetId) {
-  return CanonicalValue(CanonicalValue::Object{
+    std::string_view motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &default_fault_stop_profiles =
+        std::nullopt, std::string_view component_id = kLite6ControllableComponentId,
+    std::string_view frame_prefix = {},
+    std::optional<double> initial_joint1_position_rad = std::nullopt) {
+  CanonicalValue::Object configuration{
       {"mode", CanonicalValue("commanded_sim")},
-      {"isaac_profile", CanonicalValue("lite6")},
+      {"isaac_world", CanonicalValue("lite6_grf_ros2")},
+      {"controller_profiles",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"controllable_component_id",
+                CanonicalValue(std::string(component_id))},
+               {"isaac_profile", CanonicalValue("lite6")},
+               {"frame_prefix", CanonicalValue(std::string(frame_prefix))},
+           })})},
       {"motion_target_limits",
        CanonicalValue(
            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                {"controllable_component_id",
-                CanonicalValue(std::string(kLite6ControllableComponentId))},
+                CanonicalValue(std::string(component_id))},
                {"command_target_id",
                 CanonicalValue(std::string(motion_limit_target_id))},
                {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
            })})},
       {"planner_rng_seed", CanonicalValue(12345.0)},
-      {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{
-                                          CanonicalValue(0.0),
-                                          CanonicalValue(0.0),
-                                          CanonicalValue(1.57),
-                                          CanonicalValue(0.0),
-                                          CanonicalValue(0.0),
-                                          CanonicalValue(0.0),
-                                      })},
+      {"initial_joint_positions_rad",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(initial_joint1_position_rad.value_or(0.0)),
+           CanonicalValue(0.0),
+           CanonicalValue(1.57),
+           CanonicalValue(0.0),
+           CanonicalValue(0.0),
+           CanonicalValue(0.0),
+       })},
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(100.0)},
       {"runtime_collision_immediate_query_budget_ms", CanonicalValue(75.0)},
@@ -270,7 +283,12 @@ native_execution_configuration(std::string_view controllable_component_id,
       {"runtime_collision_lookahead_workers", CanonicalValue(4.0)},
       {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(1000.0)},
       {"validation_collision_workers", CanonicalValue(4.0)},
-  });
+  };
+  if (default_fault_stop_profiles.has_value()) {
+    configuration.emplace_back("default_fault_stop_profiles",
+                               *default_fault_stop_profiles);
+  }
+  return CanonicalValue(std::move(configuration));
 }
 
 [[nodiscard]] inline CanonicalValue translated_pose(double x_m) {
@@ -535,10 +553,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                         bool qualified_motion_controlled_stop = false,
                         std::string_view lifecycle_semantic_digest = {},
                         bool ros2_control_execution = false,
-                        bool controlled_stop_deadline_envelope = false,
                         std::string_view provider_id = "lite6_arm_provider") {
-  const bool expanded_stop_deadline =
-      qualified_motion_controlled_stop || controlled_stop_deadline_envelope;
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -1157,7 +1172,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       qualified_motion_controlled_stop || !native_motion
           ? CanonicalValue(CanonicalValue::Object{
                 {"evidence_item_id", CanonicalValue("nominal_rest")},
-                {"phase_id", CanonicalValue("nominal_terminal")},
                 {"evidence",
                  CanonicalValue(CanonicalValue::Object{
                      {"evidence_kind", CanonicalValue("motion_rest")},
@@ -1179,7 +1193,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
             })
           : CanonicalValue(CanonicalValue::Object{
                 {"evidence_item_id", CanonicalValue("goal_terminal")},
-                {"phase_id", CanonicalValue("nominal_terminal")},
                 {"evidence", CanonicalValue(CanonicalValue::Object{
                                  {"evidence_kind",
                                   CanonicalValue("controller_goal_terminal")},
@@ -1213,42 +1226,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
         {"disposition", CanonicalValue("stoppable")},
         {"containment_granularity",
          CanonicalValue(std::string(containment_granularity))},
-        {"deadline_budget",
-         CanonicalValue(CanonicalValue::Object{
-             {"outer_duration_ns",
-              CanonicalValue(expanded_stop_deadline ? 3'000'000'000.0
-                                                    : 1'000'000'000.0)},
-             {"kernel_completion_reserve_ns",
-              CanonicalValue(expanded_stop_deadline ? 200'000'000.0
-                                                    : 100'000'000.0)},
-             {"phases",
-              CanonicalValue(CanonicalValue::Array{
-                  CanonicalValue(CanonicalValue::Object{
-                      {"phase_id", CanonicalValue("nominal_command")},
-                      {"deadline_offset_ns",
-                       CanonicalValue(expanded_stop_deadline ? 300'000'000.0
-                                                             : 100'000'000.0)},
-                  }),
-                  CanonicalValue(CanonicalValue::Object{
-                      {"phase_id", CanonicalValue("nominal_terminal")},
-                      {"deadline_offset_ns",
-                       CanonicalValue(expanded_stop_deadline ? 1'750'000'000.0
-                                                             : 300'000'000.0)},
-                  }),
-                  CanonicalValue(CanonicalValue::Object{
-                      {"phase_id", CanonicalValue("hard_command")},
-                      {"deadline_offset_ns",
-                       CanonicalValue(expanded_stop_deadline ? 1'900'000'000.0
-                                                             : 500'000'000.0)},
-                  }),
-                  CanonicalValue(CanonicalValue::Object{
-                      {"phase_id", CanonicalValue("hard_terminal")},
-                      {"deadline_offset_ns",
-                       CanonicalValue(expanded_stop_deadline ? 2'700'000'000.0
-                                                             : 800'000'000.0)},
-                  }),
-              })},
-         })},
         {"escalation_stages",
          CanonicalValue(CanonicalValue::Array{
              CanonicalValue(CanonicalValue::Object{
@@ -1258,7 +1235,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                   CanonicalValue(std::string(containment_granularity))},
                  {"containment_command",
                   CanonicalValue(CanonicalValue::Object{
-                      {"command_phase_id", CanonicalValue("nominal_command")},
                       {"command",
                        qualified_motion_controlled_stop
                            ? CanonicalValue(CanonicalValue::Object{
@@ -1284,7 +1260,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                   CanonicalValue(std::string(containment_granularity))},
                  {"containment_command",
                   CanonicalValue(CanonicalValue::Object{
-                      {"command_phase_id", CanonicalValue("hard_command")},
                       {"command",
                        CanonicalValue(CanonicalValue::Object{
                            {"command_kind", CanonicalValue("registered")},
@@ -1299,7 +1274,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                   CanonicalValue(CanonicalValue::Array{
                       CanonicalValue(CanonicalValue::Object{
                           {"evidence_item_id", CanonicalValue("hard_rest")},
-                          {"phase_id", CanonicalValue("hard_terminal")},
                           {"evidence",
                            CanonicalValue(CanonicalValue::Object{
                                {"evidence_kind", CanonicalValue("motion_rest")},
@@ -1970,15 +1944,20 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   return catalog;
 }
 
-[[nodiscard]] inline GraphRevisionVerifiedCellGraph
-make_graph(const Lite6StructuralRetentionFixture &structural,
-           const QualifiedControlCatalog &catalog,
-           std::size_t instance_count = 1U, std::string_view cell_id = {},
-           std::string_view containment_granularity = "resource",
-           bool gripper_only = false,
-           std::optional<double> initial_joint1_position_rad = std::nullopt,
-           bool shared_native_domain = false,
-           std::string_view ros_motion_limit_target_id = kLite6ArmTargetId) {
+[[nodiscard]] inline GraphRevisionVerifiedCellGraph make_graph(
+    const Lite6StructuralRetentionFixture &structural,
+    const QualifiedControlCatalog &catalog, std::size_t instance_count = 1U,
+    std::string_view cell_id = {},
+    std::string_view containment_granularity = "resource",
+    bool gripper_only = false,
+    std::optional<double> initial_joint1_position_rad = std::nullopt,
+    bool shared_native_domain = false,
+    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &ros_default_fault_stop_profiles =
+        std::nullopt,
+    std::string_view first_ros_frame_prefix = {},
+    std::string_view isaac_world = "lite6_grf_ros2",
+    bool ros_mock_peers = true) {
   const bool aggregate = catalog.gripper_capability.has_value();
   if (gripper_only && (!aggregate || instance_count != 1U)) {
     throw std::logic_error(
@@ -2025,9 +2004,8 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
                                              shared_native_domain ? 0U : instance);
     const std::string binding_id = indexed_id(kLite6ArmBindingId, instance);
     const std::string runtime_unit_id =
-        indexed_id(ros2_control_execution ? kLite6Ros2ControlExecutionRuntimeId
-                                          : kLite6NativeExecutionRuntimeId,
-                   instance);
+        ros2_control_execution ? std::string(kLite6Ros2ControlExecutionRuntimeId)
+                               : indexed_id(kLite6NativeExecutionRuntimeId, instance);
     const std::string resource_prefix =
         instance == 0U ? "lite6" : "lite6_" + std::to_string(instance + 1U);
 
@@ -2063,7 +2041,10 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
          CanonicalValue(CanonicalValue::Array{})},
         {"configuration",
          ros2_control_execution
-             ? ros2_control_execution_configuration(ros_motion_limit_target_id)
+             ? ros2_control_execution_configuration(
+                   ros_motion_limit_target_id, ros_default_fault_stop_profiles,
+                   component_id, instance == 0U ? first_ros_frame_prefix : component_id + "/",
+                   instance == 0U ? initial_joint1_position_rad : std::nullopt)
              : native_execution_configuration(
                    component_id, aggregate,
                    catalog.gripper_confirmation.has_value(), !gripper_only,
@@ -2283,6 +2264,55 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
     }
   }
 
+  if (ros2_control_execution) {
+    for (std::size_t index = 0; index < runtime_units.size(); ++index) {
+      auto unit = runtime_units[index].as_object();
+      for (auto &[name, value] : unit) {
+        if (name != "configuration")
+          continue;
+        auto configuration = value.as_object();
+        for (auto &[field, selected] : configuration) {
+          if (field == "isaac_world")
+            selected = CanonicalValue(std::string(isaac_world));
+          if (field == "controller_profiles" && ros_mock_peers && index > 0U) {
+            auto profile = selected.as_array().front().as_object();
+            for (auto &[key, setting] : profile) {
+              if (key == "isaac_profile") {
+                key = "mock_profile";
+                setting = CanonicalValue("lite6_lite_gripper");
+              }
+            }
+            selected = CanonicalValue(
+                CanonicalValue::Array{CanonicalValue(std::move(profile))});
+          }
+        }
+        value = CanonicalValue(std::move(configuration));
+      }
+      runtime_units[index] = CanonicalValue(std::move(unit));
+    }
+  }
+
+  if (ros2_control_execution && runtime_units.size() > 1U) {
+    auto grouped = runtime_units.front().as_object();
+    auto configuration = runtime_units.front().find_object_member("configuration")->as_object();
+    for (auto &[name, value] : configuration) {
+      if (name != "initial_joint_positions_rad" && name != "controller_profiles" &&
+          name != "motion_target_limits" && name != "default_fault_stop_profiles" &&
+          name != "gripper_target_configurations") continue;
+      CanonicalValue::Array rows;
+      for (const auto &unit : runtime_units) {
+        const auto *items = unit.find_object_member("configuration")->find_object_member(name);
+        if (items != nullptr) rows.insert(rows.end(), items->as_array().begin(), items->as_array().end());
+      }
+      value = CanonicalValue(std::move(rows));
+    }
+    for (auto &[name, value] : grouped) {
+      if (name == "configuration") value = CanonicalValue(std::move(configuration));
+    }
+    runtime_units.clear();
+    runtime_units.emplace_back(std::move(grouped));
+  }
+
   if (shared_native_domain) {
     // Generic graph qualification permits shared domains. Construct that
     // externally supplied topology before hashing so Manager's native-specific
@@ -2340,7 +2370,7 @@ make_applicability_inputs(
     const AssistantOverlayFixture *assistant_overlay,
     const bool composer_draft_enabled = false, const bool stoppable = false,
     const bool qualified_motion_controlled_stop = false,
-    const std::vector<core::StopTimingParametersDTO> &stop_timings = {}) {
+    const std::optional<double> arm_max_stop_time_s = std::nullopt) {
   CanonicalValue::Array desired_configurations;
   desired_configurations.reserve(graph.graph().control_domains.size());
   for (const auto &domain : graph.graph().control_domains) {
@@ -2527,6 +2557,22 @@ make_applicability_inputs(
                    })},
               });
             }
+            CanonicalValue::Object arm_parameters{
+                {"stop_mode", CanonicalValue("soft_on_path")},
+                {"jerk_limits_enabled", CanonicalValue(true)},
+                {"deceleration_time_s", CanonicalValue(1.0)},
+                {"recoverable_substitution_mode",
+                 CanonicalValue("spring_back_hold")},
+                {"per_resource_limits",
+                 CanonicalValue(std::move(resource_limits))},
+                {"allow_natural_completion_on_short_path",
+                 CanonicalValue(true)},
+            };
+            // Q51: the robot's own explicit maximum Stop time, when authored.
+            if (arm_max_stop_time_s.has_value()) {
+              arm_parameters.emplace_back("max_stop_time_s",
+                                          CanonicalValue(*arm_max_stop_time_s));
+            }
             stop_stage_parameters.emplace_back(CanonicalValue::Object{
                 {"control_domain_id",
                  CanonicalValue(binding.control_domain_id.value())},
@@ -2558,17 +2604,7 @@ make_applicability_inputs(
                           core::kMotionControlledStopContractSchemaRevision))},
                  })},
                 {"default_contract_parameters",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"stop_mode", CanonicalValue("soft_on_path")},
-                     {"jerk_limits_enabled", CanonicalValue(true)},
-                     {"deceleration_time_s", CanonicalValue(1.0)},
-                     {"recoverable_substitution_mode",
-                      CanonicalValue("spring_back_hold")},
-                     {"per_resource_limits",
-                      CanonicalValue(std::move(resource_limits))},
-                     {"allow_natural_completion_on_short_path",
-                      CanonicalValue(true)},
-                 })},
+                 CanonicalValue(std::move(arm_parameters))},
             });
           }
           stop_stage_parameters.emplace_back(CanonicalValue::Object{
@@ -2641,40 +2677,6 @@ make_applicability_inputs(
                  assistant_overlay->reference.site_overlay_revision.value())},
         }));
   }
-  if (!stop_timings.empty()) {
-    if (stop_timings.size() != graph.graph().control_bindings.size())
-      throw std::logic_error(
-          "test timing inventory must cover each fixture binding");
-    auto found =
-        std::find_if(root_members.begin(), root_members.end(),
-                     [](const auto &row) { return row.first == "policies"; });
-    if (found == root_members.end())
-      throw std::logic_error("test timing requires a policy table");
-    auto policies = std::get<CanonicalValue::Object>(found->second.storage());
-    CanonicalValue::Array rows;
-    for (std::size_t i = 0; i < stop_timings.size(); ++i) {
-      const auto &binding = graph.graph().control_bindings[i];
-      const auto &timing = stop_timings[i];
-      rows.emplace_back(CanonicalValue::Object{
-          {"control_binding_id",
-           CanonicalValue(binding.control_binding_id.value())},
-          {"control_binding_revision",
-           CanonicalValue(binding.control_binding_revision.value())},
-          {"timing",
-           CanonicalValue(CanonicalValue::Object{
-               {"command_latency_allowance_ns",
-                CanonicalValue(
-                    static_cast<double>(timing.command_latency_allowance_ns))},
-               {"settling_allowance_ns", CanonicalValue(static_cast<double>(
-                                             timing.settling_allowance_ns))},
-               {"operational_timeout_ns",
-                CanonicalValue(
-                    static_cast<double>(timing.operational_timeout_ns))}})}});
-    }
-    policies.emplace_back("stop_timing_parameters",
-                          CanonicalValue(std::move(rows)));
-    found->second = CanonicalValue(std::move(policies));
-  }
   const CanonicalValue root(std::move(root_members));
   return compute_capability_provider_binding_revisions(
       decode_deployment_applicability_inputs_candidate(
@@ -2694,16 +2696,20 @@ make_lite6_controllable_retention_fixture(
     std::string_view arm_lifecycle_semantic_digest = {},
     std::string_view gripper_lifecycle_semantic_digest = {},
     bool ros2_control_execution = false, bool operator_confirmation = false,
-    const std::vector<core::StopTimingParametersDTO> &stop_timings = {},
     bool gripper_only = false,
     std::optional<double> initial_joint1_position_rad = std::nullopt,
     bool shared_native_domain = false,
-    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId) {
+    std::string_view ros_motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &ros_default_fault_stop_profiles =
+        std::nullopt,
+    const std::optional<double> arm_max_stop_time_s = std::nullopt,
+    std::string_view first_ros_frame_prefix = {},
+    std::string_view isaac_world = "lite6_grf_ros2",
+    bool ros_mock_peers = true) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (gripper_only &&
       (!aggregate_gripper || !native_motion || !stoppable ||
-       !qualified_motion_controlled_stop || ros2_control_execution ||
-       !stop_timings.empty())) {
+       !qualified_motion_controlled_stop || ros2_control_execution)) {
     throw std::logic_error(
         "Lite6 gripper-only fixture derives from the native CCLC product "
         "with its own gripper Stop policy");
@@ -2723,9 +2729,9 @@ make_lite6_controllable_retention_fixture(
         "operator confirmation fixture requires the native gripper owner");
   }
   if (ros2_control_execution && (!native_motion || chained ||
-                                 aggregate_gripper || instance_count != 1U)) {
+                                 aggregate_gripper)) {
     throw std::logic_error(
-        "ros2_control execution fixture requires one direct addressed arm");
+        "ros2_control execution fixture requires direct addressed arms");
   }
   if (qualified_motion_controlled_stop &&
       (!stoppable || !native_motion || chained || instance_count != 1U)) {
@@ -2737,11 +2743,11 @@ make_lite6_controllable_retention_fixture(
   auto catalog = fixture_detail::qualify_control_catalog(
       chained, native_motion, stoppable, containment_granularity,
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
-      ros2_control_execution, qualified_motion_controlled_stop,
+      ros2_control_execution,
       shared_native_domain ? "manyforge.provider.native_control" : "lite6_arm_provider");
   if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
     auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
-        false, true, true, "resource", false, {}, false, true);
+        false, true, true, "resource", false, {}, false);
     const auto stop_key =
         gripper_stop_catalog.stop.reference().content_addressed_store_key;
     const auto artifact = std::find_if(
@@ -2763,7 +2769,8 @@ make_lite6_controllable_retention_fixture(
   const auto graph = fixture_detail::make_graph(
       structural, catalog, instance_count, cell_id, containment_granularity,
       gripper_only, initial_joint1_position_rad, shared_native_domain,
-      ros_motion_limit_target_id);
+      ros_motion_limit_target_id, ros_default_fault_stop_profiles,
+      first_ros_frame_prefix, isaac_world, ros_mock_peers);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled
@@ -2780,7 +2787,7 @@ make_lite6_controllable_retention_fixture(
           : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
       composer_draft_enabled, stoppable, qualified_motion_controlled_stop,
-      stop_timings);
+      arm_max_stop_time_s);
 
   // A gripper-only component type declares only its gripper target. Arm and
   // planner capabilities have no selected provider or graph binding here.
@@ -3045,19 +3052,22 @@ make_lite6_native_motion_retention_fixture() {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_ros2_control_motion_retention_fixture(
     bool stoppable = false,
-    std::string_view motion_limit_target_id = kLite6ArmTargetId) {
+    std::string_view motion_limit_target_id = kLite6ArmTargetId,
+    const std::optional<CanonicalValue> &default_fault_stop_profiles =
+        std::nullopt) {
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, stoppable, "resource", false,
-      {}, {}, true, false, {}, false, std::nullopt, false,
-      motion_limit_target_id);
+      {}, {}, true, false, false, std::nullopt, false,
+      motion_limit_target_id, default_fault_stop_profiles);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_stop_qualified_native_motion_retention_fixture(
-    const std::vector<core::StopTimingParametersDTO> &stop_timings = {}) {
+    const std::optional<double> arm_max_stop_time_s = std::nullopt) {
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, true, "resource", true, {}, {},
-      false, false, stop_timings);
+      false, false, false, std::nullopt, false, kLite6ArmTargetId, std::nullopt,
+      arm_max_stop_time_s);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
@@ -3077,7 +3087,7 @@ make_lite6_native_cclc_product_retention_fixture(
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", true,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest, false,
-      operator_confirmation, {}, false, initial_joint1_position_rad);
+      operator_confirmation, false, initial_joint1_position_rad);
 }
 
 /// A gripper-only native cell: the aggregate component with its arm target
@@ -3091,7 +3101,7 @@ make_lite6_native_gripper_only_cclc_product_retention_fixture(
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", true,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest, false,
-      false, {}, true);
+      false, true);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

@@ -68,7 +68,7 @@ def _controllers() -> dict[str, object]:
         },
         'lite6_traj_controller': {
             'ros__parameters': {
-                'command_interfaces': ['position', 'velocity'],
+                'command_interfaces': ['position'],
                 'state_interfaces': ['position', 'velocity'],
                 'joints': joints,
                 'state_publish_rate': 25.0,
@@ -169,7 +169,7 @@ def test_compiles_exact_generated_production_binding() -> None:
     )
     assert execution_binding['snapshot_max_age_ms'] == 1000
     assert binding.hardware_command_interfaces == ('position', 'velocity')
-    assert binding.controller_command_interfaces == ('position', 'velocity')
+    assert binding.controller_command_interfaces == ('position',)
     assert binding.hardware_state_interfaces == ('position', 'velocity')
     assert binding.controller_state_interfaces == ('position', 'velocity')
     assert binding.decelerate_on_cancel is True
@@ -177,12 +177,13 @@ def test_compiles_exact_generated_production_binding() -> None:
         f'joint{index}': 2.0 for index in range(1, 7)
     }
     assert binding.claimed_command_interface_names == tuple(
+        f'joint{index}/position'
+        for index in range(1, 7)
+    )
+    assert binding.state_interface_names == tuple(
         f'joint{index}/{interface}'
         for index in range(1, 7)
         for interface in ('position', 'velocity')
-    )
-    assert binding.state_interface_names == (
-        binding.claimed_command_interface_names
     )
 
 
@@ -251,7 +252,7 @@ def test_binding_rejects_interface_or_type_drift() -> None:
     wrong_interfaces = _controllers()
     wrong_interfaces['lite6_traj_controller']['ros__parameters'][
         'command_interfaces'
-    ] = ['position']
+    ] = ['position', 'velocity']
     with pytest.raises(ValueError, match='command interfaces'):
         _compile(wrong_interfaces)
 

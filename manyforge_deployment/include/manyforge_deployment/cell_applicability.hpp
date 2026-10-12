@@ -337,7 +337,6 @@ struct LogicalStoppableApplicabilityTemplate final {
   core::ContainmentGranularity containment_granularity;
   core::StopEvidenceDisposition disposition;
   std::string logical_stop_symbol;
-  core::StopDeadlineBudgetDTO deadline_budget;
   std::vector<LogicalStopEscalationStageTemplate> escalation_stages;
 
   friend bool

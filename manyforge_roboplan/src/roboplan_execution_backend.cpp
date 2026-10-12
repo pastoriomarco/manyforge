@@ -457,16 +457,12 @@ natural_completion_before_stage(const core::MotionInterruptStopProfileDTO &profi
   return result;
 }
 
-std::optional<std::int64_t>
-remaining_phase(const core::RemainingStopBudgetDTO &budget,
-                const core::StopBudgetPhaseId &phase_id) {
-  const auto found = std::find_if(
-      budget.phases.begin(), budget.phases.end(),
-      [&](const auto &phase) { return phase.phase_id == phase_id; });
-  return found == budget.phases.end()
-             ? std::nullopt
-             : std::optional(found->remaining_deadline_offset_ns);
-}
+/// Q51/Q57: the native lane's bound on one hard stage (and on a controlled
+/// stage without its own deadline), as `main`'s bounded native drain
+/// (`kExecutionDrainTimeoutS`); a controlled stage uses this robot's own
+/// controlled deadline handed by the Kernel.
+constexpr std::int64_t kNativeHardStopCompletionNs =
+    static_cast<std::int64_t>(core::kExecutionDrainTimeoutS * 1e9);
 
 } // namespace
 
@@ -1688,10 +1684,12 @@ RoboPlanExecutionBackend::TranslateStopStage(
   if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
       budget.stop_id != stage.stop_id ||
       budget.stop_generation != stage.stop_generation ||
-      budget.remaining_outer_duration_ns <= 0) {
+      budget.elapsed_since_stop_ns < 0 ||
+      (budget.remaining_controlled_deadline_ns.has_value() &&
+       *budget.remaining_controlled_deadline_ns <= 0)) {
     return terminal_stop_stage_failure(
         stage, "resolved_stop_stage_budget_invalid",
-        "native Stop stage has no valid remaining Kernel budget");
+        "native Stop stage has no valid per-robot Stop timing");
   }
   const auto retained_binding = binding_.load(std::memory_order_acquire);
   const auto &binding = retained_binding->value();
@@ -1705,8 +1703,9 @@ RoboPlanExecutionBackend::TranslateStopStage(
   const auto &prepared_command =
       stage.participant_stop_plan.stage_commands[stage.stage_index];
   const auto &command = prepared_command.resolved_stage;
-  const auto command_remaining =
-      remaining_phase(budget, command.containment_command.command_phase_id);
+  // Q51/Q57: this robot's own bound for the stage.
+  const std::optional<std::int64_t> command_remaining =
+      budget.remaining_controlled_deadline_ns.value_or(kNativeHardStopCompletionNs);
   if (stage.resources != exact_resources ||
       stage.control_domain_id != path.control_domain_id ||
       stage.control_domain_revision != path.control_domain_revision ||
@@ -2003,19 +2002,11 @@ RoboPlanExecutionBackend::TranslateStopStage(
   // Anchor observations after the selected command has returned acceptance.
   // This deliberately excludes a terminal sample emitted before that return.
   const auto command_accepted_at_ns = clock_.now();
-  const auto terminal_phase = std::min_element(
-      command.evidence_requirements.begin(),
-      command.evidence_requirements.end(),
-      [&](const auto &left, const auto &right) {
-        return remaining_phase(budget, left.requirement.phase_id).value_or(-1) <
-               remaining_phase(budget, right.requirement.phase_id).value_or(-1);
-      });
-  if (terminal_phase == command.evidence_requirements.end()) {
+  if (command.evidence_requirements.empty()) {
     return fail_after_dispatch("stop_evidence_requirements_missing",
                                "native Stop stage has no evidence contract");
   }
-  const auto evidence_remaining =
-      remaining_phase(budget, terminal_phase->requirement.phase_id);
+  const auto evidence_remaining = command_remaining;
   if (!evidence_remaining.has_value() || *evidence_remaining <= 0 ||
       started_at >
           std::numeric_limits<std::int64_t>::max() - *evidence_remaining) {

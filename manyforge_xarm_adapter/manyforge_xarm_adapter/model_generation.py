@@ -59,7 +59,7 @@ def apply_manyforge_jtc_qualification(
     controller_payload: dict[str, Any],
     profile: Lite6Profile,
 ) -> dict[str, Any]:
-    """Add the ManyForge-only cancel contract to generated xArm parameters."""
+    """Apply position-only JTC claims and the existing cancel contract."""
     qualified = deepcopy(controller_payload)
     resolved = compile_lite6_binding(
         Lite6BindingInputs(
@@ -98,6 +98,7 @@ def apply_manyforge_jtc_qualification(
         raise ValueError(
             'generated controller joints disagree with the Lite6 profile'
         )
+    parameters['command_interfaces'] = ['position']
     constraints = parameters.get('constraints')
     if not isinstance(constraints, dict):
         raise ValueError(

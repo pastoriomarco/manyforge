@@ -12,6 +12,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(action_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -47,6 +48,7 @@ ament_target_dependencies(manyforge_ros2_control_execution
   rclcpp
   rclcpp_action
   control_msgs
+  action_msgs
   controller_manager_msgs
   lifecycle_msgs
   sensor_msgs
@@ -90,13 +92,5 @@ if(BUILD_TESTING)
       manyforge_ros2_control_execution GTest::gtest_main)
     gtest_discover_tests(test_ros2_gripper_command_backend)
 
-    # WS8 hot-path qualification probe. This executable is intentionally not a
-    # ctest case: unit tests prove behavior, while
-    # scripts/run-ros2-control-hot-path-qualification.sh runs this probe in a
-    # release build and emits archival JSON allocation/latency evidence.
-    add_executable(perf_ros2_control_hot_paths
-      test/perf/perf_ros2_control_hot_paths.cpp)
-    target_link_libraries(perf_ros2_control_hot_paths PRIVATE
-      manyforge_ros2_control_execution)
   endif()
 endif()

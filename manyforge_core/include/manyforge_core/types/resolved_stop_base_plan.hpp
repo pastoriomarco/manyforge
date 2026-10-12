@@ -161,7 +161,6 @@ struct ResolvedStopBasePlanDTO final {
   StopEvidencePolicyId stop_evidence_policy_id;
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
-  StopDeadlineBudgetDTO deadline_budget;
   std::vector<ResolvedStopEscalationStageDTO> escalation_stages;
 
   friend bool operator==(const ResolvedStopBasePlanDTO&, const ResolvedStopBasePlanDTO&) = default;

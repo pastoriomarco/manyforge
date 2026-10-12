@@ -37,6 +37,19 @@ resolve_verified_stop_base_plan(
       active_configuration, participant_binding);
 }
 
+/// Q48: the deployment-authored controlled (operator) Stop per-resource
+/// maximum deceleration of one participant's retained route, read from the
+/// retained control-domain product without an active configuration. The
+/// activation-time controller configuration of the offline mock lane uses it
+/// as each joint's `max_deceleration_on_cancel`. Fails closed when the route
+/// has no stoppable plan with exactly one motion-controlled Stop stage that
+/// bounds every participant resource.
+[[nodiscard]] std::vector<std::pair<core::ResourceId, double>>
+retained_controlled_stop_max_deceleration_rad_s2(
+    const RetainedBundle &retained_bundle,
+    const IVerifiedRetainedProductArtifactSource &artifact_source,
+    const core::RuntimeParticipantBinding &participant_binding);
+
 /// Persist and independently reload one resolved plan before publishing the
 /// sealed readiness value consumed by Kernel Prepare. A repository failure or
 /// any readback disagreement fails closed; the input plan is never returned as

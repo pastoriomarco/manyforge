@@ -97,20 +97,9 @@ def test_stop_validation_and_distinct_full_stop_are_public() -> None:
     )
 
 
-def test_stop_acceptance_exposes_exact_participant_qualified_budget() -> None:
-    phase = mf.StopAcceptedPhaseBudgetDTO(
-        phase_id=mf.StopBudgetPhaseId("phase.command"),
-        fixed_deadline_offset_ns=250,
-        remaining_deadline_offset_ns=50,
-    )
-    participant = mf.StopAcceptedParticipantBudgetDTO(
-        origin_stop_id=mf.StopId("stop.1"),
-        origin_stop_generation=mf.StopGeneration(8),
-        operation_id=mf.OperationId("operation.1"),
-        participant_id=mf.OperationParticipantId("participant.1"),
-        participant_stop_invocation_plan_digest=mf.ContentDigest("sha256:" + "3" * 64),
-        phases=[phase],
-    )
+def test_stop_acceptance_carries_no_shared_stop_budget() -> None:
+    # Q51: each robot's Stop deadlines come from its own profile at Stop time;
+    # the acceptance carries only its time.
     affected = mf.StopAffectedOperationRevisionDTO(
         operation_id=mf.OperationId("operation.1"),
         operation_revision_after_acceptance=mf.OperationRevision(4),
@@ -127,22 +116,24 @@ def test_stop_acceptance_exposes_exact_participant_qualified_budget() -> None:
         captured_scope_digest=mf.ContentDigest("sha256:" + "2" * 64),
         joined_predecessor_stops=[],
         affected_operation_revisions=[affected],
-        fixed_outer_duration_ns=1_000,
-        fixed_kernel_completion_reserve_ns=100,
-        remaining_outer_duration_ns=800,
         accepted_at_ns=8_000_000_000,
-        participant_budget_allocations=[participant],
     )
     assert accepted.field_error() is None
     assert accepted.accepted_at_ns == 8_000_000_000
     assert accepted.affected_operation_revisions == [affected]
     assert accepted.joined_predecessor_stops == []
-    assert accepted.participant_budget_allocations[0].origin_stop_id == mf.StopId("stop.1")
-    assert accepted.participant_budget_allocations == [participant]
-    assert accepted.participant_budget_allocations[0].phases == [phase]
+    for removed in (
+        "fixed_outer_duration_ns",
+        "fixed_kernel_completion_reserve_ns",
+        "remaining_outer_duration_ns",
+        "participant_budget_allocations",
+    ):
+        assert not hasattr(accepted, removed)
+    assert not hasattr(mf, "StopAcceptedPhaseBudgetDTO")
+    assert not hasattr(mf, "StopAcceptedParticipantBudgetDTO")
 
     with pytest.raises(AttributeError):
-        accepted.remaining_outer_duration_ns = 900
+        accepted.accepted_at_ns = 900
 
 
 def test_resolved_stop_base_plan_golden_is_shared_exactly_with_cpp() -> None:
@@ -158,10 +149,10 @@ def test_resolved_stop_base_plan_golden_is_shared_exactly_with_cpp() -> None:
 
     plan_id = mf.verify_resolved_stop_base_plan_canonical_bytes(canonical_bytes)
     assert plan_id == mf.ResolvedStopBasePlanId(
-        "sha256:ba4b37bfaa312d688ea229a4ba4d516fd2a519c3a9dc82e43e275366769a367a"
+        "sha256:840a16b6b0860f5e838d109bd327685a8d354d48f119f493d6635101c693f0d5"
     )
     assert hashlib.sha256(canonical_bytes).hexdigest() == (
-        "6580fa0212890c5f6714fffc367c7f2488e893e016acae5e7e68993458b0e819"
+        "896dc7ef6c85eefeec67231a7b490889db491480448939b6bc4ee34036f48515"
     )
 
     with pytest.raises(ValueError):

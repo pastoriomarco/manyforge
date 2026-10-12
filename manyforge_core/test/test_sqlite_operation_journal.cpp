@@ -173,7 +173,6 @@ class ScopedTemporaryDirectory final {
       StopId(std::move(stop_id)),
       StopGeneration(stop_generation),
       accepted_at_ns,
-      accepted_at_ns + 1'000'000'000,
       disposition,
       Digest('b'),
       EmergencyStopEntryStateDTO::kActive,
@@ -208,26 +207,10 @@ class ScopedTemporaryDirectory final {
       intent);
 
   std::vector<StopAffectedOperationRevisionDTO> affected_operations;
-  std::vector<StopAcceptedParticipantBudgetDTO> participant_budgets;
   affected_operations.reserve(affected_state.operations.size());
   for (const auto& operation : affected_state.operations) {
     affected_operations.push_back({operation.operation_id, operation.operation_revision});
-    for (const auto& participant : operation.participants) {
-      participant_budgets.push_back(StopAcceptedParticipantBudgetDTO{
-          acceptance.stop_id,
-          acceptance.stop_generation,
-          operation.operation_id,
-          participant.participant_id,
-          Digest('d'),
-          {StopAcceptedPhaseBudgetDTO{StopBudgetPhaseId("phase.stop"), 900'000'000, 900'000'000}}});
-    }
   }
-  std::sort(participant_budgets.begin(), participant_budgets.end(),
-            [](const auto& left, const auto& right) {
-              return std::tie(left.operation_id, left.participant_id) <
-                     std::tie(right.operation_id, right.participant_id);
-            });
-  const auto remaining = acceptance.outer_deadline_ns - acceptance.accepted_at_ns;
   return StopAcceptedDTO{
       acceptance.request_id,
       acceptance.replay_status,
@@ -240,11 +223,7 @@ class ScopedTemporaryDirectory final {
       acceptance.captured_scope_digest,
       {},
       std::move(affected_operations),
-      1'000'000'000,
-      100'000'000,
-      remaining,
       acceptance.accepted_at_ns,
-      std::move(participant_budgets),
   };
 }
 
@@ -499,15 +478,15 @@ TEST(SqliteOperationJournalTest, ExactLongServiceTimesSurviveOperationStopAndRes
   }
 }
 
-TEST(SqliteOperationJournalTest, V9ThroughV11CutoverPreservesHistoricalPayloadBytesAndDigests) {
-  for (const int version : {9, 10, 11}) {
+TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched) {
+  // Q51/Q53: journals written before the per-robot Stop timing format are
+  // refused, never converted, and their bytes stay as they were.
+  for (const int version : {9, 10, 11, 12, 13}) {
     SCOPED_TRACE(version);
     ScopedTemporaryDirectory directory;
     const auto database = directory.path() / "journal.sqlite3";
     const CellId cell("cell.test");
     const RequestOwnerEpoch epoch("owner.original");
-    std::string original_payload;
-    std::string original_digest;
     {
       SqliteOperationJournal journal(database, cell);
       ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 16U, {}).ok());
@@ -515,44 +494,48 @@ TEST(SqliteOperationJournalTest, V9ThroughV11CutoverPreservesHistoricalPayloadBy
       const auto command = CommandIntent("request.legacy", epoch.value());
       ASSERT_TRUE(
           journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
-      // The v9 writer admitted records up to 64 MiB, larger than the shared
-      // canonical parser's 16 MiB default. Exercise actual admission, not a
-      // directly fabricated SQLite payload, across the format-only migration.
-      state.operation_revision = OperationRevision(2U);
-      const std::string retained_reason(17U * 1024U * 1024U, 'x');
-      ASSERT_TRUE(
-          journal.RecordOperationState(epoch, state, nullptr, retained_reason.c_str()).ok());
-      const auto page = journal.ReadEvents(epoch, 1U);
-      ASSERT_TRUE(page.ok());
-      original_payload = page.value().events.front().payload_json;
-      original_digest = page.value().events.front().payload_digest;
     }
-    // Reconstruct the actual v9 table shape; retain its original payload bytes.
     sqlite3* legacy = nullptr;
     ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
-    const auto legacy_schema =
-        std::string(
-            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
-            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
-            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
-            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
-            "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
-            "ALTER TABLE operation_participants DROP COLUMN execution_node_instance_id;"
-            "ALTER TABLE operation_participants DROP COLUMN execution_node_attempt_id;") +
-        (version < 11 ? "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;" : "") +
-        "PRAGMA user_version=" + std::to_string(version) +
-        "; UPDATE journal_metadata SET schema_version=" + std::to_string(version) +
-        ",schema_id='manyforge.internal.execution.operation-journal.o1.5.v" +
-        std::to_string(version) + "' WHERE singleton=1;";
-    const auto downgraded = sqlite3_exec(legacy, legacy_schema.c_str(), nullptr, nullptr, nullptr);
+    const auto downgrade = "PRAGMA user_version=" + std::to_string(version) +
+                           "; UPDATE journal_metadata SET schema_version=" +
+                           std::to_string(version) +
+                           ",schema_id='manyforge.internal.execution.operation-journal.o1.5.v" +
+                           std::to_string(version) + "' WHERE singleton=1;";
+    ASSERT_EQ(sqlite3_exec(legacy, downgrade.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    const auto retained = [&]() {
+      sqlite3_stmt* row = nullptr;
+      if (sqlite3_prepare_v2(legacy,
+                             "SELECT schema_id,schema_version,payload_json,payload_digest "
+                             "FROM journal_metadata CROSS JOIN journal_records",
+                             -1, &row, nullptr) != SQLITE_OK ||
+          sqlite3_step(row) != SQLITE_ROW) {
+        sqlite3_finalize(row);
+        throw std::runtime_error("test evidence query failed");
+      }
+      std::vector<std::string> values;
+      for (int column = 0; column < 4; ++column) {
+        values.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(row, column)));
+      }
+      sqlite3_finalize(row);
+      return values;
+    };
+    const auto before = retained();
+    try {
+      SqliteOperationJournal refused(database, cell);
+      ADD_FAILURE() << "an earlier journal format was opened";
+    } catch (const std::runtime_error& error) {
+      EXPECT_NE(std::string(error.what()).find("per-robot Stop timing format"), std::string::npos)
+          << error.what();
+    }
+    EXPECT_EQ(retained(), before);
+    sqlite3_stmt* user_version = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(legacy, "PRAGMA user_version", -1, &user_version, nullptr),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(user_version), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(user_version, 0), version);
+    sqlite3_finalize(user_version);
     sqlite3_close(legacy);
-    ASSERT_EQ(downgraded, SQLITE_OK);
-    SqliteOperationJournal upgraded(database, cell);
-    const auto page = upgraded.ReadEvents(epoch, 1U);
-    ASSERT_TRUE(page.ok()) << page.error().message;
-    ASSERT_EQ(page.value().events.size(), 1U);
-    EXPECT_EQ(page.value().events.front().payload_json, original_payload);
-    EXPECT_EQ(page.value().events.front().payload_digest, original_digest);
   }
 }
 
@@ -1419,9 +1402,7 @@ TEST(SqliteOperationJournalTest,
     acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(intent).value();
     auto accepted = StopAcceptedProjection(acceptance, projected_intent, affected_state);
     accepted.joined_predecessor_stops.push_back(StopPredecessorAcceptanceRefDTO{
-        predecessor_stop_id, StopGeneration(1U), Digest('e'), 1'000'000'000});
-    accepted.participant_budget_allocations.front().origin_stop_id = predecessor_stop_id;
-    accepted.participant_budget_allocations.front().origin_stop_generation = StopGeneration(1U);
+        predecessor_stop_id, StopGeneration(1U), Digest('e')});
     const auto projected =
         journal.RecordStopAccepted(epoch, acceptance, projected_intent, accepted, affected_state);
     ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kRecorded);
@@ -1442,8 +1423,6 @@ TEST(SqliteOperationJournalTest,
     EXPECT_NE(event.payload_json.find("\"intent_kind\":\"full_stop\""), std::string::npos);
     EXPECT_NE(event.payload_json.find("\"joined_predecessor_stops\":[{"), std::string::npos);
     EXPECT_NE(event.payload_json.find(predecessor_stop_id.value()), std::string::npos);
-    EXPECT_NE(event.payload_json.find("\"origin_stop_id\":\"" + predecessor_stop_id.value() + "\""),
-              std::string::npos);
     EXPECT_NE(event.payload_json.find("\"operation_id\":\"operation:1\""), std::string::npos);
     EXPECT_NE(event.payload_json.find("\"operation_id\":\"operation:2\""), std::string::npos);
     journal.Close();

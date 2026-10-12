@@ -54,7 +54,6 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
-#include <manyforge_deployment/retained_stop_deadline_budget.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -74,9 +73,10 @@
 #include <manyforge_roboplan/retained_native_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+#include <manyforge_roboplan/controller_launch_artifacts.hpp>
+#include <manyforge_roboplan/controller_launch_process.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include "managed_ros2_component_installation.hpp"
-#include <manyforge_roboplan/retained_ros2_control_admission_owner.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #endif
@@ -94,6 +94,7 @@
 #include <optional>
 #include <roboplan/core/scene.hpp>
 #include <set>
+#include <fstream>
 #include <shared_mutex>
 #include <span>
 #include <sstream>
@@ -111,6 +112,7 @@
 
 #include "cell_admission_command_codec.hpp"
 #include "kernel_apply_fence_rpc_internal.hpp"
+#include "execution_motion_target_limits_internal.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "managed_projection_registry.hpp"
 #include "manager_liveness_rpc_internal.hpp"
@@ -3320,41 +3322,9 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
              predecessor.predecessor_stop_generation.value()))},
         {"predecessor_stop_id",
          CanonicalValue(predecessor.predecessor_stop_id.value())},
-        {"remaining_outer_duration_ns_at_join",
-         CanonicalValue(static_cast<double>(
-             predecessor.remaining_outer_duration_ns_at_join))},
     });
   }
 
-  CanonicalValue::Array participant_budgets;
-  participant_budgets.reserve(value.participant_budget_allocations.size());
-  for (const auto &participant : value.participant_budget_allocations) {
-    CanonicalValue::Array phases;
-    phases.reserve(participant.phases.size());
-    for (const auto &phase : participant.phases) {
-      phases.emplace_back(CanonicalValue::Object{
-          {"fixed_deadline_offset_ns",
-           manyforge::content_identity::nonnegative_int64_value(
-               phase.fixed_deadline_offset_ns)},
-          {"phase_id", CanonicalValue(phase.phase_id.value())},
-          {"remaining_deadline_offset_ns",
-           CanonicalValue(
-               static_cast<double>(phase.remaining_deadline_offset_ns))},
-      });
-    }
-    participant_budgets.emplace_back(CanonicalValue::Object{
-        {"operation_id", CanonicalValue(participant.operation_id.value())},
-        {"origin_stop_generation",
-         CanonicalValue(
-             static_cast<double>(participant.origin_stop_generation.value()))},
-        {"origin_stop_id", CanonicalValue(participant.origin_stop_id.value())},
-        {"participant_id", CanonicalValue(participant.participant_id.value())},
-        {"participant_stop_invocation_plan_digest",
-         CanonicalValue(
-             participant.participant_stop_invocation_plan_digest.value())},
-        {"phases", CanonicalValue(std::move(phases))},
-    });
-  }
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
                              value.accepted_at_ns)},
@@ -3362,18 +3332,7 @@ StopAcceptedValue(const core::StopAcceptedDTO &value) {
        CanonicalValue(std::move(affected_operations))},
       {"captured_scope_digest",
        CanonicalValue(value.captured_scope_digest.value())},
-      {"fixed_kernel_completion_reserve_ns",
-       CanonicalValue(
-           static_cast<double>(value.fixed_kernel_completion_reserve_ns))},
-      {"fixed_outer_duration_ns",
-       manyforge::content_identity::nonnegative_int64_value(
-           value.fixed_outer_duration_ns)},
       {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
-      {"participant_budget_allocations",
-       CanonicalValue(std::move(participant_budgets))},
-      {"remaining_outer_duration_ns",
-       manyforge::content_identity::nonnegative_int64_value(
-           value.remaining_outer_duration_ns)},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
@@ -6546,7 +6505,10 @@ struct Composition final {
       cclc_provider_manifest_source;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
-  std::string ros2_control_binding_contract_generation_id;
+  std::shared_ptr<ControllerLaunchProcess> controller_process;
+  std::string controller_request_context;
+  std::optional<ControllerLaunchSupervisor::Ensured> prepared_controller_launch;
+  bool controller_launch_adopted{};
   std::unique_ptr<RetainedRos2ControlLifecycleProduct> cclc_lifecycle_product;
 #else
   std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
@@ -6563,10 +6525,26 @@ struct Composition final {
   std::atomic_bool cclc_attached{false};
   std::atomic_bool route_recovery_pending{false};
   std::vector<std::unique_ptr<Composition>> participant_compositions;
+
+  ~Composition() {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  std::unique_ptr<RetainedRos2ControlAdmissionOwner>
-      ros2_control_admission_owner;
+    if (prepared_controller_launch && !controller_launch_adopted)
+      static_cast<void>(host_controller_launch_supervisor().discard_candidate(
+          *prepared_controller_launch));
 #endif
+  }
+
+  // A failed fence keeps engine/runtime pins, but its uninstalled process
+  // has no active owner. Borrowed and already-adopted launches remain owned.
+  void discard_unadopted_controller_launches() {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    if (prepared_controller_launch && !controller_launch_adopted)
+      static_cast<void>(host_controller_launch_supervisor().discard_candidate(
+          *prepared_controller_launch));
+    for (auto &peer : participant_compositions)
+      peer->discard_unadopted_controller_launches();
+#endif
+  }
 
   [[nodiscard]] core::ResourceAddressedExecutionKernel *
   active_addressed_kernel() const noexcept {
@@ -6651,7 +6629,6 @@ struct Composition final {
             std::move(selected_status_gripper_target_role_id)) {}
 };
 
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 [[nodiscard]] std::map<core::ControllableComponentId, const Composition *>
 IndexNativeComponentCompositions(const Composition &cell) {
   std::map<core::ControllableComponentId, const Composition *> result;
@@ -6672,6 +6649,20 @@ IndexNativeComponentCompositions(const Composition &cell) {
   }
   return result;
 }
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+[[nodiscard]] std::optional<std::string> RetainedControllerLaunchExit(
+    const std::shared_ptr<ControllerLaunchProcess> &process) {
+  if (!process)
+    return std::nullopt;
+  const auto reason = process->exited();
+  if (!reason)
+    return std::nullopt;
+  const auto evidence = process->exit_evidence();
+  return *reason + " pid=" + std::to_string(process->pid()) +
+         (evidence ? " observed_utc=" + evidence->observed_utc : "");
+}
+#endif
 
 void VerifyRetainedNativePredecessors(
     const Composition *active,
@@ -6696,6 +6687,13 @@ void VerifyRetainedNativePredecessors(
     if (is_retained) {
       Require(current != components.end(),
               "native Apply cannot retain a component without its live owner");
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      // Scoped component bring-up owns crash recovery. Retain never restarts
+      // a launch or clears its incident.
+      detail::RefuseExitedRos2Retain(
+          row.controllable_component_id,
+          RetainedControllerLaunchExit(current->second->controller_process));
+#endif
     } else if (row.disposition ==
                deployment::ApplyComponentDisposition::kAdd) {
       Require(current == components.end(),
@@ -6813,7 +6811,7 @@ ReadNativeInstalledComponentReceipts(
                             ? std::map<core::ControllableComponentId,
                                        const Composition *>{}
                             : IndexNativeComponentCompositions(*predecessor);
-  const bool product_changed =
+  [[maybe_unused]] const bool product_changed =
       request.predecessor_projection_revision.retained_bundle_id !=
           request.candidate_projection_revision.retained_bundle_id ||
       request.predecessor_projection_revision.graph_revision !=
@@ -6856,7 +6854,7 @@ ReadNativeInstalledComponentReceipts(
     }
     Require(has_component_registration,
             "native installed component has no runtime participant registrations");
-    std::vector<core::RuntimeUnitEpochBindingDTO> epochs{
+    [[maybe_unused]] std::vector<core::RuntimeUnitEpochBindingDTO> epochs{
         {request.runtime_unit_id, request.runtime_epoch}};
     const bool retained =
         row.disposition == deployment::ApplyComponentDisposition::kRetain;
@@ -6868,6 +6866,23 @@ ReadNativeInstalledComponentReceipts(
                            predecessor_owner->second->component_runtime_identity() !=
                                installed->second->component_runtime_identity(),
             "native component receipt disagrees with controller lifetime");
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    const auto &view = *installed->second;
+    Require(view.runtime != nullptr &&
+                view.ros2_control_runtime_handle != nullptr,
+            "ROS installed receipt has no owned runtime handle");
+    auto receipt = detail::ReadRos2ComponentReceipt(
+        request, component_id, *runtime_identity,
+        *view.ros2_control_runtime_handle, view.runtime->execution.get(),
+        view.runtime->gripper.get(), view.runtime->motion_binding,
+        view.runtime->gripper_binding, view.component_registrations(),
+        view.runtime->participant_engine_for(true),
+        view.runtime->participant_engine_for(false),
+        predecessor_owner == previous.end()
+            ? nullptr
+            : predecessor_owner->second->ros2_control_runtime_handle.get(),
+        RetainedControllerLaunchExit(view.controller_process));
+#else
     component_manager::ManagerRuntimeComponentReceiptDTO receipt{
         row.controllable_component_id,
         row.disposition,
@@ -6875,6 +6890,7 @@ ReadNativeInstalledComponentReceipts(
         std::move(epochs),
         retained,
         retained && product_changed};
+#endif
     Require(receipt.valid(), "native component receipt is invalid");
     receipts.push_back(std::move(receipt));
   }
@@ -6882,7 +6898,6 @@ ReadNativeInstalledComponentReceipts(
           "native installed component receipts differ from the Apply decision");
   return receipts;
 }
-#endif
 
 [[maybe_unused]] void
 AttachProductPickPlacePlanningOwner(Composition &composition) {
@@ -7007,6 +7022,171 @@ void RunManagedExecutionCommandSurface(ManagedExecutionSurfaceControl &control,
 void PreemptManagedExecutionSurfacePlanning(
     ManagedExecutionSurfaceControl &control) noexcept;
 
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+[[nodiscard]] std::shared_ptr<const CanonicalValue>
+ControllerLaunchIncidentSnapshot(ControllerLaunchProcess &process,
+                                 const ControllerLaunchExitEvidence &exit,
+                                 const deployment::RetainedBundle &bundle,
+                                 const std::string &runtime_id,
+                                 const std::string &runtime_epoch) {
+  const auto optional_text = [](const std::optional<std::string> &value) {
+    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
+  };
+  const auto optional_bool = [](const std::optional<bool> value) {
+    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
+  };
+  const auto optional_number = [](const std::optional<int> value) {
+    return value ? CanonicalValue(static_cast<double>(*value))
+                 : CanonicalValue(nullptr);
+  };
+  const auto unsigned_value = [](const std::uint64_t value) {
+    return value <= 9'007'199'254'740'991ULL
+               ? CanonicalValue(static_cast<double>(value))
+               : CanonicalValue(std::to_string(value));
+  };
+  auto output = process.output_snapshot();
+  std::uint64_t invalid_text_bytes{};
+  const bool escaped_tail = !content_identity::is_utf8_nfc(output.tail);
+  if (escaped_tail) {
+    // Preserve otherwise unrepresentable bytes as reversible ASCII escapes.
+    // Valid NFC UTF8 takes the unchanged path above.
+    constexpr char hex[] = "0123456789abcdef";
+    std::string escaped;
+    for (const auto byte : output.tail) {
+      if (static_cast<unsigned char>(byte) >= 0x80U) {
+        const auto value = static_cast<unsigned char>(byte);
+        escaped += "\\x";
+        escaped += hex[value >> 4U];
+        escaped += hex[value & 0x0fU];
+        ++invalid_text_bytes;
+      } else if (byte == '\\') {
+        escaped += "\\\\";
+      } else {
+        escaped += byte;
+      }
+    }
+    output.tail = std::move(escaped);
+  }
+  // Keep the most recent text. JSON escaping counts against the approved
+  // encoded-byte cap; every trim boundary preserves a UTF8 codepoint or a
+  // complete generated ASCII escape token.
+  auto encoded = content_identity::canonical_json(CanonicalValue(output.tail));
+  if (encoded.size() > 128U * 1024U) {
+    const auto encoded_byte = [](const unsigned char byte) -> std::size_t {
+      if (byte == '\b' || byte == '\t' || byte == '\n' || byte == '\f' ||
+          byte == '\r' || byte == '"' || byte == '\\')
+        return 2U;
+      return byte < 0x20U ? 6U : 1U;
+    };
+    auto remaining = encoded.size();
+    std::size_t removed{};
+    while (remaining > 128U * 1024U && removed < output.tail.size()) {
+      const auto token_bytes =
+          escaped_tail && output.tail[removed] == '\\'
+              ? (output.tail[removed + 1U] == 'x' ? 4U : 2U)
+              : 1U;
+      const auto token_end = removed + token_bytes;
+      while (removed < token_end)
+        remaining -=
+            encoded_byte(static_cast<unsigned char>(output.tail[removed++]));
+    }
+    while (removed < output.tail.size() &&
+           (static_cast<unsigned char>(output.tail[removed]) & 0xC0U) == 0x80U)
+      ++removed;
+    output.tail.erase(0U, removed);
+    output.truncated = true;
+  }
+  const auto line_count =
+      output.tail.empty() ? 0U
+                          : static_cast<std::size_t>(std::count(
+                                output.tail.begin(), output.tail.end(), '\n')) +
+                                (output.tail.back() == '\n' ? 0U : 1U);
+  const auto &command = process.command();
+  CanonicalValue::Array argv;
+  for (const auto &argument : command.argv)
+    argv.emplace_back(argument);
+  const ControllerLaunchReadinessEvidence unknown;
+  const auto &readiness = exit.readiness ? *exit.readiness : unknown;
+  const auto configuration =
+      deployment::ros2_control_execution_runtime_contract::
+          component_configuration_projection(
+              bundle, core::RuntimeUnitId(runtime_id),
+              core::ControllableComponentId(exit.controllable_component_id));
+  auto snapshot = std::make_shared<const CanonicalValue>(CanonicalValue::Object{
+      {"exit", CanonicalValue(CanonicalValue::Object{
+                   {"status", optional_number(exit.exit_status)},
+                   {"signal", optional_number(exit.signal)},
+                   {"core_dumped", CanonicalValue(exit.core_dumped)},
+                   {"observed_utc", CanonicalValue(exit.observed_utc)}})},
+      {"context",
+       CanonicalValue(CanonicalValue::Object{
+           {"component_id", CanonicalValue(exit.controllable_component_id)},
+           {"request_context", CanonicalValue(exit.request_context)},
+           {"runtime_unit_id", CanonicalValue(runtime_id)},
+           {"runtime_epoch", CanonicalValue(runtime_epoch)},
+           {"bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
+           {"graph_revision",
+            CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+           {"generator_identity", CanonicalValue(nullptr)},
+           {"launch_identity", CanonicalValue(exit.launch_identity)}})},
+      {"readiness",
+       CanonicalValue(CanonicalValue::Object{
+           {"known", optional_bool(readiness.known)},
+           {"controller_manager_present",
+            optional_bool(readiness.controller_manager_present)},
+           {"controller_observed",
+            optional_bool(readiness.controller_observed)},
+           {"controller_loaded", optional_bool(readiness.controller_loaded)},
+           {"controller_bound", optional_bool(readiness.controller_bound)},
+           {"arm_controller_active",
+            optional_bool(readiness.arm_controller_active)},
+           {"hardware_ready", optional_bool(readiness.hardware_ready)},
+           {"joint_sample_available",
+            optional_bool(readiness.joint_sample_available)},
+           {"binding_epoch", readiness.binding_epoch
+                                 ? unsigned_value(*readiness.binding_epoch)
+                                 : CanonicalValue(nullptr)},
+           {"sample_age_ns", readiness.sample_age_ns
+                                 ? content_identity::nonnegative_int64_value(
+                                       *readiness.sample_age_ns)
+                                 : CanonicalValue(nullptr)},
+           {"captured_utc", readiness.captured_utc.empty()
+                                ? CanonicalValue(nullptr)
+                                : CanonicalValue(readiness.captured_utc)}})},
+      {"settings",
+       CanonicalValue(CanonicalValue::Object{
+           {"argv", CanonicalValue(std::move(argv))},
+           {"controller_profile", CanonicalValue(command.controller_profile)},
+           {"runtime_namespace", CanonicalValue(command.runtime_namespace)},
+           {"arm_controller_name", CanonicalValue(command.arm_controller_name)},
+           {"gripper_controller_name",
+            optional_text(command.gripper_controller_name)},
+           {"frame_prefix", CanonicalValue(command.frame_prefix)},
+           {"controllers_yaml", CanonicalValue(command.controllers_yaml)},
+           {"retained_configuration_json",
+            CanonicalValue(content_identity::canonical_json(configuration))}})},
+      {"generated",
+       CanonicalValue(CanonicalValue::Object{
+           {"robot_description_sha256",
+            CanonicalValue(exit.robot_description_sha256)},
+           {"controllers_sha256", CanonicalValue(exit.controllers_sha256)}})},
+      {"output",
+       CanonicalValue(CanonicalValue::Object{
+           {"tail", CanonicalValue(std::move(output.tail))},
+           {"line_count", CanonicalValue(static_cast<double>(line_count))},
+           {"truncated", CanonicalValue(output.truncated)},
+           {"dropped_forward_lines",
+            unsigned_value(output.dropped_forward_lines)},
+           {"dropped_forward_bytes",
+            unsigned_value(output.dropped_forward_bytes)},
+           {"invalid_text_bytes", unsigned_value(invalid_text_bytes)}})},
+      {"core_dump_link", CanonicalValue(nullptr)}});
+  Require(core::ComponentIncidentDiagnosticSnapshotShapeIsValid(*snapshot),
+          "controller launch incident snapshot exceeded its closed bound");
+  return snapshot;
+}
+#endif
+
 struct RetainedNativeComponentSnapshot final {
   std::shared_ptr<RetainedNativeRuntime> runtime;
   std::shared_ptr<RetainedNativeGripperRuntime> gripper_runtime;
@@ -7017,6 +7197,10 @@ struct RetainedNativeComponentSnapshot final {
   CanonicalValue motion_descriptor;
   CanonicalValue gripper_descriptor;
   std::optional<core::Duration> operator_confirmation_validity_ns;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
+  std::shared_ptr<ControllerLaunchProcess> controller_process;
+#endif
 };
 
 struct CompositionBuildInput final {
@@ -7068,6 +7252,7 @@ struct CompositionBuildInput final {
   // Manager-opened scene-asset root (managed FD 9), shared by the collision
   // model and the candidate worker. Absent: relative scene meshes fail closed.
   std::optional<int> scene_asset_root_fd{};
+  std::string controller_request_context{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -7773,8 +7958,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
                         }),
             "retained native state channel mixes model and local resources");
     state_sources.push_back(RetainedSceneFrameStateSourceInput{
-        channel->query_context(),
-        core::ObservedStateSourceKind::kPredictedState,
+        channel->query_context(), channel->source_kind(),
         std::shared_ptr<const core::IObservedStateProvider>(
             channel, channel->addressed_publication())});
   };
@@ -7831,6 +8015,14 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       predecessor->second.runtime, std::move(input.projection_revision),
       input.publication_generation, std::move(*physical.status_motion_role),
       physical.status_gripper_role);
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  Require(predecessor->second.ros2_control_runtime_handle != nullptr,
+          "retained ROS component has no physical handle owner");
+  composition->ros2_control_runtime_handle =
+      predecessor->second.ros2_control_runtime_handle;
+  composition->controller_process = predecessor->second.controller_process;
+  composition->controller_request_context = input.controller_request_context;
+#endif
   composition->candidate_planner_model = std::move(candidate_planner_model);
   composition->candidate_model_generation =
       std::move(candidate_model_generation);
@@ -8214,9 +8406,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           direct_control_motion_binding.value().value().controllable_component_id);
 #endif
   std::optional<double> deployment_motion_target_limit;
-  std::vector<std::pair<core::ControllableComponentId,
-                        core::CommandTargetId>> expected_motion_limits;
-  expected_motion_limits.reserve(direct_control_inventory.motion.size());
+  std::vector<core::ControlBindingDTO> motion_limit_bindings;
+  motion_limit_bindings.reserve(direct_control_inventory.motion.size());
   for (const auto &binding : direct_control_inventory.motion) {
     const auto target = deployment::resolve_runtime_program_target(
         *binding,
@@ -8224,15 +8415,15 @@ BuildSingleProductComposition(CompositionBuildInput input) {
             std::string(deployment::kDirectControlTargetRoleId)),
         core::CapabilityId("execution.trajectory.execute"), *input.bundle,
         input.model_map);
-    if (target.component().controllable_component_id !=
-        direct_control_motion_binding.value().value().controllable_component_id) {
-      continue;
-    }
-    expected_motion_limits.emplace_back(
-        target.component().controllable_component_id,
-        target.target_role().command_target_id);
+    Require(target.control_binding().has_value(),
+            "motion target has no exact control binding");
+    motion_limit_bindings.push_back(*target.control_binding());
   }
-  std::sort(expected_motion_limits.begin(), expected_motion_limits.end());
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  constexpr bool whole_runtime_motion_limits = true;
+#else
+  constexpr bool whole_runtime_motion_limits = false;
+#endif
   std::vector<std::pair<core::ControllableComponentId,
                         core::CommandTargetId>> configured_motion_limits;
   configured_motion_limits.reserve(
@@ -8244,7 +8435,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
         return std::pair{limit.controllable_component_id,
                          limit.command_target_id};
       });
-  Require(configured_motion_limits == expected_motion_limits,
+  Require(execution_motion_target_limit_keys_match(
+              motion_limit_bindings, configured_motion_limits,
+              *local_runtime_unit_id,
+              direct_control_motion_binding.value().value().controllable_component_id,
+              whole_runtime_motion_limits),
           "execution Deployment must contain exactly one TCP-speed maximum for "
           "every motion-capable target and no unknown target");
   const auto motion_limit =
@@ -8536,6 +8731,19 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       deployment_motion_target_limit;
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   runtime_input.ordinary_motion_jerk = motion_limit->ordinary_motion_jerk;
+#else
+  // Q37 (as main): the Deployment-authored fault Stop profile is the motion
+  // target's fault profile, read directly; absent means none.
+  runtime_input.fault_stop_profile_from_deployment = true;
+  for (const auto &authored :
+       retained_runtime_configuration.default_fault_stop_profiles) {
+    if (authored.controllable_component_id ==
+            runtime_input.motion_binding.value().controllable_component_id &&
+        authored.command_target_id ==
+            runtime_input.motion_binding.value().command_target_id) {
+      runtime_input.deployment_fault_stop_profile = authored.profile;
+    }
+  }
 #endif
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   for (const auto &limit :
@@ -8559,26 +8767,222 @@ BuildSingleProductComposition(CompositionBuildInput input) {
             input.publication_generation, publisher);
   }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // Q63-Q69: this component's generated controller robot_description and
+  // controllers file, written to a per-activation, per-component directory
+  // of the host run root before the lane is composed; their hashes and the
+  // exact launch contract are activation evidence.
+  // Q78/§7.5: the mock lane's controller launch is then started (or kept,
+  // Q21) by this Manager-owned host before the lane's backend binds, so CCLC
+  // finds the arm controller loaded inactive and activates it as before.
+  std::shared_ptr<ControllerLaunchProcess> controller_process;
+  const auto discard_launch = [](ControllerLaunchSupervisor::Ensured *launch) {
+    if (launch != nullptr) {
+      static_cast<void>(
+          host_controller_launch_supervisor().discard_candidate(*launch));
+      delete launch;
+    }
+  };
+  std::unique_ptr<ControllerLaunchSupervisor::Ensured, decltype(discard_launch)>
+      prepared_launch(nullptr, discard_launch);
+  std::map<std::string, double, std::less<>> mock_cancel_by_source_joint;
+  bool mock_lane = false;
+  {
+    const auto &motion_value = direct_control_motion_binding.value().value();
+    const auto *selected_profile =
+        deployment::ros2_control_execution_runtime_contract::
+            find_controller_profile(retained_runtime_configuration,
+                                    motion_value.controllable_component_id);
+    Require(selected_profile != nullptr,
+            "ROS component has no controller profile in its runtime unit");
+    Require(motion_value.model_groups.size() == 1U,
+            "ROS component has no sole model group");
+    const auto &model_instance_id =
+        motion_value.model_groups.front().model_instance_id;
+    const auto &model_instances =
+        input.bundle->value().cell_graph.model_instances;
+    const auto model_instance = std::find_if(
+        model_instances.begin(), model_instances.end(),
+        [&](const auto &candidate) {
+          return candidate.model_instance_id == model_instance_id;
+        });
+    Require(model_instance != model_instances.end(),
+            "ROS component model instance is absent from the retained graph");
+    const auto &source_urdfs = retained_model->model_source_urdfs();
+    const auto source_urdf = std::find_if(
+        source_urdfs.begin(), source_urdfs.end(), [&](const auto &candidate) {
+          return candidate.model_asset_id == model_instance->model_asset_id &&
+                 candidate.model_revision == model_instance->model_revision;
+        });
+    Require(source_urdf != source_urdfs.end(),
+            "ROS component model source URDF is absent from the retained "
+            "planning closure");
+    const auto path_token = [](std::string text) {
+      for (auto &character : text) {
+        const bool safe = (character >= 'a' && character <= 'z') ||
+                          (character >= 'A' && character <= 'Z') ||
+                          (character >= '0' && character <= '9') ||
+                          character == '-' || character == '_' ||
+                          character == '.';
+        if (!safe) character = '_';
+      }
+      return text;
+    };
+    ComponentControllerLaunchInput artifact_input;
+    artifact_input.artifacts_root =
+        input.execution_run_root / "controller-launch-artifacts" /
+        path_token(input.bundle->retained_bundle_id().value()) /
+        path_token(input.runtime_epoch.value());
+    artifact_input.gripper_binding = direct_control_gripper_binding;
+    artifact_input.isaac_profile = selected_profile->isaac_profile;
+    artifact_input.mock_profile = selected_profile->mock_profile;
+    if (selected_profile->isaac_profile.has_value()) {
+      artifact_input.isaac_lane =
+          retained_isaac_controller_lane(*selected_profile->isaac_profile);
+    } else {
+      artifact_input.initial_joint_positions_rad =
+          selected_initial_joint_positions;
+      const deployment::FilesystemVerifiedRetainedProductArtifactSource
+          stop_artifacts(input.package_root);
+      artifact_input.controlled_stop_max_deceleration_rad_s2 =
+          deployment::retained_controlled_stop_max_deceleration_rad_s2(
+              *input.bundle, stop_artifacts,
+              direct_control_motion_binding.value());
+      if (direct_control_gripper_binding.has_value() &&
+          direct_control_gripper_binding->value()
+              .resources.front()
+              .source_joint_name.has_value()) {
+        // As `main`'s native lane seeds its gripper (retained model
+        // projection of the gripper binding's source joint).
+        const auto &gripper_path =
+            *direct_control_gripper_binding->value().control_path;
+        const auto projected = state_projector->current_state(
+            gripper_path.control_binding_id,
+            gripper_path.control_binding_revision);
+        Require(projected.ok() && projected.value().positions.size() == 1U,
+                "ROS mock gripper has no retained model projection");
+        const auto &position = projected.value().positions.front();
+        artifact_input.gripper_projected_position =
+            std::holds_alternative<core::AngularPositionDTO>(position)
+                ? std::get<core::AngularPositionDTO>(position).value_rad
+                : std::get<core::LinearPositionDTO>(position).value_m;
+      }
+    }
+    artifact_input.model_urdf = source_urdf->urdf_bytes;
+    artifact_input.frame_prefix = selected_profile->frame_prefix;
+    const auto written =
+        write_component_controller_launch_artifacts(
+            direct_control_motion_binding.value(), artifact_input);
+    const auto evidence = controller_launch_artifacts_evidence(written);
+    {
+      std::ofstream record(written.directory /
+                               "controller_launch_artifacts.json",
+                           std::ios::binary | std::ios::trunc);
+      record << evidence << '\n';
+      Require(static_cast<bool>(record),
+              "ROS controller launch evidence could not be written");
+    }
+    std::cerr << "manyforge controller launch artifacts: " << evidence
+              << std::endl;
+    if (written.lane == ControllerLaunchLane::kMock) {
+      mock_lane = true;
+      // Q48: the same per-joint cancel bounds the generated controllers file
+      // carries, keyed by the binding's own resource-to-source-joint map.
+      for (const auto &[resource_id, limit] :
+           artifact_input.controlled_stop_max_deceleration_rad_s2) {
+        const auto &resources = motion_value.resources;
+        const auto resource = std::find_if(
+            resources.begin(), resources.end(), [&](const auto &candidate) {
+              return candidate.resource_id == resource_id;
+            });
+        Require(resource != resources.end() &&
+                    resource->source_joint_name.has_value(),
+                "ROS mock Stop limit names a resource outside its arm");
+        mock_cancel_by_source_joint.emplace(*resource->source_joint_name,
+                                            limit);
+      }
+      const auto command = mock_controller_launch_command(written);
+      const auto ensured = host_controller_launch_supervisor().ensure(
+          command, written.directory,
+          input.controller_request_context.empty()
+              ? "Bootstrap runtime=" +
+                    (input.runtime_unit_id ? input.runtime_unit_id->value()
+                                           : std::string("unmanaged")) +
+                    " epoch=" + input.runtime_epoch.value()
+              : input.controller_request_context);
+      prepared_launch.reset(new ControllerLaunchSupervisor::Ensured(ensured));
+      controller_process = ensured.process;
+      std::cerr << "manyforge controller launch: component="
+                << written.controllable_component_id << " decision="
+                << (ensured.decision == ControllerLaunchDecision::kKeep
+                        ? "kept"
+                        : ensured.decision == ControllerLaunchDecision::kStart
+                              ? "started"
+                              : "restarted")
+                << " pid=" << ensured.process->pid() << std::endl;
+    } else {
+      // Q78 (Isaac): isaac_controller_launch_command() builds the command,
+      // but its world/scene inputs have no retained source yet; the Isaac
+      // launch stays caller-started until that source is decided.
+      std::cerr << "manyforge controller launch: component="
+                << written.controllable_component_id
+                << " Isaac launch is not started by this host (no retained "
+                   "world/scene launch inputs)"
+                << std::endl;
+    }
+  }
   auto ros2_control_runtime_handle =
       std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  if (controller_process != nullptr) {
+    ros2_control_runtime_handle->InstallControllerProcessFaultSource(
+        ControllerLaunchSupervisor::fault_source(
+            controller_process,
+            [weak = std::weak_ptr<RetainedRos2ControlRuntimeHandle>(
+                 ros2_control_runtime_handle)] {
+              ControllerLaunchReadinessEvidence facts;
+              const auto handle = weak.lock();
+              if (!handle)
+                return facts;
+              const auto activity = handle->arm_activity();
+              facts.controller_manager_present =
+                  activity.controller_manager_present;
+              facts.controller_observed = activity.observed;
+              if (activity.observed) {
+                facts.controller_loaded = activity.controller_loaded;
+                facts.arm_controller_active = activity.controller_active;
+                facts.hardware_ready = activity.hardware_active;
+              }
+              if (const auto port = handle->current_port()) {
+                facts.known = true;
+                const auto readiness = port->ReadReadiness();
+                facts.controller_bound = readiness.controller_bound;
+                facts.binding_epoch = readiness.binding_epoch.value();
+                const auto sample = port->ReadSample();
+                facts.joint_sample_available = sample.has_value();
+                if (sample)
+                  facts.sample_age_ns = std::max<core::TimePoint>(
+                      0, WallClock{}.now() - sample->local_receipt_stamp_ns);
+              }
+              return facts;
+            }));
+  }
   auto ros2_control_backend_config =
-      make_retained_isaac_ros2_control_backend_config(
-          retained_runtime_configuration, direct_control_motion_binding.value(),
-          std::optional<core::RuntimeParticipantBinding>{
-              direct_control_gripper_binding.value()});
+      mock_lane
+          ? make_retained_mock_ros2_control_backend_config(
+                retained_runtime_configuration,
+                direct_control_motion_binding.value(),
+                direct_control_gripper_binding, mock_cancel_by_source_joint)
+          : make_retained_isaac_ros2_control_backend_config(
+                retained_runtime_configuration,
+                direct_control_motion_binding.value(),
+                direct_control_gripper_binding);
   ros2_control_backend_config.defer_ros_start = input.managed_component_delta.has_value();
-  if (ros2_control_backend_config.defer_ros_start)
-    ros2_control_backend_config.execution.initialize_commanded_sim_on_controller_ready = false;
-  Require(ros2_control_backend_config.execution.controller_binding.has_value(),
-          "retained Isaac ROS profile has no controller binding contract");
-  const std::string ros2_control_binding_contract_generation_id =
-      ros2_control_backend_config.execution.controller_binding->generation_id;
   runtime_input.motion_state_channel_config =
-      retained_ros2_control_motion_state_config(
-          ros2_control_backend_config.execution);
-  runtime_input.gripper_state_channel_config =
-      retained_ros2_control_gripper_state_config(
-          direct_control_gripper_binding.value());
+      retained_ros2_control_motion_state_config(ros2_control_backend_config);
+  if (direct_control_gripper_binding.has_value()) {
+    runtime_input.gripper_state_channel_config =
+        retained_ros2_control_gripper_state_config(
+            *direct_control_gripper_binding);
+  }
   runtime_input.backend_factory = make_retained_ros2_control_backend_factory(
       std::move(ros2_control_backend_config), ros2_control_runtime_handle);
 #endif
@@ -8648,8 +9052,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       SimpleSchedulerConfig::from_environment(),
       execution_tick_period_ns,
       std::move(selected_initial_joint_positions),
-      deployment::resolve_retained_stop_deadline_budget(*input.bundle,
-                                                        catalog_store),
       kMaintainedNativeStopSurveillancePolicy,
       {},
       {},
@@ -8762,8 +9164,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   composition->ros2_control_runtime_handle =
       std::move(ros2_control_runtime_handle);
-  composition->ros2_control_binding_contract_generation_id =
-      ros2_control_binding_contract_generation_id;
+  composition->controller_process = std::move(controller_process);
+  composition->controller_request_context = input.controller_request_context;
+  if (prepared_launch) {
+    composition->prepared_controller_launch = *prepared_launch;
+    delete prepared_launch.release();
+  }
 #endif
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
@@ -8854,6 +9260,10 @@ BuildProductComposition(CompositionBuildInput input) {
                         gripper_component_ids.end()),
           "native gripper binding has no matching motion component");
   if (inventory.motion.size() == 1U && inventory.gripper.size() <= 1U) {
+    input.selected_component_id = motion_component_ids.front();
+    if (input.retained_component_snapshots.contains(
+            motion_component_ids.front()))
+      return BuildRetainedProductComposition(std::move(input));
     return BuildSingleProductComposition(std::move(input));
   }
 #else
@@ -8964,7 +9374,12 @@ BuildProductComposition(CompositionBuildInput input) {
     retain_component(selected.motion_program_aliases);
     retain_component(selected.gripper_program_aliases);
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-    compositions.push_back(BuildSingleProductComposition(std::move(selected)));
+    if (selected.retained_component_snapshots.contains(component_id))
+      compositions.push_back(
+          BuildRetainedProductComposition(std::move(selected)));
+    else
+      compositions.push_back(
+          BuildSingleProductComposition(std::move(selected)));
 #else
     if (selected.retained_component_snapshots.contains(component_id)) {
       compositions.push_back(BuildRetainedProductComposition(
@@ -9128,7 +9543,6 @@ BuildProductComposition(CompositionBuildInput input) {
   return primary;
 }
 
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 [[nodiscard]] std::vector<core::ControllableComponentId>
 RetainedNativeComponentIds(
     const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
@@ -9373,7 +9787,6 @@ void RefreshRetainedNativeCandidateModels(
     view.candidate_model_generation.reset();
   }
 }
-#endif
 
 [[nodiscard]] std::unique_ptr<Composition>
 BuildComposition(const HostConfig &config,
@@ -9612,47 +10025,6 @@ BuildComposition(const HostConfig &config,
   });
 }
 
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-[[nodiscard]] std::string
-Ros2ControlProviderComponentEpoch(const Composition &composition) {
-  std::vector<std::string> occurrences;
-  std::vector<const core::RuntimeParticipantBinding *> bindings{
-      &*composition.direct_control_motion_binding};
-  if (composition.direct_control_gripper_binding.has_value())
-    bindings.push_back(&*composition.direct_control_gripper_binding);
-  for (const auto *binding : bindings) {
-    Require(binding->value().control_path.has_value(),
-            "retained Isaac ROS participant has no control path");
-    const auto &path = *binding->value().control_path;
-    occurrences.push_back(path.control_domain_id.value() + "\n" +
-                          path.provider_instance_id.value() + "\n" +
-                          path.provider_manifest_id.value() + "\n" +
-                          path.provider_manifest_revision.value() + "\n" +
-                          path.provider_runtime_unit_id.value() + "\n" +
-                          path.provider_runtime_epoch.value());
-  }
-  std::sort(occurrences.begin(), occurrences.end());
-  std::string preimage("manyforge.ros2-control-provider-component-epoch.v1");
-  for (const auto &occurrence : occurrences) {
-    preimage.push_back('\0');
-    preimage.append(occurrence);
-  }
-  return content_identity::sha256_digest(preimage);
-}
-
-[[nodiscard]] std::string
-Ros2ControlCellSupervisorEpoch(const Composition &composition) {
-  std::string preimage("manyforge.cell-supervisor-component-epoch.v1");
-  preimage.push_back('\0');
-  preimage.append(composition.bundle->retained_bundle_id().value());
-  preimage.push_back('\0');
-  preimage.append(
-      composition.bundle->value().cell_graph.graph_revision.value());
-  preimage.push_back('\0');
-  preimage.append(std::to_string(composition.publication_generation.value()));
-  return content_identity::sha256_digest(preimage);
-}
-#endif
 
 [[nodiscard]] std::vector<core::RuntimeParticipantBinding>
 PhysicalControlBindings(const Composition &composition) {
@@ -9674,7 +10046,6 @@ PhysicalControlBindings(const Composition &composition) {
   return physical_bindings;
 }
 
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 [[nodiscard]] std::vector<core::RuntimeParticipantExecutionRegistration>
 NativeCellComponentRegistrations(const Composition &cell) {
   std::vector<core::RuntimeParticipantExecutionRegistration> result;
@@ -9761,7 +10132,6 @@ NativeCellStopSources(const Composition &cell) {
             "native cell has invalid Stop observation sources");
   return result;
 }
-#endif
 
 [[nodiscard]] std::vector<core::RuntimeParticipantBinding>
 CellControlBindingRepresentatives(const Composition &composition) {
@@ -10566,13 +10936,17 @@ void AttachRetainedNativeCCLC(Composition &composition,
       config.package_root);
   auto physical_bindings = PhysicalControlBindings(composition);
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  Require(composition.ros2_control_runtime_handle != nullptr &&
-              !composition.ros2_control_binding_contract_generation_id.empty(),
-          "retained Isaac ROS lifecycle has no bound execution adapter");
+  std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>> handles;
+  for (const auto &[component_id, view] :
+       IndexNativeComponentCompositions(composition)) {
+    static_cast<void>(component_id);
+    Require(view->ros2_control_runtime_handle != nullptr,
+            "retained ROS lifecycle has no bound execution adapter");
+    handles.push_back(view->ros2_control_runtime_handle);
+  }
   auto lifecycle_product = RetainedRos2ControlLifecycleProduct::Create(
-      composition.bundle, *provider_manifest_source, physical_bindings,
-      composition.ros2_control_runtime_handle, *owner_clock,
-      1'000'000'000LL);
+      composition.bundle, *provider_manifest_source, physical_bindings, handles,
+      *owner_clock, 1'000'000'000LL);
 #else
   core::SqliteCCLCJournal native_state_journal(
       config.execution_state_root /
@@ -10658,6 +11032,27 @@ void AttachRetainedNativeCCLC(Composition &composition,
       core::CellId(config.cell_id),
       {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U,
        10'000'000LL, 30'000'000'000LL}};
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  cclc_config.lifecycle_target_driver.read_output_drop_counts =
+      [](const core::ControllableComponentId &component)
+      -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+    const auto counts = host_controller_launch_supervisor()
+                            .component_output_counters(component.value());
+    if (!counts)
+      return std::nullopt;
+    return std::pair{counts->dropped_forward_lines,
+                     counts->dropped_forward_bytes};
+  };
+  cclc_config.on_incidents_pruned =
+      [](const core::ComponentIncidentPruneNotice &notice) {
+        host_controller_launch_supervisor().enqueue_host_log(
+            "INFO manyforge CCLC closed incidents pruned: count=" +
+            std::to_string(notice.count) +
+            " oldest_sequence=" + std::to_string(notice.oldest_sequence) +
+            " newest_sequence=" + std::to_string(notice.newest_sequence) +
+            "\n");
+      };
+#endif
   auto cclc = [&]() -> core::Result<
       std::unique_ptr<deployment::CCLCRuntimeComposition>> {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -10776,8 +11171,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
         CellControlBindingRepresentatives(composition), *composition.runtime,
         *composition.active_addressed_kernel(), fence_owner
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-      ,
-      composition.ros2_control_runtime_handle->lifecycle_snapshot_source()
+        ,
+        lifecycle_product.value()->lifecycle_snapshot_source()
 #endif
     );
   }();
@@ -10822,32 +11217,6 @@ void AttachRetainedNativeCCLC(Composition &composition,
       std::move(provider_manifest_source);
   composition.cclc_lifecycle_product = std::move(lifecycle_product.value());
   composition.cclc_runtime = std::move(cclc.value());
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  const auto component_id = composition.direct_control_motion_binding->value()
-                                .controllable_component_id;
-  const auto runtime_epochs =
-      composition.direct_control_motion_binding->value().runtime_unit_epochs;
-  Require(runtime_epochs.size() == 1U,
-          "retained Isaac ROS admission has no sole runtime epoch");
-  auto admission = RetainedRos2ControlAdmissionOwner::Create(
-      RetainedRos2ControlAdmissionOwnerConfig{
-          component_id, runtime_epochs.front().runtime_epoch,
-          composition.ros2_control_binding_contract_generation_id,
-          Ros2ControlProviderComponentEpoch(composition),
-          Ros2ControlCellSupervisorEpoch(composition), 50'000'000LL,
-          250'000'000LL},
-      composition.ros2_control_runtime_handle, *owner_clock,
-      [&composition]() {
-        return composition.cclc_runtime->ReadCurrentComponentSnapshot(
-            composition.direct_control_motion_binding->value()
-                .controllable_component_id);
-      });
-  if (!admission.ok()) {
-    Fail("ROS execution admission owner cannot be composed: " +
-         admission.error().message);
-  }
-  composition.ros2_control_admission_owner = std::move(admission.value());
-#endif
   composition.cclc_attached.store(true, std::memory_order_release);
 }
 
@@ -10859,9 +11228,6 @@ void DetachRetainedCCLC(Composition &composition) {
     composition.runtime->stop_recovery_configuration_source = {};
     composition.runtime->reconcile_controller_routes = {};
   }
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  composition.ros2_control_admission_owner.reset();
-#endif
   composition.cclc_runtime.reset();
   composition.cclc_cell_command_readiness_port.reset();
   composition.cclc_cell_route_publication_owner.reset();
@@ -11106,6 +11472,15 @@ TryBuildCurrentManagedCompositionInput(
       {},
       ManagedPackageRootDescriptor(config, selected_package_root),
       config.scene_asset_root_fd,
+      [&receipt, &config] {
+        if (const auto *apply =
+                std::get_if<core::NamedApplyPublicationTransactionDTO>(
+                    &receipt.request.transaction_ref))
+          return "Apply=" + apply->apply_id.value() + " generation=" +
+                 std::to_string(apply->apply_generation.value());
+        return "Bootstrap runtime=" + config.runtime_unit_id +
+               " epoch=" + config.runtime_epoch;
+      }(),
   };
 }
 
@@ -11185,7 +11560,6 @@ LoadExactManagedCandidateBundle(
 }
 
 struct ManagedBootstrapStopProduct final {
-  std::optional<core::StopDeadlineBudgetDTO> deadline_budget;
   std::vector<core::ResourceId> resource_inventory;
   bool requires_physical_composition{};
 };
@@ -11204,8 +11578,6 @@ struct ManagedBootstrapStopProduct final {
                   graph_revision,
           "managed bootstrap Stop policy differs from the retained product");
 
-  const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
-      selected->package_root);
   std::set<core::ResourceId> resources;
   for (const auto &binding :
        selected->bundle->value().cell_graph.control_bindings) {
@@ -11217,8 +11589,6 @@ struct ManagedBootstrapStopProduct final {
   Require(resources.size() <= core::kMaxKernelResourceSlots,
           "managed bootstrap resource inventory exceeds the Kernel bound");
   return {
-      deployment::resolve_retained_stop_deadline_budget(*selected->bundle,
-                                                        catalog_store),
       {resources.begin(), resources.end()},
       !selected->bundle->value().cell_graph.controllable_components.empty()};
 }
@@ -11271,10 +11641,6 @@ struct ManagedBootstrapStopProduct final {
                   request.component_delta,
           "managed component delta differs from the verified predecessor and candidate");
 
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  detail::RequireInitialRos2ComponentInstallation(
-      request, predecessor->value().cell_graph, bundle->value().cell_graph);
-#endif
   if (bundle->value().cell_graph.controllable_components.empty()) {
     return std::nullopt;
   }
@@ -11348,16 +11714,14 @@ struct ManagedBootstrapStopProduct final {
       {},
       ManagedPackageRootDescriptor(config, candidate_package_root),
       config.scene_asset_root_fd,
+      "Apply=" + request.apply_id.value() +
+          " generation=" + std::to_string(request.apply_generation.value()),
   };
 }
 
 [[nodiscard]] bool IsExactRetainedNativeViewApply(
     const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
         &request) {
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  static_cast<void>(request);
-  return false;
-#else
   return !request.component_delta.components.empty() &&
          request.predecessor_projection_revision.retained_bundle_id ==
              request.candidate_projection_revision.retained_bundle_id &&
@@ -11369,10 +11733,8 @@ struct ManagedBootstrapStopProduct final {
                        return row.disposition ==
                               deployment::ApplyComponentDisposition::kRetain;
                      });
-#endif
 }
 
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 void RefreshRetainedNativePublicationView(
     Composition &cell,
     const std::map<core::ControllableComponentId,
@@ -11444,7 +11806,6 @@ void RefreshRetainedNativePublicationView(
     composition->publication_generation = generation;
   }
 }
-#endif
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
@@ -11517,6 +11878,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::shared_ptr<RetainedStopSurveillanceOwner>
       stable_stop_surveillance_owner;
   std::unique_ptr<RetainedNativeCellRuntime> stable_cell_runtime_owner;
+  std::shared_ptr<RetainedObservationWake> stable_observation_wake;
   std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel>
       detached_addressed_kernel;
@@ -11576,8 +11938,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       config, bootstrap_retained_bundle_id, bootstrap_graph_revision);
   const bool bootstrap_requires_physical_composition =
       bootstrap_stop.requires_physical_composition;
-  bootstrap_kernel_config.cell_stop_deadline_budget =
-      std::move(bootstrap_stop.deadline_budget);
   bootstrap_kernel_config.empty_runtime_resource_inventory =
       std::move(bootstrap_stop.resource_inventory);
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -11637,7 +11997,22 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       stable_cell_runtime_owner->stop_surveillance_owner();
   stable_kernel_owner = &stable_cell_runtime_owner->addressed_kernel();
   stable_operation_journal = &stable_cell_runtime_owner->operation_journal();
+  stable_observation_wake = stable_cell_runtime_owner->observation_wake();
 #else
+  stable_observation_wake = std::make_shared<RetainedObservationWake>();
+  const auto observer_clock = detached_owner_clock;
+  stable_stop_surveillance_owner = std::shared_ptr<
+      RetainedStopSurveillanceOwner>(
+      new RetainedStopSurveillanceOwner(
+          {}, observer_clock.get(),
+          RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty),
+      [observer_clock](RetainedStopSurveillanceOwner *observer) {
+        delete observer;
+      });
+  bootstrap_kernel_config.stop_surveillance =
+      core::StopSurveillanceExecutionConfig{
+          stable_stop_surveillance_owner.get(),
+          kMaintainedNativeStopSurveillancePolicy};
   detached_operation_journal = std::make_unique<core::SqliteOperationJournal>(
       config.execution_state_root /
           std::string(core::kOperationJournalFilename),
@@ -11845,7 +12220,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   };
 
   const auto try_release_retired_composition = [&] {
-    std::lock_guard lock(managed_composition_mutex);
+    std::unique_lock lock(managed_composition_mutex);
     auto *const owner = stable_addressed_kernel();
     if (owner == nullptr || installed_under_fence_composition_request.has_value()) {
       return;
@@ -11868,6 +12243,39 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         return;
       }
     }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    const auto *const retiring = retired_managed_composition.get();
+    std::vector<std::shared_ptr<ControllerLaunchProcess>> removed_processes;
+    std::set<const ControllerLaunchProcess *> active_processes;
+    if (active_managed_composition) {
+      for (const auto &[id, view] :
+           IndexNativeComponentCompositions(*active_managed_composition)) {
+        static_cast<void>(id);
+        if (view->controller_process)
+          active_processes.insert(view->controller_process.get());
+      }
+    }
+    for (const auto &[id, view] :
+         IndexNativeComponentCompositions(*retired_managed_composition)) {
+      static_cast<void>(id);
+      if (view->controller_process &&
+          !active_processes.contains(view->controller_process.get()))
+        removed_processes.push_back(view->controller_process);
+    }
+    // The same Manager channel owns composition replacement. Keep its
+    // retired Composition, model and engine pins until exact group cleanup
+    // completes; operational Stop does not wait on this mutex.
+    lock.unlock();
+    for (const auto &process : removed_processes)
+      static_cast<void>(
+          host_controller_launch_supervisor().retire_exact(process));
+    lock.lock();
+    // Only Manager dispatch mutates the retired owner/fence; the cell owner is stable.
+    Require(retired_managed_composition.get() == retiring &&
+                stable_addressed_kernel() == owner &&
+                !installed_under_fence_composition_request,
+            "retired composition changed during exact process cleanup");
+#endif
     for (auto engine = retired_registration_engines.begin();
          engine != retired_registration_engines.end();) {
       if (active_engines.contains(*engine)) {
@@ -11931,9 +12339,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->attach_addressed_owner = false;
       input->shared_clock = detached_owner_clock;
       input->shared_scheduler = detached_owner_scheduler;
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-      input->observation_wake = stable_cell_runtime_owner->observation_wake();
-#endif
+      input->observation_wake = stable_observation_wake;
       current_predecessor_composition_pending = false;
       current_composition_builder_started = true;
       Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
@@ -11977,27 +12383,28 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       "current managed composition duplicated the stable "
                       "addressed owner");
 #endif
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               auto current_registrations =
                   NativeCellComponentRegistrations(*built);
               auto current_resolver = NativeCellParticipantResolver(
                   *built, current_registrations);
               auto current_stop_sources = NativeCellStopSources(*built);
-              const auto stop_product = LoadManagedBootstrapStopProduct(
+              static_cast<void>(LoadManagedBootstrapStopProduct(
                   config, built->bundle->retained_bundle_id(),
-                  built->bundle->value().cell_graph.graph_revision);
+                  built->bundle->value().cell_graph.graph_revision));
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               auto reconfigured =
                   stable_cell_runtime_owner->reconfigure_runtime_product(
                       std::move(current_registrations),
                       std::move(current_resolver),
-                      std::move(current_stop_sources),
-                      stop_product.deadline_budget);
+                      std::move(current_stop_sources));
 #else
               auto reconfigured =
                   detached_addressed_kernel->reconfigure_runtime_product(
-                      built->runtime->participant_registrations,
-                      std::move(built->runtime->participant_resolver),
-                      built->runtime->cell_stop_deadline_budget);
+                      std::move(current_registrations),
+                      std::move(current_resolver), [&]() {
+                        return stable_stop_surveillance_owner->ReplaceSources(
+                            std::move(current_stop_sources));
+                      });
 #endif
               if (!reconfigured.ok()) {
                 Fail("stable Kernel rejected current runtime participants: " +
@@ -12018,6 +12425,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 built->runtime->stop_surveillance_owner =
                     stable_stop_surveillance_owner;
               }
+#endif
+              if (built->runtime != nullptr)
+                built->runtime->stop_surveillance_owner =
+                    stable_stop_surveillance_owner;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+              built->controller_launch_adopted = true;
+              for (auto &peer : built->participant_compositions)
+                peer->controller_launch_adopted = true;
 #endif
               active_managed_composition = std::move(built);
               if (active_managed_composition->runtime != nullptr)
@@ -12067,23 +12482,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (selected_composition_failure != nullptr) {
       std::rethrow_exception(selected_composition_failure);
     }
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-    // Reject unsupported ownership changes before current-composition recovery
-    // or candidate construction can start a ROS endpoint/executor.
-    const auto selected_ros_candidate = LoadExactManagedCandidateBundle(config, request);
-    const auto selected_ros_predecessor = LoadManagedBundleAtPinnedRoot(
-        config, request.predecessor_projection_revision.retained_bundle_id);
-    Require(selected_ros_candidate.has_value() && selected_ros_predecessor.has_value() &&
-                deployment::derive_apply_component_delta(
-                    *selected_ros_predecessor->bundle, *selected_ros_candidate->bundle) ==
-                    request.component_delta,
-            "ROS installation delta differs from verified predecessor and candidate");
-    detail::RequireInitialRos2ComponentInstallation(
-        request, selected_ros_predecessor->bundle->value().cell_graph,
-        selected_ros_candidate->bundle->value().cell_graph);
-#endif
     const auto read_installed_receipts = [&] {
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       return ReadNativeInstalledComponentReceipts(
           request, active_managed_composition.get(),
           retired_managed_composition != nullptr
@@ -12091,28 +12490,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               : (IsExactRetainedNativeViewApply(request)
                      ? active_managed_composition.get()
                      : nullptr));
-#else
-      if (request.component_delta.components.empty())
-        return std::vector<component_manager::ManagerRuntimeComponentReceiptDTO>{};
-      const auto *candidate = active_managed_composition.get();
-      Require(candidate != nullptr && candidate->runtime != nullptr &&
-                  candidate->bundle != nullptr &&
-                  candidate->ros2_control_runtime_handle != nullptr &&
-                  candidate->runtime->gripper_binding.has_value() &&
-                  candidate->active_addressed_kernel() == stable_addressed_kernel(),
-              "ROS installed component has no stable live execution owner");
-      const auto identity = deployment::derive_component_runtime_identity(
-          *candidate->bundle, candidate->controllable_component_id);
-      Require(identity.has_value(), "ROS installed component has no sealed product identity");
-      return std::vector<component_manager::ManagerRuntimeComponentReceiptDTO>{
-          detail::ReadInitialRos2ComponentReceipt(
-              request, *identity, *candidate->ros2_control_runtime_handle,
-              candidate->runtime->execution.get(), candidate->runtime->gripper.get(),
-              candidate->runtime->motion_binding, *candidate->runtime->gripper_binding,
-              candidate->component_registrations(),
-              candidate->runtime->participant_engine_for(true),
-              candidate->runtime->participant_engine_for(false))};
-#endif
     };
     const core::ConfigurationFenceStatusQueryDTO fence_query{
         {request.apply_id, request.apply_generation},
@@ -12216,10 +12593,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           installed_under_fence_composition_request = request;
         }
         if (current != nullptr) {
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
           fence_owner.RunWithExactHeldPredecessor(
-              fence_query,
-              request.expected_predecessor_publication_generation,
+              fence_query, request.expected_predecessor_publication_generation,
               request.expected_predecessor_public_pointer_digest, [&] {
                 std::unique_lock execution_lock(execution_composition.mutex);
                 Require(active_managed_composition.get() == current &&
@@ -12231,14 +12606,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     current->publication_generation,
                     config.manager_run_root);
               });
-#else
-          {
-            std::unique_lock execution_lock(execution_composition.mutex);
-            Require(active_managed_composition.get() == current,
-                    "ROS composition changed before final Scene");
-            current->projection_revision = request.candidate_projection_revision;
-          }
-#endif
           InstallDirectSceneFrameResolver(projections, *current);
         }
       }
@@ -12406,7 +12773,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               // CCLC records one decision before any candidate route exists.
               // Retained facts are taken from the live Kernel only after the
               // host proves that the exact predecessor controller survived.
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               auto plan_request = BuildNativeApplyPlanRequest(
                   request, *active_managed_composition,
                   retired_managed_composition != nullptr
@@ -12415,39 +12781,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                              ? active_managed_composition.get()
                              : nullptr),
                   representatives);
-#else
-              core::NativeApplyPlanRequestDTO plan_request{
-                  {fence_query.owner_transaction.apply_id,
-                   fence_query.owner_transaction.apply_generation},
-                  candidate.retained_bundle_id(),
-                  candidate.value().cell_graph.graph_revision,
-                  {}, {}, {}, {}, {}, {}};
-              // ROS lifecycle plans only observe ros2_control: Apply installs
-              // routes and Stop readiness but enables nothing. The component
-              // stays Declared (command-closed) until ordinary CCLC
-              // Prepare/Enable; an explicit Disable is still preserved.
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               plan_request.changed_component_state =
                   core::ComponentLifecycleStateDTO::kDeclared;
-              for (const auto &component :
-                   candidate.value().cell_graph.controllable_components)
-                plan_request.components.push_back(
-                    component.controllable_component_id);
-              for (const auto &desired :
-                   candidate.value().desired_control_configurations) {
-                const auto compiled = std::find_if(
-                    representatives.begin(), representatives.end(),
-                    [&](const auto &row) {
-                      return row.value().control_path.has_value() &&
-                             row.value().control_path->control_domain_id ==
-                                 desired.control_domain_id;
-                    });
-                Require(compiled != representatives.end(),
-                        "candidate domain has no compiled binding");
-                plan_request.compiled_routes.push_back(
-                    {desired.control_domain_id,
-                     compiled->value()
-                         .control_path->active_control_configuration_generation});
-              }
 #endif
               core::SqliteCCLCJournal plan_journal(
                   config.execution_state_root /
@@ -12556,15 +12892,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         prepared_is_empty = true;
         prepared_managed_composition_is_empty = false;
       } else if (!preparing_composition_request.has_value()) {
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-        Require(active_managed_composition == nullptr &&
-                    retired_managed_composition == nullptr &&
-                    stable_addressed_kernel() != nullptr,
-                "ROS initial installation has a nonempty or missing predecessor owner");
-#endif
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
         VerifyRetainedNativePredecessors(active_managed_composition.get(),
-                                          request);
+                                         request);
         if (active_managed_composition != nullptr) {
           const auto previous = IndexNativeComponentCompositions(
               *active_managed_composition);
@@ -12586,10 +12915,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     owner->direct_control_joint_limits,
                     owner->direct_control_motion_descriptor,
                     owner->direct_control_gripper_descriptor,
-                    owner->operator_confirmation_validity_ns});
+                    owner->operator_confirmation_validity_ns
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                    ,
+                    owner->ros2_control_runtime_handle,
+                    owner->controller_process
+#endif
+                });
           }
         }
-#endif
         preparing_composition_request = request;
         managed_composition_building = true;
         start_builder = true;
@@ -12638,10 +12972,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               if (input.has_value()) {
                 input->retained_component_snapshots =
                     std::move(retained_snapshots);
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-                input->observation_wake =
-                    stable_cell_runtime_owner->observation_wake();
-#endif
+                input->observation_wake = stable_observation_wake;
               }
               const bool retain_view =
                   input.has_value() &&
@@ -12703,7 +13034,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       retired_registration_engines.empty(),
                   "a predecessor runtime engine remains lifetime-pinned");
           if (retained_view_input.has_value()) {
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
             Require(IsExactRetainedNativeViewApply(request) &&
                         active_managed_composition != nullptr &&
                         active_managed_composition->bundle != nullptr &&
@@ -12736,9 +13066,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             candidate.route_recovery_pending.store(true,
                                                    std::memory_order_release);
             InstallDirectSceneFrameResolver(projections, candidate);
-#else
-            Fail("ROS retained native view is unavailable");
-#endif
           } else if (prepared_is_empty) {
             Require(prepared == nullptr,
                     "empty selected product has a physical composition");
@@ -12751,7 +13078,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   snapshot_registration_engines(*active_managed_composition);
               auto reconfigured =
                   stable_cell_runtime_owner->reconfigure_runtime_component_set(
-                      {}, {}, {}, std::nullopt,
+                      {}, {}, {},
                       request.candidate_projection_revision.retained_bundle_id,
                       request.candidate_projection_revision.graph_revision,
                       request.configuration_fence_id,
@@ -12766,7 +13093,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             } else {
               auto reconfigured =
                   stable_cell_runtime_owner->reconfigure_runtime_component_set(
-                      {}, {}, {}, std::nullopt,
+                      {}, {}, {},
                       request.candidate_projection_revision.retained_bundle_id,
                       request.candidate_projection_revision.graph_revision,
                       request.configuration_fence_id,
@@ -12782,7 +13109,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     .ok(),
                 "empty selected runtime could not release route recovery");
 #else
-            std::function<core::Result<void>()> commit_empty_stop_sources;
+            const auto commit_empty_stop_sources = [&]() {
+              return stable_stop_surveillance_owner->ReplaceSources({});
+            };
             if (active_managed_composition != nullptr) {
               DetachRetainedCCLC(*active_managed_composition);
               Require(detached_addressed_kernel == nullptr &&
@@ -12795,7 +13124,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               auto &stable_runtime = *active_managed_composition->runtime;
               auto reconfigured = stable_runtime.active_addressed_kernel()
                                       ->reconfigure_runtime_component_set(
-                                          {}, {}, std::nullopt,
+                                          {}, {},
                                           request.candidate_projection_revision
                                               .retained_bundle_id,
                                           request.candidate_projection_revision
@@ -12819,7 +13148,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             } else if (detached_addressed_kernel != nullptr) {
               auto reconfigured = detached_addressed_kernel
                                       ->reconfigure_runtime_component_set(
-                                          {}, {}, std::nullopt,
+                                          {}, {},
                                           request.candidate_projection_revision
                                               .retained_bundle_id,
                                           request.candidate_projection_revision
@@ -12857,7 +13186,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       1024U,
                       &admission_gate,
                       prepared->runtime->motion_binding.value().graph_revision,
-                      prepared->runtime->cell_stop_deadline_budget,
                       {},
                       BuildOwnerSettlementValidator(
                           config.manager_state_root /
@@ -12912,19 +13240,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               std::optional<std::set<
                   core::IResolvedParticipantExecutionEngine *>>
                   predecessor_engine_snapshot;
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               const auto retained_component_ids =
                   RetainedNativeComponentIds(request);
               auto stable_stop_observer = stable_stop_surveillance_owner;
               std::vector<RetainedStopSurveillanceSourceInput>
                   candidate_stop_sources;
-#endif
               if (active_managed_composition != nullptr) {
                 predecessor_engine_snapshot =
                     snapshot_registration_engines(*active_managed_composition);
                 DetachRetainedCCLC(*active_managed_composition);
               }
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               if (!retained_component_ids.empty()) {
                 Require(active_managed_composition != nullptr &&
                             (prepared->runtime == nullptr ||
@@ -12938,7 +13263,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     *prepared, request, admission_gate);
                 RefreshRetainedNativeCandidateModels(
                     *prepared, request, admission_gate,
-                    *stable_cell_runtime_owner->clock());
+                    prepared->runtime != nullptr
+                        ? *prepared->runtime->clock
+                        : *stable_cell_runtime_owner->clock());
                 if (prepared->runtime != nullptr) {
                   std::vector<std::shared_ptr<RetainedNativeRuntime>> peers;
                   peers.reserve(prepared->participant_compositions.size());
@@ -12998,53 +13325,49 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   NativeCellComponentRegistrations(*prepared);
               auto candidate_resolver = NativeCellParticipantResolver(
                   *prepared, candidate_registrations);
-              const auto candidate_stop_product =
-                  LoadManagedBootstrapStopProduct(
-                      config, prepared->bundle->retained_bundle_id(),
-                      prepared->bundle->value().cell_graph.graph_revision);
-#endif
+              static_cast<void>(LoadManagedBootstrapStopProduct(
+                  config, prepared->bundle->retained_bundle_id(),
+                  prepared->bundle->value().cell_graph.graph_revision));
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
               auto reconfigured =
                   stable_cell_runtime_owner->reconfigure_runtime_component_set(
                       std::move(candidate_registrations),
                       std::move(candidate_resolver),
                       std::move(candidate_stop_sources),
-                      candidate_stop_product.deadline_budget,
                       request.candidate_projection_revision.retained_bundle_id,
                       request.candidate_projection_revision.graph_revision,
                       request.configuration_fence_id,
                       request.configuration_fence_scope, retained_component_ids);
 #else
-              auto reconfigured = stable_owner->reconfigure_runtime_component_set(
-                  prepared->runtime->participant_registrations,
-                  std::move(prepared->runtime->participant_resolver),
-                  prepared->runtime->cell_stop_deadline_budget,
-                  request.candidate_projection_revision.retained_bundle_id,
-                  request.candidate_projection_revision.graph_revision,
-                  request.configuration_fence_id,
-                  request.configuration_fence_scope,
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-                  retained_component_ids,
-                  [&]() -> core::Result<void> {
-                    if (stable_stop_observer == nullptr)
-                      return core::Result<void>::Ok();
-                    return stable_stop_observer->ReplaceSources(
-                        std::move(candidate_stop_sources));
-                  });
-#else
-                  {});
-#endif
+              auto reconfigured =
+                  stable_owner->reconfigure_runtime_component_set(
+                      std::move(candidate_registrations),
+                      std::move(candidate_resolver),
+                      request.candidate_projection_revision.retained_bundle_id,
+                      request.candidate_projection_revision.graph_revision,
+                      request.configuration_fence_id,
+                      request.configuration_fence_scope, retained_component_ids,
+                      [&]() -> core::Result<void> {
+                        return stable_stop_observer->ReplaceSources(
+                            std::move(candidate_stop_sources));
+                      });
 #endif
               if (!reconfigured.ok()) {
                 Fail("stable Kernel rejected the selected runtime "
                      "participants: " +
                      reconfigured.error().message);
               }
-#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+              const auto adopt_launch = [&](Composition &component) {
+                component.controller_launch_adopted = true;
+              };
+              adopt_launch(*prepared);
+              for (auto &peer : prepared->participant_compositions)
+                adopt_launch(*peer);
+#endif
               if (prepared->runtime != nullptr)
                 prepared->runtime->stop_surveillance_owner =
                     stable_stop_surveillance_owner;
-#endif
               if (active_managed_composition != nullptr) {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
                 auto &stable_runtime = *active_managed_composition->runtime;
@@ -13157,9 +13480,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // The candidate, stable Kernel and Stop engines are now retained
             // under this exact Apply fence. Executor start does not wait for a
             // controller or issue a home goal; observed readiness remains NRT.
-            Require(candidate.ros2_control_runtime_handle != nullptr,
-                    "installed ROS component has no bound runtime handle");
-            candidate.ros2_control_runtime_handle->StartBackend();
+            for (const auto &[component_id, view] :
+                 IndexNativeComponentCompositions(candidate)) {
+              static_cast<void>(component_id);
+              Require(view->ros2_control_runtime_handle != nullptr,
+                      "installed ROS component has no bound runtime handle");
+              view->ros2_control_runtime_handle->StartBackend();
+            }
 #endif
             InstallDirectSceneFrameResolver(projections, candidate);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
@@ -13175,6 +13502,25 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   ? nullptr
                   : active_managed_composition->runtime.get(),
               std::memory_order_release);
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+          // Update only the successfully installed occurrence. This includes
+          // the exact retained-view path; cached earlier incident facts stay
+          // on their original request context inside the process owner.
+          if (active_managed_composition) {
+            const auto context =
+                "Apply=" + request.apply_id.value() + " generation=" +
+                std::to_string(request.apply_generation.value());
+            const auto update_context = [&](Composition &component) {
+              component.controller_request_context = context;
+              if (component.controller_process)
+                component.controller_process->update_request_context(context);
+            };
+            update_context(*active_managed_composition);
+            for (auto &peer :
+                 active_managed_composition->participant_compositions)
+              update_context(*peer);
+          }
+#endif
           installed_under_fence_composition_request = request;
           preparing_composition_request.reset();
         });
@@ -13182,8 +13528,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       // Preparation was consumed. Preserve the first failure rather than
       // attempting another build on a later observation of this Apply.
       selected_composition_failure = std::current_exception();
-      if (prepared != nullptr)
+      if (prepared != nullptr) {
+        prepared->discard_unadopted_controller_launches();
         failed_prepared_composition = std::move(prepared);
+      }
       throw;
     }
     require_installed_candidate_configuration();
@@ -13580,19 +13928,113 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       continue;
     }
     if (request == "status") {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      // The ordinary Manager progress poll also correlates the already minted
+      // CCLC incident with its existing process evidence. No new polling owner.
+      try {
+        struct IncidentCorrelation final {
+          std::shared_ptr<ControllerLaunchProcess> process;
+          std::string incident_id;
+          std::string context;
+          std::string summary;
+          core::ControllableComponentId component_id;
+          std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
+          std::shared_ptr<const deployment::RetainedBundle> bundle;
+          bool needs_snapshot{};
+        };
+        std::vector<IncidentCorrelation> correlations;
+        {
+          std::lock_guard lock(managed_composition_mutex);
+          auto *cell = active_managed_composition.get();
+          if (cell && cell->cclc_runtime) {
+            const auto snapshot = [&](Composition &component) {
+              if (!component.controller_process ||
+                  (component.ros2_control_runtime_handle &&
+                   component.ros2_control_runtime_handle
+                       ->HasControllerProcessIncidentDiagnostic()))
+                return;
+              const auto view =
+                  cell->cclc_runtime->lifecycle_target_driver().ReadTargetView(
+                      component.controllable_component_id);
+              if (!view.ok() || !view.value().progress ||
+                  !view.value().progress->incident)
+                return;
+              const auto &incident = *view.value().progress->incident;
+              const auto context =
+                  !component.controller_request_context.empty()
+                      ? component.controller_request_context
+                      : "Bootstrap runtime=" + config.runtime_unit_id +
+                            " epoch=" + config.runtime_epoch;
+              correlations.push_back(
+                  {component.controller_process, incident.incident_id, context,
+                   incident.summary, component.controllable_component_id,
+                   component.ros2_control_runtime_handle, component.bundle,
+                   !incident.diagnostic_snapshot &&
+                       incident.containment_state !=
+                           core::ComponentIncidentContainmentStateDTO::
+                               kPending});
+            };
+            snapshot(*cell);
+            for (auto &peer : cell->participant_compositions)
+              snapshot(*peer);
+          }
+        }
+        // Auxiliary IO is outside composition, CCLC/Kernel and process
+        // observation locks. Operational Stop uses its separate control lane.
+        for (const auto &correlation : correlations) {
+          static_cast<void>(correlation.process->append_incident_correlation(
+              correlation.incident_id, correlation.context,
+              correlation.summary));
+          if (!correlation.needs_snapshot || !correlation.handle ||
+              !correlation.bundle ||
+              correlation.handle->HasControllerProcessIncidentDiagnostic(
+                  correlation.incident_id))
+            continue;
+          const auto exit = correlation.process->exit_evidence();
+          if (!exit)
+            continue;
+          const auto snapshot = ControllerLaunchIncidentSnapshot(
+              *correlation.process, *exit, *correlation.bundle,
+              config.runtime_unit_id, config.runtime_epoch);
+          std::lock_guard lock(managed_composition_mutex);
+          if (!active_managed_composition)
+            continue;
+          const auto installed =
+              IndexNativeComponentCompositions(*active_managed_composition);
+          const auto exact = installed.find(correlation.component_id);
+          if (exact != installed.end() &&
+              exact->second->controller_process == correlation.process &&
+              exact->second->ros2_control_runtime_handle == correlation.handle)
+            static_cast<void>(
+                correlation.handle->CacheControllerProcessIncidentDiagnostic(
+                    correlation.incident_id, snapshot));
+        }
+      } catch (...) {
+        // Diagnostic capture/write failure cannot suppress the primary fault
+        // or break the Manager's ordinary status/liveness protocol.
+      }
+#endif
       Require(source_report_sequence !=
                   std::numeric_limits<std::uint64_t>::max(),
               "managed runtime source sequence is exhausted");
       ++source_report_sequence;
-      SendManagedRuntimePacket(
-          config.manager_channel_fd,
+      auto source_status =
           "manyforge.native-execution-status.v2 " + config.runtime_unit_id +
-              " " + config.runtime_epoch + " " +
-              std::to_string(source_report_sequence) + " 1 serving healthy " +
-              offer_digest + " " + config.product_identity + " " +
-              config.configuration_identity + " " +
-              std::string(SelectedExecutionRuntimeRole()) +
-              " closed_no_active_effect");
+          " " + config.runtime_epoch + " " +
+          std::to_string(source_report_sequence) + " 1 serving healthy " +
+          offer_digest + " " + config.product_identity + " " +
+          config.configuration_identity + " " +
+          std::string(SelectedExecutionRuntimeRole()) +
+          " closed_no_active_effect";
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      const auto host_counts =
+          host_controller_launch_supervisor().host_output_counters();
+      source_status += " dropped_host_notice_lines=" +
+                       std::to_string(host_counts.dropped_forward_lines) +
+                       " dropped_host_notice_bytes=" +
+                       std::to_string(host_counts.dropped_forward_bytes);
+#endif
+      SendManagedRuntimePacket(config.manager_channel_fd, source_status);
       continue;
     }
     if (request == "shutdown") {
@@ -14077,7 +14519,6 @@ private:
       reason_codes.emplace_back(CanonicalValue(reason));
     }
     return CanonicalValue(CanonicalValue::Object{
-        {"command_gate_open", CanonicalValue(snapshot.command_gate_open)},
         {"command_path_ready", CanonicalValue(snapshot.command_path_ready)},
         {"configured", CanonicalValue(snapshot.configured)},
         {"feedback_messages_received",
@@ -14197,10 +14638,23 @@ private:
   ResolveObservationOwner(const core::ProgramBindingId &program_binding_id,
                           const core::TargetRoleId &target_role_id,
                           const core::CapabilityId &capability_id,
-                          const bool motion, Composition &composition) const {
+                          const bool motion, Composition &composition,
+                          std::map<std::string, std::string> *failures = nullptr) const {
     std::optional<ResolvedObservationOwner> match;
     bool ambiguous = false;
     const auto inspect = [&](Composition &candidate) {
+      const auto refuse = [&](std::string phase, const core::ErrorDTO *error = nullptr) {
+        if (failures == nullptr)
+          return;
+        const auto prefix = candidate.controllable_component_id.value() + ".";
+        failures->emplace(prefix + "phase", std::move(phase));
+        if (error != nullptr) {
+          failures->emplace(prefix + "code", error->code);
+          failures->emplace(prefix + "message", error->message);
+          for (const auto &[key, value] : error->details)
+            failures->emplace(prefix + key, value);
+        }
+      };
       const auto channel =
           motion ? (candidate.runtime != nullptr
                         ? candidate.runtime->motion_state_channel
@@ -14212,22 +14666,34 @@ private:
                                     RetainedObservedStateChannel>(
                                     candidate.gripper_runtime->state_channel())
                               : nullptr);
-      if (!channel)
+      if (!channel) {
+        refuse("observation_channel_missing");
         return;
+      }
       const auto physical = channel->binding();
-      if (!physical.value().control_path.has_value())
+      if (!physical.value().control_path.has_value()) {
+        refuse("physical_control_path_missing");
         return;
+      }
       std::vector<core::RuntimeParticipantBinding> representatives;
       if (candidate.runtime != nullptr) {
         const auto configuration =
             candidate.runtime->ReadCurrentPublishedRouteConfiguration(
                 physical.value().control_path->control_domain_id);
-        if (!configuration.ok() || !configuration.value())
+        if (!configuration.ok()) {
+          refuse("current_route_read_failed", &configuration.error());
           return;
+        }
+        if (!configuration.value()) {
+          refuse("current_route_missing");
+          return;
+        }
         const auto selected = candidate.runtime->ReadCurrentPhysicalParticipants(
             *configuration.value());
-        if (!selected.ok())
+        if (!selected.ok()) {
+          refuse("physical_participants_read_failed", &selected.error());
           return;
+        }
         representatives = selected.value();
       } else {
         const auto route = candidate.active_addressed_kernel()
@@ -14241,18 +14707,24 @@ private:
                     .control_path->active_control_configuration_generation ||
             route.value()->active_configuration
                     .active_control_configuration_id !=
-                physical.value().control_path->active_control_configuration_id)
+                physical.value().control_path->active_control_configuration_id) {
+          refuse("current_route_unqualified", route.ok() ? nullptr : &route.error());
           return;
+        }
         representatives.push_back(physical);
       }
       const auto resolved =
           composition.target_resolver->ResolveObservationTarget(
               program_binding_id, target_role_id, capability_id, physical,
               representatives);
-      if (!resolved.ok())
+      if (!resolved.ok()) {
+        refuse("sealed_target_resolution_failed", &resolved.error());
         return;
+      }
       if (match.has_value()) {
         ambiguous = true;
+        if (failures != nullptr)
+          failures->emplace("reason", "observation_owner_ambiguous");
         return;
       }
       match.emplace(ResolvedObservationOwner{&candidate, channel, physical,
@@ -14410,12 +14882,14 @@ private:
         frame_query                ? "model.kinematics.fk"
         : query.grasp_confirmation ? "tool.gripper.confirmation.operator"
                                    : "tool.gripper.feedback");
+    std::map<std::string, std::string> failures;
     const auto owner =
         ResolveObservationOwner(query.program_binding_id, query.target_role_id,
-                                capability_id, frame_query, composition);
+                                capability_id, frame_query, composition, &failures);
     if (!owner.has_value())
       return ErrorResponse("execution_target_observation_unavailable",
-                           "target has no unique qualified observation owner");
+                           "target has no unique qualified observation owner",
+                           std::move(failures));
     auto &selected = *owner->composition;
     const auto &channel = owner->channel;
     const auto &observed_binding = owner->physical;

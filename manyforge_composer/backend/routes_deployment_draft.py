@@ -181,7 +181,6 @@ class UpdateControlledStopRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     profile: dict[str, Any] | None
-    timing: dict[str, Any] | None
 
 
 class UpdateMotionTargetLimitRequest(_LocalFence):
@@ -637,7 +636,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     body.profile,
                     controllable_component_id=body.controllable_component_id,
                     command_target_id=body.command_target_id,
-                    timing=body.timing,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
                 )

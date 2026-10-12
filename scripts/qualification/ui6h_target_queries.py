@@ -2286,9 +2286,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                 )
                 assert arm_terminal["state"] == "succeeded", arm_terminal
                 assert arm_terminal["failed_count"] == 0, arm_terminal
-                assert arm_terminal["acceptance_to_terminal_latency_ns"] <= (
-                    arm_terminal["acceptance"]["fixed_outer_duration_ns"]
-                ), arm_terminal
                 if args.stop_jerk is not None or args.stop_ramp_duration is not None:
                     profiles = [
                         stage["profile"]

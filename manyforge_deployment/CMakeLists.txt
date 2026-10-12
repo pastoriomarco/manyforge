@@ -685,7 +685,6 @@ add_library(manyforge_deployment_verification_core
   src/runtime_contract_registry.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
-  src/retained_stop_deadline_budget.cpp
   src/stop_evidence_policy_codec.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
@@ -1441,6 +1440,11 @@ if(BUILD_TESTING)
   function(manyforge_prepare_maintained_model
       family_id label urdf_path srdf_path package_prefix
       resource_root output_variable)
+    # One spelling per source file: a graph that also adds another package
+    # naming the same model (Q9 aggregate) must not list it twice.
+    get_filename_component(urdf_path "${urdf_path}" REALPATH)
+    get_filename_component(srdf_path "${srdf_path}" REALPATH)
+    get_filename_component(resource_root "${resource_root}" REALPATH)
     set(fixture_root
       "${CMAKE_CURRENT_BINARY_DIR}/generated/${family_id}_structural")
     file(GLOB_RECURSE resource_inputs CONFIGURE_DEPENDS LIST_DIRECTORIES false
@@ -1813,8 +1817,8 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retained_bundle_store PRIVATE
     manyforge_deployment GTest::gtest_main)
-  target_link_options(test_retained_bundle_store PRIVATE
-    "-Wl,--wrap=fsync")
+  # The test defines fsync to inject directory-fsync faults.
+  target_link_libraries(test_retained_bundle_store PRIVATE ${CMAKE_DL_LIBS})
   gtest_discover_tests(test_retained_bundle_store
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
@@ -1953,8 +1957,8 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_link_libraries(test_build_manifest PRIVATE
     manyforge_deployment GTest::gtest_main)
-  target_link_options(test_build_manifest PRIVATE
-    "-Wl,--wrap=fsync")
+  # The test defines fsync to inject directory-fsync faults.
+  target_link_libraries(test_build_manifest PRIVATE ${CMAKE_DL_LIBS})
   gtest_discover_tests(test_build_manifest
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

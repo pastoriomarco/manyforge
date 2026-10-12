@@ -2179,9 +2179,6 @@ void register_model_compiler_bindings(py::module_& module) {
           "logical_stop_symbol",
           &deployment::LogicalStoppableApplicabilityTemplate::
               logical_stop_symbol)
-      .def_readonly(
-          "deadline_budget",
-          &deployment::LogicalStoppableApplicabilityTemplate::deadline_budget)
       .def_property_readonly(
           "escalation_stages",
           [](const deployment::LogicalStoppableApplicabilityTemplate& value) {

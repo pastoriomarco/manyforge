@@ -94,11 +94,9 @@ struct StopScopeResolutionDTO final {
 };
 
 /// One exact predecessor supplied to aggregate acceptance construction. The
-/// acceptance is immutable owner truth; `remaining_outer_duration_ns_at_join`
-/// is freshly sampled under the same Kernel ordering fence as the aggregate.
+/// acceptance is immutable owner truth.
 struct StopAcceptedPredecessorInput final {
   StopAcceptedDTO acceptance;
-  std::int64_t remaining_outer_duration_ns_at_join{};
 };
 
 /// Validates the immutable resolution snapshot, including complete scope for
@@ -140,45 +138,35 @@ struct StopAcceptedPredecessorInput final {
 [[nodiscard]] Result<ContentDigest> ComputeCapturedStopScopeDigest(
     const StopScopeResolutionDTO& resolution);
 
-/// Construct one immutable Stop acceptance from an already-resolved scope and
-/// the exact participant plans retained before dispatch. The constructor
-/// derives both content identities, requires one common outer/reserve budget,
-/// and publishes participant-qualified phase rows without flattening equal
-/// phase spelling across participants.
+/// Construct one immutable Stop acceptance from an already-resolved scope.
+/// The constructor derives both content identities. No Stop budget is
+/// accepted (Q51): each robot's deadlines come from its own profile and lane
+/// at stage dispatch.
 [[nodiscard]] Result<StopAcceptedDTO> MakeStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, std::int64_t remaining_outer_duration_ns,
-    std::int64_t accepted_at_ns, std::span<const PreparedParticipantStopPlanDTO> participant_plans);
+    std::int64_t accepted_at_ns);
 
 [[nodiscard]] Result<StopAcceptedDTO> MakeStopAccepted(
     const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, std::int64_t remaining_outer_duration_ns,
-    std::int64_t accepted_at_ns, std::span<const PreparedParticipantStopPlanDTO> participant_plans);
+    std::int64_t accepted_at_ns);
 
-/// Construct one promoted aggregate Full Stop. Predecessor revisions and
-/// participant rows are inherited exactly and shortened to the aggregate's
-/// earliest deadline; only `newly_affected_operation_revisions` and
-/// `new_participant_plans` describe freshly fenced scope.
+/// Construct one promoted aggregate Full Stop. Predecessor revisions are
+/// inherited exactly; only `newly_affected_operation_revisions` describe
+/// freshly fenced scope.
 [[nodiscard]] Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, std::int64_t proposed_remaining_outer_duration_ns,
-    std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> new_participant_plans,
-    std::span<const StopAcceptedPredecessorInput> predecessors);
+    std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors);
 
 [[nodiscard]] Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
     const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    const StopDeadlineBudgetDTO& fixed_budget, std::int64_t proposed_remaining_outer_duration_ns,
-    std::int64_t accepted_at_ns,
-    std::span<const PreparedParticipantStopPlanDTO> new_participant_plans,
-    std::span<const StopAcceptedPredecessorInput> predecessors);
+    std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors);
 
 }  // namespace manyforge::core

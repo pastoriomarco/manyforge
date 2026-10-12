@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <map>
 #include <mutex>
@@ -1119,9 +1120,10 @@ RetainedGripperCommandBackend::TranslateStopStage(
       stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
       budget.stop_id != stage.stop_id ||
       budget.stop_generation != stage.stop_generation ||
-      budget.remaining_outer_duration_ns <= 0) {
+      budget.elapsed_since_stop_ns < 0 ||
+      budget.remaining_controlled_deadline_ns.has_value()) {
     return failure("resolved_stop_stage_budget_invalid",
-                   "native gripper Stop has no valid remaining Kernel budget");
+                   "native gripper Stop has no valid per-robot Stop timing");
   }
 
   const auto &binding = state_->binding->value();
@@ -1135,11 +1137,6 @@ RetainedGripperCommandBackend::TranslateStopStage(
     exact_resources.push_back(resource.resource_id);
   }
   std::sort(exact_resources.begin(), exact_resources.end());
-  const auto phase = std::find_if(
-      budget.phases.begin(), budget.phases.end(), [&](const auto &candidate) {
-        return candidate.phase_id ==
-               command.containment_command.command_phase_id;
-      });
   if (stage.resources != exact_resources) {
     return failure("resolved_stop_stage_resource_mismatch",
                    "native gripper Stop crosses its exact resource scope");
@@ -1168,14 +1165,12 @@ RetainedGripperCommandBackend::TranslateStopStage(
     return failure("resolved_stop_stage_provider_occurrence_mismatch",
                    "native gripper Stop names another provider occurrence");
   }
-  if (phase == budget.phases.end() ||
-      phase->remaining_deadline_offset_ns <= 0) {
-    return failure("resolved_stop_stage_phase_budget_expired",
-                   "native gripper Stop phase has no remaining budget");
-  }
-  const auto stage_deadline_ns = std::min(
-      saturating_deadline(started_at, budget.remaining_outer_duration_ns),
-      saturating_deadline(started_at, phase->remaining_deadline_offset_ns));
+  // Q58 (as `main`): the gripper's Stop is a fire-and-forget cancel with no
+  // Stop time limit of its own; the bound below only keeps this local state
+  // read/publication from blocking (`main`'s bounded native drain).
+  const auto stage_deadline_ns = saturating_deadline(
+      started_at,
+      static_cast<std::int64_t>(core::kExecutionDrainTimeoutS * 1e9));
   const bool controller_goal_cancel =
       command.containment_command.command_kind ==
       core::StopContainmentCommandKind::kControllerGoalCancel;

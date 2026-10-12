@@ -1262,55 +1262,27 @@ TEST(DeploymentApplicabilityCodec,
       "count exceeds");
 }
 
-TEST(DeploymentApplicabilityCodec,
-     StopTimingIsClosedCanonicalAndPreservesAbsence) {
+TEST(DeploymentApplicabilityCodec, PerBindingStopTimingIsNoLongerAPolicyField) {
+  // Q51/Q53: each robot's Stop timing lives in its own controlled-Stop profile
+  // (`max_stop_time_s`); the cell-wide per-binding timing table is gone and
+  // an older document carrying it is refused, not converted.
   auto policies = interrupt_policy_envelope("", "");
   const auto absent = decode(with_policies(minimal_document(), policies));
-  EXPECT_TRUE(absent.value().stop_timing_parameters.empty());
   EXPECT_EQ(absent.normalized_policies()->find_object_member(
                 "stop_timing_parameters"),
             nullptr);
-  const auto row = [](std::string id, std::string timeout = "3000000000") {
-    return "{\"control_binding_id\":\"" + id +
-           "\",\"control_binding_revision\":\"" + std::string(kZeroDigest) +
-           "\",\"timing\":{\"command_latency_allowance_ns\":250000000,"
-           "\"settling_allowance_ns\":750000000,\"operational_timeout_ns\":" +
-           timeout + "}}";
-  };
-  const auto source = [&](std::string rows) {
-    auto with_timing = policies;
-    with_timing.pop_back();
-    return with_policies(minimal_document(),
-                         with_timing + ",\"stop_timing_parameters\":[" + rows +
-                             "]}");
-  };
-  const auto parsed = decode(source(row("z") + "," + row("a")));
-  ASSERT_EQ(parsed.value().stop_timing_parameters.size(), 2U);
-  EXPECT_EQ(
-      parsed.value().stop_timing_parameters.front().control_binding_id.value(),
-      "a");
-  EXPECT_EQ(parsed.value()
-                .stop_timing_parameters.front()
-                .timing.operational_timeout_ns,
-            3'000'000'000);
-  const auto round_trip = decode(with_policies(
-      minimal_document(), canonical_json(*parsed.normalized_policies())));
-  EXPECT_EQ(round_trip.value().stop_timing_parameters,
-            parsed.value().stop_timing_parameters);
-  expect_decode_error_containing(source(row("a") + "," + row("a")),
-                                 "duplicate control binding timing");
-  // Item 24: a timeout shorter than the profile plus allowances is not an
-  // Apply-time refusal; the Stop deadline watchdog bounds it at run time.
-  EXPECT_EQ(decode(source(row("a", "1000000000")))
-                .value()
-                .stop_timing_parameters.front()
-                .timing.operational_timeout_ns,
-            1'000'000'000);
-  expect_decode_error_containing(source(row("a", "3000000000.5")),
-                                 "I-JSON-safe integer");
-  auto unknown = row("a");
-  unknown.insert(unknown.size() - 1, ",\"other_timeout_ns\":4000000000");
-  expect_decode_error_containing(source(unknown), "unknown field");
+  auto with_timing = policies;
+  with_timing.pop_back();
+  expect_decode_error_containing(
+      with_policies(minimal_document(),
+                    with_timing +
+                        ",\"stop_timing_parameters\":[{\"control_binding_id\":\"a\","
+                        "\"control_binding_revision\":\"" +
+                        std::string(kZeroDigest) +
+                        "\",\"timing\":{\"command_latency_allowance_ns\":250000000,"
+                        "\"settling_allowance_ns\":750000000,"
+                        "\"operational_timeout_ns\":3000000000}}]}"),
+      "unknown field");
 }
 
 } // namespace

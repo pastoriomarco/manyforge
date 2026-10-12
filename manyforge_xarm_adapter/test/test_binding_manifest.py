@@ -90,7 +90,7 @@ def test_binding_manifest_retains_robot_family_but_no_unit_identity_or_address(
             },
             'lite6_traj_controller': {
                 'ros__parameters': {
-                    'command_interfaces': ['position', 'velocity'],
+                    'command_interfaces': ['position'],
                     'state_interfaces': ['position', 'velocity'],
                     'joints': [
                         f'joint{index}' for index in range(1, 7)

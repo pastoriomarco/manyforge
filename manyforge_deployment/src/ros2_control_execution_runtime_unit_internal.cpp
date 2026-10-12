@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -225,10 +227,10 @@ require_artifact(const core::RetainedProductDTO &product,
 
 } // namespace
 
-CanonicalValue ros2_control_execution_runtime_manifest_projection(
+namespace {
+
+CanonicalValue ros2_control_execution_runtime_infrastructure_projection(
     const core::RuntimeUnitDTO &unit) {
-  const CanonicalValue configuration =
-      require_qualified_runtime_configuration(unit.configuration);
   const auto &liveness =
       native_execution_runtime_contract::manager_liveness_policy();
   return CanonicalValue(CanonicalValue::Object{
@@ -239,7 +241,7 @@ CanonicalValue ros2_control_execution_runtime_manifest_projection(
       {"runtime_product_id",
        CanonicalValue(
            ros2_control_execution_runtime_product_id(unit.runtime_unit_id))},
-      {"configuration", configuration},
+      {"configuration", CanonicalValue(CanonicalValue::Object{})},
       {"manager_liveness_policy",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_policy_id",
@@ -361,6 +363,19 @@ CanonicalValue ros2_control_execution_runtime_manifest_projection(
   });
 }
 
+} // namespace
+
+CanonicalValue ros2_control_execution_runtime_manifest_projection(
+    const core::RuntimeUnitDTO &unit) {
+  static_cast<void>(require_qualified_runtime_configuration(unit.configuration));
+  if (unit.runtime_profile_id.value() != kRos2ControlExecutionRuntimeProfileId ||
+      unit.runtime_profile_revision.value() != ros2_control_execution_runtime_profile_revision() ||
+      !unit.dependency_runtime_unit_ids.empty()) {
+    fail_retained_bundle("runtime unit differs from the stable ROS execution profile");
+  }
+  return ros2_control_execution_runtime_infrastructure_projection(unit);
+}
+
 std::string ros2_control_execution_runtime_profile_document() {
   CanonicalValue identity(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.runtime_profile.v1")},
@@ -426,6 +441,37 @@ std::string ros2_control_execution_runtime_profile_revision() {
   return revision;
 }
 
+void require_no_exclusive_ros_controller_topic_collision(
+    const CanonicalValue::Array &controller_profiles) {
+  // Existing lite6/ur10e profile facts: both use these global command/state
+  // topics. Adding a profile with different topics must extend these facts.
+  std::map<std::string_view, std::string> owners;
+  for (const auto &row : controller_profiles) {
+    const auto *isaac = row.find_object_member("isaac_profile");
+    if (isaac == nullptr)
+      continue;
+    if (!isaac->is_string() ||
+        (isaac->as_string() != "lite6" && isaac->as_string() != "ur10e")) {
+      fail_retained_bundle("unsupported Isaac controller profile");
+    }
+    const auto *component = row.find_object_member("controllable_component_id");
+    if (component == nullptr || !component->is_string()) {
+      fail_retained_bundle(
+          "ROS controller profile lacks its component identity");
+    }
+    for (const std::string_view topic :
+         {"/isaac_joint_commands", "/isaac_joint_states"}) {
+      const auto [owner, inserted] =
+          owners.emplace(topic, component->as_string());
+      if (!inserted) {
+        fail_retained_bundle("exclusive Isaac topic collision between " +
+                             owner->second + " and " + component->as_string() +
+                             ": " + std::string(topic));
+      }
+    }
+  }
+}
+
 bool ros2_control_execution_runtime_configuration_is_qualified(
     const core::JsonObjectDTO &configuration) noexcept {
   try {
@@ -446,7 +492,8 @@ std::string ros2_control_execution_runtime_implementation_revision() {
       "planner-scene-projection-v1;logical-scene-services-v1;"
       "build-owned-candidate-worker;runtime-contract-offer-correlation-v2;"
       "retained-manager-liveness-receiver-v2;isolated-manager-liveness-transport-v1;"
-      "fenced-initial-aggregate-installation-v1;managed-startup-without-home-motion-v1");
+      "fenced-initial-aggregate-installation-v1;managed-startup-without-home-motion-v1;"
+      "component-owned-frame-prefix-v1;infrastructure-only-runtime-manifest-v1");
 }
 
 std::string ros2_control_execution_runtime_process_adapter_revision() {
@@ -547,10 +594,9 @@ CanonicalValue parse_and_verify_ros2_control_execution_runtime_manifest(
       require_member(object, "configuration",
                      "ros2_control_execution_runtime_manifest"),
       "ros2_control_execution_runtime_manifest.configuration");
-  if (!ros2_control_execution_runtime_configuration_is_qualified(
-          configuration)) {
-    fail_retained_bundle("ros2_control execution runtime manifest has an "
-                         "unqualified configuration");
+  if (!configuration.empty()) {
+    fail_retained_bundle("ros2_control execution runtime manifest configuration "
+                         "must be infrastructure-only");
   }
   const core::RuntimeUnitDTO expected{
       core::RuntimeUnitId(runtime_unit_id),
@@ -570,7 +616,7 @@ CanonicalValue parse_and_verify_ros2_control_execution_runtime_manifest(
         "ros2_control runtime embedded offer differs from package offer");
   }
   if (api != kRos2ControlExecutionRuntimeManifestApiVersion ||
-      root != ros2_control_execution_runtime_manifest_projection(expected)) {
+      root != ros2_control_execution_runtime_infrastructure_projection(expected)) {
     fail_retained_bundle("ros2_control execution runtime manifest differs "
                          "from its closed contract");
   }
@@ -669,6 +715,125 @@ void require_ros2_control_execution_runtime_product_matches_retained_bundle(
 } // namespace manyforge::deployment::detail
 
 namespace manyforge::deployment::ros2_control_execution_runtime_contract {
+namespace {
+
+[[noreturn]] void fail_fault_profile(const std::string_view reason) {
+  throw RetainedBundleError(
+      "ros2_control runtime fault Stop profile is invalid: " +
+      std::string(reason));
+}
+
+[[nodiscard]] const core::JsonValueDTO *
+fault_member(const core::JsonObjectDTO &row, const std::string_view name) {
+  const auto found = row.find(name);
+  return found == row.end() ? nullptr : &found->second;
+}
+
+[[nodiscard]] const std::string &
+fault_text(const core::JsonObjectDTO &row, const std::string_view name) {
+  const auto *value = fault_member(row, name);
+  const auto *text =
+      value == nullptr ? nullptr : std::get_if<std::string>(&value->value);
+  if (text == nullptr) {
+    fail_fault_profile(std::string(name) + " is absent");
+  }
+  return *text;
+}
+
+[[nodiscard]] std::optional<bool>
+fault_boolean(const core::JsonObjectDTO &row, const std::string_view name) {
+  const auto *value = fault_member(row, name);
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  const auto *flag = std::get_if<bool>(&value->value);
+  if (flag == nullptr) {
+    fail_fault_profile(std::string(name) + " is not boolean");
+  }
+  return *flag;
+}
+
+// Decodes `main`'s authored `default_fault_stop_profile` fields as `main`'s
+// kernel-config parser did, without deriving anything from the operator
+// profile. Omitted natural completion is normalized as every authored Stop
+// profile is (true only for soft_on_path; `main` honoured it only there).
+[[nodiscard]] Configuration::FaultStopProfile
+decode_fault_stop_profile(const core::JsonValueDTO &encoded) {
+  const auto *row = std::get_if<core::JsonObjectDTO>(&encoded.value);
+  if (row == nullptr) {
+    fail_fault_profile("row is not an object");
+  }
+  Configuration::FaultStopProfile result{
+      core::ControllableComponentId(
+          fault_text(*row, "controllable_component_id")),
+      core::CommandTargetId(fault_text(*row, "command_target_id")),
+      {}};
+  auto &profile = result.profile;
+  profile.profile_id = fault_text(*row, "profile_id");
+  const auto &mode = fault_text(*row, "stop_mode");
+  if (mode == "soft_on_path") {
+    profile.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
+  } else if (mode == "spring_back_hold") {
+    profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  } else if (mode == "hard_deceleration") {
+    profile.stop_mode = core::MotionInterruptStopMode::kHardDeceleration;
+  } else {
+    fail_fault_profile("stop_mode is unsupported");
+  }
+  if (const auto *value = fault_member(*row, "deceleration_time_s")) {
+    const auto *number = std::get_if<double>(&value->value);
+    if (number == nullptr) {
+      fail_fault_profile("deceleration_time_s is not a number");
+    }
+    profile.deceleration_time_s = *number;
+  }
+  if (const auto *value =
+          fault_member(*row, "per_joint_max_deceleration_rad_s2")) {
+    const auto *limits = std::get_if<core::JsonValueDTO::Array>(&value->value);
+    if (limits == nullptr) {
+      fail_fault_profile("per_joint_max_deceleration_rad_s2 is not an array");
+    }
+    for (const auto &limit : *limits) {
+      const auto *joint_row = std::get_if<core::JsonObjectDTO>(&limit.value);
+      const auto *magnitude =
+          joint_row == nullptr
+              ? nullptr
+              : fault_member(*joint_row, "max_deceleration_rad_s2");
+      const auto *number = magnitude == nullptr
+                               ? nullptr
+                               : std::get_if<double>(&magnitude->value);
+      if (number == nullptr ||
+          !profile.per_joint_max_deceleration
+               .emplace(fault_text(*joint_row, "source_joint_name"),
+                        core::CoordinateAccelerationDTO{
+                            core::AngularAccelerationDTO{*number}})
+               .second) {
+        fail_fault_profile("per-joint deceleration rows are invalid");
+      }
+    }
+  }
+  const bool controlled =
+      profile.stop_mode != core::MotionInterruptStopMode::kHardDeceleration;
+  const auto natural_completion =
+      fault_boolean(*row, "allow_natural_completion_on_short_path");
+  if (!controlled && natural_completion.has_value()) {
+    fail_fault_profile(
+        "hard_deceleration forbids allow_natural_completion_on_short_path");
+  }
+  profile.allow_natural_completion_on_short_path =
+      natural_completion.value_or(
+          profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath);
+  profile.require_backend_confirmation =
+      fault_boolean(*row, "require_backend_confirmation").value_or(true);
+  profile.jerk_limits_enabled = controlled;
+  if (const auto error = core::motion_interrupt_stop_profile_field_error(profile);
+      !error.empty()) {
+    fail_fault_profile(error);
+  }
+  return result;
+}
+
+} // namespace
 
 Configuration
 require_configuration(const RetainedBundle &retained_bundle,
@@ -751,19 +916,86 @@ require_configuration(const RetainedBundle &retained_bundle,
   };
 
   const auto *mode = std::get_if<std::string>(&require_member("mode").value);
-  const auto *profile =
-      std::get_if<std::string>(&require_member("isaac_profile").value);
+  const auto *profiles = std::get_if<core::JsonValueDTO::Array>(
+      &require_member("controller_profiles").value);
   const auto *positions = std::get_if<core::JsonValueDTO::Array>(
       &require_member("initial_joint_positions_rad").value);
-  if (mode == nullptr || *mode != "commanded_sim" || profile == nullptr ||
-      (*profile != "lite6" && *profile != "ur10e") ||
-      positions == nullptr || positions->empty()) {
+  if (mode == nullptr || *mode != "commanded_sim" || profiles == nullptr ||
+      profiles->empty() || positions == nullptr || positions->empty()) {
     throw RetainedBundleError("ros2_control runtime configuration has an "
                               "unsupported mode, profile, or initial state");
   }
 
+  const auto canonical_configuration =
+      detail::json_object_to_canonical(unit.configuration);
+  detail::require_no_exclusive_ros_controller_topic_collision(
+      canonical_configuration.find_object_member("controller_profiles")
+          ->as_array());
   Configuration result;
-  result.isaac_profile = *profile;
+  if (const auto found = unit.configuration.find("isaac_world");
+      found != unit.configuration.end()) {
+    const auto *world = std::get_if<std::string>(&found->second.value);
+    if (world == nullptr || world->empty()) {
+      throw RetainedBundleError(
+          "ros2_control isaac_world must be a portable identifier");
+    }
+    result.isaac_world = *world;
+  }
+  // Q68: one controller profile per hosted component, exactly one lane each.
+  for (const auto &row : *profiles) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+    const auto text = [&](const std::string_view name)
+        -> std::optional<std::string> {
+      if (object == nullptr) return std::nullopt;
+      const auto found = object->find(name);
+      if (found == object->end()) return std::nullopt;
+      const auto *value = std::get_if<std::string>(&found->second.value);
+      if (value == nullptr || value->empty()) {
+        throw RetainedBundleError(
+            "ros2_control runtime configuration has an invalid controller "
+            "profile");
+      }
+      return *value;
+    };
+    std::string frame_prefix;
+    if (object != nullptr) {
+      if (const auto found = object->find("frame_prefix"); found != object->end()) {
+        const auto *value = std::get_if<std::string>(&found->second.value);
+        if (value == nullptr) {
+          throw RetainedBundleError("ros2_control frame_prefix must be a string");
+        }
+        frame_prefix = *value;
+      }
+    }
+    const auto component = text("controllable_component_id");
+    auto isaac = text("isaac_profile");
+    auto mock = text("mock_profile");
+    if (!component.has_value() || isaac.has_value() == mock.has_value() ||
+        object->size() != (object->contains("frame_prefix") ? 3U : 2U) ||
+        (isaac.has_value() && *isaac != "lite6" && *isaac != "ur10e") ||
+        (mock.has_value() && *mock != "lite6_lite_gripper" &&
+         *mock != "ur10e_robotiq_2f_140" && *mock != "ur5_roboplan" &&
+         *mock != "ur5e_robotiq_2f_85")) {
+      throw RetainedBundleError("ros2_control runtime configuration has an "
+                                "unsupported mode, profile, or initial state");
+    }
+    result.controller_profiles.push_back(Configuration::ControllerProfile{
+        core::ControllableComponentId(*component), std::move(isaac),
+        std::move(mock), std::move(frame_prefix)});
+  }
+  if (!result.isaac_world.has_value() &&
+      std::any_of(result.controller_profiles.begin(),
+                  result.controller_profiles.end(), [](const auto &profile) {
+                    return profile.isaac_profile.has_value();
+                  })) {
+    throw RetainedBundleError(
+        "isaac_world is required when a component uses an Isaac profile");
+  }
+  std::sort(result.controller_profiles.begin(), result.controller_profiles.end(),
+            [](const auto &left, const auto &right) {
+              return left.controllable_component_id <
+                     right.controllable_component_id;
+            });
   const auto *motion_limits = std::get_if<core::JsonValueDTO::Array>(
       &require_member("motion_target_limits").value);
   if (motion_limits == nullptr || motion_limits->empty()) {
@@ -792,6 +1024,72 @@ require_configuration(const RetainedBundle &retained_bundle,
     throw RetainedBundleError(
         "ros2_control runtime must contain exactly one TCP-speed "
         "maximum for every motion target and no unknown target");
+  }
+  std::set<core::ControllableComponentId> hosted_components;
+  for (const auto &[component, target] : expected) {
+    static_cast<void>(target);
+    hosted_components.insert(component);
+  }
+  std::set<core::ControllableComponentId> profiled_components;
+  for (const auto &profile : result.controller_profiles) {
+    if (!profiled_components.insert(profile.controllable_component_id).second) {
+      throw RetainedBundleError(
+          "ros2_control runtime repeats a component controller profile");
+    }
+  }
+  if (profiled_components != hosted_components) {
+    throw RetainedBundleError(
+        "ros2_control runtime must select exactly one controller profile for "
+        "every hosted component and no unknown component");
+  }
+  if (const auto found =
+          unit.configuration.find("gripper_target_configurations");
+      found != unit.configuration.end()) {
+    const auto *rows =
+        std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+    if (rows == nullptr) {
+      throw RetainedBundleError(
+          "ros2_control runtime configuration has invalid gripper target "
+          "configurations");
+    }
+    result.gripper_target_configurations =
+        detail::decode_execution_gripper_target_configurations(
+            *rows, "ros2_control runtime configuration");
+    for (const auto &gripper : result.gripper_target_configurations) {
+      const bool hosted = std::any_of(
+          retained_bundle.value().cell_graph.control_bindings.begin(),
+          retained_bundle.value().cell_graph.control_bindings.end(),
+          [&](const auto &binding) {
+            return binding.provider_runtime_unit_id == runtime_unit_id &&
+                   binding.capability_id.value() == "tool.gripper.command" &&
+                   binding.controllable_component_id ==
+                       gripper.controllable_component_id &&
+                   binding.command_target_id == gripper.command_target_id;
+          });
+      if (!hosted) {
+        throw RetainedBundleError(
+            "ros2_control runtime gripper configuration names a target this "
+            "unit does not host");
+      }
+    }
+  }
+  if (const auto found = unit.configuration.find("default_fault_stop_profiles");
+      found != unit.configuration.end()) {
+    const auto *rows = std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+    if (rows == nullptr) {
+      throw RetainedBundleError(
+          "ros2_control runtime has invalid default_fault_stop_profiles");
+    }
+    for (const auto &row : *rows) {
+      auto decoded = decode_fault_stop_profile(row);
+      if (!expected.contains({decoded.controllable_component_id,
+                              decoded.command_target_id})) {
+        throw RetainedBundleError(
+            "ros2_control runtime fault Stop profile names no hosted motion "
+            "target");
+      }
+      result.default_fault_stop_profiles.push_back(std::move(decoded));
+    }
   }
   result.planner_rng_seed = require_uint32("planner_rng_seed");
   result.execution_tick_hz = require_uint32("execution_tick_hz");
@@ -833,6 +1131,89 @@ require_configuration(const RetainedBundle &retained_bundle,
         "ros2_control runtime configuration has invalid collision cadences");
   }
   return result;
+}
+
+Configuration require_component_configuration(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id) {
+  auto result = require_configuration(bundle, runtime_unit_id);
+  // Reuse the native exact binding-resource ownership and aggregate ordering.
+  native_execution_runtime_contract::Configuration motion;
+  motion.initial_joint_positions_rad = result.initial_joint_positions_rad;
+  motion.motion_target_limits = result.motion_target_limits;
+  motion.gripper_target_configurations = result.gripper_target_configurations;
+  motion = detail::select_native_component_configuration(
+      std::move(motion), bundle.value().cell_graph, runtime_unit_id, component_id);
+  result.initial_joint_positions_rad = std::move(motion.initial_joint_positions_rad);
+  result.motion_target_limits = std::move(motion.motion_target_limits);
+  result.gripper_target_configurations = std::move(motion.gripper_target_configurations);
+  const auto unrelated = [&](const auto &row) {
+    return row.controllable_component_id != component_id;
+  };
+  std::erase_if(result.controller_profiles, unrelated);
+  std::erase_if(result.default_fault_stop_profiles, unrelated);
+  if (std::none_of(result.controller_profiles.begin(),
+                   result.controller_profiles.end(), [](const auto &profile) {
+                     return profile.isaac_profile.has_value();
+                   })) {
+    result.isaac_world.reset();
+  }
+  return result;
+}
+
+CanonicalValue component_configuration_projection(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id) {
+  const auto selected = require_component_configuration(bundle, runtime_unit_id, component_id);
+  const auto *graph = bundle.normalized_root().find_object_member("cell_graph");
+  const auto *units = graph == nullptr ? nullptr : graph->find_object_member("runtime_units");
+  if (units == nullptr || !units->is_array()) {
+    throw RetainedBundleError("ROS component configuration lacks its verified graph");
+  }
+  for (const auto &unit : units->as_array()) {
+    const auto *id = unit.find_object_member("runtime_unit_id");
+    if (id == nullptr || !id->is_string() || id->as_string() != runtime_unit_id.value()) continue;
+    const auto *configuration = unit.find_object_member("configuration");
+    if (configuration == nullptr || !configuration->is_object()) {
+      throw RetainedBundleError("ROS component configuration lacks its verified settings");
+    }
+    auto result = configuration->as_object();
+    if (!selected.isaac_world.has_value()) {
+      std::erase_if(result,
+                    [](const auto &row) { return row.first == "isaac_world"; });
+    }
+    for (auto &[name, value] : result) {
+      if (name == "initial_joint_positions_rad") {
+        CanonicalValue::Array positions;
+        for (const auto position : selected.initial_joint_positions_rad) positions.emplace_back(position);
+        value = CanonicalValue(std::move(positions));
+      } else if (name == "controller_profiles" || name == "motion_target_limits" ||
+                 name == "default_fault_stop_profiles" || name == "gripper_target_configurations") {
+        CanonicalValue::Array rows;
+        for (const auto &row : value.as_array()) {
+          const auto *owner = row.find_object_member("controllable_component_id");
+          if (owner == nullptr || !owner->is_string()) {
+            throw RetainedBundleError("ROS target configuration has no component owner");
+          }
+          if (owner->as_string() == component_id.value()) rows.push_back(row);
+        }
+        value = CanonicalValue(std::move(rows));
+      }
+    }
+    return CanonicalValue(std::move(result));
+  }
+  throw RetainedBundleError("ROS component configuration has no runtime projection");
+}
+
+const Configuration::ControllerProfile *
+find_controller_profile(const Configuration &configuration,
+                        const core::ControllableComponentId &component_id) {
+  const auto found = std::find_if(
+      configuration.controller_profiles.begin(),
+      configuration.controller_profiles.end(), [&](const auto &profile) {
+        return profile.controllable_component_id == component_id;
+      });
+  return found == configuration.controller_profiles.end() ? nullptr : &*found;
 }
 
 std::string implementation_revision() {

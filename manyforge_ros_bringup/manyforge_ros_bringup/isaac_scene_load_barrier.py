@@ -137,6 +137,7 @@ class IsaacSceneLoadBarrier(Node):
         self.declare_parameter("world_uri", "")
         self.declare_parameter("expected_world_name", "")
         self.declare_parameter("require_existing_world", False)
+        self.declare_parameter("passive_join", False)
         self.declare_parameter("startup_timeout_s", 120.0)
         self.declare_parameter("service_timeout_s", 30.0)
         self.declare_parameter("required_topics", Parameter.Type.STRING_ARRAY)
@@ -149,6 +150,7 @@ class IsaacSceneLoadBarrier(Node):
         self.require_existing_world = bool(
             self.get_parameter("require_existing_world").value
         )
+        self.passive_join = bool(self.get_parameter("passive_join").value)
         self.startup_timeout_s = float(
             self.get_parameter("startup_timeout_s").value
         )
@@ -181,6 +183,8 @@ class IsaacSceneLoadBarrier(Node):
     def run(self) -> dict[str, Any]:
         startup_deadline = time.monotonic() + self.startup_timeout_s
         services = self._wait_for_services(startup_deadline)
+        if self.passive_join:
+            return self._run_passive_join(services, startup_deadline)
         startup_error: Exception | None = None
         observed_features: set[int] = set()
         observed_topics: list[str] = []
@@ -208,8 +212,8 @@ class IsaacSceneLoadBarrier(Node):
 
             if not self.require_existing_world:
                 request = LoadWorld.Request()
-                request.uri = self.world_uri
-                request.resource_string = ""
+                request.world_resource.uri = self.world_uri
+                request.world_resource.resource_string = ""
                 request.fail_on_unsupported_element = True
                 request.ignore_missing_or_unsupported_assets = False
                 loaded = self._call(
@@ -324,21 +328,68 @@ class IsaacSceneLoadBarrier(Node):
             "features": sorted(observed_features),
         }
 
+    def _run_passive_join(
+        self, services: dict[str, str], deadline: float
+    ) -> dict[str, Any]:
+        # Q84: this branch has no load, playback or stopped-state cleanup,
+        # including failures. Robot holding remains downstream in CCLC.
+        features = self._call(
+            services["features"],
+            GetSimulatorFeatures,
+            GetSimulatorFeatures.Request(),
+            deadline=deadline,
+        ).features
+        observed_features = {int(value) for value in features.features}
+        if int(SimulatorFeatures.WORLD_INFO_GETTING) not in observed_features:
+            raise RuntimeError("Isaac simulation adapter lacks world-info feature")
+        current = self._call(
+            services["current_world"],
+            GetCurrentWorld,
+            GetCurrentWorld.Request(),
+            deadline=deadline,
+        )
+        self._require_ok(current.result, operation="GetCurrentWorld")
+        if not world_readback_matches(
+            current.world,
+            expected_uri=self.world_uri,
+            expected_name=self.expected_world_name,
+        ):
+            raise RuntimeError("GetCurrentWorld readback differs from passive join world")
+        observed_topics = self._wait_for_required_topics(deadline)
+        return {
+            "schema_version": RESULT_SCHEMA,
+            "world_name": self.expected_world_name,
+            "world_uri": self.world_uri,
+            "simulation_state": "unchanged",
+            "services": services,
+            "required_topics": list(self.required_topics),
+            "readiness_probe": {
+                "mode": "passive",
+                "observed_topics": observed_topics,
+            },
+            "features": sorted(observed_features),
+        }
+
     def _wait_for_services(self, deadline: float) -> dict[str, str]:
+        service_types = (
+            {key: _SERVICE_TYPES[key] for key in ("features", "current_world")}
+            if self.passive_join
+            else _SERVICE_TYPES
+        )
         last_services: dict[str, str] = {}
         while time.monotonic() < deadline:
             graph = self.get_service_names_and_types()
             selected = {
                 key: select_service_name(graph, service_type=value)
-                for key, value in _SERVICE_TYPES.items()
+                for key, value in service_types.items()
             }
             last_services = {
                 key: value for key, value in selected.items() if value is not None
             }
-            if len(last_services) == len(_SERVICE_TYPES):
+            if len(last_services) == len(service_types):
                 return last_services
             time.sleep(0.05)
-        missing_services = sorted(set(_SERVICE_TYPES) - set(last_services))
+        missing_services = sorted(set(service_types) - set(last_services))
         raise TimeoutError(
             "Isaac simulation-control readiness timed out; missing services="
             f"{missing_services}"

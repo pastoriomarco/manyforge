@@ -31,13 +31,14 @@ void register_interrupt_bindings(py::module_& module) {
 
   py::class_<MotionInterruptStopProfileDTO>(module, "MotionInterruptStopProfileDTO")
       .def(py::init<std::string, MotionInterruptStopMode, std::optional<double>,
-                    std::map<std::string, CoordinateAccelerationDTO>, bool,
+                    std::optional<double>, std::map<std::string, CoordinateAccelerationDTO>, bool,
                     std::optional<MotionInterruptStopMode>, bool,
                     std::optional<std::map<std::string, CoordinateVelocityDTO>>,
                     InterruptStructuredValue, std::optional<bool>,
                     std::map<std::string, CoordinateJerkDTO>>(),
            py::arg("profile_id"), py::arg("stop_mode"),
            py::arg("deceleration_time_s") = std::nullopt,
+           py::arg("max_stop_time_s") = std::nullopt,
            py::arg("per_joint_max_deceleration") =
                std::map<std::string, CoordinateAccelerationDTO>{},
            py::arg("allow_natural_completion_on_short_path") = false,
@@ -50,6 +51,7 @@ void register_interrupt_bindings(py::module_& module) {
       .def_readwrite("profile_id", &MotionInterruptStopProfileDTO::profile_id)
       .def_readwrite("stop_mode", &MotionInterruptStopProfileDTO::stop_mode)
       .def_readwrite("deceleration_time_s", &MotionInterruptStopProfileDTO::deceleration_time_s)
+      .def_readwrite("max_stop_time_s", &MotionInterruptStopProfileDTO::max_stop_time_s)
       .def_readwrite("per_joint_max_deceleration",
                      &MotionInterruptStopProfileDTO::per_joint_max_deceleration)
       .def_readwrite("allow_natural_completion_on_short_path",
