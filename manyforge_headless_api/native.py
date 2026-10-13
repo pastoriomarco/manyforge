@@ -87,6 +87,7 @@ class HeadlessApiConfig:
     activation_preparer_capability_root: Path | None = None
     activation_preparer_activation_root: Path | None = None
     activation_preparer_timeout_seconds: float = 120.0
+    canonical_empty_admission_filename: Path | None = None
 
     def __post_init__(self) -> None:
         path_values = (
@@ -189,6 +190,12 @@ class HeadlessApiConfig:
                 raise ValueError("Activation preparer capabilities must be absolute")
         if not 0 < self.activation_preparer_timeout_seconds <= 300:
             raise ValueError("activation_preparer_timeout_seconds must be in (0, 300]")
+        if self.canonical_empty_admission_filename is not None and (
+            self.canonical_empty_admission_filename.is_absolute()
+            or self.canonical_empty_admission_filename.name in {"", ".", ".."}
+            or len(self.canonical_empty_admission_filename.parts) != 1
+        ):
+            raise ValueError("canonical-empty admission filename must be root-local")
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError("maximum_request_body_bytes must be between 1024 and 1048576")
 

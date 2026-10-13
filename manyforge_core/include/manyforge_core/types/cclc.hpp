@@ -8,6 +8,7 @@ namespace manyforge::core {
 enum class CCLCRequestKindDTO : std::uint8_t {
   kComponentLifecycle = 0,
   kRouteSelection,
+  kLifecycleTargetRetirement,
 };
 
 }  // namespace manyforge::core

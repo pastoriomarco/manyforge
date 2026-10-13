@@ -1303,6 +1303,7 @@ create_retained_native_runtime_participants(
       std::move(input.direct_control_joint_limits);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
+  runtime->prepare_measured_sources = std::move(input.prepare_measured_sources);
   runtime->kinematic_model = std::make_shared<RetainedKinematicModelProxy>(
       make_retained_motion_model_generation(
           runtime->motion_binding, std::move(input.scene),
@@ -2701,6 +2702,441 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
       readback.value()->active_configuration);
 }
 
+namespace {
+
+template <typename Value>
+core::Result<Value> measured_source_unavailable(std::string reason,
+                                                std::string message) {
+  return core::Result<Value>::Err({"runtime_measured_source_unavailable",
+                                   std::move(message),
+                                   {{"reason", std::move(reason)}}});
+}
+
+// Caller holds the existing cell route-publication exclusion. Include every
+// registered domain, not just the operation's selected motion participant.
+using MeasuredRouteReadbacks = std::vector<
+    std::pair<core::ControlDomainId,
+              std::optional<core::RuntimeRouteConfigurationReadbackDTO>>>;
+
+core::Result<MeasuredRouteReadbacks>
+measured_route_readbacks(const RetainedNativeRuntime &runtime) {
+  using Result = core::Result<MeasuredRouteReadbacks>;
+  const auto *root = runtime.cell_runtime_root != nullptr
+                         ? runtime.cell_runtime_root
+                         : &runtime;
+  auto *kernel = root->active_addressed_kernel();
+  if (kernel == nullptr)
+    return measured_source_unavailable<MeasuredRouteReadbacks>(
+        "measured_kernel_missing", "Measured routes have no current Kernel");
+  std::set<core::ControlDomainId> domains;
+  const auto add = [&](const auto &binding) {
+    if (binding.value().control_path)
+      domains.insert(binding.value().control_path->control_domain_id);
+  };
+  for (const auto &row : root->participant_registrations)
+    add(row.binding);
+  for (const auto &row : runtime.control_binding_representatives)
+    add(row);
+  add(runtime.motion_binding);
+  if (runtime.gripper_binding)
+    add(*runtime.gripper_binding);
+  MeasuredRouteReadbacks result;
+  result.reserve(domains.size());
+  for (const auto &domain : domains) {
+    auto current = kernel->current_runtime_route_configuration(domain);
+    if (!current.ok())
+      return Result::Err(current.error());
+    // Missing route truth remains part of the authenticated closure. It does
+    // not make an unrelated component's existing route publication fail.
+    result.emplace_back(domain, std::move(current.value()));
+  }
+  return Result::Ok(std::move(result));
+}
+
+std::vector<core::ActiveControlConfigurationDTO>
+measured_configurations(const MeasuredRouteReadbacks &readbacks) {
+  std::vector<core::ActiveControlConfigurationDTO> result;
+  result.reserve(readbacks.size());
+  for (const auto &[domain, row] : readbacks)
+    if (row)
+      result.push_back(row->active_configuration);
+  return result;
+}
+
+bool measured_physical_scope_matches(
+    const RetainedNativeRuntime &runtime,
+    const core::RuntimeParticipantBinding &motion,
+    const std::optional<core::RuntimeParticipantBinding> &gripper,
+    const std::vector<core::RuntimeParticipantBinding> &representatives) {
+  if (runtime.motion_binding.value() != motion.value() ||
+      runtime.gripper_binding.has_value() != gripper.has_value() ||
+      (gripper && runtime.gripper_binding->value() != gripper->value()) ||
+      runtime.control_binding_representatives.size() != representatives.size())
+    return false;
+  for (std::size_t i = 0; i < representatives.size(); ++i)
+    if (runtime.control_binding_representatives[i].value() !=
+        representatives[i].value())
+      return false;
+  return true;
+}
+
+core::Result<void> validate_prepared_measured_sources(
+    const RetainedPreparedRobotMeasuredSources &prepared,
+    const core::RuntimeParticipantBinding &motion,
+    const std::optional<core::RuntimeParticipantBinding> &gripper,
+    const std::vector<core::ActiveControlConfigurationDTO> &configurations) {
+  const auto unavailable = [] {
+    return measured_source_unavailable<void>(
+        "measured_prepared_scope_mismatch",
+        "Prepared sources cross their physical route");
+  };
+  if (!prepared.enable_publication ||
+      prepared.source_view.component_id !=
+          motion.value().controllable_component_id)
+    return unavailable();
+  for (const auto &source : prepared.source_view.sources) {
+    auto valid = source.descriptor.validate();
+    if (!valid.ok())
+      return valid;
+    const auto &query = source.descriptor.publication.query_context;
+    const auto matches = [&](const core::RuntimeParticipantBinding &binding) {
+      const auto &value = binding.value();
+      if (!value.control_path)
+        return false;
+      const auto &path = *value.control_path;
+      if (query.controllable_component_id != value.controllable_component_id ||
+          query.command_target_id != value.command_target_id ||
+          query.capability_id != value.capability_id ||
+          query.control_domain_id != path.control_domain_id ||
+          query.control_domain_revision != path.control_domain_revision ||
+          query.control_binding_id != path.control_binding_id ||
+          query.control_binding_revision != path.control_binding_revision ||
+          query.controller_topology_id != path.controller_topology_id ||
+          query.topology_revision != path.topology_revision ||
+          query.control_route_id != path.control_route_id ||
+          query.control_interface_contract_id !=
+              path.control_interface_contract_id ||
+          query.control_interface_revision != path.control_interface_revision ||
+          query.active_control_configuration_id !=
+              path.active_control_configuration_id ||
+          query.active_control_configuration_generation !=
+              path.active_control_configuration_generation ||
+          query.provider_instance_id != path.provider_instance_id ||
+          query.provider_manifest_id != path.provider_manifest_id ||
+          query.provider_manifest_revision != path.provider_manifest_revision ||
+          query.runtime_epoch != path.provider_runtime_epoch ||
+          query.resources.size() != value.resources.size())
+        return false;
+      for (std::size_t i = 0; i < value.resources.size(); ++i) {
+        const auto &resource = value.resources[i];
+        if (query.resources[i] != resource.resource_id ||
+            query.joint_names[i] != resource.compiled_resource_name ||
+            query.coordinate_kinds[i] != resource.coordinate_kind ||
+            !resource.source_joint_name ||
+            source.descriptor.source_joint_names[i] !=
+                *resource.source_joint_name)
+          return false;
+      }
+      return std::any_of(
+          configurations.begin(), configurations.end(),
+          [&](const auto &configuration) {
+            return configuration.control_domain_id == path.control_domain_id &&
+                   configuration.control_domain_revision ==
+                       path.control_domain_revision &&
+                   configuration.active_control_configuration_id ==
+                       path.active_control_configuration_id &&
+                   configuration.active_control_configuration_generation ==
+                       path.active_control_configuration_generation &&
+                   configuration.controller_topology_id ==
+                       path.controller_topology_id &&
+                   configuration.topology_revision == path.topology_revision &&
+                   configuration.activation_set_id == path.activation_set_id &&
+                   configuration.source_runtime_unit_id ==
+                       path.provider_runtime_unit_id &&
+                   configuration.source_runtime_epoch ==
+                       path.provider_runtime_epoch &&
+                   configuration.state ==
+                       core::ActiveControlConfigurationStateDTO::kReconciled &&
+                   std::any_of(configuration.binding_routes.begin(),
+                               configuration.binding_routes.end(),
+                               [&](const auto &route) {
+                                 return route.control_binding_id ==
+                                            path.control_binding_id &&
+                                        route.control_binding_revision ==
+                                            path.control_binding_revision &&
+                                        route.control_route_id ==
+                                            path.control_route_id;
+                               });
+          });
+    };
+    if (!matches(motion) && !(gripper && matches(*gripper)))
+      return unavailable();
+  }
+  return core::Result<void>::Ok();
+}
+
+void enable_prepared_measured_sources(
+    const RetainedPreparedRobotMeasuredSources &prepared) noexcept {
+  // Composition supplies the actual no-throw gate. A throwing callback violates
+  // that construction contract and cannot become a partial association commit.
+  prepared.enable_publication();
+}
+
+core::Result<void> validate_measured_readiness_snapshot(
+    const RetainedNativeRuntime &runtime,
+    const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,
+    const MeasuredRouteReadbacks &readbacks) {
+  const auto unavailable = [] {
+    return measured_source_unavailable<void>(
+        "measured_snapshot_association_mismatch",
+        "Readiness snapshot has no exact current physical route association");
+  };
+  if (!snapshot.locally_valid() ||
+      snapshot.controllable_component_id !=
+          runtime.motion_binding.value().controllable_component_id)
+    return unavailable();
+  const auto &publication = snapshot.active_publication_receipt.request;
+  std::set<core::ControlDomainId> domains;
+  for (const auto &binding : runtime.control_binding_representatives) {
+    const auto &value = binding.value();
+    if (value.controllable_component_id != snapshot.controllable_component_id ||
+        value.retained_bundle_id != publication.candidate_retained_bundle_id ||
+        value.graph_revision != publication.candidate_graph_revision ||
+        !value.control_path)
+      return unavailable();
+    domains.insert(value.control_path->control_domain_id);
+  }
+  if (domains.size() != snapshot.domains.size() ||
+      domains.size() != snapshot.provider_occurrences.size())
+    return unavailable();
+  for (const auto &scope : snapshot.domains) {
+    if (!domains.contains(scope.control_domain_id))
+      return unavailable();
+    const auto current =
+        std::find_if(readbacks.begin(), readbacks.end(), [&](const auto &row) {
+          return row.first == scope.control_domain_id;
+        });
+    if (current == readbacks.end() || !current->second)
+      return unavailable();
+    const auto &readback = *current->second;
+    if (!scope.active_control_configuration ||
+        *scope.active_control_configuration != readback.active_configuration ||
+        scope.control_domain_revision !=
+            readback.active_configuration.control_domain_revision ||
+        scope.controller_topology_id !=
+            readback.active_configuration.controller_topology_id ||
+        scope.topology_revision !=
+            readback.active_configuration.topology_revision ||
+        readback.active_configuration.state !=
+            core::ActiveControlConfigurationStateDTO::kReconciled ||
+        !readback.operation_admission_open)
+      return unavailable();
+    std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
+    std::vector<core::ResourceId> resources;
+    for (const auto &representative : runtime.control_binding_representatives) {
+      const auto &value = representative.value();
+      const auto &path = *value.control_path;
+      if (path.control_domain_id != scope.control_domain_id)
+        continue;
+      bindings.push_back({path.control_binding_id,
+                          path.control_binding_revision,
+                          path.control_route_id});
+      for (const auto &resource : value.resources)
+        resources.push_back(resource.resource_id);
+      const auto provider = std::find_if(
+          snapshot.provider_occurrences.begin(),
+          snapshot.provider_occurrences.end(), [&](const auto &row) {
+            return row.control_domain_id == path.control_domain_id &&
+                   row.control_domain_revision ==
+                       path.control_domain_revision &&
+                   row.provider_instance_id == path.provider_instance_id &&
+                   row.provider_manifest_id == path.provider_manifest_id &&
+                   row.provider_manifest_revision ==
+                       path.provider_manifest_revision &&
+                   row.provider_runtime_unit_id ==
+                       path.provider_runtime_unit_id &&
+                   row.provider_runtime_epoch == path.provider_runtime_epoch;
+          });
+      if (provider == snapshot.provider_occurrences.end())
+        return unavailable();
+      const auto readiness = std::find_if(
+          readback.readiness_rows.begin(), readback.readiness_rows.end(),
+          [&](const auto &row) {
+            return row.controllable_component_id ==
+                       value.controllable_component_id &&
+                   row.component_lifecycle_generation ==
+                       snapshot.component_lifecycle_generation &&
+                   row.control_binding_id == path.control_binding_id &&
+                   row.control_binding_revision ==
+                       path.control_binding_revision;
+          });
+      if (readiness == readback.readiness_rows.end())
+        return unavailable();
+    }
+    std::sort(bindings.begin(), bindings.end(),
+              [](const auto &a, const auto &b) {
+                return a.control_binding_id < b.control_binding_id;
+              });
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()),
+                    resources.end());
+    if (bindings != scope.current_control_bindings ||
+        resources != scope.current_resources)
+      return unavailable();
+  }
+  return core::Result<void>::Ok();
+}
+
+} // namespace
+
+core::Result<core::RobotMeasuredStateSourceView>
+RetainedNativeRuntime::PrepareCurrentMeasuredSources() {
+  using Result = core::Result<core::RobotMeasuredStateSourceView>;
+  // Owning holders precede the exclusion so every return/exception releases
+  // subscriptions and their shared clocks only after the route lock retires.
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> previous;
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> candidate;
+  RetainedRobotMeasuredSourcePreparer preparer;
+  auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::unique_lock lock(root->route_publication_mutex_);
+  if (!prepare_measured_sources)
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_preparer_missing",
+        "The runtime has no measured producer preparer");
+  try {
+    preparer = prepare_measured_sources;
+    previous = prepared_measured_sources_;
+    const auto motion = motion_binding;
+    const auto gripper = gripper_binding;
+    const auto representatives = control_binding_representatives;
+    auto readbacks = measured_route_readbacks(*this);
+    if (!readbacks.ok())
+      return Result::Err(readbacks.error());
+    auto configurations = measured_configurations(readbacks.value());
+    lock.unlock();
+    auto staged = preparer(motion, gripper, configurations);
+    if (!staged.ok())
+      return Result::Err(staged.error());
+    candidate = std::move(staged.value());
+    std::optional<core::RobotMeasuredStateSourceView> source_view;
+    if (candidate) {
+      auto valid = validate_prepared_measured_sources(*candidate, motion,
+                                                      gripper, configurations);
+      if (!valid.ok())
+        return Result::Err(valid.error());
+      source_view = candidate->source_view;
+    }
+    if ((cell_runtime_root != nullptr ? cell_runtime_root : this) != root)
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_source_association_changed",
+          "Measured cell root changed while preparing sources");
+    lock.lock();
+    auto current = measured_route_readbacks(*this);
+    if (!current.ok())
+      return Result::Err(current.error());
+    if (prepared_measured_sources_ != previous ||
+        !measured_physical_scope_matches(*this, motion, gripper,
+                                         representatives) ||
+        current.value() != readbacks.value())
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_source_association_changed",
+          "Measured route changed while preparing sources");
+    prepared_measured_sources_.swap(candidate);
+    if (prepared_measured_sources_)
+      enable_prepared_measured_sources(*prepared_measured_sources_);
+    lock.unlock();
+    if (!source_view)
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_prepared_sources_missing",
+          "Current measured sources are unavailable");
+    return Result::Ok(std::move(*source_view));
+  } catch (const std::exception &exception) {
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_source_preparation_failed", exception.what());
+  } catch (...) {
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_source_preparation_failed",
+        "Measured source preparation failed");
+  }
+}
+
+core::Result<core::ComponentLifecycleReadinessSourceView>
+RetainedNativeRuntime::CaptureReadinessSources(
+    const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,
+    const std::shared_ptr<RetainedNativeRuntime> &owning_runtime) const {
+  using Result = core::Result<core::ComponentLifecycleReadinessSourceView>;
+  if (!owning_runtime || owning_runtime.get() != this)
+    return measured_source_unavailable<
+        core::ComponentLifecycleReadinessSourceView>(
+        "measured_runtime_owner_mismatch",
+        "Readiness needs this exact owning runtime");
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> prepared;
+  auto *root =
+      cell_runtime_root != nullptr ? cell_runtime_root : owning_runtime.get();
+  std::lock_guard lock(root->route_publication_mutex_);
+  try {
+    prepared = prepared_measured_sources_;
+    if (!prepared)
+      return measured_source_unavailable<
+          core::ComponentLifecycleReadinessSourceView>(
+          "measured_current_sources_missing",
+          "Current measured sources are unavailable");
+    auto readbacks = measured_route_readbacks(*this);
+    if (!readbacks.ok())
+      return Result::Err(readbacks.error());
+    auto valid = validate_measured_readiness_snapshot(*this, snapshot,
+                                                      readbacks.value());
+    if (!valid.ok())
+      return Result::Err(valid.error());
+    valid = validate_prepared_measured_sources(
+        *prepared, motion_binding, gripper_binding,
+        measured_configurations(readbacks.value()));
+    if (!valid.ok())
+      return Result::Err(valid.error());
+    core::ComponentLifecycleReadinessSourceView result{
+        prepared->source_view,
+        [owning_runtime, prepared, root, motion = motion_binding,
+         gripper = gripper_binding,
+         representatives = control_binding_representatives,
+         expected_readbacks = std::move(readbacks.value()),
+         snapshot]() -> core::Result<void> {
+          // The existing product context pins the actual cell owner as well as
+          // this runtime. Never lock an association retired to another root.
+          if ((owning_runtime->cell_runtime_root != nullptr
+                   ? owning_runtime->cell_runtime_root
+                   : owning_runtime.get()) != root)
+            return measured_source_unavailable<void>(
+                "measured_source_association_changed",
+                "Measured cell root is no longer current");
+          std::lock_guard current_lock(root->route_publication_mutex_);
+          if (owning_runtime->prepared_measured_sources_ != prepared ||
+              !measured_physical_scope_matches(*owning_runtime, motion, gripper,
+                                               representatives))
+            return measured_source_unavailable<void>(
+                "measured_source_association_changed",
+                "Captured measured sources are no longer current");
+          auto current = measured_route_readbacks(*owning_runtime);
+          if (!current.ok())
+            return core::Result<void>::Err(current.error());
+          if (current.value() != expected_readbacks)
+            return measured_source_unavailable<void>(
+                "measured_source_association_changed",
+                "Captured Kernel route readback changed");
+          return validate_measured_readiness_snapshot(*owning_runtime, snapshot,
+                                                      current.value());
+        }};
+    return Result::Ok(std::move(result));
+  } catch (const std::exception &exception) {
+    return measured_source_unavailable<
+        core::ComponentLifecycleReadinessSourceView>(
+        "measured_source_capture_failed", exception.what());
+  } catch (...) {
+    return measured_source_unavailable<
+        core::ComponentLifecycleReadinessSourceView>(
+        "measured_source_capture_failed", "Measured source capture failed");
+  }
+}
+
 bool RetainedNativeRuntime::GripperSourceIsCurrent(
     const core::RuntimeParticipantBinding &source) const {
   if (!gripper || !source.value().control_path.has_value() ||
@@ -2781,8 +3217,15 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       return (*peer)->PublishAndReadBackRouteConfiguration(
           configuration, std::move(participants));
   }
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+      candidate_measured_sources;
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+      previous_measured_sources;
+  RetainedRobotMeasuredSourcePreparer measured_preparer;
+  core::RuntimeParticipantAdmissionResolver staged_root_resolver;
+  core::RuntimeParticipantAdmissionResolver displaced_local_resolver;
   auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
-  std::lock_guard lock(cell_root->route_publication_mutex_);
+  std::unique_lock lock(cell_root->route_publication_mutex_);
   auto *const kernel = addressed_kernel != nullptr ? addressed_kernel.get()
                                                     : cell_addressed_kernel;
   if (kernel == nullptr || participant_engine == nullptr) {
@@ -3015,7 +3458,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           gripper_stop_execution_port, std::nullopt));
     }
 
-    const auto local_registrations = registrations;
+    auto local_registrations = registrations;
     auto cell_participants = compose_cell_participants(
         *this, registrations, next_motion, next_gripper);
     registrations = std::move(cell_participants.registrations);
@@ -3053,10 +3496,64 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     auto kernel_resolver = make_kernel_participant_resolver(
         std::move(binding_resolver), std::move(cell_physical_registrations));
+    if (cell_root != this)
+      staged_root_resolver = kernel_resolver;
 
-    const auto transition_time_ns = clock->now();
     const auto old_motion = motion_binding;
     const auto old_gripper = gripper_binding;
+    const auto old_representatives = control_binding_representatives;
+    if (prepare_measured_sources) {
+      measured_preparer = prepare_measured_sources;
+      previous_measured_sources = prepared_measured_sources_;
+      auto before = measured_route_readbacks(*this);
+      if (!before.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            before.error());
+      auto configurations = measured_configurations(before.value());
+      const auto selected = std::find_if(
+          configurations.begin(), configurations.end(), [&](const auto &row) {
+            return row.control_domain_id == configuration.control_domain_id;
+          });
+      if (selected == configurations.end())
+        configurations.push_back(configuration);
+      else
+        *selected = configuration;
+      lock.unlock();
+      auto staged =
+          measured_preparer(next_motion, next_gripper, configurations);
+      if (!staged.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            staged.error());
+      candidate_measured_sources = std::move(staged.value());
+      if (candidate_measured_sources) {
+        auto valid = validate_prepared_measured_sources(
+            *candidate_measured_sources, next_motion, next_gripper,
+            configurations);
+        if (!valid.ok())
+          return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+              valid.error());
+      }
+      if ((cell_runtime_root != nullptr ? cell_runtime_root : this) !=
+          cell_root)
+        return measured_source_unavailable<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "measured_source_association_changed",
+            "Measured cell root changed while staging a successor");
+      lock.lock();
+      auto current = measured_route_readbacks(*this);
+      if (!current.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            current.error());
+      if (prepared_measured_sources_ != previous_measured_sources ||
+          !measured_physical_scope_matches(*this, old_motion, old_gripper,
+                                           old_representatives) ||
+          current.value() != before.value())
+        return measured_source_unavailable<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "measured_source_association_changed",
+            "Measured route changed while staging a successor");
+    }
+    const auto transition_time_ns = clock->now();
     bool motion_rebound = false;
     bool gripper_rebound = false;
     const auto rollback_physical_route = [&]() noexcept {
@@ -3185,19 +3682,25 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     gripper_binding_aliases = std::move(next_gripper_aliases);
     control_binding_representatives = std::move(next_representatives);
     if (cell_root == this) {
-      participant_registrations = registrations;
+      participant_registrations.swap(registrations);
     } else {
-      participant_registrations = local_registrations;
-      cell_root->participant_registrations = registrations;
+      participant_registrations.swap(local_registrations);
+      cell_root->participant_registrations.swap(registrations);
     }
-    participant_resolver = std::move(kernel_resolver);
+    participant_resolver.swap(kernel_resolver);
+    displaced_local_resolver.swap(kernel_resolver);
     if (cell_root != this) {
-      cell_root->participant_resolver = participant_resolver;
+      cell_root->participant_resolver.swap(staged_root_resolver);
     }
     if (cell_root->cell_runtime_owner != nullptr) {
       cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
           std::move(stable_cell_registrations),
           std::move(stable_cell_resolver));
+    }
+    if (measured_preparer) {
+      prepared_measured_sources_.swap(candidate_measured_sources);
+      if (prepared_measured_sources_)
+        enable_prepared_measured_sources(*prepared_measured_sources_);
     }
 
     return readback;
@@ -4252,7 +4755,9 @@ void attach_retained_native_addressed_owner(
 
 std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
-                               RetainedNativeRuntimeConfig config) {
+                               RetainedNativeRuntimeConfig config,
+                               std::shared_ptr<WallClock> shared_clock,
+                               std::shared_ptr<SimpleScheduler> shared_scheduler) {
   RetainedNativeAddressedOwnerConfig owner_config{
       std::move(config.request_owner_epoch),
       std::move(config.cell_id),
@@ -4264,8 +4769,9 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       std::move(config.cell_admission_settlement_validator),
       std::move(config.cell_admission_reconcile_validator),
       std::move(config.manager_liveness_required_set)};
-  auto runtime = create_retained_native_runtime_participants(std::move(input),
-                                                             std::move(config));
+  auto runtime = create_retained_native_runtime_participants(
+      std::move(input), std::move(config), std::move(shared_clock),
+      std::move(shared_scheduler));
   attach_retained_native_addressed_owner(runtime, std::move(owner_config));
   return runtime;
 }

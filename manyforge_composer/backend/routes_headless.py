@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetirementIntent
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -20,9 +21,13 @@ from manyforge_headless_api.control_protocol import (
     is_stop_command,
 )
 from manyforge_headless_api.models import (
+    CanonicalEmptyActivationPreparationRequest,
+    ManagerDeploymentCandidatePreviewRequest,
+    ManagerApplyRequest,
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
+    ComponentProcessStopBody,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     OperationControlRequest,
@@ -309,6 +314,38 @@ def create_headless_router(
     def manager_status() -> dict[str, Any]:
         return _call(client.manager_status)
 
+    @router.post("/api/activation-preparations")
+    def prepare_canonical_empty(body: CanonicalEmptyActivationPreparationRequest) -> dict[str, Any]:
+        return _call(lambda: client.prepare_activation(body.model_dump(mode="json")))
+
+    @router.post("/api/manager/deployment-candidates/preview")
+    def preview_manager_candidate(body: ManagerDeploymentCandidatePreviewRequest) -> dict[str, Any]:
+        return _call(lambda: client.manager_deployment_candidate_preview(body.model_dump(mode="json")))
+
+    @router.post("/api/manager/apply")
+    def apply_manager_candidate(body: ManagerApplyRequest) -> dict[str, Any]:
+        return _call(lambda: client.manager_apply(body.model_dump(mode="json")))
+
+    @router.get("/api/manager/canonical-empty-selection")
+    def canonical_empty_selection() -> dict[str, Any]:
+        return _call(client.canonical_empty_selection)
+
+    @router.get("/api/cclc/targets/retirement-offer")
+    def lifecycle_target_retirement_offer() -> dict[str, Any]:
+        return _call(client.lifecycle_target_retirement_offer)
+
+    @router.post("/api/cclc/targets/retire")
+    def retire_lifecycle_targets(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
+        return _call(lambda: client.retire_lifecycle_targets(body.model_dump(mode="json")))
+
+    @router.post("/api/cclc/targets/retire/result")
+    def lifecycle_target_retirement_result(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
+        return _call(lambda: client.lifecycle_target_retirement_result(body.model_dump(mode="json")))
+
+    @router.post("/api/cclc/targets/settlement")
+    def lifecycle_owner_settlement(body: LifecycleOwnerSettlementRequest) -> dict[str, Any]:
+        return _call(lambda: client.lifecycle_owner_settlement(body.model_dump(mode="json")))
+
     @router.get("/api/manager/graph")
     def manager_graph() -> dict[str, Any]:
         return _call(client.manager_graph)
@@ -333,11 +370,35 @@ def create_headless_router(
     ) -> dict[str, Any]:
         return _call(lambda: client.cclc_route_templates(component_id))
 
+    @router.get("/api/cclc/components/{component_id}/process/stop-offer")
+    def component_process_stop_offer(component_id: Annotated[str, Path(min_length=1, max_length=128)]) -> dict[str, Any]:
+        return _call(lambda: client.component_process_stop_offer(component_id))
+
+    @router.post("/api/cclc/components/{component_id}/process/stop")
+    def stop_component_process(
+        component_id: Annotated[str, Path(min_length=1, max_length=128)],
+        body: ComponentProcessStopBody,
+    ) -> dict[str, Any]:
+        if component_id != body.request.controllable_component_id:
+            raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "Process Stop component path does not match its request", "details": {}, "request_id": body.request.request_context.request_id})
+        return _call(lambda: client.stop_component_process(component_id, body.model_dump(mode="json")))
+
+    @router.post("/api/cclc/components/{component_id}/process/stop/result")
+    def component_process_stop_result(
+        component_id: Annotated[str, Path(min_length=1, max_length=128)],
+        body: ComponentProcessStopBody,
+    ) -> dict[str, Any]:
+        if component_id != body.request.controllable_component_id:
+            raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "Process Stop component path does not match its request", "details": {}, "request_id": body.request.request_context.request_id})
+        return _call(lambda: client.component_process_stop_result(component_id, body.model_dump(mode="json")))
+
     @router.post("/api/cclc/lifecycle/requests")
     def cclc_lifecycle_submit(
         body: ComponentLifecycleRequest,
     ) -> dict[str, Any]:
         payload = body.model_dump(mode="json")
+        if payload.get("close_incident_recovery") is None:
+            payload.pop("close_incident_recovery", None)
         if payload.get("program_node_evidence") is None:
             payload.pop("program_node_evidence", None)
         return _call(lambda: client.submit_component_lifecycle(payload))
@@ -353,6 +414,8 @@ def create_headless_router(
         body: ComponentLifecycleRequest,
     ) -> dict[str, Any]:
         payload = body.model_dump(mode="json")
+        if payload.get("close_incident_recovery") is None:
+            payload.pop("close_incident_recovery", None)
         if payload.get("program_node_evidence") is None:
             payload.pop("program_node_evidence", None)
         return _call(lambda: client.component_lifecycle_request_result(payload))

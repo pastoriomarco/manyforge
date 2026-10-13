@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import hashlib
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -95,7 +96,9 @@ def _applied_activation_order(stack: ProcessStack) -> list[str]:
         order = selected["activationOrder"]
         assert order is not None, selected
         applied = headless.program_applied_status()
-        assert selected["scenarioId"] == applied["scenario_id"], (selected, applied)
+        origin = applied["origin"]
+        assert origin["kind"] == "scenario", applied
+        assert selected["scenarioId"] == origin["scenario_id"], (selected, applied)
         assert selected["deploymentRevision"] == applied["deployment_revision"], (selected, applied)
         assert order["retainedBundleId"] == applied["retained_bundle_id"], (order, applied)
         assert order["graphRevision"] == applied["graph_revision"], (order, applied)
@@ -179,14 +182,127 @@ def _activate_loaded_components(stack: ProcessStack) -> list[str]:
     component_ids = _applied_activation_order(stack)
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
+
+        def wait_ready(initial: dict[str, Any], intent: str, requested: str) -> None:
+            identity_fields = (
+                "controllable_component_id", "retained_bundle_id", "graph_revision",
+                "publication_generation", "active_public_pointer_digest",
+                "component_lifecycle_generation", "component_lifecycle_state",
+                "provider_occurrences", "domains",
+            )
+            identity = {key: initial[key] for key in identity_fields}
+            start_wallclock = time.time()
+            started = time.monotonic()
+            deadline = started + 20.0
+            trace: list[dict[str, Any]] = []
+            trace_dropped = 0
+            previous_facts = None
+            while True:
+                assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
+                current = headless.cclc_component(initial["controllable_component_id"])
+                assert {key: current[key] for key in identity_fields} == identity, current
+                readiness = current["readiness"]
+                assert readiness["request_owner_epoch"] == owner_epoch, current
+                assert readiness["next_intent"] == intent, current
+                assert readiness["requested_state"] == requested, current
+                assert type(readiness["ready"]) is bool, current
+                error = readiness.get("error") or {}
+                observed_codes = {
+                    "ready": readiness["ready"],
+                    "error_code": str(error.get("code", "")),
+                    "error_reason": str((error.get("details") or {}).get("reason", "")),
+                    "domain_codes": [str((row.get("error") or {}).get("code", ""))
+                                     for row in readiness.get("domains", [])],
+                    "measured_code": str(((readiness.get("measured_state") or {}).get("error") or {}).get("code", "")),
+                }
+                facts = json.dumps(observed_codes, sort_keys=True, separators=(",", ":"))
+                if facts != previous_facts:
+                    error = readiness.get("error") or {}
+                    trace.append({
+                        "elapsed_seconds": time.monotonic() - started,
+                        "facts_sha256": hashlib.sha256(facts.encode()).hexdigest(),
+                        "ready": readiness["ready"],
+                        "error_code": str(error.get("code", ""))[:256],
+                        "error_reason": str((error.get("details") or {}).get("reason", ""))[:256],
+                        "domain_codes": [code[:256] for code in observed_codes["domain_codes"][:64]],
+                        "measured_code": observed_codes["measured_code"][:256],
+                    })
+                    if len(trace) > 64:
+                        trace.pop(0)
+                        trace_dropped += 1
+                    previous_facts = facts
+                if readiness["ready"]:
+                    return
+                assert readiness["error"] is not None, current
+                if time.monotonic() >= deadline:
+                    encoded = json.dumps(current, sort_keys=True, separators=(",", ":")).encode()
+                    evidence: dict[str, Any] = {
+                        "start_wallclock_seconds": start_wallclock,
+                        "join_identity": identity,
+                        "request_owner_epoch": owner_epoch,
+                        "provider_runtime_epochs": [row.get("runtime_epoch")
+                                                    for row in current["provider_occurrences"]],
+                        "intent": intent, "requested_state": requested,
+                        "snapshot_sha256": hashlib.sha256(encoded).hexdigest(),
+                        "snapshot_bytes": len(encoded), "truncated": False,
+                        "change_trace": trace, "trace_dropped_count": trace_dropped,
+                        "snapshot": current,
+                    }
+                    cap = 256 * 1024
+                    payload = json.dumps(evidence, sort_keys=True).encode()
+                    if len(payload) > cap:
+                        del evidence["snapshot"]
+                        evidence["truncated"] = True
+                        # Bound identity too; its complete hash remains in the
+                        # receipt when the last exact body exceeds the cap.
+                        identity_bytes = json.dumps(identity, sort_keys=True).encode()
+                        evidence["join_identity_sha256"] = hashlib.sha256(identity_bytes).hexdigest()
+                        evidence["join_identity"] = str(identity)[:4096]
+                        epochs_bytes = json.dumps(evidence["provider_runtime_epochs"], sort_keys=True).encode()
+                        evidence["provider_runtime_epochs_sha256"] = hashlib.sha256(epochs_bytes).hexdigest()
+                        evidence["provider_runtime_epochs"] = str(evidence["provider_runtime_epochs"])[:4096]
+                        evidence["snapshot_utf8_prefix"] = encoded[: cap // 4].decode("utf-8", errors="replace")
+                        payload = json.dumps(evidence, sort_keys=True).encode()
+                        while len(payload) > cap and evidence["snapshot_utf8_prefix"]:
+                            evidence["snapshot_utf8_prefix"] = evidence["snapshot_utf8_prefix"][:len(evidence["snapshot_utf8_prefix"]) // 2]
+                            payload = json.dumps(evidence, sort_keys=True).encode()
+                        while len(payload) > cap and evidence["change_trace"]:
+                            evidence["change_trace"].pop(0)
+                            evidence["trace_dropped_count"] += 1
+                            payload = json.dumps(evidence, sort_keys=True).encode()
+                    assert len(payload) <= cap, "readiness evidence exceeded its byte cap"
+                    evidence_path = stack.root / "readiness-last-snapshot.json"
+                    evidence_path.write_bytes(payload)
+                    summary = str({
+                        "component_id": initial["controllable_component_id"],
+                        "state": current["component_lifecycle_state"],
+                        "intent": intent, "requested_state": requested,
+                        "ready": observed_codes["ready"],
+                        "error_code": observed_codes["error_code"][:128],
+                        "reason": observed_codes["error_reason"][:256],
+                        "domain_codes": str(observed_codes["domain_codes"])[:512],
+                        "measured_code": observed_codes["measured_code"][:128],
+                        "evidence": str(evidence_path),
+                        "snapshot_sha256": evidence["snapshot_sha256"],
+                        "truncated": evidence["truncated"],
+                    })[:2048]
+                    raise AssertionError(summary)
+                # Match useCCLC.ts POLL_INTERVAL_MS=250; retain the same bound.
+                time.sleep(0.25)
+
         for component_id in component_ids:
             before = headless.cclc_component(component_id)
+            assert before["controllable_component_id"] == component_id, before
             state = before["component_lifecycle_state"]
             if state == "active":
                 continue  # Unchanged Active owners never cycle on config-only Apply.
             assert state in {"declared", "disabled", "prepared"}, before
             if state != "prepared":
+                wait_ready(before, "prepare", "prepared")
                 _component_lifecycle(stack, component_id, "prepare", owner_epoch)
+                before = headless.cclc_component(component_id)
+                assert before["component_lifecycle_state"] == "prepared", before
+            wait_ready(before, "enable", "active")
             _component_lifecycle(stack, component_id, "enable", owner_epoch)
         assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
     assert _applied_activation_order(stack) == component_ids
@@ -369,10 +485,13 @@ def _load_scenario(
             assert applied["executable"] is False
             assert applied["program_binding_id"] is None
             assert applied["non_executable"]["unresolved_roles"]
-        assert applied["scenario_id"] == scenario_id
+        origin = applied if executable else applied["origin"]
+        if not executable:
+            assert origin["kind"] == "scenario", applied
+        assert origin["scenario_id"] == scenario_id
         return (
             applied,
-            applied["source_document_digest"],
+            origin["source_document_digest"],
         )
 
 
@@ -529,6 +648,7 @@ def _start_run(
         draft = composer.request("GET", "/api/program/draft")["program"]
         for attempt in range(8):
             try:
+                stack.wait_authoring_admission(expected_allowed=True)
                 return composer.program_run_start(
                     {
                         "request_id": f"ui6i.{scenario_id}.run.{attempt}",
@@ -541,9 +661,6 @@ def _start_run(
                             "record_digest"
                         ],
                         "draft_program_revision": draft["program_revision"],
-                        "expected_admission_generation": stack.wait_authoring_admission(
-                            expected_allowed=True
-                        )["admission_generation"],
                     }
                 )
             except HeadlessClientError as error:
@@ -1631,7 +1748,47 @@ def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
     def configured_inactive(status: dict[str, Any], *, initial: bool, preserved: dict[str, Any]) -> None:
         _assert_stored_authoring_apply_without_linked_children(stack, status)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            snapshots = [headless.cclc_component(component) for component in component_ids]
+            snapshots = []
+            for component in component_ids:
+                read_started_wallclock = time.time()
+                try:
+                    snapshots.append(headless.cclc_component(component))
+                except HeadlessClientError as error:
+                    # Preserve the already-read error body and original failure;
+                    # no new GET, retry or change to configured-state assertions.
+                    encoded = json.dumps(error.response, sort_keys=True, separators=(",", ":")).encode()
+                    digest = hashlib.sha256(encoded).hexdigest()
+                    evidence_path = stack.root / "readiness-last-snapshot.json"
+                    evidence = {
+                        "component_id": component,
+                        "start_wallclock_seconds": read_started_wallclock,
+                        "error_response_sha256": digest,
+                        "error_response_bytes": len(encoded),
+                        "truncated": False,
+                        "error_response": error.response,
+                    }
+                    cap = 256 * 1024
+                    payload = json.dumps(evidence, sort_keys=True).encode()
+                    if len(payload) > cap:
+                        del evidence["error_response"]
+                        evidence["truncated"] = True
+                        evidence["error_response_utf8_prefix"] = encoded[:cap // 4].decode("utf-8", errors="replace")
+                        payload = json.dumps(evidence, sort_keys=True).encode()
+                        while len(payload) > cap:
+                            evidence["error_response_utf8_prefix"] = evidence["error_response_utf8_prefix"][:len(evidence["error_response_utf8_prefix"]) // 2]
+                            payload = json.dumps(evidence, sort_keys=True).encode()
+                    try:
+                        evidence_path.write_bytes(payload)
+                    except OSError as evidence_error:
+                        error.add_note(f"CCLC error evidence write failed: {str(evidence_error)[:256]}")
+                    error.add_note(str({
+                        "component_id": component,
+                        "already_read_response": encoded[:1024].decode("utf-8", errors="replace"),
+                        "error_response_sha256": digest,
+                        "truncated": evidence["truncated"],
+                        "evidence": str(evidence_path),
+                    })[:2048])
+                    raise
             for current in snapshots:
                 assert current["component_lifecycle_state"] == ("declared" if initial else "disabled"), current
                 if initial:

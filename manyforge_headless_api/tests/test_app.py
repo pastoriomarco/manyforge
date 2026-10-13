@@ -305,9 +305,9 @@ def _applied_program_status_projection() -> dict[str, Any]:
         "program_revision": "sha256:" + "4" * 64,
         "record_digest": "sha256:" + "5" * 64,
         "retained_bundle_id": "sha256:" + "8" * 64,
-        "scenario_id": "cell-pick",
+        "origin": {"kind": "scenario", "scenario_id": "cell-pick",
+                   "source_document_digest": "sha256:" + "6" * 64},
         "schema_version": "manyforge.applied_program_status.v2",
-        "source_document_digest": "sha256:" + "6" * 64,
     }
 
 
@@ -820,9 +820,9 @@ class FakeManager:
             "ok": True,
             "phase": "accepted",
             "prepared_activation": {
-                "schema_version": "manyforge.prepared_activation_input.v5",
-                "scenario_id": "scenario.1",
-                "source_document_digest": "sha256:" + "1" * 64,
+                "schema_version": "manyforge.prepared_activation_input.v6",
+                "origin": {"kind": "scenario", "scenario_id": "scenario.1",
+                           "source_document_digest": "sha256:" + "1" * 64},
                 "captured_input_digest": "sha256:" + "d" * 64,
                 "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "b" * 64,
@@ -1580,9 +1580,9 @@ class FakeActivationPreparer:
     def prepare(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(copy.deepcopy(kwargs))
         return {
-            "schema_version": "manyforge.prepared_activation_input.v5",
-            "source_document_digest": kwargs["source_document_digest"],
-            "scenario_id": kwargs["scenario_id"],
+            "schema_version": "manyforge.prepared_activation_input.v6",
+            "origin": {"kind": "scenario", "scenario_id": kwargs["scenario_id"],
+                       "source_document_digest": kwargs["source_document_digest"]},
             "captured_input_digest": kwargs["captured_input_digest"],
             "prepared_activation_id": "sha256:" + "6" * 64,
             "deployment_artifact_id": "cell_a",
@@ -2078,6 +2078,64 @@ def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
     assert diff["observed_units"] == observed
 
 
+@pytest.mark.parametrize("code,status", [
+    ("program_run_started_then_failed", 422),
+    ("program_run_superseded_by_stop", 422),
+    ("program_run_stopped_before_start", 409),
+    ("authoring_not_ready", 409),
+    ("program_cycle_reconciliation_required", 503),
+    ("program_runner_internal_error", 500),
+])
+def test_program_started_then_failed_preserves_owner_status_and_details(
+    code: str, status: int,
+) -> None:
+    details = {
+        "program_run_id": "program-cycle.2",
+        "claim_generation": 9,
+        "needs_reset": True,
+        "cause_code": "component_lifecycle_facts_stale",
+        "admission_changed": True,
+        "expected_admission_generation": 36,
+        "observed_admission_generation": 37,
+    }
+
+    class FailedStartRunner(FakeProgramRunner):
+        def start_run(self, body: dict[str, Any]) -> dict[str, Any]:
+            raise ProgramRunnerClientError(
+                code,
+                "Owner outcome",
+                status,
+                details=details,
+            )
+
+    core = FakeCore()
+    core.applied_program = _applied_for_program_run()
+    client = TestClient(
+        create_app(
+            service=_service(core, FakeManager(), program_runner=FailedStartRunner())
+        )
+    )
+    with client:
+        response = client.post(
+            "/api/program/runs",
+            json={
+                **_caller(),
+                "scenario_id": "cell-pick",
+                "source_document_digest": "sha256:" + "6" * 64,
+                "expected_applied_record_digest": "sha256:" + "5" * 64,
+                "draft_program_revision": core.applied_program["program_revision"],
+            },
+        )
+    assert response.status_code == status
+    error = response.json()["detail"]
+    assert error == {
+        "code": code,
+        "message": "Owner outcome",
+        "details": details,
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
 def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     runner = FakeProgramRunner()
     core = FakeCore()
@@ -2096,7 +2154,6 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": core.applied_program["program_revision"],
-        "expected_admission_generation": _ADMISSION_GENERATION,
     }
     stop_body = {
         **_caller(),
@@ -2205,7 +2262,6 @@ def test_non_executable_program_refuses_execute_but_not_manual_control() -> None
         "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": "sha256:" + "7" * 64,
-        "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
     with client:
@@ -2242,7 +2298,6 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
         "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": source["record_digest"],
         "draft_program_revision": core.applied_program["program_revision"],
-        "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
     response = client.post("/api/program/runs", json=request)
@@ -2362,7 +2417,6 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
         "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": core.applied_program["program_revision"],
-        "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
     with client:
@@ -2594,9 +2648,9 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
-                    "schema_version": "manyforge.prepared_activation_input.v5",
-                    "scenario_id": "scenario.1",
-                    "source_document_digest": "sha256:" + "1" * 64,
+                    "schema_version": "manyforge.prepared_activation_input.v6",
+                    "origin": {"kind": "scenario", "scenario_id": "scenario.1",
+                               "source_document_digest": "sha256:" + "1" * 64},
                     "captured_input_digest": "sha256:" + "d" * 64,
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
@@ -2667,8 +2721,9 @@ class _CommittingManager(FakeManager):
         return {**super().observe_apply(apply_id, apply_generation), "state": self.state}
 
 
-class _NotifiedRunner:
+class _NotifiedRunner(FakeProgramRunner):
     def __init__(self, error: ProgramRunnerClientError | None = None) -> None:
+        super().__init__(active=False)
         self.error = error
         self.reconciliations = 0
         self.observed_activations: list[Any] = []
@@ -2809,27 +2864,140 @@ def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
     assert runner.reconciliations == 2
 
 
+
+def _scene_completion_service(runner: _NotifiedRunner):
+    core = FakeCore()
+    core.committed_activation = _committed_activation("apply.2")
+    status = _applied_program_status_projection()
+    status["record_digest"] = core.committed_activation["record_digest"]
+    core.applied_program_status_projection = status
+    core.applied_program = _applied_for_program_run()
+    core.applied_program["source"]["record_digest"] = status["record_digest"]
+    service = _status_reading_service(core, _CommittingManager("succeeded"), runner)
+    return service, core
+
+
+def test_committed_apply_prepares_scene_even_if_values_already_reconciled():
+    runner = _NotifiedRunner()
+    runner.reconcile_persistent_values = lambda: {"outcome": "duplicate"}
+    service, core = _scene_completion_service(runner)
+    service.notify_committed_apply()
+    preparations = [body for kind, body in runner.calls if kind == "prepare_scene"]
+    assert len(preparations) == 1
+    assert preparations[0]["expected_applied_record_digest"] == core.committed_activation["record_digest"]
+    assert preparations[0]["expected_admission_generation"] == _ADMISSION_GENERATION
+    assert preparations[0]["request_owner_epoch"] == "program-runner.epoch.1"
+
+
+
+def test_supported_apply_completion_places_scene_without_browser_callback():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    with TestClient(create_app(service=service)) as client:
+        response = client.get("/api/manager/apply/status", params={
+            "apply_id": "apply.2", "apply_generation": 1,
+        })
+        assert response.status_code == 200
+        assert response.json()["state"] == "succeeded"
+        assert runner.wait_for(1)
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+
+
+
+def test_apply_completion_releases_its_bookkeeping_lock_before_runner_rpc():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    original = runner.prepare_applied_scene
+    def prepare(body):
+        assert service._apply_scene_completion_lock.acquire(blocking=False)
+        service._apply_scene_completion_lock.release()
+        return original(body)
+    runner.prepare_applied_scene = prepare
+    service.notify_committed_apply()
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+
+
+def test_apply_completion_rechecks_current_selection_before_scene_effect(caplog):
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    original = runner.cycle_status
+    def changed_selection():
+        core.applied_program["source"]["record_digest"] = "sha256:" + "a" * 64
+        return original()
+    runner.cycle_status = changed_selection
+    service.notify_committed_apply()
+    assert not runner.calls
+    assert "program_run_applied_selection_stale" in caplog.text
+
+
+def test_duplicate_apply_notification_does_not_replace_deliberate_scene_edits():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+    core.committed_activation["apply_id"] = "apply.3"
+    core.committed_activation["apply_generation"] = 2
+    core.committed_activation["committed_applies"][-1].update(
+        apply_id="apply.3", apply_generation=2
+    )
+    service.notify_committed_apply()
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
+
+
+@pytest.mark.parametrize("kind", ["no_program", "sealed", "superseded"])
+def test_committed_apply_without_current_scenario_program_does_not_prepare_scene(kind):
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    status = core.applied_program_status_projection
+    if kind == "superseded":
+        status["record_digest"] = "sha256:" + "a" * 64
+    else:
+        status.update(executable=False, program_id=None, program_revision=None,
+                      program_binding_id=None, program=None, non_executable=None)
+        if kind == "sealed":
+            status["origin"] = {"kind": "sealed_canonical_empty", "cell_id": "cell_a",
+                **{field: status[field] for field in ("deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision")},
+                "admission_digest": "sha256:" + "e" * 64}
+    service.notify_committed_apply()
+    assert not runner.calls
+
+
+def test_failed_apply_scene_placement_is_not_retried_by_status_notification(caplog):
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    def failed(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable", 409)
+    runner.prepare_applied_scene = failed
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+    assert "program_scene_preparation_failed" in caplog.text
+
+
 def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.committed_scenario_activation.v1",
+        "schema_version": "manyforge.committed_scenario_activation.v2",
         "apply_id": apply_id,
         "apply_generation": 1,
         "publication_generation": 3,
         "record_digest": "sha256:" + "d" * 64,
-        "scenario_id": "scenario.1",
+        "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64},
         "program": None,
         "committed_applies": [
             {
                 "apply_id": "apply.1",
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "c" * 64,
-                "scenario_id": "scenario.2",
+                "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64},
             },
             {
                 "apply_id": apply_id,
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "d" * 64,
-                "scenario_id": "scenario.1",
+                "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64},
             },
         ],
     }
@@ -4399,3 +4567,115 @@ def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot(
             "admitted_tcp_linear_speed_mps": 0.1,
         }],
     }
+
+
+def _empty_preparation_selection() -> dict[str, Any]:
+    digest = "sha256:" + "1" * 64
+    return {"request_owner_epoch": "manager-actual", "cell_id": "cell_a",
+            "deployment_artifact_id": "cell_a", "deployment_revision": digest,
+            "candidate_retained_bundle_id": digest, "candidate_graph_revision": digest,
+            "admission_digest": "sha256:" + "2" * 64}
+
+
+def _empty_preparation_request() -> dict[str, Any]:
+    selected = _empty_preparation_selection()
+    return {"request_owner_epoch": selected["request_owner_epoch"],
+            "expected_admission_generation": _ADMISSION_GENERATION,
+            "origin": {"kind": "sealed_canonical_empty", "cell_id": selected["cell_id"],
+                       "deployment_artifact_id": selected["deployment_artifact_id"],
+                       "deployment_revision": selected["deployment_revision"],
+                       "retained_bundle_id": selected["candidate_retained_bundle_id"],
+                       "graph_revision": selected["candidate_graph_revision"],
+                       "admission_digest": selected["admission_digest"]}}
+
+
+class _EmptyPreparationManager(FakeManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.selections = [_empty_preparation_selection(), _empty_preparation_selection()]
+        self.selection_reads = 0
+
+    def canonical_empty_selection(self) -> dict[str, Any]:
+        selected = self.selections[min(self.selection_reads, len(self.selections) - 1)]
+        self.selection_reads += 1
+        return copy.deepcopy(selected)
+
+
+class _EmptyPreparationWorker(FakeActivationPreparer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.released: list[str] = []
+
+    def prepare_canonical_empty(self, selection) -> dict[str, Any]:
+        self.calls.append(copy.deepcopy(selection))
+        return {"prepared_activation_id": "sha256:" + "6" * 64, "origin": _empty_preparation_request()["origin"]}
+
+    def release(self, prepared_id: str) -> None:
+        self.released.append(prepared_id)
+
+
+def test_sealed_preparation_uses_fresh_selection_and_has_no_apply_effect() -> None:
+    manager = _EmptyPreparationManager()
+    worker = _EmptyPreparationWorker()
+    client = TestClient(create_app(service=_service(FakeCore(), manager, activation_preparer=worker)))
+    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
+    assert response.status_code == 200, response.text
+    assert response.json()["prepared_activation"]["origin"]["kind"] == "sealed_canonical_empty"
+    assert worker.calls == [_empty_preparation_selection()]
+    assert manager.selection_reads == 2
+    assert worker.released == []
+
+
+@pytest.mark.parametrize("field", ["request_owner_epoch", "cell_id", "deployment_artifact_id",
+    "deployment_revision", "candidate_retained_bundle_id", "candidate_graph_revision", "admission_digest"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_sealed_preparation_refuses_changed_owner_or_any_admission_fact(field, when) -> None:
+    manager = _EmptyPreparationManager()
+    worker = _EmptyPreparationWorker()
+    index = 0 if when == "before" else 1
+    manager.selections[index][field] = "other" if field in {"request_owner_epoch", "cell_id", "deployment_artifact_id"} else "sha256:" + "f" * 64
+    client = TestClient(create_app(service=_service(FakeCore(), manager, activation_preparer=worker)))
+    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "stale_generation"
+    assert len(worker.calls) == (1 if when == "after" else 0)
+    assert worker.released == (["sha256:" + "6" * 64] if when == "after" else [])
+
+
+def test_sealed_preparation_admission_change_releases_cache_and_never_applies() -> None:
+    manager = _EmptyPreparationManager()
+    worker = _EmptyPreparationWorker()
+    service = _service(FakeCore(), manager, activation_preparer=worker)
+    admission = FakeCellAdmission()
+    reads = 0
+
+    def get():
+        nonlocal reads
+        reads += 1
+        return {"authoring_allowed": reads == 1, "admission_generation": _ADMISSION_GENERATION}
+    admission.get = get
+    service.cell_admission = admission
+    client = TestClient(create_app(service=service))
+    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
+    assert response.status_code == 409, response.text
+    assert worker.released == ["sha256:" + "6" * 64]
+
+
+@pytest.mark.parametrize("change", [None, {"program_id": "fake"}, {"graph_revision": "sha256:" + "f" * 64},
+    {"scenario_id": "fake"}, {"deployment_artifact_id": "foreign"}])
+def test_sealed_applied_status_keeps_true_no_scenario_and_exact_candidate(change) -> None:
+    core = FakeCore()
+    status = _applied_program_status_projection()
+    status.update(executable=False, program_id=None, program_revision=None, program_binding_id=None,
+                  message="No Program is selected")
+    status["origin"] = {"kind": "sealed_canonical_empty", "cell_id": "cell_a",
+        **{field: status[field] for field in ("deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision")},
+        "admission_digest": "sha256:" + "e" * 64}
+    if change: status.update(change)
+    core.applied_program_status_projection = status
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+    response = client.get("/api/program/applied/status")
+    assert response.status_code == (502 if change else 200), response.text
+    if not change:
+        assert "scenario_id" not in response.json() and "source_document_digest" not in response.json()
+        assert response.json()["origin"] == status["origin"]

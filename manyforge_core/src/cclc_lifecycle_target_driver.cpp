@@ -1618,6 +1618,48 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   return true;
 }
 
+Result<ComponentLifecycleReadinessTargetFactsDTO>
+CCLCLifecycleTargetDriver::ReadReadinessFacts(const ControllableComponentId& component) {
+  auto facts = store_.LoadLifecycleTargetFacts(component);
+  if (!facts.ok()) return Result<ComponentLifecycleReadinessTargetFactsDTO>::Err(facts.error());
+  ComponentLifecycleReadinessTargetFactsDTO result{std::move(facts.value()), std::nullopt};
+  if (result.facts.open_incident) {
+    const auto& incident = *result.facts.open_incident;
+    result.blocker = incident.diagnostic.value_or(driver_error(
+        "component_incident_open", incident.incident.summary, "incident_open"));
+    result.blocker->details.emplace("cause_class", std::string(to_string(incident.incident.cause_class)));
+  }
+  for (const auto& cause : result.facts.intervention_causes) {
+    if (!result.blocker && lifecycle_cause_requires_intervention(cause.cause_class))
+      result.blocker = driver_error("intervention_required", "the component retains an intervention cause",
+                                   std::string(to_string(cause.cause_class)));
+  }
+  {
+    std::lock_guard lock(state_mutex_);
+    const auto found = components_.find(component);
+    if (found != components_.end() && !result.blocker) {
+      const auto& state = found->second;
+      if (state.unrecorded_incident &&
+          state.unrecorded_incident_generation == result.facts.recovery_generation) {
+        result.blocker = driver_error("component_incident_open", state.unrecorded_incident->summary,
+                                     "incident_not_yet_recorded");
+      } else {
+        for (const auto& [domain, cause] : state.unrecorded_causes) {
+          static_cast<void>(domain);
+          if (cause.recovery_generation == result.facts.recovery_generation &&
+              lifecycle_cause_requires_intervention(cause.cause_class)) {
+            result.blocker = driver_error("intervention_required",
+                state.cause_record_error.value_or("the component retains an unrecorded intervention cause"),
+                std::string(to_string(cause.cause_class)));
+            break;
+          }
+        }
+      }
+    }
+  }
+  return Result<ComponentLifecycleReadinessTargetFactsDTO>::Ok(std::move(result));
+}
+
 Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetView(
     const ControllableComponentId& component) {
   auto target = store_.LoadLifecycleTarget(component);
@@ -1714,6 +1756,9 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
     const ComponentLifecycleIntentDTO& intent) {
   using Value = std::optional<CCLCLifecycleRequestResultDTO>;
   if (!OperatorRecover(intent) || !intent.locally_valid()) {
+    if (intent.close_incident_recovery)
+      return Result<Value>::Err(driver_error("component_lifecycle_close_recovery_invalid",
+          "Close recovery is not an operator incident recovery", "close_recovery_invalid"));
     // Ordinary CCLC admission decides (and rejects an invalid one).
     return Result<Value>::Ok(std::nullopt);
   }
@@ -1733,6 +1778,9 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
       auto recovered = store_.RecoverComponentIncident(
           ports.ReadRequestOwnerEpoch(), intent,
           intent.attribution.principal_id.value_or(intent.request_context.source_label), now);
+      if (recovered.ok() && !recovered.value() && intent.close_incident_recovery)
+        return Result<Value>::Err(driver_error("component_lifecycle_close_incident_mismatch",
+            "Close recovery has no exact open incident", "close_incident_mismatch"));
       if (recovered.ok() && recovered.value()) Wake();
       return recovered;
     };

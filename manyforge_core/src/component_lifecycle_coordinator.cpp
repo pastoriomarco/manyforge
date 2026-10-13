@@ -428,6 +428,300 @@ class ComponentLifecycleCoordinator::Impl final {
         ComponentLifecycleProductPin(product_control_->current, std::move(lease)));
   }
 
+  [[nodiscard]] Result<CCLCComponentReadDTO> ReadCurrentComponentView(
+      const ControllableComponentId& component,
+      const std::function<Result<ComponentLifecycleTargetViewDTO>()>& read_target,
+      const std::function<Result<ComponentLifecycleReadinessTargetFactsDTO>()>& read_target_facts) const {
+    using ReadResult = Result<CCLCComponentReadDTO>;
+    auto pin = AcquireProductPin();
+    if (!pin.ok()) return ReadResult::Err(pin.error());
+    const auto& context = pin.value().context();
+    const auto owner = CurrentOwnerEpoch();
+    const auto now = clock_.now();
+    if (owner.empty() || now < 0 || !read_target || !read_target_facts)
+      return ReadResult::Err(coordinator_error("cclc_product_read_unavailable",
+          "the current component owner read is unavailable", "owner_read_unavailable"));
+    auto current = context.current_snapshot_source.ReadCurrentComponentSnapshot(component);
+    if (!current.ok()) return ReadResult::Err(current.error());
+    auto verified = VerifyComponentLifecycleCurrentSnapshot(current.value());
+    if (!verified.ok()) return ReadResult::Err(verified.error());
+    if (current.value().controllable_component_id != component || !context.identity ||
+        current.value().active_publication_receipt != context.identity->publication ||
+        std::count(context.identity->configured_components.begin(),
+                   context.identity->configured_components.end(), component) != 1)
+      return ReadResult::Err(coordinator_error("cclc_product_read_unavailable",
+          "the component does not belong to this exact current product", "product_identity_mismatch"));
+    auto target_facts = read_target_facts();
+    if (!target_facts.ok()) return ReadResult::Err(target_facts.error());
+    auto target = read_target();
+    if (!target.ok()) return ReadResult::Err(target.error());
+    if (target.value().target != target_facts.value().facts.target)
+      return ReadResult::Err(coordinator_error("component_lifecycle_facts_stale",
+          "the component target changed during its read", "target_read_changed"));
+    const auto route_membership = ReadComponentRouteMembership(component);
+    std::vector<RouteSelectionStatusDTO> route_statuses;
+    route_statuses.reserve(route_membership.size());
+    for (const auto& route : route_membership) {
+      auto status = journal_.LoadRetainedRouteSelectionStatus(
+          route->original_acceptance.route_selection_transaction_id);
+      if (!status.ok()) return ReadResult::Err(status.error());
+      if (!status.value() || status.value()->acceptance != route->original_acceptance)
+        return ReadResult::Err(coordinator_error("route_selection_status_unavailable",
+            "the current route pursuit has no exact durable status", "route_status_unavailable"));
+      route_statuses.push_back(std::move(*status.value()));
+    }
+    const auto admission = kernel_cell_admission_port_.GetAuthoringAdmission();
+    std::uint64_t gate_generation;
+    const char* owner_admission_closed_reason = nullptr;
+    {
+      std::lock_guard lock(admission_mutex_);
+      gate_generation = admission_gate_generation_;
+      if (!accepting_.load(std::memory_order_acquire))
+        owner_admission_closed_reason = "cclc_not_accepting";
+      else if (admission_fault_closed_.load(std::memory_order_acquire))
+        owner_admission_closed_reason = "cclc_admission_fault_closed";
+      else if (admission_resolution_active_)
+        owner_admission_closed_reason = "cclc_admission_resolution_active";
+      else if (admission_persistence_active_)
+        owner_admission_closed_reason = "cclc_admission_persistence_active";
+      else if (owner_wide_containment_gate_count_ != 0U)
+        owner_admission_closed_reason = "cclc_owner_containment_pending";
+      else if (unresolved_effect_admission_gate_count_ != 0U)
+        owner_admission_closed_reason = "cclc_effect_outcome_unresolved";
+    }
+    const bool owner_admission_open = owner_admission_closed_reason == nullptr;
+    CCLCComponentReadDTO result{current.value(), std::move(target.value()),
+        {owner, now, std::nullopt, std::nullopt, false, std::nullopt, {},
+         {std::nullopt, std::nullopt, std::nullopt}}};
+    auto& readiness = result.readiness;
+    const auto block = [&](const ErrorDTO& error) {
+      if (!readiness.error) readiness.error = error;
+    };
+    if (target_facts.value().blocker) block(*target_facts.value().blocker);
+    if (owner_admission_closed_reason != nullptr)
+      block(coordinator_error("cclc_admission_closed", "CCLC admission is closed",
+                              owner_admission_closed_reason));
+    if (!admission.authoring_allowed || !admission.admission_generation.nonzero())
+      block(coordinator_error("authoring_not_ready", "cell admission is closed", "cell_admission_closed"));
+    switch (result.snapshot.component_lifecycle_state) {
+      case ComponentLifecycleStateDTO::kDeclared:
+      case ComponentLifecycleStateDTO::kDisabled:
+        readiness.next_intent = ComponentLifecycleIntentKindDTO::kPrepare;
+        readiness.requested_state = ComponentLifecycleStateDTO::kPrepared;
+        break;
+      case ComponentLifecycleStateDTO::kPrepared:
+        readiness.next_intent = ComponentLifecycleIntentKindDTO::kEnable;
+        readiness.requested_state = ComponentLifecycleStateDTO::kActive;
+        break;
+      case ComponentLifecycleStateDTO::kActive:
+        break;
+      default:
+        block(coordinator_error("invalid_state_transition",
+            "the current component state has no ordinary activation step", "activation_state_not_eligible"));
+        break;
+    }
+    // Capture owning readers from the existing route publisher, never the
+    // inventory's original static readers. The same captured association is
+    // checked before and after the complete projection.
+    std::optional<ComponentLifecycleReadinessSourceView> sources;
+    std::optional<ErrorDTO> source_association_error;
+    const auto source_unavailable = [&](const ErrorDTO& error) {
+      source_association_error = error;
+      block(error);
+    };
+    if (!route_statuses.empty()) {
+      // Pending or uncertain route work owns the association. A surviving old
+      // reader is not evidence for the candidate, even before fence acquisition.
+      const auto error = std::find_if(route_statuses.begin(), route_statuses.end(),
+          [](const auto& status) { return status.error.has_value(); });
+      source_unavailable(error != route_statuses.end() ? *error->error :
+          coordinator_error("route_selection_pending",
+              "the current component route pursuit has not settled", "route_pursuit_pending"));
+    } else if (context.capture_readiness_sources) {
+      auto captured = context.capture_readiness_sources(result.snapshot);
+      if (!captured.ok()) source_unavailable(captured.error());
+      else if (!captured.value().validate_current)
+        source_unavailable(coordinator_error("cclc_product_read_unavailable", "the source association has no current readback",
+                                "source_readback_unavailable"));
+      else {
+        sources = std::move(captured.value());
+        auto checked = sources->validate_current();
+        if (!checked.ok()) { source_unavailable(checked.error()); sources.reset(); }
+      }
+    } else {
+      source_unavailable(coordinator_error("cclc_product_read_unavailable", "the current route-source view is not composed",
+                              "route_source_view_unavailable"));
+    }
+    readiness.domains.reserve(result.snapshot.provider_occurrences.size());
+    const bool active = result.snapshot.component_lifecycle_state == ComponentLifecycleStateDTO::kActive;
+    for (const auto& provider : result.snapshot.provider_occurrences) {
+      ComponentLifecycleDomainReadinessDTO row{provider, std::nullopt, std::nullopt, std::nullopt};
+      if (source_association_error) {
+        // A still-live predecessor callback is not current-route evidence.
+        row.error = source_association_error;
+        readiness.domains.push_back(std::move(row));
+        continue;
+      }
+      auto health = context.lifecycle_port_resolver.ReadExactLifecycleHealth(provider, now);
+      if (!health.ok()) row.error = health.error();
+      else {
+        row.health = std::move(health.value());
+        if (!row.health->locally_valid()) {
+          row.error = coordinator_error("component_lifecycle_observation_invalid",
+              "the exact provider health projection is invalid", "health_projection_invalid");
+          row.health.reset();
+        }
+        else {
+          row.has_activation_step = row.health->has_activation_step;
+          // Match the follower's existing cause interpretation. A diagnostic
+          // alone is not an additional lifecycle predicate; availability is
+          // decided by the same qualified catalog below.
+          auto cause = LifecycleBlockingCauseClassDTO::kNone;
+          for (const auto& fact : row.health->facts) {
+            if (fact.lifecycle_fact_id.value() != kLifecycleBlockingCauseFactId) continue;
+            cause = fact.value.kind == LifecycleFactValueKindDTO::kToken && fact.value.token_value
+                        ? parse_lifecycle_blocking_cause_class(*fact.value.token_value)
+                              .value_or(LifecycleBlockingCauseClassDTO::kUnknown)
+                        : LifecycleBlockingCauseClassDTO::kUnknown;
+            break;
+          }
+          const auto recovered = target_facts.value().facts.target
+                                     ? target_facts.value().facts.target->recovered_cause
+                                     : std::nullopt;
+          if (lifecycle_cause_requires_intervention(cause) && recovered != cause) {
+            row.error = row.health->diagnostic.value_or(coordinator_error(
+                "intervention_required", "the current lifecycle source requires intervention",
+                "intervention_required"));
+            if (row.error->details.size() < 64U)
+              row.error->details.emplace("cause_class", std::string(to_string(cause)));
+          }
+          auto catalog = context.lifecycle_plan_catalog_source.LoadExactLifecyclePlanCatalog(
+              provider.provider_manifest_id, provider.provider_manifest_revision,
+              provider.lifecycle_plan_catalog_digest);
+          if (!row.error && !catalog.ok()) row.error = catalog.error();
+          else if (!row.error && (readiness.next_intent || active)) {
+            auto decision = EvaluateLifecycleDomainPlan(
+                active ? ComponentLifecycleIntentKindDTO::kEnable : *readiness.next_intent,
+                active ? ComponentLifecycleStateDTO::kActive : *readiness.requested_state,
+                catalog.value(), provider, *row.health);
+            if (!decision.ok()) row.error = decision.error();
+            else if (active && decision.value().kind != LifecycleDomainPlanDecisionKind::kAlreadySatisfied)
+              row.error = coordinator_error("component_lifecycle_transition_missing",
+                  "the existing Active postcondition is not satisfied", "active_postcondition_not_satisfied");
+            else if (!active) row.decision_kind = decision.value().kind;
+          }
+        }
+      }
+      if (row.error) block(*row.error);
+      readiness.domains.push_back(std::move(row));
+    }
+    if (!context.measured_state_inventory) {
+      readiness.measured_state.error = source_association_error.has_value()
+          ? *source_association_error
+          : coordinator_error("measured_source_unavailable",
+              "the qualified robot inventory is not composed", "measured_inventory_unavailable");
+    } else {
+      const auto& robots = context.measured_state_inventory->robots();
+      const auto robot = std::find_if(robots.begin(), robots.end(),
+          [&](const auto& requirement) { return requirement.component_id == component; });
+      readiness.measured_state.required = robot != robots.end();
+      if (robot != robots.end()) {
+        readiness.measured_state.available = false;
+        if (!sources || !sources->measured_sources)
+          readiness.measured_state.error = coordinator_error("measured_source_unavailable",
+              "the exact current component source view is unavailable", "current_measured_sources_unavailable");
+        else if (sources->measured_sources->component_id != component)
+          readiness.measured_state.error = coordinator_error("measured_source_unavailable",
+              "the captured source view belongs to another component", "measured_component_mismatch");
+        else {
+          auto measured = context.measured_state_inventory->ReadComponent(*sources->measured_sources, now);
+          if (!measured.ok()) readiness.measured_state.error = measured.error();
+          else readiness.measured_state.available = true;
+        }
+      } else if (sources && sources->measured_sources) {
+        readiness.measured_state.required.reset();
+        readiness.measured_state.error = coordinator_error("measured_source_unavailable",
+            "the source view does not belong to the qualified robot inventory", "measured_membership_mismatch");
+      }
+    }
+    if (readiness.measured_state.error) block(*readiness.measured_state.error);
+    if (sources) {
+      auto checked = sources->validate_current();
+      if (!checked.ok()) return ReadResult::Err(checked.error());
+    }
+    // A positive sampled verdict must not outlive its actual owner, target,
+    // publication, route or admission generation. No retry/probe is issued.
+    for (std::size_t index = 0U; index < route_membership.size(); ++index) {
+      auto status = journal_.LoadRetainedRouteSelectionStatus(
+          route_membership[index]->original_acceptance.route_selection_transaction_id);
+      if (!status.ok()) return ReadResult::Err(status.error());
+      if (!status.value() || *status.value() != route_statuses[index])
+        return ReadResult::Err(coordinator_error("component_lifecycle_facts_stale",
+            "the component route status changed during its read", "route_status_changed"));
+    }
+    auto latest = context.current_snapshot_source.ReadCurrentComponentSnapshot(component);
+    if (!latest.ok()) return ReadResult::Err(latest.error());
+    auto latest_facts = read_target_facts();
+    if (!latest_facts.ok()) return ReadResult::Err(latest_facts.error());
+    // Keep the existing short-circuit order and sample each owner/admission
+    // value at most once. Diagnostics consume these same samples only.
+    const bool snapshot_changed = latest.value() != result.snapshot;
+    const bool target_facts_changed =
+        !snapshot_changed && latest_facts.value() != target_facts.value();
+    const auto latest_owner = !snapshot_changed && !target_facts_changed
+                                  ? std::optional(CurrentOwnerEpoch())
+                                  : std::nullopt;
+    const bool owner_changed = latest_owner && *latest_owner != owner;
+    const auto latest_admission = latest_owner && !owner_changed
+                                      ? std::optional(kernel_cell_admission_port_.GetAuthoringAdmission())
+                                      : std::nullopt;
+    const bool admission_changed = latest_admission && *latest_admission != admission;
+    if (snapshot_changed || target_facts_changed || owner_changed || admission_changed) {
+      auto error = coordinator_error("component_lifecycle_facts_stale",
+          "the current component context changed during its read", "component_read_changed");
+      const auto token = [](bool value) { return value ? "true" : "false"; };
+      error.details.emplace("controllable_component_id", component.value());
+      error.details.emplace("snapshot_changed", token(snapshot_changed));
+      error.details.emplace("target_facts_changed",
+                            snapshot_changed ? "not_checked" : token(target_facts_changed));
+      error.details.emplace("owner_changed", latest_owner ? token(owner_changed) : "not_checked");
+      error.details.emplace("admission_changed",
+                            latest_admission ? token(admission_changed) : "not_checked");
+      error.details.emplace("snapshot_digest_before", result.snapshot.snapshot_digest.value());
+      error.details.emplace("snapshot_digest_after", latest.value().snapshot_digest.value());
+      error.details.emplace("component_generation_before",
+                            std::to_string(result.snapshot.component_lifecycle_generation.value()));
+      error.details.emplace("component_generation_after",
+                            std::to_string(latest.value().component_lifecycle_generation.value()));
+      error.details.emplace("owner_epoch_before", owner.value());
+      error.details.emplace("owner_epoch_after", latest_owner ? latest_owner->value() : "not_checked");
+      error.details.emplace("admission_generation_before",
+                            std::to_string(admission.admission_generation.value()));
+      error.details.emplace("admission_generation_after",
+                            latest_admission ? std::to_string(latest_admission->admission_generation.value())
+                                             : "not_checked");
+      error.details.emplace("authoring_allowed_before", token(admission.authoring_allowed));
+      error.details.emplace("authoring_allowed_after",
+                            latest_admission ? token(latest_admission->authoring_allowed) : "not_checked");
+      return ReadResult::Err(std::move(error));
+    }
+    {
+      std::lock_guard lock(admission_mutex_);
+      if (!ComponentRouteMembershipMatches(component, route_membership) ||
+          admission_gate_generation_ != gate_generation ||
+          product_control_->current.get() != &context ||
+          shutting_down_.load(std::memory_order_acquire) || product_control_->exchange_pending ||
+          owner_admission_open != (accepting_.load(std::memory_order_acquire) &&
+              !admission_fault_closed_.load(std::memory_order_acquire) &&
+              !admission_resolution_active_ && !admission_persistence_active_ &&
+              owner_wide_containment_gate_count_ == 0U && unresolved_effect_admission_gate_count_ == 0U))
+        return ReadResult::Err(coordinator_error("component_lifecycle_facts_stale",
+            "the current owner changed during its read", "owner_read_changed"));
+    }
+    readiness.ready = !readiness.error;
+    return ReadResult::Ok(std::move(result));
+  }
+
   [[nodiscard]] Result<std::shared_ptr<const ComponentLifecycleProductContext>>
   ReadPinnedProductContext(const ComponentLifecycleProductPin& pin) const {
     using ContextResult = Result<std::shared_ptr<const ComponentLifecycleProductContext>>;
@@ -484,6 +778,8 @@ class ComponentLifecycleCoordinator::Impl final {
     std::optional<PendingProductExchange> withdrawn;
     std::shared_ptr<const ComponentLifecycleProductContext> retired;
     std::vector<std::pair<ScheduleHandle, std::shared_ptr<std::atomic<bool>>>> polls;
+    std::vector<std::pair<std::string, std::uint64_t>> previous_watermarks;
+    std::vector<std::pair<std::string, std::uint64_t>> successor_watermarks;
     const auto observation = [&](ComponentLifecycleProductExchangePhase phase,
                                  std::string reason) -> ExchangeResult {
       if (!previous || !previous->identity || !previous->identity->publication.valid())
@@ -599,6 +895,11 @@ class ComponentLifecycleCoordinator::Impl final {
         return refuse_locked("product_admission_not_settled");
       polls = scheduled_handles_;
       scheduler_lane_used = scheduler_lane_used_;
+      try {
+        previous_watermarks = component_generation_watermarks_;
+      } catch (...) {
+        return refuse_locked("product_generation_proof_exception");
+      }
     }
     // Active sets are empty and workers/publication producers idle. Cancel
     // only leftover weak terminal polls, retaining every tracked handle until
@@ -628,6 +929,71 @@ class ComponentLifecycleCoordinator::Impl final {
     // is a blocker, not an indefinitely pending preparation; an unreadable
     // proof closes admission and retains the original current product.
     if (!durable.ok()) return reject("product_journal_not_quiescent", true);
+    // Apply adoption can advance durable facts while this retained owner
+    // still holds the predecessor cache. Operation pins and the settled work
+    // barrier exclude the live facade writers; reads cannot fence an outside
+    // uncoordinated journal writer.
+    try {
+      successor_watermarks = previous_watermarks;
+      auto membership = successor->identity->configured_components;
+      std::sort(membership.begin(), membership.end());
+      using GenerationProof = std::pair<ComponentLifecycleCurrentFactReadbackDTO,
+                                        std::optional<ComponentLifecycleCurrentSnapshotDTO>>;
+      const auto read_component =
+          [&](const ControllableComponentId& component) -> Result<GenerationProof> {
+        auto fact = journal_.LoadCurrentComponentLifecycleFact(component);
+        if (!fact.ok()) return Result<GenerationProof>::Err(fact.error());
+        if (!fact.value().locally_valid() || fact.value().controllable_component_id != component)
+          return Result<GenerationProof>::Err(coordinator_error(
+              "cclc_product_exchange_refused", "current fact changed component scope",
+              "product_generation_facts_mismatch"));
+        std::optional<ComponentLifecycleCurrentSnapshotDTO> snapshot;
+        if (fact.value().durable_generation) {
+          auto current = successor->current_snapshot_source.ReadCurrentComponentSnapshot(component);
+          if (!current.ok()) return Result<GenerationProof>::Err(current.error());
+          if (!VerifyComponentLifecycleCurrentSnapshot(current.value()).ok() ||
+              current.value().controllable_component_id != component ||
+              current.value().active_publication_receipt != successor->identity->publication ||
+              current.value().component_lifecycle_generation != *fact.value().durable_generation)
+            return Result<GenerationProof>::Err(coordinator_error(
+                "cclc_product_exchange_refused", "snapshot differs from exact successor facts",
+                "product_generation_snapshot_mismatch"));
+          snapshot.emplace(std::move(current.value()));
+        }
+        return Result<GenerationProof>::Ok({std::move(fact.value()), std::move(snapshot)});
+      };
+      std::vector<GenerationProof> proofs;
+      proofs.reserve(membership.size());
+      for (const auto& component : membership) {
+        auto proof = read_component(component);
+        if (!proof.ok()) return reject("product_generation_proof_failed");
+        const auto& generation = proof.value().first.durable_generation;
+        auto floor = std::find_if(successor_watermarks.begin(), successor_watermarks.end(),
+                                  [&](const auto& row) { return row.first == component.value(); });
+        if (floor != successor_watermarks.end() &&
+            (!generation || generation->value() < floor->second))
+          return reject("product_generation_floor_regressed");
+        if (generation) {
+          if (floor == successor_watermarks.end()) {
+            if (successor_watermarks.size() >= kMaxCoordinatorActiveTransactions)
+              return reject("product_generation_watermark_capacity_exhausted");
+            successor_watermarks.emplace_back(component.value(), generation->value());
+          } else {
+            floor->second = generation->value();
+          }
+        }
+        proofs.push_back(std::move(proof.value()));
+      }
+      for (std::size_t index = 0U; index < membership.size(); ++index) {
+        auto repeated = read_component(membership[index]);
+        if (!repeated.ok() || repeated.value() != proofs[index])
+          return reject("product_generation_proof_changed");
+      }
+      durable = journal_.ReadQuiescentOwner(expected_owner);
+    } catch (...) {
+      return reject("product_generation_proof_exception");
+    }
+    if (!durable.ok()) return reject("product_journal_not_quiescent", true);
     {
       std::unique_lock admission_lock(admission_mutex_, std::try_to_lock);
       if (!admission_lock.owns_lock())
@@ -647,7 +1013,8 @@ class ComponentLifecycleCoordinator::Impl final {
           product_control_->pending->owner != expected_owner || admission_fault_closed_ ||
           shutting_down_.load(std::memory_order_acquire) || recovery_in_progress_ ||
           unresolved_effect_admission_gate_count_ != 0U ||
-          owner_wide_containment_gate_count_ != 0U || !AdmissionIsOpen()) {
+          owner_wide_containment_gate_count_ != 0U || !AdmissionIsOpen() ||
+          component_generation_watermarks_ != previous_watermarks) {
         withdrawn = std::move(product_control_->pending);
         product_control_->pending.reset();
         product_control_->exchange_pending = false;
@@ -673,6 +1040,7 @@ class ComponentLifecycleCoordinator::Impl final {
         return observation(ComponentLifecycleProductExchangePhase::kPending,
                            "product_new_callbacks_pending");
       retired = std::move(product_control_->current);
+      component_generation_watermarks_.swap(successor_watermarks);
       product_control_->current = successor;
       withdrawn = std::move(product_control_->pending);
       product_control_->pending.reset();
@@ -1100,6 +1468,11 @@ class ComponentLifecycleCoordinator::Impl final {
     if (inspected.value().has_value()) {
       return ReplayResult(*inspected.value());
     }
+    if (intent.close_incident_recovery)
+      return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
+          "component_lifecycle_close_incident_mismatch",
+          "Close incident recovery requires the exact open incident journal path",
+          "close_incident_mismatch"));
     // Replay is a journal read. A transient exchange refusal must not bind an
     // unstarted request to a durable rejection, and an existing whole-pass pin
     // remains usable while new pins are excluded.
@@ -2000,6 +2373,128 @@ class ComponentLifecycleCoordinator::Impl final {
     admission_resolution_ready_.wait(lock, [&] { return !admission_persistence_active_; });
   }
 
+  [[nodiscard]] Result<void> ValidateRetirementScopeLocked(
+      const CCLCLifecycleTargetRetirementScopeDTO& scope) const {
+    if (!scope.locally_valid() || !started_ || shutting_down_.load(std::memory_order_acquire) ||
+        product_control_->exchange_pending || CurrentOwnerEpoch() != scope.request_owner_epoch ||
+        !product_control_->current || !product_control_->current->identity)
+      return Result<void>::Err(coordinator_error("component_lifecycle_target_retirement_scope_stale",
+          "Close scope has no exact current product owner", "retirement_scope_stale"));
+    const auto& publication = product_control_->current->identity->publication;
+    if (publication.publication_generation != scope.publication_generation ||
+        publication.durable_public_pointer_content_digest != scope.active_public_pointer_digest)
+      return Result<void>::Err(coordinator_error("component_lifecycle_target_retirement_scope_stale",
+          "Close scope names another immutable publication", "retirement_publication_changed"));
+    return Result<void>::Ok();
+  }
+
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementOfferDTO> ReadLifecycleTargetRetirementOffer() {
+    using Offer = Result<CCLCLifecycleTargetRetirementOfferDTO>;
+    auto pin = AcquireProductPin();
+    if (!pin.ok()) return Offer::Err(pin.error());
+    std::unique_ptr<ICellCloseAdmissionLease> lease;
+    std::unique_lock admission_lock(admission_mutex_);
+    if (!product_control_->current || !product_control_->current->identity)
+      return Offer::Err(coordinator_error("component_lifecycle_target_retirement_scope_unavailable",
+          "Close needs the actual immutable publication", "publication_identity_unavailable"));
+    const auto& publication = product_control_->current->identity->publication;
+    const CCLCLifecycleTargetRetirementScopeDTO scope{CurrentOwnerEpoch(), publication.publication_generation,
+        publication.durable_public_pointer_content_digest};
+    const auto scoped = ValidateRetirementScopeLocked(scope);
+    if (!scoped.ok()) return Offer::Err(scoped.error());
+    auto acquired = kernel_cell_admission_port_.AcquireCellCloseAdmissionLease();
+    if (!acquired.ok()) return Offer::Err(acquired.error());
+    lease = std::move(acquired.value());
+    const auto before = lease->ValidatePrerequisites();
+    if (!before.ok()) return Offer::Err(before.error());
+    auto targets = journal_.LoadLifecycleTargetsForClose(scope.request_owner_epoch);
+    if (!targets.ok()) return Offer::Err(targets.error());
+    const auto after = lease->ValidatePrerequisites();
+    if (!after.ok()) return Offer::Err(after.error());
+    return Offer::Ok({scope, std::move(targets.value())});
+  }
+
+  [[nodiscard]] Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>> ReadLifecycleTargetRetirementResult(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+    // Original immutable membership reads do not borrow the current product,
+    // change targets, dispatch work or require a current owner namespace.
+    return journal_.ReadLifecycleTargetRetirementResult(intent);
+  }
+
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementResultDTO> RetireLifecycleTargetsForClose(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+    using Retired = Result<CCLCLifecycleTargetRetirementResultDTO>;
+    // Exact replay/conflict/expiry belongs to the original request before any
+    // current publication or Kernel fact. A lost reply cannot retire successors.
+    auto original = journal_.ReadLifecycleTargetRetirementResult(intent);
+    if (!original.ok()) return Retired::Err(original.error());
+    if (original.value()) return Retired::Ok(std::move(*original.value()));
+    auto pin = AcquireProductPin();
+    if (!pin.ok()) return Retired::Err(pin.error());
+    std::unique_ptr<ICellCloseAdmissionLease> lease;
+    std::unique_lock admission_lock(admission_mutex_);
+    const auto scoped = ValidateRetirementScopeLocked(intent.scope);
+    if (!scoped.ok()) return Retired::Err(scoped.error());
+    auto acquired = kernel_cell_admission_port_.AcquireCellCloseAdmissionLease();
+    if (!acquired.ok()) return Retired::Err(acquired.error());
+    lease = std::move(acquired.value());
+    const auto prepared = lease->PrepareCommandEligibilityClosure(intent);
+    if (!prepared.ok()) return Retired::Err(prepared.error());
+    // Every allocation-bearing error value is prepared before retirement.
+    auto join_unknown = Retired::Err(coordinator_error(
+        "component_lifecycle_target_retirement_outcome_unknown",
+        "the durable retirement has no exact Kernel eligibility closure",
+        "eligibility_closure_unproved"));
+    // The same SQL transaction compares all targets, retains the complete
+    // typed result, and checks this admission lease at acceptance/precommit.
+    // There is no lifecycle dispatch and no state/submission lock over SQL.
+    auto retired = journal_.RetireLifecycleTargetsForClose(CurrentOwnerEpoch(), intent, *lease);
+    if (!retired.ok()) {
+      if (retired.error().code == "persistence_outcome_unknown") {
+        static_cast<void>(lease->CloseCommandEligibilityForUnknownRetirement(intent));
+        CloseAdmissionLocked();
+      }
+      return retired;
+    }
+    if (retired.value().replay_status == RequestReplayStatusDTO::kReplayedExact)
+      return retired;
+    if (!lease->CloseCommandEligibilityAfterRetirement(intent, retired.value())) {
+      static_cast<void>(lease->CloseCommandEligibilityForUnknownRetirement(intent));
+      CloseAdmissionLocked();
+      return join_unknown;
+    }
+    return retired;
+  }
+
+  [[nodiscard]] Result<void> ReadLifecycleOwnerSettlement(
+      const CCLCLifecycleTargetRetirementScopeDTO& scope) {
+    auto pin = AcquireProductPin();
+    if (!pin.ok()) return Result<void>::Err(pin.error());
+    std::unique_ptr<ICellCloseAdmissionLease> lease;
+    {
+      std::unique_lock admission_lock(admission_mutex_);
+      const auto scoped = ValidateRetirementScopeLocked(scope);
+      if (!scoped.ok()) return scoped;
+      auto acquired = kernel_cell_admission_port_.AcquireCellCloseAdmissionLease();
+      if (!acquired.ok()) return Result<void>::Err(acquired.error());
+      lease = std::move(acquired.value());
+    }
+    const auto before = lease->ValidatePrerequisites();
+    if (!before.ok()) return before;
+    const auto settled = ReadLifecycleOwnerSettlement();
+    if (!settled.ok()) return settled; // Existing exact memory/durable settlement proof.
+    const auto after = lease->ValidatePrerequisites();
+    if (!after.ok()) return after;
+    // Like the existing settlement front/recheck, never wait for CCLC
+    // while retaining Kernel admission: Offer/Retire use CCLC -> Kernel.
+    std::unique_lock admission_lock(admission_mutex_, std::try_to_lock);
+    if (!admission_lock.owns_lock())
+      return Result<void>::Err(coordinator_error("component_lifecycle_owner_settlement_unknown",
+          "the lifecycle owner has no complete current settlement proof",
+          "original_work_settlement_unproven"));
+    return ValidateRetirementScopeLocked(scope);
+  }
+
   [[nodiscard]] Result<void> ReadLifecycleOwnerSettlement() {
     const auto unknown = [] {
       return Result<void>::Err(
@@ -2390,6 +2885,7 @@ class ComponentLifecycleCoordinator::Impl final {
         std::optional<RouteConfigurationFenceAdmissionSnapshotDTO> accepted_fence_admission,
         std::vector<ControlDomainId> accepted_reserved_domains)
         : product_context(std::move(context)),
+          original_acceptance(initial_status.acceptance),
           status(std::move(initial_status)),
           snapshot(std::move(accepted_snapshot)),
           fence_admission(std::move(accepted_fence_admission)),
@@ -2397,6 +2893,9 @@ class ComponentLifecycleCoordinator::Impl final {
           effective_deadline_ns(status.accepted_at_ns + status.acceptance.timeout_duration_ns) {}
 
     const std::shared_ptr<const ComponentLifecycleProductContext> product_context;
+    // Immutable accepted identity for read-only membership; worker status is
+    // never read under the membership mutex as if that protected its writes.
+    const RouteSelectionAcceptedDTO original_acceptance;
     RouteSelectionStatusDTO status;
     RouteSelectionCurrentSnapshot snapshot;
     std::optional<RouteConfigurationFenceAdmissionSnapshotDTO> fence_admission;
@@ -2411,6 +2910,34 @@ class ComponentLifecycleCoordinator::Impl final {
     bool scheduled{};
     bool controller_source_replaced_before_transition{};
   };
+
+  [[nodiscard]] std::vector<std::shared_ptr<RouteRuntimeState>>
+  ReadComponentRouteMembership(const ControllableComponentId& component) const {
+    std::vector<std::shared_ptr<RouteRuntimeState>> result;
+    std::lock_guard lock(state_mutex_);
+    for (const auto& route : active_route_transactions_) {
+      const auto& expectations = route->original_acceptance.component_expectations;
+      if (std::any_of(expectations.begin(), expectations.end(), [&](const auto& expected) {
+            return expected.controllable_component_id == component;
+          })) result.push_back(route);
+    }
+    return result;
+  }
+
+  [[nodiscard]] bool ComponentRouteMembershipMatches(
+      const ControllableComponentId& component,
+      const std::vector<std::shared_ptr<RouteRuntimeState>>& captured) const {
+    std::lock_guard lock(state_mutex_);
+    std::size_t index = 0U;
+    for (const auto& route : active_route_transactions_) {
+      const auto& expectations = route->original_acceptance.component_expectations;
+      if (!std::any_of(expectations.begin(), expectations.end(), [&](const auto& expected) {
+            return expected.controllable_component_id == component;
+          })) continue;
+      if (index >= captured.size() || captured[index++].get() != route.get()) return false;
+    }
+    return index == captured.size();
+  }
 
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> ReplayResult(
       const CCLCLifecycleRequestResultDTO& result) const {
@@ -5246,6 +5773,23 @@ class ComponentLifecycleCoordinator::Impl final {
                 : observation.error());
         return false;
       }
+      // Q127: only activation admission consumes endpoint conflict facts.
+      // Observe remains usable for Disable/Recover/Close, and unrelated
+      // health-source errors retain their existing admission semantics.
+      const auto intent = runtime->status.accepted_intent.intent;
+      if (intent == ComponentLifecycleIntentKindDTO::kPrepare ||
+          intent == ComponentLifecycleIntentKindDTO::kEnable) {
+        const auto health = runtime->product_context->lifecycle_port_resolver
+                                .ReadExactLifecycleHealth(
+                                    *domain.resolved_provider_occurrence,
+                                    observation_received_at_ns);
+        if (!health.ok() &&
+            (health.error().code == "duplicate_component_instance" ||
+             health.error().code == "component_instance_graph_unsettled")) {
+          FailBeforeEffect(runtime, health.error());
+          return false;
+        }
+      }
       runtime->observations[index] = observation.value();
       if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kRecover) {
         recover_inputs.push_back(
@@ -5750,7 +6294,25 @@ class ComponentLifecycleCoordinator::Impl final {
         (!runtime->command_eligibility_closed && !runtime->recovering)) {
       return Result<void>::Ok();
     }
-    const bool eligible =
+    // Retirement and terminal publication share the existing CCLC exclusion.
+    // SQL completes outside Kernel state; this local exclusion ends before the
+    // caller's failure path may call CloseAdmission on the same mutex.
+    std::unique_lock retirement_lock(admission_mutex_);
+    const auto retained = journal_.ReadLifecycleTargetRetention(
+        status.accepted_intent.controllable_component_id);
+    if (!retained.ok()) return Result<void>::Err(retained.error());
+    if (retained.value() &&
+        (!retained.value()->locally_valid() ||
+         retained.value()->target.controllable_component_id !=
+             status.accepted_intent.controllable_component_id)) {
+      return Result<void>::Err(coordinator_error(
+          "component_lifecycle_target_retirement_proof_invalid",
+          "terminal readiness has no valid exact retained target proof",
+          "retirement_proof_invalid"));
+    }
+    const bool closed_by_retirement = retained.value() &&
+        retained.value()->retirement_reason == LifecycleTargetRetirementReasonDTO::kClose;
+    const bool eligible = !closed_by_retirement &&
         status.terminal_result.has_value() &&
         *status.terminal_result != ComponentLifecycleTerminalResultDTO::kFailedPartialEffect &&
         status.current_state == ComponentLifecycleStateDTO::kActive;
@@ -6263,6 +6825,29 @@ ComponentLifecycleCoordinator::~ComponentLifecycleCoordinator() = default;
 
 Result<void> ComponentLifecycleCoordinator::Start() {
   return impl_->Start();
+}
+
+Result<CCLCComponentReadDTO> ComponentLifecycleCoordinator::ReadCurrentComponentView(
+    const ControllableComponentId& component,
+    const std::function<Result<ComponentLifecycleTargetViewDTO>()>& read_target,
+    const std::function<Result<ComponentLifecycleReadinessTargetFactsDTO>()>& read_target_facts) const {
+  return impl_->ReadCurrentComponentView(component, read_target, read_target_facts);
+}
+
+Result<CCLCLifecycleTargetRetirementOfferDTO> ComponentLifecycleCoordinator::ReadLifecycleTargetRetirementOffer() const {
+  return impl_->ReadLifecycleTargetRetirementOffer();
+}
+Result<CCLCLifecycleTargetRetirementResultDTO> ComponentLifecycleCoordinator::RetireLifecycleTargetsForClose(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  return impl_->RetireLifecycleTargetsForClose(intent);
+}
+Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>> ComponentLifecycleCoordinator::ReadLifecycleTargetRetirementResult(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) const {
+  return impl_->ReadLifecycleTargetRetirementResult(intent);
+}
+Result<void> ComponentLifecycleCoordinator::ReadLifecycleOwnerSettlement(
+    const CCLCLifecycleTargetRetirementScopeDTO& scope) const {
+  return impl_->ReadLifecycleOwnerSettlement(scope);
 }
 
 Result<ComponentLifecycleProductPin> ComponentLifecycleCoordinator::AcquireProductPin() const {

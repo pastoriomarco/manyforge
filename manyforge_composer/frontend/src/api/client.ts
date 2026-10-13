@@ -1,3 +1,9 @@
+import { normalizePublicRequestContext, parseComponentProcessStopResult, parseComponentProcessStopOffer } from './processStopParsers';
+import { parseCanonicalEmptySelection, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
+  parseLifecycleTargetRetirementResult, parseLifecycleTargetRetirementLookup } from './scenarioCloseParsers';
+import type { CanonicalEmptySelection, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
+  LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult, LifecycleTargetRetirementScope } from '../types/scenarioClose';
+import type { ComponentProcessStopRequest, ComponentProcessStopResult } from '../types/cclc';
 import {
   parseAuthoringSubmissionOutcome,
   parseAuthoringWorkspaceSnapshot,
@@ -29,6 +35,9 @@ import {
   parseStopFaultRecoveryOffer,
   parseStopFaultRecoveryResult,
   parseNodeEnvironmentResponse,
+  parsePreparedActivationInput,
+  parseManagerDeploymentCandidatePreviewResponse,
+  parseManagerApplyResponse,
   parseObjectResponse,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
@@ -553,6 +562,29 @@ export function composerSettingsConflict(error: unknown): ComposerSettingsSnapsh
   }
 }
 
+/** A Close recovery reply cannot fall back to an ordinary lifecycle transaction. */
+function requireExactCloseIncidentRecovery(
+  request: CCLCLifecycleRequestBody,
+  result: CCLCAdmission,
+): void {
+  const expected = request.close_incident_recovery;
+  if (expected == null) {
+    if (result.incidentRecovery?.closureReason !== undefined) {
+      throw new Error('Ordinary Recover cannot acknowledge a Close closure reason.');
+    }
+    return;
+  }
+  if (['stale_request_owner_epoch', 'request_id_conflict', 'request_ledger_full', 'request_result_expired'].includes(result.replayStatus)
+    && result.incidentRecovery === null && result.transactionId === null && result.requestId === null && result.status === null) return;
+  if (request.intent !== 'recover' || request.reason !== 'cell closed by operator'
+    || result.incidentRecovery?.incidentId !== expected.expected_incident_id
+    || result.incidentRecovery.componentId !== request.controllable_component_id
+    || result.incidentRecovery.closureReason !== 'cell_closed_by_operator'
+    || result.transactionId !== null || result.status !== null) {
+    throw new Error('Close incident recovery was not acknowledged for the exact incident.');
+  }
+}
+
 export const api = {
   health: {
     get: (signal?: AbortSignal): Promise<HealthResponse> =>
@@ -602,6 +634,48 @@ export const api = {
       requestJson('/api/source-model', parseSourceModelProjection, signal),
   },
   cclc: {
+    targetRetirementOffer: (signal?: AbortSignal): Promise<LifecycleTargetRetirementOffer> => requestJson(
+      '/api/cclc/targets/retirement-offer', parseLifecycleTargetRetirementOffer, signal,
+    ),
+    retireTargets: (request: LifecycleTargetRetirementIntent, signal?: AbortSignal): Promise<LifecycleTargetRetirementResult> => {
+      const sent = structuredClone(request);
+      sent.request_context = normalizePublicRequestContext(sent.request_context) as typeof sent.request_context;
+      return requestJson('/api/cclc/targets/retire', (value) => parseLifecycleTargetRetirementResult(value, sent),
+        signal, { method: 'POST', body: JSON.stringify(sent) });
+    },
+    targetRetirementResult: (request: LifecycleTargetRetirementIntent, signal?: AbortSignal): Promise<LifecycleTargetRetirementResult | null> => {
+      const sent = structuredClone(request);
+      sent.request_context = normalizePublicRequestContext(sent.request_context) as typeof sent.request_context;
+      return requestJson('/api/cclc/targets/retire/result', (value) => parseLifecycleTargetRetirementLookup(value, sent),
+        signal, { method: 'POST', body: JSON.stringify(sent) });
+    },
+    ownerSettlement: (scope: LifecycleTargetRetirementScope, signal?: AbortSignal): Promise<LifecycleOwnerSettlementResult> => {
+      const sent = structuredClone(scope);
+      return requestJson('/api/cclc/targets/settlement', (value) => parseLifecycleOwnerSettlement(value, sent),
+        signal, { method: 'POST', body: JSON.stringify({ scope: sent }) });
+    },
+    componentProcessStopOffer: (componentId: string): Promise<import('../types/cclc').ComponentProcessStopOffer> => requestJson(
+      `/api/cclc/components/${encodeURIComponent(componentId)}/process/stop-offer`,
+      (value) => parseComponentProcessStopOffer(value, componentId),
+    ),
+    stopComponentProcess: (request: ComponentProcessStopRequest): Promise<ComponentProcessStopResult> => {
+      const captured = structuredClone(request);
+      captured.request_context = normalizePublicRequestContext(captured.request_context) as typeof captured.request_context;
+      return requestJson(
+        `/api/cclc/components/${encodeURIComponent(captured.controllable_component_id)}/process/stop`,
+        (value) => parseComponentProcessStopResult(value, captured), undefined,
+        { method: 'POST', body: JSON.stringify({ request: captured }) },
+      );
+    },
+    componentProcessStopResult: (request: ComponentProcessStopRequest): Promise<ComponentProcessStopResult> => {
+      const captured = structuredClone(request);
+      captured.request_context = normalizePublicRequestContext(captured.request_context) as typeof captured.request_context;
+      return requestJson(
+        `/api/cclc/components/${encodeURIComponent(captured.controllable_component_id)}/process/stop/result`,
+        (value) => parseComponentProcessStopResult(value, captured), undefined,
+        { method: 'POST', body: JSON.stringify({ request: captured }) },
+      );
+    },
     owner: (signal?: AbortSignal): Promise<CCLCOwnerIdentity> => requestJson(
       '/api/cclc/owner',
       parseCCLCOwnerIdentity,
@@ -654,6 +728,7 @@ export const api = {
         ) {
           throw new Error('incident recovery does not match its request');
         }
+        requireExactCloseIncidentRecovery(request, result);
         return result;
       },
       signal,
@@ -678,6 +753,7 @@ export const api = {
           && result.incidentRecovery.componentId !== request.controllable_component_id) {
           throw new Error('incident recovery does not match its request');
         }
+        requireExactCloseIncidentRecovery(request, result);
         return result;
       },
       signal,
@@ -1143,6 +1219,28 @@ export const api = {
     ),
   },
   manager: {
+    prepareCanonicalEmpty: (body: Record<string, unknown>): Promise<Record<string, unknown>> => requestJson(
+      '/api/activation-preparations', (value) => {
+        const envelope = parseObjectResponse(value);
+        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'prepared_activation')) {
+          throw new Error('activation preparation must contain only prepared_activation');
+        }
+        parsePreparedActivationInput(envelope.prepared_activation, 'preparedActivation');
+        return parseObjectResponse(envelope.prepared_activation);
+      }, undefined,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    previewCandidate: (body: Record<string, unknown>): Promise<import('../types/api').ManagerDeploymentCandidatePreviewResponse> => requestJson(
+      '/api/manager/deployment-candidates/preview', parseManagerDeploymentCandidatePreviewResponse, undefined,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    applyCandidate: (body: Record<string, unknown>): Promise<import('../types/api').ManagerApplyResponse> => requestJson(
+      '/api/manager/apply', parseManagerApplyResponse, undefined,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    canonicalEmptySelection: (signal?: AbortSignal): Promise<CanonicalEmptySelection> => requestJson(
+      '/api/manager/canonical-empty-selection', parseCanonicalEmptySelection, signal,
+    ),
     status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(
       '/api/manager/status',
       parseManagerStatusProjection,

@@ -7,6 +7,7 @@
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 
 #include <gtest/gtest.h>
+#include <roboplan/core/scene.hpp>
 #include "managed_ros2_component_installation.hpp"
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
@@ -15,6 +16,8 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -485,6 +488,198 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     EXPECT_NE(message.find("replacement_start_allowance_s"), std::string::npos)
         << message;
     EXPECT_NE(message.find("late_cycle_margin_s"), std::string::npos) << message;
+  }
+}
+
+[[nodiscard]] RetainedRos2ControlBackendConfig
+test_factory_config(bool measured_lane) {
+  RetainedRos2ControlBackendConfig config;
+  config.node_name = "manyforge_factory_clock_fixture";
+  config.node_namespace = "/manyforge/robot_1";
+  config.executor_thread_count = 1U;
+  config.arm = test_arm_transport(config.node_namespace);
+  config.participant = test_participant_config();
+  config.observed_state_authority_profile_id = "commanded_simulation";
+  config.defer_ros_start = true;
+  if (measured_lane) {
+    config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
+        config.node_namespace + "/joint_states", 250'000'000,
+        core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+        std::string(kMeasuredJointStateProfileId)};
+  }
+  return config;
+}
+
+[[nodiscard]] std::shared_ptr<RetainedObservedStateChannel>
+test_projected_channel(const core::RuntimeParticipantBinding &binding,
+                       RetainedObservedStateChannelConfig config,
+                       core::IClock &clock) {
+  // The factory fixtures bind a retained model coordinate, so their channel
+  // needs the matching model projection even though no executor is started.
+  const auto &value = binding.value();
+  if (value.resources.size() != 1U || value.model_groups.size() != 1U ||
+      !value.control_path.has_value())
+    throw std::logic_error("clock fixture requires one addressed model joint");
+  const auto &resource = value.resources.front();
+  const auto &joint = resource.compiled_resource_name;
+  const std::string joint_type =
+      resource.coordinate_kind == core::CoordinateKind::kAngular ? "revolute"
+                                                               : "prismatic";
+  const std::string urdf =
+      "<robot name='clock_fixture' version='1.0'><link name='base'/>"
+      "<link name='tip'/><joint name='" + joint +
+      "' type='" + joint_type + "'><parent link='base'/><child link='tip'/>"
+      "<axis xyz='0 0 1'/><limit lower='-1' upper='1' effort='5' velocity='2'/>"
+      "</joint></robot>";
+  auto scene = std::make_shared<roboplan::Scene>(
+      "clock_fixture", roboplan::loadUrdfSceneDescriptionFromXml(urdf, {}));
+  RetainedKinematicModelMapInput model_map{
+      value.retained_bundle_id,
+      value.graph_revision,
+      {{value.control_path->control_binding_id,
+        value.controllable_component_id,
+        value.command_target_id,
+        {{resource.resource_id,
+          {{value.model_groups.front().model_instance_id, joint,
+            resource.coordinate_kind}}}}}}};
+  auto projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create(
+          std::move(scene), std::make_shared<std::mutex>(), std::move(model_map),
+          {binding}, config.freshness_budget_ns));
+  return std::make_shared<RetainedObservedStateChannel>(
+      binding, std::move(projector), std::move(config), &clock);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MeasuredLaneRefusesMissingOrForeignClockBeforeTransportAndBind) {
+  const auto motion = commanded_binding();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  for (const bool foreign_owner : {false, true}) {
+    auto config = test_factory_config(true);
+    // An invalid node name makes premature ROS construction observable.
+    config.node_name = "invalid/node/name";
+    if (foreign_owner)
+      config.measured_receiver_clock = std::make_shared<core::FakeClock>();
+    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    auto factory = make_retained_ros2_control_backend_factory(
+        std::move(config), handle);
+    try {
+      // Clock ownership must refuse before the missing-channel guard too.
+      static_cast<void>(factory(motion, std::nullopt, nullptr, nullptr,
+                                clock, scheduler));
+      FAIL() << "measured lane requires the exact owning receiver clock";
+    } catch (const std::invalid_argument &error) {
+      EXPECT_EQ(std::string(error.what()).substr(
+                    0U, std::string(error.what()).find(':')),
+                foreign_owner ? "measured_receiver_clock_mismatch"
+                              : "measured_receiver_clock_missing");
+    }
+    EXPECT_FALSE(handle->node());
+    EXPECT_FALSE(handle->participant());
+    EXPECT_FALSE(handle->current_port());
+  }
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     LegacyLaneWithoutMeasuredSourceStillAcceptsBorrowedClock) {
+  const auto motion = commanded_binding();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = test_factory_config(false);
+  const auto motion_channel = test_projected_channel(
+      motion, retained_ros2_control_motion_state_config(config), clock);
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto factory = make_retained_ros2_control_backend_factory(
+      std::move(config), handle);
+  const auto backend = factory(motion, std::nullopt, motion_channel, nullptr,
+                               clock, scheduler);
+  ASSERT_TRUE(backend.execution);
+  EXPECT_TRUE(handle->OwnsBackend(backend.execution.get(), motion, std::nullopt));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     BindRefusesForeignClockOwnerBeforeParticipantConstruction) {
+  core::FakeClock clock;
+  const auto sink = std::make_shared<NullExecutionStateSink>();
+  auto resources = make_test_transport_resources(
+      "manyforge_bind_clock_fixture", sink, clock);
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  bool participant_constructed = false;
+  const auto bound = handle->Bind(
+      std::move(resources), clock, test_arm_transport("/manyforge/robot_1"),
+      [&](std::shared_ptr<core::IExecutionPort>) {
+        participant_constructed = true;
+        return std::shared_ptr<core::ExecutionPortParticipant>{};
+      },
+      nullptr, commanded_binding(), std::nullopt, std::nullopt,
+      std::make_shared<core::FakeClock>());
+  ASSERT_FALSE(bound.ok());
+  EXPECT_EQ(bound.error().details.at("reason"),
+            "ros2_control_handle_clock_owner_mismatch");
+  EXPECT_FALSE(participant_constructed);
+  EXPECT_FALSE(handle->node());
+  EXPECT_FALSE(handle->participant());
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     ExactMeasuredClockOwnerSurvivesThroughExistingBackendAndLifecycleOwners) {
+  // Each independent existing handle owner must preserve the borrowed clock,
+  // even after the caller, factory and all other backend owners release it.
+  for (const int retained_owner : {0, 1, 2}) {
+    SCOPED_TRACE(retained_owner);
+    const auto motion = commanded_binding();
+    const auto tool = commanded_gripper_binding();
+    auto clock = std::make_shared<core::FakeClock>();
+    clock->set(123'000'000);
+    const std::weak_ptr<core::IClock> weak_clock = clock;
+    core::ManualScheduler scheduler;
+    auto config = test_factory_config(true);
+    config.measured_receiver_clock = clock;
+    config.gripper.emplace();
+    config.gripper->action_name =
+        config.node_namespace + "/gripper_controller/gripper_cmd";
+    config.gripper->group_id = "gripper";
+    config.gripper->joint_name = "gripper_joint";
+    auto motion_channel = test_projected_channel(
+        motion, retained_ros2_control_motion_state_config(config), *clock);
+    auto gripper_channel = test_projected_channel(
+        tool, retained_ros2_control_gripper_state_config(tool), *clock);
+    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak_handle = handle;
+    auto factory = make_retained_ros2_control_backend_factory(
+        std::move(config), handle);
+    auto backend = factory(motion, tool, motion_channel, gripper_channel,
+                           *clock, scheduler);
+    ASSERT_TRUE(backend.execution);
+    ASSERT_TRUE(backend.gripper);
+    EXPECT_FALSE(backend.execution.owner_before(handle));
+    EXPECT_FALSE(handle.owner_before(backend.execution));
+    EXPECT_FALSE(backend.gripper.owner_before(handle));
+    EXPECT_FALSE(handle.owner_before(backend.gripper));
+    std::shared_ptr<core::IExecutionBackend> retained_execution;
+    std::shared_ptr<core::IGripperCommandBackend> retained_gripper;
+    RetainedExternallyManagedDomainSnapshotSource retained_lifecycle;
+    if (retained_owner == 0)
+      retained_execution = backend.execution;
+    else if (retained_owner == 1)
+      retained_gripper = backend.gripper;
+    else
+      retained_lifecycle = handle->lifecycle_snapshot_source();
+    backend = {};
+    factory = {};
+    motion_channel.reset();
+    gripper_channel.reset();
+    handle.reset();
+    clock.reset();
+    EXPECT_FALSE(weak_handle.expired());
+    ASSERT_FALSE(weak_clock.expired());
+    EXPECT_EQ(weak_clock.lock()->now(), 123'000'000);
+    retained_execution.reset();
+    retained_gripper.reset();
+    retained_lifecycle = {};
+    EXPECT_TRUE(weak_handle.expired());
+    EXPECT_TRUE(weak_clock.expired());
   }
 }
 
@@ -1143,6 +1338,174 @@ mock_runtime_configuration(const std::string &mock_profile) {
 
 const std::map<std::string, double, std::less<>> kMockCancel{
     {"source_joint_1", 12.5}};
+
+[[nodiscard]] core::ActiveControlConfigurationDTO
+reconciled_configuration(const core::RuntimeParticipantBinding &binding) {
+  const auto &path = *binding.value().control_path;
+  return {path.active_control_configuration_id,
+          path.control_domain_id,
+          path.control_domain_revision,
+          {{path.control_binding_id, path.control_binding_revision,
+            path.control_route_id}},
+          path.activation_set_id,
+          path.controller_topology_id,
+          path.topology_revision,
+          path.provider_runtime_unit_id,
+          path.provider_runtime_epoch,
+          1U,
+          {},
+          path.active_control_configuration_generation,
+          core::ActiveControlConfigurationStateDTO::kReconciled};
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MeasuredLaneUsesSelectedProfileTopicAndExistingPositiveBudget) {
+  const auto motion = commanded_binding();
+  const auto tool = commanded_gripper_binding();
+  const auto isaac = make_retained_isaac_ros2_control_backend_config(
+      isaac_runtime_configuration("lite6"), motion, tool);
+  ASSERT_TRUE(isaac.arm.measured_joint_state_lane);
+  ASSERT_TRUE(isaac.isaac_guard);
+  EXPECT_EQ(isaac.arm.measured_joint_state_lane->absolute_topic,
+            isaac.isaac_guard->joint_states_topic);
+  EXPECT_EQ(isaac.arm.measured_joint_state_lane->freshness_budget_ns,
+            isaac.participant.stop.controller_state_max_age_ns);
+  EXPECT_GT(isaac.arm.measured_joint_state_lane->freshness_budget_ns, 0);
+  const auto mock = make_retained_mock_ros2_control_backend_config(
+      mock_runtime_configuration("lite6_lite_gripper"), motion, tool,
+      kMockCancel);
+  ASSERT_TRUE(mock.arm.measured_joint_state_lane);
+  EXPECT_EQ(mock.arm.measured_joint_state_lane->absolute_topic,
+            mock.node_namespace + "/joint_states");
+  EXPECT_EQ(mock.arm.measured_joint_state_lane->freshness_budget_ns,
+            mock.participant.stop.controller_state_max_age_ns);
+  EXPECT_GT(mock.arm.measured_joint_state_lane->freshness_budget_ns, 0);
+  for (const auto *lane : {&*isaac.arm.measured_joint_state_lane,
+                           &*mock.arm.measured_joint_state_lane}) {
+    EXPECT_EQ(lane->measured_state_authority_id.value(),
+              kMeasuredJointStateAuthorityId);
+    EXPECT_EQ(lane->measured_source_profile_id, kMeasuredJointStateProfileId);
+  }
+  // The separate measured role never changes the execution/Stop authority.
+  EXPECT_EQ(mock.participant.stop.trip_authority,
+            core::StateAuthorityClass::kCommanded);
+  EXPECT_EQ(isaac.participant.stop.trip_authority,
+            core::StateAuthorityClass::kCommanded);
+  EXPECT_EQ(retained_ros2_control_motion_state_config(mock).freshness_budget_ns,
+            0);
+  EXPECT_EQ(
+      retained_ros2_control_motion_state_config(isaac).freshness_budget_ns, 0);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MeasuredDescriptorUsesExactPhysicalTupleAndReconciledConfiguration) {
+  const auto motion = commanded_binding();
+  const auto tool = commanded_gripper_binding();
+  const auto config = make_retained_mock_ros2_control_backend_config(
+      mock_runtime_configuration("lite6_lite_gripper"), motion, tool,
+      kMockCancel);
+  ASSERT_TRUE(config.arm.measured_joint_state_lane);
+  for (const auto *binding : {&motion, &tool}) {
+    const auto sealed_before = binding->value();
+    const auto configuration = reconciled_configuration(*binding);
+    const auto constructed =
+        make_retained_ros2_control_measured_state_descriptor(
+            *binding, configuration, *config.arm.measured_joint_state_lane);
+    ASSERT_TRUE(constructed.ok()) << constructed.error().message;
+    EXPECT_TRUE(constructed.value().validate().ok());
+    auto expected = core::make_observed_state_query_context(
+        *binding, config.participant.stop.controller_state_max_age_ns);
+    ASSERT_TRUE(expected.ok());
+    expected.value().state_authority_id =
+        config.arm.measured_joint_state_lane->measured_state_authority_id;
+    expected.value().state_authority_class =
+        core::StateAuthorityClass::kMeasured;
+    EXPECT_EQ(constructed.value().publication.query_context, expected.value());
+    EXPECT_EQ(constructed.value().publication.authority_generation,
+              configuration.active_control_configuration_generation.value());
+    ASSERT_EQ(constructed.value().publication.source_precedence.size(), 1U);
+    const auto &source =
+        constructed.value().publication.source_precedence.front();
+    EXPECT_EQ(source.kind, core::ObservedRobotStateSourceKind::kJointState);
+    EXPECT_EQ(source.source_id,
+              config.arm.measured_joint_state_lane->absolute_topic);
+    EXPECT_EQ(source.freshness_budget_ns,
+              config.participant.stop.controller_state_max_age_ns);
+    EXPECT_EQ(source.authority_profile,
+              core::ObservedRobotStateAuthorityProfile::kMeasured);
+    EXPECT_EQ(source.authority_profile_id, kMeasuredJointStateProfileId);
+    std::vector<std::string> names;
+    for (const auto &resource : binding->value().resources)
+      names.push_back(*resource.source_joint_name);
+    EXPECT_EQ(constructed.value().source_joint_names, names);
+    EXPECT_EQ(binding->value(), sealed_before);
+  }
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MeasuredDescriptorRejectsForeignRouteOrUnqualifiedLane) {
+  const auto binding = commanded_binding();
+  const auto config = make_retained_mock_ros2_control_backend_config(
+      mock_runtime_configuration("lite6_lite_gripper"), binding,
+      commanded_gripper_binding(), kMockCancel);
+  const auto good = reconciled_configuration(binding);
+  const auto lane = *config.arm.measured_joint_state_lane;
+  auto foreign = good;
+  foreign.source_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, foreign, lane)
+                   .ok());
+  foreign = good;
+  foreign.active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(
+          good.active_control_configuration_generation.value() + 1U);
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, foreign, lane)
+                   .ok());
+  foreign = good;
+  foreign.binding_routes.front().control_binding_revision =
+      core::ControlBindingRevision("foreign.revision");
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, foreign, lane)
+                   .ok());
+  foreign = good;
+  foreign.state =
+      core::ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, foreign, lane)
+                   .ok());
+  auto unqualified = lane;
+  unqualified.freshness_budget_ns = 0;
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, good, unqualified)
+                   .ok());
+  unqualified = lane;
+  unqualified.measured_state_authority_id =
+      core::StateAuthorityId("state.commanded");
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, good, unqualified)
+                   .ok());
+  unqualified = lane;
+  unqualified.measured_source_profile_id = "manyforge.commanded_simulation";
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, good, unqualified)
+                   .ok());
+  unqualified = lane;
+  unqualified.absolute_topic = "relative/joint_states";
+  EXPECT_FALSE(make_retained_ros2_control_measured_state_descriptor(
+                   binding, good, unqualified)
+                   .ok());
+  auto missing_mapping = binding.value();
+  missing_mapping.resources.front().source_joint_name.reset();
+  auto sealed_missing =
+      core::verify_runtime_participant_binding(std::move(missing_mapping));
+  ASSERT_TRUE(sealed_missing.ok());
+  const auto missing = make_retained_ros2_control_measured_state_descriptor(
+      sealed_missing.value(), good, lane);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().details.at("reason"),
+            "measured_source_coordinate_mapping_invalid");
+}
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      Lite6MockProfileUsesIsaacLaneFactsAndItsOwnControllers) {

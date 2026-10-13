@@ -23,8 +23,12 @@ For the extractor's wire contract, filename rules, and OBJ format see
   extension's README "Install" section. Confirm with
   `ros2 service list | grep manyforge`.
 - A ManyForge checkout on the same network (or the same host) as Isaac.
-- `ros2` reachable from the ManyForge host (either via a native ROS
-  install or the `manyforge-ros-jazzy-full` Docker image).
+- The temporary Isaac qualification hold uses the exact Jazzy image
+  `manyforge-ros-jazzy-full:q44-20261010` on the laptop; no host ROS installation
+  is required. Set `MANYFORGE_ISAAC_ROS_IMAGE` to another explicitly qualified
+  held image when needed. Current Orin/Thor inventories have no such full
+  image, so these recipes are unavailable there until one is supplied.
+  The common Lyrical image does not replace the held lane.
 
 Throughout this runbook the placeholder `${MANYFORGE_REPO_ROOT}` refers
 to your checkout (for example `${HOME}/workspaces/dev_ws/src/manyforge`), and
@@ -37,8 +41,8 @@ With Isaac Sim running and your scene loaded, ask the extension for an
 inventory:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-ros2 service call /manyforge/isaac_collider_report std_srvs/srv/Trigger '{}'
+docker run --rm --network host ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010} \
+  bash -lc "source /opt/ros/jazzy/setup.bash; ros2 service call /manyforge/isaac_collider_report std_srvs/srv/Trigger '{}'"
 ```
 
 The response is a JSON string. Spot-check that the objects you expect
@@ -85,7 +89,7 @@ vs `*_visual.obj` etc.).
 ## 3. Pull mesh files onto the ManyForge host
 
 The transfer client lives in `manyforge_ros`. From the ManyForge host
-(either natively or in the ROS Docker image), run one transfer per
+(inside the held Jazzy Docker image), run one transfer per
 object you want to materialise. The `mesh_export_dir` argument is a
 directory on the **Isaac host** where the extractor writes the OBJ;
 the client then chunked-transfers the bytes back and reassembles them
@@ -99,7 +103,7 @@ mkdir -p ${MANYFORGE_REPO_ROOT}/examples/${SCENE_NAME}/meshes
 
 docker run --rm --network host \
   -v ${MANYFORGE_REPO_ROOT}:/workspace \
-  -w /workspace manyforge-ros-jazzy-full \
+  -w /workspace ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010} \
   bash -lc 'source /opt/ros/jazzy/setup.bash;
     export PYTHONPATH=/workspace:/workspace/manyforge_ros:${PYTHONPATH};
     python3 -m manyforge_ros.isaac_mesh_transfer \

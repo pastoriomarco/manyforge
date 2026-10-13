@@ -653,6 +653,83 @@ afterEach(() => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
+  it.each([
+    [422, 'program_run_started_then_failed', 'Run failed:', true, false],
+    [422, 'program_run_superseded_by_stop', 'Run stopped — Reset required', true, false],
+    [409, 'program_run_stopped_before_start', 'Run stopped before start — Reset required', true, false],
+    [503, 'program_cycle_reconciliation_required', 'Command delivery is unconfirmed', false, false],
+    [500, 'program_runner_internal_error', 'Command delivery is unconfirmed', false, false],
+    [422, 'program_run_started_then_failed', 'Run outcome could not be read', true, true],
+  ] as const)('distinguishes known Run outcomes from unknown delivery for HTTP %s/%s', async (
+    status, code, message, confirmed, malformed,
+  ) => {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false, status,
+      json: async () => ({ detail: {
+        code, message: code === 'program_run_started_then_failed'
+          ? 'Required component changed after claim' : 'Operator Stop won the start',
+        details: { program_run_id: 'program-cycle.2',
+          claim_generation: code === 'program_run_stopped_before_start' ? null : 9,
+          needs_reset: malformed ? 'true' : true, component_id: 'arm.1',
+          cause_code: code === 'program_run_started_then_failed'
+            ? 'program_required_component_not_active' : 'program_run_superseded_by_stop',
+          cause_message: code === 'program_run_started_then_failed'
+            ? 'Required component changed after claim' : 'Operator Stop won the start',
+          ...(['program_run_superseded_by_stop', 'program_run_stopped_before_start'].includes(code)
+            ? { stopped_by_operator: true } : {}),
+          ...(code === 'program_run_stopped_before_start' ? { no_effect: true } : {}),
+        },
+      } }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    try {
+      const failure = await source.sendExecutionCommand(
+        'program_run', { scenario_id: 'lite6' }, 'run.http.outcome',
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain(message);
+      if (confirmed && !malformed) {
+        expect((failure as Error).message).toContain('program-cycle.2');
+        expect((failure as Error).message).toContain(code === 'program_run_started_then_failed'
+          ? 'Required component changed after claim' : 'Operator Stop won the start');
+        expect((failure as Error).message).toContain('Reset required');
+      }
+      if (malformed) expect((failure as Error).message).not.toContain('Reset required');
+      expect(FakeWebSocket.shell.readyState).toBe(confirmed ? FakeWebSocket.OPEN : 3);
+      expect(FakeWebSocket.shell.sent.some((frame) =>
+        JSON.parse(frame).incident_kind === 'command_delivery_unconfirmed')).toBe(!confirmed);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      source.dispose();
+    }
+  });
+
   it('sends new execution through Composer admission without consuming a WS command sequence', async () => {
     class FakeWebSocket {
       static readonly OPEN = 1;

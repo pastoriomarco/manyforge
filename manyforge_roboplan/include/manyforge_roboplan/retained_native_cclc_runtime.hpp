@@ -23,10 +23,28 @@ namespace manyforge::roboplan_backend {
 MakeVerifiedEmptyCellRoutePublicationOwner(
     const deployment::RetainedBundle &retained_bundle);
 
+/// Plain construction dependencies, owned by the existing product context.
+/// The callback is consumed once after existing route recovery; it performs
+/// no provider sampling, source staging, lifecycle action or publication.
+struct RetainedNativeCCLCReadinessDependencies final {
+  std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> inventory;
+  deployment::CCLCReadinessSourceCapture capture;
+};
+using RetainedNativeCCLCReadinessConstruction =
+    std::function<RetainedNativeCCLCReadinessDependencies()>;
+
 /// Product-owned policy for the retained native CCLC join.
 struct RetainedNativeCCLCRuntimeConfig final {
   deployment::CCLCRuntimeCompositionConfig composition;
   core::Duration controller_observation_freshness_ns;
+  /// Immutable complete geometry and pure current-source capture belong to
+  /// this same product context, including successor preparation.
+  std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory>
+      measured_state_inventory{};
+  deployment::CCLCReadinessSourceCapture capture_readiness_sources{};
+  /// Empty keeps the direct inputs unchanged. A nonempty pure construction
+  /// callback is consumed synchronously once and never retained by reads.
+  RetainedNativeCCLCReadinessConstruction prepare_readiness_dependencies{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
@@ -41,18 +59,27 @@ DeriveRetainedNativeStateSourceProjections(
 
 /// Derive the same native Apply request before installation or outgoing-owner
 /// retirement. Compiled generations are planned floors; retained readbacks are
-/// exact current Kernel facts. This performs no I/O, records no plan, and proves
-/// neither actual controller survival nor installed candidate readiness.
+/// exact current Kernel facts. This performs no I/O, records no plan, and
+/// proves neither actual controller survival nor installed candidate readiness.
+/// Ordinary Apply may supply the exact observed retained/removed owner sets;
+/// these choose transient lifecycle effects, never alter the authored delta.
+/// Both overrides must be present together and borrowed through this call.
 [[nodiscard]] core::Result<core::NativeApplyPlanRequestDTO>
 DeriveRetainedNativeApplyPlanRequest(
     const core::NamedApplyPublicationTransactionDTO &apply,
     const deployment::RetainedBundle &candidate,
     const deployment::RetainedBundle *predecessor,
     const deployment::ApplyComponentDeltaDTO &delta,
-    std::span<const core::RuntimeParticipantBinding> candidate_physical_bindings,
-    std::span<const core::RuntimeRouteConfigurationReadbackDTO> retained_route_readbacks,
+    std::span<const core::RuntimeParticipantBinding>
+        candidate_physical_bindings,
+    std::span<const core::RuntimeRouteConfigurationReadbackDTO>
+        retained_route_readbacks,
     core::ComponentLifecycleStateDTO changed_component_state =
-        core::ComponentLifecycleStateDTO::kActive);
+        core::ComponentLifecycleStateDTO::kActive,
+    std::optional<std::span<const core::ControllableComponentId>>
+        actual_retained_components = std::nullopt,
+    std::optional<std::span<const core::ControllableComponentId>>
+        actual_removed_components = std::nullopt);
 
 /// Parent-Apply candidate initialization delegated to CCLC. The caller must
 /// hold and verify the exact Manager fence around this call and pass the plan

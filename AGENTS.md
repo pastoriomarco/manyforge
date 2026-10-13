@@ -84,7 +84,7 @@ docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-develo
 
 The default container name can be overridden with `MANYFORGE_DEV_CONTAINER_NAME`;
 use that same name for diagnosis. Capture logs before stopping: stop removes the
-container and its runtime state. Save wanted artifacts through the UI first.
+container while keeping its durable runtime root. Save wanted artifacts through the UI first.
 After explicit shutdown authorization:
 
 ```bash

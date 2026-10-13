@@ -625,7 +625,7 @@ if(BUILD_TESTING)
     add_executable(test_component_lifecycle_coordinator
       test/test_component_lifecycle_coordinator.cpp)
     target_link_libraries(test_component_lifecycle_coordinator PRIVATE
-      manyforge_core_sqlite_cclc_journal GTest::gtest_main)
+      manyforge_core_sqlite_cclc_journal SQLite::SQLite3 GTest::gtest_main)
     gtest_discover_tests(test_component_lifecycle_coordinator
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

@@ -38,6 +38,7 @@ from manyforge_program_runner.runtime import (
     ProgramRunnerError,
     ProgramRuntime,
 )
+from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.cell_admission import (
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
@@ -116,6 +117,7 @@ class _Headless:
         "commit_scene_transaction",
         "scene_transaction_status",
         "cclc_component",
+        "cclc_component_lifecycle_snapshot",
         "cclc_owner_identity",
         "cclc_route_templates",
         "component_lifecycle_status",
@@ -159,7 +161,7 @@ class _Headless:
             },
         }
 
-    def cclc_component(self, component_id: str) -> dict[str, Any]:
+    def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
         assert component_id == "robot.1"
         self.cclc_reads.append(component_id)
         return {
@@ -213,7 +215,7 @@ def test_program_component_readiness_uses_exact_cclc_state() -> None:
             self.graph = _DIGEST_B
             self.reads: list[str] = []
 
-        def cclc_component(self, component_id: str) -> dict[str, Any]:
+        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
             self.reads.append(component_id)
             return {
                 "controllable_component_id": component_id,
@@ -254,7 +256,7 @@ def test_program_component_readiness_uses_exact_cclc_state() -> None:
 
 def test_program_component_readiness_does_not_block_an_unbound_peer() -> None:
     class Components:
-        def cclc_component(self, component_id: str) -> dict[str, Any]:
+        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
             assert component_id == "robot.enabled"
             return {
                 "controllable_component_id": component_id,
@@ -282,15 +284,15 @@ def test_disabled_required_component_rejects_program_before_claim(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     class DisabledHeadless(_Headless):
-        def cclc_component(self, component_id: str) -> dict[str, Any]:
+        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
             return {
-                **super().cclc_component(component_id),
+                **super().cclc_component_lifecycle_snapshot(component_id),
                 "component_lifecycle_state": "disabled",
             }
 
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     headless = DisabledHeadless()
     admission = _Admission()
@@ -1574,7 +1576,6 @@ def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartReq
             "source_document_digest": _DIGEST_A,
             "expected_applied_record_digest": _DIGEST_B,
             "draft_program_revision": _DIGEST_A,
-            "expected_admission_generation": 1,
         }
     )
 
@@ -1850,15 +1851,25 @@ def test_starting_stop_reaches_native_while_capture_registration_is_held(
         starter.join(5)
         if stopper is not None:
             stopper.join(5)
+        cycle = runtime._journal.read()
         runtime.shutdown()
     assert not starter.is_alive()
     assert len(failures) == 1
     assert isinstance(failures[0], ProgramRunnerError)
     assert failures[0].code == "program_run_superseded_by_stop"
+    assert failures[0].details["cause_code"] == "program_run_superseded_by_stop"
+    assert failures[0].details["program_run_id"] == "program-cycle.1"
+    assert failures[0].details["needs_reset"] is True
+    assert failures[0].details["stopped_by_operator"] is True
+    assert "stopped during start" in str(failures[0])
+    assert cycle.state == "terminal_awaiting_reset"
+    assert cycle.failure is None
+    assert cycle.start_settlement["kind"] == "proven_no_effect"
+    assert cycle.start_settlement["program_run_id"] == "program-cycle.1"
     assert runtime._starting_kernel_owner_epoch is None
 
 
-def test_run_prepares_while_idle_then_only_verifies_after_claim(
+def test_applied_scene_preparation_precedes_run_and_run_never_checks_scene(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -1869,7 +1880,7 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
 
         def get(self) -> dict[str, Any]:
             events.append(f"admission:{self.generation}")
-            return {"admission_generation": self.generation}
+            return {"admission_generation": self.generation, "authoring_allowed": True}
 
         def acquire(self, intent: dict[str, Any]) -> dict[str, Any]:
             events.append("claim")
@@ -1916,9 +1927,20 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
     )
     runtime.start()
 
+    runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
+        "request_id": "applied.scene", "request_owner_epoch": "composer.1",
+        "source_label": "composer", "correlation_id": None,
+        "expected_applied_record_digest": _DIGEST_B,
+        "expected_admission_generation": 1,
+    }))
+    assert events == ["admission:1", "prepare", "verify", "admission:3"]
+    events.clear()
+    for method in ("prepare_initial_scene", "verify_initial_scene"):
+        monkeypatch.setattr(runtime._scene, method,
+                            lambda *_args: pytest.fail("Run touched the Scene"))
     runtime.start_run(_start_request())
 
-    assert events == ["admission:1", "prepare", "admission:3", "claim", "verify"]
+    assert events == ["admission:3", "admission:3", "claim"]
     status = runtime.cycle_status()
     run = runtime.read_run(status["program_run_id"])
     assert status["state"] == "running"
@@ -1936,38 +1958,151 @@ def test_run_prepares_while_idle_then_only_verifies_after_claim(
     runtime.shutdown()
 
 
-def test_scene_preparation_failure_leaves_cycle_idle_without_claim(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+
+@pytest.mark.parametrize("changed_program", [False, True])
+def test_immediate_run_after_idle_reset_uses_server_generation_and_exact_program(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, changed_program: bool,
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
-    admission = _Admission()
+    class Admission(_Admission):
+        generation = 36
+        starting = False
+        reads = 0
+        def get(self):
+            if self.starting:
+                self.reads += 1
+                if self.reads == 2:
+                    # The Manager observes the just-published Reset cycle
+                    # between the initial and fresh server admission reads.
+                    self.generation = 38
+            return {"admission_generation": self.generation, "authoring_allowed": True}
+        def acquire(self, intent):
+            assert intent["expected_admission_generation"] == self.generation == 38
+            claim = super().acquire(intent)
+            claim["acquired_admission_generation"] = self.generation
+            return claim
+    admission = Admission()
+    headless = _Headless()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.reset-run.1")
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.prepare-fail.1"
-        ),
-        headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
-        admission_client=admission,  # type: ignore[arg-type]
-        cycle_journal=ProgramCycleJournal(
-            tmp_path / "cycle.sqlite3", owner_epoch="runner.prepare-fail.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.reset-run.1"),
+        headless_client=headless, execution_transport=_Headless(), admission_client=admission,
+        cycle_journal=journal,
     )
-    monkeypatch.setattr(
-        runtime._scene,  # noqa: SLF001
-        "prepare_initial_scene",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("scene unavailable")),
-    )
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    runtime._owner = owner
+    runtime._host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    monkeypatch.setattr(runtime._scene, "prepare_initial_scene",
+                        lambda *_args: {"schema_version": "manyforge.prepared_program_scene.v1"})
+    monkeypatch.setattr(runtime._scene, "verify_initial_scene", lambda *_args: None)
     runtime.start()
+    try:
+        for generation in (1, 2):
+            result = runtime.reset_cycle(ProgramCycleResetRequest.model_validate({
+                "request_id": "idle.reset." + str(generation), "request_owner_epoch": "operator.1",
+                "source_label": "operator_ui", "program_run_id": None,
+                "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": generation,
+                "expected_claim_generation": None, "terminal_reference": None,
+                "settlement_evidence_digest": None,
+            }))
+        assert result["admission"]["admission_generation"] == 36
+        assert journal.read().cycle_generation == 3
+        for method in ("prepare_initial_scene", "verify_initial_scene"):
+            monkeypatch.setattr(runtime._scene, method,
+                                lambda *_args: pytest.fail("Run touched the Scene"))
+        admission.starting = True
+        if changed_program:
+            original = headless.program_applied
+            def another_client_applied():
+                applied = original()
+                applied["source"]["record_digest"] = _DIGEST_A
+                return applied
+            monkeypatch.setattr(headless, "program_applied", another_client_applied)
+            with pytest.raises(ProgramRunnerError) as refused:
+                runtime.start_run(_start_request())
+            assert refused.value.code == "program_run_applied_selection_stale"
+            assert not admission.claims
+            assert journal.read().state == "idle_after_reset"
+        else:
+            runtime.start_run(_start_request())
+            assert journal.read().state == "running"
+            assert len(admission.claims) == 1
+            assert admission.claims[0]["expected_admission_generation"] == 38
+    finally:
+        runtime.shutdown()
 
-    with pytest.raises(ProgramRunnerError, match="scene unavailable"):
+
+def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    class IdleAdmission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    admission = IdleAdmission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.prepare-fail.1"),
+        headless_client=_Headless(), execution_transport=_Headless(),
+        admission_client=admission,
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.prepare-fail.1"),
+    )
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    runtime._owner = owner
+    runtime._host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    monkeypatch.setattr(runtime._scene, "prepare_initial_scene",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError("scene unavailable")))
+    runtime.start()
+    preparation = ProgramScenePreparationRequest.model_validate({
+        "request_id": "apply.scene.failure", "request_owner_epoch": "composer.1",
+        "source_label": "composer", "correlation_id": None,
+        "expected_applied_record_digest": _DIGEST_B,
+        "expected_admission_generation": 1,
+    })
+    with pytest.raises(ProgramRunnerError, match="scene unavailable") as failed:
+        runtime.prepare_applied_scene(preparation)
+    assert failed.value.code == "program_scene_preparation_failed"
+    status = runtime.cycle_status()
+    assert status["state"] == "idle_after_reset"
+    assert status["failure"]["code"] == "program_scene_preparation_failed"
+    commands = {row["command_kind"]: row for row in status["allowed_commands"]}
+    assert commands["program_run"]["allowed"] is False
+    assert commands["program_run"]["disabled_reason"] == "program_scene_preparation_failed"
+    assert commands["program_reset"]["allowed"] is True
+    with pytest.raises(ProgramRunnerError) as rejected:
         runtime.start_run(_start_request())
-
+    assert rejected.value.code == "program_scene_preparation_failed"
     assert admission.claims == []
-    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    objects = {"changed": True}
+    def restore(_context, _scene):
+        assert runtime.cycle_status()["state"] == "idle_after_reset"
+        objects.clear()
+        objects["program_object"] = True
+        return {"schema_version": "manyforge.prepared_program_scene.v1"}
+    monkeypatch.setattr(runtime._scene, "prepare_initial_scene", restore)
+    monkeypatch.setattr(runtime._scene, "verify_initial_scene", lambda *_args: None)
+    reset = ProgramCycleResetRequest.model_validate({
+        "request_id": "idle.reset", "request_owner_epoch": "composer.1",
+        "source_label": "operator_ui", "correlation_id": None,
+        "program_run_id": None, "expected_owner_epoch": runtime.owner_epoch,
+        "expected_cycle_generation": 1, "expected_claim_generation": None,
+        "terminal_reference": None, "settlement_evidence_digest": None,
+    })
+    result = runtime.reset_cycle(reset)
+    assert result["program_run_id"] is None
+    assert result["idle_cycle_generation"] == 2
+    assert objects == {"program_object": True}
+    assert runtime.cycle_status()["failure"] is None
+    runtime.start_run(_start_request(request_id="after.idle.reset"))
+    assert runtime.cycle_status()["state"] == "running"
+    assert len(admission.claims) == 1
     runtime.shutdown()
 
 
@@ -2005,16 +2140,16 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
     preparation_entered = Event()
     continue_preparation = Event()
 
-    def prepare_scene(*_args: object) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        preparation_entered.set()
-        assert continue_preparation.wait(timeout=1.0)
-        return (
-            "program-cycle.1",
-            {},
-            {"schema_version": "manyforge.prepared_program_scene.v1"},
-        )
-
-    monkeypatch.setattr(runtime, "_prepare_run_scene", prepare_scene)
+    original_get = admission.get
+    reads = 0
+    def read_admission():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            preparation_entered.set()
+            assert continue_preparation.wait(timeout=1.0)
+        return original_get()
+    monkeypatch.setattr(admission, "get", read_admission)
     monkeypatch.setattr(
         runtime._scene, "release", lambda _context_id: None
     )  # noqa: SLF001
@@ -2058,7 +2193,16 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
     assert not thread.is_alive()
     assert len(start_outcome) == 1
     assert isinstance(start_outcome[0], ProgramRunnerError)
-    assert start_outcome[0].code == "program_run_superseded_by_stop"
+    assert start_outcome[0].code == "program_run_stopped_before_start"
+    assert start_outcome[0].details == {
+        "program_run_id": "program-cycle.1",
+        "claim_generation": None,
+        "stopped_by_operator": True,
+        "no_effect": True,
+        "needs_reset": True,
+        "cause_code": "program_run_superseded_by_stop",
+        "cause_message": "Program Stop was accepted before Run admission completed",
+    }
     assert host.start_admissions == []
     assert admission.claims == []
     terminal = runtime.cycle_status()
@@ -2221,9 +2365,8 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
     runtime.shutdown()
 
 
-def test_post_claim_scene_race_records_resettable_no_effect_settlement(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+def test_run_does_not_compare_changed_authored_scene(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
@@ -2231,61 +2374,21 @@ def test_post_claim_scene_race_records_resettable_no_effect_settlement(
     )
     admission = _Admission()
     runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test", owner_epoch="runner.scene-race.1"
-        ),
-        headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
-        admission_client=admission,  # type: ignore[arg-type]
-        cycle_journal=ProgramCycleJournal(
-            tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-race.1"
-        ),
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.scene-changed.1"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission,
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.scene-changed.1"),
     )
-    monkeypatch.setattr(
-        runtime._scene,  # noqa: SLF001
-        "prepare_initial_scene",
-        lambda *_args, **_kwargs: {
-            "schema_version": "manyforge.prepared_program_scene.v1"
-        },
-    )
-    monkeypatch.setattr(
-        runtime._scene,  # noqa: SLF001
-        "verify_initial_scene",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("scene raced")),
-    )
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    runtime._owner = owner
+    runtime._host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    for method in ("prepare_initial_scene", "verify_initial_scene"):
+        monkeypatch.setattr(runtime._scene, method,
+                            lambda *_args: pytest.fail("Run edited or compared the Scene"))
     runtime.start()
-
-    with pytest.raises(ProgramRunnerError, match="scene raced"):
-        runtime.start_run(_start_request())
-
-    status = runtime.cycle_status()
-    retained = runtime._journal.read()  # noqa: SLF001
-    assert status["state"] == "terminal_awaiting_reset"
-    assert status["program_run_id"] == "program-cycle.1"
-    assert status["terminal_or_settlement_reference"].startswith("sha256:")
-    assert retained.start_settlement is not None
-    assert retained.start_settlement["kind"] == "proven_no_effect"
-    assert runtime._digest(retained.start_settlement) == (  # noqa: SLF001
-        status["terminal_or_settlement_reference"]
-    )
-    _bypass_reset_scene_preparation(monkeypatch)
-    reset = ProgramCycleResetRequest.model_validate(
-        {
-            "request_id": "request.reset.scene-race",
-            "request_owner_epoch": "composer.epoch.1",
-            "source_label": "operator_ui",
-            "correlation_id": None,
-            "program_run_id": status["program_run_id"],
-            "expected_owner_epoch": runtime.owner_epoch,
-            "expected_cycle_generation": status["cycle_generation"],
-            "expected_claim_generation": status["cycle_claim_generation"],
-            "terminal_reference": status["terminal_or_settlement_reference"],
-            "settlement_evidence_digest": status["terminal_or_settlement_reference"],
-        }
-    )
-    runtime.reset_cycle(reset)
-    assert len(admission.releases) == 1
-    assert runtime.cycle_status()["state"] == "idle_after_reset"
+    runtime.start_run(_start_request())
+    assert runtime.cycle_status()["state"] == "running"
+    assert len(admission.claims) == 1
     runtime.shutdown()
 
 
@@ -2295,7 +2398,7 @@ def test_host_start_without_a_result_retains_claim_for_reconciliation(
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
@@ -2454,7 +2557,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     tmp_path,
 ) -> None:
     headless = _Headless()
-    admitted = object()
+    admitted = _PreparedRunAdmission()
     joins: list[dict[str, Any]] = []
 
     def join(applied: dict[str, Any], **_kwargs: object):
@@ -2840,7 +2943,7 @@ def test_manual_handover_requeries_kernel_and_retains_cleanup_outcome(
 
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     runtime, journal, _admission = _reconcile_runtime(
@@ -2990,7 +3093,7 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
 ):
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     runtime, journal, _admission = _reconcile_runtime(
@@ -3128,7 +3231,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
@@ -3319,7 +3422,7 @@ def test_control_projection_reuses_one_paired_run_and_selection_snapshot(
 ):
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     runtime, _journal, _admission = _reconcile_runtime(
@@ -3407,7 +3510,7 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
 ) -> None:
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     journal_path = tmp_path / "cycle.sqlite3"
@@ -4371,7 +4474,7 @@ def test_stop_retains_claim_until_exact_terminal_snapshot_is_observed(
     headless = _Headless()
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
@@ -4510,7 +4613,7 @@ def uncertain_reset_runtime(monkeypatch, tmp_path):
     """One lost Resume through the public owner path, with ordinary capacity full."""
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     monkeypatch.setattr(
@@ -4883,7 +4986,7 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
     headless = InterleavedHeadless()
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     journal = ProgramCycleJournal(
@@ -4913,11 +5016,13 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
     admission.generation = 3
     with pytest.raises(ProgramRunnerError) as rechecked:
         runtime.start_run(request)
-    assert rechecked.value.code == "stale_generation"
+    assert rechecked.value.code == "program_run_draft_applied_mismatch"
     with pytest.raises(ProgramRunnerError) as still_stale:
-        runtime.start_run(_start_request(request_id="request.start.capacity"))
-    assert still_stale.value.code == "stale_generation"
-    assert events == ["generation", "applied", "generation", "generation"]
+        runtime.start_run(
+            request.model_copy(update={"request_id": "request.start.capacity"})
+        )
+    assert still_stale.value.code == "program_run_draft_applied_mismatch"
+    assert events == ["generation", "applied"] * 3
     assert admission.claims == []
     assert journal._database.execute(  # noqa: SLF001
         "SELECT COUNT(*) FROM program_cycle_inflight_commands"
@@ -4938,7 +5043,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
 
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     admission = _Admission()
@@ -4981,7 +5086,7 @@ def test_native_acquire_rejection_is_safe_to_recheck_without_retained_receipt(
 
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     admission = RejectingAdmission()
@@ -5344,7 +5449,7 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
 ):
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
     _bypass_scene_preparation(monkeypatch)
     runtime, journal, _admission = _reconcile_runtime(
@@ -5507,5 +5612,126 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
         else:
             assert rejected.value.code == "program_cycle_reconciliation_required"
             assert journal.read().reconciliation_required
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_lifecycle_failure_before_or_after_claim_is_honest_and_resettable(monkeypatch, tmp_path, failure_at):
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission",
+                        lambda *_args, **_kwargs: _PreparedRunAdmission())
+    details = {"snapshot_changed": "false", "target_facts_changed": "false", "owner_changed": "false",
+               "admission_changed": "true", "admission_generation_before": "36", "admission_generation_after": "37"}
+    class PointHeadless(_Headless):
+        reads = 0
+        failing = True
+        def cclc_component(self, _component_id):
+            pytest.fail("Run collected the unrelated full readiness projection")
+        def cclc_component_lifecycle_snapshot(self, component_id):
+            self.reads += 1
+            if self.failing and self.reads == failure_at:
+                raise HeadlessClientError("component_lifecycle_facts_stale", "actual read failure", 409, details=details)
+            return super().cclc_component_lifecycle_snapshot(component_id)
+    headless = PointHeadless()
+    admission = _Admission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.failed-start.1")
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.failed-start.1"),
+                             headless_client=headless, execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner = owner
+    runtime._host = host
+    _bypass_reset_scene_preparation(monkeypatch)
+    runtime.start()
+    try:
+        with pytest.raises(ProgramRunnerError) as caught:
+            runtime.start_run(_start_request())
+        error = caught.value
+        assert all(error.details[key] == value for key, value in details.items())
+        cycle = journal.read()
+        assert host.start_admissions == [] and headless.registered_captures == []
+        if failure_at == 1:
+            assert error.code == "component_lifecycle_facts_stale"
+            assert cycle.state == "idle_after_reset" and cycle.claim is None
+            assert admission.claims == []
+        else:
+            assert error.code == "program_run_started_then_failed"
+            assert error.details["program_run_id"] == cycle.program_run_id == "program-cycle.1"
+            assert error.details["needs_reset"] is True
+            assert cycle.state == "terminal_awaiting_reset" and cycle.claim is not None
+            assert cycle.start_settlement["prepared_scene"] == {}
+            assert cycle.failure["code"] == "component_lifecycle_facts_stale"
+            assert all(cycle.failure["details"][key] == value for key, value in details.items())
+            assert runtime.cycle_status()["failure"] == cycle.failure
+            assert runtime._cycle_terminal_evidence_is_exact(journal, cycle)
+            assert journal.pending_commands() == ()
+            with pytest.raises(ProgramRunnerError) as repeated:
+                runtime.start_run(_start_request())
+            assert repeated.value.code == "program_cycle_reset_required"
+            assert len(admission.claims) == 1 and host.start_admissions == []
+            assert journal.pending_commands() == ()
+            headless.failing = False
+            # A no-host-run failed start has no native tasks; the current own
+            # claim and exact durable settlement still govern release.
+            reset = runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.failed.start"))
+            assert reset["idle_cycle_generation"] == 2
+            assert journal.read().state == "idle_after_reset" and journal.read().claim is None
+            assert admission.releases[0]["settlement"]["evidence_digest"] == cycle.terminal_reference
+            runtime.start_run(_start_request().model_copy(update={"request_id": "run.after.failed-start.reset"}))
+            assert journal.read().state == "running"
+    finally:
+        runtime.shutdown()
+
+
+def test_stop_wins_running_cas_after_last_abort_without_inventing_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission",
+                        lambda *_args, **_kwargs: _PreparedRunAdmission())
+    class StopHeadless(_Headless):
+        def stop_program_run(self, body):
+            return {"ok": True, "owner_epoch": "execution.epoch.1", "accepted": {
+                "request_id": body["request_context"]["request_id"], "stop_id": "stop.1",
+                "stop_generation": 1, "replay_status": "accepted_new"}}
+    headless, admission = StopHeadless(), _Admission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+                             headless_client=headless, execution_transport=headless,
+                             admission_client=admission, cycle_journal=journal)
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    project = runtime._project_run
+    stopped = False
+    def stop_after_last_abort(snapshot):
+        nonlocal stopped
+        if not stopped and journal.read().state == "starting":
+            stopped = True
+            stop = ProgramRunStopRequest.model_validate({
+                "request_id": "stop.last-window", "request_owner_epoch": "composer.1",
+                "source_label": "operator", "correlation_id": None,
+                "program_run_id": "program-cycle.1", "expected_owner_epoch": "runner.1",
+                "reason": "operator Stop before Running CAS"})
+            assert runtime.stop_run("program-cycle.1", stop)["state"] == "stopping"
+        return project(snapshot)
+    monkeypatch.setattr(runtime, "_project_run", stop_after_last_abort)
+    try:
+        with pytest.raises(ProgramRunnerError) as caught:
+            runtime.start_run(_start_request())
+        assert stopped
+        assert caught.value.code == "program_run_superseded_by_stop"
+        assert caught.value.details["program_run_id"] == "program-cycle.1"
+        cycle = journal.read()
+        assert len(admission.claims) == 1
+        assert caught.value.details["claim_generation"] == cycle.claim["claim_generation"]
+        assert caught.value.details["stopped_by_operator"] is True
+        assert caught.value.details["needs_reset"] is True
+        assert cycle.state == "terminal_awaiting_reset" and cycle.failure is None
+        assert cycle.start_settlement["kind"] == "terminal_effects_settled"
+        assert cycle.start_settlement["terminal_run"]["state"] == "stopped"
+        assert len(host.start_admissions) == 1 and host.scheduled == []
+        assert len(host.stop_calls) == 1
     finally:
         runtime.shutdown()

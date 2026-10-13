@@ -3,11 +3,13 @@ import { describe, expect, it } from 'vitest';
 import {
   componentLifecyclePresentation,
   componentLifecycleToneClass,
+  componentReadinessDomainPresentation,
 } from './componentLifecyclePresentation';
 import type {
   CCLCComponentSnapshot,
   CCLCLifecycleProgress,
   CCLCLifecycleTarget,
+  CCLCReadinessDomain,
 } from '../types/cclc';
 
 function snapshot(
@@ -20,9 +22,16 @@ function snapshot(
     lifecycleGeneration: 4,
     lifecycleState,
     retainedBundleId: 'bundle.1',
+    publicationGeneration: 1, activePublicPointerDigest: 'pointer.1',
     graphRevision: 'graph.1',
     domains: [],
     providers: [],
+    readiness: { requestOwnerEpoch: 'owner.1', evaluatedAtNs: 100,
+      nextIntent: lifecycleState === 'declared' || lifecycleState === 'disabled' ? 'prepare' : lifecycleState === 'prepared' ? 'enable' : null,
+      requestedState: lifecycleState === 'declared' || lifecycleState === 'disabled' ? 'prepared' : lifecycleState === 'prepared' ? 'active' : null,
+      ready: lifecycleState === 'active',
+      error: lifecycleState === 'active' ? null : { code: 'not_ready', message: 'controller_manager not ready', details: {} },
+      domains: [], measuredState: { required: false, available: null, error: null } },
     lifecycleTarget: target === null ? null : {
       requestedState: 'active', origin: 'startup', targetGeneration: 1, ...target,
     },
@@ -43,6 +52,49 @@ function message(value: CCLCComponentSnapshot): string {
   return componentLifecyclePresentation(value).message;
 }
 
+function readinessDomain(): CCLCReadinessDomain {
+  return {
+    providerOccurrence: { controlDomainId: 'domain.gripper', controlDomainRevision: 'revision.1',
+      lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: 'provider.1',
+      providerManifestId: 'manifest.1', providerManifestRevision: 'revision.1',
+      providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' },
+    health: { observedState: 'active', diagnostic: null, facts: [
+      { lifecycleFactId: 'external.controller_loaded', value: { kind: 'boolean', booleanValue: true } },
+      { lifecycleFactId: 'external.controller_configuration_ready', value: { kind: 'boolean', booleanValue: true } },
+      { lifecycleFactId: 'external.controller_inactive_unrequested', value: { kind: 'boolean', booleanValue: false } },
+      { lifecycleFactId: 'external.fault_present', value: { kind: 'boolean', booleanValue: true } },
+      { lifecycleFactId: 'external.transport_ready', value: { kind: 'boolean', booleanValue: false } },
+    ] }, decisionKind: null, error: null,
+  };
+}
+
+describe('domain activation presentation', () => {
+  it.each([undefined, true])('preserves existing presentation for activation fact %s', (hasActivationStep) => {
+    const domain = readinessDomain();
+    domain.hasActivationStep = hasActivationStep;
+    expect(componentReadinessDomainPresentation(domain)).toEqual({ state: 'active', facts: domain.health!.facts });
+  });
+  it('words no activation step without displaying normalized controller facts or changing raw health', () => {
+    const domain = readinessDomain();
+    domain.hasActivationStep = false;
+    const presented = componentReadinessDomainPresentation(domain);
+    expect(presented.state).toBe('No activation step');
+    expect(presented.facts.map((fact) => fact.lifecycleFactId)).toEqual([
+      'external.fault_present', 'external.transport_ready',
+    ]);
+    expect(domain.health!.observedState).toBe('active');
+    expect(domain.health!.facts).toHaveLength(5);
+  });
+  it('retains genuine faulted and unavailable health alongside no activation step', () => {
+    const domain = readinessDomain();
+    domain.hasActivationStep = false;
+    domain.health!.observedState = 'faulted';
+    expect(componentReadinessDomainPresentation(domain).state).toBe('No activation step · faulted');
+    domain.health = null;
+    expect(componentReadinessDomainPresentation(domain).state).toBe('No activation step · health unavailable');
+  });
+});
+
 describe('component lifecycle presentation', () => {
   it('presents the four separate facts for a startup target that is waiting', () => {
     const presented = componentLifecyclePresentation(snapshot('declared', {}, {
@@ -53,7 +105,7 @@ describe('component lifecycle presentation', () => {
       tone: 'waiting',
       target: 'active (requested by startup configuration, target 1)',
       achieved: 'declared · generation 4',
-      readiness: 'controller unavailable or not yet ready · controller_manager not ready · next step: prepare',
+      readiness: 'Not ready · [not_ready] controller_manager not ready · next step: prepare · Target wait duration unavailable',
       consequence: 'Motion is unavailable until the component reaches its requested target.',
       incident: null,
     });
@@ -156,7 +208,7 @@ describe('component lifecycle presentation', () => {
     expect(message(snapshot('disabled', {
       requestedState: 'disabled', origin: 'startup',
     }, { phase: 'satisfied', blockingCauseClass: 'none', nextIntent: null }))).toBe(
-      'Component disabled',
+      'Not ready',
     );
   });
 
@@ -168,14 +220,14 @@ describe('component lifecycle presentation', () => {
     expect(ready.tone).toBe('ready');
     expect(message(snapshot('prepared', { requestedState: 'prepared' }, {
       phase: 'satisfied', blockingCauseClass: 'none', nextIntent: null,
-    }))).toBe('Component prepared');
+    }))).toBe('Not ready');
   });
 
   it('presents absent owner target facts without inventing progress', () => {
     const presented = componentLifecyclePresentation(snapshot('prepared', null, null));
     expect(presented.target).toBe('No requested target');
-    expect(presented.readiness).toBe('Not reported by the lifecycle owner');
-    expect(presented.message).toBe('Component prepared');
+    expect(presented.readiness).toBe('Not ready · [not_ready] controller_manager not ready · next step: enable · Target wait duration unavailable');
+    expect(presented.message).toBe('Not ready');
     expect(message(snapshot('active', null, null))).toBe('Ready');
     expect(message(snapshot('prepared', {}, {
       phase: 'cancelled', blockingCauseClass: 'none', nextIntent: null,
@@ -190,4 +242,56 @@ describe('component lifecycle presentation', () => {
       'status-pill phase-intervention_required',
     );
   });
+
+  it('presents an owner-retired target separately from an ordinary cancellation', () => {
+    const retired = componentLifecyclePresentation(snapshot('prepared', null, {
+      phase: 'cancelled', blockingCauseClass: 'none', nextIntent: null,
+      blockingReason: 'target_retired:original_work_settled',
+    }));
+    expect(retired.message).toBe('Target retired');
+    expect(retired.consequence).toContain('original_work_settled');
+    expect(retired.achieved).toBe('prepared · generation 4');
+    expect(message(snapshot('prepared', null, { phase: 'cancelled', blockingCauseClass: 'none',
+      nextIntent: null, blockingReason: 'operator cancelled request' }))).toBe('Lifecycle target cancelled');
+  });
+});
+
+it('shows actual degraded readiness even for durable Active and keeps a real health fault visible', () => {
+  const current = snapshot('active', null, null);
+  current.readiness = { ...current.readiness, ready: false,
+    error: { code: 'measured_source_unavailable', message: 'Measured feed is stale', details: {} } };
+  expect(componentLifecyclePresentation(current).message).toBe('Not ready');
+  expect(componentLifecyclePresentation(current).readiness).toContain('Measured feed is stale');
+  current.readiness.domains = [{ providerOccurrence: {
+    controlDomainId: 'domain.arm', controlDomainRevision: 'revision.1', providerInstanceId: 'provider.1',
+    providerManifestId: 'manifest.1', providerManifestRevision: 'manifest.revision.1', providerRuntimeUnitId: 'runtime.1',
+    providerRuntimeEpoch: 'epoch.1', lifecyclePlanCatalogDigest: 'catalog.1' },
+    health: { observedState: 'faulted', facts: [], diagnostic: null }, decisionKind: null, error: current.readiness.error }];
+  expect(componentLifecyclePresentation(current).message).toBe('Fault — intervention required');
+});
+
+
+it('shows exact owner target-wait elapsed and preserves code, message and cause', () => {
+  const current = snapshot('declared', {}, {});
+  current.readiness.evaluatedAtNs = '9007199257240993';
+  current.lifecycleProgress!.waitingSinceNs = '9007199254740993';
+  current.readiness.error = { code: 'measured_state_unavailable', message: 'Actual measured read failed', details: { reason: 'actual_source_stale' } };
+  const before = structuredClone(current);
+  expect(componentLifecyclePresentation(current).readiness).toBe('Not ready · [measured_state_unavailable] Actual measured read failed · actual_source_stale · next step: prepare · Target wait: 0.002 s at last owner evaluation');
+  expect(current).toEqual(before);
+});
+it('does not invent elapsed time for missing, future or satisfied owner waiting facts', () => {
+  const current = snapshot('declared', {}, {});
+  for (const waiting of [null, 101]) {
+    current.lifecycleProgress!.waitingSinceNs = waiting;
+    expect(componentLifecyclePresentation(current).readiness).toContain('Target wait duration unavailable');
+  }
+  current.lifecycleProgress!.waitingSinceNs = 100;
+  expect(componentLifecyclePresentation(current).readiness).toContain('Target wait: 0.000 s at last owner evaluation');
+  for (const phase of ['satisfied', 'cancelled'] as const) {
+    current.lifecycleProgress!.phase = phase;
+    expect(componentLifecyclePresentation(current).readiness).toContain('Target wait duration unavailable');
+  }
+  current.readiness.ready = true;
+  expect(componentLifecyclePresentation(current).readiness).not.toContain('Target wait');
 });

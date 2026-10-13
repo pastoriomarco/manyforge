@@ -36,7 +36,7 @@ inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
 inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
-    "manyforge.committed_scenario_activation.v1";
+    "manyforge.committed_scenario_activation.v2";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =

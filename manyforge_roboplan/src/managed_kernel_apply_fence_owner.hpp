@@ -33,6 +33,11 @@ struct ManagedKernelAdmissionObservation final {
 /// N7-a3 uses it while the managed command surface remains closed. N7-a4
 /// joins operation admission to this same gate; it must not create a second
 /// resource/fence truth.
+using ManagedTerminalApplyFenceValidator =
+    std::function<manyforge::core::Result<void>(
+        const manyforge::core::ApplyConfigurationFenceIntentDTO &,
+        const manyforge::core::ConfigurationFenceAcceptedDTO &)>;
+
 class ManagedKernelAdmissionGate final
     : public manyforge::core::IResourceOperationAdmissionGate {
 public:
@@ -73,7 +78,10 @@ public:
       std::uint64_t expected_operation_resource_generation,
       const std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
           &expected_active_control_configurations,
-      const std::function<void()> &commit_durable_fence);
+      const std::function<void()> &commit_durable_fence,
+      const std::function<void(const manyforge::core::ConfigurationFenceId &,
+                               const manyforge::core::ConfigurationFenceScopeDTO
+                                   &)> &validate_terminal_overlap = {});
   void AcquireRouteFenceDurably(
       const manyforge::core::ConfigurationFenceId &fence_id,
       const manyforge::core::ConfigurationFenceScopeDTO &scope,
@@ -155,6 +163,9 @@ public:
                        &query) const override;
   [[nodiscard]] manyforge::core::ConfigurationFenceAcceptedDTO Acquire(
       const manyforge::core::ApplyConfigurationFenceIntentDTO &intent) override;
+  [[nodiscard]] manyforge::core::ConfigurationFenceAcceptedDTO
+  Acquire(const manyforge::core::ApplyConfigurationFenceIntentDTO &intent,
+          const ManagedTerminalApplyFenceValidator &validate_terminal_overlap);
   [[nodiscard]]
   manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO
   ReconcileAcquireAttempt(

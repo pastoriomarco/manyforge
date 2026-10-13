@@ -473,7 +473,6 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
-                "expected_admission_generation": 7,
             },
         )
         prepared = client.post(
@@ -627,7 +626,6 @@ def test_stop_route_progresses_while_both_ordinary_workers_are_occupied() -> Non
             "source_document_digest": _DIGEST_A,
             "expected_applied_record_digest": _DIGEST_B,
             "draft_program_revision": _DIGEST_B,
-            "expected_admission_generation": 7,
         }
     )
     stop_request = ProgramRunStopRequest.model_validate(
@@ -687,7 +685,6 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
                 "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
-                "expected_admission_generation": 7,
                 "invented": True,
             },
         )
@@ -726,6 +723,7 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
         "authoring_not_ready",
         "program_cycle_reset_required",
         "program_run_draft_applied_mismatch",
+        "program_scene_preparation_failed",
         "stale_generation",
     ],
 )
@@ -744,7 +742,6 @@ def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
                 "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
-                "expected_admission_generation": 7,
             },
         )
     assert response.status_code == 409
@@ -844,3 +841,45 @@ def test_node_correction_preview_is_a_plain_runner_query() -> None:
     assert foreign.status_code == 422
     assert [kind for kind, _value in runtime.calls] == ["node_preview"]
     assert runtime.calls[0][1][1].model_dump(mode="json") == body
+
+
+def test_run_contract_removes_client_generation_and_rejects_old_wire_field():
+    runtime = FakeRuntime()
+    body = {**_caller(), "scenario_id": "cell-pick",
+            "source_document_digest": _DIGEST_A,
+            "expected_applied_record_digest": _DIGEST_B,
+            "draft_program_revision": _DIGEST_B}
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/api/program/runs", json=body).status_code == 200
+        legacy = client.post("/api/program/runs", json={**body, "expected_admission_generation": 36})
+        assert legacy.status_code == 422
+        schema = client.get("/openapi.json").json()["components"]["schemas"]["ProgramRunStartRequest"]
+        assert "expected_admission_generation" not in schema["properties"]
+        assert "expected_admission_generation" not in schema["required"]
+    assert len([call for call in runtime.calls if call[0] == "start"]) == 1
+
+
+@pytest.mark.parametrize("code,status", [
+    ("program_run_started_then_failed", 422),
+    ("program_run_superseded_by_stop", 422),
+    ("program_run_stopped_before_start", 409),
+    ("authoring_not_ready", 409),
+    ("program_cycle_reconciliation_required", 503),
+    ("program_runner_internal_error", 500),
+])
+def test_started_then_failed_response_preserves_actual_identity_and_native_details(
+    code: str, status: int,
+) -> None:
+    details = {"program_run_id": "program-cycle.2", "claim_generation": 9, "needs_reset": True,
+        "cause_code": "component_lifecycle_facts_stale", "admission_changed": "true",
+        "admission_generation_before": "36", "admission_generation_after": "37"}
+    class FailedStart(FakeRuntime):
+        def start_run(self, _request):
+            raise ProgramRunnerError(code, "Owner outcome", details=details)
+    with TestClient(create_app(FailedStart())) as client:
+        response = client.post("/api/program/runs", json={**_caller(), "request_id": "run.failed.1",
+            "scenario_id": "cell-pick", "source_document_digest": _DIGEST_A,
+            "expected_applied_record_digest": _DIGEST_B, "draft_program_revision": _DIGEST_A})
+    assert response.status_code == status
+    assert response.json() == {"detail": {"code": code,
+        "message": "Owner outcome", "details": details}}

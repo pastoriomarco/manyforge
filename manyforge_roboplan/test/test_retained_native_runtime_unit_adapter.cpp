@@ -12,13 +12,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <iterator>
 #include <iostream>
-#include <map>
+#include <iterator>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
@@ -36,6 +36,7 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +50,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../manyforge_component_manager/src/manager_liveness_rpc_internal.hpp"
 #include "../../manyforge_component_manager/src/native_projection_rpc_internal.hpp"
 #include "../../manyforge_component_manager/src/selected_runtime_composition_rpc_internal.hpp"
 
@@ -3081,6 +3083,151 @@ SelectedAdapterRequest(const NativeFixture &fixture,
           core::RuntimeEpoch("original.manager.1")};
 }
 
+volatile std::sig_atomic_t shutdown_probe_terms = 0;
+void ShutdownProbeTerm(int) { shutdown_probe_terms = shutdown_probe_terms + 1; }
+
+// Exercise the production Manager adapter using an actual private socket and
+// direct child. This peer reports facts only; it has no Kernel/robot authority.
+int RunShutdownPacketProbe(const int ordinary, const int private_channel,
+                           const std::filesystem::path &root,
+                           const core::RuntimeEpoch &epoch,
+                           const std::string &ready_packet) {
+  namespace rpc = component_manager::detail;
+  const auto mode = ReadFile(root / "shutdown-probe.mode");
+  struct sigaction action {};
+  action.sa_handler = ShutdownProbeTerm;
+  sigemptyset(&action.sa_mask);
+  if (::sigaction(SIGTERM, &action, nullptr) != 0)
+    throw std::runtime_error("shutdown packet probe handler failed");
+  unsigned shutdown_packets = 0;
+  bool ordinary_cut = false;
+  bool stopping = false;
+  rpc::NativeShutdownProgress progress{epoch.value()};
+  std::optional<std::pair<std::chrono::steady_clock::time_point, std::string>>
+      delayed_progress;
+  unsigned status_requests = 0;
+  while (!std::filesystem::exists(root / "shutdown-probe.release")) {
+    if (!ordinary_cut && std::filesystem::exists(root / "shutdown-probe.cut")) {
+      if (::shutdown(ordinary, SHUT_RD) != 0)
+        throw std::runtime_error("shutdown packet probe cut failed");
+      ordinary_cut = true;
+      std::ofstream(root / "shutdown-probe.cut-ready") << "cut";
+    }
+    if (delayed_progress &&
+        std::chrono::steady_clock::now() >= delayed_progress->first) {
+      const auto &reply = delayed_progress->second;
+      if (::send(ordinary, reply.data(), reply.size(), MSG_NOSIGNAL) !=
+          static_cast<ssize_t>(reply.size()))
+        throw std::runtime_error("delayed shutdown probe response failed");
+      delayed_progress.reset();
+    }
+    if (shutdown_probe_terms != 0)
+      stopping = true;
+    if (stopping)
+      progress.phase = rpc::NativeShutdownPhase::kExecutionDrain;
+    {
+      {
+        std::ofstream facts(root / "shutdown-probe.facts.tmp");
+        facts << shutdown_packets << ' ' << shutdown_probe_terms << ' '
+              << stopping << ' ' << status_requests;
+      }
+      std::filesystem::rename(root / "shutdown-probe.facts.tmp",
+                              root / "shutdown-probe.facts");
+    }
+    std::array<pollfd, 2> fds{{{ordinary_cut ? -1 : ordinary, POLLIN, 0},
+                               {private_channel, POLLIN, 0}}};
+    const auto ready = ::poll(fds.data(), fds.size(), 20);
+    if (ready < 0 && errno == EINTR)
+      continue;
+    if (ready < 0)
+      throw std::runtime_error("shutdown packet probe poll failed");
+    for (std::size_t index = 0; index < fds.size(); ++index) {
+      if ((fds[index].revents & POLLIN) == 0)
+        continue;
+      std::string packet(rpc::kMaximumManagerLivenessRpcPacketBytes, '\0');
+      const auto bytes =
+          ::recv(fds[index].fd, packet.data(), packet.size(), MSG_TRUNC);
+      if (bytes <= 0 || static_cast<std::size_t>(bytes) > packet.size())
+        throw std::runtime_error("shutdown packet probe request invalid");
+      packet.resize(static_cast<std::size_t>(bytes));
+      std::string response;
+      if (index == 1U) {
+        // The peer exercises actual adapter framing/ownership only. This
+        // serialized acknowledgement is not a Kernel/expiry qualification.
+        const auto request = rpc::DecodeManagerLivenessRpcRequest(packet);
+        const auto &set = request.required_set;
+        const auto receiver = std::find_if(
+            set.required_receivers.begin(), set.required_receivers.end(),
+            [&](const auto &row) {
+              return row.runtime_unit_id == request.receiver_runtime_unit_id;
+            });
+        if (receiver == set.required_receivers.end() ||
+            receiver->runtime_epoch != epoch)
+          throw std::runtime_error("shutdown probe renewal identity mismatch");
+        const core::ManagerLivenessStatusDTO status{
+            set.cell_id,
+            receiver->runtime_unit_id,
+            epoch,
+            set.manager_runtime_unit_id,
+            set.manager_runtime_epoch,
+            set.manager_owner_epoch,
+            receiver->runtime_policy_id,
+            receiver->runtime_policy_revision,
+            request.heartbeat.heartbeat_sequence,
+            request.heartbeat.heartbeat_sequence,
+            0,
+            core::ManagerLivenessStateDTO::kCurrent,
+            false,
+            std::nullopt};
+        response = rpc::EncodeManagerLivenessRpcResponse(
+            core::ManagerLivenessObservationDTO{
+                status, set.active_bundle_id, set.required_runtime_set_digest,
+                core::ComputeManagerLivenessStatusDigest(status)});
+      } else if (rpc::IsNativeShutdownRpcPacket(packet)) {
+        ++status_requests;
+        if (rpc::DecodeNativeShutdownRpcRequest(packet) != epoch.value())
+          throw std::runtime_error("shutdown packet probe epoch mismatch");
+        if (mode == "silent")
+          continue;
+        auto observed = progress;
+        if (mode == "foreign")
+          observed.runtime_epoch = "foreign.host.epoch";
+        response = rpc::EncodeNativeShutdownRpcResponse(observed);
+        if (mode == "late") {
+          if (delayed_progress)
+            throw std::runtime_error(
+                "shutdown status was queued while its reply remained pending");
+          delayed_progress = std::pair{std::chrono::steady_clock::now() +
+                                           std::chrono::milliseconds(1100),
+                                       response};
+          continue;
+        }
+      } else if (packet == "shutdown") {
+        ++shutdown_packets;
+        stopping = true;
+        response = "shutdown-accepted";
+      } else if (packet == "hello") {
+        response = ready_packet;
+      } else {
+        const auto decoded = rpc::DecodeNativeProjectionRpcRequest(packet);
+        const auto *prepare =
+            std::get_if<rpc::NativeProjectionPrepareRequest>(&decoded);
+        if (!prepare)
+          throw std::runtime_error(
+              "unexpected shutdown probe projection request");
+        response = rpc::EncodeNativeProjectionRpcResponse(
+            rpc::NativeProjectionPrepareResult{*prepare});
+      }
+      if (::send(fds[index].fd, response.data(), response.size(),
+                 MSG_NOSIGNAL) != static_cast<ssize_t>(response.size()))
+        throw std::runtime_error("shutdown packet probe response failed");
+    }
+  }
+  std::ofstream(root / "shutdown-probe.final")
+      << shutdown_packets << ' ' << shutdown_probe_terms << ' ' << stopping;
+  return 0;
+}
+
 // This is only a packet peer: production admission/codec values are reused,
 // but no planner, CCLC, robot, engine or effect owner is implemented here.
 int RunSelectedAdapterPacketChild(const int argc, char **argv) {
@@ -3121,7 +3268,14 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
     }
     if (!captured) throw std::runtime_error("site argv fixture capture failed");
   }
+  if (std::filesystem::exists(run_root / "shutdown-probe.mode")) {
+    return RunShutdownPacketProbe(
+        channel,
+        std::stoi(arguments.at("--manyforge-managed-liveness-channel-fd")),
+        run_root, epoch, admission->expected_ready_packet(epoch));
+  }
   std::uint64_t sequence = 0U;
+  bool delayed_process_read_consumed = false;
   for (;;) {
     std::string packet(rpc::kMaximumSelectedRuntimeCompositionRpcPacketBytes,
                        '\0');
@@ -3150,8 +3304,72 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
     } else {
       const auto request =
           rpc::DecodeSelectedRuntimeCompositionRpcRequestVariant(packet);
+      const auto *process_stop =
+          std::get_if<component_manager::ManagerComponentProcessStopRequestDTO>(
+              &request);
+      const auto *process_read = std::get_if<
+          component_manager::ManagerComponentProcessStopReadRequestDTO>(
+          &request);
+      if (process_stop || process_read) {
+        const auto &original =
+            process_stop ? *process_stop : process_read->request;
+        std::ofstream observed(run_root / "selected-test-last-request.bin",
+                               std::ios::binary);
+        observed.write(packet.data(),
+                       static_cast<std::streamsize>(packet.size()));
+        observed.close();
+        std::ofstream calls(run_root / "process-stop.requests", std::ios::app);
+        calls << (process_stop ? "stop\n" : "read\n");
+        calls.close();
+        if (!observed || !calls)
+          throw std::runtime_error("process Stop peer capture failed");
+        const bool delayed_consuming_read =
+            process_read && original.launch_identity == "stop.read-delay" &&
+            !delayed_process_read_consumed;
+        // Model a host cache READ that copies and erases its result before
+        // sending. This packet fixture proves correlation, not physical drain.
+        if (delayed_consuming_read) delayed_process_read_consumed = true;
+        if ((process_stop && original.launch_identity == "stop.delay") ||
+            delayed_consuming_read) {
+          const auto deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          while (!std::filesystem::exists(run_root / "process-stop.release")) {
+            if (std::chrono::steady_clock::now() >= deadline)
+              throw std::runtime_error("process Stop test release missing");
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          }
+        }
+        auto echo = original;
+        if (echo.launch_identity == "stop.foreign")
+          ++echo.leader_pid;
+        if (delayed_consuming_read) {
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              component_manager::ManagerComponentProcessStopResultDTO{
+                  echo, core::ControllerLaunchCleanupState::kDrained,
+                  core::ControllerLaunchGroupDrainReceipt{
+                      echo.leader_pid, echo.controllable_component_id.value(),
+                      echo.launch_identity, "2026-10-13T00:00:00Z"},
+                  std::nullopt});
+        } else {
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              component_manager::ManagerComponentProcessStopResultDTO{
+                  echo, core::ControllerLaunchCleanupState::kUnknown,
+                  std::nullopt,
+                  core::ErrorDTO{"packet_peer_unknown",
+                                 "fixture has no physical drain proof",
+                                 {}}});
+        }
+        if (::send(channel, response.data(), response.size(), MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(response.size()))
+          throw std::runtime_error("process Stop peer response was not atomic");
+        std::ofstream(run_root / "process-stop.replied") << "reply\n";
+        if (delayed_consuming_read)
+          std::ofstream(run_root / "process-stop.read-replied") << "reply\n";
+        continue;
+      }
       if (const auto *inspection = std::get_if<
-              component_manager::ManagerComponentBringUpInspectionRequestDTO>(&request)) {
+              component_manager::ManagerComponentBringUpInspectionRequestDTO>(
+              &request)) {
         auto echo = *inspection;
         if (echo.manager_runtime_epoch.value() == "inspection.delay")
           std::this_thread::sleep_for(std::chrono::milliseconds(11000));
@@ -3309,6 +3527,129 @@ InstallSelectedPacketTestTargets(const std::filesystem::path &root) {
       root);
 }
 
+void CheckShutdownPacketProbe(const std::string &mode,
+                              const bool cut_initial_send) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  const auto root = fixture.execution_run_root.path();
+  std::ofstream(root / "shutdown-probe.mode") << mode;
+  auto adapter = MakeAdapter(fixture, targets.path());
+  struct ReleaseProbe {
+    const std::filesystem::path &root;
+    ~ReleaseProbe() {
+      try {
+        std::ofstream(root / "shutdown-probe.release") << "release";
+      } catch (...) {
+      } // Failure unwinding still attempts to release the child.
+    }
+  } release_before_adapter_destruction{root};
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto policy = contract::manager_liveness_policy();
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const std::vector<core::RequiredManagerLivenessReceiverDTO> receivers{
+      {fixture.query->plan.runtime_unit_id, epoch, policy.runtime_policy_id,
+       policy.runtime_policy_revision}};
+  const core::ManagerLivenessRequiredSetDTO required_set{
+      fixture.bundle->value().cell_graph.cell_id,
+      fixture.bundle->retained_bundle_id(),
+      core::ComputeRequiredRuntimeSetDigest(receivers),
+      core::RuntimeUnitId("manager.shutdown.probe"),
+      core::RuntimeEpoch("manager.shutdown.epoch"),
+      core::RequestOwnerEpoch("manager.shutdown.owner"),
+      receivers};
+  const core::ManagerHeartbeatDTO heartbeat{
+      required_set.cell_id,
+      required_set.manager_runtime_unit_id,
+      required_set.manager_runtime_epoch,
+      required_set.manager_owner_epoch,
+      1U,
+      policy.runtime_policy_id,
+      policy.runtime_policy_revision};
+  const component_manager::ManagerLivenessTransportRequestDTO renewal{
+      fixture.query->plan.runtime_unit_id,
+      core::ActiveBundlePublicationGeneration(1U),
+      fixture.bundle->value().cell_graph.graph_revision,
+      core::ContentDigest(std::string(kIntentDigest)),
+      required_set,
+      policy,
+      heartbeat,
+      std::nullopt};
+  const auto first_renewal = adapter.RenewManagerLiveness(renewal);
+  ASSERT_EQ(first_renewal.status.last_accepted_heartbeat_sequence, 1U);
+  ManagerHeartbeatLane heartbeat_lane(adapter, renewal);
+  if (cut_initial_send) {
+    std::ofstream(root / "shutdown-probe.cut") << "cut";
+    bool cut = false;
+    for (int i = 0; i < 200 && !cut; ++i) {
+      cut = std::filesystem::exists(root / "shutdown-probe.cut-ready");
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(cut);
+  }
+  auto stopped = std::async(std::launch::async, [&] {
+    return adapter.EnsureStopped(*fixture.query);
+  });
+  ReleaseProbe release_before_future_destruction{root};
+  // Beyond the old automatic 2s escalation: unchanged/silent status is not
+  // permission to signal, kill or declare the actual child absent.
+  EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(2500)),
+            std::future_status::timeout);
+  const auto continuing_renewal =
+      heartbeat_lane.WaitForAccepted(5U, std::chrono::seconds(2));
+  EXPECT_TRUE(continuing_renewal.has_value()) << heartbeat_lane.Failure();
+  heartbeat_lane.Stop();
+  unsigned packets = 99;
+  int terms = 99;
+  bool stopping = false;
+  unsigned status_requests = 99;
+  std::istringstream(ReadFile(root / "shutdown-probe.facts")) >> packets >>
+      terms >> stopping >> status_requests;
+  EXPECT_EQ(packets, cut_initial_send ? 0U : 1U);
+  EXPECT_EQ(terms, cut_initial_send ? 1 : 0);
+  EXPECT_TRUE(stopping);
+  if (cut_initial_send)
+    EXPECT_EQ(status_requests, 0U);
+  else if (mode == "silent")
+    EXPECT_EQ(status_requests, 1U);
+  else if (mode == "late")
+    EXPECT_GE(status_requests, 2U);
+  else
+    EXPECT_GE(status_requests, 1U);
+  std::ofstream(root / "shutdown-probe.release") << "release";
+  EXPECT_EQ(stopped.get().state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  packets = 99;
+  terms = 99;
+  stopping = false;
+  std::istringstream(ReadFile(root / "shutdown-probe.final")) >> packets >>
+      terms >> stopping;
+  EXPECT_EQ(packets, cut_initial_send ? 0U : 1U);
+  EXPECT_EQ(terms, cut_initial_send ? 1 : 0);
+  EXPECT_TRUE(stopping);
+}
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ShutdownWaitsForActualExitWithUnchangedProgress) {
+  CheckShutdownPacketProbe("responsive", false);
+}
+TEST(RetainedNativeRuntimeUnitAdapter,
+     DelayedShutdownStatusNeverRequestsSigterm) {
+  CheckShutdownPacketProbe("silent", false);
+}
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ForeignShutdownProgressNeverRequestsSigterm) {
+  CheckShutdownPacketProbe("foreign", false);
+}
+TEST(RetainedNativeRuntimeUnitAdapter,
+     LateShutdownStatusCannotPoisonConcurrentRenewal) {
+  CheckShutdownPacketProbe("late", false);
+}
+TEST(RetainedNativeRuntimeUnitAdapter,
+     InitialShutdownSendFailureRequestsSigtermOnlyOnce) {
+  CheckShutdownPacketProbe("responsive", true);
+}
+
 [[nodiscard]] component_manager::detail::SelectedRuntimeCompositionRpcRequest
 ReadObservedSelectedRequest(const NativeFixture &fixture) {
   return component_manager::detail::
@@ -3345,6 +3686,248 @@ component_manager::ManagerComponentBringUpInspectionRequestDTO InspectionAdapter
           selected.candidate_retained_bundle_bytes, selected.candidate_projection_revision,
           core::ActiveBundlePublicationGeneration(1U), core::ContentDigest(std::string(kIntentDigest)),
           selected.runtime_unit_id, epoch, core::RuntimeEpoch(manager_epoch)};
+}
+
+component_manager::ManagerComponentProcessStopRequestDTO
+ProcessStopAdapterRequest(const NativeFixture &fixture,
+                          const core::RuntimeEpoch &epoch,
+                          const std::string &launch) {
+  const auto selected = SelectedAdapterRequest(fixture, epoch, "");
+  return {{core::RequestId("process.stop.1"),
+           core::RequestOwnerEpoch("original.cclc.1"), "adapter-test",
+           std::nullopt},
+          selected.candidate_projection_revision,
+          core::ActiveBundlePublicationGeneration(1U),
+          core::ContentDigest(std::string(kIntentDigest)),
+          selected.runtime_unit_id,
+          epoch,
+          selected.manager_runtime_epoch,
+          core::ControllableComponentId("selected.component"),
+          launch,
+          1234};
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ProcessStopReadPreservesExactUnknownWithoutResubmission) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto request = ProcessStopAdapterRequest(
+      fixture, core::RuntimeEpoch(started.process_incarnation()),
+      "stop.current");
+  ASSERT_TRUE(request.valid());
+  const auto submitted = adapter.StopComponentProcess(request);
+  ASSERT_TRUE(submitted.ok());
+  EXPECT_EQ(submitted.value().request, request);
+  EXPECT_EQ(submitted.value().state,
+            core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(submitted.value().receipt);
+  const auto read = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(read.value().request, request);
+  ASSERT_TRUE(read.value().error);
+  EXPECT_EQ(read.value().error->code, "packet_peer_unknown");
+  EXPECT_FALSE(read.value().receipt);
+  EXPECT_EQ(
+      ReadFile(fixture.execution_run_root.path() / "process-stop.requests"),
+      "stop\nread\n");
+  EXPECT_EQ(
+      std::get<component_manager::ManagerComponentProcessStopReadRequestDTO>(
+          ReadObservedSelectedRequest(fixture))
+          .request,
+      request);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
+            started.process_incarnation());
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ProcessStopForeignEchoCannotQualifyOrResubmit) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto request = ProcessStopAdapterRequest(
+      fixture, core::RuntimeEpoch(started.process_incarnation()),
+      "stop.foreign");
+  EXPECT_THROW(static_cast<void>(adapter.StopComponentProcess(request)),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  const auto read = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(read.value().state, core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(read.value().receipt);
+  EXPECT_EQ(
+      ReadFile(fixture.execution_run_root.path() / "process-stop.requests"),
+      "stop\n");
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
+            started.process_incarnation());
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ProcessStopTimeoutRetainsHostAndReadsOnlyExactLateReply) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  struct ReplyRelease final {
+    std::filesystem::path root;
+    ~ReplyRelease() {
+      try {
+        std::ofstream(root / "process-stop.release") << "release\n";
+      } catch (...) {
+      }
+    }
+  } release{fixture.execution_run_root.path()};
+  const auto request = ProcessStopAdapterRequest(
+      fixture, core::RuntimeEpoch(started.process_incarnation()), "stop.delay");
+  const auto submitted = adapter.StopComponentProcess(request);
+  ASSERT_TRUE(submitted.ok());
+  EXPECT_EQ(submitted.value().state,
+            core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(submitted.value().receipt);
+  const auto pending = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(pending.value().error);
+  EXPECT_EQ(pending.value().error->code, "component_process_stop_pending");
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\n");
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
+            started.process_incarnation());
+  std::ofstream(release.root / "process-stop.release") << "release\n";
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!std::filesystem::exists(release.root / "process-stop.replied") &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(std::filesystem::exists(release.root / "process-stop.replied"));
+  const auto read = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(read.value().request, request);
+  ASSERT_TRUE(read.value().error);
+  EXPECT_EQ(read.value().error->code, "packet_peer_unknown");
+  EXPECT_FALSE(read.value().receipt);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\nread\n");
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
+            started.process_incarnation());
+}
+
+// Scope: real private-channel late READ delivery and exact association only.
+// The peer's receipt is authored transport data, not a physical drain proof.
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ProcessStopLateConsumingReadReturnsExactReceiptOnce) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  struct ReplyRelease final {
+    std::filesystem::path root;
+    ~ReplyRelease() {
+      try { std::ofstream(root / "process-stop.release") << "release\n"; }
+      catch (...) {}
+    }
+  } release{fixture.execution_run_root.path()};
+  const auto request = ProcessStopAdapterRequest(
+      fixture, core::RuntimeEpoch(started.process_incarnation()), "stop.read-delay");
+  ASSERT_TRUE(adapter.StopComponentProcess(request).ok());
+  const auto timed_out = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(timed_out.ok());
+  EXPECT_EQ(timed_out.value().state, core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(timed_out.value().receipt);
+  ASSERT_TRUE(timed_out.value().error);
+  EXPECT_EQ(timed_out.value().error->code, "component_process_stop_response_unavailable");
+  std::ofstream(release.root / "process-stop.release") << "release\n";
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!std::filesystem::exists(release.root / "process-stop.read-replied") &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(std::filesystem::exists(release.root / "process-stop.read-replied"));
+  // An unrelated status observation settles the packet without consuming
+  // the exact READ association's value.
+  EXPECT_TRUE(adapter.ObserveProgress(
+      *fixture.query, core::RuntimeEpoch(started.process_incarnation())).has_value());
+  auto foreign = request;
+  foreign.request_context.request_id = core::RequestId("process.stop.foreign");
+  const auto foreign_read = adapter.ReadComponentProcessStop({foreign});
+  ASSERT_TRUE(foreign_read.ok());
+  EXPECT_EQ(foreign_read.value().request, foreign);
+  EXPECT_FALSE(foreign_read.value().receipt);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\nread\n");
+  const auto duplicate = adapter.StopComponentProcess(request);
+  ASSERT_TRUE(duplicate.ok());
+  EXPECT_EQ(duplicate.value().request, request);
+  EXPECT_EQ(duplicate.value().state, core::ControllerLaunchCleanupState::kDrained);
+  ASSERT_TRUE(duplicate.value().receipt);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\nread\n");
+  const auto exact = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(exact.ok());
+  EXPECT_EQ(exact.value().request, request);
+  EXPECT_EQ(exact.value().state, core::ControllerLaunchCleanupState::kDrained);
+  ASSERT_TRUE(exact.value().receipt);
+  EXPECT_EQ(*exact.value().receipt,
+            (core::ControllerLaunchGroupDrainReceipt{
+                request.leader_pid, request.controllable_component_id.value(),
+                request.launch_identity, "2026-10-13T00:00:00Z"}));
+  EXPECT_FALSE(exact.value().error);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\nread\n");
+  const auto consumed = adapter.ReadComponentProcessStop({request});
+  ASSERT_TRUE(consumed.ok());
+  EXPECT_EQ(consumed.value().state, core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(consumed.value().receipt);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"), "stop\nread\nread\n");
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ProcessStopNewExplicitRequestCannotReceiveOldLateReadReceipt) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  struct ReplyRelease final {
+    std::filesystem::path root;
+    ~ReplyRelease() {
+      try { std::ofstream(root / "process-stop.release") << "release\n"; }
+      catch (...) {}
+    }
+  } release{fixture.execution_run_root.path()};
+  const auto original = ProcessStopAdapterRequest(
+      fixture, core::RuntimeEpoch(started.process_incarnation()), "stop.read-delay");
+  ASSERT_TRUE(adapter.StopComponentProcess(original).ok());
+  const auto timed_out = adapter.ReadComponentProcessStop({original});
+  ASSERT_TRUE(timed_out.ok());
+  ASSERT_TRUE(timed_out.value().error);
+  EXPECT_EQ(timed_out.value().error->code, "component_process_stop_response_unavailable");
+  std::ofstream(release.root / "process-stop.release") << "release\n";
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!std::filesystem::exists(release.root / "process-stop.read-replied") &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(std::filesystem::exists(release.root / "process-stop.read-replied"));
+  auto successor = original;
+  successor.request_context.request_id = core::RequestId("process.stop.successor");
+  successor.launch_identity = "stop.current";
+  const auto submitted = adapter.StopComponentProcess(successor);
+  ASSERT_TRUE(submitted.ok());
+  EXPECT_EQ(submitted.value().request, successor);
+  EXPECT_FALSE(submitted.value().receipt);
+  const auto current = adapter.ReadComponentProcessStop({successor});
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(current.value().request, successor);
+  EXPECT_FALSE(current.value().receipt);
+  const auto stale = adapter.ReadComponentProcessStop({original});
+  ASSERT_TRUE(stale.ok());
+  EXPECT_EQ(stale.value().state, core::ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(stale.value().receipt);
+  EXPECT_EQ(ReadFile(release.root / "process-stop.requests"),
+            "stop\nread\nstop\nread\nread\n");
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter, ComponentInspectionPreservesExactOccurrenceAndUnavailableFacts) {

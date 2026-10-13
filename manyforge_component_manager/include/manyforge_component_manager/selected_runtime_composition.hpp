@@ -5,6 +5,7 @@
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/controller_launch_group_drain.hpp>
 #include <manyforge_core/types/lifecycle_target.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/projection_common.hpp>
@@ -124,10 +125,10 @@ struct ManagerRuntimeComponentReceiptDTO final {
 
 /// Exact receipt check against the request: one receipt per non-removed
 /// delta row in delta order, the planned identity, exactly the request's
-/// managed runtime unit at its runtime epoch, retention reported exactly
-/// for kRetain, and a re-seal reported exactly for retained components when
-/// the candidate product differs from the predecessor. Removed rows have no
-/// receipt.
+/// managed runtime unit at its runtime epoch. Disposition echoes the authored
+/// delta; retention reports the actual retained owner. A re-seal is required
+/// exactly for actual retained owners when the product changes. Removed rows
+/// have no receipt.
 [[nodiscard]] bool ComponentReceiptsMatchRequest(
     const ManagerSelectedRuntimeCompositionRequestDTO &request,
     const std::vector<ManagerRuntimeComponentReceiptDTO> &receipts) noexcept;
@@ -227,6 +228,50 @@ struct ManagerApplyComponentBringUpResultDTO final {
 /// Read-only candidate preflight. No Apply or CCLC identity is minted here.
 /// Manager binds the genuine predecessor and original process epochs; the host
 /// verifies the whole candidate and reports actual component process presence.
+/// Current installed-owner read; independent of any candidate component list.
+struct ManagerComponentProcessInventoryRequestDTO final {
+  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
+  manyforge::core::ActiveBundlePublicationGeneration
+      expected_predecessor_publication_generation;
+  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
+  manyforge::core::RuntimeUnitId runtime_unit_id;
+  manyforge::core::RuntimeEpoch runtime_epoch;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch;
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool
+  operator==(const ManagerComponentProcessInventoryRequestDTO &,
+             const ManagerComponentProcessInventoryRequestDTO &) = default;
+};
+
+struct ManagerComponentProcessOccurrenceDTO final {
+  manyforge::core::ControllableComponentId controllable_component_id;
+  std::string launch_identity;
+  std::int32_t leader_pid{};
+  /// Exact leader observation only; Absent alone is not a group-drain proof.
+  ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
+  manyforge::core::ControllerLaunchCleanupState cleanup_state{
+      manyforge::core::ControllerLaunchCleanupState::kNotRequested};
+  std::optional<manyforge::core::ControllerLaunchGroupDrainReceipt> receipt{};
+  std::optional<manyforge::core::ContentDigest> installed_runtime_identity{};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool
+  operator==(const ManagerComponentProcessOccurrenceDTO &,
+             const ManagerComponentProcessOccurrenceDTO &) = default;
+};
+
+/// Uses the existing MFNSRC4 collection bound, never a truncated union.
+inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
+struct ManagerComponentProcessInventoryResultDTO final {
+  ManagerComponentProcessInventoryRequestDTO request;
+  std::vector<ManagerComponentProcessOccurrenceDTO> process_occurrences;
+  /// Retains observed rows but makes completeness/absence UNKNOWN.
+  std::optional<manyforge::core::ErrorDTO> error{};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool
+  operator==(const ManagerComponentProcessInventoryResultDTO &,
+             const ManagerComponentProcessInventoryResultDTO &) = default;
+};
+
 struct ManagerComponentBringUpInspectionRequestDTO final {
   manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
   manyforge::core::ContentDigest candidate_retained_bundle_digest;
@@ -319,9 +364,66 @@ struct ManagerComponentBringUpInspectionResultDTO final {
                          const ManagerComponentBringUpInspectionResultDTO &) = default;
 };
 
+/// Operator request for the exact predecessor launch occurrence. The existing
+/// host publication and Manager epochs authenticate the request before effects.
+struct ManagerComponentProcessStopRequestDTO final {
+  manyforge::core::PublicRequestContextDTO request_context;
+  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
+  manyforge::core::ActiveBundlePublicationGeneration expected_predecessor_publication_generation;
+  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
+  manyforge::core::RuntimeUnitId runtime_unit_id;
+  manyforge::core::RuntimeEpoch runtime_epoch;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch;
+  manyforge::core::ControllableComponentId controllable_component_id;
+  std::string launch_identity;
+  std::int32_t leader_pid;
+
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerComponentProcessStopRequestDTO &,
+                         const ManagerComponentProcessStopRequestDTO &) = default;
+};
+
+struct ManagerComponentProcessStopReadRequestDTO final {
+  ManagerComponentProcessStopRequestDTO request;
+  [[nodiscard]] bool valid() const noexcept { return request.valid(); }
+  friend bool operator==(const ManagerComponentProcessStopReadRequestDTO &,
+                         const ManagerComponentProcessStopReadRequestDTO &) = default;
+};
+
+/// Read-only cached cleanup state from the pinned original process owner.
+/// Absent process/leader exit alone never grants kDrained.
+struct ManagerComponentProcessStopResultDTO final {
+  ManagerComponentProcessStopRequestDTO request;
+  manyforge::core::ControllerLaunchCleanupState state;
+  std::optional<manyforge::core::ControllerLaunchGroupDrainReceipt> receipt{};
+  std::optional<manyforge::core::ErrorDTO> error{};
+  [[nodiscard]] bool valid() const noexcept;
+};
+
 class IManagerSelectedRuntimeCompositionPort {
 public:
   virtual ~IManagerSelectedRuntimeCompositionPort() = default;
+
+  [[nodiscard]] virtual manyforge::core::Result<
+      ManagerComponentProcessInventoryResultDTO>
+  InspectInstalledComponentProcesses(
+      const ManagerComponentProcessInventoryRequestDTO &) {
+    return manyforge::core::Result<ManagerComponentProcessInventoryResultDTO>::
+        Err({"installed_process_inspection_unavailable",
+             "installed component process inspection is not composed",
+             {}});
+  }
+
+  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &) {
+    return manyforge::core::Result<ManagerComponentProcessStopResultDTO>::Err(
+        {"component_process_stop_unavailable", "component process Stop is not composed", {}});
+  }
+  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &) {
+    return manyforge::core::Result<ManagerComponentProcessStopResultDTO>::Err(
+        {"component_process_stop_unavailable", "component process Stop result is not composed", {}});
+  }
 
   [[nodiscard]] virtual manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
   InspectComponentBringUp(const ManagerComponentBringUpInspectionRequestDTO &) {

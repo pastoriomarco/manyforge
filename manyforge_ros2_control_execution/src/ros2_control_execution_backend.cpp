@@ -1,4 +1,5 @@
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
+#include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -137,6 +138,7 @@ struct Ros2ControlExecutionBackend::State {
   std::mutex mutex;
   std::weak_ptr<rclcpp_action::Client<Action>> action_client;
   std::weak_ptr<rclcpp::Node> node;
+  std::shared_ptr<SelectedRosEndpointFacts> endpoints;
   core::IClock &clock;
   JtcExecutionAdapterConfig config;
   bool closed{false};
@@ -231,7 +233,18 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
       resources.node(), configuration.action_name);
   state_->action_client = action_client_;
   state_->node = resources.node();
+  state_->endpoints = std::make_shared<SelectedRosEndpointFacts>(
+      resources.node(), configuration.state_topic,
+      "control_msgs/msg/JointTrajectoryControllerState");
   std::weak_ptr<State> weak = state_;
+  rclcpp::SubscriptionOptions options;
+  options.event_callbacks.matched_callback =
+      [weak](rclcpp::MatchedInfo &info) {
+        if (const auto state = weak.lock()) {
+          state->endpoints->ObserveMatchedCount(info.current_count);
+          state->endpoints->Refresh();
+        }
+      };
   state_sub_ =
       resources.node()
           ->create_subscription<
@@ -241,7 +254,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
                          ConstSharedPtr message) {
                 if (const auto state = weak.lock())
                   ReceiveState(state, *message);
-              });
+              }, options);
   if (configuration.lane_facts.supports_scale)
     scale_pub_ = resources.node()
                      ->create_publisher<control_msgs::msg::SpeedScalingFactor>(
@@ -249,6 +262,15 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
                          rclcpp::QoS(1).reliable().transient_local());
 }
 Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() { shutdown(); }
+
+void Ros2ControlExecutionBackend::RefreshEndpointFacts() {
+  state_->endpoints->Refresh();
+}
+
+std::optional<core::ErrorDTO>
+Ros2ControlExecutionBackend::ReadEndpointDiagnostic() const {
+  return state_->endpoints->ReadError();
+}
 
 void Ros2ControlExecutionBackend::ObserveReadiness(
     ExecutionReadinessDTO readiness) {

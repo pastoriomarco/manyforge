@@ -39,6 +39,18 @@ struct SelectedCCLCClaimIntentRecordDTO final {
     std::string_view bytes);
 [[nodiscard]] bool IsCCLCSelectedBringUpClaimIntentEncoding(std::string_view bytes) noexcept;
 
+/// Exact original intent retained in the existing membership result slot.
+struct CCLCTargetRetirementRecordDTO final {
+  CCLCLifecycleTargetRetirementIntentDTO intent;
+  std::vector<ComponentLifecycleTargetDTO> retired_targets;
+  friend bool operator==(const CCLCTargetRetirementRecordDTO&,
+                         const CCLCTargetRetirementRecordDTO&) = default;
+};
+[[nodiscard]] std::string EncodeCCLCTargetRetirementRecord(const CCLCTargetRetirementRecordDTO&);
+[[nodiscard]] CCLCTargetRetirementRecordDTO DecodeCCLCTargetRetirementRecord(std::string_view);
+[[nodiscard]] std::string CCLCTargetRetirementSemanticIntentDigest(
+    const CCLCLifecycleTargetRetirementIntentDTO&);
+
 [[nodiscard]] std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error);
 [[nodiscard]] ErrorDTO DecodeCCLCAdmissionRejection(std::string_view bytes);
 

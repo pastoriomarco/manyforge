@@ -19,6 +19,7 @@
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -440,9 +441,13 @@ LoadIsaacSiteSettings(const std::optional<std::filesystem::path> &path) {
 }
 
 enum class CommandKind {
+  kCanonicalEmptySelection,
   kDeploymentCandidatePreview,
   kApply,
   kApplyStatus,
+  kStopComponentProcess,
+  kComponentProcessStopResult,
+  kComponentProcessStopOffer,
   kSceneCommit,
   kSceneTransactionStatus,
   kSceneOwnerRead,
@@ -459,6 +464,7 @@ enum class CommandKind {
 [[nodiscard]] bool
 RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   switch (command) {
+  case CommandKind::kCanonicalEmptySelection:
   case CommandKind::kDeploymentCandidatePreview:
   case CommandKind::kSceneCommit:
   case CommandKind::kSceneCandidatePreview:
@@ -471,6 +477,9 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kSceneTransactionStatus:
   case CommandKind::kApply:
   case CommandKind::kApplyStatus:
+  case CommandKind::kStopComponentProcess:
+  case CommandKind::kComponentProcessStopResult:
+  case CommandKind::kComponentProcessStopOffer:
   case CommandKind::kScenePoseQuery:
   case CommandKind::kSceneRuntimeOwnerRead:
   case CommandKind::kShutdownRuntime:
@@ -553,6 +562,8 @@ struct ManagerCommand final {
   std::optional<core::ContentDigest> accepted_impact_digest{};
   std::optional<core::ApplyId> apply_id{};
   std::optional<core::ApplyGeneration> apply_generation{};
+  std::optional<component_manager::ManagerComponentProcessStopRequestDTO> component_process_stop{};
+  std::optional<core::ControllableComponentId> process_stop_offer_component{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -563,11 +574,12 @@ const CanonicalValue &RequiredMember(const CanonicalValue &root,
 }
 
 std::string RequiredString(const CanonicalValue &root,
-                           const std::string_view name) {
+                           const std::string_view name,
+                           const std::size_t maximum_bytes = kMaximumCommandIdentityBytes) {
   const auto *value =
       std::get_if<std::string>(&RequiredMember(root, name).storage());
   Require(value != nullptr && !value->empty() &&
-              value->size() <= kMaximumCommandIdentityBytes,
+              value->size() <= maximum_bytes,
           "command field " + std::string(name) +
               " must be one bounded non-empty string");
   return *value;
@@ -686,7 +698,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
           "Apply prepared activation schema is unsupported (only " +
               std::string(deployment::kPreparedActivationInputSchemaVersion) +
               "; launch-time Program parameter overrides were removed)");
-  RequireExactObjectSize(value, 14U, "Apply prepared activation");
+  RequireExactObjectSize(value, 13U, "Apply prepared activation");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
   const auto deployment_revision = RequiredString(value, "deployment_revision");
@@ -740,7 +752,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
                     RequiredString(value, "graph_revision"),
             "Apply Program outcome differs from its prepared activation");
   }
-  for (const auto field : {"source_document_digest", "retained_bundle_id",
+  for (const auto field : {"retained_bundle_id",
                            "graph_revision",
                            "node_environment_digest"}) {
     Require(core::IsExactLowercaseSha256Digest(RequiredString(value, field)),
@@ -750,7 +762,22 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   Require(assistant_mode == "required" || assistant_mode == "optional" ||
               assistant_mode == "forbidden",
           "Apply prepared activation assistant_mode is unsupported");
-  static_cast<void>(RequiredString(value, "scenario_id"));
+  const auto origin = deployment::parse_prepared_activation_origin(
+      RequiredMember(value, "origin"));
+  if (const auto *sealed =
+          std::get_if<deployment::PreparedSealedCanonicalEmptyOrigin>(&origin)) {
+    Require(no_program &&
+                sealed->deployment_artifact_id.value() ==
+                    RequiredString(value, "deployment_artifact_id") &&
+                sealed->deployment_revision.value() == deployment_revision &&
+                sealed->retained_bundle_id.value() ==
+                    RequiredString(value, "retained_bundle_id") &&
+                sealed->graph_revision.value() ==
+                    RequiredString(value, "graph_revision") &&
+                deployment::sealed_canonical_empty_capture_digest(*sealed).value() ==
+                    captured_input_digest,
+            "Apply sealed empty origin differs from its preparation");
+  }
   if (!no_program) {
     static_cast<void>(RequiredString(value, "program_id"));
     Require(core::IsExactLowercaseSha256Digest(RequiredString(value, "program_revision")),
@@ -774,13 +801,14 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
 /// A caller therefore cannot submit an outcome the preparer did not produce.
 bool PreparedActivationIsStoredExactly(
     const std::filesystem::path &activation_root,
-    const component_manager::ManagerApplyPreparedActivationDTO &activation) {
+    const component_manager::ManagerApplyPreparedActivationDTO &activation,
+    const deployment::CanonicalEmptyRetainedBundleAdmission *admission) {
   if (activation_root.empty()) {
     return false;
   }
   const auto stored =
       deployment::FilesystemPreparedActivationRepository(activation_root)
-          .get_verified(activation.prepared_activation_id);
+          .get_verified(activation.prepared_activation_id, admission);
   if (stored == nullptr) {
     return false;
   }
@@ -1289,6 +1317,36 @@ RequiredPoseObserverBindings(const CanonicalValue &value) {
   return result;
 }
 
+component_manager::ManagerComponentProcessStopRequestDTO
+RequiredComponentProcessStop(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 10U, "component process Stop request");
+  const auto &context = RequiredMember(value, "request_context");
+  const auto *correlation = context.find_object_member("correlation_id");
+  RequireExactObjectSize(context, correlation ? 4U : 3U, "component Stop request context");
+  core::PublicRequestContextDTO request_context{
+      core::RequestId(RequiredString(context, "request_id")),
+      core::RequestOwnerEpoch(RequiredString(context, "request_owner_epoch")),
+      RequiredString(context, "source_label"), std::nullopt};
+  if (correlation) request_context.correlation_id = RequiredString(context, "correlation_id");
+  const auto pid = RequiredUnsigned(RequiredMember(value, "leader_pid"), "leader PID");
+  Require(pid <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()),
+          "component Stop leader PID exceeds int32");
+  component_manager::ManagerComponentProcessStopRequestDTO result{
+      std::move(request_context), RequiredProjectionRevision(RequiredMember(value, "predecessor_projection_revision")),
+      core::ActiveBundlePublicationGeneration(RequiredUnsigned(
+          RequiredMember(value, "expected_predecessor_publication_generation"), "predecessor publication generation")),
+      core::ContentDigest(RequiredString(value, "expected_predecessor_public_pointer_digest")),
+      core::RuntimeUnitId(RequiredString(value, "runtime_unit_id")),
+      core::RuntimeEpoch(RequiredString(value, "runtime_epoch")),
+      core::RuntimeEpoch(RequiredString(value, "manager_runtime_epoch")),
+      core::ControllableComponentId(RequiredString(value, "controllable_component_id")),
+      RequiredString(value, "launch_identity",
+                     core::kMaximumCellAdmissionPrivateBinaryBytes),
+      static_cast<std::int32_t>(pid)};
+  Require(result.valid(), "component process Stop request is invalid");
+  return result;
+}
+
 ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(!bytes.empty() && bytes.size() <= kMaximumCommandBytes,
           "command packet is empty or exceeds its byte bound");
@@ -1305,6 +1363,26 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(RequiredString(root, "api_version") == kManagerCommandApiVersion,
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
+  if (command == "component_process_stop_offer") {
+    RequireExactObjectSize(root, 3U, "component process Stop offer command");
+    ManagerCommand result{.kind = CommandKind::kComponentProcessStopOffer};
+    result.process_stop_offer_component = core::ControllableComponentId(
+        RequiredString(root, "controllable_component_id"));
+    Require(result.process_stop_offer_component->value().size() <= core::kMaxLifecycleIdentityBytes,
+            "component Stop offer identity is too long");
+    return result;
+  }
+  if (command == "stop_component_process" || command == "component_process_stop_result") {
+    RequireExactObjectSize(root, 3U, "component process Stop command");
+    ManagerCommand result{.kind = command == "stop_component_process"
+        ? CommandKind::kStopComponentProcess : CommandKind::kComponentProcessStopResult};
+    result.component_process_stop = RequiredComponentProcessStop(RequiredMember(root, "request"));
+    return result;
+  }
+  if (command == "canonical_empty_selection") {
+    RequireExactObjectSize(root, 2U, "canonical-empty selection command");
+    return ManagerCommand{.kind = CommandKind::kCanonicalEmptySelection};
+  }
   if (command == "deployment_candidate_preview") {
     RequireExactObjectSize(root, 10U, "deployment candidate preview command");
     const auto deployment_revision =
@@ -2053,14 +2131,15 @@ CanonicalValue DeploymentApplyImpact(
     const deployment::RetainedBundle &current,
     const deployment::RetainedBundle &candidate,
     const std::filesystem::path &activation_root,
-    const core::ContentDigest &prepared_activation_id) {
+    const core::ContentDigest &prepared_activation_id,
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
   const auto delta =
       deployment::derive_apply_component_delta(current, candidate);
   Require(!activation_root.empty(),
           "Deployment impact requires the trusted activation store");
   const auto prepared =
       deployment::FilesystemPreparedActivationRepository(activation_root)
-          .get_verified(prepared_activation_id);
+          .get_verified(prepared_activation_id, &admission);
   Require(prepared != nullptr &&
               prepared->retained_bundle_id() == candidate.retained_bundle_id(),
           "Deployment impact names no stored prepared activation for the "
@@ -2279,6 +2358,52 @@ CanonicalValue ApplyStatusResponse(
   });
 }
 
+CanonicalValue ComponentProcessStopResultResponse(
+    const component_manager::ManagerComponentProcessStopResultDTO &result) {
+  Require(result.valid(), "component process Stop result is invalid");
+  const auto &request = result.request;
+  CanonicalValue::Object context{
+      {"request_id", CanonicalValue(request.request_context.request_id.value())},
+      {"request_owner_epoch", CanonicalValue(request.request_context.request_owner_epoch.value())},
+      {"source_label", CanonicalValue(request.request_context.source_label)}};
+  if (request.request_context.correlation_id)
+    context.emplace_back("correlation_id", CanonicalValue(*request.request_context.correlation_id));
+  CanonicalValue request_value(CanonicalValue::Object{
+      {"request_context", CanonicalValue(std::move(context))},
+      {"predecessor_projection_revision", ProjectionRevision(request.predecessor_projection_revision)},
+      {"expected_predecessor_publication_generation", Unsigned(request.expected_predecessor_publication_generation.value(), "publication generation")},
+      {"expected_predecessor_public_pointer_digest", CanonicalValue(request.expected_predecessor_public_pointer_digest.value())},
+      {"runtime_unit_id", CanonicalValue(request.runtime_unit_id.value())},
+      {"runtime_epoch", CanonicalValue(request.runtime_epoch.value())},
+      {"manager_runtime_epoch", CanonicalValue(request.manager_runtime_epoch.value())},
+      {"controllable_component_id", CanonicalValue(request.controllable_component_id.value())},
+      {"launch_identity", CanonicalValue(request.launch_identity)},
+      {"leader_pid", CanonicalValue(static_cast<double>(request.leader_pid))}});
+  const auto state = [&] {
+    switch (result.state) {
+      case core::ControllerLaunchCleanupState::kNotRequested: return "not_requested";
+      case core::ControllerLaunchCleanupState::kPending: return "pending";
+      case core::ControllerLaunchCleanupState::kUnknown: return "unknown";
+      case core::ControllerLaunchCleanupState::kDrained: return "drained";
+    }
+    Fail("component process Stop result state is invalid");
+  }();
+  auto receipt = CanonicalValue(nullptr);
+  if (result.receipt) receipt = CanonicalValue(CanonicalValue::Object{
+      {"leader_pid", CanonicalValue(static_cast<double>(result.receipt->leader_pid))},
+      {"controllable_component_id", CanonicalValue(result.receipt->controllable_component_id)},
+      {"launch_identity", CanonicalValue(result.receipt->launch_identity)},
+      {"observed_utc", CanonicalValue(result.receipt->observed_utc)}});
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"ok", CanonicalValue(true)},
+      {"error", CanonicalValue(nullptr)},
+      {"result", CanonicalValue(CanonicalValue::Object{
+          {"request", std::move(request_value)}, {"state", CanonicalValue(state)},
+          {"receipt", std::move(receipt)},
+          {"error", result.error ? ErrorValue(*result.error) : CanonicalValue(nullptr)}})}});
+}
+
 CanonicalValue
 SuccessResponse(const std::string_view operation,
                 const std::optional<std::uint64_t> manager_gen,
@@ -2383,8 +2508,9 @@ public:
   explicit ManagerVerifiedPackageView(
       std::filesystem::path package_root,
       std::optional<std::filesystem::path> activation_root =
-          std::nullopt)
-      : package_root_(package_root), activation_root_(activation_root),
+          std::nullopt,
+      const deployment::CanonicalEmptyRetainedBundleAdmission *admission = nullptr)
+      : package_root_(package_root), activation_root_(activation_root), admission_(admission),
         bundles_(package_root, activation_root),
         artifacts_(package_root, activation_root) {}
 
@@ -2429,7 +2555,7 @@ public:
     const auto &maps = bundle.value().compiled_products.symbol_role_maps;
     if (outcome != nullptr && RequiredString(*outcome, "kind") == "no_program") {
       if (!activation_root_.has_value() ||
-          !PreparedActivationIsStoredExactly(*activation_root_, activation)) {
+          !PreparedActivationIsStoredExactly(*activation_root_, activation, admission_)) {
         throw std::invalid_argument("Apply empty Scene requires exact no_program evidence");
       }
       // Empty initial intents still go through the normal Scene staging and
@@ -2483,7 +2609,7 @@ public:
       }
       const auto prepared =
           deployment::FilesystemPreparedActivationRepository(*activation_root_)
-              .get_verified(activation.prepared_activation_id);
+              .get_verified(activation.prepared_activation_id, admission_);
       if (prepared == nullptr ||
           prepared->retained_bundle_id() != bundle.retained_bundle_id() ||
           prepared->program_revision() != program->value().program_revision) {
@@ -2584,6 +2710,7 @@ public:
 private:
   std::filesystem::path package_root_;
   std::optional<std::filesystem::path> activation_root_;
+  const deployment::CanonicalEmptyRetainedBundleAdmission *admission_;
   deployment::FilesystemVerifiedRetainedBundleSource bundles_;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts_;
   mutable std::mutex mutex_;
@@ -2742,7 +2869,7 @@ public:
             package_generation_.descriptor_bound_root(),
             config_.activation_root.empty()
                 ? std::nullopt
-                : std::optional(config_.activation_root)),
+                : std::optional(config_.activation_root), &admission_),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
@@ -3447,6 +3574,94 @@ private:
     std::vector<component_manager::ManagerComponentProcessObservationDTO> configured_components;
   };
 
+  core::Result<CanonicalValue> ReadComponentProcessStopOffer(
+      const core::ControllableComponentId &component) {
+    using Offer = core::Result<CanonicalValue>;
+    const auto unavailable = [](const std::string &message) {
+      return Offer::Err({"component_process_stop_offer_unknown", message, {}});
+    };
+    const auto active = plan_source_.ReadCurrentPlan();
+    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult> runtime;
+    {
+      std::lock_guard source_lock(manager_source_mutex_);
+      runtime = last_runtime_;
+    }
+    if (!runtime || runtime->plan.active_publication != active.active_publication)
+      return unavailable("the actual current runtime observation is unavailable");
+    const auto bundle = verified_package_.get_verified(active.active_publication.request.candidate_retained_bundle_id);
+    if (!bundle) return unavailable("the actual current publication has no verified host membership");
+    CanonicalValue::Array inventories;
+    std::size_t count = 0U;
+    for (const auto &unit : bundle->value().cell_graph.runtime_units) {
+      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId &&
+          unit.runtime_profile_id.value() != deployment::native_execution_runtime_contract::kRuntimeProfileId)
+        continue;
+      const auto *host = runtime->observations.observation(unit.runtime_unit_id.value());
+      if (!host || host->process_presence() != component_manager::ProcessPresenceState::kPresent || host->runtime_epoch().empty())
+        return unavailable("the actual component host occurrence is unavailable; a new epoch is not absence");
+      const auto &publication = active.active_publication;
+      const component_manager::ManagerComponentProcessInventoryRequestDTO request{
+          publication.request.candidate_projection_revision, publication.publication_generation,
+          publication.durable_public_pointer_content_digest, unit.runtime_unit_id,
+          core::RuntimeEpoch(host->runtime_epoch()), manager_runtime_epoch_};
+      const auto observed = native_runtime_adapter_.InspectInstalledComponentProcesses(request);
+      if (!observed.ok()) return Offer::Err(observed.error());
+      if (!observed.value().valid() || observed.value().request != request)
+        return unavailable("the installed process inventory has a foreign original scope");
+      if (observed.value().error) return Offer::Err(*observed.value().error);
+      CanonicalValue::Array rows;
+      for (const auto &row : observed.value().process_occurrences) {
+        if (row.controllable_component_id != component) continue;
+        if (++count > component_manager::kMaximumComponentProcessInventoryEntries)
+          return unavailable("the complete addressed process union exceeds its existing bound");
+        const auto state = [&] {
+          switch (row.cleanup_state) {
+            case core::ControllerLaunchCleanupState::kNotRequested: return "not_requested";
+            case core::ControllerLaunchCleanupState::kPending: return "pending";
+            case core::ControllerLaunchCleanupState::kUnknown: return "unknown";
+            case core::ControllerLaunchCleanupState::kDrained: return "drained";
+          }
+          Fail("installed process cleanup state is invalid");
+        }();
+        auto receipt = CanonicalValue(nullptr);
+        if (row.receipt) receipt = CanonicalValue(CanonicalValue::Object{
+            {"leader_pid", CanonicalValue(static_cast<double>(row.receipt->leader_pid))},
+            {"controllable_component_id", CanonicalValue(row.receipt->controllable_component_id)},
+            {"launch_identity", CanonicalValue(row.receipt->launch_identity)},
+            {"observed_utc", CanonicalValue(row.receipt->observed_utc)}});
+        rows.emplace_back(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(row.controllable_component_id.value())},
+            {"launch_identity", CanonicalValue(row.launch_identity)},
+            {"leader_pid", CanonicalValue(static_cast<double>(row.leader_pid))},
+            {"process_presence", CanonicalValue(std::string(component_manager::ToString(row.process_presence)))},
+            {"cleanup_state", CanonicalValue(state)}, {"receipt", std::move(receipt)},
+            {"installed_runtime_identity", row.installed_runtime_identity ? CanonicalValue(row.installed_runtime_identity->value()) : CanonicalValue(nullptr)}});
+      }
+      inventories.emplace_back(CanonicalValue::Object{
+          {"request", CanonicalValue(CanonicalValue::Object{
+              {"predecessor_projection_revision", ProjectionRevision(request.predecessor_projection_revision)},
+              {"expected_predecessor_publication_generation", Unsigned(request.expected_predecessor_publication_generation.value(), "publication generation")},
+              {"expected_predecessor_public_pointer_digest", CanonicalValue(request.expected_predecessor_public_pointer_digest.value())},
+              {"runtime_unit_id", CanonicalValue(request.runtime_unit_id.value())},
+              {"runtime_epoch", CanonicalValue(request.runtime_epoch.value())},
+              {"manager_runtime_epoch", CanonicalValue(request.manager_runtime_epoch.value())}})},
+          {"process_occurrences", CanonicalValue(std::move(rows))}, {"error", CanonicalValue(nullptr)}});
+      {
+        std::lock_guard source_lock(manager_source_mutex_);
+        const auto *current = last_runtime_ ? last_runtime_->observations.observation(unit.runtime_unit_id.value()) : nullptr;
+        if (!last_runtime_ || last_runtime_->plan.active_publication != active.active_publication ||
+            !current || current->process_presence() != component_manager::ProcessPresenceState::kPresent ||
+            current->runtime_epoch() != host->runtime_epoch())
+          return unavailable("the actual host scope changed during its passive process read");
+      }
+    }
+    if (plan_source_.ReadCurrentPlan().active_publication != active.active_publication)
+      return unavailable("the predecessor publication changed during its passive process read");
+    return Offer::Ok(CanonicalValue(CanonicalValue::Object{
+        {"controllable_component_id", CanonicalValue(component.value())},
+        {"process_inventories", CanonicalValue(std::move(inventories))}}));
+  }
+
   CanonicalValue WithConfiguredBringUpImpact(
       CanonicalValue impact, const deployment::RetainedBundle &candidate,
       const component_manager::ManagerActiveRuntimePlanDTO &active,
@@ -4003,6 +4218,55 @@ private:
     using BatchProgress =
         component_manager::detail::ManagerLivenessBatchProgress;
     auto native_batch = BatchProgress::kNotStarted;
+    std::string_view failure_predicate = "program_runner_liveness_probe";
+    std::string_view failure_scope = "cell-role:program_runner";
+    std::array<char, 256U> failure_runtime_unit{};
+    std::size_t failure_runtime_unit_size{};
+    const auto track_failure = [&](const std::string_view predicate,
+                                   const std::string_view scope,
+                                   const std::string_view runtime_unit = {}) noexcept {
+      failure_predicate = predicate;
+      failure_scope = scope;
+      failure_runtime_unit_size =
+          std::min(runtime_unit.size(), failure_runtime_unit.size());
+      if (failure_runtime_unit_size != 0U)
+        std::copy_n(runtime_unit.data(), failure_runtime_unit_size,
+                    failure_runtime_unit.data());
+    };
+    const auto warn_failure = [&](const std::string_view cause) noexcept {
+      // Diagnostic identity only, owned by this single renewal lane. Lease
+      // counters and retry decisions never consult it. Diagnostic allocation
+      // or stream failure must not escape into renewal or terminate its lane.
+      const std::string_view runtime_unit(failure_runtime_unit.data(),
+                                          failure_runtime_unit_size);
+      try {
+        std::string warning =
+            "Manager native liveness renewal remains fail-closed: cell=";
+        warning.append(admission_.cell_id().value().substr(0U, 256U));
+        warning.append(" bundle=")
+            .append(active_bundle.retained_bundle_id().value().substr(0U, 256U));
+        warning.append(" predicate=").append(failure_predicate);
+        warning.append(" scope=").append(failure_scope);
+        if (!runtime_unit.empty())
+          warning.append(" runtime_unit=").append(runtime_unit);
+        warning.append(" cause=").append(cause.substr(0U, 512U));
+        if (manager_liveness_last_warning_.has_value() &&
+            *manager_liveness_last_warning_ == warning)
+          return;
+        manager_liveness_last_warning_ = std::move(warning);
+        std::cerr << *manager_liveness_last_warning_ << '\n';
+      } catch (...) {
+        try {
+          std::cerr << "Manager native liveness renewal remains fail-closed: "
+                    << "predicate=" << failure_predicate
+                    << " scope=" << failure_scope
+                    << " runtime_unit=" << runtime_unit
+                    << " cause=" << cause.substr(0U, 512U) << '\n';
+        } catch (...) {
+          // Logging availability never changes the already recorded failure.
+        }
+      }
+    };
     const auto record_attempt_failure = [&] {
       manager_liveness_retry_gate_.RecordAttemptFailure(
           native_batch, ElapsedNs(),
@@ -4025,6 +4289,9 @@ private:
                 kProcessAdapterContractId) {
           continue;
         }
+        track_failure("required_native_receiver_observable",
+                      "native_runtime_unit",
+                      row.runtime_unit_id.value());
         const auto *observation =
             runtime.observations.observation(row.runtime_unit_id.value());
         if (observation == nullptr || observation->runtime_epoch().empty()) {
@@ -4052,6 +4319,7 @@ private:
                                   right.runtime_policy_id,
                                   right.runtime_policy_revision);
                 });
+      track_failure("required_runtime_set_valid", "cell");
       const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
       const core::ManagerLivenessRequiredSetDTO required_set{
           admission_.cell_id(),
@@ -4071,10 +4339,13 @@ private:
       // Renew the independent Runner before any native retry/backoff or
       // readiness work. Apply may deliberately retire a native receiver;
       // that is not evidence that this Manager process has disappeared.
+      track_failure("program_runner_liveness_renewal", "cell-role:program_runner",
+                    runner.runtime_unit_id.value());
       auto runner_renewal = RenewProgramRunnerLiveness(
           config_.program_runner_liveness_socket, runner, required_set,
           manager_heartbeat_sequence_, std::nullopt);
       probed_cycle_status = runner_renewal.program_cycle_status;
+      track_failure("cell_admission_readiness_reduction", "cell");
       if (!allow_native ||
           !manager_liveness_retry_gate_.attempt_allowed(ElapsedNs())) {
         SubmitFailClosedReadiness(probed_cycle_status);
@@ -4152,6 +4423,7 @@ private:
       }
       if (!requests.empty())
         native_batch = BatchProgress::kInFlight;
+      track_failure("native_liveness_batch", "required_native_receiver_batch");
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
@@ -4163,6 +4435,9 @@ private:
       for (std::size_t index = 0U; index < native_receivers.size(); ++index) {
         const auto &receiver = native_receivers[index];
         const auto &response = responses[index];
+        track_failure("native_receiver_reconciliation_identity",
+                      "native_runtime_unit",
+                      receiver.runtime_unit_id.value());
         if (response.active_bundle_id != required_set.active_bundle_id ||
             response.required_runtime_set_digest != digest ||
             response.status.receiver_runtime_unit_id !=
@@ -4186,15 +4461,22 @@ private:
         }
       }
       native_batch = BatchProgress::kValidated;
+      track_failure("runtime_reconciliation_converged", "cell");
       if (!reconciliation.has_value()) {
         throw std::runtime_error(
             "Execution readiness requires converged reconciliation");
       }
       if (runner_renewal.observation.status.state !=
           core::ManagerLivenessStateDTO::kCurrent) {
+        track_failure("program_runner_reconciliation_sequence_available",
+                      "cell-role:program_runner",
+                      runner.runtime_unit_id.value());
         Require(manager_heartbeat_sequence_ <
                     core::kMaximumManagerLivenessCounter,
                 "Manager heartbeat sequence is exhausted");
+        track_failure("program_runner_reconciliation_renewal",
+                      "cell-role:program_runner",
+                      runner.runtime_unit_id.value());
         runner_renewal = RenewProgramRunnerLiveness(
             config_.program_runner_liveness_socket, runner, required_set,
             ++manager_heartbeat_sequence_,
@@ -4205,10 +4487,16 @@ private:
       // require the private receiver's exact process identity and publish the
       // newer owner-issued status instead of treating ordinary progress as a
       // liveness failure.
+      track_failure("program_runner_cycle_owner_current",
+                    "cell-role:program_runner",
+                    runner.runtime_unit_id.value());
       Require(IsCurrentProgramRunnerOwner(runner_renewal.program_cycle_status,
                                           runner.runtime_epoch),
               "Program cycle is not issued by the current Program Runner");
       probed_cycle_status = runner_renewal.program_cycle_status;
+      track_failure("kernel_program_runner_liveness_publication",
+                    "cell-role:program_runner",
+                    runner.runtime_unit_id.value());
       const auto published_runner =
           native_runtime_adapter_.Publish(runner_renewal.observation);
       if (!published_runner.ok()) {
@@ -4216,6 +4504,7 @@ private:
             "Kernel rejected Program Runner liveness observation: " +
             published_runner.error().message);
       }
+      track_failure("cell_admission_readiness_reduction", "cell");
       const auto readiness = BuildCellAdmissionReadiness(
           runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
           forced_closed);
@@ -4224,6 +4513,7 @@ private:
       // false outage to already-running Program children.
       if (!last_submitted_readiness_.has_value() ||
           *last_submitted_readiness_ != readiness) {
+        track_failure("readiness_snapshot_current", "cell");
         {
           std::lock_guard lock(manager_liveness_lane_mutex_);
           Require(forced_closed || (readiness_barrier ==
@@ -4231,9 +4521,11 @@ private:
                                     !manager_liveness_force_closed_),
                   "Manager liveness snapshot changed during renewal");
         }
+        track_failure("kernel_cell_readiness_publication", "cell");
         SubmitCellAdmissionReadiness(readiness);
       }
       manager_liveness_retry_gate_.RecordSuccess();
+      manager_liveness_last_warning_.reset();
     } catch (const component_manager::ManagerLivenessRuntimeTransition &) {
       // Runtime replacement is already fenced by Apply. No native heartbeat
       // was sent, so this is ordinary convergence rather than an uncertain
@@ -4267,8 +4559,7 @@ private:
         }
       }
       record_attempt_failure();
-      std::cerr << "Manager native liveness renewal remains fail-closed: "
-                << error.what() << '\n';
+      warn_failure(error.what());
     } catch (...) {
       SubmitFailClosedReadiness(probed_cycle_status);
       {
@@ -4280,7 +4571,7 @@ private:
         }
       }
       record_attempt_failure();
-      std::cerr << "Manager native liveness renewal remains fail-closed\n";
+      warn_failure("unknown exception");
     }
   }
 
@@ -5130,6 +5421,65 @@ private:
         }
       }
       switch (command.kind) {
+      case CommandKind::kComponentProcessStopOffer: {
+        Require(command.process_stop_offer_component.has_value(), "component process Stop offer lacks its addressed component");
+        const auto offered = ReadComponentProcessStopOffer(*command.process_stop_offer_component);
+        if (!offered.ok()) {
+          auto fields = DetailedErrorResponse(offered.error().code, offered.error().message, offered.error().details).as_object();
+          fields.emplace_back("result", CanonicalValue(nullptr));
+          TrySendResponse(client.get(), CanonicalValue(std::move(fields)));
+        } else TrySendResponse(client.get(), CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))}, {"ok", CanonicalValue(true)},
+            {"error", CanonicalValue(nullptr)}, {"result", offered.value()}}));
+        return false;
+      }
+      case CommandKind::kStopComponentProcess:
+      case CommandKind::kComponentProcessStopResult: {
+        Require(command.component_process_stop.has_value(), "component process Stop request is absent");
+        const auto &request = *command.component_process_stop;
+        Require(request.manager_runtime_epoch == manager_runtime_epoch_,
+                "component process Stop names another Manager occurrence");
+        const auto result = command.kind == CommandKind::kStopComponentProcess
+            ? native_runtime_adapter_.StopComponentProcess(request)
+            : native_runtime_adapter_.ReadComponentProcessStop({request});
+        if (!result.ok()) {
+          auto fields = DetailedErrorResponse(result.error().code,
+              result.error().message, result.error().details).as_object();
+          fields.emplace_back("result", CanonicalValue(nullptr));
+          TrySendResponse(client.get(), CanonicalValue(std::move(fields)));
+        } else {
+          Require(result.value().request == request, "component process Stop returned a foreign request");
+          TrySendResponse(client.get(), ComponentProcessStopResultResponse(result.value()));
+        }
+        return false;
+  }
+      case CommandKind::kCanonicalEmptySelection: {
+        // These are sealed package facts, not a prepared activation or
+        // authority to bypass the ordinary candidate-preview and Apply path.
+        auto response = CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+            {"ok", CanonicalValue(true)},
+            {"canonical_empty_selection",
+             CanonicalValue(CanonicalValue::Object{
+                 {"request_owner_epoch", CanonicalValue(manager_owner_epoch_)},
+                 {"cell_id", CanonicalValue(admission_.cell_id().value())},
+                 {"deployment_artifact_id",
+                  CanonicalValue(admission_.deployment_artifact_id().value())},
+                 {"deployment_revision",
+                  CanonicalValue(admission_.deployment_revision().value())},
+                 {"candidate_retained_bundle_id",
+                  CanonicalValue(admission_.retained_bundle_id().value())},
+                 {"candidate_graph_revision",
+                  CanonicalValue(admission_.graph_revision().value())},
+                 {"admission_digest",
+                  CanonicalValue(admission_.admission_digest().value())},
+             })},
+        });
+        RequireCurrentPackageGeneration();
+        TrySendResponse(client.get(), response);
+        break;
+      }
       case CommandKind::kDeploymentCandidatePreview: {
         Require(command.request_owner_epoch.has_value() &&
                     command.deployment_artifact_id.has_value() &&
@@ -5204,7 +5554,7 @@ private:
           }
           auto impact = DeploymentApplyImpact(
               *current_bundle, *candidate_bundle, config_.activation_root,
-              *command.prepared_activation_id);
+              *command.prepared_activation_id, admission_);
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,
@@ -5313,7 +5663,7 @@ private:
           }
           if (!existing.has_value() &&
               !PreparedActivationIsStoredExactly(config_.activation_root,
-                                                 *command.prepared_activation)) {
+                                                 *command.prepared_activation, &admission_)) {
             TrySendResponse(
                 client.get(),
                 ApplyErrorResponse(
@@ -5376,7 +5726,7 @@ private:
             }
             auto impact = DeploymentApplyImpact(
                 *current_bundle, *candidate_bundle, config_.activation_root,
-                candidate_receipt.prepared_activation_id);
+                candidate_receipt.prepared_activation_id, admission_);
             if (DeploymentApplyImpactDigest(impact) !=
                 candidate_receipt.impact_digest) {
               TrySendResponse(
@@ -6029,6 +6379,8 @@ private:
   std::uint64_t manager_heartbeat_sequence_{};
   component_manager::detail::ManagerLivenessRetryGate
       manager_liveness_retry_gate_;
+  // Log-only, accessed exclusively by RunNativeManagerLivenessLane.
+  std::optional<std::string> manager_liveness_last_warning_;
   std::optional<core::ActiveBundlePublicationReceiptDTO>
       manager_liveness_attempted_publication_;
   std::optional<core::ActiveBundlePublicationReceiptDTO>

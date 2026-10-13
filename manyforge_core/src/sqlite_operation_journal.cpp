@@ -491,6 +491,52 @@ class Transaction final {
   bool committed_{};
 };
 
+// Only a failed COMMIT with no live transaction needs durable readback.
+// All ordinary writes retain their existing transaction/error behavior.
+enum class ConfigurationCommitReadback { kCommitted, kAbsent, kUnknown };
+class ConfigurationCommitUnknown final : public std::runtime_error {
+ public:
+  explicit ConfigurationCommitUnknown(ErrorDTO error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+  const ErrorDTO& error() const noexcept { return error_; }
+
+ private:
+  ErrorDTO error_;
+};
+
+void CommitConfigurationApply(Transaction& transaction, sqlite3* database,
+                              const CellAdmissionClaimDTO& claim, auto&& readback) {
+  try {
+    transaction.Commit();
+  } catch (const JournalFailure& commit_error) {
+    // A still-open SQLite transaction has not committed; its destructor rolls
+    // back. Never turn this proven pre-effect failure into a sticky closure.
+    if (sqlite3_get_autocommit(database) == 0) throw;
+    const auto unknown = [&](std::string read_error) {
+      return ConfigurationCommitUnknown(
+          ErrorDTO{"persistence_outcome_unknown",
+                   "configuration Apply journal commit outcome is unknown",
+                   {{"reason", "persistence_outcome_unknown"},
+                    {"owner_epoch", claim.intent.owner_epoch.value()},
+                    {"request_id", claim.intent.request_id.value()},
+                    {"owner_transaction_id", claim.intent.owner_transaction_id},
+                    {"claim_generation", std::to_string(claim.claim_generation.value())},
+                    {"commit_error", std::string(commit_error.what()).substr(0U, 512U)},
+                    {"readback_error", std::move(read_error).substr(0U, 512U)}}});
+    };
+    ConfigurationCommitReadback outcome;
+    try {
+      ReadSnapshot snapshot(database);
+      outcome = readback();
+    } catch (const std::exception& read_error) {
+      throw unknown(read_error.what());
+    }
+    if (outcome == ConfigurationCommitReadback::kCommitted) return;
+    if (outcome == ConfigurationCommitReadback::kAbsent) throw;
+    throw unknown("durable rows do not match either exact committed or exact absent state");
+  }
+}
+
 [[nodiscard]] std::int64_t ScalarInteger(sqlite3* database, std::string_view sql) {
   Statement statement(database, sql);
   Require(statement.Step(), "operation_journal_corrupt",
@@ -1976,6 +2022,8 @@ template <typename T>
 [[nodiscard]] Result<T> AsResult(auto&& function) {
   try {
     return Result<T>::Ok(function());
+  } catch (const ConfigurationCommitUnknown& error) {
+    return Result<T>::Err(error.error());
   } catch (const JournalFailure& error) {
     return Result<T>::Err(JournalError(error));
   } catch (const std::exception& error) {
@@ -2656,6 +2704,40 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   return result;
 }
 
+[[nodiscard]] std::vector<CellAdmissionClaimDTO> LoadHeldCellClaims(sqlite3* database) {
+  std::vector<CellAdmissionClaimDTO> rows;
+  Statement held(database,
+                 "SELECT claim_generation FROM cell_admission_claims "
+                 "WHERE release_owner_role IS NULL AND reconciled_sequence IS NULL "
+                 "ORDER BY claim_generation");
+  while (held.Step()) {
+    rows.push_back(LoadCellClaim(database, PositiveIdentifier(held.Integer(0),
+                                                              "cell-admission claim generation"))
+                       .claim);
+  }
+  return rows;
+}
+
+[[nodiscard]] std::vector<CellAdmissionCurrentOwnerEpochDTO> LoadCellCurrentOwners(
+    sqlite3* database) {
+  std::vector<CellAdmissionCurrentOwnerEpochDTO> rows;
+  Statement owners(database, "SELECT owner_role,owner_epoch FROM cell_admission_current_owners");
+  while (owners.Step()) {
+    rows.push_back({CellOwnerRole(owners.Text(0)), RequestOwnerEpoch(owners.Text(1))});
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.owner_role < b.owner_role; });
+  return rows;
+}
+
+[[nodiscard]] bool ConfigurationApplyClaim(const CellAdmissionClaimDTO& claim) {
+  return claim.intent.claim_kind == CellAdmissionClaimKindDTO::kManagerApply &&
+         claim.intent.owner_role == CellAdmissionOwnerRoleDTO::kManager &&
+         claim.intent.scope.resources.empty() && claim.intent.scope.configurations.empty() &&
+         !claim.intent.program_cycle_evidence && !claim.intent.intervention_evidence &&
+         !claim.intent.program_node_evidence;
+}
+
 }  // namespace
 
 class SqliteOperationJournal::Impl final {
@@ -2787,8 +2869,18 @@ class SqliteOperationJournal::Impl final {
       const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
       std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics);
 
-  std::uint64_t RecordCellAdmissionClaimAcquired(const RequestOwnerEpoch& owner_epoch,
-                                                 const CellAdmissionClaimDTO& claim);
+  std::uint64_t RecordCellAdmissionClaimAcquired(
+      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
+      const CellAdmissionCurrentOwnerEpochDTO* verified_manager = nullptr,
+      const std::vector<CellAdmissionClaimDTO>* expected_held_claims = nullptr,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>* expected_current_owners = nullptr,
+      CellAdmissionClaimDTO* persisted_claim = nullptr);
+  AdmissionGeneration RecordTerminalApplyClaimsReleasedBySuccess(
+      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
+      AdmissionGeneration expected_admission_generation);
   std::uint64_t RecordCellAdmissionClaimReleased(const RequestOwnerEpoch& owner_epoch,
                                                  const CellAdmissionClaimDTO& claim,
                                                  const CellAdmissionClaimReleaseDTO& release,
@@ -4389,7 +4481,12 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationState(
 }
 
 std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
-    const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) {
+    const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
+    const CellAdmissionCurrentOwnerEpochDTO* verified_manager,
+    const std::vector<CellAdmissionClaimDTO>* expected_held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>* expected_current_owners,
+    CellAdmissionClaimDTO* persisted_claim) {
+  const bool configuration_apply = verified_manager != nullptr;
   Require(ValidateCellAdmissionClaimIntent(claim.intent).ok() && claim.claim_generation.nonzero() &&
               claim.acquired_admission_generation.nonzero() &&
               claim.intent.expected_admission_generation == claim.acquired_admission_generation &&
@@ -4413,12 +4510,39 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   auto semantic_digest = CellAdmissionClaimIntentDigest(claim.intent);
   Require(semantic_digest.ok(), "operation_journal_record_invalid",
           "cell-admission acquire intent digest is invalid");
+  Require(
+      !configuration_apply || (expected_held_claims && expected_current_owners && persisted_claim),
+      "operation_journal_record_invalid", "configuration Apply proof inputs are missing");
+  auto resulting_owners = configuration_apply ? *expected_current_owners
+                                              : std::vector<CellAdmissionCurrentOwnerEpochDTO>{};
+  if (configuration_apply) {
+    Require(expected_held_claims && expected_current_owners && persisted_claim &&
+                ConfigurationApplyClaim(claim) &&
+                verified_manager->owner_role == CellAdmissionOwnerRoleDTO::kManager &&
+                verified_manager->owner_epoch == claim.intent.owner_epoch &&
+                std::is_sorted(expected_held_claims->begin(), expected_held_claims->end(),
+                               [](const auto& a, const auto& b) {
+                                 return a.claim_generation < b.claim_generation;
+                               }) &&
+                std::all_of(expected_held_claims->begin(), expected_held_claims->end(),
+                            ConfigurationApplyClaim),
+            "operation_journal_record_invalid", "configuration Apply proof shape is invalid");
+    const auto prior = std::find_if(
+        resulting_owners.begin(), resulting_owners.end(),
+        [](const auto& row) { return row.owner_role == CellAdmissionOwnerRoleDTO::kManager; });
+    if (prior == resulting_owners.end())
+      resulting_owners.push_back(*verified_manager);
+    else
+      *prior = *verified_manager;
+    std::sort(resulting_owners.begin(), resulting_owners.end(),
+              [](const auto& a, const auto& b) { return a.owner_role < b.owner_role; });
+  }
   Statement current_owner(
       database_, "SELECT owner_epoch FROM cell_admission_current_owners WHERE owner_role=?");
   current_owner.Bind(1, to_string(claim.intent.owner_role));
   if (current_owner.Step()) {
-    Require(current_owner.Text(0) == claim.intent.owner_epoch.value() && !current_owner.Step(),
-            "stale_request_owner_epoch",
+    const bool matches = current_owner.Text(0) == claim.intent.owner_epoch.value();
+    Require((configuration_apply || matches) && !current_owner.Step(), "stale_request_owner_epoch",
             "cell-admission request names a stale request-owner epoch");
   }
   Statement membership(
@@ -4459,10 +4583,44 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     Require(!replay.Step(), "operation_journal_corrupt",
             "cell-admission request identity is duplicated");
     const auto existing = LoadCellClaim(database_, existing_generation);
-    Require(existing.claim == claim, "operation_journal_request_conflict",
-            "cell-admission acquire replay conflicts with durable truth");
+    if (configuration_apply) {
+      auto expected_replay = *expected_held_claims;
+      expected_replay.push_back(existing.claim);
+      Require(
+          existing.claim.intent == claim.intent &&
+              existing.claim.claim_generation == claim.claim_generation &&
+              existing.claim.acquired_admission_generation == claim.acquired_admission_generation &&
+              LoadHeldCellClaims(database_) == expected_replay &&
+              LoadCellCurrentOwners(database_) == resulting_owners &&
+              ScalarInteger(database_,
+                            "SELECT cell_admission_generation_high_water "
+                            "FROM journal_metadata WHERE singleton=1") ==
+                  static_cast<std::int64_t>(claim.acquired_admission_generation.value() + 1U),
+          "operation_journal_request_conflict",
+          "configuration Apply replay lacks exact durable inventory and membership");
+      *persisted_claim = existing.claim;
+    } else {
+      Require(existing.claim == claim, "operation_journal_request_conflict",
+              "cell-admission acquire replay conflicts with durable truth");
+    }
     transaction.Commit();
     return existing_generation;
+  }
+  if (configuration_apply) {
+    Require(LoadHeldCellClaims(database_) == *expected_held_claims &&
+                LoadCellCurrentOwners(database_) == *expected_current_owners,
+            "operation_journal_request_conflict",
+            "configuration Apply inventory or current-owner membership changed");
+    Statement adopt(database_,
+                    "INSERT INTO cell_admission_current_owners(owner_role,owner_epoch,"
+                    "established_kernel_owner_epoch) VALUES(?,?,?) ON CONFLICT(owner_role) "
+                    "DO UPDATE SET owner_epoch=excluded.owner_epoch,"
+                    "established_kernel_owner_epoch=excluded.established_kernel_owner_epoch");
+    adopt.Bind(1, to_string(verified_manager->owner_role));
+    adopt.Bind(2, verified_manager->owner_epoch.value());
+    adopt.Bind(3, owner_epoch.value());
+    Require(!adopt.Step(), "operation_journal_corrupt",
+            "Manager membership adoption returned a row");
   }
   Statement retire_membership(
       database_,
@@ -4620,7 +4778,31 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   advance.Bind(4, claim_high_water);
   Require(!advance.Step() && sqlite3_changes(database_) == 1, "operation_journal_record_invalid",
           "cell-admission acquire generation did not advance");
-  transaction.Commit();
+  if (persisted_claim) *persisted_claim = claim;
+  if (configuration_apply) {
+    // Prepare the expected postimage before COMMIT; normal success returns by move only.
+    auto expected_committed = *expected_held_claims;
+    expected_committed.push_back(claim);
+    CommitConfigurationApply(transaction, database_, claim, [&] {
+      const auto held = LoadHeldCellClaims(database_);
+      const auto owners = LoadCellCurrentOwners(database_);
+      const auto generation = ScalarInteger(
+          database_,
+          "SELECT cell_admission_generation_high_water FROM journal_metadata WHERE singleton=1");
+      if (held == expected_committed && owners == resulting_owners &&
+          generation ==
+              static_cast<std::int64_t>(claim.acquired_admission_generation.value() + 1U)) {
+        return ConfigurationCommitReadback::kCommitted;
+      }
+      if (held == *expected_held_claims && owners == *expected_current_owners &&
+          generation == static_cast<std::int64_t>(claim.acquired_admission_generation.value())) {
+        return ConfigurationCommitReadback::kAbsent;
+      }
+      return ConfigurationCommitReadback::kUnknown;
+    });
+  } else {
+    transaction.Commit();
+  }
   return claim.claim_generation.value();
 }
 
@@ -4718,6 +4900,152 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
           "cell-admission release generation did not advance");
   transaction.Commit();
   return claim.claim_generation.value();
+}
+
+AdmissionGeneration SqliteOperationJournal::Impl::RecordTerminalApplyClaimsReleasedBySuccess(
+    const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+    const CellAdmissionClaimReleaseDTO& fresh_success_release,
+    const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
+    const AdmissionGeneration expected_admission_generation) {
+  Require(ConfigurationApplyClaim(fresh_claim) &&
+              ValidateCellAdmissionClaimRelease(fresh_success_release).ok() &&
+              fresh_success_release ==
+                  CellAdmissionClaimReleaseDTO{
+                      fresh_claim.intent.owner_role, fresh_claim.intent.owner_epoch,
+                      fresh_claim.intent.owner_transaction_id, fresh_claim.intent.request_id,
+                      fresh_claim.intent.request_payload_digest,
+                      fresh_claim.acquired_admission_generation, fresh_claim.claim_generation,
+                      fresh_success_release.settlement} &&
+              fresh_success_release.settlement.settlement_kind ==
+                  CellAdmissionSettlementKindDTO::kTerminalEffectsSettled &&
+              expected_admission_generation.nonzero() &&
+              expected_admission_generation.value() < kMaximumSafeInteger &&
+              std::is_sorted(expected_held_claims.begin(), expected_held_claims.end(),
+                             [](const auto& a, const auto& b) {
+                               return a.claim_generation < b.claim_generation;
+                             }) &&
+              std::adjacent_find(expected_held_claims.begin(), expected_held_claims.end(),
+                                 [](const auto& a, const auto& b) {
+                                   return a.claim_generation == b.claim_generation;
+                                 }) == expected_held_claims.end() &&
+              std::all_of(expected_held_claims.begin(), expected_held_claims.end(),
+                          ConfigurationApplyClaim) &&
+              std::find(expected_held_claims.begin(), expected_held_claims.end(), fresh_claim) !=
+                  expected_held_claims.end(),
+          "operation_journal_record_invalid", "fresh Apply success release is not exact");
+  const auto lock = LockOrdinaryWriter();
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale", "fresh Apply names a non-active Kernel owner");
+  Require(LoadCellCurrentOwners(database_) == expected_current_owners &&
+              std::find(expected_current_owners.begin(), expected_current_owners.end(),
+                        CellAdmissionCurrentOwnerEpochDTO{CellAdmissionOwnerRoleDTO::kManager,
+                                                          fresh_claim.intent.owner_epoch}) !=
+                  expected_current_owners.end(),
+          "operation_journal_request_conflict", "fresh Apply current-owner membership changed");
+  const auto durable_held = LoadHeldCellClaims(database_);
+  const auto generation = ScalarInteger(
+      database_,
+      "SELECT cell_admission_generation_high_water FROM journal_metadata WHERE singleton=1");
+  const bool has_old = expected_held_claims.size() > 1U;
+  const AdmissionGeneration resulting(expected_admission_generation.value() + (has_old ? 1U : 0U));
+  // Replay is exact readback after a possibly unknown commit, not a second release.
+  if (has_old && durable_held == std::vector<CellAdmissionClaimDTO>{fresh_claim}) {
+    for (const auto& old : expected_held_claims) {
+      if (old == fresh_claim) continue;
+      const auto row = LoadCellClaim(database_, old.claim_generation.value());
+      const CellAdmissionClaimReleaseDTO release{old.intent.owner_role,
+                                                 old.intent.owner_epoch,
+                                                 old.intent.owner_transaction_id,
+                                                 old.intent.request_id,
+                                                 old.intent.request_payload_digest,
+                                                 old.acquired_admission_generation,
+                                                 old.claim_generation,
+                                                 fresh_success_release.settlement};
+      Require(row.claim == old && row.release == release &&
+                  !LoadCellReconcileSettlement(database_, old),
+              "operation_journal_request_conflict",
+              "old Apply release replay differs from success");
+    }
+    Require(generation == static_cast<std::int64_t>(resulting.value()),
+            "operation_journal_request_conflict", "old Apply release replay generation changed");
+    transaction.Commit();
+    return resulting;
+  }
+  Require(durable_held == expected_held_claims &&
+              generation == static_cast<std::int64_t>(expected_admission_generation.value()),
+          "operation_journal_request_conflict",
+          "old Apply release inventory or generation changed");
+  for (const auto& old : expected_held_claims) {
+    if (old == fresh_claim) continue;
+    Statement update(
+        database_,
+        "UPDATE cell_admission_claims SET release_owner_role=?,release_owner_epoch=?,"
+        "release_owner_transaction_id=?,release_request_id=?,release_request_payload_digest=?,"
+        "release_acquired_admission_generation=?,release_settlement_kind=?,release_evidence_digest="
+        "? "
+        "WHERE claim_generation=? AND release_owner_role IS NULL AND reconciled_sequence IS NULL");
+    update.Bind(1, to_string(old.intent.owner_role));
+    update.Bind(2, old.intent.owner_epoch.value());
+    update.Bind(3, old.intent.owner_transaction_id);
+    update.Bind(4, old.intent.request_id.value());
+    update.Bind(5, old.intent.request_payload_digest.value());
+    update.Bind(6, static_cast<std::int64_t>(old.acquired_admission_generation.value()));
+    update.Bind(7, to_string(fresh_success_release.settlement.settlement_kind));
+    update.Bind(8, fresh_success_release.settlement.evidence_digest.value());
+    update.Bind(9, static_cast<std::int64_t>(old.claim_generation.value()));
+    Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
+            "old Apply success release did not update exact row");
+  }
+  if (has_old) {
+    Statement advance(database_,
+                      "UPDATE journal_metadata SET cell_admission_generation_high_water=? "
+                      "WHERE singleton=1 AND cell_admission_generation_high_water=?");
+    advance.Bind(1, static_cast<std::int64_t>(resulting.value()));
+    advance.Bind(2, static_cast<std::int64_t>(expected_admission_generation.value()));
+    Require(!advance.Step() && sqlite3_changes(database_) == 1, "operation_journal_record_invalid",
+            "old Apply success release generation changed");
+  }
+  CommitConfigurationApply(transaction, database_, fresh_claim, [&] {
+    const auto held = LoadHeldCellClaims(database_);
+    const auto owners = LoadCellCurrentOwners(database_);
+    const auto observed_generation = ScalarInteger(
+        database_,
+        "SELECT cell_admission_generation_high_water FROM journal_metadata WHERE singleton=1");
+    bool all_released = true;
+    bool all_absent = true;
+    for (const auto& old : expected_held_claims) {
+      if (old == fresh_claim) continue;
+      const auto row = LoadCellClaim(database_, old.claim_generation.value());
+      const CellAdmissionClaimReleaseDTO release{old.intent.owner_role,
+                                                 old.intent.owner_epoch,
+                                                 old.intent.owner_transaction_id,
+                                                 old.intent.request_id,
+                                                 old.intent.request_payload_digest,
+                                                 old.acquired_admission_generation,
+                                                 old.claim_generation,
+                                                 fresh_success_release.settlement};
+      all_released = all_released && row.claim == old && row.release == release &&
+                     !LoadCellReconcileSettlement(database_, old);
+      all_absent = all_absent && row.claim == old && !row.release &&
+                   !LoadCellReconcileSettlement(database_, old);
+    }
+    if (held == std::vector<CellAdmissionClaimDTO>{fresh_claim} && all_released &&
+        owners == expected_current_owners &&
+        observed_generation == static_cast<std::int64_t>(resulting.value())) {
+      return ConfigurationCommitReadback::kCommitted;
+    }
+    if (held == expected_held_claims && all_absent && owners == expected_current_owners &&
+        observed_generation == static_cast<std::int64_t>(expected_admission_generation.value())) {
+      return ConfigurationCommitReadback::kAbsent;
+    }
+    return ConfigurationCommitReadback::kUnknown;
+  });
+  return resulting;
 }
 
 std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
@@ -5200,6 +5528,33 @@ Result<std::uint64_t> SqliteOperationJournal::RecordCellAdmissionClaimAcquired(
     const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) {
   return AsResult<std::uint64_t>(
       [&] { return impl_->RecordCellAdmissionClaimAcquired(owner_epoch, claim); });
+}
+
+Result<CellAdmissionClaimDTO> SqliteOperationJournal::RecordConfigurationApplyClaimAcquired(
+    const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
+    const CellAdmissionCurrentOwnerEpochDTO& verified_manager,
+    const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners) {
+  return AsResult<CellAdmissionClaimDTO>([&] {
+    auto persisted = claim;
+    impl_->RecordCellAdmissionClaimAcquired(owner_epoch, claim, &verified_manager,
+                                            &expected_held_claims, &expected_current_owners,
+                                            &persisted);
+    return persisted;
+  });
+}
+
+Result<AdmissionGeneration> SqliteOperationJournal::RecordTerminalApplyClaimsReleasedBySuccess(
+    const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+    const CellAdmissionClaimReleaseDTO& fresh_success_release,
+    const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
+    const AdmissionGeneration expected_admission_generation) {
+  return AsResult<AdmissionGeneration>([&] {
+    return impl_->RecordTerminalApplyClaimsReleasedBySuccess(
+        owner_epoch, fresh_claim, fresh_success_release, expected_held_claims,
+        expected_current_owners, expected_admission_generation);
+  });
 }
 
 Result<std::uint64_t> SqliteOperationJournal::RecordCellAdmissionClaimReleased(

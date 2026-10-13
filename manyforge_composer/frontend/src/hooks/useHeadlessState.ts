@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
+import { structuredErrorText } from '../state/structuredError';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
   parseApiErrorDto,
+  parseKnownProgramRunOutcome,
   parseAuthoringWorkspaceContainment,
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
@@ -856,10 +858,25 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           });
           const body: unknown = await response.json();
           if (!response.ok) {
-            // A definite client rejection has no submitted effect. A server
-            // error can occur after submission and remains uncertain.
+            // A non-5xx owner response is a known outcome, including an
+            // accepted Run that failed. Server errors remain uncertain.
             acknowledged = response.status >= 400 && response.status < 500;
             const error = parseApiErrorDto(body);
+            if (error !== null && ['program_run_started_then_failed',
+              'program_run_superseded_by_stop', 'program_run_stopped_before_start'].includes(error.code)) {
+              let outcome;
+              try {
+                outcome = parseKnownProgramRunOutcome(body, response.status);
+              } catch {
+                throw new Error('Run outcome could not be read; check the Program state before Reset.');
+              }
+              if (outcome.code === 'program_run_started_then_failed') {
+                throw new Error(`Run failed: ${structuredErrorText(outcome)} — Reset required.`);
+              }
+              const stopped = outcome.code === 'program_run_stopped_before_start'
+                ? 'Run stopped before start' : 'Run stopped';
+              throw new Error(`${stopped} — Reset required. ${structuredErrorText(outcome)}`);
+            }
             throw new Error(
               operatorAlarmRefusalMessage(error?.code, error?.details)
                 || error?.message || error?.code

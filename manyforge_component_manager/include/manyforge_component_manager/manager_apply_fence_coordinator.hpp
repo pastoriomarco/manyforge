@@ -90,13 +90,15 @@ struct ManagerApplyFenceAcquireResult final {
 };
 
 /// Manager-owned exact Kernel generation/configuration observation used to
-/// construct the fixed fence request. It deliberately contains no scope,
-/// disposition, request identity, graph, or bundle input.
+/// construct the fixed fence request. The optional actual scope is the trusted
+/// current-owner convergence closure, captured before the first fence attempt.
+/// Disposition, request identity, graph and bundle remain fixed by the Apply.
 struct ManagerApplyFenceExpectationDTO final {
   std::uint64_t expected_operation_resource_generation;
   manyforge::core::ConfigurationFenceGeneration expected_fence_generation;
   std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
       expected_active_control_configurations;
+  std::optional<manyforge::core::ConfigurationFenceScopeDTO> actual_scope{};
 };
 
 /// Bounded durable pre-effect coordinator for one named Apply fence.

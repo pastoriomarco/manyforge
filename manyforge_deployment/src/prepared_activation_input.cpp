@@ -220,10 +220,63 @@ parse_artifacts(const CanonicalValue &value, const std::string_view label,
 
 } // namespace
 
+PreparedActivationOrigin parse_prepared_activation_origin(const CanonicalValue &value) {
+  const auto &kind = text(member(value, "kind"), "origin.kind");
+  if (kind == "scenario") {
+    require_exact_fields(value, {"kind", "scenario_id", "source_document_digest"}, "origin");
+    const auto &scenario = text(member(value, "scenario_id"), "origin.scenario_id");
+    if (scenario.size() > 256U) fail("prepared activation origin scenario_id exceeds its bound");
+    const auto &source = text(member(value, "source_document_digest"), "origin.source_document_digest");
+    require_digest(source, "origin.source_document_digest");
+    return PreparedScenarioOrigin{scenario, core::ContentDigest(source)};
+  }
+  if (kind != "sealed_canonical_empty") fail("prepared activation origin kind is unsupported");
+  require_exact_fields(value, {"kind", "cell_id", "deployment_artifact_id", "deployment_revision",
+                             "retained_bundle_id", "graph_revision", "admission_digest"}, "origin");
+  const auto identity = [&](std::string_view name) -> const std::string & {
+    const auto &result = text(member(value, name), std::string("origin.") + std::string(name));
+    try {
+      detail::require_retained_portable_identity(result, std::string("origin.") + std::string(name));
+    } catch (const std::exception &error) {
+      fail(error.what());
+    }
+    return result;
+  };
+  const auto digest = [&](std::string_view name) -> const std::string & {
+    const auto &result = text(member(value, name), std::string("origin.") + std::string(name));
+    require_digest(result, std::string("origin.") + std::string(name));
+    return result;
+  };
+  return PreparedSealedCanonicalEmptyOrigin{
+      core::CellId(identity("cell_id")), core::DeploymentArtifactId(identity("deployment_artifact_id")),
+      core::DeploymentRevision(digest("deployment_revision")), core::RetainedBundleId(digest("retained_bundle_id")),
+      core::GraphRevision(digest("graph_revision")), core::ContentDigest(digest("admission_digest"))};
+}
+
+CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin) {
+  if (const auto *scenario = std::get_if<PreparedScenarioOrigin>(&origin))
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("scenario")}, {"scenario_id", CanonicalValue(scenario->scenario_id)},
+        {"source_document_digest", CanonicalValue(scenario->source_document_digest.value())}});
+  const auto &sealed = std::get<PreparedSealedCanonicalEmptyOrigin>(origin);
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("sealed_canonical_empty")}, {"cell_id", CanonicalValue(sealed.cell_id.value())},
+      {"deployment_artifact_id", CanonicalValue(sealed.deployment_artifact_id.value())},
+      {"deployment_revision", CanonicalValue(sealed.deployment_revision.value())},
+      {"retained_bundle_id", CanonicalValue(sealed.retained_bundle_id.value())},
+      {"graph_revision", CanonicalValue(sealed.graph_revision.value())},
+      {"admission_digest", CanonicalValue(sealed.admission_digest.value())}});
+}
+
+core::ContentDigest sealed_canonical_empty_capture_digest(const PreparedSealedCanonicalEmptyOrigin &origin) {
+  return core::ContentDigest(sha256_digest(canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.sealed_canonical_empty_capture.v1")},
+      {"origin", prepared_activation_origin_value(origin)}}))));
+}
+
 PreparedActivationInput::PreparedActivationInput(
     core::ContentDigest prepared_activation_id,
-    core::ContentDigest source_document_digest,
-    std::string scenario_id,
+    PreparedActivationOrigin origin,
     core::ContentDigest captured_input_digest,
     core::DeploymentArtifactId deployment_artifact_id,
     core::DeploymentRevision deployment_revision,
@@ -237,8 +290,7 @@ PreparedActivationInput::PreparedActivationInput(
     CanonicalValue normalized_root,
     VerifiedPreparedActivationClosure closure)
     : prepared_activation_id_(std::move(prepared_activation_id)),
-      source_document_digest_(std::move(source_document_digest)),
-      scenario_id_(std::move(scenario_id)),
+      origin_(std::move(origin)),
       captured_input_digest_(std::move(captured_input_digest)),
       deployment_artifact_id_(std::move(deployment_artifact_id)),
       deployment_revision_(std::move(deployment_revision)),
@@ -275,8 +327,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
        "deployment_artifact_id", "deployment_revision", "graph_revision",
        "node_environment_digest", "prepared_activation_id",
        "program_id", "program_outcome", "program_revision",
-       "retained_bundle_id", "scenario_id", "schema_version",
-       "source_document_digest"},
+       "retained_bundle_id", "origin", "schema_version"},
       "prepared activation input");
   const auto &schema = text(member(value, "schema_version"), "schema_version");
   if (schema != kPreparedActivationInputSchemaVersion) {
@@ -284,12 +335,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   }
   const auto &prepared_id =
       text(member(value, "prepared_activation_id"), "prepared_activation_id");
-  const auto &source_digest =
-      text(member(value, "source_document_digest"), "source_document_digest");
-  const auto &scenario_id = text(member(value, "scenario_id"), "scenario_id");
-  if (scenario_id.size() > 256U) {
-    fail("prepared activation input scenario_id exceeds its bound");
-  }
+  auto origin = parse_prepared_activation_origin(member(value, "origin"));
   const auto &captured_digest =
       text(member(value, "captured_input_digest"), "captured_input_digest");
   const auto &deployment_revision =
@@ -331,7 +377,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   const auto &node_environment_digest =
       text(member(value, "node_environment_digest"), "node_environment_digest");
   require_digest(prepared_id, "prepared_activation_id");
-  require_digest(source_digest, "source_document_digest");
   require_digest(captured_digest, "captured_input_digest");
   require_digest(deployment_revision, "deployment_revision");
   require_digest(retained_bundle_id, "retained_bundle_id");
@@ -472,12 +517,24 @@ parse_prepared_activation_input(const CanonicalValue &value) {
     fail("prepared activation assistant mode differs from retained contents");
   }
 
+  if (const auto *sealed = std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin)) {
+    if (!no_program || assistant_mode != "optional" ||
+        sealed->cell_id != bundle->value().cell_graph.cell_id ||
+        sealed->deployment_artifact_id != bundle->value().deployment_artifact_id ||
+        sealed->deployment_revision != bundle->value().deployment_revision ||
+        sealed->retained_bundle_id != bundle->retained_bundle_id() ||
+        sealed->graph_revision != bundle->value().cell_graph.graph_revision ||
+        sealed_canonical_empty_capture_digest(*sealed).value() != captured_digest ||
+        !bundle->value().cell_graph.controllable_components.empty() ||
+        !bundle->value().cell_graph.model_instances.empty() || model_map.has_value())
+      fail("sealed canonical-empty origin differs from its exact no_program candidate capture");
+  }
+
   VerifiedPreparedActivationClosure closure{
       bundle, std::move(model_map), std::move(program), std::move(binding),
       std::move(raw_artifacts), std::move(catalog_artifacts)};
   return PreparedActivationInput(
-      core::ContentDigest(prepared_id), core::ContentDigest(source_digest),
-      scenario_id,
+      core::ContentDigest(prepared_id), std::move(origin),
       core::ContentDigest(captured_digest),
       core::DeploymentArtifactId(text(member(value, "deployment_artifact_id"),
                                       "deployment_artifact_id")),

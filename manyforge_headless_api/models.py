@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -535,6 +536,53 @@ class ActivationPreparationRequest(StrictRequest):
         return self
 
 
+class PreparedScenarioOrigin(StrictRequest):
+    kind: Literal["scenario"]
+    scenario_id: str
+    source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("scenario_id")
+    @classmethod
+    def validate_scenario_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="scenario_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class PreparedSealedCanonicalEmptyOrigin(StrictRequest):
+    kind: Literal["sealed_canonical_empty"]
+    cell_id: str
+    deployment_artifact_id: str
+    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    admission_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("cell_id", "deployment_artifact_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+
+
+PreparedActivationOrigin = Annotated[
+    PreparedScenarioOrigin | PreparedSealedCanonicalEmptyOrigin,
+    Field(discriminator="kind"),
+]
+
+
+class CanonicalEmptyActivationPreparationRequest(StrictRequest):
+    origin: PreparedSealedCanonicalEmptyOrigin
+    request_owner_epoch: str
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("request_owner_epoch")
+    @classmethod
+    def validate_owner(cls, value: str) -> str:
+        return _bounded_nfc(value, label="request_owner_epoch", maximum_bytes=128)
+
+
 class ManagerApplyPreparedActivation(StrictRequest):
     """Exact UA2A prepared activation accepted by one named Apply.
 
@@ -547,9 +595,8 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v5"]
-    scenario_id: str
-    source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    schema_version: Literal["manyforge.prepared_activation_input.v6"]
+    origin: PreparedActivationOrigin
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -593,7 +640,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
             raise ValueError("Program outcome kind is unsupported")
         return value
 
-    @field_validator("deployment_artifact_id", "scenario_id", "program_id")
+    @field_validator("deployment_artifact_id", "program_id")
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -615,6 +662,23 @@ class ManagerApplyPreparedActivation(StrictRequest):
                 raise ValueError("no_program requires no Program identity")
         elif self.program_id is None or self.program_revision is None:
             raise ValueError("selected Program requires its identity and revision")
+        if isinstance(self.origin, PreparedSealedCanonicalEmptyOrigin):
+            if self.program_outcome != {"kind": "no_program"} or any(
+                getattr(self.origin, field) != getattr(self, field)
+                for field in (
+                    "deployment_artifact_id", "deployment_revision",
+                    "retained_bundle_id", "graph_revision",
+                )
+            ):
+                raise ValueError("sealed empty origin requires its exact no-Program candidate")
+            capture = {
+                "schema_version": "manyforge.sealed_canonical_empty_capture.v1",
+                "origin": self.origin.model_dump(mode="json"),
+            }
+            if self.captured_input_digest != "sha256:" + hashlib.sha256(
+                rfc8785.dumps(capture)
+            ).hexdigest():
+                raise ValueError("sealed empty capture does not match its origin")
         return self
 
 
@@ -694,7 +758,6 @@ class ProgramRunStartRequest(ExecutionControlAttributionRequest):
         Field(pattern=SHA256_PATTERN),
     ]
     draft_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class ProgramScenePreparationRequest(CallerAttributionRequest):
@@ -760,7 +823,7 @@ class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
 
 
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
-    program_run_id: str
+    program_run_id: str | None
     expected_owner_epoch: str
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_claim_generation: (
@@ -773,7 +836,9 @@ class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
 
     @field_validator("program_run_id", "expected_owner_epoch")
     @classmethod
-    def validate_cycle_identity(cls, value: str, info) -> str:
+    def validate_cycle_identity(cls, value: str | None, info) -> str | None:
+        if value is None and info.field_name == "program_run_id":
+            return None
         return _bounded_nfc(
             value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
         )
@@ -3395,6 +3460,105 @@ class CCLCExpectedControlDomainRequest(StrictRequest):
         return self
 
 
+class CloseIncidentRecoveryRequest(StrictRequest):
+    expected_incident_id: str
+
+    @field_validator("expected_incident_id")
+    @classmethod
+    def validate_incident_id(cls, value: str) -> str:
+        return _bounded_nfc(value, label="expected_incident_id", maximum_bytes=128)
+
+
+class BoundedPublicRequestContext(CallerAttributionRequest):
+    @model_serializer(mode="wrap")
+    def serialize_optional_correlation(self, handler):
+        payload = handler(self)
+        if self.correlation_id is None:
+            payload.pop("correlation_id", None)
+        return payload
+
+    @field_validator("request_id", "request_owner_epoch")
+    @classmethod
+    def validate_owner_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+
+
+class ComponentProcessStopRequest(StrictRequest):
+    request_context: BoundedPublicRequestContext
+    predecessor_projection_revision: ProjectionRevisionRequest
+    expected_predecessor_publication_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+    expected_predecessor_public_pointer_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    runtime_unit_id: str
+    runtime_epoch: str
+    manager_runtime_epoch: str
+    controllable_component_id: str
+    launch_identity: str
+    leader_pid: Annotated[int, Field(ge=1, le=2_147_483_647)]
+
+    @field_validator("runtime_unit_id", "runtime_epoch", "manager_runtime_epoch",
+                     "controllable_component_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+
+    @field_validator("launch_identity")
+    @classmethod
+    def validate_launch_identity(cls, value: str) -> str:
+        # Reuse the native RPC packet ceiling; complete packet limits still apply.
+        return _bounded_nfc(value, label="launch_identity", maximum_bytes=256 * 1024)
+
+
+class ComponentProcessStopBody(StrictRequest):
+    request: ComponentProcessStopRequest
+
+
+class ComponentProcessDrainReceipt(StrictRequest):
+    leader_pid: Annotated[int, Field(ge=1, le=2_147_483_647)]
+    controllable_component_id: str
+    launch_identity: str
+    observed_utc: str
+
+    @field_validator("controllable_component_id", "observed_utc")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+
+    @field_validator("launch_identity")
+    @classmethod
+    def validate_launch_identity(cls, value: str) -> str:
+        # Reuse the native RPC packet ceiling; complete packet limits still apply.
+        return _bounded_nfc(value, label="launch_identity", maximum_bytes=256 * 1024)
+
+
+class ComponentProcessStopResult(StrictRequest):
+    request: ComponentProcessStopRequest
+    state: Literal["not_requested", "pending", "unknown", "drained"]
+    receipt: ComponentProcessDrainReceipt | None
+    error: dict[str, Any] | None
+
+    @model_validator(mode="after")
+    def validate_drain(self) -> "ComponentProcessStopResult":
+        if self.state == "drained":
+            if self.receipt is None or self.error is not None:
+                raise ValueError("drained requires its exact receipt and no error")
+            if (self.receipt.leader_pid != self.request.leader_pid
+                    or self.receipt.controllable_component_id != self.request.controllable_component_id
+                    or self.receipt.launch_identity != self.request.launch_identity):
+                raise ValueError("drain receipt does not match the exact launch request")
+        elif self.receipt is not None:
+            raise ValueError("only drained may carry a drain receipt")
+        if self.error is not None and (
+                set(self.error) != {"code", "message", "details"}
+                or not isinstance(self.error["code"], str) or not self.error["code"]
+                or not isinstance(self.error["message"], str) or not self.error["message"]
+                or not isinstance(self.error["details"], dict)
+                or len(self.error["details"]) > 4096
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       for key, value in self.error["details"].items())):
+            raise ValueError("process Stop error must be an exact ErrorDTO")
+        return self
+
+
 class ComponentLifecycleRequest(StrictRequest):
     request_context: CallerAttributionRequest
     controllable_component_id: str
@@ -3408,6 +3572,7 @@ class ComponentLifecycleRequest(StrictRequest):
         Field(min_length=1, max_length=256),
     ]
     reason: str | None = None
+    close_incident_recovery: CloseIncidentRecoveryRequest | None = None
     confirmed: bool
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     program_node_evidence: ProgramNodeAdmissionEvidenceRequest | None = None
@@ -3430,6 +3595,9 @@ class ComponentLifecycleRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_domain_order(self) -> "ComponentLifecycleRequest":
+        if self.close_incident_recovery is not None and (
+                self.intent != "recover" or self.reason != "cell closed by operator"):
+            raise ValueError("Close incident recovery requires explicit Recover and its exact reason")
         if self.program_node_evidence is not None:
             raise ValueError(
                 "component lifecycle mutations are unsupported as Program nodes; "

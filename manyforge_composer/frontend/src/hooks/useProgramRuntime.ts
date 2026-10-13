@@ -321,6 +321,19 @@ export function programPendingAfterProjection(
   return pending;
 }
 
+export const PROGRAM_RESET_READINESS_MESSAGE = 'Reset done, waiting for cell ready…';
+
+export function programResetReadinessMessage(snapshot: ComposerHeadlessState | null): string | null {
+  const cycle = snapshot?.programCycle;
+  // Only successful Reset publication advances the durable cycle generation.
+  return cycle !== undefined && cycle.cycleGeneration > 1
+    && cycle.state === 'idle_after_reset'
+    && cycle.programRunId === null && cycle.cycleClaimGeneration === null
+    && cycle.terminalOrSettlementReference === null && cycle.failure === null
+    && snapshot?.authoringAdmission.authoringAllowed === false
+    ? PROGRAM_RESET_READINESS_MESSAGE : null;
+}
+
 export function buildProgramStartRequest(
   applied: AppliedProgramSelection | null,
   runnerAvailable: boolean,
@@ -352,7 +365,6 @@ export function buildProgramStartRequest(
     source_document_digest: applied.sourceDocumentDigest,
     expected_applied_record_digest: applied.recordDigest,
     draft_program_revision: workspace.draft.programRevision,
-    expected_admission_generation: snapshot.authoringAdmission.admissionGeneration,
   };
 }
 
@@ -360,7 +372,7 @@ export function buildProgramStartRequest(
 export interface ProgramResetIdentity {
   requestId: string;
   correlationId: string;
-  programRunId: string;
+  programRunId: string | null;
   programRunnerOwnerEpoch: string;
   cycleGeneration: number;
 }
@@ -392,7 +404,8 @@ export function buildProgramResetRequest(
   if (
     cycle === undefined
     || !allowed
-    || cycle.programRunId === null
+    || (cycle.programRunId === null && (cycle.state !== 'idle_after_reset'
+      || cycle.cycleClaimGeneration !== null || cycle.terminalOrSettlementReference !== null))
   ) return null;
   return {
     request_id: requestId,
@@ -987,7 +1000,7 @@ export function useProgramRuntime(
     const request = buildProgramResetRequest(
       snapshot, callerEpoch.current, requestId, correlationId,
     );
-    if (request === null || controlSource === null || cycle?.programRunId == null) {
+    if (request === null || controlSource === null || cycle === null) {
       const message = request === null
         ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
         : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.';
@@ -1678,7 +1691,8 @@ export function useProgramRuntime(
     (DRAFT_GATED_COMMANDS.has(commandKind) ? draftUnappliedReason : null)
     ?? snapshot?.programCycle.allowedCommands.find(
       (command) => command.commandKind === commandKind,
-    )?.disabledReason ?? null
+    )?.disabledReason
+    ?? (commandKind === 'program_run' ? programResetReadinessMessage(snapshot) : null)
   ), [draftUnappliedReason, snapshot]);
 
   const alarms = snapshot?.alarms ?? null;

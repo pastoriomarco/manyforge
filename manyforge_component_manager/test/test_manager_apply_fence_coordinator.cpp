@@ -894,5 +894,47 @@ TEST(ManagerApplyFenceCoordinator,
   EXPECT_TRUE(paths_are_one_new_one_replay);
 }
 
+TEST(ManagerApplyFenceCoordinator,
+     ActualScopeIsAcceptedOnceAndExactReplayKeepsItsOriginalScope) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  SqliteManagerApplyJournal writer(path, TestCellId());
+  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  const auto intent = ApplyIntent();
+  auto actual_scope = NonemptyFenceScope();
+  actual_scope.domains.front().predecessor_control_domain_revision.reset();
+  actual_scope.bindings.front().predecessor_control_binding_revision.reset();
+  ASSERT_TRUE(actual_scope.valid());
+  auto expectation = Expectation();
+  expectation.actual_scope = actual_scope;
+  ScriptedFencePort kernel(independent_reader, intent);
+  kernel.acquire_response = AcceptedFence(actual_scope);
+  ManagerApplyFenceCoordinator coordinator(writer, kernel,
+                                           RuntimeEpoch("manager-runtime-1"));
+  const auto accepted = RunAdmission(coordinator, intent, expectation);
+  EXPECT_EQ(accepted.durable_attempt.record.fence_intent.scope, actual_scope);
+  EXPECT_EQ(
+      accepted.durable_affected_scope.record.affected_scope.component_delta,
+      manyforge::deployment::derive_apply_component_delta(TestBundle(),
+                                                          TestBundle()));
+  EXPECT_TRUE(
+      kernel.saw_exact_durable_intent_and_attempt_before_acquire.load());
+  EXPECT_EQ(kernel.acquire_calls.load(), 1);
+  auto changed_observation = expectation;
+  changed_observation.actual_scope = ConfigurationFenceScopeDTO{};
+  const auto replay = RunAdmission(coordinator, intent, changed_observation);
+  EXPECT_EQ(replay.path,
+            ManagerApplyFenceAcquirePath::kDurableAcceptanceReplay);
+  EXPECT_EQ(replay.durable_attempt.record.fence_intent,
+            accepted.durable_attempt.record.fence_intent);
+  EXPECT_EQ(replay.durable_attempt.record.intent_digest,
+            accepted.durable_attempt.record.intent_digest);
+  EXPECT_EQ(replay.durable_attempt.record.affected_scope_digest,
+            accepted.durable_attempt.record.affected_scope_digest);
+  EXPECT_EQ(replay.durable_attempt.record.fence_attempt_digest,
+            accepted.durable_attempt.record.fence_attempt_digest);
+  EXPECT_EQ(kernel.acquire_calls.load(), 1);
+}
+
 } // namespace
 } // namespace manyforge::component_manager

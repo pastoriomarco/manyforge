@@ -7,6 +7,7 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,6 +19,13 @@ using CellAdmissionInterventionValidator = std::function<Result<void>(
 using CellAdmissionApplyBringUpValidator = std::function<Result<void>(
     const CellAdmissionClaimIntentDTO&, const CellAdmissionReadinessSnapshotDTO&,
     const RuntimeEpoch&)>;
+// Trusted process-local callbacks. No caller or wire supplies terminal proof.
+using CellAdmissionConfigurationApplyValidator = std::function<Result<void>(
+    const CellAdmissionClaimIntentDTO&, std::span<const CellAdmissionClaimDTO>,
+    const CellAdmissionReadinessSnapshotDTO&, const RuntimeEpoch&)>;
+using CellAdmissionConfigurationApplySuccessValidator =
+    std::function<Result<void>(const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&,
+                               std::span<const CellAdmissionClaimDTO>)>;
 using CellAdmissionProgramNodeValidator =
     std::function<Result<void>(const ProgramNodeAdmissionEvidenceDTO&)>;
 using CellAdmissionSettlementValidator =
@@ -54,6 +62,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<void> RefreshStopFaultAdmission();
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
+  /// Sticky owner-cache storage uncertainty; status only, cleared by restart.
+  [[nodiscard]] std::optional<ErrorDTO> persistence_outcome_unknown() const;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
@@ -76,6 +86,17 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionApplyBringUpValidator& validate_plan);
+  /// Ordinary configuration convergence under exact current Manager/host and
+  /// immutable-terminal proofs. All old held rows retain their exclusion.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionConfigurationApplyValidator& validate);
+  /// Called only after fresh success has released every exact old fence.
+  /// Keeps the fresh claim held until its ordinary release.
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
+      const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const CellAdmissionConfigurationApplySuccessValidator& validate);
   /// Read the same readiness/claim preconditions used by manual acquisition.
   /// This reserves nothing; the composing Kernel still checks the target hold.
   [[nodiscard]] Result<void> CheckManualCellAdmissionReadiness(
@@ -101,6 +122,10 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   /// Current held authority, excluding released and reconciled predecessors.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
       CellAdmissionClaimKindDTO kind) const;
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
+      CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const;
+  [[nodiscard]] std::vector<CellAdmissionClaimDTO> held_claims(
+      CellAdmissionClaimKindDTO kind) const;
   /// Bounded ordinary-release snapshot, never read by physical Stop. An empty
   /// node identity denotes an unscoped child (e.g. intervention/recovery).
   [[nodiscard]] std::vector<std::string> unsettled_program_child_nodes(
@@ -114,7 +139,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer,
-      bool selected_apply_bring_up = false);
+      bool selected_apply_bring_up = false,
+      const CellAdmissionConfigurationApplyValidator& configuration_apply_validator = {});
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
@@ -136,6 +162,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       const std::vector<CellAdmissionReconcileSettlementDTO>& prospective = {}) const;
   [[nodiscard]] bool IsStaleOwnerLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Result<void> AdvanceGenerationLocked();
+  void CloseForPersistenceUnknownLocked(ErrorDTO&& error, const CellAdmissionClaimDTO& claim);
 
   struct ManagerLivenessRow final {
     RequiredManagerLivenessReceiverDTO receiver;
@@ -161,6 +188,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   mutable std::mutex liveness_transition_mutex_;
   CellAdmissionReadinessSnapshotDTO readiness_;
   bool route_recovery_pending_{};
+  std::optional<ErrorDTO> persistence_outcome_unknown_;
   std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set_;
   std::vector<ManagerLivenessRow> manager_liveness_rows_;
   std::size_t manager_liveness_current_unfenced_count_{};

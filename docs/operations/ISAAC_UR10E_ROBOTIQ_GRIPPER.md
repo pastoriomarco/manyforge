@@ -69,7 +69,7 @@ gripper on its own.
 
 ```bash
 docker exec manyforge-isaac-topic-control-1 bash -lc '
-  source /opt/ros/jazzy/setup.bash
+  source /opt/ros/${ROS_DISTRO}/setup.bash
   ros2 topic echo --once /manyforge/isaac_gripper_bridge/ready
 '
 ```
@@ -136,7 +136,7 @@ With playback active and readiness true, send close and open actions:
 
 ```bash
 docker exec manyforge-isaac-topic-control-1 bash -lc '
-  source /opt/ros/jazzy/setup.bash
+  source /opt/ros/${ROS_DISTRO}/setup.bash
   ros2 action send_goal --feedback \
     /robotiq_gripper_controller/gripper_cmd \
     control_msgs/action/GripperCommand \

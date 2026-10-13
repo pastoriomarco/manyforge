@@ -213,6 +213,40 @@ class IOperationJournal {
                  {}});
   }
 
+  /// Trusted owner adaptation, using the existing ordinary claim tables.
+  [[nodiscard]] virtual Result<CellAdmissionClaimDTO> RecordConfigurationApplyClaimAcquired(
+      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionCurrentOwnerEpochDTO& verified_manager,
+      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners) {
+    static_cast<void>(kernel_owner_epoch);
+    static_cast<void>(fresh_claim);
+    static_cast<void>(verified_manager);
+    static_cast<void>(expected_held_claims);
+    static_cast<void>(expected_current_owners);
+    return Result<CellAdmissionClaimDTO>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "configuration Apply journal adaptation is unavailable",
+                 {}});
+  }
+  [[nodiscard]] virtual Result<AdmissionGeneration> RecordTerminalApplyClaimsReleasedBySuccess(
+      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
+      AdmissionGeneration expected_admission_generation) {
+    static_cast<void>(kernel_owner_epoch);
+    static_cast<void>(fresh_claim);
+    static_cast<void>(fresh_success_release);
+    static_cast<void>(expected_held_claims);
+    static_cast<void>(expected_current_owners);
+    static_cast<void>(expected_admission_generation);
+    return Result<AdmissionGeneration>::Err(
+        ErrorDTO{"operation_journal_cell_admission_unavailable",
+                 "configuration Apply journal adaptation is unavailable",
+                 {}});
+  }
+
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimReleased(
       const RequestOwnerEpoch&, const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&,
       AdmissionGeneration) {

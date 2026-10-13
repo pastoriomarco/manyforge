@@ -7,6 +7,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <manyforge_core/configured_robot_measured_state.hpp>
@@ -84,6 +85,50 @@ struct RetainedRos2ControlArmGuardHooks final {
   std::function<std::optional<std::string>()> fault;
 };
 
+/// Build-owned measured JointState role of the selected lane. Instance
+/// identity remains the verified physical provider/binding/runtime tuple.
+inline constexpr std::string_view kMeasuredJointStateAuthorityId =
+    "manyforge.ros2_control.measured_joint_state";
+inline constexpr std::string_view kMeasuredJointStateProfileId =
+    "manyforge.ros2_control.joint_state.measured.v1";
+
+struct RetainedMeasuredJointStateLane final {
+  std::string absolute_topic;
+  core::Duration freshness_budget_ns;
+  core::StateAuthorityId measured_state_authority_id;
+  std::string measured_source_profile_id;
+
+  friend bool operator==(const RetainedMeasuredJointStateLane &,
+                         const RetainedMeasuredJointStateLane &) = default;
+};
+
+/// Fresh empty source ownership staged by the existing route/product owner.
+/// Aliasing readers independently retain storage and the actual clock/node.
+/// Destruction of this staging value never retires a pinned predecessor.
+class PreparedMeasuredStateSources final {
+public:
+  [[nodiscard]] const std::vector<core::MeasuredStateSourceDescriptor> &
+  descriptors() const noexcept;
+  [[nodiscard]] const std::vector<
+      std::shared_ptr<const core::IObservedStateProvider>> &
+  readers() const noexcept {
+    return readers_;
+  }
+  /// The route owner calls this only after positive exact readback and its
+  /// coherent no-throw association commit. No sample is copied or minted.
+  void EnablePublication() noexcept;
+
+private:
+  friend class RetainedRos2ControlRuntimeHandle;
+  struct Storage;
+  PreparedMeasuredStateSources(
+      std::shared_ptr<Storage> storage,
+      std::vector<std::shared_ptr<const core::IObservedStateProvider>> readers);
+  std::shared_ptr<Storage> storage_;
+  const std::vector<std::shared_ptr<const core::IObservedStateProvider>>
+      readers_;
+};
+
 /// Lane facts the handle needs to construct one JTC adapter instance per
 /// binding epoch.
 struct RetainedRos2ControlArmTransport final {
@@ -97,6 +142,8 @@ struct RetainedRos2ControlArmTransport final {
   /// An explicitly configured gripper controller in this same controller
   /// manager/hardware. Absent for non-CM transports; never derived from an URL.
   std::optional<RetainedRos2ControlArmController> gripper_controller{};
+  /// Absent is unavailable, never a zero-robot or commanded-state fallback.
+  std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane;
 };
 
 /// Retained ROS resource lifetime of one runtime composition: the shared
@@ -138,6 +185,8 @@ public:
   /// takes the gripper adapter. Fails closed (everything shut down) on any
   /// mismatch. Selected bring-up consumes the exact owner-computed successor;
   /// absent seed preserves epoch 1 and the ordinary first observation.
+  /// An optional genuine clock owner must name this same receiver clock and
+  /// remains alive through child and transport teardown.
   [[nodiscard]] core::Result<void> Bind(
       std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
       core::IClock &clock, RetainedRos2ControlArmTransport arm,
@@ -147,7 +196,8 @@ public:
       const core::RuntimeParticipantBinding &motion_binding,
       const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
       const std::optional<core::SelectedControllerOccurrenceDTO>
-          &successor_occurrence = std::nullopt);
+          &successor_occurrence = std::nullopt,
+      std::shared_ptr<core::IClock> clock_owner = {});
 
   /// Exact owned arm epoch and canonical domain observation floors, including
   /// zero before an ordinary first observation. Unbound handles have no
@@ -172,13 +222,18 @@ public:
   /// The explicit topic carries JointState; descriptors explicitly map
   /// their source_joint_names to addressed coordinates, index for index.
   /// Receipt uses the same owner clock supplied to Bind.
-  /// Reconfiguration starts empty and retires old writes; owning readers keep
-  /// their previous publication storage and last sample. No lifecycle effects.
-  [[nodiscard]] core::Result<
-      std::vector<std::shared_ptr<const core::IObservedStateProvider>>>
-  ConfigureMeasuredStateSources(
+  /// Construct empty inactive sources on the bound lane's existing node.
+  /// Candidate bindings come from the qualified route owner before effects.
+  /// Construction checks physical transport reuse, not route effect authority.
+  /// Never replaces or retires predecessor sources on a shared handle.
+  /// Successful null means subscription construction is operationally
+  /// unavailable; the actual exception is logged. Invalid association is Err.
+  [[nodiscard]] core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
+  StageMeasuredStateSources(
       std::vector<core::MeasuredStateSourceDescriptor> descriptors,
-      std::string joint_state_topic, core::IClock &receiver_clock);
+      std::shared_ptr<core::IClock> receiver_clock,
+      const core::RuntimeParticipantBinding &candidate_motion,
+      const std::optional<core::RuntimeParticipantBinding> &candidate_gripper);
 
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);
@@ -187,9 +242,13 @@ public:
   /// reports an exit reason, the arm and gripper domains report a `fault`
   /// (the component is failed and motion admission closes); nothing restarts
   /// it here. Only before `StartBackend` (it may precede `Bind`); at most
-  /// once.
+  /// once. The optional health source reads the same exact owner cache without
+  /// advancement; when absent, health is unavailable rather than calling the
+  /// lifecycle advancement source.
   void InstallControllerProcessFaultSource(
-      std::function<std::optional<std::string>()> source);
+      std::function<std::optional<std::string>()> source,
+      std::function<core::Result<std::optional<std::string>>()> health_source =
+          {});
   /// Cache the already captured diagnostic of this exact process occurrence.
   /// The host checks its installed handle/process under the existing fence;
   /// construction/encoding occurs outside all observation/control locks.
@@ -274,6 +333,12 @@ public:
   ReadLifecycleSnapshot(const core::ControlDomainId &control_domain_id,
                         core::TimePoint now_ns);
 
+  /// Pure projection of the same continuously maintained health inputs.
+  /// No lifecycle generation/signature/intervention/discovery commit.
+  [[nodiscard]] core::Result<core::LifecycleDomainHealthDTO>
+  ReadLifecycleHealth(const core::ControlDomainId &control_domain_id,
+                      core::TimePoint now_ns) const;
+
   [[nodiscard]] RetainedRos2ControlArmActivity arm_activity() const;
 
   /// Read-only transport diagnostics for the exactly bound gripper target.
@@ -290,13 +355,30 @@ public:
   controller_statistics() const;
 
 private:
+  friend class RetainedRos2ControlRuntimeHandleTestAccess;
   struct ArmState;
-  struct MeasuredStateChannels;
+  struct LifecycleHealthInputs;
+  struct LifecycleClassification;
   class ArmPort;
+
+  [[nodiscard]] core::Result<LifecycleHealthInputs>
+  CaptureLifecycleHealthInputs(const core::ControlDomainId &domain,
+                               core::TimePoint now_ns) const;
+  static void ReadLifecycleMonitorFacts(LifecycleHealthInputs &inputs);
+  [[nodiscard]] static LifecycleClassification
+  ComputeLifecycleHealth(const LifecycleHealthInputs &inputs);
+  [[nodiscard]] core::Result<RetainedExternallyManagedDomainSnapshot>
+  CommitLifecycleObservation(const core::ControlDomainId &domain,
+                             LifecycleHealthInputs inputs,
+                             LifecycleClassification classification);
 
   void ObserveActivity(
       RetainedRos2ControlArmActivity activity,
       std::optional<RetainedRos2ControlArmActivity> gripper_activity = {});
+  /// Graph refresh stays on the existing NRT Observe/observer path; health
+  /// only consumes the maintained endpoint facts.
+  void RefreshEndpointFacts();
+  [[nodiscard]] std::optional<core::ErrorDTO> ReadEndpointDiagnostic() const;
   [[nodiscard]] RetainedRos2ControlSwitchResult PrepareGripperController();
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SwitchGripperController(bool activate, std::stop_token cancellation);
@@ -318,9 +400,10 @@ private:
   mutable std::mutex mutex_;
   /// Serializes CCLC switch primitives (one controller switch at a time).
   std::mutex switch_mutex_;
+  // Declared before dependent resources: destroyed after their teardown.
+  std::shared_ptr<core::IClock> clock_owner_;
   std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources_;
   core::IClock *clock_{};
-  std::shared_ptr<MeasuredStateChannels> measured_state_channels_;
   std::optional<RetainedRos2ControlArmTransport> arm_transport_;
   std::shared_ptr<ArmState> arm_;
   std::shared_ptr<core::ExecutionPortParticipant> participant_;
@@ -329,6 +412,8 @@ private:
   std::optional<core::RuntimeParticipantBinding> gripper_binding_;
   std::optional<RetainedRos2ControlArmGuardHooks> guard_hooks_;
   std::function<std::optional<std::string>()> process_fault_source_;
+  std::function<core::Result<std::optional<std::string>>()>
+      process_health_source_;
   std::string process_diagnostic_incident_id_;
   std::shared_ptr<const content_identity::CanonicalValue>
       process_diagnostic_snapshot_;

@@ -1073,8 +1073,7 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     workspace = response.json()
     assert applied is not None
     publication = {
-        "scenario_id": "cell_a",
-        "source_document_digest": _DIGEST,
+        "origin": {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": _DIGEST},
         "deployment_revision": applied_revision,
         "retained_bundle_id": _DIGEST,
         "graph_revision": _DIGEST,
@@ -1095,6 +1094,10 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         publication,
     )
     state._retain_submitted_deployment(captured)
+    # CurrentScenario is an authored Scenario projection, not a prepared receipt.
+    origin = publication.pop("origin")
+    publication.update(scenario_id=origin["scenario_id"],
+                       source_document_digest=origin["source_document_digest"])
     state.published_scenario = lambda: {  # type: ignore[method-assign]
         "ready": True,
         "published_scenario": publication,
@@ -1542,9 +1545,10 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         prepare_only=False,
     ):
         prepared_activation = {
-            "schema_version": "manyforge.prepared_activation_input.v5",
+            "schema_version": "manyforge.prepared_activation_input.v6",
             "prepared_activation_id": "sha256:" + "9" * 64,
-            "source_document_digest": intent["source_document_digest"],
+            "origin": {"kind": "scenario", "scenario_id": intent["scenario_id"],
+                       "source_document_digest": intent["source_document_digest"]},
             "captured_input_digest": intent["captured_input_digest"],
             "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
             "deployment_revision": candidate_revision,
@@ -1720,7 +1724,17 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         "scenario_id": "lite6_pick_and_place",
     }
     monkeypatch.setattr(
-        state, "published_scenario", lambda: {"published_scenario": {"ready": True}}
+        state, "published_scenario", lambda: {"published_scenario": {
+            "scenario_id": applied_context["scenario_id"],
+            "source_document_digest": applied_context["source_document_digest"],
+            "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
+            "deployment_revision": edited["draft"]["deploymentRevision"],
+            "retained_bundle_id": applied.json()["result"]["prepared_activation"]["retained_bundle_id"],
+            "graph_revision": applied.json()["result"]["prepared_activation"]["graph_revision"],
+            "program_id": program["program_id"],
+            "program_revision": program["program_revision"],
+            "program_outcome": deepcopy(applied.json()["result"]["prepared_activation"]["program_outcome"]),
+        }}
     )
     monkeypatch.setattr(
         state, "applied_activation_for_publication", lambda _p: deepcopy(applied_context)
@@ -1756,10 +1770,10 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v5",
-        "scenario_id": "scenario-a",
+        "schema_version": "manyforge.prepared_activation_input.v6",
+        "origin": {"kind": "scenario", "scenario_id": "scenario-a",
+                   "source_document_digest": "sha256:" + "7" * 64},
         "prepared_activation_id": "sha256:" + "6" * 64,
-        "source_document_digest": "sha256:" + "7" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
         "deployment_artifact_id": "cell-a",
         "deployment_revision": "sha256:" + "9" * 64,
@@ -1794,8 +1808,8 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
             "deployment": {"api_version": "manyforge.deployment_intent.v2"},
             "model_source_closure": {},
             "program_role_assignment": {},
-            "source_document_digest": prepared_activation["source_document_digest"],
-            "scenario_id": prepared_activation["scenario_id"],
+            "source_document_digest": prepared_activation["origin"]["source_document_digest"],
+            "scenario_id": prepared_activation["origin"]["scenario_id"],
         },
         parent_claim,
         apply=True,
@@ -1823,6 +1837,9 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     )
 
     assert result["status"] == "accepted"
+    assert manager_requests[0]["prepared_activation"] == prepared_activation
+    assert "scenario_id" not in manager_requests[0]["prepared_activation"]
+    assert "source_document_digest" not in manager_requests[0]["prepared_activation"]
     assert manager_requests[0]["prepared_activation"]["program_outcome"] == (
         prepared_activation["program_outcome"]
     )
@@ -2214,7 +2231,6 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
-            "expected_admission_generation": 1,
         },
     )
     assert response.status_code == 409
@@ -2267,7 +2283,6 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
-            "expected_admission_generation": 1,
         },
     )
     assert response.status_code == 200
@@ -2300,7 +2315,6 @@ def test_run_rejects_unapplied_program_draft_before_transport() -> None:
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
-            "expected_admission_generation": 1,
         },
     )
     assert response.status_code == 409
@@ -2492,9 +2506,9 @@ def _configuration_preparation(tmp_path: Path):
     digest = "sha256:" + "a" * 64
     current = {"retained_bundle_id": "bundle.current", "graph_revision": "graph.current"}
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v5",
-        "prepared_activation_id": digest, "scenario_id": "cell",
-        "source_document_digest": digest, "captured_input_digest": digest,
+        "schema_version": "manyforge.prepared_activation_input.v6",
+        "prepared_activation_id": digest, "origin": {"kind": "scenario", "scenario_id": "cell",
+        "source_document_digest": digest}, "captured_input_digest": digest,
         "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
         "retained_bundle_id": "bundle.next", "graph_revision": "graph.next",
         "program_id": None, "program_revision": None,
@@ -2586,3 +2600,17 @@ def test_activation_order_comes_from_exact_applied_capture_not_draft(monkeypatch
         "retainedBundleId": "bundle", "graphRevision": _DIGEST, "componentIds": ["z", "a"]}
     monkeypatch.setattr(state, "applied_deployment_for_publication", lambda _current: None)
     assert _workspace(state)["managerApplied"]["activationOrder"] is None
+
+
+@pytest.mark.parametrize("origin", [
+    {"kind": "sealed_canonical_empty", "cell_id": "cell_a"},
+    {"kind": "scenario", "scenario_id": "foreign", "source_document_digest": _DIGEST},
+    {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": "sha256:" + "f" * 64},
+    None,
+])
+def test_captured_authoring_context_requires_checked_scenario_origin(origin) -> None:
+    state = ComposerState()
+    with pytest.raises(AuthoringOperationError) as error:
+        state._captured_deployment_context({"deployment": {"name": "current"},
+            "scenario_id": "cell_a", "source_document_digest": _DIGEST}, {"origin": origin})
+    assert error.value.code == "activation_authoring_capture_mismatch"

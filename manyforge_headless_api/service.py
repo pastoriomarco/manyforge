@@ -25,6 +25,7 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ActivationPreparationRequest,
+    CanonicalEmptyActivationPreparationRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ManagerDeploymentCandidatePreviewRequest,
@@ -70,6 +71,7 @@ from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
     validate_committed_scenario_activation,
+    validate_prepared_activation_origin,
 )
 
 
@@ -279,6 +281,8 @@ class HeadlessService:
         self.kernel_attention_source: Callable[[], dict[str, Any] | None] | None = None
         # Admission bound only: exact node attempts whose advisory native
         # preview is in flight (see program_node_correction_preview).
+        self._apply_scene_completion_lock = Lock()
+        self._apply_scene_attempted: tuple[str, int, str] | None = None
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
         # Each Apply Headless forwards is followed to its committed outcome,
@@ -754,6 +758,9 @@ class HeadlessService:
             "source_content_digest": section.get("source_content_digest"),
         }
 
+    def canonical_empty_selection(self) -> dict[str, Any]:
+        return self.manager.canonical_empty_selection()
+
     def manager_status(self) -> dict[str, Any]:
         runtime, section = self._source_section("manager")
         payload = section["payload"]
@@ -1154,6 +1161,10 @@ class HeadlessService:
                 "native core returned an unsupported Applied Program status",
             )
         executable = projection.get("executable")
+        try:
+            origin = validate_prepared_activation_origin(projection.get("origin"))
+        except ProgramBindingTransportError as error:
+            raise HeadlessApiError("program_applied_selection_invalid", "native core returned an invalid Applied origin") from error
         expected_fields = {
             "deployment_artifact_id",
             "deployment_revision",
@@ -1167,9 +1178,8 @@ class HeadlessService:
             "program_revision",
             "record_digest",
             "retained_bundle_id",
-            "scenario_id",
+            "origin",
             "schema_version",
-            "source_document_digest",
         }
         if (
             set(projection) != expected_fields
@@ -1196,6 +1206,12 @@ class HeadlessService:
             )
             or not isinstance(projection.get("deployment_revision"), str)
             or not _sha256_identity(projection["deployment_revision"])
+            or (origin["kind"] == "sealed_canonical_empty" and (
+                projection.get("program_id") is not None or executable
+                or any(origin[field] != projection.get(field) for field in (
+                    "deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision",
+                ))
+            ))
         ):
             raise HeadlessApiError(
                 "program_applied_selection_invalid",
@@ -1220,12 +1236,10 @@ class HeadlessService:
             ) from error
 
     def notify_committed_apply(self) -> None:
-        """Wake the Program runner after a committed Apply was observed: by
-        the follower of each forwarded Apply, or by an Apply-status read.
+        """Reconcile values and place the Program Scene after committed Apply.
 
-        The runner reads the committed activation itself, so a duplicate, late
-        or lost wake changes nothing it would not otherwise do; a failure is
-        logged and never touches the Apply.
+        Repeated status reads do not repeat placement or retry a failed
+        placement. The existing idle Reset is the explicit retry path.
         """
 
         if self.program_runner is None:
@@ -1236,6 +1250,40 @@ class HeadlessService:
             logging.getLogger(__name__).warning(
                 "Program runner did not reconcile persistent values after a "
                 "committed Apply: %s: %s",
+                error.code,
+                error,
+            )
+        try:
+            committed = self.committed_scenario_activation()
+            applied = self.program_applied_status()
+            if (
+                applied["origin"]["kind"] != "scenario"
+                or applied["program_id"] is None
+                or applied["record_digest"] != committed["record_digest"]
+            ):
+                return
+            identity = (
+                committed["apply_id"], committed["apply_generation"],
+                committed["record_digest"],
+            )
+            with self._apply_scene_completion_lock:
+                if self._apply_scene_attempted == identity:
+                    return
+                self._apply_scene_attempted = identity
+            cycle = self.program_cycle_status()
+            admission = self.authoring_admission()
+            # The existing preparation path rechecks the current selection
+            # and admission before the Runner performs any Scene effect.
+            self.program_scene_prepare(ProgramScenePreparationRequest(
+                request_id="apply-scene." + identity[2][7:],
+                request_owner_epoch=cycle["program_runner_owner_epoch"],
+                source_label="headless_apply_completion",
+                expected_applied_record_digest=identity[2],
+                expected_admission_generation=admission["admission_generation"],
+            ))
+        except (HeadlessApiError, ProgramRunnerClientError) as error:
+            logging.getLogger(__name__).warning(
+                "Program scene preparation after committed Apply failed: %s: %s",
                 error.code,
                 error,
             )
@@ -2007,6 +2055,15 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
+    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
+        return self.manager.component_process_stop_offer(component_id)
+
+    def stop_component_process(self, request: Any) -> dict[str, Any]:
+        return self.manager.stop_component_process(request)
+
+    def component_process_stop_result(self, request: Any) -> dict[str, Any]:
+        return self.manager.component_process_stop_result(request)
+
     def component_lifecycle_submit(self, request: Any) -> dict[str, Any]:
         if self.cclc is None:
             raise HeadlessApiError(
@@ -2402,7 +2459,7 @@ class HeadlessService:
         return self.manager.preview_deployment_candidate(request)
 
     def prepare_activation(
-        self, request: ActivationPreparationRequest
+        self, request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest
     ) -> dict[str, Any]:
         if self.activation_preparer is None:
             raise HeadlessApiError(
@@ -2422,6 +2479,33 @@ class HeadlessService:
                 "stale_generation",
                 "Activation preparation requires the current idle admission",
             )
+        if isinstance(request, CanonicalEmptyActivationPreparationRequest):
+            selection = self.manager.canonical_empty_selection()
+            origin = request.origin.model_dump(mode="json")
+            selected_origin = {
+                "kind": "sealed_canonical_empty", "cell_id": selection["cell_id"],
+                "deployment_artifact_id": selection["deployment_artifact_id"],
+                "deployment_revision": selection["deployment_revision"],
+                "retained_bundle_id": selection["candidate_retained_bundle_id"],
+                "graph_revision": selection["candidate_graph_revision"],
+                "admission_digest": selection["admission_digest"],
+            }
+            if selection["request_owner_epoch"] != request.request_owner_epoch or selected_origin != origin:
+                raise HeadlessApiError("stale_generation", "Canonical-empty selection changed before preparation")
+            receipt = self.activation_preparer.prepare_canonical_empty(selection)
+            try:
+                after = self.manager.canonical_empty_selection()
+                current_admission = self._cell_admission().get()
+                if (after != selection or current_admission.get("authoring_allowed") is not True
+                        or current_admission.get("admission_generation") != request.expected_admission_generation):
+                    raise HeadlessApiError("stale_generation", "Canonical-empty selection or admission changed during preparation")
+            except CellAdmissionError as error:
+                self.activation_preparer.release(receipt["prepared_activation_id"])
+                raise self._admission_error(error) from error
+            except Exception:
+                self.activation_preparer.release(receipt["prepared_activation_id"])
+                raise
+            return {"prepared_activation": receipt}
         return {
             "prepared_activation": self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,

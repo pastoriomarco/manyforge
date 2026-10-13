@@ -299,6 +299,62 @@ def _require_canonical_empty_configuration(
             )
 
 
+def _check_sealed_preparation(args: argparse.Namespace, package: Path, output: Path) -> None:
+    # This is the actual package produced and reloaded by the preceding worker.
+    admission_paths = list(package.glob("canonical-empty-admission.*.json"))
+    assert len(admission_paths) == 1
+    admission_path = admission_paths[0]
+    admission = json.loads(admission_path.read_bytes())
+    origin = {"kind": "sealed_canonical_empty", **{name: admission[name] for name in (
+        "cell_id", "deployment_artifact_id", "deployment_revision",
+        "retained_bundle_id", "graph_revision", "admission_digest")}}
+    capture = raw_sha256_digest(canonical_json_bytes({
+        "schema_version": "manyforge.sealed_canonical_empty_capture.v1", "origin": origin}))
+    request = {"schema_version": "manyforge.sealed_canonical_empty_preparation_request.v1",
+               "runtime_cell_id": admission["cell_id"], "origin": origin,
+               "captured_input_digest": capture}
+    output.mkdir()
+    path = output / "request.json"
+    path.write_bytes(canonical_json_bytes(request))
+    command = [str(args.tool), "--input", str(path), "--capability-root", str(args.workspace),
+               "--activation-root", str(output)]
+    missing = subprocess.run(command, capture_output=True, text=True)
+    assert missing.returncode != 0 and "admission is unavailable" in missing.stderr
+    command += ["--canonical-empty-package-root", str(package),
+                "--canonical-empty-admission-filename", admission_path.name]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert len(receipt) == 13 and receipt["schema_version"] == "manyforge.prepared_activation_input.v6"
+    assert receipt["origin"] == origin and receipt["captured_input_digest"] == capture
+    assert "scenario_id" not in receipt and "source_document_digest" not in receipt
+    prepared = _stored_product(output, receipt)
+    payload = prepared["activation_payload"]
+    assert receipt["program_outcome"] == {"kind": "no_program"}
+    assert receipt["program_id"] is None and receipt["program_revision"] is None
+    assert payload["program"] is None and payload["program_binding"] is None
+    assert payload["program_role_assignment"] == {"component_roles": [], "target_roles": []}
+    bundle_path = package / "retained-bundles" / "sha256" / (admission["retained_bundle_id"].removeprefix("sha256:") + ".json")
+    assert payload["retained_bundle"] == json.loads(bundle_path.read_bytes())
+    assert not payload["retained_bundle"]["cell_graph"]["controllable_components"]
+    assert _native_host_products(prepared)
+    replay = subprocess.run(command, capture_output=True, text=True)
+    assert replay.returncode == 0 and json.loads(replay.stdout) == receipt, replay.stderr
+    # A rederived capture cannot turn a foreign admission selection into proof.
+    forged = copy.deepcopy(request)
+    forged["origin"]["admission_digest"] = "sha256:" + "f" * 64
+    forged["captured_input_digest"] = raw_sha256_digest(canonical_json_bytes({
+        "schema_version": "manyforge.sealed_canonical_empty_capture.v1", "origin": forged["origin"]}))
+    path.write_bytes(canonical_json_bytes(forged))
+    rejected = subprocess.run(command, capture_output=True, text=True)
+    assert rejected.returncode != 0 and "differs from actual admission" in rejected.stderr
+    mixed = copy.deepcopy(request)
+    mixed["origin"]["scenario_id"] = None
+    path.write_bytes(canonical_json_bytes(mixed))
+    rejected = subprocess.run(command, capture_output=True, text=True)
+    assert rejected.returncode != 0 and "unexpected field scenario_id" in rejected.stderr
+
+
 def _run(
     args: argparse.Namespace,
     request: dict[str, object],
@@ -336,12 +392,12 @@ def _run(
         raise AssertionError("preparer exceeded the compact receipt bound")
     receipt = json.loads(result.stdout)
     value = _stored_product(activation_root, receipt)
-    if value["source_document_digest"] != request["source_document_digest"]:
+    if value["origin"]["source_document_digest"] != request["source_document_digest"]:
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v5":
-        raise AssertionError("preparer did not return the v5 prepared activation")
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v6":
+        raise AssertionError("preparer did not return the v6 prepared activation")
     program_outcome = value.get("program_outcome")
     if (
         not isinstance(program_outcome, dict)
@@ -858,6 +914,7 @@ def _check_ros_preparation(
     # the populated candidate and its fence-host product remain exact.
     published = _run(args, request, root / "ros-published", publish_canonical_empty=True)
     assert published is not None
+    _check_sealed_preparation(args, root / "ros-published" / "activation", root / "ros-sealed")
     assert published["activation_payload"]["retained_bundle"] == bundle
     assert _run(args, request, root / "ros-published", publish_canonical_empty=True,
                 reuse_root=True) == published
@@ -1476,6 +1533,7 @@ def main() -> int:
             publish_canonical_empty=True,
         )
         assert prepared is not None
+        _check_sealed_preparation(args, temporary / "valid" / "activation", temporary / "sealed")
         if args.runtime_identity:
             replay = _run(args, request, temporary / "exact-replay",
                           publish_canonical_empty=True)
@@ -1489,7 +1547,7 @@ def main() -> int:
             other = _run(args, other_runtime, temporary / "other-runtime")
             assert other is not None
             assert other["captured_input_digest"] == prepared["captured_input_digest"]
-            assert other["source_document_digest"] == prepared["source_document_digest"]
+            assert other["origin"]["source_document_digest"] == prepared["origin"]["source_document_digest"]
             for field in ("prepared_activation_id", "retained_bundle_id", "graph_revision"):
                 assert other[field] != prepared[field], field
             forbidden = copy.deepcopy(request)

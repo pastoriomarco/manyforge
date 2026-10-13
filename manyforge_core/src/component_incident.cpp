@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/component_incident.hpp>
 #include <string>
 #include <utility>
@@ -297,6 +298,379 @@ std::string CellObserverIncidentEventPayload(const CellObserverIncidentRecordDTO
   return EncodeCellObserverIncidentRecord(record);
 }
 
+namespace {
+
+void ObserverExact(const CanonicalValue& value, std::initializer_list<std::string_view> keys) {
+  if (!value.is_object() || value.as_object().size() != keys.size() ||
+      !std::all_of(keys.begin(), keys.end(),
+                   [&](auto key) { return value.find_object_member(key); }))
+    throw std::invalid_argument("observer bring-up fields differ");
+}
+const CanonicalValue& ObserverField(const CanonicalValue& value, std::string_view key) {
+  const auto* result = value.find_object_member(key);
+  if (!result) throw std::invalid_argument("observer bring-up field is missing");
+  return *result;
+}
+std::string ObserverText(const CanonicalValue& value, std::string_view key) {
+  const auto& field = ObserverField(value, key);
+  if (!field.is_string()) throw std::invalid_argument("observer bring-up text is invalid");
+  return field.as_string();
+}
+std::optional<std::string> ObserverOptionalText(const CanonicalValue& value) {
+  if (value.is_null()) return std::nullopt;
+  if (!value.is_string()) throw std::invalid_argument("observer bring-up optional text is invalid");
+  return value.as_string();
+}
+std::uint64_t ObserverUnsigned(const CanonicalValue& value) {
+  if (value.is_number()) {
+    const auto number = value.as_number();
+    if (std::isfinite(number) && number >= 0 && number <= 9007199254740991.0 &&
+        std::floor(number) == number)
+      return static_cast<std::uint64_t>(number);
+  } else if (value.is_string()) {
+    const auto& text = value.as_string();
+    std::uint64_t result{};
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+    if (!text.empty() && text.front() != '0' && parsed.ec == std::errc{} &&
+        parsed.ptr == text.data() + text.size() && result > 9007199254740991ULL)
+      return result;
+  }
+  throw std::invalid_argument("observer bring-up counter is invalid");
+}
+bool ObserverBool(const CanonicalValue& value) {
+  if (!value.is_bool()) throw std::invalid_argument("observer bring-up boolean is invalid");
+  return value.as_bool();
+}
+CanonicalValue ObserverTarget(const CellObserverIncidentTargetDTO& target) {
+  return CanonicalValue(
+      CanonicalValue::Object{{"cell_id", CanonicalValue(target.cell_id.value())},
+                             {"source_id", CanonicalValue(target.source_id)},
+                             {"source_epoch_base", CanonicalValue(target.source_epoch_base)}});
+}
+CellObserverIncidentTargetDTO ObserverTarget(const CanonicalValue& value) {
+  ObserverExact(value, {"cell_id", "source_id", "source_epoch_base"});
+  return {CellId(ObserverText(value, "cell_id")), ObserverText(value, "source_id"),
+          ObserverText(value, "source_epoch_base")};
+}
+CanonicalValue ObserverProcess(const std::optional<CellObserverBringUpProcessDTO>& process) {
+  if (!process) return CanonicalValue(nullptr);
+  return CanonicalValue(
+      CanonicalValue::Object{{"leader_pid", NonNegative(process->leader_pid)},
+                             {"launch_identity", CanonicalValue(process->launch_identity)}});
+}
+std::optional<CellObserverBringUpProcessDTO> ObserverProcess(const CanonicalValue& value) {
+  if (value.is_null()) return std::nullopt;
+  ObserverExact(value, {"leader_pid", "launch_identity"});
+  return CellObserverBringUpProcessDTO{
+      content_identity::parse_nonnegative_int64(ObserverField(value, "leader_pid")),
+      ObserverText(value, "launch_identity")};
+}
+constexpr std::string_view ObserverPhase(const CellObserverBringUpPhaseDTO phase) {
+  switch (phase) {
+    case CellObserverBringUpPhaseDTO::kAdmitted:
+      return "admitted";
+    case CellObserverBringUpPhaseDTO::kRetiring:
+      return "retiring";
+    case CellObserverBringUpPhaseDTO::kStarted:
+      return "started";
+    case CellObserverBringUpPhaseDTO::kOpenAccepted:
+      return "open_accepted";
+    case CellObserverBringUpPhaseDTO::kFailed:
+      return "failed";
+    case CellObserverBringUpPhaseDTO::kUnknown:
+      return "unknown";
+  }
+  return {};
+}
+bool ObserverBoundedText(std::string_view value) {
+  return !value.empty() && value.size() <= kMaxLifecycleIdentityBytes;
+}
+}  // namespace
+
+bool CellObserverLossAssociationDTO::locally_valid() const noexcept {
+  return !incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
+         !latest_exit_id.empty() && latest_exit_id.size() <= kMaxComponentIncidentIdBytes &&
+         latest_exit_digest.size() == 64U &&
+         std::all_of(latest_exit_digest.begin(), latest_exit_digest.end(), [](const char value) {
+           return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+         });
+}
+
+bool CellObserverBringUpIntentDTO::locally_valid() const noexcept {
+  try {
+    const auto& request = request_context;
+    if (!ObserverBoundedText(request.request_id.value()) ||
+        !ObserverBoundedText(request.request_owner_epoch.value()) || request.source_label.empty() ||
+        request.source_label.size() > kMaxLifecycleRequestLabelBytes ||
+        (request.correlation_id &&
+         (request.correlation_id->empty() ||
+          request.correlation_id->size() > kMaxLifecycleRequestLabelBytes)) ||
+        !attribution.locally_valid() ||
+        (attribution.principal_id &&
+         attribution.principal_id->size() > kMaxLifecycleRequestLabelBytes) ||
+        !projection_revision.valid() ||
+        !ObserverBoundedText(projection_revision.retained_bundle_id.value()) ||
+        !ObserverBoundedText(projection_revision.graph_revision.value()) ||
+        !publication_generation.nonzero() ||
+        !IsExactLowercaseSha256Digest(publication_digest.value()) ||
+        !ObserverBoundedText(runtime_unit_id.value()) || !ObserverBoundedText(host_epoch.value()) ||
+        manager_epoch.empty() || manager_epoch.size() > kMaxLifecycleRequestLabelBytes ||
+        scene_owner_epoch.empty() || scene_owner_epoch.size() > kMaxLifecycleRequestLabelBytes ||
+        scene_identity_json.empty() ||
+        scene_identity_json.size() > kMaxComponentIncidentRecordBytes ||
+        !predecessor.locally_valid() || !replacement.locally_valid() ||
+        predecessor.cell_id != replacement.cell_id ||
+        predecessor.source_epoch_base == replacement.source_epoch_base ||
+        retained_snapshot_path.empty() ||
+        retained_snapshot_path.size() > kMaxObserverBringUpSnapshotPathBytes ||
+        retained_snapshot_path.front() != '/' ||
+        retained_snapshot_path.find('\0') != std::string::npos ||
+        (predecessor_incident_id &&
+         (predecessor_incident_id->empty() ||
+          predecessor_incident_id->size() > kMaxComponentIncidentIdBytes)))
+      return false;
+    const auto scene = content_identity::parse_canonical_json(scene_identity_json);
+    ObserverExact(scene, {"deployment_generation", "graph_revision", "program_generation",
+                          "retained_bundle_id", "runtime_generation"});
+    if (!ObserverBoundedText(ObserverText(scene, "graph_revision")) ||
+        !ObserverBoundedText(ObserverText(scene, "retained_bundle_id")))
+      return false;
+    for (const auto key : {"deployment_generation", "program_generation", "runtime_generation"})
+      static_cast<void>(ObserverUnsigned(ObserverField(scene, key)));
+    // Scene owns the interpretation. Store only the exact canonical identity
+    // checked by that owner, never use this record as a Scene authority.
+    return content_identity::canonical_json(scene) == scene_identity_json;
+  } catch (...) {
+    return false;
+  }
+}
+bool CellObserverBringUpProcessDTO::locally_valid() const noexcept {
+  return leader_pid > 0 && !launch_identity.empty() &&
+         launch_identity.size() <= kMaximumCellAdmissionPrivateBinaryBytes;
+}
+bool CellObserverBringUpOpenDTO::locally_valid() const noexcept {
+  return !source_epoch.empty() && source_epoch.size() <= 256U && source_epoch_order != 0U &&
+         source_epoch_order <= 9007199254740991ULL && accepted_at_ns >= 0;
+}
+bool CellObserverBringUpRecordDTO::locally_valid() const noexcept {
+  if (!intent.locally_valid() || ObserverPhase(phase).empty() || admitted_at_ns < 0 ||
+      updated_at_ns < admitted_at_ns ||
+      (predecessor_process && !predecessor_process->locally_valid()) ||
+      (started_process && !started_process->locally_valid()) ||
+      (diagnostic && !ComponentIncidentDiagnosticIsValid(*diagnostic)))
+    return false;
+  if (predecessor_loss.has_value() != intent.predecessor_incident_id.has_value() ||
+      (predecessor_loss && (!predecessor_loss->locally_valid() ||
+                           predecessor_loss->incident_id != *intent.predecessor_incident_id)))
+    return false;
+  const bool started = phase == CellObserverBringUpPhaseDTO::kStarted ||
+                       phase == CellObserverBringUpPhaseDTO::kOpenAccepted;
+  if (started && (!predecessor_drained_or_absent || !started_process)) return false;
+  if (started_process && !predecessor_drained_or_absent) return false;
+  if (phase == CellObserverBringUpPhaseDTO::kRetiring && started_process) return false;
+  if (phase == CellObserverBringUpPhaseDTO::kAdmitted &&
+      (predecessor_drained_or_absent || started_process || diagnostic))
+    return false;
+  if ((phase == CellObserverBringUpPhaseDTO::kOpenAccepted) != first_open.has_value()) return false;
+  if (first_open) {
+    if (!first_open->locally_valid() || first_open->accepted_at_ns < admitted_at_ns ||
+        first_open->accepted_at_ns > updated_at_ns ||
+        !first_open->source_epoch.starts_with(intent.replacement.source_epoch_base + "."))
+      return false;
+    const auto suffix = std::string_view(first_open->source_epoch)
+                            .substr(intent.replacement.source_epoch_base.size() + 1U);
+    std::uint64_t counter{};
+    const auto parsed = std::from_chars(suffix.data(), suffix.data() + suffix.size(), counter);
+    if (suffix.empty() || suffix.front() == '0' || parsed.ec != std::errc{} ||
+        parsed.ptr != suffix.data() + suffix.size() || counter == 0U ||
+        counter > 9007199254740991ULL)
+      return false;
+  }
+  return true;
+}
+
+std::string EncodeCellObserverBringUpRecord(const CellObserverBringUpRecordDTO& record) {
+  if (!record.locally_valid()) throw std::invalid_argument("observer bring-up record is invalid");
+  const auto& intent = record.intent;
+  const auto& request = intent.request_context;
+  const auto& projection = intent.projection_revision;
+  const auto& scene = projection.scene_revision;
+  CanonicalValue first_open(nullptr);
+  CanonicalValue predecessor_loss(nullptr);
+  if (record.predecessor_loss) {
+    predecessor_loss = CanonicalValue(CanonicalValue::Object{
+        {"incident_id", CanonicalValue(record.predecessor_loss->incident_id)},
+        {"latest_exit_id", CanonicalValue(record.predecessor_loss->latest_exit_id)},
+        {"latest_exit_digest", CanonicalValue(record.predecessor_loss->latest_exit_digest)}});
+  }
+  if (record.first_open) {
+    first_open = CanonicalValue(CanonicalValue::Object{
+        {"source_epoch", CanonicalValue(record.first_open->source_epoch)},
+        {"source_epoch_order", Unsigned(record.first_open->source_epoch_order)},
+        {"accepted_at_ns", NonNegative(record.first_open->accepted_at_ns)}});
+  }
+  const auto bytes = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"intent",
+       CanonicalValue(CanonicalValue::Object{
+           {"request_context",
+            CanonicalValue(CanonicalValue::Object{
+                {"request_id", CanonicalValue(request.request_id.value())},
+                {"request_owner_epoch", CanonicalValue(request.request_owner_epoch.value())},
+                {"source_label", CanonicalValue(request.source_label)},
+                {"correlation_id", OptionalText(request.correlation_id)}})},
+           {"attribution",
+            CanonicalValue(CanonicalValue::Object{
+                {"transport", CanonicalValue(static_cast<double>(intent.attribution.transport))},
+                {"assurance", CanonicalValue(static_cast<double>(intent.attribution.assurance))},
+                {"principal_id", OptionalText(intent.attribution.principal_id)}})},
+           {"projection_revision",
+            CanonicalValue(CanonicalValue::Object{
+                {"retained_bundle_id", CanonicalValue(projection.retained_bundle_id.value())},
+                {"graph_revision", CanonicalValue(projection.graph_revision.value())},
+                {"scene_id", CanonicalValue(scene.scene_id.value())},
+                {"scene_revision", Unsigned(scene.revision_id)},
+                {"scene_content_hash", CanonicalValue(scene.content_hash.value())}})},
+           {"publication_generation", Unsigned(intent.publication_generation.value())},
+           {"publication_digest", CanonicalValue(intent.publication_digest.value())},
+           {"runtime_unit_id", CanonicalValue(intent.runtime_unit_id.value())},
+           {"host_epoch", CanonicalValue(intent.host_epoch.value())},
+           {"manager_epoch", CanonicalValue(intent.manager_epoch)},
+           {"scene_owner_epoch", CanonicalValue(intent.scene_owner_epoch)},
+           {"scene_identity", content_identity::parse_canonical_json(intent.scene_identity_json)},
+           {"predecessor", ObserverTarget(intent.predecessor)},
+           {"replacement", ObserverTarget(intent.replacement)},
+           {"retained_snapshot_path", CanonicalValue(intent.retained_snapshot_path)},
+           {"predecessor_incident_id", OptionalText(intent.predecessor_incident_id)}})},
+      {"phase", CanonicalValue(std::string(ObserverPhase(record.phase)))},
+      {"admitted_at_ns", NonNegative(record.admitted_at_ns)},
+      {"updated_at_ns", NonNegative(record.updated_at_ns)},
+      {"predecessor_process", ObserverProcess(record.predecessor_process)},
+      {"predecessor_loss", std::move(predecessor_loss)},
+      {"predecessor_drained_or_absent", CanonicalValue(record.predecessor_drained_or_absent)},
+      {"started_process", ObserverProcess(record.started_process)},
+      {"first_open", std::move(first_open)},
+      {"diagnostic",
+       record.diagnostic ? DiagnosticValue(*record.diagnostic) : CanonicalValue(nullptr)}}));
+  if (bytes.size() > kMaxComponentIncidentRecordBytes)
+    throw std::length_error("observer_bring_up_record_too_large");
+  return bytes;
+}
+
+CellObserverBringUpRecordDTO DecodeCellObserverBringUpRecord(std::string_view bytes) {
+  auto limits = content_identity::CanonicalJsonParseLimits{};
+  limits.maximum_bytes = kMaxComponentIncidentRecordBytes;
+  const auto root = content_identity::parse_canonical_json(bytes, limits);
+  ObserverExact(root,
+                {"intent", "phase", "admitted_at_ns", "updated_at_ns", "predecessor_process",
+                 "predecessor_loss", "predecessor_drained_or_absent", "started_process",
+                 "first_open", "diagnostic"});
+  const auto& intent = ObserverField(root, "intent");
+  ObserverExact(intent,
+                {"request_context", "attribution", "projection_revision", "publication_generation",
+                 "publication_digest", "runtime_unit_id", "host_epoch", "manager_epoch",
+                 "scene_owner_epoch", "scene_identity", "predecessor", "replacement",
+                 "retained_snapshot_path", "predecessor_incident_id"});
+  const auto& request = ObserverField(intent, "request_context");
+  ObserverExact(request, {"request_id", "request_owner_epoch", "source_label", "correlation_id"});
+  const auto& attribution = ObserverField(intent, "attribution");
+  ObserverExact(attribution, {"transport", "assurance", "principal_id"});
+  const auto enum_value = [](const CanonicalValue& value, int maximum) {
+    if (!value.is_number() || !std::isfinite(value.as_number()) || value.as_number() < 0 ||
+        value.as_number() > maximum || std::floor(value.as_number()) != value.as_number())
+      throw std::invalid_argument("observer attribution enum is invalid");
+    return static_cast<int>(value.as_number());
+  };
+  const auto& projection = ObserverField(intent, "projection_revision");
+  ObserverExact(projection, {"retained_bundle_id", "graph_revision", "scene_id", "scene_revision",
+                             "scene_content_hash"});
+  CellObserverBringUpRecordDTO result{
+      {{RequestId(ObserverText(request, "request_id")),
+        RequestOwnerEpoch(ObserverText(request, "request_owner_epoch")),
+        ObserverText(request, "source_label"),
+        ObserverOptionalText(ObserverField(request, "correlation_id"))},
+       {static_cast<RequestTransportDTO>(enum_value(ObserverField(attribution, "transport"), 2)),
+        static_cast<RequestAssuranceDTO>(enum_value(ObserverField(attribution, "assurance"), 1)),
+        ObserverOptionalText(ObserverField(attribution, "principal_id"))},
+       {RetainedBundleId(ObserverText(projection, "retained_bundle_id")),
+        GraphRevision(ObserverText(projection, "graph_revision")),
+        {SceneId(ObserverText(projection, "scene_id")),
+         ObserverUnsigned(ObserverField(projection, "scene_revision")),
+         ContentDigest(ObserverText(projection, "scene_content_hash"))}},
+       ActiveBundlePublicationGeneration(
+           ObserverUnsigned(ObserverField(intent, "publication_generation"))),
+       ContentDigest(ObserverText(intent, "publication_digest")),
+       RuntimeUnitId(ObserverText(intent, "runtime_unit_id")),
+       RuntimeEpoch(ObserverText(intent, "host_epoch")),
+       ObserverText(intent, "manager_epoch"),
+       ObserverText(intent, "scene_owner_epoch"),
+       content_identity::canonical_json(ObserverField(intent, "scene_identity")),
+       ObserverTarget(ObserverField(intent, "predecessor")),
+       ObserverTarget(ObserverField(intent, "replacement")),
+       ObserverText(intent, "retained_snapshot_path"),
+       ObserverOptionalText(ObserverField(intent, "predecessor_incident_id"))},
+      CellObserverBringUpPhaseDTO::kAdmitted,
+      0,
+      0,
+      std::nullopt,
+      false,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  const auto phase = ObserverText(root, "phase");
+  bool found = false;
+  for (const auto value :
+       {CellObserverBringUpPhaseDTO::kAdmitted, CellObserverBringUpPhaseDTO::kRetiring,
+        CellObserverBringUpPhaseDTO::kStarted, CellObserverBringUpPhaseDTO::kOpenAccepted,
+        CellObserverBringUpPhaseDTO::kFailed, CellObserverBringUpPhaseDTO::kUnknown}) {
+    if (ObserverPhase(value) == phase) {
+      result.phase = value;
+      found = true;
+      break;
+    }
+  }
+  if (!found) throw std::invalid_argument("observer bring-up phase is invalid");
+  result.admitted_at_ns =
+      content_identity::parse_nonnegative_int64(ObserverField(root, "admitted_at_ns"));
+  result.updated_at_ns =
+      content_identity::parse_nonnegative_int64(ObserverField(root, "updated_at_ns"));
+  result.predecessor_process = ObserverProcess(ObserverField(root, "predecessor_process"));
+  const auto& predecessor_loss = ObserverField(root, "predecessor_loss");
+  if (!predecessor_loss.is_null()) {
+    ObserverExact(predecessor_loss, {"incident_id", "latest_exit_id", "latest_exit_digest"});
+    result.predecessor_loss = CellObserverLossAssociationDTO{
+        ObserverText(predecessor_loss, "incident_id"),
+        ObserverText(predecessor_loss, "latest_exit_id"),
+        ObserverText(predecessor_loss, "latest_exit_digest")};
+  }
+  result.predecessor_drained_or_absent =
+      ObserverBool(ObserverField(root, "predecessor_drained_or_absent"));
+  result.started_process = ObserverProcess(ObserverField(root, "started_process"));
+  const auto& open = ObserverField(root, "first_open");
+  if (!open.is_null()) {
+    ObserverExact(open, {"source_epoch", "source_epoch_order", "accepted_at_ns"});
+    result.first_open = CellObserverBringUpOpenDTO{
+        ObserverText(open, "source_epoch"),
+        ObserverUnsigned(ObserverField(open, "source_epoch_order")),
+        content_identity::parse_nonnegative_int64(ObserverField(open, "accepted_at_ns"))};
+  }
+  const auto& diagnostic = ObserverField(root, "diagnostic");
+  if (!diagnostic.is_null()) {
+    ObserverExact(diagnostic, {"code", "message", "details"});
+    ErrorDTO error{ObserverText(diagnostic, "code"), ObserverText(diagnostic, "message"), {}};
+    const auto& details = ObserverField(diagnostic, "details");
+    if (!details.is_object())
+      throw std::invalid_argument("observer diagnostic details are invalid");
+    for (const auto& [key, value] : details.as_object()) {
+      if (!value.is_string() || !error.details.emplace(key, value.as_string()).second)
+        throw std::invalid_argument("observer diagnostic detail is invalid");
+    }
+    result.diagnostic = std::move(error);
+  }
+  if (!result.locally_valid() || EncodeCellObserverBringUpRecord(result) != bytes)
+    throw std::invalid_argument("observer bring-up record is invalid or noncanonical");
+  return result;
+}
+
 std::vector<LifecycleIncidentRecoveryPolicyDTO> DefaultLifecycleIncidentRecoveryPolicy() {
   using Cause = LifecycleBlockingCauseClassDTO;
   // Addendum 2 item 6: every class requires the operator's acknowledgement;
@@ -540,7 +914,8 @@ bool ComponentIncidentDiagnosticSnapshotShapeIsValid(const CanonicalValue& snaps
                          "bundle_id", "graph_revision", "generator_identity", "launch_identity"}))
       return false;
     for (const auto& [key, value] : context.as_object())
-      if (!text(value, key == "request_context" || key == "generator_identity" ? 1024U : 128U))
+      if (!text(value, key == "launch_identity" ? kMaximumCellAdmissionPrivateBinaryBytes
+                       : key == "request_context" || key == "generator_identity" ? 1024U : 128U))
         return false;
     const auto& readiness = *snapshot.find_object_member("readiness");
     if (!exact(readiness,
@@ -698,10 +1073,9 @@ std::optional<ComponentIncidentContainmentReceiptDTO> ComponentIncidentContainme
 }
 
 std::string ComponentIncidentAcknowledgedPayload(
-    const std::string_view record_json, const ComponentLifecycleIncidentDTO& acknowledged) {
-  return Patched(
-      record_json,
-      {{"acknowledged", CanonicalValue(true)},
+    const std::string_view record_json, const ComponentLifecycleIncidentDTO& acknowledged,
+    const std::optional<ComponentIncidentClosureReasonDTO> closure_reason) {
+  CanonicalValue::Object updates{{"acknowledged", CanonicalValue(true)},
        {"acknowledged_at_ns", acknowledged.acknowledged_at_ns
                                   ? NonNegative(*acknowledged.acknowledged_at_ns)
                                   : CanonicalValue(nullptr)},
@@ -710,7 +1084,13 @@ std::string ComponentIncidentAcknowledgedPayload(
         acknowledged.acknowledgement_request_id
             ? CanonicalValue(acknowledged.acknowledgement_request_id->value())
             : CanonicalValue(nullptr)},
-       {"event_kind", CanonicalValue(std::string(kComponentIncidentAcknowledgedEventKind))}});
+       {"event_kind", CanonicalValue(std::string(kComponentIncidentAcknowledgedEventKind))}};
+  if (closure_reason) {
+    if (*closure_reason != ComponentIncidentClosureReasonDTO::kCellClosedByOperator)
+      throw std::invalid_argument("incident closure reason is invalid");
+    updates.emplace_back("closure_reason", CanonicalValue("cell_closed_by_operator"));
+  }
+  return Patched(record_json, std::move(updates));
 }
 
 }  // namespace manyforge::core

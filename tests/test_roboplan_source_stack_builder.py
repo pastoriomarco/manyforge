@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts/ci/build-roboplan-source-stack.sh"
 _CLOSURE_SCRIPT = _REPO_ROOT / "scripts/ci/build-roboplan-source-closure.sh"
 _VERIFIER_SCRIPT = _REPO_ROOT / "scripts/ci/verify-external-source-closure.py"
-_DOCKERFILES = (_REPO_ROOT / "Dockerfile", _REPO_ROOT / "Dockerfile.ros-jazzy-full")
+_DOCKERFILES = (_REPO_ROOT / "Dockerfile", _REPO_ROOT / "Dockerfile.ros-lyrical-full")
 _PROJECTS = (
     "roboplan_common",
     "roboplan_example_models",

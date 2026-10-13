@@ -2,11 +2,13 @@
 
 #include "native_projection_transition_internal.hpp"
 
-#include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/native_domain_topology.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <set>
 
 #include <algorithm>
 #include <cstddef>
@@ -119,14 +121,16 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
   return bundle;
 }
 
-[[nodiscard]] ManagerApplyFenceExpectationDTO
-FenceExpectation(const ManagerApplyIntentDTO &intent,
-                 const deployment::RetainedBundle &predecessor,
-                 const deployment::RetainedBundle &candidate,
-                 const ManagerActiveRuntimePlanDTO &active_plan,
-                 SqliteManagerApplyJournal &journal,
-                 core::IManagerKernelApplyFencePort &kernel_fence,
-                 const core::RuntimeEpoch &manager_runtime_epoch) {
+[[nodiscard]] ManagerApplyFenceExpectationDTO FenceExpectation(
+    const ManagerApplyIntentDTO &intent,
+    const deployment::RetainedBundle &predecessor,
+    const deployment::RetainedBundle &candidate,
+    const ManagerActiveRuntimePlanDTO &active_plan,
+    SqliteManagerApplyJournal &journal,
+    core::IManagerKernelApplyFencePort &kernel_fence,
+    const core::RuntimeEpoch &manager_runtime_epoch,
+    IManagerSelectedRuntimeCompositionPort *runtime_composition,
+    const deployment::IVerifiedRetainedBundleSource &retained_bundle_source) {
   if (const auto attempt =
           journal.ReadFenceAttempt(intent.apply_id, intent.apply_generation);
       attempt.has_value()) {
@@ -135,18 +139,16 @@ FenceExpectation(const ManagerApplyIntentDTO &intent,
         fence.expected_operation_resource_generation,
         fence.expected_fence_generation,
         fence.expected_active_control_configurations,
+        fence.scope,
     };
   }
 
-  const auto scope = deployment::derive_apply_configuration_fence_scope(
-      predecessor, candidate);
-  const core::ConfigurationFenceAdmissionQueryDTO query{
-      scope,
-      manager_runtime_epoch,
-  };
+  auto scope = deployment::derive_apply_configuration_fence_scope(predecessor,
+                                                                  candidate);
+  core::ConfigurationFenceAdmissionQueryDTO query{scope, manager_runtime_epoch};
   Require(query.valid(), "derived Kernel admission query is invalid");
 
-  const auto snapshot = kernel_fence.ObserveAdmission(query);
+  auto snapshot = kernel_fence.ObserveAdmission(query);
   Require(snapshot.matches(query),
           "Kernel returned invalid or foreign admission evidence");
   Require(SameDeploymentRevision(snapshot.active_projection_revision,
@@ -158,6 +160,125 @@ FenceExpectation(const ManagerApplyIntentDTO &intent,
                   active_plan.active_publication.publication_generation,
           "Kernel admission evidence does not match the current durable "
           "predecessor publication");
+  if (runtime_composition != nullptr) {
+    const ManagerComponentProcessInventoryRequestDTO inventory_request{
+        active_plan.active_publication.request.candidate_projection_revision,
+        active_plan.active_publication.publication_generation,
+        active_plan.active_publication.durable_public_pointer_content_digest,
+        snapshot.execution_host_epoch.runtime_unit_id,
+        snapshot.execution_host_epoch.runtime_epoch,
+        manager_runtime_epoch};
+    const auto inventory =
+        runtime_composition->InspectInstalledComponentProcesses(
+            inventory_request);
+    if (!inventory.ok())
+      Fail("actual_installed_state_unknown: " + inventory.error().message +
+           "; restart the workbench container");
+    Require(inventory.value().valid() &&
+                inventory.value().request == inventory_request,
+            "actual_installed_state_unknown: installed process inventory is "
+            "foreign");
+    if (inventory.value().error)
+      Fail(inventory.value().error->code + ": " +
+           inventory.value().error->message +
+           "; restart the workbench container");
+    std::set<core::ControllableComponentId> restart;
+    for (const auto &row : inventory.value().process_occurrences) {
+      Require(row.process_presence != ProcessPresenceState::kUnknown &&
+                  row.installed_runtime_identity,
+              "actual_installed_state_unknown: installed process identity or "
+              "presence is unknown; restart the workbench container");
+      const auto wanted = deployment::derive_component_runtime_identity(
+          candidate, row.controllable_component_id);
+      if (row.process_presence != ProcessPresenceState::kPresent ||
+          wanted != row.installed_runtime_identity)
+        restart.insert(row.controllable_component_id);
+    }
+    for (const auto &component :
+         candidate.value().cell_graph.controllable_components) {
+      const auto wanted = deployment::derive_component_runtime_identity(
+          candidate, component.controllable_component_id);
+      const auto count = std::count_if(
+          inventory.value().process_occurrences.begin(),
+          inventory.value().process_occurrences.end(), [&](const auto &row) {
+            return row.controllable_component_id ==
+                       component.controllable_component_id &&
+                   row.process_presence == ProcessPresenceState::kPresent &&
+                   row.installed_runtime_identity == wanted;
+          });
+      Require(count <= 1, "actual_installed_state_unknown: component has "
+                          "multiple current process owners");
+      if (count == 0)
+        restart.insert(component.controllable_component_id);
+    }
+    std::vector<std::shared_ptr<const deployment::RetainedBundle>>
+        terminal_products;
+    std::vector<const deployment::RetainedBundle *> source_products;
+    const auto old_statuses = journal.ReadStatusInventory();
+    for (const auto &row : inventory.value().process_occurrences) {
+      if (!restart.contains(row.controllable_component_id))
+        continue;
+      const auto old_identity = deployment::derive_component_runtime_identity(
+          predecessor, row.controllable_component_id);
+      const auto new_identity = deployment::derive_component_runtime_identity(
+          candidate, row.controllable_component_id);
+      if (old_identity == row.installed_runtime_identity ||
+          new_identity == row.installed_runtime_identity)
+        continue;
+      std::shared_ptr<const deployment::RetainedBundle> source;
+      for (const auto &status : old_statuses) {
+        if (!status.terminal_outcome || status.bring_up_plan ||
+            status.terminal_outcome->terminal_outcome.succeeded())
+          continue;
+        const auto product = retained_bundle_source.get_verified(
+            status.intent.intent.candidate_retained_bundle_id);
+        if (!product ||
+            !deployment::verify_retained_bundle_identity(*product) ||
+            product->value().cell_graph.cell_id != intent.cell_id ||
+            product->value().cell_graph.graph_revision !=
+                status.intent.intent.candidate_graph_revision)
+          continue;
+        if (deployment::derive_component_runtime_identity(
+                *product, row.controllable_component_id) ==
+            row.installed_runtime_identity) {
+          source = product;
+          break;
+        }
+      }
+      Require(
+          source != nullptr,
+          "actual_installed_state_unknown: installed failed candidate "
+          "lacks its exact terminal product; restart the workbench container");
+      if (std::none_of(terminal_products.begin(), terminal_products.end(),
+                       [&](const auto &known) {
+                         return known->retained_bundle_id() ==
+                                source->retained_bundle_id();
+                       })) {
+        source_products.push_back(source.get());
+        terminal_products.push_back(std::move(source));
+      }
+    }
+    const std::vector<core::ControllableComponentId> components(restart.begin(),
+                                                                restart.end());
+    const auto actual_scope =
+        deployment::derive_apply_configuration_fence_scope(
+            predecessor, candidate, components, source_products);
+    if (actual_scope != scope) {
+      query.affected_scope = actual_scope;
+      const auto expanded = kernel_fence.ObserveAdmission(query);
+      Require(expanded.matches(query) &&
+                  expanded.execution_host_epoch ==
+                      snapshot.execution_host_epoch &&
+                  expanded.active_projection_revision ==
+                      snapshot.active_projection_revision &&
+                  expanded.active_public_pointer_digest ==
+                      snapshot.active_public_pointer_digest,
+              "actual_installed_state_unknown: original host or publication "
+              "changed during scope observation");
+      snapshot = expanded;
+      scope = actual_scope;
+    }
+  }
   if (snapshot.affected_queued_operation_count != 0U ||
       snapshot.affected_active_operation_count != 0U) {
     throw ManagerNamedApplyBusyError(
@@ -167,6 +288,7 @@ FenceExpectation(const ManagerApplyIntentDTO &intent,
       snapshot.operation_resource_generation,
       snapshot.configuration_fence_generation,
       snapshot.active_control_configurations,
+      scope,
   };
 }
 
@@ -394,10 +516,10 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     ApplyProgressObserver apply_progress_observer)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
-      artifact_source_(artifact_source),
-      publication_reader_(publication_store),
-      scene_owner_(scene_owner),
-      kernel_fence_(kernel_fence), cell_admission_(cell_admission),
+      artifact_source_(artifact_source), publication_reader_(publication_store),
+      scene_owner_(scene_owner), kernel_fence_(kernel_fence),
+      cell_admission_(cell_admission),
+      runtime_composition_port_(runtime_composition),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)),
       apply_id_factory_(std::move(apply_id_factory)),
       initial_scene_source_(std::move(initial_scene_source)),
@@ -406,9 +528,9 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
                                   progress_port, clock_ns, pre_start_guard),
-      runtime_coordinator_(apply_journal_,
-                           publication_store, artifact_source, process_port,
-                           progress_port, std::move(operating_system),
+      runtime_coordinator_(apply_journal_, publication_store, artifact_source,
+                           process_port, progress_port,
+                           std::move(operating_system),
                            std::move(launch_environment_contracts),
                            std::move(clock_ns), std::move(pre_start_guard)),
       scene_initialization_coordinator_(apply_journal_, scene_owner),
@@ -1307,7 +1429,20 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   try {
     expectation.emplace(FenceExpectation(
         intent, predecessor, candidate, *active_plan, apply_journal_,
-        kernel_fence_, manager_runtime_epoch_));
+        kernel_fence_, manager_runtime_epoch_,
+        !original_linked &&
+                std::any_of(
+                    active_plan->runtime_units.begin(),
+                    active_plan->runtime_units.end(),
+                    [](const auto &unit) {
+                      return unit.runtime_profile_id.value() ==
+                             deployment::
+                                 ros2_control_execution_runtime_contract::
+                                     kRuntimeProfileId;
+                    })
+            ? &runtime_composition_port_
+            : nullptr,
+        retained_bundle_source_));
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
         apply_journal_, durable_intent, "apply_fence_evidence_failed",

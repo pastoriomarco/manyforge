@@ -106,6 +106,17 @@ class SqliteOperationJournal final : public IOperationJournal {
 
   [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
       const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> RecordConfigurationApplyClaimAcquired(
+      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionCurrentOwnerEpochDTO& verified_manager,
+      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners) override;
+  [[nodiscard]] Result<AdmissionGeneration> RecordTerminalApplyClaimsReleasedBySuccess(
+      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
+      AdmissionGeneration expected_admission_generation) override;
   [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimReleased(
       const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
       const CellAdmissionClaimReleaseDTO& release,

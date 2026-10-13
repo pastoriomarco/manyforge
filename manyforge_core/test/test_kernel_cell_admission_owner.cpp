@@ -98,6 +98,27 @@ class AdmissionJournal final : public IOperationJournal {
     return Result<std::uint64_t>::Ok(++sequence);
   }
 
+  Result<CellAdmissionClaimDTO> RecordConfigurationApplyClaimAcquired(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO& claim,
+      const CellAdmissionCurrentOwnerEpochDTO&, const std::vector<CellAdmissionClaimDTO>&,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>&) override {
+    if (fail_configuration_write)
+      return Result<CellAdmissionClaimDTO>::Err(ErrorCode::kInternalError);
+    ++sequence;
+    return Result<CellAdmissionClaimDTO>::Ok(claim);
+  }
+  Result<AdmissionGeneration> RecordTerminalApplyClaimsReleasedBySuccess(
+      const RequestOwnerEpoch&, const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&,
+      const std::vector<CellAdmissionClaimDTO>& held,
+      const std::vector<CellAdmissionCurrentOwnerEpochDTO>&,
+      AdmissionGeneration generation) override {
+    if (fail_configuration_write)
+      return Result<AdmissionGeneration>::Err(ErrorCode::kInternalError);
+    ++sequence;
+    return Result<AdmissionGeneration>::Ok(
+        AdmissionGeneration(generation.value() + (held.size() > 1U)));
+  }
+  bool fail_configuration_write{};
   bool fail_generation{};
   std::atomic<std::uint64_t> sequence{};
 };
@@ -247,6 +268,118 @@ TEST(KernelCellAdmissionOwner,
   EXPECT_FALSE(owner.AcquireCellAdmissionClaim(fresh).ok());  // pre-clear generation
   fresh.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
   EXPECT_TRUE(owner.AcquireCellAdmissionClaim(fresh).ok());
+}
+
+TEST(KernelCellAdmissionOwner, ConfigurationApplyRetainsTerminalMarkersUntilFreshSuccess) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto old_intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                           owner.GetAuthoringAdmission().admission_generation, "old.failed");
+  old_intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  const auto old = owner.AcquireCellAdmissionClaim(old_intent);
+  ASSERT_TRUE(old.ok());
+  auto fresh = old_intent;
+  fresh.request_id = RequestId("fresh.apply");
+  fresh.owner_transaction_id = "fresh.transaction";
+  fresh.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  const auto before = journal.sequence.load();
+  EXPECT_FALSE(owner.AcquireConfigurationApplyClaim(fresh, {}).ok());
+  EXPECT_FALSE(
+      owner
+          .AcquireConfigurationApplyClaim(fresh,
+                                          [](const auto&, auto, const auto&, const auto&) {
+                                            return Result<void>::Err(ErrorDTO{
+                                                "apply_live", "old Apply has no terminal", {}});
+                                          })
+          .ok());
+  EXPECT_EQ(journal.sequence.load(), before);
+  int checked = 0;
+  const auto acquired = owner.AcquireConfigurationApplyClaim(
+      fresh, [&](const auto& intent, auto held, const auto&, const auto& epoch) {
+        ++checked;
+        EXPECT_EQ(intent, fresh);
+        EXPECT_EQ(held.size(), 1U);
+        if (!held.empty()) {
+          EXPECT_EQ(held.front(), old.value());
+        }
+        EXPECT_EQ(epoch, EmptyLivenessSet().manager_runtime_epoch);
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(acquired.ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  const auto replay =
+      owner.AcquireConfigurationApplyClaim(fresh, [&](const auto&, auto, const auto&, const auto&) {
+        ++checked;
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), acquired.value());
+  EXPECT_EQ(checked, 1);
+  EXPECT_FALSE(owner
+                   .ReleaseTerminalApplyClaimsAfterSuccess(
+                       acquired.value(), Release(acquired.value()),
+                       [](const auto&, const auto&, auto) {
+                         return Result<void>::Err(
+                             ErrorDTO{"fence_held", "old fence remains held", {}});
+                       })
+                   .ok());
+  const auto settled = owner.ReleaseTerminalApplyClaimsAfterSuccess(
+      acquired.value(), Release(acquired.value()),
+      [&](const auto& claim, const auto&, auto markers) {
+        EXPECT_EQ(claim, acquired.value());
+        EXPECT_EQ(markers.size(), 1U);
+        EXPECT_EQ(markers.front(), old.value());
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(settled.ok());
+  EXPECT_FALSE(settled.value().authoring_allowed);  // Fresh exclusion remains held.
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(acquired.value())).ok());
+  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner, ConfigurationApplyCannotBypassForeignClaimsOrTrueStopFault) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  const auto foreign =
+      owner.AcquireCellAdmissionClaim(Intent(CellAdmissionClaimKindDTO::kAuthoringMutation,
+                                             owner.GetAuthoringAdmission().admission_generation));
+  ASSERT_TRUE(foreign.ok());
+  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                       owner.GetAuthoringAdmission().admission_generation, "fresh.apply");
+  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  int checked = 0;
+  const auto validate = [&](const auto&, auto, const auto&, const auto&) {
+    ++checked;
+    return Result<void>::Ok();
+  };
+  EXPECT_FALSE(owner.AcquireConfigurationApplyClaim(intent, validate).ok());
+  EXPECT_EQ(checked, 0);
+  bool fault = true;
+  auto faulted = Owner(clock, journal, 16U, {}, [&] { return fault; });
+  ASSERT_TRUE(faulted.UpdateCellAdmissionReadiness(Ready()).ok());
+  intent.expected_admission_generation = faulted.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(faulted.AcquireConfigurationApplyClaim(intent, validate).ok());
+  EXPECT_EQ(checked, 0);
+}
+
+TEST(KernelCellAdmissionOwner, ConfigurationApplyProvenWriteFailureDoesNotChangeAdmission) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  const auto before = owner.GetAuthoringAdmission();
+  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply, before.admission_generation);
+  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  journal.fail_configuration_write = true;
+  const auto result = owner.AcquireConfigurationApplyClaim(
+      intent, [](const auto&, auto, const auto&, const auto&) { return Result<void>::Ok(); });
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(owner.GetAuthoringAdmission(), before);
+  EXPECT_FALSE(owner.has_unresolved_claims());
 }
 
 TEST(KernelCellAdmissionOwner, ApplyBringUpRequiresPositivePrivatePlanAndKeepsFaultClosed) {

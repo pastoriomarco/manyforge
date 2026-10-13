@@ -2,6 +2,7 @@
 
 #include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <manyforge_core/ports/iobserved_state_provider.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <memory>
 #include <vector>
@@ -35,6 +36,9 @@ struct ConfiguredRobotMeasuredStateRequirement final {
   ControllableComponentId component_id;
   std::vector<ResourceId> required_resources;
   std::vector<RequiredRobotMeasuredStateSource> sources;
+  /// Verified direct geometry, independent of runtime source availability.
+  /// Empty retains the legacy descriptor-derived geometry construction.
+  std::vector<RuntimeResourceBindingDTO> geometry_coordinates{};
 };
 
 /// Owning source leases captured by the existing product's route publisher.

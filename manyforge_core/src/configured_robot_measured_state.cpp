@@ -112,15 +112,42 @@ ConfiguredRobotMeasuredStateInventory::ConfiguredRobotMeasuredStateInventory(
         required.size() != robot.required_resources.size()) {
       throw std::invalid_argument("measured robot inventory has invalid geometry resources");
     }
+    std::map<ResourceId, const RuntimeResourceBindingDTO*> geometry;
+    if (!robot.geometry_coordinates.empty()) {
+      for (const auto& coordinate : robot.geometry_coordinates) {
+        if (coordinate.resource_role_id.empty() ||
+            !required.contains(coordinate.resource_id) ||
+            !geometry.emplace(coordinate.resource_id, &coordinate).second ||
+            coordinate.compiled_resource_name.empty() ||
+            !coordinate.source_joint_name || coordinate.source_joint_name->empty() ||
+            (coordinate.coordinate_kind != CoordinateKind::kAngular &&
+             coordinate.coordinate_kind != CoordinateKind::kLinear)) {
+          throw std::invalid_argument("measured robot inventory has invalid geometry coordinates");
+        }
+      }
+      if (geometry.size() != required.size()) {
+        throw std::invalid_argument("measured robot inventory has incomplete geometry coordinates");
+      }
+    }
     std::set<ResourceId> covered;
     for (const auto& source : robot.sources) {
       if (!source.descriptor.validate().ok() ||
           source.descriptor.publication.query_context.controllable_component_id != robot.component_id) {
         throw std::invalid_argument("measured source does not name its configured robot");
       }
-      for (const auto& resource : source.descriptor.publication.query_context.resources) {
+      const auto& query = source.descriptor.publication.query_context;
+      for (std::size_t index = 0; index < query.resources.size(); ++index) {
+        const auto& resource = query.resources[index];
         if (!required.contains(resource) || !covered.insert(resource).second) {
           throw std::invalid_argument("measured robot sources overlap or exceed geometry resources");
+        }
+        if (!geometry.empty()) {
+          const auto& coordinate = *geometry.at(resource);
+          if (coordinate.compiled_resource_name != query.joint_names[index] ||
+              coordinate.coordinate_kind != query.coordinate_kinds[index] ||
+              *coordinate.source_joint_name != source.descriptor.source_joint_names[index]) {
+            throw std::invalid_argument("measured source differs from verified geometry coordinates");
+          }
         }
       }
     }
@@ -196,11 +223,18 @@ Result<RobotMeasuredStateCapture> ConfiguredRobotMeasuredStateInventory::ReadCom
   const std::set<ResourceId> required(robot->required_resources.begin(),
                                       robot->required_resources.end());
   std::map<ResourceId, std::pair<std::string, CoordinateKind>> coordinates;
-  for (const auto& source : robot->sources) {
-    const auto& query = source.descriptor.publication.query_context;
-    for (std::size_t index = 0; index < query.resources.size(); ++index) {
-      coordinates.emplace(query.resources[index],
-                          std::pair{query.joint_names[index], query.coordinate_kinds[index]});
+  if (!robot->geometry_coordinates.empty()) {
+    for (const auto& coordinate : robot->geometry_coordinates) {
+      coordinates.emplace(coordinate.resource_id,
+                          std::pair{coordinate.compiled_resource_name, coordinate.coordinate_kind});
+    }
+  } else {
+    for (const auto& source : robot->sources) {
+      const auto& query = source.descriptor.publication.query_context;
+      for (std::size_t index = 0; index < query.resources.size(); ++index) {
+        coordinates.emplace(query.resources[index],
+                            std::pair{query.joint_names[index], query.coordinate_kinds[index]});
+      }
     }
   }
   std::set<ResourceId> covered;
@@ -220,9 +254,13 @@ Result<RobotMeasuredStateCapture> ConfiguredRobotMeasuredStateInventory::ReadCom
         return RobotResult::Err(unavailable("measured_source_view_invalid", robot->component_id));
       }
       const auto coordinate = coordinates.find(resource);
+      const auto physical = std::find_if(robot->geometry_coordinates.begin(),
+          robot->geometry_coordinates.end(), [&](const auto& row) { return row.resource_id == resource; });
       if (coordinate == coordinates.end() ||
           coordinate->second.first != query.joint_names[index] ||
-          coordinate->second.second != query.coordinate_kinds[index]) {
+          coordinate->second.second != query.coordinate_kinds[index] ||
+          (physical != robot->geometry_coordinates.end() &&
+           *physical->source_joint_name != source.descriptor.source_joint_names[index])) {
         return RobotResult::Err(unavailable("measured_source_view_geometry_mismatch",
                                            robot->component_id));
       }

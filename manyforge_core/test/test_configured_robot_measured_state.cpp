@@ -347,5 +347,95 @@ TEST(ConfiguredRobotMeasuredState, EmptySuccessorViewNeverFallsBackToPinnedStati
   EXPECT_FALSE(inventory.ReadComponent(view, 1060).ok());
 }
 
+std::vector<RuntimeResourceBindingDTO> verified_coordinates() {
+  return {{ResourceRoleId("joint-role"), ResourceId("joint"), "physical_joint", "joint",
+           CoordinateKind::kAngular},
+          {ResourceRoleId("slide-role"), ResourceId("slide"), "physical_slide", "slide",
+           CoordinateKind::kLinear}};
+}
+
+TEST(ConfiguredRobotMeasuredState, ExplicitGeometryAdmitsRecoveredSourceWithoutOldSourceIdentity) {
+  auto current = descriptor();
+  current.publication.query_context.runtime_epoch = RuntimeEpoch("recovered-epoch");
+  current.publication.query_context.active_control_configuration_generation =
+      ActiveControlConfigurationGeneration(2U);
+  current.publication.authority_generation = 4U;
+  auto reader = std::make_shared<CountedMeasuredReader>(published(current));
+  const ConfiguredRobotMeasuredStateInventory inventory{{
+      {ControllableComponentId("robot-a"), current.publication.query_context.resources,
+       {}, verified_coordinates()}}};
+  EXPECT_FALSE(inventory.Read(1050).ok());
+  EXPECT_FALSE(inventory.ReadComponent({ControllableComponentId("robot-a"), {}}, 1050).ok());
+  EXPECT_FALSE(inventory.ReadComponent({ControllableComponentId("robot-a"), {{current, nullptr}}},
+                                     1050).ok());
+  EXPECT_EQ(reader->reads, 0);
+  const auto captured = inventory.ReadComponent(
+      {ControllableComponentId("robot-a"), {{current, reader}}}, 1050);
+  ASSERT_TRUE(captured.ok());
+  ASSERT_EQ(captured.value().sources.size(), 1U);
+  EXPECT_EQ(captured.value().sources.front().source_epoch, RuntimeEpoch("recovered-epoch"));
+  EXPECT_EQ(reader->reads, 1);
+  // Source freshness and returned identity still use the original validator.
+  EXPECT_FALSE(inventory.ReadComponent(
+      {ControllableComponentId("robot-a"), {{current, reader}}}, 1101).ok());
+}
+
+TEST(ConfiguredRobotMeasuredState, ExplicitGeometryRejectsMalformedRowsAndDescriptorDisagreement) {
+  const auto source = descriptor();
+  auto base = required(source, nullptr);
+  base.geometry_coordinates = verified_coordinates();
+  EXPECT_NO_THROW(ConfiguredRobotMeasuredStateInventory({base}));
+  auto model_local_names = base;
+  model_local_names.sources.clear();
+  model_local_names.geometry_coordinates.back().source_joint_name =
+      model_local_names.geometry_coordinates.front().source_joint_name;
+  // Source-local URDF names may repeat across distinct model bindings.
+  EXPECT_NO_THROW(ConfiguredRobotMeasuredStateInventory({model_local_names}));
+  model_local_names.geometry_coordinates.back().compiled_resource_name =
+      model_local_names.geometry_coordinates.front().compiled_resource_name;
+  // Cross-binding naming policy remains the verified producer's concern.
+  EXPECT_NO_THROW(ConfiguredRobotMeasuredStateInventory({model_local_names}));
+  for (int mutation = 0; mutation < 11; ++mutation) {
+    auto invalid = base;
+    auto& rows = invalid.geometry_coordinates;
+    switch (mutation) {
+      case 0: rows.pop_back(); break;
+      case 1: rows.push_back(rows.front()); break;
+      case 2: rows.back().resource_id = ResourceId("foreign"); break;
+      case 3: rows.back().compiled_resource_name.clear(); break;
+      case 4: rows.back().compiled_resource_name = rows.front().compiled_resource_name; break;
+      case 5: rows.back().source_joint_name.reset(); break;
+      case 6: rows.back().source_joint_name = ""; break;
+      case 7: rows.back().source_joint_name = rows.front().source_joint_name; break;
+      case 8: rows.back().coordinate_kind = static_cast<CoordinateKind>(255); break;
+      case 9: rows.back().source_joint_name = "foreign_source"; break;
+      case 10: rows.back().coordinate_kind = CoordinateKind::kAngular; break;
+    }
+    EXPECT_THROW(ConfiguredRobotMeasuredStateInventory({invalid}), std::invalid_argument) << mutation;
+  }
+}
+
+TEST(ConfiguredRobotMeasuredState, ExplicitGeometryRejectsForeignViewBeforeReading) {
+  const auto source = descriptor();
+  auto reader = std::make_shared<CountedMeasuredReader>(published(source));
+  const ConfiguredRobotMeasuredStateInventory inventory{{
+      {ControllableComponentId("robot-a"), source.publication.query_context.resources,
+       {}, verified_coordinates()}}};
+  for (int mutation = 0; mutation < 5; ++mutation) {
+    auto changed = source;
+    auto& query = changed.publication.query_context;
+    switch (mutation) {
+      case 0: query.resources.back() = ResourceId("foreign"); break;
+      case 1: query.joint_names.back() = "foreign"; break;
+      case 2: query.coordinate_kinds.back() = CoordinateKind::kAngular; break;
+      case 3: changed.source_joint_names.back() = "foreign_source"; break;
+      case 4: query.controllable_component_id = ControllableComponentId("foreign"); break;
+    }
+    EXPECT_FALSE(inventory.ReadComponent(
+        {ControllableComponentId("robot-a"), {{changed, reader}}}, 1050).ok()) << mutation;
+  }
+  EXPECT_EQ(reader->reads, 0);
+}
+
 }  // namespace
 }  // namespace manyforge::core

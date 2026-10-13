@@ -15,7 +15,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 17;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 19;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -339,6 +339,16 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       const ControllableComponentId& component, LifecycleTargetStateDTO requested_state,
       LifecycleTargetOriginDTO origin) override;
   [[nodiscard]] Result<std::vector<ComponentLifecycleTargetDTO>> LoadLifecycleTargets() override;
+  [[nodiscard]] Result<std::optional<ComponentLifecycleTargetRetentionDTO>>
+  ReadLifecycleTargetRetention(const ControllableComponentId&) override;
+  [[nodiscard]] Result<std::vector<ComponentLifecycleTargetDTO>>
+  LoadLifecycleTargetsForClose(const RequestOwnerEpoch&) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>
+  ReadLifecycleTargetRetirementResult(const CCLCLifecycleTargetRetirementIntentDTO&) override;
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementResultDTO>
+  RetireLifecycleTargetsForClose(const RequestOwnerEpoch&,
+      const CCLCLifecycleTargetRetirementIntentDTO&, const ICellCloseAdmissionLease&) override;
+
   [[nodiscard]] Result<std::optional<ComponentLifecycleTargetDTO>> LoadLifecycleTarget(
       const ControllableComponentId& component) override;
   [[nodiscard]] Result<ComponentLifecycleTargetFactsDTO> LoadLifecycleTargetFacts(
@@ -367,6 +377,23 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<CellObserverIncidentRecordDTO> RecordCellObserverIncident(
       const CellObserverIncidentRecordDTO& current_exit);
   [[nodiscard]] Result<std::optional<CellObserverIncidentRecordDTO>> LoadOpenCellObserverIncident();
+  [[nodiscard]] Result<std::optional<CellObserverLossAssociationDTO>>
+  LoadOpenCellObserverLossAssociation();
+
+  [[nodiscard]] Result<std::optional<CellObserverBringUpRecordDTO>> LoadLatestCellObserverBringUp();
+  /// Compare the complete latest record, including genuine absence of a row.
+  /// An exact current request replay returns its outcome without new work.
+  [[nodiscard]] Result<CellObserverBringUpAdmissionDTO> BeginLatestCellObserverBringUp(
+      const CellObserverBringUpRecordDTO& admitted,
+      const std::optional<CellObserverBringUpRecordDTO>& expected_latest);
+  /// Exact-record CAS; immutable intent cannot change. No retry or effect.
+  [[nodiscard]] Result<CellObserverBringUpRecordDTO> UpdateLatestCellObserverBringUp(
+      const CellObserverBringUpRecordDTO& expected, const CellObserverBringUpRecordDTO& updated);
+  /// Atomic latest outcome + genuine predecessor incident acknowledgement.
+  /// Only the exact started latest attempt's first accepted Open can close it.
+  [[nodiscard]] Result<CellObserverBringUpRecordDTO> CloseCellObserverIncidentByOperatorBringUp(
+      const CellObserverBringUpRecordDTO& expected_started,
+      const CellObserverBringUpOpenDTO& first_open);
 
   /// Component incidents and their bounded durable history events
   /// (addendum 2, 2026-10-08); session-scoped like the targets.

@@ -127,7 +127,7 @@ Inside the container:
 
 ```bash
 cd /workspaces/isaac_ros-dev
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/${ROS_DISTRO}/setup.bash
 source install/setup.bash 2>/dev/null || true
 
 source /workspaces/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh

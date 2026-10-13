@@ -62,6 +62,10 @@ public:
   /// Read this epoch's own FJT client availability for the Enable
   /// postcondition. No graph wait or change to execution readiness.
   [[nodiscard]] bool ActionServerIsReady() const;
+  /// Existing NRT lifecycle/observer checkpoints maintain selected publisher
+  /// facts. Neither method changes execution readiness or sends a command.
+  void RefreshEndpointFacts();
+  [[nodiscard]] std::optional<core::ErrorDTO> ReadEndpointDiagnostic() const;
   core::ExecutionTimingDTO ReadTiming() override;
   core::ExecutionLaneFactsDTO ReadLaneFacts() const override;
 

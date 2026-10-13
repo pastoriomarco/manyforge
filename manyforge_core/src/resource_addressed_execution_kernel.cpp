@@ -3516,6 +3516,122 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   }
 }
 
+class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
+    : public ICellCloseAdmissionLease {
+ public:
+  explicit CellCloseAdmissionLease(ResourceAddressedExecutionKernel& owner)
+      : owner_(owner), admission_lock_(*owner.admission_mutex_) {}
+
+  [[nodiscard]] Result<void> ValidatePrerequisites() const override {
+    // DX583/Q121: inspect actual Kernel facts under the existing admission
+    // lease and a brief state lock. Neither state nor submission spans SQL;
+    // Stop remains recognizable, and callers recheck immediately precommit.
+    std::lock_guard state_lock(owner_.state_mutex_);
+    owner_.refresh_stop_fault_latch_locked();
+    if (is_active_stop_fault_latch(owner_.active_stop_fault_latch_))
+      return Result<void>::Err(error("cell_close_stop_fault", "Close requires the actual StopFault to be reset", "active_stop_fault"));
+    for (const auto& [id, operation] : owner_.active_operations_) {
+      if (operation->containment_effect_uncertain())
+        return Result<void>::Err(ErrorDTO{"cell_close_containment_uncertain", "Close cannot infer rest from an uncertain terminal", {{"operation_id", id.value()}}});
+      switch (operation->state.state) {
+        case OperationStateKind::kQueued:
+        case OperationStateKind::kResolving:
+        case OperationStateKind::kPlanning:
+        case OperationStateKind::kValidating:
+        case OperationStateKind::kPrepared:
+        case OperationStateKind::kDispatching:
+        case OperationStateKind::kExecuting:
+        case OperationStateKind::kStopping:
+          return Result<void>::Err(ErrorDTO{"cell_close_operation_nonterminal", "Close requires ordinary Stop before nonterminal work can retire", {{"operation_id", id.value()}}});
+        case OperationStateKind::kCompleted:
+        case OperationStateKind::kStopped:
+        case OperationStateKind::kFailed:
+        case OperationStateKind::kInterrupted:
+        case OperationStateKind::kInterventionRequired:
+        case OperationStateKind::kCancelledPreDispatch:
+          break;
+      }
+    }
+    return Result<void>::Ok();
+  }
+
+  [[nodiscard]] Result<void> PrepareCommandEligibilityClosure(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) override {
+    if (prepared_ || !intent.locally_valid())
+      return Result<void>::Err(error("cell_close_eligibility_preparation_invalid",
+                                    "Close eligibility requires one exact valid retirement",
+                                    "invalid_or_repeated_preparation"));
+    const auto current = ValidatePrerequisites();
+    if (!current.ok()) return current;
+    try {
+      auto prepared = intent;
+      std::vector<ComponentCommandReadinessDTO*> entries;
+      entries.reserve(intent.expected_targets.size());
+      {
+        std::lock_guard state_lock(owner_.state_mutex_);
+        for (const auto& target : intent.expected_targets) {
+          const auto entry = owner_.component_command_readiness_.find(
+              target.controllable_component_id);
+          // Absence is already command-closed. The projection map does not
+          // erase entries, and this same admission lease excludes publishers.
+          if (entry != owner_.component_command_readiness_.end())
+            entries.push_back(&entry->second);
+        }
+      }
+      prepared_.emplace(std::move(prepared));
+      entries_ = std::move(entries);
+      return Result<void>::Ok();
+    } catch (...) {
+      return Result<void>::Err(error("cell_close_eligibility_preparation_unavailable",
+                                    "Close eligibility values could not be prepared before retirement",
+                                    "preparation_allocation_failed"));
+    }
+  }
+
+  [[nodiscard]] bool CloseCommandEligibilityAfterRetirement(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent,
+      const CCLCLifecycleTargetRetirementResultDTO& retired) noexcept override {
+    // Complete equality is comparison-only: locally_valid() on a constructed
+    // result would copy vectors and must never run after durable commitment.
+    if (!prepared_ || consumed_ || *prepared_ != intent ||
+        retired.replay_status != RequestReplayStatusDTO::kAcceptedNew ||
+        retired.request_context != prepared_->request_context ||
+        retired.scope != prepared_->scope ||
+        retired.retired_targets != prepared_->expected_targets)
+      return false;
+    std::lock_guard state_lock(owner_.state_mutex_);
+    for (auto* entry : entries_) entry->command_eligible = false;
+    consumed_ = true;
+    return true;
+  }
+
+  [[nodiscard]] bool CloseCommandEligibilityForUnknownRetirement(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) noexcept override {
+    if (!prepared_ || consumed_ || *prepared_ != intent) return false;
+    std::lock_guard state_lock(owner_.state_mutex_);
+    for (auto* entry : entries_) entry->command_eligible = false;
+    consumed_ = true;
+    return true;
+  }
+
+ private:
+  ResourceAddressedExecutionKernel& owner_;
+  std::unique_lock<std::recursive_mutex> admission_lock_;
+  std::optional<CCLCLifecycleTargetRetirementIntentDTO> prepared_;
+  std::vector<ComponentCommandReadinessDTO*> entries_;
+  bool consumed_{};
+};
+
+Result<std::unique_ptr<ICellCloseAdmissionLease>>
+ResourceAddressedExecutionKernel::AcquireCellCloseAdmissionLease() {
+  // Ordinary Execute admission already takes this same lock before state
+  // (the pending/admitted publication barrier). No submission/state lock or
+  // callback is retained over the caller's journal transaction.
+  std::unique_ptr<ICellCloseAdmissionLease> lease =
+      std::make_unique<CellCloseAdmissionLease>(*this);
+  return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Ok(std::move(lease));
+}
+
 AuthoringAdmissionDTO ResourceAddressedExecutionKernel::GetAuthoringAdmission() const {
   return cell_admission_owner_->GetAuthoringAdmission();
 }
@@ -4080,6 +4196,25 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
 }
 
 Result<CellAdmissionClaimDTO>
+ResourceAddressedExecutionKernel::AcquireConfigurationApplyCellAdmissionClaim(
+    const CellAdmissionClaimIntentDTO& intent,
+    const CellAdmissionConfigurationApplyValidator& validate) {
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->AcquireConfigurationApplyClaim(intent, validate);
+}
+
+Result<AuthoringAdmissionDTO>
+ResourceAddressedExecutionKernel::ReleaseTerminalApplyClaimsAfterSuccess(
+    const CellAdmissionClaimDTO& fresh_claim,
+    const CellAdmissionClaimReleaseDTO& fresh_success_release,
+    const CellAdmissionConfigurationApplySuccessValidator& validate) {
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->ReleaseTerminalApplyClaimsAfterSuccess(
+      fresh_claim, fresh_success_release, validate);
+}
+
+Result<CellAdmissionClaimDTO>
 ResourceAddressedExecutionKernel::AcquireApplyBringUpCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer) {
   std::lock_guard submit_lock(submission_mutex_);
@@ -4355,6 +4490,16 @@ std::optional<CellAdmissionClaimDTO>
 ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaim(
     const CellAdmissionClaimKindDTO kind) const {
   return cell_admission_owner_->held_claim(kind);
+}
+
+std::optional<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaim(
+    const CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const {
+  return cell_admission_owner_->held_claim(kind, owner_transaction_id);
+}
+
+std::vector<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaims(
+    const CellAdmissionClaimKindDTO kind) const {
+  return cell_admission_owner_->held_claims(kind);
 }
 
 Result<CellAdmissionRecoveryReceiptDTO>
@@ -7532,6 +7677,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     // state while waiting and thereby delay recognized Stop.
     std::lock_guard admission_lock(*admission_mutex_);
     std::lock_guard state_lock(state_mutex_);
+    // Close may retire command eligibility after this Execute's preflight.
+    // Repeat the existing component check at the actual admission barrier,
+    // before any resource reservation, journal write or provider effect.
+    if (auto refusal = component_command_refusal_locked(resolved.value())) {
+      return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+    }
     if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
@@ -8257,6 +8408,11 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     // blocked durable claim cannot convoy recognized Stop.
     std::lock_guard admission_lock(*admission_mutex_);
     std::lock_guard state_lock(state_mutex_);
+    for (const auto& admission : admissions) {
+      if (auto refusal = component_command_refusal_locked(admission.registration)) {
+        return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+      }
+    }
     if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",

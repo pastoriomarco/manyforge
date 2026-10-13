@@ -893,9 +893,15 @@ DeriveRetainedNativeApplyPlanRequest(
     const deployment::RetainedBundle &candidate,
     const deployment::RetainedBundle *predecessor,
     const deployment::ApplyComponentDeltaDTO &delta,
-    const std::span<const core::RuntimeParticipantBinding> candidate_physical_bindings,
-    const std::span<const core::RuntimeRouteConfigurationReadbackDTO> retained_route_readbacks,
-    const core::ComponentLifecycleStateDTO changed_component_state) {
+    const std::span<const core::RuntimeParticipantBinding>
+        candidate_physical_bindings,
+    const std::span<const core::RuntimeRouteConfigurationReadbackDTO>
+        retained_route_readbacks,
+    const core::ComponentLifecycleStateDTO changed_component_state,
+    const std::optional<std::span<const core::ControllableComponentId>>
+        actual_retained_components,
+    const std::optional<std::span<const core::ControllableComponentId>>
+        actual_removed_components) {
   using Plan = core::NativeApplyPlanRequestDTO;
   try {
     if (!apply.valid() || !deployment::verify_retained_bundle_identity(candidate) ||
@@ -957,6 +963,40 @@ DeriveRetainedNativeApplyPlanRequest(
     if (candidate_rows != plan.components.size())
       return reject<Plan>("native_apply_plan_component_mismatch",
                           "native Apply delta does not cover every candidate component");
+
+    if (actual_retained_components.has_value() !=
+        actual_removed_components.has_value())
+      return reject<Plan>(
+          "actual_installed_state_unknown",
+          "actual retained/removed owner selection is incomplete");
+    if (actual_retained_components) {
+      const auto canonical = [](const auto rows) {
+        return rows.size() <= core::kMaximumCCLCComponentWatermarks &&
+               std::is_sorted(rows.begin(), rows.end()) &&
+               std::adjacent_find(rows.begin(), rows.end()) == rows.end();
+      };
+      if (!canonical(*actual_retained_components) ||
+          !canonical(*actual_removed_components))
+        return reject<Plan>(
+            "actual_installed_state_unknown",
+            "actual owner selection is not bounded and canonical");
+      for (const auto &component : *actual_retained_components)
+        if (!std::binary_search(plan.components.begin(), plan.components.end(),
+                                component))
+          return reject<Plan>(
+              "actual_installed_state_unknown",
+              "retained actual owner is absent from the verified candidate");
+      for (const auto &component : *actual_removed_components)
+        if (std::binary_search(plan.components.begin(), plan.components.end(),
+                               component))
+          return reject<Plan>(
+              "actual_installed_state_unknown",
+              "removed actual owner is still wanted by the verified candidate");
+      plan.retained_components.assign(actual_retained_components->begin(),
+                                      actual_retained_components->end());
+      plan.removed_components.assign(actual_removed_components->begin(),
+                                     actual_removed_components->end());
+    }
 
     std::map<core::ControlBindingId, const core::RuntimeParticipantBinding *> physical_by_binding;
     for (const auto &physical : candidate_physical_bindings) {
@@ -1258,6 +1298,30 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
   }
 }
 
+namespace {
+void PrepareReadinessConstructionInputs(RetainedNativeCCLCRuntimeConfig &config) {
+  if (!config.prepare_readiness_dependencies) return;
+  // Consume once; nothing in the installed context can call this again.
+  auto prepare = std::move(config.prepare_readiness_dependencies);
+  config.prepare_readiness_dependencies = {};
+  try {
+    auto dependencies = prepare();
+    config.measured_state_inventory = std::move(dependencies.inventory);
+    config.capture_readiness_sources = std::move(dependencies.capture);
+  } catch (...) {
+    // Readiness construction is not a new Apply or lifecycle admission test.
+    // Preserve unavailable truth rather than substituting a source authority.
+    config.measured_state_inventory.reset();
+    config.capture_readiness_sources =
+        [](const core::ComponentLifecycleCurrentSnapshotDTO &) {
+      return core::Result<core::ComponentLifecycleReadinessSourceView>::Err(
+          {"measured_source_unavailable", "measured readiness construction is unavailable",
+           {{"reason", "measured_dependency_construction_failed"}}});
+    };
+  }
+}
+} // namespace
+
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
 CreateRetainedNativeCCLCRuntime(
     RetainedNativeCCLCRuntimeConfig config,
@@ -1300,6 +1364,7 @@ CreateRetainedNativeCCLCRuntime(
         Err(closure.error());
   }
   auto &value = closure.value();
+  PrepareReadinessConstructionInputs(config);
   auto composition = deployment::CCLCRuntimeComposition::Create(
       std::move(config.composition), std::move(retained_bundle),
       active_publication_reader, std::move(expected_active_publication),
@@ -1310,7 +1375,9 @@ CreateRetainedNativeCCLCRuntime(
       kernel_cell_admission_port,
       kernel_route_fence_port, kernel_publication_owner, clock, scheduler,
       std::move(kernel_current_configuration_source),
-      component_command_readiness_port);
+      component_command_readiness_port,
+      std::move(config.measured_state_inventory),
+      std::move(config.capture_readiness_sources));
   return composition;
 }
 
@@ -1353,6 +1420,7 @@ PrepareRetainedNativeCCLCProductContext(
         closure.error());
   }
   auto &value = closure.value();
+  PrepareReadinessConstructionInputs(config);
   return composition.PrepareProductContext({
       std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,
@@ -1361,7 +1429,9 @@ PrepareRetainedNativeCCLCProductContext(
       std::move(value.controller_ports), std::move(value.source_projections),
       std::move(kernel_current_configuration_source),
       component_command_readiness_port, kernel_publication_owner,
-      std::move(installed_product_lifetime)});
+      std::move(installed_product_lifetime),
+      std::move(config.measured_state_inventory),
+      std::move(config.capture_readiness_sources)});
 }
 
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>

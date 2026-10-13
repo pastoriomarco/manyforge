@@ -68,7 +68,7 @@ def run_xacro(source: Path, output: Path, prefix: Path, *arguments: str) -> None
     environment["AMENT_PREFIX_PATH"] = (
         str(prefix) if not existing else f"{prefix}:{existing}"
     )
-    executable = shutil.which("xacro") or "/opt/ros/jazzy/bin/xacro"
+    executable = shutil.which("xacro") or "/opt/ros/lyrical/bin/xacro"
     with output.open("wb") as stream:
         subprocess.run(
             [executable, str(source), *arguments],

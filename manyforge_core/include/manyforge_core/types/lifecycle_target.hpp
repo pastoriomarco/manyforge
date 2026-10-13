@@ -146,6 +146,30 @@ struct ComponentLifecycleTargetDTO final {
                          const ComponentLifecycleTargetDTO&) = default;
 };
 
+/// Provenance of retirement of this exact retained target generation. This
+/// owner-private row fact is not a new command/readiness authority.
+enum class LifecycleTargetRetirementReasonDTO : std::uint8_t {
+  kNone = 0,
+  kOrdinaryCancellation,
+  kClose,
+};
+
+struct ComponentLifecycleTargetRetentionDTO final {
+  ComponentLifecycleTargetDTO target;
+  bool present;
+  LifecycleTargetRetirementReasonDTO retirement_reason;
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    if (!target.locally_valid()) return false;
+    return present
+        ? retirement_reason == LifecycleTargetRetirementReasonDTO::kNone
+        : retirement_reason == LifecycleTargetRetirementReasonDTO::kOrdinaryCancellation ||
+          retirement_reason == LifecycleTargetRetirementReasonDTO::kClose;
+  }
+  friend bool operator==(const ComponentLifecycleTargetRetentionDTO&,
+                         const ComponentLifecycleTargetRetentionDTO&) = default;
+};
+
 /// Last intervention-required cause observed for one component domain. It
 /// survives loss of communication and is cleared only by fresh status.
 struct ComponentLifecycleInterventionCauseDTO final {

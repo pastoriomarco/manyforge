@@ -1,7 +1,6 @@
 # Ubuntu Noble cache tooling only; the helper pins an already-built ROS image.
-# LYRICAL (evaluation): copy of Dockerfile.ros-jazzy-cache; only the distro
-# check differs. Build it like scripts/ros/build-jazzy-cache-image.sh does,
-# passing this file instead of the Jazzy one.
+# Build with scripts/ros/build-jazzy-cache-image.sh (legacy helper name).
+# The helper resolves and pins an existing local full Lyrical image.
 ARG MANYFORGE_ROS_BASE=manyforge-ros-lyrical-full:eval-20261011
 FROM ${MANYFORGE_ROS_BASE}
 ARG MANYFORGE_ROS_BASE_ID

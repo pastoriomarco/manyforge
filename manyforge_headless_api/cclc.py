@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 import socket
 import unicodedata
@@ -13,6 +13,13 @@ import rfc8785
 from manyforge_behavior.json_scalars import MAXIMUM_SAFE_INTEGER, nonnegative_int64
 
 from .native import HeadlessApiError, strict_json_object
+from .close_wire import (
+    LifecycleTargetRetirementIntent,
+    LifecycleTargetRetirementScope,
+    retirement_offer,
+    retirement_result,
+    settlement_result,
+)
 from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
@@ -32,7 +39,17 @@ class CCLCOpenPort(Protocol):
 
     def owner_identity(self) -> dict[str, Any]: ...
 
+    def lifecycle_target_retirement_offer(self) -> dict[str, Any]: ...
+
+    def retire_lifecycle_targets(self, intent: LifecycleTargetRetirementIntent) -> dict[str, Any]: ...
+
+    def lifecycle_target_retirement_result(self, intent: LifecycleTargetRetirementIntent) -> dict[str, Any] | None: ...
+
+    def lifecycle_owner_settlement(self, scope: LifecycleTargetRetirementScope) -> dict[str, Any]: ...
+
     def component_snapshot(self, component_id: str) -> dict[str, Any]: ...
+
+    def component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]: ...
 
     def route_templates(self, component_id: str) -> dict[str, Any]: ...
 
@@ -100,6 +117,8 @@ _MAX_INCIDENT_SUMMARY_BYTES = 1024
 _MAX_VENDOR_CODES = 16
 _MAX_VENDOR_CODE_BYTES = 64
 _MAX_DIAGNOSTIC_BYTES = 512 * 1024
+# Same existing whole selected-runtime packet ceiling as Close/Stop identities.
+_MAX_LAUNCH_IDENTITY_BYTES = 256 * 1024
 _MAX_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
 INCIDENT_EVENT_KINDS = frozenset(
     {"component_incident", "component_incident_acknowledged"}
@@ -162,6 +181,176 @@ def _is_owner_uint64(value: Any) -> bool:
 
 def _closed(value: Any, fields: set[str]) -> bool:
     return isinstance(value, dict) and set(value) == fields
+
+
+_COMPONENT_FIELDS = {
+    "active_public_pointer_digest", "component_lifecycle_generation",
+    "component_lifecycle_state", "controllable_component_id", "domains",
+    "graph_revision", "lifecycle_progress", "lifecycle_target",
+    "provider_occurrences", "publication_generation", "retained_bundle_id",
+    "snapshot_digest", "readiness",
+}
+_OCCURRENCE_FIELDS = {
+    "control_domain_id", "provider_instance_id", "provider_manifest_id",
+    "provider_manifest_revision", "provider_runtime_unit_id",
+    "provider_runtime_epoch", "lifecycle_plan_catalog_digest",
+}
+_LIFECYCLE_STATES = frozenset({
+    "undeclared", "declared", "prepared", "active", "degraded", "faulted",
+    "disabling", "disabled",
+})
+
+
+def _readiness_error(value: Any, maximum_details: int = 64) -> bool:
+    return value is None or (
+        _closed(value, {"code", "message", "details"})
+        and _diagnostic_text(value["code"], 128, nonempty=True)
+        and _diagnostic_text(value["message"], 1024)
+        and isinstance(value["details"], dict) and len(value["details"]) <= maximum_details
+        and all(_diagnostic_text(key, 64, nonempty=True)
+                and _diagnostic_text(detail, 256)
+                for key, detail in value["details"].items())
+    )
+
+
+def _canonical_rows(value: Any, maximum: int, key: Callable) -> bool:
+    if not isinstance(value, list) or len(value) > maximum:
+        return False
+    keys = [key(row) for row in value]
+    return all(left < right for left, right in zip(keys, keys[1:]))
+
+
+def _validate_component_readiness(
+    snapshot: Mapping[str, Any], *, lifecycle_only: bool = False
+) -> None:
+    """Validate the paired closed owner read; never compute readiness."""
+    def require(valid: bool) -> None:
+        if not valid:
+            raise HeadlessApiError("cclc_open_response_invalid", "CCLC component readiness is invalid")
+
+    try:
+        counters = {"dropped_output_lines", "dropped_output_bytes"}
+        fields = (_COMPONENT_FIELDS - {"lifecycle_progress", "lifecycle_target", "readiness"}
+                  if lifecycle_only else _COMPONENT_FIELDS | (counters if counters & set(snapshot) else set()))
+        require(set(snapshot) == fields)
+        state = snapshot["component_lifecycle_state"]
+        require(_member(state, _LIFECYCLE_STATES))
+        for name in ("controllable_component_id", "graph_revision", "retained_bundle_id",
+                     "snapshot_digest", "active_public_pointer_digest"):
+            require(_diagnostic_text(snapshot[name], 256, nonempty=True))
+        for name in ("component_lifecycle_generation", "publication_generation"):
+            require(_is_int(snapshot[name]) and 1 <= snapshot[name] <= MAXIMUM_SAFE_INTEGER)
+        domains = snapshot["domains"]
+        require(_canonical_rows(domains, 256, lambda row: row["control_domain_id"]))
+        require(bool(domains))
+        revisions = {}
+        for domain in domains:
+            require(_closed(domain, {"active_control_configuration", "control_domain_id",
+                "control_domain_revision", "controller_topology_id", "current_control_bindings",
+                "current_resources", "topology_revision"}))
+            for name in ("control_domain_id", "control_domain_revision", "controller_topology_id", "topology_revision"):
+                require(_diagnostic_text(domain[name], 256, nonempty=True))
+            bindings = domain["current_control_bindings"]
+            require(_canonical_rows(bindings, 4096, lambda binding: binding["control_binding_id"]) and bool(bindings))
+            for binding in bindings:
+                require(_closed(binding, {"control_binding_id", "control_binding_revision", "control_route_id"})
+                    and all(_diagnostic_text(value, 256, nonempty=True) for value in binding.values()))
+            resources = domain["current_resources"]
+            require(_canonical_rows(resources, 4096, lambda resource: resource) and bool(resources)
+                and all(_diagnostic_text(resource, 256, nonempty=True) for resource in resources))
+            active = domain["active_control_configuration"]
+            if active is not None:
+                require(_closed(active, {"activation_set_id", "active_control_configuration_generation",
+                    "active_control_configuration_id", "binding_routes", "control_domain_id", "control_domain_revision",
+                    "controller_topology_id", "source_runtime_epoch", "source_runtime_unit_id", "source_sequence", "state", "topology_revision"}))
+                for key in ("activation_set_id", "active_control_configuration_id", "control_domain_id", "control_domain_revision",
+                            "controller_topology_id", "source_runtime_epoch", "source_runtime_unit_id", "topology_revision"):
+                    require(_diagnostic_text(active[key], 256, nonempty=True))
+                for key in ("active_control_configuration_generation", "source_sequence"):
+                    require(_is_int(active[key]) and 1 <= active[key] <= MAXIMUM_SAFE_INTEGER)
+                require(_member(active["state"], frozenset({"reconciled", "external_or_unknown_unreconciled"})))
+                routes = active["binding_routes"]
+                require(_canonical_rows(routes, 4096, lambda route: route["control_binding_id"]) and bool(routes))
+                for route in routes:
+                    require(_closed(route, {"control_binding_id", "control_binding_revision", "control_route_id"})
+                        and all(_diagnostic_text(value, 256, nonempty=True) for value in route.values()))
+            revisions[domain["control_domain_id"]] = domain["control_domain_revision"]
+        providers = snapshot["provider_occurrences"]
+        require(_canonical_rows(providers, 4096, lambda row: (row["control_domain_id"], row["provider_instance_id"])))
+        for provider in providers:
+            require(_closed(provider, _OCCURRENCE_FIELDS))
+            require(all(_diagnostic_text(value, 256, nonempty=True) for value in provider.values()))
+        if lifecycle_only:
+            return
+        readiness = snapshot["readiness"]
+        require(_closed(readiness, {"request_owner_epoch", "evaluated_at_ns", "next_intent",
+            "requested_state", "ready", "error", "domains", "measured_state"}))
+        require(_diagnostic_text(readiness["request_owner_epoch"], 256, nonempty=True))
+        require(_is_owner_ns(readiness["evaluated_at_ns"]))
+        intent, requested = (("prepare", "prepared") if state in {"declared", "disabled"}
+            else ("enable", "active") if state == "prepared" else (None, None))
+        require(readiness["next_intent"] == intent and readiness["requested_state"] == requested)
+        require(type(readiness["ready"]) is bool and _readiness_error(readiness["error"]))
+        require(readiness["ready"] or readiness["error"] is not None)
+        rows = readiness["domains"]
+        ordered_fields = ("control_domain_id", "control_domain_revision", "provider_instance_id",
+            "provider_manifest_id", "provider_manifest_revision", "provider_runtime_unit_id",
+            "provider_runtime_epoch", "lifecycle_plan_catalog_digest")
+        require(_canonical_rows(rows, 256, lambda row: tuple(row["provider_occurrence"][key] for key in ordered_fields)))
+        require(len(rows) == len(providers))
+        for row in rows:
+            fields = {"provider_occurrence", "health", "decision_kind", "error"}
+            if "has_activation_step" in row:
+                fields.add("has_activation_step")
+                require(type(row["has_activation_step"]) is bool)
+            require(_closed(row, fields))
+            occurrence = row["provider_occurrence"]
+            require(_closed(occurrence, _OCCURRENCE_FIELDS | {"control_domain_revision"}))
+            require(all(_diagnostic_text(value, 128, nonempty=True) for value in occurrence.values()))
+            require(revisions.get(occurrence["control_domain_id"]) == occurrence["control_domain_revision"])
+            require({key: occurrence[key] for key in _OCCURRENCE_FIELDS} in providers)
+            require(_readiness_error(row["error"]))
+            health, decision = row["health"], row["decision_kind"]
+            require(decision is None or _member(decision, frozenset({"already_satisfied", "dispatch_primitive"})))
+            if health is None:
+                require(decision is None and row["error"] is not None)
+            else:
+                require(_closed(health, {"observed_state", "facts", "diagnostic"}))
+                require(_member(health["observed_state"], _LIFECYCLE_STATES) and _readiness_error(health["diagnostic"], 8))
+                require(_canonical_rows(health["facts"], 256, lambda fact: fact["lifecycle_fact_id"]))
+                for fact in health["facts"]:
+                    require(_closed(fact, {"lifecycle_fact_id", "value"}))
+                    require(_diagnostic_text(fact["lifecycle_fact_id"], 128, nonempty=True))
+                    value = fact["value"]
+                    kind = value["kind"]
+                    if kind == "unknown":
+                        require(_closed(value, {"kind"}))
+                    elif kind == "boolean":
+                        require(_closed(value, {"kind", "boolean_value"}) and type(value["boolean_value"]) is bool)
+                    elif kind == "integer":
+                        require(_closed(value, {"kind", "integer_value"}) and _is_int(value["integer_value"])
+                            and abs(value["integer_value"]) <= MAXIMUM_SAFE_INTEGER)
+                    elif kind == "token":
+                        require(_closed(value, {"kind", "token_value"})
+                            and _diagnostic_text(value["token_value"], 128, nonempty=True))
+                    else:
+                        require(False)
+                if intent is not None:
+                    require((row["error"] is None) == (decision is not None))
+            if intent is None:
+                require(decision is None)
+        measured = readiness["measured_state"]
+        require(_closed(measured, {"required", "available", "error"}) and _readiness_error(measured["error"]))
+        require((measured["required"] is False and measured["available"] is None and measured["error"] is None)
+            or (measured["required"] is None and measured["available"] is None and measured["error"] is not None)
+            or (measured["required"] is True and type(measured["available"]) is bool
+                and (measured["error"] is None) == measured["available"]))
+        if readiness["ready"]:
+            require(readiness["error"] is None and measured["error"] is None
+                and all(row["health"] is not None and row["error"] is None for row in rows)
+                and (intent is not None or state == "active"))
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        raise HeadlessApiError("cclc_open_response_invalid", "CCLC component readiness is invalid") from exc
 
 
 def _valid_diagnostic(value: Any) -> bool:
@@ -229,7 +418,10 @@ def _valid_diagnostic(value: Any) -> bool:
         ):
             return False
         for key, fact in snapshot["context"].items():
-            maximum = 1024 if key in {"request_context", "generator_identity"} else 128
+            maximum = (
+                _MAX_LAUNCH_IDENTITY_BYTES if key == "launch_identity"
+                else 1024 if key in {"request_context", "generator_identity"} else 128
+            )
             if fact is not None and not _diagnostic_text(fact, maximum):
                 return False
         readiness = snapshot["readiness"]
@@ -392,6 +584,17 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
             raise _invalid_lifecycle_fact("lifecycle_progress")
 
 
+def _validate_close_incident_intent(intent: Mapping[str, Any]) -> None:
+    close = intent.get("close_incident_recovery")
+    if close is not None and (
+            intent.get("intent") != "recover"
+            or intent.get("reason") != "cell closed by operator"
+            or not isinstance(close, dict)
+            or set(close) != {"expected_incident_id"}
+            or not _bounded_text(close["expected_incident_id"], _MAX_INCIDENT_ID_BYTES)):
+        raise HeadlessApiError("cclc_open_request_invalid", "Close incident recovery intent is invalid")
+
+
 def _validate_incident_recovery(
     result: Mapping[str, Any], intent: Mapping[str, Any]
 ) -> None:
@@ -403,20 +606,30 @@ def _validate_incident_recovery(
     absent for every other request.
     """
 
+    close = intent.get("close_incident_recovery")
     if "incident_recovery" not in result:
+        if close is not None:
+            if (set(result) == {"acceptance", "replay_status", "status"}
+                    and result.get("replay_status") in {"stale_request_owner_epoch", "request_id_conflict",
+                        "request_ledger_full", "request_result_expired"}
+                    and result["acceptance"] is None and result["status"] is None):
+                return  # Preserve the existing typed refusal; it is no acknowledgement.
+            raise HeadlessApiError("cclc_open_response_invalid", "Close requires the exact incident recovery acknowledgement")
         return
     recovery = result["incident_recovery"]
     component_id = intent.get("controllable_component_id")
     if (
         not isinstance(recovery, dict)
         or set(recovery)
-        != {
+        != ({
             "acknowledged_at_ns",
             "acknowledged_by",
             "cause_class",
             "controllable_component_id",
             "incident_id",
-        }
+        } | ({"closure_reason"} if close is not None else set()))
+        or (close is not None and (recovery.get("closure_reason") != "cell_closed_by_operator"
+            or recovery.get("incident_id") != close["expected_incident_id"]))
         or not _bounded_text(recovery["incident_id"], _MAX_INCIDENT_ID_BYTES)
         or not _member(recovery["cause_class"], _INCIDENT_CAUSE_CLASSES)
         or not _bounded_text(recovery["acknowledged_by"], 1024)
@@ -657,7 +870,40 @@ class CCLCOpenRequestClient:
                 "CCLC component snapshot identity does not match its request",
             )
         _validate_lifecycle_target_facts(result)
+        _validate_component_readiness(result)
         return result
+
+    def component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
+        result = self._require_object(
+            self._exchange("component_lifecycle_snapshot", {"controllable_component_id": component_id}),
+            command="component_lifecycle_snapshot",
+        )
+        if result.get("controllable_component_id") != component_id:
+            raise HeadlessApiError(
+                "cclc_open_response_identity_mismatch",
+                "CCLC component snapshot identity does not match its request",
+            )
+        _validate_component_readiness(result, lifecycle_only=True)
+        return result
+
+    def lifecycle_target_retirement_offer(self) -> dict[str, Any]:
+        return retirement_offer(self._require_object(
+            self._exchange("lifecycle_target_retirement_offer", {}),
+            command="lifecycle_target_retirement_offer"))
+
+    def retire_lifecycle_targets(self, intent: LifecycleTargetRetirementIntent) -> dict[str, Any]:
+        return retirement_result(self._require_object(
+            self._exchange("lifecycle_target_retire", intent.model_dump(mode="json", exclude_none=False)),
+            command="lifecycle_target_retire"), intent)
+
+    def lifecycle_target_retirement_result(self, intent: LifecycleTargetRetirementIntent) -> dict[str, Any] | None:
+        result = self._exchange("lifecycle_target_retirement_result", intent.model_dump(mode="json", exclude_none=False))
+        return None if result is None else retirement_result(result, intent)
+
+    def lifecycle_owner_settlement(self, scope: LifecycleTargetRetirementScope) -> dict[str, Any]:
+        return settlement_result(self._require_object(
+            self._exchange("lifecycle_owner_settlement", {"scope": scope.model_dump(mode="json")}),
+            command="lifecycle_owner_settlement"), scope)
 
     def route_templates(self, component_id: str) -> dict[str, Any]:
         result = self._require_object(
@@ -689,6 +935,7 @@ class CCLCOpenRequestClient:
         return result
 
     def submit_lifecycle(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        _validate_close_incident_intent(intent)
         result = self._require_object(
             self._exchange("lifecycle_submit", intent),
             command="lifecycle_submit",
@@ -710,6 +957,7 @@ class CCLCOpenRequestClient:
     def lifecycle_request_result(
         self, intent: Mapping[str, Any]
     ) -> dict[str, Any] | None:
+        _validate_close_incident_intent(intent)
         result = self._request_result("lifecycle_request_result", intent)
         if result is not None:
             _validate_incident_recovery(result, intent)

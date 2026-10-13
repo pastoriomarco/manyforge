@@ -177,13 +177,51 @@ export interface CCLCComponentSnapshot {
   lifecycleState: CCLCLifecycleState;
   retainedBundleId: string;
   graphRevision: string;
+  publicationGeneration: number;
+  activePublicPointerDigest: string;
   domains: CCLCComponentDomain[];
   providers: CCLCProviderOccurrence[];
   lifecycleTarget: CCLCLifecycleTarget | null;
   lifecycleProgress: CCLCLifecycleProgress | null;
+  readiness: CCLCComponentReadiness;
   /** Informational host output losses; unavailable observations stay absent. */
   droppedOutputLines?: CCLCUnsigned64;
   droppedOutputBytes?: CCLCUnsigned64;
+}
+
+export type CCLCLifecycleFactValue =
+  | { kind: 'unknown' }
+  | { kind: 'boolean'; booleanValue: boolean }
+  | { kind: 'integer'; integerValue: number }
+  | { kind: 'token'; tokenValue: string };
+
+export interface CCLCReadinessDomain {
+  providerOccurrence: CCLCProviderOccurrence & { controlDomainRevision: string };
+  /** Build-selected presentation fact; absent means not stated. */
+  hasActivationStep?: boolean;
+  health: {
+    observedState: CCLCLifecycleState;
+    facts: Array<{ lifecycleFactId: string; value: CCLCLifecycleFactValue }>;
+    diagnostic: CCLCTransactionStatus['error'];
+  } | null;
+  decisionKind: 'already_satisfied' | 'dispatch_primitive' | null;
+  error: CCLCTransactionStatus['error'];
+}
+
+/** Current owner verdict only; no readiness/admission authority or browser deadline. */
+export interface CCLCComponentReadiness {
+  requestOwnerEpoch: string;
+  evaluatedAtNs: Nanoseconds;
+  nextIntent: 'prepare' | 'enable' | null;
+  requestedState: 'prepared' | 'active' | null;
+  ready: boolean;
+  error: CCLCTransactionStatus['error'];
+  domains: CCLCReadinessDomain[];
+  measuredState: {
+    required: boolean | null;
+    available: boolean | null;
+    error: CCLCTransactionStatus['error'];
+  };
 }
 
 export interface CCLCExpectedActiveConfiguration {
@@ -253,6 +291,8 @@ export interface CCLCLifecycleRequestBody {
     }>;
   }>;
   reason: string;
+  /** Close acknowledges exactly this open incident; ordinary Recover is unchanged. */
+  close_incident_recovery?: { expected_incident_id: string } | null;
   confirmed: true;
 }
 
@@ -311,4 +351,49 @@ export interface CCLCIncidentRecovery {
   causeClass: CCLCIncidentCauseClass;
   acknowledgedBy: string;
   acknowledgedAtNs: Nanoseconds;
+  closureReason?: 'cell_closed_by_operator';
+}
+
+/** Bounded new owner commands preserve optional correlation presence exactly. */
+export type BoundedPublicRequestContext = Omit<CCLCRequestContext, 'correlation_id'> & { correlation_id?: string | null };
+
+/** Exact installed launch occurrence, never derived from a provider epoch alone. */
+export interface ComponentProcessStopRequest {
+  request_context: BoundedPublicRequestContext;
+  predecessor_projection_revision: import('./api').ProjectionRevision;
+  expected_predecessor_publication_generation: number;
+  expected_predecessor_public_pointer_digest: string;
+  runtime_unit_id: string;
+  runtime_epoch: string;
+  manager_runtime_epoch: string;
+  controllable_component_id: string;
+  launch_identity: string;
+  leader_pid: number;
+}
+export interface ComponentProcessStopResult {
+  request: ComponentProcessStopRequest;
+  state: 'not_requested' | 'pending' | 'unknown' | 'drained';
+  receipt: {
+    leader_pid: number;
+    controllable_component_id: string;
+    launch_identity: string;
+    observed_utc: string;
+  } | null;
+  error: CCLCTransactionStatus['error'];
+}
+
+export interface ComponentProcessStopOffer {
+  controllable_component_id: string;
+  process_inventories: Array<{
+    request: Pick<ComponentProcessStopRequest, 'predecessor_projection_revision'
+      | 'expected_predecessor_publication_generation' | 'expected_predecessor_public_pointer_digest'
+      | 'runtime_unit_id' | 'runtime_epoch' | 'manager_runtime_epoch'>;
+    process_occurrences: Array<{
+      controllable_component_id: string; launch_identity: string; leader_pid: number;
+      process_presence: 'unknown' | 'absent' | 'present';
+      cleanup_state: 'not_requested' | 'pending' | 'unknown' | 'drained';
+      receipt: ComponentProcessStopResult['receipt']; installed_runtime_identity: string | null;
+    }>;
+    error: null;
+  }>;
 }

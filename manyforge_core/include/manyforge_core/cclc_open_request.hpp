@@ -23,6 +23,27 @@ class ICCLCOpenRequestPort {
   virtual ~ICCLCOpenRequestPort() = default;
 
   [[nodiscard]] virtual RequestOwnerEpoch ReadRequestOwnerEpoch() const = 0;
+
+  [[nodiscard]] virtual Result<CCLCLifecycleTargetRetirementOfferDTO>
+  ReadLifecycleTargetRetirementOffer() {
+    return Result<CCLCLifecycleTargetRetirementOfferDTO>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<CCLCLifecycleTargetRetirementResultDTO>
+  RetireLifecycleTargetsForClose(const CCLCLifecycleTargetRetirementIntentDTO&) {
+    return Result<CCLCLifecycleTargetRetirementResultDTO>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>
+  ReadLifecycleTargetRetirementResult(const CCLCLifecycleTargetRetirementIntentDTO&) {
+    return Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<void> ReadLifecycleOwnerSettlement(
+      const CCLCLifecycleTargetRetirementScopeDTO&) {
+    return Result<void>::Err(
+        {"cclc_owner_settlement_unavailable", "owner settlement is not composed", {}});
+  }
   [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) = 0;
   [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
@@ -34,6 +55,13 @@ class ICCLCOpenRequestPort {
       const LifecycleTransactionId& transaction_id) = 0;
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component_id) const = 0;
+  /// Closed status projection from the actual composed owner. A legacy
+  /// source override cannot manufacture readiness from a component snapshot.
+  [[nodiscard]] virtual Result<CCLCComponentReadDTO> ReadCurrentComponentView(
+      const ControllableComponentId&) const {
+    return Result<CCLCComponentReadDTO>::Err(
+        {"cclc_product_read_unavailable", "the grouped component owner read is not composed", {}});
+  }
   /// Requested lifecycle target and progress shown beside the component
   /// snapshot. Both are absent when no target is recorded or composed.
   [[nodiscard]] virtual Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
@@ -74,6 +102,13 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
       ComponentLifecycleCoordinator& coordinator,
       CCLCLifecycleTargetDriver* target_driver = nullptr) noexcept;
 
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementOfferDTO> ReadLifecycleTargetRetirementOffer() override;
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementResultDTO> RetireLifecycleTargetsForClose(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>> ReadLifecycleTargetRetirementResult(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) override;
+  [[nodiscard]] Result<void> ReadLifecycleOwnerSettlement(
+      const CCLCLifecycleTargetRetirementScopeDTO& scope) override;
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override;
@@ -82,6 +117,8 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& transaction_id) override;
   [[nodiscard]] Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
+      const ControllableComponentId& component_id) const override;
+  [[nodiscard]] Result<CCLCComponentReadDTO> ReadCurrentComponentView(
       const ControllableComponentId& component_id) const override;
   [[nodiscard]] Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
       const ControllableComponentId& component_id) const override;

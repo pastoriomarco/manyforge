@@ -5,8 +5,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <barrier>
 #include <algorithm>
+#include <array>
+#include <barrier>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -1675,6 +1676,131 @@ TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) 
                           ManagerApplyEffectDisposition::kUnknown, true));
   EXPECT_FALSE(settlement(ManagerApplyPhase::kAccepted,
                           ManagerApplyEffectDisposition::kKnown, false));
+}
+
+// Q118: exact terminal proof is passive; a LIVE holder is never inferred dead.
+TEST(ManagerApplyJournal,
+     ConfigurationSuccessorRequiresExactTerminalOldClaims) {
+  for (const auto disposition : {ManagerApplyEffectDisposition::kKnown,
+                                 ManagerApplyEffectDisposition::kUnknown}) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "successor-proof.sqlite3";
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    const core::CellAdmissionClaimDTO claim{
+        {core::CellAdmissionClaimKindDTO::kManagerApply,
+         core::CellAdmissionOwnerRoleDTO::kManager,
+         intent.intent.request_context.request_owner_epoch,
+         intent.intent.apply_id.value(),
+         intent.intent.request_context.request_id,
+         intent.intent_digest,
+         *intent.intent.expected_admission_generation,
+         {},
+         std::nullopt,
+         std::nullopt,
+         std::nullopt},
+        core::CellAdmissionClaimGeneration(3U),
+        *intent.intent.expected_admission_generation,
+        42};
+    const std::array claims{claim};
+    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
+                     path, CellId("cell-1"), claims)
+                     .ok());
+    const auto terminal =
+        journal
+            .EnsureTerminalOutcome(
+                {ApplyId("apply-1"), ApplyGeneration(1U), std::nullopt,
+                 std::nullopt, std::nullopt, std::nullopt,
+                 disposition == ManagerApplyEffectDisposition::kKnown
+                     ? ManagerApplyTerminalOutcomeState::kFailed
+                     : ManagerApplyTerminalOutcomeState::kUnknownEffect,
+                 ManagerApplyFailureEvidenceDTO{
+                     intent.intent_digest, ManagerApplyPhase::kAccepted,
+                     "refused", "test refusal", disposition}})
+            .record;
+    EXPECT_TRUE(ValidateTerminalManagerApplyClaimsReadOnly(
+                    path, CellId("cell-1"), claims)
+                    .ok());
+    auto foreign = claim;
+    foreign.intent.request_payload_digest =
+        ContentDigest(std::string(kDigestTwo));
+    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
+                     path, CellId("cell-1"), std::array{foreign})
+                     .ok());
+    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
+                     path, CellId("cell-other"), claims)
+                     .ok());
+    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
+                     path, CellId("cell-1"), std::array{claim, claim})
+                     .ok());
+    EXPECT_EQ(
+        journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
+        terminal);
+    EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
+  }
+}
+
+TEST(ManagerApplyJournal,
+     ConfigurationSuccessorRequiresExactFreshSucceededChain) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "fresh-success-proof.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto transition = EnsureSelectedBundleTransition(journal);
+  const auto status =
+      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(status.has_value());
+  const auto &intent = status->intent;
+  const core::CellAdmissionClaimDTO claim{
+      {core::CellAdmissionClaimKindDTO::kManagerApply,
+       core::CellAdmissionOwnerRoleDTO::kManager,
+       intent.intent.request_context.request_owner_epoch,
+       intent.intent.apply_id.value(),
+       intent.intent.request_context.request_id,
+       intent.intent_digest,
+       *intent.intent.expected_admission_generation,
+       {},
+       std::nullopt,
+       std::nullopt,
+       std::nullopt},
+      core::CellAdmissionClaimGeneration(3U),
+      *intent.intent.expected_admission_generation,
+      42};
+  core::CellAdmissionClaimReleaseDTO release{
+      claim.intent.owner_role,
+      claim.intent.owner_epoch,
+      claim.intent.owner_transaction_id,
+      claim.intent.request_id,
+      claim.intent.request_payload_digest,
+      claim.acquired_admission_generation,
+      claim.claim_generation,
+      {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
+       ContentDigest(std::string(kDigestOne))}};
+  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
+                                                        claim, release)
+                   .ok());
+  const auto completed = EnsureApplyCompletion(journal, transition);
+  release.settlement.evidence_digest =
+      completed.terminal.terminal_outcome_digest;
+  EXPECT_TRUE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
+                                                       claim, release)
+                  .ok());
+  EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
+                   path, CellId("cell-1"), std::array{claim})
+                   .ok());
+  auto foreign = release;
+  foreign.settlement.evidence_digest = ContentDigest(std::string(kDigestTwo));
+  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
+                                                        claim, foreign)
+                   .ok());
+  foreign = release;
+  foreign.claim_generation = core::CellAdmissionClaimGeneration(4U);
+  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
+                                                        claim, foreign)
+                   .ok());
+  EXPECT_EQ(
+      journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
+      completed.terminal);
+  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
 }
 
 TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {

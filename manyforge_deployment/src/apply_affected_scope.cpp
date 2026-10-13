@@ -2,6 +2,7 @@
 
 #include "apply_affected_scope_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
+#include <manyforge_deployment/apply_component_delta.hpp>
 
 #include <algorithm>
 #include <map>
@@ -286,9 +287,10 @@ void MarkRuntimeUnitDependents(const core::RetainedBundleDTO &bundle,
   }
 }
 
-void CloseResourceOverlap(const core::CellGraphDTO &predecessor,
-                          const core::CellGraphDTO &candidate,
-                          std::set<core::ResourceId> &resources) {
+void CloseResourceOverlap(
+    const core::CellGraphDTO &predecessor, const core::CellGraphDTO &candidate,
+    std::set<core::ResourceId> &resources,
+    const std::vector<const core::ControlBindingDTO *> &actual_bindings) {
   bool changed = true;
   while (changed) {
     const auto previous_size = resources.size();
@@ -302,6 +304,10 @@ void CloseResourceOverlap(const core::CellGraphDTO &predecessor,
         MarkBinding(binding, resources);
       }
     }
+    for (const auto *binding : actual_bindings) {
+      if (ClaimsAny(*binding, resources))
+        MarkBinding(*binding, resources);
+    }
     changed = resources.size() != previous_size;
   }
 }
@@ -313,7 +319,11 @@ namespace detail {
 core::ConfigurationFenceScopeDTO
 derive_apply_configuration_fence_scope_verified_values(
     const core::RetainedBundleDTO &old_bundle,
-    const core::RetainedBundleDTO &new_bundle) {
+    const core::RetainedBundleDTO &new_bundle,
+    const std::span<const core::ControllableComponentId>
+        actual_restart_components,
+    const std::span<const core::RetainedBundleDTO *const>
+        actual_terminal_products) {
   if (old_bundle.cell_graph.cell_id != new_bundle.cell_graph.cell_id) {
     Fail("Apply affected-scope bundles belong to different cells");
   }
@@ -488,23 +498,89 @@ derive_apply_configuration_fence_scope_verified_values(
   MarkRuntimeUnitDependents(new_bundle, affected_runtime_units,
                             affected_resources);
 
-  CloseResourceOverlap(old_graph, new_graph, affected_resources);
+  std::vector<const core::ControlBindingDTO *> actual_bindings;
+  std::map<core::ControlDomainId, const core::ControlDomainDTO *>
+      actual_domains;
+  std::set<core::ControllableComponentId> actual_components;
+  if (actual_terminal_products.size() > kMaximumApplyComponentDeltaRows ||
+      actual_restart_components.size() > kMaximumApplyComponentDeltaRows) {
+    Fail("actual_installed_state_unknown: terminal source inventory exceeds "
+         "its component bound");
+  }
+  if (!std::is_sorted(actual_restart_components.begin(),
+                      actual_restart_components.end()) ||
+      std::adjacent_find(actual_restart_components.begin(),
+                         actual_restart_components.end()) !=
+          actual_restart_components.end()) {
+    Fail("actual Apply restart components are not a bounded canonical "
+         "inventory");
+  }
+  for (const auto *source : actual_terminal_products) {
+    if (!source || source->cell_graph.cell_id != old_graph.cell_id)
+      Fail("actual_installed_state_unknown: terminal product has a foreign "
+           "cell");
+    for (const auto &binding : source->cell_graph.control_bindings) {
+      if (!std::binary_search(actual_restart_components.begin(),
+                              actual_restart_components.end(),
+                              binding.controllable_component_id))
+        continue;
+      actual_components.insert(binding.controllable_component_id);
+      actual_bindings.push_back(&binding);
+      MarkBinding(binding, affected_resources);
+      const auto domain = std::find_if(
+          source->cell_graph.control_domains.begin(),
+          source->cell_graph.control_domains.end(), [&](const auto &row) {
+            return row.control_domain_id == binding.control_domain_id;
+          });
+      if (domain == source->cell_graph.control_domains.end())
+        Fail("actual_installed_state_unknown: terminal source binding has no "
+             "actual domain");
+      const auto [found, inserted] =
+          actual_domains.emplace(domain->control_domain_id, &*domain);
+      if (!inserted && *found->second != *domain)
+        Fail("actual_installed_state_unknown: terminal products conflict on "
+             "actual domain revision");
+    }
+  }
+  for (const auto &component : actual_restart_components) {
+    const auto present = [&](const auto &graph) {
+      return std::any_of(graph.controllable_components.begin(),
+                         graph.controllable_components.end(),
+                         [&](const auto &row) {
+                           return row.controllable_component_id == component;
+                         });
+    };
+    if (!present(old_graph) && !present(new_graph) &&
+        !actual_components.contains(component)) {
+      Fail("actual Apply restart component is absent from both verified "
+           "products");
+    }
+    MarkComponent(old_graph, component, affected_resources);
+    MarkComponent(new_graph, component, affected_resources);
+  }
+  CloseResourceOverlap(old_graph, new_graph, affected_resources,
+                       actual_bindings);
   if (affected_resources.empty()) {
     return {};
   }
 
-  const auto old_bindings =
-      IndexBy<core::ControlBindingDTO, core::ControlBindingId>(
-          old_graph.control_bindings,
-          [](const core::ControlBindingDTO &binding) {
-            return binding.control_binding_id;
-          });
+  auto old_bindings = IndexBy<core::ControlBindingDTO, core::ControlBindingId>(
+      old_graph.control_bindings, [](const core::ControlBindingDTO &binding) {
+        return binding.control_binding_id;
+      });
   const auto new_bindings =
       IndexBy<core::ControlBindingDTO, core::ControlBindingId>(
           new_graph.control_bindings,
           [](const core::ControlBindingDTO &binding) {
             return binding.control_binding_id;
           });
+  for (const auto *binding : actual_bindings) {
+    const auto [found, inserted] =
+        old_bindings.emplace(binding->control_binding_id, binding);
+    if (!inserted && *found->second != *binding)
+      Fail("actual_installed_state_unknown: terminal products conflict on "
+           "actual binding revision");
+  }
   std::set<core::ControlBindingId> selected_binding_ids;
   for (const auto &[id, binding] : old_bindings) {
     if (ClaimsAny(*binding, affected_resources)) {
@@ -547,16 +623,21 @@ derive_apply_configuration_fence_scope_verified_values(
     });
   }
 
-  const auto old_domains =
-      IndexBy<core::ControlDomainDTO, core::ControlDomainId>(
-          old_graph.control_domains, [](const core::ControlDomainDTO &domain) {
-            return domain.control_domain_id;
-          });
+  auto old_domains = IndexBy<core::ControlDomainDTO, core::ControlDomainId>(
+      old_graph.control_domains, [](const core::ControlDomainDTO &domain) {
+        return domain.control_domain_id;
+      });
   const auto new_domains =
       IndexBy<core::ControlDomainDTO, core::ControlDomainId>(
           new_graph.control_domains, [](const core::ControlDomainDTO &domain) {
             return domain.control_domain_id;
           });
+  for (const auto &[id, domain] : actual_domains) {
+    const auto [found, inserted] = old_domains.emplace(id, domain);
+    if (!inserted && *found->second != *domain)
+      Fail("actual_installed_state_unknown: terminal source conflicts with the "
+           "actual predecessor domain");
+  }
   std::vector<core::ConfigurationFenceDomainScopeDTO> domains;
   domains.reserve(domain_ids.size());
   for (const auto &id : domain_ids) {
@@ -590,12 +671,29 @@ derive_apply_configuration_fence_scope_verified_values(
 core::ConfigurationFenceScopeDTO
 derive_apply_configuration_fence_scope(const RetainedBundle &predecessor,
                                        const RetainedBundle &candidate) {
+  return derive_apply_configuration_fence_scope(predecessor, candidate, {});
+}
+
+core::ConfigurationFenceScopeDTO derive_apply_configuration_fence_scope(
+    const RetainedBundle &predecessor, const RetainedBundle &candidate,
+    const std::span<const core::ControllableComponentId>
+        actual_restart_components,
+    const std::span<const RetainedBundle *const> actual_terminal_products) {
   if (!verify_retained_bundle_identity(predecessor) ||
       !verify_retained_bundle_identity(candidate)) {
     Fail("Apply affected-scope input failed retained-bundle identity proof");
   }
+  std::vector<const core::RetainedBundleDTO *> sources;
+  sources.reserve(actual_terminal_products.size());
+  for (const auto *product : actual_terminal_products) {
+    if (!product || !verify_retained_bundle_identity(*product))
+      Fail("actual_installed_state_unknown: terminal source product failed "
+           "byte identity proof");
+    sources.push_back(&product->value());
+  }
   return detail::derive_apply_configuration_fence_scope_verified_values(
-      predecessor.value(), candidate.value());
+      predecessor.value(), candidate.value(), actual_restart_components,
+      sources);
 }
 
 } // namespace manyforge::deployment

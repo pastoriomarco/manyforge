@@ -209,6 +209,46 @@ class UnusedComponentSnapshotSource final : public ICCLCCurrentComponentSnapshot
   }
 };
 
+// Qualified component read over the same accepted route fixture. This is a
+// read-only owner view; the route test retains its actual journal/fence/claim.
+class RouteReadinessSnapshotSource final : public ICCLCCurrentComponentSnapshotSource {
+ public:
+  static ActiveBundlePublicationReceiptDTO Publication() {
+    const ProjectionRevisionDTO revision{RetainedBundleId("bundle.1"),
+        GraphRevision("graph.1"), {SceneId(Sha('a')), 1U, ContentDigest(Sha('b'))}};
+    return {{ActiveBundlePublicationTransactionRefDTO{BootstrapPublicationTransactionDTO{
+        BootstrapId("bootstrap.1"), BootstrapGeneration(1U)}}, revision,
+        revision.retained_bundle_id, revision.graph_revision, std::nullopt,
+        ContentDigest("private.1")}, ActiveBundlePublicationGeneration(2U),
+        ContentDigest("public-pointer.1")};
+  }
+  RouteReadinessSnapshotSource() {
+    const auto desired = Desired();
+    const auto& binding = desired.binding_routes.front();
+    value = std::make_unique<ComponentLifecycleCurrentSnapshotDTO>(ComponentLifecycleCurrentSnapshotDTO{
+        ContentDigest("unsealed"), ControllableComponentId("component.arm"),
+        ComponentLifecycleGeneration(4U), ComponentLifecycleStateDTO::kPrepared, publication,
+        {{desired.control_domain_id, desired.control_domain_revision, desired.controller_topology_id,
+          desired.topology_revision, std::nullopt,
+          {{binding.control_binding_id, binding.control_binding_revision, binding.control_route_id}},
+          {ResourceId("joint.arm")}}},
+        {{desired.control_domain_id, desired.control_domain_revision, ProviderInstanceId("provider.arm"),
+          ProviderManifestId("manifest.arm"), ProviderManifestRevision(Sha('1')),
+          RuntimeUnitId("runtime.controller-manager"), RuntimeEpoch("runtime-epoch.1"), ContentDigest(Sha('2'))}}});
+    const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(*value);
+    if (!digest.ok()) throw std::runtime_error(digest.error().message);
+    value->snapshot_digest = digest.value();
+  }
+  Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponentSnapshot(
+      const ControllableComponentId& component) const override {
+    if (component != value->controllable_component_id)
+      return Result<ComponentLifecycleCurrentSnapshotDTO>::Err({"foreign_component", "foreign component", {}});
+    return Result<ComponentLifecycleCurrentSnapshotDTO>::Ok(*value);
+  }
+  ActiveBundlePublicationReceiptDTO publication = Publication();
+  std::unique_ptr<ComponentLifecycleCurrentSnapshotDTO> value;
+};
+
 class UnusedCatalogSource final : public ICCLCLifecyclePlanCatalogSource {
  public:
   [[nodiscard]] Result<BrandLifecyclePlanCatalogDTO> LoadExactLifecyclePlanCatalog(
@@ -1136,7 +1176,7 @@ TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClear
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
   CCLCDomainReservationTable reservations;
-  UnusedComponentSnapshotSource component_snapshots;
+  RouteReadinessSnapshotSource component_snapshots;
   UnusedCatalogSource catalogs;
   UnusedBrandResolver brand_resolver;
   RecoveryAwareAdmissionPort admission_port;
@@ -1151,9 +1191,20 @@ TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClear
   WaitableManualScheduler scheduler;
   ComponentLifecycleCoordinatorRouteServices route_services{&route_snapshots, &controller_resolver,
                                                             &route_fence, &publisher};
-  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, component_snapshots,
-                                            catalogs, brand_resolver, admission_port, clock,
-                                            scheduler, route_services);
+  std::size_t source_captures = 0U;
+  const auto context = std::make_shared<const ComponentLifecycleProductContext>(
+      ComponentLifecycleProductContext{component_snapshots, catalogs, brand_resolver, route_services,
+          nullptr, ComponentLifecycleProductIdentity{component_snapshots.publication,
+              {ControllableComponentId("component.arm")}}, nullptr,
+          std::make_shared<const ConfiguredRobotMeasuredStateInventory>(
+              std::vector<ConfiguredRobotMeasuredStateRequirement>{}),
+          [&](const ComponentLifecycleCurrentSnapshotDTO&) {
+            ++source_captures;
+            return Result<ComponentLifecycleReadinessSourceView>::Ok(
+                {std::nullopt, [] { return Result<void>::Ok(); }});
+          }});
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, context,
+                                            admission_port, clock, scheduler);
   ASSERT_TRUE(coordinator.Start().ok());
   auto intent = Intent(coordinator.request_owner_epoch());
   admission_port.RejectNextClaim(
@@ -1183,6 +1234,23 @@ TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClear
   EXPECT_EQ(failed.value()->error->details.at("reason"),
             "stop_stage_attempt_prequalification_exceeded");
   EXPECT_EQ(failed.value()->phase, RouteSelectionTransactionPhaseDTO::kPublishing);
+  const auto observations_before = controller->observe_count();
+  const auto publication_count_before = publisher.publication_count();
+  const auto readiness = coordinator.ReadCurrentComponentView(ControllableComponentId("component.arm"),
+      [] { return Result<ComponentLifecycleTargetViewDTO>::Ok(
+          {std::nullopt, std::nullopt, std::nullopt, std::nullopt}); },
+      [] { return Result<ComponentLifecycleReadinessTargetFactsDTO>::Ok({{}, std::nullopt}); });
+  ASSERT_TRUE(readiness.ok()) << readiness.error().message;
+  EXPECT_FALSE(readiness.value().readiness.ready);
+  ASSERT_EQ(readiness.value().readiness.domains.size(), 1U);
+  EXPECT_FALSE(readiness.value().readiness.domains.front().health);
+  EXPECT_EQ(readiness.value().readiness.domains.front().error, failed.value()->error);
+  EXPECT_EQ(source_captures, 0U);
+  EXPECT_EQ(controller->observe_count(), observations_before);
+  EXPECT_EQ(publisher.publication_count(), publication_count_before);
+  const auto after_read = coordinator.LoadRouteSelectionStatus(id);
+  ASSERT_TRUE(after_read.ok() && after_read.value());
+  EXPECT_EQ(*after_read.value(), *failed.value());
   EXPECT_EQ(route_fence.release_count(), 0U);
   clock.set(2'000);
   scheduler.AdvanceTo(2'000);

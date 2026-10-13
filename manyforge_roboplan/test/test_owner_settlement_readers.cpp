@@ -97,11 +97,13 @@ ReleaseJson(std::string_view role, std::string_view owner_epoch,
 
 [[nodiscard]] std::string
 ProgramStartSettlementJson(std::string_view claim_json,
-                           std::string_view program_run_id) {
+                           std::string_view program_run_id,
+                           std::string_view prepared_scene =
+                               "{\"schema_version\":"
+                               "\"manyforge.prepared_program_scene.v1\"}") {
   return "{\"claim\":" + std::string(claim_json) +
-         ",\"kind\":\"proven_no_effect\",\"prepared_scene\":{"
-         "\"schema_version\":\"manyforge.prepared_program_scene.v1\"},"
-         "\"program_run_id\":\"" +
+         ",\"kind\":\"proven_no_effect\",\"prepared_scene\":" +
+         std::string(prepared_scene) + ",\"program_run_id\":\"" +
          std::string(program_run_id) +
          "\",\"schema_version\":"
          "\"manyforge.program_cycle_start_settlement.v1\"}";
@@ -289,6 +291,62 @@ TEST(OwnerSettlementReaders,
     else
       EXPECT_EQ(result.error().details.at("reason"),
                 "program_run_recovery_product_unavailable");
+  }
+}
+
+TEST(OwnerSettlementReaders,
+     NoSceneFailedStartResetAcceptsOnlyEmptyOrLegacySceneEvidence) {
+  const auto claim_json = ClaimJson("program_cycle", "program_runner",
+                                    "runner.1", "cycle.1", "start.1");
+  const auto claim = DecodeCellAdmissionClaim(claim_json);
+  struct Case {
+    const char *scene;
+    bool accepted;
+  };
+  for (const auto &item :
+       {Case{"{}", true},
+        Case{"{\"schema_version\":\"manyforge.prepared_program_scene.v1\"}", true},
+        Case{"{\"unexpected\":true}", false},
+        Case{"{\"schema_version\":\"foreign\"}", false},
+        Case{"[]", false}, Case{"null", false}}) {
+    SCOPED_TRACE(item.scene);
+    const auto settlement =
+        ProgramStartSettlementJson(claim_json, "cycle.1", item.scene);
+    // Each case has its own authentic digest, so malformed scene evidence
+    // cannot be rejected merely because the terminal reference is stale.
+    const auto evidence = content_identity::sha256_digest(settlement);
+    const auto release_json =
+        ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
+                    "explicit_reset", evidence);
+    const auto release = DecodeCellAdmissionClaimRelease(release_json);
+    TemporaryDatabase fixture;
+    fixture.Exec(
+        "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+        "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,7);"
+        "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+        "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+        "terminal_reference TEXT,start_settlement_json TEXT,"
+        "release_intent_json TEXT,reconciliation_required INTEGER,"
+        "acquisition_pending_json TEXT,reset_phase TEXT);"
+        "INSERT INTO program_cycle VALUES(1,'resetting','runner.1','cycle.1','" +
+        claim_json + "','" + evidence + "','" + settlement + "','" +
+        release_json + "',0,NULL,'releasing')");
+    const auto result =
+        ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release);
+    EXPECT_EQ(result.ok(), item.accepted);
+    if (item.accepted) {
+      const auto foreign_release = DecodeCellAdmissionClaimRelease(
+          ReleaseJson("program_runner", "runner.1", "cycle.1", "foreign.start",
+                      "explicit_reset", evidence));
+      EXPECT_FALSE(ValidateProgramCycleSettlementReadOnly(
+                       fixture.path(), claim, foreign_release)
+                       .ok());
+      fixture.Exec("UPDATE program_cycle SET terminal_reference='" +
+                   std::string(kDigestB) + "'");
+      EXPECT_FALSE(ValidateProgramCycleSettlementReadOnly(
+                       fixture.path(), claim, release)
+                       .ok());
+    }
   }
 }
 

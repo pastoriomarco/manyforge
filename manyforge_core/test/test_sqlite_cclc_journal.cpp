@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
+#include "close_retirement_sqlite_faults.hpp"
 #include <sqlite3.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -26,6 +29,9 @@
 
 namespace manyforge::core {
 namespace {
+
+// Actual retained UR5e launch identity from the qualified Close fixture.
+const std::string kUr5eLaunchIdentity257 = "mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n";
 
 [[nodiscard]] CellObserverIncidentRecordDTO ObserverLossRecord() {
   using content_identity::CanonicalValue;
@@ -5482,6 +5488,44 @@ TEST(SqliteCCLCJournal, PruneNoticeFailureCannotUndoCommittedPruningOrNewInciden
             2);
 }
 
+TEST(SqliteCCLCJournal, Real257ByteLaunchIdentitySurvivesIncidentReadbackAndReopen) {
+  ASSERT_EQ(kUr5eLaunchIdentity257.size(), 257U);
+  ScopedTemporaryDirectory temporary;
+  const ControllableComponentId component("ur5e_robot");
+  const auto initial = TestIncident("incident.ur5e", component,
+                                    LifecycleBlockingCauseClassDTO::kFault, 100);
+  const auto context = WithObserverMember(
+      *TestLaunchDiagnosticSnapshot()->find_object_member("context"), "launch_identity",
+      content_identity::CanonicalValue(kUr5eLaunchIdentity257));
+  const auto snapshot = std::make_shared<const content_identity::CanonicalValue>(
+      WithObserverMember(*TestLaunchDiagnosticSnapshot(), "context", context));
+  ASSERT_TRUE(ComponentIncidentDiagnosticSnapshotShapeIsValid(*snapshot));
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    ASSERT_TRUE(journal.OpenComponentIncident(initial, 0U).ok());
+    const auto contained = ComponentIncidentRecordWithContainment(
+        initial.record_json, ComponentIncidentContainmentStateDTO::kFailed, std::nullopt,
+        std::string("fixture containment unavailable"));
+    ASSERT_TRUE(journal.RecordComponentIncidentContainment(
+        "incident.ur5e", ComponentIncidentContainmentStateDTO::kFailed, contained, 110).value());
+    ASSERT_TRUE(journal.AppendComponentIncidentDiagnostic(
+        "incident.ur5e", 120, ErrorDTO{"controller_launch_exited", "signal=11", {}}, snapshot).value());
+    const auto current = journal.LoadOpenComponentIncident(component).value();
+    ASSERT_TRUE(current && current->diagnostic_snapshot);
+    EXPECT_EQ(*current->diagnostic_snapshot, *snapshot);
+    std::shared_ptr<const content_identity::CanonicalValue> event_snapshot;
+    (void)ComponentIncidentDiagnosticFromRecord(
+        journal.LoadComponentIncidentEvents(0U, 16U).value().back().payload_json, &event_snapshot);
+    ASSERT_TRUE(event_snapshot);
+    EXPECT_EQ(*event_snapshot, *snapshot);
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+  const auto retained = reopened.LoadOpenComponentIncident(component).value();
+  ASSERT_TRUE(retained && retained->diagnostic_snapshot);
+  EXPECT_EQ(retained->diagnostic_snapshot->find_object_member("context")
+                ->find_object_member("launch_identity")->as_string(), kUr5eLaunchIdentity257);
+}
+
 TEST(SqliteCCLCJournal, ExitDiagnosticIsSetOnceAndSurvivesGlobalEventTrimAndReopen) {
   ScopedTemporaryDirectory temporary;
   const ControllableComponentId component("component.1");
@@ -6112,6 +6156,84 @@ TEST(SqliteCCLCJournal, OpenIncidentSurvivesReopenAndOnlyTheOperatorsRecoverClos
       TestIncident("incident.3", component, LifecycleBlockingCauseClassDTO::kCollision, 300), 1U);
   ASSERT_TRUE(next.ok());
   EXPECT_EQ(next.value().incident.incident_id, "incident.3");
+}
+
+TEST(SqliteCCLCJournal, CloseRecoveryMatchesActualIncidentAndRetainsTypedReplayAcrossReopen) {
+  ScopedTemporaryDirectory temporary;
+  RequestOwnerEpoch owner("owner.1");
+  const ControllableComponentId component("component.1");
+  auto close = RecoverIntent("close.recover.1", owner);
+  close.reason = "cell closed by operator";
+  close.close_incident_recovery = CloseComponentIncidentRecoveryDTO{"incident.1"};
+  ComponentIncidentRecoveryDTO expected{
+      "incident.1", component, LifecycleBlockingCauseClassDTO::kFault, "operator.ada", 140,
+      ComponentIncidentClosureReasonDTO::kCellClosedByOperator};
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+    close.request_context.request_owner_epoch = owner;
+    ASSERT_TRUE(journal.OpenComponentIncident(
+        TestIncident("incident.1", component, LifecycleBlockingCauseClassDTO::kFault, 100), 0U).ok());
+    auto foreign = close;
+    foreign.close_incident_recovery->expected_incident_id = "incident.foreign";
+    const auto refused = journal.RecoverComponentIncident(owner, foreign, "operator.ada", 120);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().code, "component_lifecycle_close_incident_mismatch");
+    EXPECT_TRUE(journal.LoadOpenComponentIncident(component).value());
+    EXPECT_FALSE(journal.ReadLifecycleRequestResult(foreign).value());
+    const auto recovered = journal.RecoverComponentIncident(owner, close, "operator.ada", 140);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_TRUE(recovered.value());
+    EXPECT_EQ(recovered.value()->incident_recovery, expected);
+    EXPECT_FALSE(recovered.value()->acceptance);
+    EXPECT_FALSE(recovered.value()->status);
+    const auto events = journal.LoadComponentIncidentEvents(0U, 16U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().size(), 1U);
+    EXPECT_NE(events.value().front().payload_json.find(
+        R"("closure_reason":"cell_closed_by_operator")"), std::string::npos);
+    EXPECT_NE(events.value().front().payload_json.find(
+        R"("acknowledged_by":"operator.ada")"), std::string::npos);
+    const auto replay = journal.RecoverComponentIncident(owner, close, "other.operator", 150);
+    ASSERT_TRUE(replay.ok() && replay.value());
+    EXPECT_EQ(replay.value()->replay_status, RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(replay.value()->incident_recovery, expected);
+    const auto conflict = journal.RecoverComponentIncident(owner, foreign, "operator.ada", 150);
+    ASSERT_TRUE(conflict.ok() && conflict.value());
+    EXPECT_EQ(conflict.value()->replay_status, RequestReplayStatusDTO::kRequestIdConflict);
+    auto closed = close;
+    closed.request_context.request_id = RequestId("close.again");
+    EXPECT_FALSE(journal.RecoverComponentIncident(owner, closed, "operator.ada", 160).ok());
+    ASSERT_TRUE(journal.OpenComponentIncident(
+        TestIncident("incident.2", component, LifecycleBlockingCauseClassDTO::kFault, 200), 1U).ok());
+    EXPECT_FALSE(journal.RecoverComponentIncident(owner, closed, "operator.ada", 220).ok());
+    EXPECT_EQ(journal.LoadOpenComponentIncident(component).value()->incident.incident_id, "incident.2");
+    journal.Close();
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+  const auto replay = reopened.ReadLifecycleRequestResult(close);
+  ASSERT_TRUE(replay.ok() && replay.value());
+  EXPECT_EQ(replay.value()->incident_recovery, expected);
+  EXPECT_EQ(replay.value()->replay_status, RequestReplayStatusDTO::kReplayedExact);
+}
+
+TEST(SqliteCCLCJournal, CloseRecoveryWithNoActualIncidentNeverFallsBackToOrdinaryRecover) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  RequestOwnerEpoch owner("owner.1");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+  auto close = RecoverIntent("close.recover", owner);
+  close.reason = "cell closed by operator";
+  close.close_incident_recovery = CloseComponentIncidentRecoveryDTO{"incident.absent"};
+  const auto refused = journal.RecoverComponentIncident(owner, close, "operator.ada", 100);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_lifecycle_close_incident_mismatch");
+  EXPECT_FALSE(journal.ReadLifecycleRequestResult(close).value());
+  EXPECT_TRUE(journal.LoadComponentIncidentEvents(0U, 16U).value().empty());
+  close.close_incident_recovery.reset();
+  const auto ordinary = journal.RecoverComponentIncident(owner, close, "operator.ada", 100);
+  ASSERT_TRUE(ordinary.ok());
+  EXPECT_FALSE(ordinary.value());
 }
 
 TEST(SqliteCCLCJournal, ChangedConfigurationRetiresReachedIntentAndOperatorRecoverRemainsExplicit) {
@@ -8304,6 +8426,856 @@ TEST(SqliteCCLCJournal, CloseRetiresEveryActualTargetPreservingCausesAndIncident
     EXPECT_EQ(reopened.LoadLifecycleTargetFacts(component).value(), after.value());
     EXPECT_EQ(reopened.LoadLifecycleTargetFacts(second).value(), second_after.value());
   }
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementCodecPreservesCompleteCASAndRejectsUnprovedRows) {
+  CCLCLifecycleTargetRetirementIntentDTO intent{
+      {RequestId("close.targets.1"), RequestOwnerEpoch("owner.1"), "composer.close", std::nullopt},
+      {RequestOwnerEpoch("owner.1"), ActiveBundlePublicationGeneration(3U),
+       ContentDigest("sha256:" + std::string(64U, 'a'))},
+      {{ControllableComponentId("arm"), LifecycleTargetStateDTO::kDisabled,
+        LifecycleTargetOriginDTO::kOperator, 7U, true, LifecycleBlockingCauseClassDTO::kFault}}};
+  ASSERT_TRUE(intent.locally_valid());
+  const detail::CCLCTargetRetirementRecordDTO record{intent, intent.expected_targets};
+  const auto bytes = detail::EncodeCCLCTargetRetirementRecord(record);
+  EXPECT_EQ(detail::DecodeCCLCTargetRetirementRecord(bytes), record);
+  EXPECT_THROW(detail::DecodeCCLCTargetRetirementRecord(bytes + "x"), std::invalid_argument);
+  EXPECT_THROW(detail::DecodeCCLCTargetRetirementRecord(bytes.substr(0U, bytes.size() - 1U)),
+               std::invalid_argument);
+  const auto digest = detail::CCLCTargetRetirementSemanticIntentDigest(intent);
+  auto changed = intent;
+  changed.expected_targets.front().reached = false;
+  EXPECT_NE(detail::CCLCTargetRetirementSemanticIntentDigest(changed), digest);
+  changed = intent;
+  changed.expected_targets.front().recovered_cause.reset();
+  EXPECT_NE(detail::CCLCTargetRetirementSemanticIntentDigest(changed), digest);
+  changed = intent;
+  changed.scope.publication_generation = ActiveBundlePublicationGeneration(4U);
+  EXPECT_NE(detail::CCLCTargetRetirementSemanticIntentDigest(changed), digest);
+  changed = intent;
+  changed.request_context.correlation_id = "different attribution";
+  EXPECT_NE(detail::CCLCTargetRetirementSemanticIntentDigest(changed), digest);
+  changed = intent;
+  changed.expected_targets.push_back(changed.expected_targets.front());
+  EXPECT_FALSE(changed.locally_valid());
+  auto wrong = record;
+  wrong.retired_targets.clear();
+  EXPECT_THROW(detail::EncodeCCLCTargetRetirementRecord(wrong), std::invalid_argument);
+  changed = intent;
+  changed.expected_targets.clear();
+  const detail::CCLCTargetRetirementRecordDTO empty{changed, {}};
+  EXPECT_EQ(detail::DecodeCCLCTargetRetirementRecord(detail::EncodeCCLCTargetRetirementRecord(empty)),
+            empty);
+}
+
+namespace {
+class RetirementTestLease final : public ICellCloseAdmissionLease {
+ public:
+  mutable int checks{};
+  int fail_at{};
+  Result<void> ValidatePrerequisites() const override {
+    ++checks;
+    if (checks == fail_at)
+      return Result<void>::Err({"actual_close_guard_unknown", "actual prerequisite changed", {{"cause", "test-fault"}}});
+    return Result<void>::Ok();
+  }
+};
+
+CCLCLifecycleTargetRetirementIntentDTO RetirementIntent(SqliteCCLCJournal& journal,
+    const RequestOwnerEpoch& owner, const std::string& id) {
+  const auto rows = journal.LoadLifecycleTargetsForClose(owner);
+  if (!rows.ok()) throw std::runtime_error(rows.error().message);
+  return {{RequestId(id), owner, "composer.close", std::nullopt},
+          {owner, ActiveBundlePublicationGeneration(2U), ContentDigest(Sha('d'))}, rows.value()};
+}
+}  // namespace
+
+TEST(SqliteCCLCJournal, TargetRetirementExactReplayCannotRetireSuccessorAndSurvivesReopen) {
+  TargetCASFixture f;
+  ASSERT_TRUE(f.journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+      LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator).ok());
+  const auto intent = RetirementIntent(f.journal, f.owner, "close.retire.1");
+  RetirementTestLease lease;
+  const auto retired = f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+  ASSERT_TRUE(retired.ok()) << retired.error().message;
+  EXPECT_EQ(retired.value().retired_targets, intent.expected_targets);
+  EXPECT_EQ(lease.checks, 2);
+  EXPECT_TRUE(f.journal.LoadLifecycleTargets().value().empty());
+  const auto successor = f.journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+      LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator);
+  ASSERT_TRUE(successor.ok());
+  const auto replay = f.journal.RetireLifecycleTargetsForClose(RequestOwnerEpoch("different.current.owner"), intent, lease);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(lease.checks, 2);
+  EXPECT_EQ(f.journal.LoadLifecycleTargets().value(), std::vector<ComponentLifecycleTargetDTO>{successor.value()});
+  f.journal.Close();
+  SqliteCCLCJournal reopened(f.path, CellId("cell.1"), 2U);
+  const auto read = reopened.ReadLifecycleTargetRetirementResult(intent);
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  ASSERT_TRUE(read.value());
+  EXPECT_EQ(read.value()->retired_targets, intent.expected_targets);
+  EXPECT_EQ(reopened.LoadLifecycleTargets().value(), std::vector<ComponentLifecycleTargetDTO>{successor.value()});
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementCompleteCASConflictsWithoutMembershipOrTargetWrites) {
+  TargetCASFixture f;
+  ASSERT_TRUE(f.journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+      LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator).ok());
+  const auto intent = RetirementIntent(f.journal, f.owner, "close.cas.1");
+  auto changed = intent;
+  changed.expected_targets.front().reached = !changed.expected_targets.front().reached;
+  RetirementTestLease lease;
+  const auto refused = f.journal.RetireLifecycleTargetsForClose(f.owner, changed, lease);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_lifecycle_target_retirement_conflict");
+  EXPECT_EQ(lease.checks, 0);
+  EXPECT_EQ(f.journal.LoadLifecycleTargets().value(), intent.expected_targets);
+  EXPECT_FALSE(f.journal.ReadLifecycleTargetRetirementResult(changed).value());
+  const auto accepted = f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+  ASSERT_TRUE(accepted.ok());
+  changed = intent;
+  changed.scope.publication_generation = ActiveBundlePublicationGeneration(3U);
+  const auto conflict = f.journal.RetireLifecycleTargetsForClose(f.owner, changed, lease);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().code, "request_id_conflict");
+  EXPECT_EQ(lease.checks, 2);
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementPrecommitGuardRollsBackRowsMembershipAndTerminalSequence) {
+  for (int fail_at : {1, 2}) {
+    TargetCASFixture f;
+    ASSERT_TRUE(f.journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+        LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator).ok());
+    const auto intent = RetirementIntent(f.journal, f.owner, "close.guard.1");
+    RetirementTestLease lease;
+    lease.fail_at = fail_at;
+    const auto refused = f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().code, "actual_close_guard_unknown");
+    EXPECT_EQ(refused.error().details.at("cause"), "test-fault");
+    EXPECT_EQ(f.journal.LoadLifecycleTargets().value(), intent.expected_targets);
+    EXPECT_FALSE(f.journal.ReadLifecycleTargetRetirementResult(intent).value());
+    RetirementTestLease allowed;
+    ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, intent, allowed).ok());
+    f.journal.Close();
+    SqliteCCLCJournal reopened(f.path, CellId("cell.1"), 2U);
+    ASSERT_TRUE(reopened.ReadLifecycleTargetRetirementResult(intent).value());
+  }
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementSharesOrdinaryRequestNamespaceAndRefusesStaleFreshOwner) {
+  TargetCASFixture f;
+  const auto ordinary = Intent("shared.request.1", f.owner, 1U);
+  ASSERT_TRUE(f.journal.RecordLifecycleRejection(f.owner, ordinary,
+      {"no_admission", "known refusal", {{"effect", "not_started"}}}, std::nullopt).ok());
+  const auto intent = RetirementIntent(f.journal, f.owner, "shared.request.1");
+  RetirementTestLease lease;
+  const auto collision = f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+  ASSERT_FALSE(collision.ok());
+  EXPECT_EQ(collision.error().code, "request_id_conflict");
+  auto stale = intent;
+  stale.request_context.request_id = RequestId("fresh.stale.1");
+  const auto refused = f.journal.RetireLifecycleTargetsForClose(RequestOwnerEpoch("stale.owner"), stale, lease);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "stale_request_owner_epoch");
+  EXPECT_EQ(lease.checks, 0);
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementSharesGlobalHistoryCapacityAndKeepsExpiryTombstone) {
+  TargetCASFixture f(1U, 3U);
+  RetirementTestLease lease;
+  const auto first = RetirementIntent(f.journal, f.owner, "close.history.1");
+  ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, first, lease).ok());
+  const auto second = RetirementIntent(f.journal, f.owner, "close.history.2");
+  ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, second, lease).ok());
+  const auto expired = f.journal.ReadLifecycleTargetRetirementResult(first);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code, "request_result_expired");
+  const auto ordinary = Intent("ordinary.history.1", f.owner, 1U);
+  ASSERT_TRUE(f.journal.RecordLifecycleRejection(f.owner, ordinary,
+      {"no_admission", "ordinary refusal", {{"effect", "not_started"}}}, std::nullopt).ok());
+  const auto shared_expired = f.journal.ReadLifecycleTargetRetirementResult(second);
+  ASSERT_FALSE(shared_expired.ok());
+  EXPECT_EQ(shared_expired.error().code, "request_result_expired");
+  auto fresh = second;
+  fresh.request_context.request_id = RequestId("close.history.full");
+  const auto full = f.journal.RetireLifecycleTargetsForClose(f.owner, fresh, lease);
+  ASSERT_FALSE(full.ok());
+  EXPECT_EQ(full.error().code, "request_ledger_full");
+  f.journal.Close();
+  SqliteCCLCJournal reopened(f.path, CellId("cell.1"), 1U);
+  EXPECT_EQ(reopened.ReadLifecycleTargetRetirementResult(first).error().code, "request_result_expired");
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementOversizedResultUsesExistingByteCompactionAndNeverInventsReplay) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U, 1U);
+  RequestOwnerEpoch owner("owner.bytes.seed");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 2U).ok());
+  const auto intent = RetirementIntent(journal, owner, "close.bytes.1");
+  RetirementTestLease lease;
+  ASSERT_TRUE(journal.RetireLifecycleTargetsForClose(owner, intent, lease).ok());
+  const auto expired = journal.ReadLifecycleTargetRetirementResult(intent);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().code, "request_result_expired");
+  EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+  journal.Close();
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"), 1U, 1U);
+  EXPECT_EQ(reopened.ReadLifecycleTargetRetirementResult(intent).error().code, "request_result_expired");
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementStartupRejectsMissingResultAndRegressedTerminalOrder) {
+  for (const auto* corruption : {
+      "UPDATE cclc_request_memberships SET target_retirement_sequence=0",
+      "UPDATE cclc_request_memberships SET target_retirement_blob=NULL"}) {
+    TargetCASFixture f;
+    RetirementTestLease lease;
+    const auto intent = RetirementIntent(f.journal, f.owner, "close.corrupt.1");
+    ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease).ok());
+    f.journal.Close();
+    ExecRaw(f.path, corruption);
+    EXPECT_THROW((SqliteCCLCJournal(f.path, CellId("cell.1"), 2U)), std::runtime_error);
+  }
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementStartupRejectsDuplicateGlobalTerminalOrder) {
+  TargetCASFixture f;
+  RetirementTestLease lease;
+  const auto first = RetirementIntent(f.journal, f.owner, "close.order.1");
+  ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, first, lease).ok());
+  const auto second = RetirementIntent(f.journal, f.owner, "close.order.2");
+  ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, second, lease).ok());
+  EXPECT_EQ(RawScalar(f.path, "SELECT count(DISTINCT target_retirement_sequence) FROM cclc_request_memberships"), 2);
+  f.journal.Close();
+  ExecRaw(f.path, "UPDATE cclc_request_memberships SET target_retirement_sequence=1 WHERE target_retirement_sequence IS NOT NULL");
+  EXPECT_THROW((SqliteCCLCJournal(f.path, CellId("cell.1"), 2U)), std::runtime_error);
+}
+
+TEST(SqliteCCLCJournal, CloseRetirementReasonSurvivesAuthenticRemovalAndPassiveReplay) {
+  TargetCASFixture f;
+  const ControllableComponentId component("component.1");
+  ASSERT_TRUE(f.journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kActive,
+                                          LifecycleTargetOriginDTO::kOperator).ok());
+  const auto intent = RetirementIntent(f.journal, f.owner, "close.reason.1");
+  RetirementTestLease lease;
+  ASSERT_TRUE(f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease).ok());
+  auto retained = f.journal.ReadLifecycleTargetRetention(component);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value());
+  EXPECT_FALSE(retained.value()->present);
+  EXPECT_EQ(retained.value()->retirement_reason, LifecycleTargetRetirementReasonDTO::kClose);
+  EXPECT_EQ(retained.value()->target.target_generation, intent.expected_targets.front().target_generation);
+  const auto removed = f.journal.PlanNativeApply(NativeApplyPlanRequestWithDelta(
+      "apply.reason.remove", "bundle.reason.empty", {}, {}, {}, {component}, {},
+      {ControlDomainId("domain.1")}));
+  ASSERT_TRUE(removed.ok()) << removed.error().message;
+  ASSERT_TRUE(f.journal.AdoptNativeApplyFacts(
+      {NativeApplyPublication("apply.reason.remove", 1U, "bundle.reason.empty", 3U),
+       removed.value().components, {}}).ok());
+  retained = f.journal.ReadLifecycleTargetRetention(component);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value());
+  EXPECT_EQ(retained.value()->retirement_reason, LifecycleTargetRetirementReasonDTO::kClose);
+  EXPECT_EQ(retained.value()->target.target_generation, intent.expected_targets.front().target_generation);
+  f.journal.Close();
+  SqliteCCLCJournal reopened(f.path, CellId("cell.1"), 2U);
+  ASSERT_EQ(reopened.ReadLifecycleTargetRetention(component).value()->retirement_reason,
+            LifecycleTargetRetirementReasonDTO::kClose);
+  auto route = ActiveConfiguration(ExpectedDomain());
+  const auto readded = reopened.PlanNativeApply(
+      NativeApplyPlanRequest("apply.reason.readd", 1U, "bundle.a", route));
+  ASSERT_TRUE(readded.ok()) << readded.error().message;
+  ASSERT_EQ(readded.value().routes.size(), 1U);
+  route.active_control_configuration_generation = readded.value().routes.front().generation;
+  ASSERT_TRUE(reopened.AdoptNativeApplyFacts(
+      {NativeApplyPublication("apply.reason.readd", 1U, "bundle.a", 4U),
+       readded.value().components, {route}}).ok());
+  const auto successor = reopened.SetLifecycleTarget(component, LifecycleTargetStateDTO::kPrepared,
+                                                     LifecycleTargetOriginDTO::kOperator);
+  ASSERT_TRUE(successor.ok());
+  const auto fresh = reopened.ReadLifecycleTargetRetention(component);
+  ASSERT_TRUE(fresh.ok());
+  ASSERT_TRUE(fresh.value());
+  EXPECT_TRUE(fresh.value()->present);
+  EXPECT_EQ(fresh.value()->retirement_reason, LifecycleTargetRetirementReasonDTO::kNone);
+  EXPECT_GT(fresh.value()->target.target_generation, intent.expected_targets.front().target_generation);
+  const auto replay = reopened.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(reopened.ReadLifecycleTargetRetention(component).value(), fresh.value());
+}
+
+TEST(SqliteCCLCJournal, OrdinaryTargetCancellationHasDistinctRetirementReason) {
+  TargetCASFixture f;
+  const ControllableComponentId component("component.1");
+  ASSERT_FALSE(f.journal.ReadLifecycleTargetRetention(component).value());
+  const auto target = f.journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kActive,
+                                                  LifecycleTargetOriginDTO::kOperator);
+  ASSERT_TRUE(target.ok());
+  const auto removed = f.journal.PlanNativeApply(NativeApplyPlanRequestWithDelta(
+      "apply.reason.remove", "bundle.reason.empty", {}, {}, {}, {component}, {},
+      {ControlDomainId("domain.1")}));
+  ASSERT_TRUE(removed.ok()) << removed.error().message;
+  ASSERT_TRUE(f.journal.AdoptNativeApplyFacts(
+      {NativeApplyPublication("apply.reason.remove", 1U, "bundle.reason.empty", 3U),
+       removed.value().components, {}}).ok());
+  const auto retained = f.journal.ReadLifecycleTargetRetention(component);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value());
+  EXPECT_FALSE(retained.value()->present);
+  EXPECT_EQ(retained.value()->retirement_reason, LifecycleTargetRetirementReasonDTO::kOrdinaryCancellation);
+  EXPECT_EQ(retained.value()->target.target_generation, target.value().target_generation);
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementReasonRejectsCorruptProofAndEarlierFormatWithoutMigration) {
+  for (const auto* corruption : {
+      "PRAGMA ignore_check_constraints=ON; UPDATE cclc_component_lifecycle_targets SET retirement_reason=99",
+      "PRAGMA ignore_check_constraints=ON; UPDATE cclc_component_lifecycle_targets SET retirement_reason=2",
+      "PRAGMA user_version=18"}) {
+    TargetCASFixture f;
+    const ControllableComponentId component("component.1");
+    ASSERT_TRUE(f.journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kActive,
+                                            LifecycleTargetOriginDTO::kOperator).ok());
+    f.journal.Close();
+    ExecRaw(f.path, corruption);
+    const auto before_version = RawScalar(f.path, "PRAGMA user_version");
+    const auto before_reason = RawScalar(f.path,
+        "SELECT retirement_reason FROM cclc_component_lifecycle_targets WHERE controllable_component_id='component.1'");
+    EXPECT_THROW((SqliteCCLCJournal(f.path, CellId("cell.1"), 2U)), std::runtime_error);
+    EXPECT_EQ(RawScalar(f.path, "PRAGMA user_version"), before_version);
+    EXPECT_EQ(RawScalar(f.path,
+        "SELECT retirement_reason FROM cclc_component_lifecycle_targets WHERE controllable_component_id='component.1'"),
+        before_reason);
+  }
+}
+
+TEST(SqliteCCLCJournal, TargetRetirementCommitRollbackIsOrdinaryOnlyWithExactReadableOriginals) {
+  for (const bool unreadable : {false, true}) {
+    SCOPED_TRACE(unreadable);
+    test::CloseRetirementCommitFailure failure;
+    test::ScopedCloseRetirementCommitFailure hook(failure);
+    TargetCASFixture f;
+    ASSERT_TRUE(f.journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+        LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator).ok());
+    const auto intent = RetirementIntent(f.journal, f.owner, "close.commit.1");
+    RetirementTestLease lease;
+    failure.fail_readback = unreadable;
+    failure.armed = true;
+    const auto result = f.journal.RetireLifecycleTargetsForClose(f.owner, intent, lease);
+    EXPECT_EQ(failure.commit_failures, 1);
+    ASSERT_FALSE(result.ok());
+    if (unreadable) {
+      EXPECT_EQ(result.error().code, "persistence_outcome_unknown");
+      EXPECT_EQ(result.error().details.at("reason"), "close_target_retirement_commit_unknown");
+    } else {
+      EXPECT_NE(result.error().code, "persistence_outcome_unknown");
+    }
+    failure.deny_reads = false;
+    EXPECT_EQ(f.journal.LoadLifecycleTargets().value(), intent.expected_targets);
+    EXPECT_FALSE(f.journal.ReadLifecycleTargetRetirementResult(intent).value());
+    EXPECT_EQ(f.journal.ReadLifecycleTargetRetention(ControllableComponentId("component.1")).value()->retirement_reason,
+              LifecycleTargetRetirementReasonDTO::kNone);
+  }
+}
+
+namespace {
+CellObserverBringUpRecordDTO ObserverBringUpRecord(std::string request_id = "bring-up.1") {
+  using content_identity::CanonicalValue;
+  const auto predecessor = ObserverLossRecord().target;
+  CellObserverBringUpRecordDTO record{
+      {{RequestId(std::move(request_id)), RequestOwnerEpoch("operator.owner"),
+        "Components observer bring-up", std::string("operator-correlation")},
+       {RequestTransportDTO::kHttp, RequestAssuranceDTO::kExternallyAuthenticated,
+        std::string("operator")},
+       {RetainedBundleId("bundle.1"),
+        GraphRevision("graph.1"),
+        {SceneId("sha256:" + std::string(64U, 'a')), 1U,
+         ContentDigest("sha256:" + std::string(64U, 'b'))}},
+       ActiveBundlePublicationGeneration(1U),
+       ContentDigest("sha256:" + std::string(64U, 'c')),
+       RuntimeUnitId("host.unit"),
+       RuntimeEpoch("host.epoch"),
+       "manager.epoch",
+       "scene.epoch",
+       content_identity::canonical_json(
+           CanonicalValue(CanonicalValue::Object{{"deployment_generation", CanonicalValue(1.0)},
+                                                 {"graph_revision", CanonicalValue("graph.1")},
+                                                 {"program_generation", CanonicalValue(1.0)},
+                                                 {"retained_bundle_id", CanonicalValue("bundle.1")},
+                                                 {"runtime_generation", CanonicalValue(1.0)}})),
+       predecessor,
+       {predecessor.cell_id, predecessor.source_id, "operator-replacement"},
+       "/run/observer-input.json",
+       std::nullopt},
+      CellObserverBringUpPhaseDTO::kAdmitted,
+      100,
+      100,
+      CellObserverBringUpProcessDTO{1234, "launch.old"},
+      false,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  return record;
+}
+CellObserverBringUpRecordDTO StartObserverBringUp(SqliteCCLCJournal& journal,
+                                                  const CellObserverBringUpRecordDTO& admitted) {
+  auto retiring = admitted;
+  retiring.phase = CellObserverBringUpPhaseDTO::kRetiring;
+  retiring.updated_at_ns = admitted.admitted_at_ns + 1;
+  const auto retired = journal.UpdateLatestCellObserverBringUp(admitted, retiring);
+  if (!retired.ok())
+    throw std::runtime_error(retired.error().code + ": " + retired.error().message);
+  auto started = retiring;
+  started.phase = CellObserverBringUpPhaseDTO::kStarted;
+  started.updated_at_ns = admitted.admitted_at_ns + 2;
+  started.predecessor_drained_or_absent = true;
+  started.started_process = CellObserverBringUpProcessDTO{2345, "launch.new"};
+  const auto result = journal.UpdateLatestCellObserverBringUp(retiring, started);
+  if (!result.ok()) throw std::runtime_error(result.error().code + ": " + result.error().message);
+  return result.value();
+}
+}  // namespace
+
+TEST(CellObserverBringUpValueTest, FullLaunchIdentityUsesExistingPacketCeiling) {
+  EXPECT_TRUE((CellObserverBringUpProcessDTO{42, kUr5eLaunchIdentity257}).locally_valid());
+  EXPECT_TRUE((CellObserverBringUpProcessDTO{
+      42, std::string(kMaximumCellAdmissionPrivateBinaryBytes, 'x')}).locally_valid());
+  EXPECT_FALSE((CellObserverBringUpProcessDTO{
+      42, std::string(kMaximumCellAdmissionPrivateBinaryBytes + 1U, 'x')}).locally_valid());
+  EXPECT_FALSE((CellObserverBringUpProcessDTO{0, kUr5eLaunchIdentity257}).locally_valid());
+  EXPECT_FALSE((CellObserverBringUpProcessDTO{42, ""}).locally_valid());
+}
+
+TEST(SqliteCCLCJournal, Real257ByteObserverLaunchIdentitySurvivesReadbackAndReopen) {
+  ScopedTemporaryDirectory temporary;
+  auto admitted = ObserverBringUpRecord();
+  admitted.predecessor_process = CellObserverBringUpProcessDTO{1234, kUr5eLaunchIdentity257};
+  ASSERT_EQ(kUr5eLaunchIdentity257.size(), 257U);
+  ASSERT_TRUE(admitted.locally_valid());
+  EXPECT_EQ(DecodeCellObserverBringUpRecord(EncodeCellObserverBringUpRecord(admitted)), admitted);
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+    ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+    EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), admitted);
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  EXPECT_EQ(reopened.LoadLatestCellObserverBringUp().value(), admitted);
+}
+
+TEST(CellObserverBringUpValueTest, ClosedCodecPreservesFullWidthTimeAndRejectsForeignOpen) {
+  auto record = ObserverBringUpRecord();
+  record.admitted_at_ns = record.updated_at_ns = std::numeric_limits<std::int64_t>::max();
+  ASSERT_TRUE(record.locally_valid());
+  const auto bytes = EncodeCellObserverBringUpRecord(record);
+  EXPECT_EQ(DecodeCellObserverBringUpRecord(bytes), record);
+  EXPECT_NE(bytes.find("9223372036854775807"), std::string::npos);
+  auto extra = WithObserverMember(content_identity::parse_canonical_json(bytes), "extra",
+                                  content_identity::CanonicalValue(nullptr));
+  EXPECT_THROW(DecodeCellObserverBringUpRecord(content_identity::canonical_json(extra)),
+               std::exception);
+  record.admitted_at_ns = 100;
+  record.updated_at_ns = 103;
+  record.phase = CellObserverBringUpPhaseDTO::kOpenAccepted;
+  record.predecessor_drained_or_absent = true;
+  record.started_process = CellObserverBringUpProcessDTO{2345, "launch.new"};
+  record.first_open = CellObserverBringUpOpenDTO{"foreign-source.1", 1U, 103};
+  EXPECT_FALSE(record.locally_valid());
+  for (const auto suffix : {"", "0", "01", "9007199254740992", "-1"}) {
+    record.first_open->source_epoch = record.intent.replacement.source_epoch_base + "." + suffix;
+    EXPECT_FALSE(record.locally_valid()) << suffix;
+  }
+  record.first_open->source_epoch = record.intent.replacement.source_epoch_base + ".1";
+  EXPECT_EQ(DecodeCellObserverBringUpRecord(EncodeCellObserverBringUpRecord(record)), record);
+  record.intent.predecessor_incident_id = "observer.loss.1";
+  EXPECT_FALSE(record.locally_valid());
+  record.predecessor_loss = CellObserverLossAssociationDTO{
+      "observer.loss.1", "observer.exit.1", std::string(64U, 'a')};
+  ASSERT_TRUE(record.locally_valid());
+  EXPECT_EQ(DecodeCellObserverBringUpRecord(EncodeCellObserverBringUpRecord(record)), record);
+  record.predecessor_loss->latest_exit_digest.front() = 'A';
+  EXPECT_FALSE(record.locally_valid());
+  record.predecessor_loss->latest_exit_digest.front() = 'a';
+  record.predecessor_loss->incident_id = "foreign.incident";
+  EXPECT_FALSE(record.locally_valid());
+}
+
+TEST(SqliteCCLCJournal, ObserverBringUpLatestReplayConflictAndUnknownSurviveReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto admitted = ObserverBringUpRecord();
+  auto unknown = admitted;
+  unknown.phase = CellObserverBringUpPhaseDTO::kUnknown;
+  unknown.updated_at_ns = 101;
+  unknown.diagnostic =
+      ErrorDTO{"observer_actual_state_unavailable", "actual old group is not proved absent", {}};
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+    EXPECT_FALSE(journal.LoadLatestCellObserverBringUp().value());
+    const auto begun = journal.BeginLatestCellObserverBringUp(admitted, std::nullopt);
+    ASSERT_TRUE(begun.ok()) << begun.error().message;
+    EXPECT_TRUE(begun.value().accepted_new);
+    EXPECT_FALSE(
+        journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).value().accepted_new);
+    ASSERT_TRUE(journal.UpdateLatestCellObserverBringUp(admitted, unknown).ok());
+    const auto replay = journal.BeginLatestCellObserverBringUp(admitted, std::nullopt);
+    ASSERT_TRUE(replay.ok());
+    EXPECT_FALSE(replay.value().accepted_new);
+    EXPECT_EQ(replay.value().record, unknown);
+    auto repeated = admitted;
+    repeated.admitted_at_ns = repeated.updated_at_ns = 500;
+    repeated.predecessor_process = CellObserverBringUpProcessDTO{9999, "freshly-observed-process"};
+    repeated.intent.attribution = {RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified, std::nullopt};
+    const auto original_evidence = journal.BeginLatestCellObserverBringUp(repeated, std::nullopt);
+    ASSERT_TRUE(original_evidence.ok());
+    EXPECT_FALSE(original_evidence.value().accepted_new);
+    EXPECT_EQ(original_evidence.value().record, unknown);
+    auto conflict = admitted;
+    conflict.intent.manager_epoch = "different.manager";
+    const auto refused = journal.BeginLatestCellObserverBringUp(conflict, unknown);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().code, "observer_bring_up_request_conflict");
+    EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), unknown);
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  const auto loaded = reopened.LoadLatestCellObserverBringUp().value();
+  ASSERT_TRUE(loaded);
+  EXPECT_EQ(*loaded, unknown);
+  EXPECT_FALSE(loaded->predecessor_drained_or_absent);
+  EXPECT_FALSE(loaded->started_process);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT count(*) FROM cclc_component_incidents"), 0);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT count(*) FROM cclc_request_memberships"), 0);
+}
+
+TEST(SqliteCCLCJournal, ObserverHealthyBringUpFirstOpenCreatesNoIncidentOrLifecycleOwner) {
+  ScopedTemporaryDirectory temporary;
+  const auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  const auto started = StartObserverBringUp(journal, admitted);
+  const CellObserverBringUpOpenDTO open{started.intent.replacement.source_epoch_base + ".1", 1U,
+                                        103};
+  const auto closed = journal.CloseCellObserverIncidentByOperatorBringUp(started, open);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  EXPECT_EQ(closed.value().phase, CellObserverBringUpPhaseDTO::kOpenAccepted);
+  EXPECT_EQ(closed.value().first_open, open);
+  EXPECT_EQ(journal.CloseCellObserverIncidentByOperatorBringUp(started, open).value(),
+            closed.value());
+  EXPECT_FALSE(journal.LoadOpenCellObserverIncident().value());
+  for (const auto table :
+       {"cclc_component_incidents", "cclc_owner_epochs", "cclc_component_recovery_generations",
+        "cclc_request_memberships", "lifecycle_transactions"}) {
+    EXPECT_EQ(
+        RawScalar(JournalPath(temporary), ("SELECT count(*) FROM " + std::string(table)).c_str()),
+        0)
+        << table;
+  }
+}
+
+TEST(SqliteCCLCJournal, ObserverOnlyLatestFirstOpenClosesOriginalIncidentAtomically) {
+  ScopedTemporaryDirectory temporary;
+  auto incident = ObserverLossRecord();
+  incident.detected_at_ns = 99;
+  auto admitted = ObserverBringUpRecord();
+  admitted.intent.predecessor_incident_id = incident.incident_id;
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.RecordCellObserverIncident(incident).ok());
+  admitted.predecessor_loss = journal.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  const auto started = StartObserverBringUp(journal, admitted);
+  // Neither a durable admission nor a checked successful spawn closes it.
+  EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), incident);
+  auto replacement = ObserverBringUpRecord("bring-up.2");
+  replacement.intent.predecessor = started.intent.replacement;
+  replacement.intent.replacement.source_epoch_base = "second-explicit-replacement";
+  replacement.intent.predecessor_incident_id = incident.incident_id;
+  replacement.predecessor_loss = admitted.predecessor_loss;
+  replacement.predecessor_process = started.started_process;
+  replacement.admitted_at_ns = replacement.updated_at_ns = 104;
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(replacement, started).ok());
+  const auto late = journal.CloseCellObserverIncidentByOperatorBringUp(
+      started, {started.intent.replacement.source_epoch_base + ".1", 1U, 103});
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().code, "observer_bring_up_stale");
+  EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), incident);
+  const auto new_started = StartObserverBringUp(journal, replacement);
+  const auto foreign = journal.CloseCellObserverIncidentByOperatorBringUp(
+      new_started, {started.intent.replacement.source_epoch_base + ".2", 2U, 107});
+  EXPECT_FALSE(foreign.ok());
+  EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), incident);
+  const auto complete = journal.CloseCellObserverIncidentByOperatorBringUp(
+      new_started, {new_started.intent.replacement.source_epoch_base + ".1", 2U, 107});
+  ASSERT_TRUE(complete.ok()) << complete.error().message;
+  EXPECT_FALSE(journal.LoadOpenCellObserverIncident().value());
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT acknowledged FROM cclc_component_incidents"),
+            1);
+  const auto events = journal.LoadComponentIncidentEvents(0U, 8U).value();
+  ASSERT_EQ(events.size(), 2U);
+  EXPECT_EQ(events[0].payload_json, EncodeCellObserverIncidentRecord(incident));
+  const auto event = content_identity::parse_canonical_json(events[1].payload_json);
+  const auto* ack = event.find_object_member("acknowledgement");
+  ASSERT_NE(ack, nullptr);
+  EXPECT_EQ(ack->find_object_member("reason")->as_string(), "superseded by operator bring-up");
+  EXPECT_EQ(ack->find_object_member("request_id")->as_string(), "bring-up.2");
+  journal.Close();
+  SqliteCCLCJournal reopened(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  EXPECT_EQ(reopened.LoadLatestCellObserverBringUp().value(), complete.value());
+  EXPECT_FALSE(reopened.LoadOpenCellObserverIncident().value());
+  EXPECT_EQ(reopened.LoadComponentIncidentEvents(0U, 8U).value(), events);
+}
+
+TEST(SqliteCCLCJournal, ObserverStaleOutcomeAndUnprovedStartCannotReplaceLatest) {
+  ScopedTemporaryDirectory temporary;
+  const auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  auto invalid = admitted;
+  invalid.phase = CellObserverBringUpPhaseDTO::kStarted;
+  invalid.started_process = CellObserverBringUpProcessDTO{2345, "launch.new"};
+  EXPECT_FALSE(journal.UpdateLatestCellObserverBringUp(admitted, invalid).ok());
+  EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), admitted);
+  const auto started = StartObserverBringUp(journal, admitted);
+  auto stale = admitted;
+  stale.phase = CellObserverBringUpPhaseDTO::kFailed;
+  stale.diagnostic = ErrorDTO{"observer_spawn_failed", "old completion", {}};
+  const auto refused = journal.UpdateLatestCellObserverBringUp(admitted, stale);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "observer_bring_up_stale");
+  EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), started);
+}
+
+TEST(SqliteCCLCJournal, ObserverEncodedOverflowAndForeignCellLeaveLatestUnchanged) {
+  ScopedTemporaryDirectory temporary;
+  const auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  auto large = ObserverBringUpRecord("bring-up.large");
+  // Raw path is within the existing command bound; escaping exceeds the
+  // existing complete incident bound. No mandatory identity is truncated.
+  large.intent.retained_snapshot_path =
+      "/" + std::string(kMaxObserverBringUpSnapshotPathBytes - 1U, '"');
+  ASSERT_TRUE(large.locally_valid());
+  const auto overflow = journal.BeginLatestCellObserverBringUp(large, admitted);
+  ASSERT_FALSE(overflow.ok());
+  EXPECT_EQ(overflow.error().code, "observer_bring_up_record_too_large");
+  auto foreign = ObserverBringUpRecord("bring-up.foreign");
+  foreign.intent.predecessor.cell_id = foreign.intent.replacement.cell_id = CellId("foreign.cell");
+  EXPECT_FALSE(journal.BeginLatestCellObserverBringUp(foreign, admitted).ok());
+  EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), admitted);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT count(*) FROM cclc_component_incidents"), 0);
+}
+
+TEST(SqliteCCLCJournal, ObserverBringUpCrossConnectionCASSerializesAdmissionOutcomeAndFirstOpen) {
+  ScopedTemporaryDirectory temporary;
+  const auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal first(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  SqliteCCLCJournal second(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  auto race = [](auto first_call, auto second_call) {
+    std::barrier ready(2);
+    std::optional<decltype(first_call())> first_result;
+    std::jthread worker([&] {
+      ready.arrive_and_wait();
+      first_result.emplace(first_call());
+    });
+    ready.arrive_and_wait();
+    auto second_result = second_call();
+    worker.join();
+    return std::pair{std::move(*first_result), std::move(second_result)};
+  };
+  auto competitor = ObserverBringUpRecord("bring-up.competing");
+  competitor.intent.replacement.source_epoch_base = "competing-replacement";
+  const auto admissions =
+      race([&] { return first.BeginLatestCellObserverBringUp(admitted, std::nullopt); },
+           [&] { return second.BeginLatestCellObserverBringUp(competitor, std::nullopt); });
+  ASSERT_NE(admissions.first.ok(), admissions.second.ok());
+  const auto& refused_admission = admissions.first.ok() ? admissions.second : admissions.first;
+  EXPECT_EQ(refused_admission.error().code, "observer_bring_up_stale");
+  const auto current = first.LoadLatestCellObserverBringUp().value();
+  ASSERT_TRUE(current);
+  EXPECT_EQ(current, second.LoadLatestCellObserverBringUp().value());
+  auto retiring = *current;
+  retiring.phase = CellObserverBringUpPhaseDTO::kRetiring;
+  retiring.updated_at_ns += 1;
+  auto competing_outcome = retiring;
+  competing_outcome.updated_at_ns += 1;
+  const auto updates =
+      race([&] { return first.UpdateLatestCellObserverBringUp(*current, retiring); },
+           [&] { return second.UpdateLatestCellObserverBringUp(*current, competing_outcome); });
+  ASSERT_NE(updates.first.ok(), updates.second.ok());
+  const auto& refused_update = updates.first.ok() ? updates.second : updates.first;
+  EXPECT_EQ(refused_update.error().code, "observer_bring_up_stale");
+  const auto actual_retiring = first.LoadLatestCellObserverBringUp().value();
+  ASSERT_TRUE(actual_retiring);
+  auto started = *actual_retiring;
+  started.phase = CellObserverBringUpPhaseDTO::kStarted;
+  started.updated_at_ns += 1;
+  started.predecessor_drained_or_absent = true;
+  started.started_process = CellObserverBringUpProcessDTO{2345, "launch.new"};
+  ASSERT_TRUE(first.UpdateLatestCellObserverBringUp(*actual_retiring, started).ok());
+  const CellObserverBringUpOpenDTO open{started.intent.replacement.source_epoch_base + ".1", 1U,
+                                        started.updated_at_ns + 1};
+  auto next = ObserverBringUpRecord("bring-up.next");
+  next.intent.predecessor = started.intent.replacement;
+  next.intent.replacement.source_epoch_base = "next-replacement";
+  next.admitted_at_ns = next.updated_at_ns = open.accepted_at_ns + 1;
+  const auto closures =
+      race([&] { return first.CloseCellObserverIncidentByOperatorBringUp(started, open); },
+           [&] { return second.BeginLatestCellObserverBringUp(next, started); });
+  ASSERT_NE(closures.first.ok(), closures.second.ok());
+  if (closures.first.ok()) {
+    EXPECT_EQ(closures.second.error().code, "observer_bring_up_stale");
+    EXPECT_EQ(first.LoadLatestCellObserverBringUp().value(), closures.first.value());
+  } else {
+    EXPECT_EQ(closures.first.error().code, "observer_bring_up_stale");
+    EXPECT_EQ(first.LoadLatestCellObserverBringUp().value(), closures.second.value().record);
+  }
+  EXPECT_EQ(first.LoadLatestCellObserverBringUp().value(),
+            second.LoadLatestCellObserverBringUp().value());
+  EXPECT_FALSE(first.LoadOpenCellObserverIncident().value());
+}
+
+TEST(SqliteCCLCJournal, ObserverBringUpLaterRealExitRefusesDelayedOpenWithoutChangingIncident) {
+  ScopedTemporaryDirectory temporary;
+  auto first_exit = ObserverLossRecord();
+  first_exit.detected_at_ns = 99;
+  auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.RecordCellObserverIncident(first_exit).ok());
+  admitted.intent.predecessor_incident_id = first_exit.incident_id;
+  admitted.predecessor_loss = journal.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(admitted.predecessor_loss);
+  EXPECT_EQ(admitted.predecessor_loss->latest_exit_id, first_exit.incident_id);
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  const auto started = StartObserverBringUp(journal, admitted);
+  auto second_exit = first_exit;
+  second_exit.incident_id = "observer.real-exit.2";
+  second_exit.target = started.intent.replacement;
+  second_exit.diagnostic_snapshot = WithObserverMember(
+      second_exit.diagnostic_snapshot, "context",
+      WithObserverMember(*second_exit.diagnostic_snapshot.find_object_member("context"),
+                         "source_epoch_base",
+                         content_identity::CanonicalValue(second_exit.target.source_epoch_base)));
+  ASSERT_TRUE(second_exit.locally_valid());
+  second_exit.detected_at_ns = 104;
+  const auto stored = journal.RecordCellObserverIncident(second_exit);
+  ASSERT_TRUE(stored.ok()) << stored.error().message;
+  EXPECT_EQ(stored.value(), first_exit);
+  const auto latest_loss = journal.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(latest_loss);
+  EXPECT_EQ(latest_loss->incident_id, first_exit.incident_id);
+  EXPECT_EQ(latest_loss->latest_exit_id, second_exit.incident_id);
+  EXPECT_NE(latest_loss->latest_exit_digest, admitted.predecessor_loss->latest_exit_digest);
+  const auto events = journal.LoadComponentIncidentEvents(0U, 8U).value();
+  ASSERT_EQ(events.size(), 2U);
+  auto repeated = admitted;
+  repeated.admitted_at_ns = repeated.updated_at_ns = 105;
+  repeated.predecessor_loss = latest_loss;
+  const auto replay = journal.BeginLatestCellObserverBringUp(repeated, std::nullopt);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_FALSE(replay.value().accepted_new);
+  EXPECT_EQ(replay.value().record, started);
+  auto altered = started;
+  altered.predecessor_loss = latest_loss;
+  EXPECT_FALSE(journal.UpdateLatestCellObserverBringUp(started, altered).ok());
+  const auto delayed = journal.CloseCellObserverIncidentByOperatorBringUp(
+      started, {started.intent.replacement.source_epoch_base + ".1", 1U, 103});
+  ASSERT_FALSE(delayed.ok());
+  EXPECT_EQ(delayed.error().code, "observer_bring_up_loss_changed");
+  EXPECT_EQ(journal.LoadLatestCellObserverBringUp().value(), started);
+  EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), first_exit);
+  EXPECT_EQ(journal.LoadOpenCellObserverLossAssociation().value(), latest_loss);
+  EXPECT_EQ(journal.LoadComponentIncidentEvents(0U, 8U).value(), events);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT count(*) FROM cclc_component_incidents"), 1);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT acknowledged FROM cclc_component_incidents"), 0);
+}
+
+TEST(SqliteCCLCJournal, ObserverBringUpClosureBeforeGenuineLaterExitKeepsOriginalReplay) {
+  ScopedTemporaryDirectory temporary;
+  auto first_exit = ObserverLossRecord();
+  first_exit.detected_at_ns = 99;
+  auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal journal(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(journal.RecordCellObserverIncident(first_exit).ok());
+  admitted.intent.predecessor_incident_id = first_exit.incident_id;
+  admitted.predecessor_loss = journal.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  const auto started = StartObserverBringUp(journal, admitted);
+  const CellObserverBringUpOpenDTO open{started.intent.replacement.source_epoch_base + ".1", 1U, 103};
+  const auto closed = journal.CloseCellObserverIncidentByOperatorBringUp(started, open);
+  ASSERT_TRUE(closed.ok());
+  auto second_exit = first_exit;
+  second_exit.incident_id = "observer.real-exit.2";
+  second_exit.target = started.intent.replacement;
+  second_exit.diagnostic_snapshot = WithObserverMember(
+      second_exit.diagnostic_snapshot, "context",
+      WithObserverMember(*second_exit.diagnostic_snapshot.find_object_member("context"),
+                         "source_epoch_base",
+                         content_identity::CanonicalValue(second_exit.target.source_epoch_base)));
+  ASSERT_TRUE(second_exit.locally_valid());
+  second_exit.detected_at_ns = 104;
+  const auto stored = journal.RecordCellObserverIncident(second_exit);
+  ASSERT_TRUE(stored.ok());
+  EXPECT_EQ(stored.value(), second_exit);
+  const auto events = journal.LoadComponentIncidentEvents(0U, 8U).value();
+  ASSERT_EQ(events.size(), 3U);
+  const auto replay = journal.CloseCellObserverIncidentByOperatorBringUp(started, open);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), closed.value());
+  EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), second_exit);
+  EXPECT_EQ(journal.LoadOpenCellObserverLossAssociation().value()->latest_exit_id,
+            second_exit.incident_id);
+  EXPECT_EQ(journal.LoadComponentIncidentEvents(0U, 8U).value(), events);
+  EXPECT_EQ(RawScalar(JournalPath(temporary), "SELECT count(*) FROM cclc_component_incidents"), 2);
+}
+
+TEST(SqliteCCLCJournal, ObserverBringUpCrossConnectionRealExitAndClosurePreserveActualOrder) {
+  ScopedTemporaryDirectory temporary;
+  auto first_exit = ObserverLossRecord();
+  first_exit.detected_at_ns = 99;
+  auto admitted = ObserverBringUpRecord();
+  SqliteCCLCJournal first(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  SqliteCCLCJournal second(JournalPath(temporary), admitted.intent.replacement.cell_id);
+  ASSERT_TRUE(first.RecordCellObserverIncident(first_exit).ok());
+  admitted.intent.predecessor_incident_id = first_exit.incident_id;
+  admitted.predecessor_loss = first.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(first.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
+  const auto started = StartObserverBringUp(first, admitted);
+  auto later_exit = first_exit;
+  later_exit.incident_id = "observer.real-exit.2";
+  later_exit.target = started.intent.replacement;
+  later_exit.diagnostic_snapshot = WithObserverMember(
+      later_exit.diagnostic_snapshot, "context",
+      WithObserverMember(*later_exit.diagnostic_snapshot.find_object_member("context"),
+                         "source_epoch_base",
+                         content_identity::CanonicalValue(later_exit.target.source_epoch_base)));
+  ASSERT_TRUE(later_exit.locally_valid());
+  later_exit.detected_at_ns = 104;
+  std::barrier ready(2);
+  std::optional<Result<CellObserverIncidentRecordDTO>> recorded;
+  std::jthread worker([&] {
+    ready.arrive_and_wait();
+    recorded.emplace(second.RecordCellObserverIncident(later_exit));
+  });
+  ready.arrive_and_wait();
+  const auto closed = first.CloseCellObserverIncidentByOperatorBringUp(
+      started, {started.intent.replacement.source_epoch_base + ".1", 1U, 103});
+  worker.join();
+  ASSERT_TRUE(recorded && recorded->ok());
+  const auto loss = first.LoadOpenCellObserverLossAssociation().value();
+  ASSERT_TRUE(loss);
+  EXPECT_EQ(loss->latest_exit_id, later_exit.incident_id);
+  if (closed.ok()) {
+    EXPECT_EQ(recorded->value(), later_exit);
+    EXPECT_EQ(first.LoadOpenCellObserverIncident().value(), later_exit);
+    EXPECT_EQ(first.LoadComponentIncidentEvents(0U, 8U).value().size(), 3U);
+  } else {
+    EXPECT_EQ(closed.error().code, "observer_bring_up_loss_changed");
+    EXPECT_EQ(recorded->value(), first_exit);
+    EXPECT_EQ(first.LoadOpenCellObserverIncident().value(), first_exit);
+    EXPECT_EQ(first.LoadLatestCellObserverBringUp().value(), started);
+    EXPECT_EQ(first.LoadComponentIncidentEvents(0U, 8U).value().size(), 2U);
+  }
+  EXPECT_EQ(first.LoadOpenCellObserverLossAssociation().value(),
+            second.LoadOpenCellObserverLossAssociation().value());
 }
 
 }  // namespace manyforge::core

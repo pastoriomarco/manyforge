@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -430,3 +431,26 @@ def test_measured_grasp_result_wire_is_absent_and_frame_is_bounded() -> None:
         module.matrix_to_pose(identity, frame_id=True)
     with pytest.raises(ValueError, match="1024-character bound"):
         module.matrix_to_pose(identity, frame_id="x" * 1025)
+
+
+@pytest.mark.parametrize("distro", (None, "jazzy", "lyrical"))
+def test_release_gate_ros_setup_uses_selected_container_distro(distro, monkeypatch):
+    monkeypatch.syspath_prepend(str(_ROOT / "scripts/qualification"))
+    module = _load_script(
+        "manyforge_release_gate_ros_setup_test",
+        "scripts/qualification/verify_step18_release_gates.py",
+    )
+    environment = dict(os.environ)
+    environment.pop("ROS_DISTRO", None)
+    if distro is not None:
+        environment["ROS_DISTRO"] = distro
+    # Capture the shell-selected paths; never source ROS or launch a gate.
+    result = subprocess.run(
+        ["bash", "-c", 'source() { printf \'%s\\n\' "$1"; }; ' + module._ros_setup()],
+        env=environment, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.splitlines() == [
+        f"/opt/ros/{distro or 'lyrical'}/setup.bash",
+        "/opt/manyforge/topic_based_ros2_control/install/setup.bash",
+        "/opt/manyforge/venv/bin/activate",
+    ]

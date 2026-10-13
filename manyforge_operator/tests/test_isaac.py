@@ -78,6 +78,40 @@ def _container_config(tmp_path: Path) -> IsaacLauncherConfig:
         evidence_root="/srv/manyforge/evidence", isaac_site_settings="/srv/manyforge/site.json"))
 
 
+
+def test_held_isaac_setup_defaults_are_jazzy_and_explicit_inputs_win(tmp_path, monkeypatch):
+    config = _container_config(tmp_path)
+    assert config.remote.ros_setup_script == "/opt/ros/jazzy/setup.bash"
+    assert IsaacLauncherConfig.__dataclass_fields__["local_ros_setup_script"].default == Path(
+        "/opt/ros/jazzy/setup.bash"
+    )
+    arguments = _parser().parse_args(
+        ["start", "--profile", "isaac", "--source-root", str(config.source_root)]
+    )
+    arguments.source_root = config.source_root
+    arguments.isaac_executable = config.isaac_executable
+    arguments.world_path = config.world_path
+    for field in ("source_root", "container_image_id", "container_name", "cache_root",
+                  "runtime_root", "evidence_root", "manager_executable", "install_root",
+                  "node_catalog_path", "alarm_catalog_path", "state_root",
+                  "simulation_control_config", "ros_environment_script"):
+        setattr(arguments, "remote_" + field, getattr(config.remote, field))
+    for field in ("package_aggregate_sha256", "compiler_build_manifest_sha256",
+                  "node_environment_sha256"):
+        setattr(arguments, field, getattr(config.remote, field))
+    captured = []
+    monkeypatch.setattr("manyforge_operator.cli.IsaacLauncherConfig",
+                        lambda **kwargs: captured.append(kwargs))
+    _isaac_config(arguments)
+    assert captured[-1]["local_ros_setup_script"] == Path("/opt/ros/jazzy/setup.bash")
+    assert captured[-1]["remote"].ros_setup_script == "/opt/ros/jazzy/setup.bash"
+    arguments.local_ros_setup_script = config.local_ros_setup_script
+    arguments.remote_ros_setup_script = "/custom/qualified/setup.bash"
+    _isaac_config(arguments)
+    assert captured[-1]["local_ros_setup_script"] == config.local_ros_setup_script
+    assert captured[-1]["remote"].ros_setup_script == "/custom/qualified/setup.bash"
+
+
 def test_remote_native_command_keeps_optional_source_identity_absent(tmp_path: Path):
     launcher = IsaacLauncher(_config(tmp_path))
 

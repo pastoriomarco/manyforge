@@ -154,9 +154,9 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
-            "schema_version": "manyforge.prepared_activation_input.v5",
-            "scenario_id": "scenario.1",
-            "source_document_digest": "sha256:" + "1" * 64,
+            "schema_version": "manyforge.prepared_activation_input.v6",
+            "origin": {"kind": "scenario", "scenario_id": "scenario.1",
+                       "source_document_digest": "sha256:" + "1" * 64},
             "captured_input_digest": "sha256:" + "d" * 64,
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
@@ -183,7 +183,7 @@ def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
 def test_no_program_activation_requires_exact_absence() -> None:
     value = {
         **_prepared_activation(),
-        "schema_version": "manyforge.prepared_activation_input.v5",
+        "schema_version": "manyforge.prepared_activation_input.v6",
         "program_id": None,
         "program_revision": None,
         "program_outcome": {"kind": "no_program"},
@@ -1556,3 +1556,60 @@ def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> N
     }
     with pytest.raises(ValidationError, match="Extra inputs"):
         SceneTransactionRequest.model_validate(malformed)
+
+
+def _sealed_prepared_activation() -> dict[str, object]:
+    import hashlib
+    import rfc8785
+
+    origin = {
+        "kind": "sealed_canonical_empty", "cell_id": "cell_a",
+        "deployment_artifact_id": "deployment.1", "deployment_revision": "sha256:" + "a" * 64,
+        "retained_bundle_id": "sha256:" + "2" * 64, "graph_revision": "sha256:" + "3" * 64,
+        "admission_digest": "sha256:" + "6" * 64,
+    }
+    return {**_prepared_activation(), "origin": origin,
+            "captured_input_digest": "sha256:" + hashlib.sha256(rfc8785.dumps({
+                "schema_version": "manyforge.sealed_canonical_empty_capture.v1", "origin": origin,
+            })).hexdigest(), "program_id": None, "program_revision": None,
+            "program_outcome": {"kind": "no_program"}, "assistant_mode": "optional"}
+
+
+def test_prepared_origins_are_closed_and_preserve_ordinary_identity_bound() -> None:
+    value = _prepared_activation()
+    value["origin"]["scenario_id"] = "s" * 256
+    assert ManagerApplyPreparedActivation.model_validate(value).origin.scenario_id == "s" * 256
+    for bad in (
+        {**value, "schema_version": "manyforge.prepared_activation_input.v5"},
+        {**value, "scenario_id": "fabricated"},
+        {**value, "source_document_digest": "sha256:" + "1" * 64},
+        {**value, "origin": {**value["origin"], "cell_id": "cell_a"}},
+        {**value, "origin": {**value["origin"], "kind": "unknown"}},
+        {**value, "origin": {**value["origin"], "scenario_id": "s" * 257}},
+    ):
+        with pytest.raises(ValidationError):
+            ManagerApplyPreparedActivation.model_validate(bad)
+
+
+@pytest.mark.parametrize("field,wrong", [
+    ("program_id", "fake-program"), ("program_revision", "sha256:" + "4" * 64),
+    ("program_outcome", {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64}),
+    ("assistant_mode", "required"), ("deployment_revision", "sha256:" + "b" * 64),
+    ("retained_bundle_id", "sha256:" + "b" * 64), ("graph_revision", "sha256:" + "b" * 64),
+    ("deployment_artifact_id", "other"), ("captured_input_digest", "sha256:" + "b" * 64),
+])
+def test_sealed_origin_requires_exact_capture_candidate_and_no_program(field, wrong) -> None:
+    value = _sealed_prepared_activation()
+    assert ManagerApplyPreparedActivation.model_validate(value).origin.kind == "sealed_canonical_empty"
+    with pytest.raises(ValidationError):
+        ManagerApplyPreparedActivation.model_validate({**value, field: wrong})
+
+
+@pytest.mark.parametrize("field,wrong", [
+    ("scenario_id", "fake"), ("source_document_digest", None), ("cell_id", "x" * 129),
+    ("admission_digest", "not-a-digest"), ("kind", "scenario"),
+])
+def test_sealed_origin_refuses_mixed_or_unbounded_identity(field, wrong) -> None:
+    value = _sealed_prepared_activation()
+    with pytest.raises(ValidationError):
+        ManagerApplyPreparedActivation.model_validate({**value, "origin": {**value["origin"], field: wrong}})

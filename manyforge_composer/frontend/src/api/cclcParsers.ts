@@ -4,6 +4,9 @@ import type {
   CCLCBlockingCauseClass,
   CCLCComponentExpectation,
   CCLCComponentSnapshot,
+  CCLCComponentReadiness,
+  CCLCReadinessDomain,
+  CCLCLifecycleFactValue,
   CCLCOwnerIdentity,
   CCLCDesiredBindingRoute,
   CCLCComponentIncident,
@@ -80,6 +83,8 @@ const MAX_INCIDENT_SUMMARY_BYTES = 1024;
 const MAX_VENDOR_CODES = 16;
 const MAX_VENDOR_CODE_BYTES = 64;
 const MAX_DIAGNOSTIC_BYTES = 512 * 1024;
+// Same existing whole selected-runtime packet ceiling as Close/Stop identities.
+const MAX_LAUNCH_IDENTITY_BYTES = 256 * 1024;
 const MAX_DIAGNOSTIC_TAIL_BYTES = 128 * 1024;
 
 function fail(path: string, expected: string): never {
@@ -174,6 +179,147 @@ function errorAt(value: unknown, path: string): CCLCTransactionStatus['error'] {
     parsedDetails[key] = textAt(detail, `${path}.details.${key}`);
   });
   return { code, message, details: parsedDetails };
+}
+
+function readinessTextAt(value: unknown, path: string, maximum = 128, nonempty = true): string {
+  if (typeof value !== 'string' || (nonempty && value.length === 0)
+    || value.normalize('NFC') !== value || new TextEncoder().encode(value).length > maximum
+    || new TextDecoder('utf-8', { ignoreBOM: true }).decode(new TextEncoder().encode(value)) !== value) {
+    return fail(path, 'bounded NFC text');
+  }
+  return value;
+}
+
+function readinessErrorAt(value: unknown, path: string, maximumDetails = 64): CCLCTransactionStatus['error'] {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exact(row, ['code', 'message', 'details'], path);
+  const details = objectAt(row.details, `${path}.details`);
+  if (Object.keys(details).length > maximumDetails) fail(`${path}.details`, `at most ${maximumDetails} rows`);
+  return {
+    code: readinessTextAt(row.code, `${path}.code`),
+    message: readinessTextAt(row.message, `${path}.message`, 1024, false),
+    details: Object.fromEntries(Object.entries(details).map(([key, value]) => [
+      readinessTextAt(key, `${path}.details key`, 64),
+      readinessTextAt(value, `${path}.details.${key}`, 256, false),
+    ])),
+  };
+}
+
+function readinessFactValueAt(value: unknown, path: string): CCLCLifecycleFactValue {
+  const row = objectAt(value, path);
+  switch (row.kind) {
+    case 'unknown': exact(row, ['kind'], path); return { kind: 'unknown' };
+    case 'boolean':
+      exact(row, ['kind', 'boolean_value'], path);
+      return { kind: 'boolean', booleanValue: booleanAt(row.boolean_value, `${path}.boolean_value`) };
+    case 'integer':
+      exact(row, ['kind', 'integer_value'], path);
+      return { kind: 'integer', integerValue: safeIntegerAt(row.integer_value, `${path}.integer_value`) };
+    case 'token':
+      exact(row, ['kind', 'token_value'], path);
+      return { kind: 'token', tokenValue: readinessTextAt(row.token_value, `${path}.token_value`) };
+    default: return fail(`${path}.kind`, 'a lifecycle fact value kind');
+  }
+}
+
+function componentReadinessAt(
+  value: unknown, state: CCLCLifecycleState,
+  domains: CCLCComponentSnapshot['domains'], providers: CCLCComponentSnapshot['providers'],
+): CCLCComponentReadiness {
+  const path = 'cclcComponent.readiness';
+  const row = objectAt(value, path);
+  exact(row, ['request_owner_epoch', 'evaluated_at_ns', 'next_intent', 'requested_state',
+    'ready', 'error', 'domains', 'measured_state'], path);
+  const nextIntent = state === 'declared' || state === 'disabled' ? 'prepare'
+    : state === 'prepared' ? 'enable' : null;
+  const requestedState = nextIntent === 'prepare' ? 'prepared' : nextIntent === 'enable' ? 'active' : null;
+  if (row.next_intent !== nextIntent || row.requested_state !== requestedState) {
+    fail(path, 'the exact next intent/requested state pair for the component state');
+  }
+  const error = readinessErrorAt(row.error, `${path}.error`);
+  const ready = booleanAt(row.ready, `${path}.ready`);
+  if (!ready && error === null) fail(`${path}.error`, 'the actual readiness blocker');
+  const occurrences = arrayAt(row.domains, `${path}.domains`, 256).map<CCLCReadinessDomain>((value, index) => {
+    const domainPath = `${path}.domains[${index}]`;
+    const domain = objectAt(value, domainPath);
+    exact(domain, ['provider_occurrence', 'health', 'decision_kind', 'error',
+      ...('has_activation_step' in domain ? ['has_activation_step'] : [])], domainPath);
+    const hasActivationStep = 'has_activation_step' in domain
+      ? booleanAt(domain.has_activation_step, `${domainPath}.has_activation_step`) : undefined;
+    const occurrence = objectAt(domain.provider_occurrence, `${domainPath}.provider_occurrence`);
+    exact(occurrence, ['control_domain_id', 'control_domain_revision', 'provider_instance_id',
+      'provider_manifest_id', 'provider_manifest_revision', 'provider_runtime_unit_id',
+      'provider_runtime_epoch', 'lifecycle_plan_catalog_digest'], `${domainPath}.provider_occurrence`);
+    Object.entries(occurrence).forEach(([key, value]) => readinessTextAt(value, `${domainPath}.provider_occurrence.${key}`));
+    const providerOccurrence = {
+      controlDomainId: occurrence.control_domain_id as string,
+      controlDomainRevision: occurrence.control_domain_revision as string,
+      providerInstanceId: occurrence.provider_instance_id as string,
+      providerManifestId: occurrence.provider_manifest_id as string,
+      providerManifestRevision: occurrence.provider_manifest_revision as string,
+      providerRuntimeUnitId: occurrence.provider_runtime_unit_id as string,
+      providerRuntimeEpoch: occurrence.provider_runtime_epoch as string,
+      lifecyclePlanCatalogDigest: occurrence.lifecycle_plan_catalog_digest as string,
+    };
+    if (!domains.some((candidate) => candidate.controlDomainId === providerOccurrence.controlDomainId
+      && candidate.controlDomainRevision === providerOccurrence.controlDomainRevision)
+      || !providers.some((candidate) => Object.entries(candidate).every(([key, value]) => (
+        providerOccurrence[key as keyof typeof providerOccurrence] === value
+      )))) fail(`${domainPath}.provider_occurrence`, 'an exact parent occurrence and domain revision');
+    const domainError = readinessErrorAt(domain.error, `${domainPath}.error`);
+    const decisionKind = domain.decision_kind;
+    if (decisionKind !== null && decisionKind !== 'already_satisfied' && decisionKind !== 'dispatch_primitive') {
+      fail(`${domainPath}.decision_kind`, 'a lifecycle plan decision or null');
+    }
+    let health = null;
+    if (domain.health !== null) {
+      const observed = objectAt(domain.health, `${domainPath}.health`);
+      exact(observed, ['observed_state', 'facts', 'diagnostic'], `${domainPath}.health`);
+      health = {
+        observedState: closedTextAt(observed.observed_state, LIFECYCLE_STATES,
+          `${domainPath}.health.observed_state`, 'a lifecycle state'),
+        facts: canonicalBy(arrayAt(observed.facts, `${domainPath}.health.facts`, 256).map((value, index) => {
+          const factPath = `${domainPath}.health.facts[${index}]`;
+          const fact = objectAt(value, factPath);
+          exact(fact, ['lifecycle_fact_id', 'value'], factPath);
+          return { lifecycleFactId: readinessTextAt(fact.lifecycle_fact_id, `${factPath}.lifecycle_fact_id`),
+            value: readinessFactValueAt(fact.value, `${factPath}.value`) };
+        }), (fact) => fact.lifecycleFactId, `${domainPath}.health.facts`),
+        diagnostic: readinessErrorAt(observed.diagnostic, `${domainPath}.health.diagnostic`, 8),
+      };
+    }
+    if ((health === null && (decisionKind !== null || domainError === null))
+      || (nextIntent === null && decisionKind !== null)
+      || (nextIntent !== null && health !== null && ((domainError === null) !== (decisionKind !== null)))) {
+      fail(domainPath, 'consistent health, decision and error');
+    }
+    return { providerOccurrence, health, decisionKind, error: domainError,
+      ...(hasActivationStep === undefined ? {} : { hasActivationStep }) };
+  });
+  canonicalBy(occurrences, (domain) => [domain.providerOccurrence.controlDomainId,
+    domain.providerOccurrence.controlDomainRevision, domain.providerOccurrence.providerInstanceId,
+    domain.providerOccurrence.providerManifestId, domain.providerOccurrence.providerManifestRevision,
+    domain.providerOccurrence.providerRuntimeUnitId, domain.providerOccurrence.providerRuntimeEpoch,
+    domain.providerOccurrence.lifecyclePlanCatalogDigest].join('\u0000'), `${path}.domains`);
+  if (occurrences.length !== providers.length) fail(`${path}.domains`, 'the complete parent occurrence set');
+  const measured = objectAt(row.measured_state, `${path}.measured_state`);
+  exact(measured, ['required', 'available', 'error'], `${path}.measured_state`);
+  const measuredError = readinessErrorAt(measured.error, `${path}.measured_state.error`);
+  if (!(measured.required === false && measured.available === null && measuredError === null)
+    && !(measured.required === null && measured.available === null && measuredError !== null)
+    && !(measured.required === true && typeof measured.available === 'boolean'
+      && (measured.available ? measuredError === null : measuredError !== null))) {
+    fail(`${path}.measured_state`, 'an exact qualified measured-state verdict');
+  }
+  if (ready && (error !== null || measuredError !== null || occurrences.some((domain) => (
+    domain.health === null || domain.error !== null
+  )) || (nextIntent === null && state !== 'active'))) fail(path, 'a consistent positive readiness verdict');
+  return { requestOwnerEpoch: readinessTextAt(row.request_owner_epoch, `${path}.request_owner_epoch`, 256),
+    evaluatedAtNs: parseNanoseconds(row.evaluated_at_ns, `${path}.evaluated_at_ns`),
+    nextIntent, requestedState, ready, error, domains: occurrences,
+    measuredState: { required: measured.required as boolean | null,
+      available: measured.available as boolean | null, error: measuredError } };
 }
 
 export function parseCCLCOwnerIdentity(value: unknown): CCLCOwnerIdentity {
@@ -457,7 +603,8 @@ function diagnosticAt(value: unknown, path: string): CCLCIncidentDiagnostic | nu
   }
   Object.entries(snapshot.context as JsonObject).forEach(([key, fact]) => {
     if (fact !== null) diagnosticTextAt(fact, `${snapshotPath}.context.${key}`,
-      key === 'request_context' || key === 'generator_identity' ? 1024 : 128);
+      key === 'launch_identity' ? MAX_LAUNCH_IDENTITY_BYTES
+        : key === 'request_context' || key === 'generator_identity' ? 1024 : 128);
   });
   Object.entries(snapshot.readiness as JsonObject).forEach(([key, fact]) => {
     if (fact === null) return;
@@ -590,7 +737,7 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     'component_lifecycle_state', 'controllable_component_id', 'domains',
     'graph_revision', 'lifecycle_progress', 'lifecycle_target',
     'provider_occurrences', 'publication_generation',
-    'retained_bundle_id', 'snapshot_digest',
+    'retained_bundle_id', 'snapshot_digest', 'readiness',
     ...(hasOutputCounters ? ['dropped_output_lines', 'dropped_output_bytes'] : []),
   ], 'cclcComponent');
   const state = textAt(
@@ -737,8 +884,11 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     lifecycleState: state,
     retainedBundleId: textAt(row.retained_bundle_id, 'cclcComponent.retained_bundle_id'),
     graphRevision: textAt(row.graph_revision, 'cclcComponent.graph_revision'),
+    publicationGeneration: integerAt(row.publication_generation, 'cclcComponent.publication_generation'),
+    activePublicPointerDigest: textAt(row.active_public_pointer_digest, 'cclcComponent.active_public_pointer_digest'),
     domains,
     providers,
+    readiness: componentReadinessAt(row.readiness, state, domains, providers),
     lifecycleTarget: lifecycleTargetAt(
       row.lifecycle_target,
       'cclcComponent.lifecycle_target',
@@ -993,11 +1143,16 @@ function incidentRecoveryAt(value: unknown, path: string): CCLCIncidentRecovery 
   exact(row, [
     'acknowledged_at_ns', 'acknowledged_by', 'cause_class', 'controllable_component_id',
     'incident_id',
+    ...('closure_reason' in row ? ['closure_reason'] : []),
   ], path);
   if (!boundedNfcText(row.incident_id, MAX_INCIDENT_ID_BYTES)) {
     fail(`${path}.incident_id`, 'bounded non-empty NFC text');
   }
+  if ('closure_reason' in row && row.closure_reason !== 'cell_closed_by_operator') {
+    fail(`${path}.closure_reason`, 'cell_closed_by_operator');
+  }
   return {
+    ...('closure_reason' in row ? { closureReason: 'cell_closed_by_operator' as const } : {}),
     incidentId: row.incident_id,
     componentId: textAt(row.controllable_component_id, `${path}.controllable_component_id`),
     causeClass: closedTextAt(

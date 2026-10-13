@@ -251,6 +251,15 @@ struct ApplyComponentGenerationSelectionDTO final {
                          const ApplyComponentGenerationSelectionDTO&) = default;
 };
 
+/// The existing operator Recover bound to one still-open incident for Close.
+/// This grants no ordinary recovery fallback or vendor effect.
+struct CloseComponentIncidentRecoveryDTO final {
+  std::string expected_incident_id;
+
+  friend bool operator==(const CloseComponentIncidentRecoveryDTO&,
+                         const CloseComponentIncidentRecoveryDTO&) = default;
+};
+
 struct ComponentLifecycleIntentDTO final {
   PublicRequestContextDTO request_context;
   ControllableComponentId controllable_component_id;
@@ -263,6 +272,7 @@ struct ComponentLifecycleIntentDTO final {
   AdmissionGeneration expected_admission_generation{1U};
   std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
   std::optional<ApplyComponentGenerationSelectionDTO> apply_generation_selection{};
+  std::optional<CloseComponentIncidentRecoveryDTO> close_incident_recovery{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool replay_equal(const ComponentLifecycleIntentDTO& other) const noexcept;
@@ -313,6 +323,8 @@ struct LifecycleDomainHealthDTO final {
   ComponentLifecycleStateDTO observed_state;
   std::vector<LifecycleFactDTO> facts;
   std::optional<ErrorDTO> diagnostic;
+  /// Presentation only: absent means the producer has not stated applicability.
+  std::optional<bool> has_activation_step{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 

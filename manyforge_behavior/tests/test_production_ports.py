@@ -3833,3 +3833,31 @@ def test_node_preview_refuses_unbound_runs_and_non_motion_nodes() -> None:
             request_id="p",
         )
     assert transport.submissions == []
+
+
+def test_idle_scene_restoration_reuses_the_exact_applied_program_convergence() -> None:
+    transport = _SceneTransport()
+    port = _scene_port(transport)
+    context = _scene_context()
+    scene = [_authored_scene()[0]]
+    # Successful Program Apply/Load invokes this same existing primitive.
+    proof = port.prepare_initial_scene(context, scene)
+    port.verify_initial_scene(context, scene, proof)
+    assert list(transport.objects) == ["graspable"]
+    assert len(transport.submissions) == 1
+    # A deliberate authored edit while idle is allowed. Ordinary idle Reset
+    # restores the Program objects through the same convergence, never Run.
+    edit = deepcopy(transport.submissions[0])
+    edit["request_context"]["request_id"] = "operator.authored.scene.edit"
+    edit["expected_projection_revision"] = deepcopy(transport.revision)
+    edit["expected_admission_generation"] = transport.admission_generation
+    edit["operation"]["kind"] = "upsert_object"
+    edit["operation"]["pose"]["position_m"]["x_m"] = 0.7
+    transport.commit_scene_transaction(edit)
+    assert transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"]["x"] == 0.7
+    proof = port.prepare_initial_scene(context, scene)
+    port.verify_initial_scene(context, scene, proof)
+    assert len(transport.submissions) == 3
+    assert transport.submissions[-1]["operation"]["kind"] == "upsert_object"
+    assert transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"]["x"] == 0.3
+    port.release(context.program_run_id)

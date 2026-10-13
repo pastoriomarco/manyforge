@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/route_selection.hpp>
+#include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/types/cclc.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/component_incident.hpp>
@@ -20,6 +21,85 @@ inline constexpr std::size_t kMaximumCCLCRequestMembership = 4096U;
 inline constexpr std::size_t kMaximumCCLCActiveTransactions = 64U;
 inline constexpr std::size_t kMaximumCCLCComponentWatermarks = 64U;
 inline constexpr std::size_t kMaximumCCLCActiveConfigurationWatermarks = 64U;
+
+/// Current owner/publication scope for an explicit target retirement. Echoed
+/// offer values are CAS data, never effect permission or settlement proof.
+struct CCLCLifecycleTargetRetirementScopeDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  ActiveBundlePublicationGeneration publication_generation;
+  ContentDigest active_public_pointer_digest;
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    const auto& digest = active_public_pointer_digest.value();
+    return !request_owner_epoch.empty() &&
+           request_owner_epoch.value().size() <= kMaxLifecycleIdentityBytes &&
+           publication_generation.nonzero() && digest.size() == 71U &&
+           digest.starts_with("sha256:") &&
+           std::all_of(digest.begin() + 7, digest.end(), [](char c) {
+             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+  }
+  friend bool operator==(const CCLCLifecycleTargetRetirementScopeDTO&,
+                         const CCLCLifecycleTargetRetirementScopeDTO&) = default;
+};
+
+[[nodiscard]] inline bool ValidCCLCRetirementTargets(
+    const std::vector<ComponentLifecycleTargetDTO>& targets) noexcept {
+  return targets.size() <= kMaximumCCLCComponentWatermarks &&
+         std::is_sorted(targets.begin(), targets.end(), [](const auto& a, const auto& b) {
+           return a.controllable_component_id < b.controllable_component_id;
+         }) &&
+         std::adjacent_find(targets.begin(), targets.end(), [](const auto& a, const auto& b) {
+           return a.controllable_component_id == b.controllable_component_id;
+         }) == targets.end() &&
+         std::all_of(targets.begin(), targets.end(), [](const auto& target) {
+           return target.locally_valid() &&
+                  (!target.recovered_cause ||
+                   parse_lifecycle_blocking_cause_class(to_string(*target.recovered_cause)) ==
+                       target.recovered_cause);
+         });
+}
+
+struct CCLCLifecycleTargetRetirementIntentDTO final {
+  PublicRequestContextDTO request_context;
+  CCLCLifecycleTargetRetirementScopeDTO scope;
+  std::vector<ComponentLifecycleTargetDTO> expected_targets;
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    return scope.locally_valid() &&
+           request_context.request_owner_epoch == scope.request_owner_epoch &&
+           !request_context.request_id.empty() &&
+           request_context.request_id.value().size() <= kMaxLifecycleIdentityBytes &&
+           !request_context.source_label.empty() &&
+           request_context.source_label.size() <= kMaxLifecycleRequestLabelBytes &&
+           (!request_context.correlation_id ||
+            (!request_context.correlation_id->empty() &&
+             request_context.correlation_id->size() <= kMaxLifecycleRequestLabelBytes)) &&
+           ValidCCLCRetirementTargets(expected_targets);
+  }
+  friend bool operator==(const CCLCLifecycleTargetRetirementIntentDTO&,
+                         const CCLCLifecycleTargetRetirementIntentDTO&) = default;
+};
+
+struct CCLCLifecycleTargetRetirementOfferDTO final {
+  CCLCLifecycleTargetRetirementScopeDTO scope;
+  std::vector<ComponentLifecycleTargetDTO> targets;
+  [[nodiscard]] bool locally_valid() const noexcept {
+    return scope.locally_valid() && ValidCCLCRetirementTargets(targets);
+  }
+};
+
+struct CCLCLifecycleTargetRetirementResultDTO final {
+  RequestReplayStatusDTO replay_status;
+  CCLCLifecycleTargetRetirementScopeDTO scope;
+  std::vector<ComponentLifecycleTargetDTO> retired_targets;
+  PublicRequestContextDTO request_context;
+  [[nodiscard]] bool locally_valid() const noexcept {
+    return (replay_status == RequestReplayStatusDTO::kAcceptedNew ||
+            replay_status == RequestReplayStatusDTO::kReplayedExact) &&
+           CCLCLifecycleTargetRetirementIntentDTO{request_context, scope, retired_targets}.locally_valid();
+  }
+};
 
 /// Trusted caller distinction: receiver startup retires Active intent, while
 /// an exact settled capacity checkpoint preserves the same live product.
@@ -235,6 +315,31 @@ class ICCLCCurrentFactReader {
 /// corresponding external effect or public projection.
 class ICCLCJournal : public ICCLCCurrentFactReader {
  public:
+  /// Exact retained row, including a retired generation; absence is not Close
+  /// provenance. The terminal publisher reads under the existing CCLC exclusion.
+  [[nodiscard]] virtual Result<std::optional<ComponentLifecycleTargetRetentionDTO>>
+  ReadLifecycleTargetRetention(const ControllableComponentId&) {
+    return Result<std::optional<ComponentLifecycleTargetRetentionDTO>>::Err(
+        {"cclc_target_retirement_proof_unavailable", "retained target proof is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::vector<ComponentLifecycleTargetDTO>>
+  LoadLifecycleTargetsForClose(const RequestOwnerEpoch&) {
+    return Result<std::vector<ComponentLifecycleTargetDTO>>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement read is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>
+  ReadLifecycleTargetRetirementResult(const CCLCLifecycleTargetRetirementIntentDTO&) {
+    return Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement result is not composed", {}});
+  }
+  /// Original replay precedes current owner/target/guard checks. Fresh CAS
+  /// shares the existing membership transaction and Kernel admission lease.
+  [[nodiscard]] virtual Result<CCLCLifecycleTargetRetirementResultDTO>
+  RetireLifecycleTargetsForClose(const RequestOwnerEpoch&,
+      const CCLCLifecycleTargetRetirementIntentDTO&, const ICellCloseAdmissionLease&) {
+    return Result<CCLCLifecycleTargetRetirementResultDTO>::Err(
+        {"cclc_target_retirement_unavailable", "target retirement is not composed", {}});
+  }
   ~ICCLCJournal() override = default;
 
   /// An unfinished parent Apply may have reserved generations or published

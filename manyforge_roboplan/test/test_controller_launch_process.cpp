@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -369,6 +371,7 @@ public:
           << "printf '%s\\n' \"$@\" > \"$out/$$.args\"\n"
           << "ls /proc/$$/fd > \"$out/$$.fds\"\n"
           << "printf '%s' \"$ROS_LOG_DIR\" > \"$out/$$.roslog\"\n"
+          << "printf '%s' \"$ROS_HOME\" > \"$out/$$.roshome\"\n"
           << "if [ -n \"$FAKE_LAUNCH_EXIT\" ]; then exit "
              "\"$FAKE_LAUNCH_EXIT\"; fi\n"
           << "trap 'exit 0' INT TERM\n"
@@ -405,6 +408,286 @@ private:
 };
 
 [[nodiscard]] bool alive(const int pid) { return ::kill(pid, 0) == 0; }
+
+// Exec a fresh fixture host so it owns the real spawner thread. The test is a
+// subreaper only while this isolated tree runs, allowing exact child reaping
+// without depending on the container's PID 1. No ROS node or simulator starts.
+class AbruptLaunchHost final {
+public:
+  AbruptLaunchHost(const std::filesystem::path &root, const std::string &role,
+                  const std::string &selector)
+      : root_(root) {
+    if (::prctl(PR_GET_CHILD_SUBREAPER, &previous_subreaper_) != 0 ||
+        ::prctl(PR_SET_CHILD_SUBREAPER, 1) != 0)
+      throw std::runtime_error("cannot prepare fixture subreaper");
+    std::vector<std::string> environment;
+    for (auto entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+      if (!std::string_view(*entry).starts_with("MANYFORGE_Q116_HOST_") &&
+          !std::string_view(*entry).starts_with("GTEST_OUTPUT="))
+        environment.emplace_back(*entry);
+    }
+    environment.push_back("MANYFORGE_Q116_HOST_ROOT=" + root.string());
+    environment.push_back("MANYFORGE_Q116_HOST_ROLE=" + role);
+    std::vector<char *> env;
+    for (auto &entry : environment)
+      env.push_back(entry.data());
+    env.push_back(nullptr);
+    std::string filter = "--gtest_filter=" + selector;
+    char executable[] = "/proc/self/exe";
+    char *args[]{executable, filter.data(), nullptr};
+    host_pid_ = ::fork();
+    if (host_pid_ == 0) {
+      ::execve(executable, args, env.data());
+      ::_exit(127);
+    }
+    if (host_pid_ < 0) {
+      ::prctl(PR_SET_CHILD_SUBREAPER, previous_subreaper_);
+      throw std::runtime_error("cannot start fixture host");
+    }
+  }
+  ~AbruptLaunchHost() {
+    cleanup(host_pid_);
+    // After host/leader exit, surviving descendants belong to this subreaper.
+    // waitpid checks actual parenthood before signalling any recorded PID.
+    cleanup(read_pid("launch_pid"));
+    cleanup(read_pid("child_pid"));
+    ::prctl(PR_SET_CHILD_SUBREAPER, previous_subreaper_);
+  }
+  [[nodiscard]] int read_pid(const char *name) const {
+    int pid = -1;
+    std::istringstream(read_file(root_ / name)) >> pid;
+    return pid;
+  }
+  [[nodiscard]] bool kill_host() {
+    if (::kill(host_pid_, SIGKILL) != 0)
+      return false;
+    int status = 0;
+    const auto pid = host_pid_;
+    while (::waitpid(pid, &status, 0) < 0) {
+      if (errno != EINTR)
+        return false;
+    }
+    host_pid_ = -1;
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+  }
+  [[nodiscard]] bool reap_launch() {
+    const auto pid = read_pid("launch_pid");
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      int status = 0;
+      const auto result = ::waitpid(pid, &status, WNOHANG);
+      const auto wait_errno = errno;
+      if (result == pid || (result < 0 && wait_errno != EINTR)) {
+        const auto wait_error = result < 0 ? wait_errno : 0;
+        const char *evidence = ::getenv("MANYFORGE_Q116_EVIDENCE_ROOT");
+        const auto directory = evidence == nullptr
+                                   ? root_
+                                   : std::filesystem::path(evidence) / root_.filename();
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        std::ofstream record(directory / "launch_wait_status.json");
+        record << "{\"waitpid_result\":" << result
+               << ",\"waitpid_errno\":" << wait_error
+               << ",\"raw_status\":"
+               << (result == pid ? std::to_string(status) : "null")
+               << ",\"exited\":" << (result == pid && WIFEXITED(status) ? "true" : "false")
+               << ",\"exit_code\":"
+               << (result == pid && WIFEXITED(status) ? std::to_string(WEXITSTATUS(status)) : "null")
+               << ",\"signaled\":" << (result == pid && WIFSIGNALED(status) ? "true" : "false")
+               << ",\"signal\":"
+               << (result == pid && WIFSIGNALED(status) ? std::to_string(WTERMSIG(status)) : "null")
+               << "}\n";
+        record.flush();
+        if (error || !record)
+          std::fprintf(stderr, "Q116 raw waitpid status capture failed\n");
+      }
+      // Diagnostic IO must not change the existing waitpid error predicate.
+      errno = wait_errno;
+      if (result == pid)
+        return true; // Exact leader reaped; raw terminal status is reported above.
+      if (result < 0 && errno != EINTR)
+        return false;
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  }
+
+private:
+  static void cleanup(const int pid) {
+    if (pid <= 0)
+      return;
+    int status = 0;
+    if (::waitpid(pid, &status, WNOHANG) == 0) {
+      ::kill(pid, SIGKILL);
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      }
+    }
+  }
+  std::filesystem::path root_;
+  int previous_subreaper_{0};
+  int host_pid_{-1};
+};
+
+void check_parent_death(const std::string &role, const std::string &selector,
+                        const bool managed_shutdown) {
+  if (const char *root_value = ::getenv("MANYFORGE_Q116_HOST_ROOT")) {
+    const std::filesystem::path root(root_value);
+    const std::string host_role(::getenv("MANYFORGE_Q116_HOST_ROLE"));
+    ControllerLaunchSupervisor supervisor;
+    std::shared_ptr<CellLaunchProcess> cell;
+    int pid = -1;
+    if (host_role == "cell") {
+      const CellLaunchCommand command{
+          manyforge::core::CellId("q116_fixture"), CellLaunchRole::kSceneBarrier,
+          std::nullopt,
+          {"ros2", "launch", "manyforge_ros_bringup", "mock_control.launch.py"},
+          "q116_cell_fixture"};
+      cell = supervisor.start_cell_process(command, root / "artifacts");
+      pid = cell->pid();
+    } else {
+      auto command =
+          host_role == "isaac"
+              ? isaac_controller_launch_command(isaac_artifacts(root),
+                                                 isaac_lane(), isaac_inputs())
+              : mock_controller_launch_command(mock_artifacts(root));
+      if (host_role == "other")
+        command.argv[3] = "other_control.launch.py";
+      if (host_role == "foreign_package")
+        command.argv[2] = "other_bringup";
+      if (host_role == "mismatched_lane")
+        command.lane = ControllerLaunchLane::kIsaac;
+      pid = supervisor.ensure(command, root / "artifacts").process->pid();
+    }
+    std::ofstream(root / "launch_pid") << pid;
+    for (;;)
+      ::pause();
+  }
+  FakeLaunch fake;
+  const auto root = fake.root();
+  struct EvidenceCapture final {
+    std::filesystem::path root;
+    ~EvidenceCapture() {
+      const char *evidence = ::getenv("MANYFORGE_Q116_EVIDENCE_ROOT");
+      if (evidence == nullptr)
+        return;
+      std::error_code error;
+      const auto target = std::filesystem::path(evidence) / root.filename();
+      std::filesystem::create_directories(target, error);
+      if (!error)
+        std::filesystem::copy(root, target,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::skip_symlinks,
+                              error);
+      if (error)
+        std::fprintf(stderr, "Q116 shutdown artifacts unavailable: %s\n",
+                     error.message().c_str());
+    }
+  } evidence_capture{root};
+  // Replace only this fixture's PATH entry. The installed launch SDK owns a
+  // genuine ExecuteProcess child; the canonical robot launch files are unused.
+  std::ofstream(root / "bin/ros2") << R"PY(#!/usr/bin/python3
+import ctypes
+import os
+from pathlib import Path
+import sys
+from launch import LaunchDescription, LaunchService
+from launch.actions import ExecuteProcess, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+root = Path(__file__).resolve().parent.parent
+value = ctypes.c_int()
+if ctypes.CDLL(None, use_errno=True).prctl(2, ctypes.byref(value), 0, 0, 0):
+    raise OSError(ctypes.get_errno(), 'PR_GET_PDEATHSIG')
+(root / 'parent_death_signal').write_text(str(value.value))
+service = LaunchService(noninteractive=not sys.stdin.isatty())
+(root / 'launch_pgid').write_text(str(os.getpgrp()))
+child = ExecuteProcess(cmd=[sys.executable, str(root / 'child.py'), str(root)])
+def child_exited(event, context):
+    (root / 'child_exit_pid').write_text(str(event.pid))
+    (root / 'child_exit_code').write_text(str(event.returncode))
+service.include_launch_description(LaunchDescription([
+    RegisterEventHandler(OnProcessExit(target_action=child, on_exit=child_exited)),
+    child,
+]))
+result = service.run()
+(root / 'launch_service_return').write_text(str(result))
+sys.exit(result)
+)PY";
+  std::ofstream(root / "child.py") << R"PY(import os
+from pathlib import Path
+import signal
+import sys
+root = Path(sys.argv[1])
+def interrupted(signum, frame):
+    (root / 'child_signal').write_text(str(signum))
+    sys.exit(0)
+signal.signal(signal.SIGINT, interrupted)
+(root / 'child_pgid').write_text(str(os.getpgrp()))
+(root / 'child_pid').write_text(str(os.getpid()))
+while True:
+    signal.pause()
+)PY";
+  AbruptLaunchHost host(root, role, selector);
+  ASSERT_TRUE(fake.wait_for(root / "launch_pid"));
+  ASSERT_TRUE(fake.wait_for(root / "child_pid"));
+  ASSERT_TRUE(fake.wait_for(root / "parent_death_signal"));
+  ASSERT_TRUE(fake.wait_for(root / "launch_pgid"));
+  ASSERT_TRUE(fake.wait_for(root / "child_pgid"));
+  const auto launch_group = host.read_pid("launch_pgid");
+  const auto child_group = host.read_pid("child_pgid");
+  ASSERT_GT(launch_group, 0);
+  ASSERT_GT(child_group, 0);
+  ASSERT_NE(launch_group, ::getpgrp());
+  ASSERT_NE(child_group, ::getpgrp());
+  const auto expected = managed_shutdown ? SIGINT : SIGTERM;
+  EXPECT_EQ(read_file(root / "parent_death_signal"), std::to_string(expected));
+  ::testing::Test::RecordProperty("parent_death_signal", expected);
+  ASSERT_TRUE(host.kill_host());
+  ::testing::Test::RecordProperty("host_exit_signal", SIGKILL);
+  if (managed_shutdown) {
+    ASSERT_TRUE(fake.wait_for(root / "child_signal"));
+    EXPECT_EQ(read_file(root / "child_signal"), std::to_string(SIGINT));
+    ASSERT_TRUE(host.reap_launch());
+    ASSERT_TRUE(fake.wait_for(root / "child_exit_code"));
+    EXPECT_EQ(host.read_pid("child_exit_pid"), host.read_pid("child_pid"));
+    EXPECT_EQ(read_file(root / "child_exit_code"), "0");
+    // The service return is separate from interpreter finalization/stdio exit.
+    ASSERT_TRUE(fake.wait_for(root / "launch_service_return"));
+    ::testing::Test::RecordProperty("launch_service_return",
+                                   read_file(root / "launch_service_return"));
+    for (const auto group : {launch_group, child_group}) {
+      errno = 0;
+      const auto result = ::kill(-group, 0);
+      const auto group_error = errno;
+      EXPECT_EQ(result, -1) << "surviving process group " << group;
+      EXPECT_EQ(group_error, ESRCH) << "process group " << group;
+      std::ofstream(root / ("group_" + std::to_string(group) + "_status"))
+          << result << " " << group_error;
+    }
+    // The launch SDK must have reaped its managed child before exiting.
+    EXPECT_FALSE(alive(host.read_pid("child_pid")));
+    ::testing::Test::RecordProperty("managed_child_signal", SIGINT);
+  }
+}
+
+TEST(ControllerLaunchSupervisor, MockParentDeathInterruptsManagedLaunchChild) {
+  check_parent_death("mock", "ControllerLaunchSupervisor."
+                             "MockParentDeathInterruptsManagedLaunchChild",
+                     true);
+}
+
+TEST(ControllerLaunchSupervisor, IsaacParentDeathInterruptsManagedLaunchChild) {
+  check_parent_death("isaac", "ControllerLaunchSupervisor."
+                              "IsaacParentDeathInterruptsManagedLaunchChild",
+                     true);
+}
+
+TEST(ControllerLaunchSupervisor, OtherLaunchRolesKeepParentDeathSigterm) {
+  for (const auto *role : {"other", "foreign_package", "mismatched_lane", "cell"}) {
+    SCOPED_TRACE(role);
+    check_parent_death(role, "ControllerLaunchSupervisor."
+                             "OtherLaunchRolesKeepParentDeathSigterm",
+                       false);
+  }
+}
 
 // A node in the fake launch's process group. The test keeps parenthood so it
 // can reap the probe and assert actual termination even under container PID 1.
@@ -551,6 +834,21 @@ TEST(ControllerLaunchSupervisor, UnchangedIsaacApplyKeepsTheExactProcess) {
 TEST(ControllerLaunchSupervisor,
      PrivateRosLogEnvironmentFollowsActualOccurrence) {
   FakeLaunch fake;
+  const auto inherited_home = std::getenv("ROS_HOME");
+  struct RestoreRosHome final {
+    std::optional<std::string> previous;
+    ~RestoreRosHome() {
+      if (previous)
+        ::setenv("ROS_HOME", previous->c_str(), 1);
+      else
+        ::unsetenv("ROS_HOME");
+    }
+  } restore_home{inherited_home == nullptr
+                     ? std::optional<std::string>()
+                     : std::optional<std::string>(inherited_home)};
+  const auto shared_home = fake.root() / "execution-run" / "ros-home";
+  std::filesystem::create_directories(shared_home);
+  ASSERT_EQ(::setenv("ROS_HOME", shared_home.c_str(), 1), 0);
   ControllerLaunchSupervisor supervisor(100ms);
   const auto inherited = std::getenv("ROS_LOG_DIR");
   const auto host_value = inherited == nullptr
@@ -562,8 +860,11 @@ TEST(ControllerLaunchSupervisor,
   const auto second_root = fake.root() / "second-artifacts";
   const auto first = supervisor.ensure(command, first_root);
   ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".roslog")));
+  ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".roshome")));
   EXPECT_EQ(read_file(fake.out(first.process->pid(), ".roslog")),
             (first_root / "ros").string());
+  EXPECT_EQ(read_file(fake.out(first.process->pid(), ".roshome")),
+            shared_home.string());
   const auto kept = supervisor.ensure(command, second_root);
   EXPECT_EQ(kept.process, first.process);
   EXPECT_FALSE(std::filesystem::exists(second_root));
@@ -572,7 +873,19 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_EQ(after == nullptr ? std::optional<std::string>()
                              : std::optional<std::string>(after),
             host_value);
-  EXPECT_TRUE(supervisor.discard_candidate(first));
+  auto replacement_command = command;
+  replacement_command.identity += ".replacement";
+  const auto restarted = supervisor.ensure(replacement_command, second_root);
+  EXPECT_EQ(restarted.decision, ControllerLaunchDecision::kRestart);
+  ASSERT_TRUE(fake.wait_for(fake.out(restarted.process->pid(), ".roslog")));
+  ASSERT_TRUE(fake.wait_for(fake.out(restarted.process->pid(), ".roshome")));
+  EXPECT_EQ(read_file(fake.out(restarted.process->pid(), ".roslog")),
+            (second_root / "ros").string());
+  EXPECT_EQ(read_file(fake.out(restarted.process->pid(), ".roshome")),
+            shared_home.string());
+  ASSERT_NE(std::getenv("ROS_HOME"), nullptr);
+  EXPECT_EQ(std::string(std::getenv("ROS_HOME")), shared_home.string());
+  EXPECT_TRUE(supervisor.discard_candidate(restarted));
   EXPECT_EQ(first.process->exit_evidence()->upstream_log_directory,
             first_root / "ros");
 }
@@ -723,6 +1036,23 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
   EXPECT_EQ(again.decision, ControllerLaunchDecision::kRestart);
   EXPECT_NE(again.process->pid(), started.process->pid());
   EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
+}
+
+TEST(ControllerLaunchSupervisor, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(100ms);
+  auto command = mock_controller_launch_command(mock_artifacts(fake.root()));
+  command.identity = std::string(5000U, 'x');
+  const auto started = supervisor.ensure(command, fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  const auto tail = started.process->output_snapshot().tail;
+  EXPECT_NE(tail.find("[truncated]"), std::string::npos);
+  EXPECT_EQ(tail.find(command.identity), std::string::npos);
+  EXPECT_EQ(started.process->command().identity, command.identity);
+  started.process->stop(100ms);
+  const auto evidence = started.process->exit_evidence();
+  ASSERT_TRUE(evidence);
+  EXPECT_EQ(evidence->launch_identity, command.identity);
 }
 
 TEST(ControllerLaunchSupervisor,
@@ -1384,6 +1714,117 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(supervisor.retire_exact(replacement.process));
 }
 
+TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(10s);
+  const auto probe = [&](const std::string &name) {
+    const auto root = fake.root().string();
+    return std::vector<std::string>{"sh", "-c",
+                                    "trap 'printf int > " + root + "/" + name +
+                                        ".int' INT; "
+                                        "printf ready > " +
+                                        root + "/" + name +
+                                        ".ready; "
+                                        "while [ ! -f " +
+                                        root +
+                                        "/release ]; do sleep 0.02; done"};
+  };
+  auto a = mock_controller_launch_command(mock_artifacts(fake.root()));
+  auto b = mock_controller_launch_command(
+      mock_artifacts(fake.root(), "sha256:peer", "peer"));
+  a.argv = probe("a");
+  b.argv = probe("b");
+  const auto first = supervisor.ensure(a, fake.root() / "a-artifacts");
+  const auto second = supervisor.ensure(b, fake.root() / "b-artifacts");
+  auto cell = supervisor.start_cell_process(
+      CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
+                        CellLaunchRole::kSceneBarrier, std::nullopt,
+                        probe("cell"), "cell.shutdown.barrier"},
+      fake.root() / "cell-artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.root() / "a.ready"));
+  ASSERT_TRUE(fake.wait_for(fake.root() / "b.ready"));
+  ASSERT_TRUE(fake.wait_for(fake.root() / "cell.ready"));
+  const auto snapshot = supervisor.BeginHostShutdown({cell});
+  const int cell_pid = cell->pid();
+  cell.reset(); // the complete cut retains the actual cell occurrence
+  EXPECT_TRUE(fake.wait_for(fake.root() / "a.int"));
+  EXPECT_TRUE(fake.wait_for(fake.root() / "b.int"));
+  EXPECT_TRUE(fake.wait_for(fake.root() / "cell.int"));
+  auto progress = supervisor.PollHostShutdown(snapshot);
+  EXPECT_EQ(progress.total, 3U);
+  EXPECT_EQ(progress.signalled, 3U);
+  EXPECT_EQ(progress.pending, 3U);
+  EXPECT_EQ(progress.escalated, 0U);
+  EXPECT_TRUE(alive(cell_pid));
+  EXPECT_THROW(static_cast<void>(
+                   supervisor.ensure(a, fake.root() / "refused-artifacts")),
+               ControllerLaunchProcessError);
+  EXPECT_THROW(
+      static_cast<void>(supervisor.start_cell_process(
+          CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
+                            CellLaunchRole::kSceneBarrier, std::nullopt,
+                            probe("foreign"), "cell.shutdown.foreign"},
+          fake.root() / "refused-cell-artifacts")),
+      ControllerLaunchProcessError);
+  {
+    std::ofstream release(fake.root() / "release");
+    release << "release";
+  }
+  for (int i = 0; i < 200 && progress.pending != 0U; ++i) {
+    std::this_thread::sleep_for(10ms);
+    progress = supervisor.PollHostShutdown(snapshot);
+  }
+  EXPECT_EQ(progress.pending, 0U);
+  EXPECT_EQ(progress.reaped, 3U);
+  EXPECT_EQ(progress.drained, 3U);
+  EXPECT_EQ(progress.unknown, 0U);
+  EXPECT_FALSE(alive(first.process->pid()));
+  EXPECT_FALSE(alive(second.process->pid()));
+  EXPECT_FALSE(alive(cell_pid));
+}
+
+TEST(ControllerLaunchSupervisor,
+     AggregateDoesNotRenewConcurrentExactRetirementGrace) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(10s);
+  auto command = mock_controller_launch_command(mock_artifacts(fake.root()));
+  const auto root = fake.root().string();
+  command.argv = {"sh", "-c",
+                  "trap 'printf int > " + root +
+                      "/interrupt' INT; printf ready > " + root +
+                      "/ready; while :; do sleep 0.02; done"};
+  const auto started = supervisor.ensure(command, fake.root() / "artifacts",
+                                         "first-stop-context");
+  ASSERT_TRUE(started.process->append_incident_correlation(
+      "existing.first.incident", "first-stop-context", "first stop"));
+  ASSERT_TRUE(fake.wait_for(fake.root() / "ready"));
+  auto existing =
+      std::async(std::launch::async, [&] { started.process->stop(500ms); });
+  EXPECT_TRUE(fake.wait_for(fake.root() / "interrupt"));
+  ASSERT_EQ(existing.wait_for(0ms), std::future_status::timeout);
+  started.process->update_request_context("later-retain-context");
+  ASSERT_TRUE(started.process->append_incident_correlation(
+      "existing.later.incident", "later-retain-context", "later retain"));
+  const auto snapshot = supervisor.BeginHostShutdown({});
+  auto progress = supervisor.PollHostShutdown(snapshot);
+  for (int i = 0; i < 100 && progress.pending != 0U; ++i) {
+    std::this_thread::sleep_for(10ms);
+    progress = supervisor.PollHostShutdown(snapshot);
+  }
+  // The first actual retirement's 500ms grace is not replaced by host 10s.
+  EXPECT_EQ(progress.pending, 0U);
+  EXPECT_EQ(progress.reaped, 1U);
+  EXPECT_EQ(existing.wait_for(1s), std::future_status::ready);
+  existing.get();
+  const auto tail = started.process->output_snapshot().tail;
+  const auto end = tail.find("manyforge_controller_launch_end");
+  ASSERT_NE(end, std::string::npos);
+  EXPECT_NE(tail.find("request_context=\"first-stop-context\"", end),
+            std::string::npos);
+  EXPECT_NE(tail.find("incident_id=\"existing.first.incident\"", end),
+            std::string::npos);
+}
+
 TEST(ControllerLaunchSupervisor,
      CountersSurviveReplaceRemoveReaddAndLateOutput) {
   FakeLaunch fake;
@@ -1957,6 +2398,23 @@ TEST(ControllerLaunchSupervisor,
           "exact_cell_launch_identity"};
 }
 
+TEST(CellLaunchProcess, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(100ms);
+  auto command = cell_command();
+  command.identity = std::string(5000U, 'x');
+  const auto process = supervisor.start_cell_process(command, fake.root() / "cell.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
+  const auto tail = process->output_snapshot().tail;
+  EXPECT_NE(tail.find("[truncated]"), std::string::npos);
+  EXPECT_EQ(tail.find(command.identity), std::string::npos);
+  EXPECT_EQ(process->command().identity, command.identity);
+  process->stop(100ms);
+  const auto evidence = process->exit_evidence();
+  ASSERT_TRUE(evidence);
+  EXPECT_EQ(evidence->command.identity, command.identity);
+}
+
 TEST(CellLaunchProcess, BarrierExitEvidenceDistinguishesSuccessAndFailure) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
@@ -2042,6 +2500,29 @@ TEST(CellLaunchProcess, CachedExitNeverClaimsAnExternallyReapedLeader) {
   EXPECT_FALSE(supervisor.retire_cell_process(process));
   // Keep the real earlier diagnostic, but never promote it to a reap receipt.
   EXPECT_EQ(process->exit_evidence()->observed_utc, evidence->observed_utc);
+}
+
+TEST(CellLaunchProcess, GroupDrainRequiresTheActualOwnedRetirement) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(100ms);
+  const auto owned =
+      supervisor.start_cell_process(cell_command(CellLaunchRole::kPoseObserver),
+                                    fake.root() / "owned-observer");
+  ASSERT_TRUE(fake.wait_for(fake.out(owned->pid(), ".args")));
+  EXPECT_FALSE(owned->group_drained());
+  ASSERT_TRUE(supervisor.retire_cell_process(owned));
+  EXPECT_TRUE(owned->group_drained());
+  EXPECT_TRUE(owned->group_drained());
+
+  const auto foreign_reap =
+      supervisor.start_cell_process(cell_command(CellLaunchRole::kPoseObserver),
+                                    fake.root() / "foreign-reap");
+  ASSERT_TRUE(fake.wait_for(fake.out(foreign_reap->pid(), ".args")));
+  ASSERT_EQ(::kill(foreign_reap->pid(), SIGKILL), 0);
+  ASSERT_EQ(::waitpid(foreign_reap->pid(), nullptr, 0), foreign_reap->pid());
+  EXPECT_FALSE(supervisor.retire_cell_process(foreign_reap));
+  EXPECT_FALSE(foreign_reap->group_drained());
+  EXPECT_TRUE(owned->group_drained());
 }
 
 TEST(CellLaunchProcess, InvalidTypedInputsAndLogRootRefuseBeforeSpawn) {

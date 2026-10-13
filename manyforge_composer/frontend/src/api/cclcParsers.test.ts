@@ -10,7 +10,7 @@ import {
 } from './cclcParsers';
 
 function componentSnapshot(): Record<string, unknown> {
-  return {
+  const snapshot = {
     active_public_pointer_digest: `sha256:${'1'.repeat(64)}`,
     component_lifecycle_generation: 4,
     component_lifecycle_state: 'prepared',
@@ -56,6 +56,15 @@ function componentSnapshot(): Record<string, unknown> {
     retained_bundle_id: 'bundle.1',
     snapshot_digest: `sha256:${'4'.repeat(64)}`,
   };
+  return { ...snapshot, readiness: {
+    request_owner_epoch: 'cclc-owner.1', evaluated_at_ns: 100,
+    next_intent: 'enable', requested_state: 'active', ready: false,
+    error: { code: 'component_lifecycle_transition_missing', message: 'Controller not ready', details: { reason: 'no_transition_satisfied' } },
+    domains: [{ provider_occurrence: { ...snapshot.provider_occurrences[0], control_domain_revision: 'domain.revision.1' },
+      health: { observed_state: 'prepared', facts: [{ lifecycle_fact_id: 'fact.loaded', value: { kind: 'boolean', boolean_value: false } }], diagnostic: null },
+      decision_kind: null, error: { code: 'component_lifecycle_transition_missing', message: 'Controller not ready', details: { reason: 'no_transition_satisfied' } } }],
+    measured_state: { required: true, available: true, error: null },
+  } };
 }
 
 function lifecycleAcceptance(): Record<string, unknown> {
@@ -115,6 +124,27 @@ function componentWithDiagnostic(diagnostic: unknown): Record<string, unknown> {
 }
 
 describe('CCLC closed response parsers', () => {
+  it('preserves the actual full 257-byte UR5e diagnostic launch identity', () => {
+    const identity = "mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n";
+    expect(new TextEncoder().encode(identity).length).toBe(257);
+    const diagnostic = incidentDiagnostic();
+    diagnostic.snapshot.context.launch_identity = identity;
+    const parsed = parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic));
+    expect(parsed.lifecycleProgress?.incident?.diagnostic?.snapshot?.context.launch_identity).toBe(identity);
+  });
+
+  it('uses the Close packet ceiling only for diagnostic launch identity', () => {
+    const diagnostic = incidentDiagnostic();
+    diagnostic.snapshot.context.launch_identity = 'x'.repeat(256 * 1024);
+    expect(parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))
+      .lifecycleProgress?.incident?.diagnostic).toEqual(diagnostic);
+    diagnostic.snapshot.context.launch_identity += 'x';
+    expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
+    diagnostic.snapshot.context.launch_identity = 'launch.1';
+    diagnostic.snapshot.context.component_id = 'x'.repeat(129);
+    expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
+  });
+
   it('preserves closed rich incident evidence and exact full-width scalars', () => {
     const diagnostic = incidentDiagnostic();
     const incident = parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic)).lifecycleProgress?.incident;
@@ -538,6 +568,23 @@ describe('CCLC closed response parsers', () => {
     }, 'lifecycle')).toThrow('closed fields');
   });
 
+  it('retains only the typed Close incident acknowledgement reason', () => {
+    const recovery = {
+      acknowledged_at_ns: 9000, acknowledged_by: 'manyforge_composer',
+      cause_class: 'emergency_stop', controllable_component_id: 'component.arm',
+      incident_id: 'incident.arm', closure_reason: 'cell_closed_by_operator',
+    };
+    const envelope = { acceptance: null, incident_recovery: recovery,
+      replay_status: 'accepted_new', status: null };
+    expect(parseCCLCAdmission(envelope, 'lifecycle').incidentRecovery?.closureReason)
+      .toBe('cell_closed_by_operator');
+    for (const invalid of [null, '', 'recovered', true]) {
+      expect(() => parseCCLCAdmission({ ...envelope,
+        incident_recovery: { ...recovery, closure_reason: invalid } }, 'lifecycle'))
+        .toThrow('closure_reason');
+    }
+  });
+
   it('keeps full-width owner nanoseconds exact and refuses noncanonical spellings', () => {
     // Owner clocks exceed 2^53 ns after ~104 days: larger values arrive as
     // canonical decimal text and must stay text, never a rounded number.
@@ -614,5 +661,109 @@ describe('CCLC closed response parsers', () => {
         status: null,
       }, 'lifecycle')).toThrow('nanoseconds');
     }
+  });
+});
+
+function changeReadiness(path: string[], value: unknown) {
+  const snapshot = componentSnapshot();
+  let row = snapshot as Record<string, unknown>;
+  for (const key of path.slice(0, -1)) row = row[key] as Record<string, unknown>;
+  row[path.at(-1)!] = value;
+  return snapshot;
+}
+
+describe('Q114 closed readiness', () => {
+  it.each([true, false])('preserves optional activation fact %s without changing readiness', (value) => {
+    const wire = changeReadiness(['readiness', 'domains', '0', 'has_activation_step'], value);
+    const parsed = parseCCLCComponentSnapshot(wire).readiness;
+    expect(parsed.domains[0]?.hasActivationStep).toBe(value);
+    expect(parsed.ready).toBe(false);
+    expect(parsed.nextIntent).toBe('enable');
+    expect(parsed.domains[0]?.health).toEqual(parseCCLCComponentSnapshot(componentSnapshot()).readiness.domains[0]?.health);
+    expect(parsed.error?.details.reason).toBe('no_transition_satisfied');
+  });
+  it('keeps an absent activation fact unstated', () => {
+    const domain = parseCCLCComponentSnapshot(componentSnapshot()).readiness.domains[0]!;
+    expect(domain.hasActivationStep).toBeUndefined();
+    expect(Object.hasOwn(domain, 'hasActivationStep')).toBe(false);
+  });
+  it.each([null, 'false', 0, undefined])('rejects a nonboolean present activation fact %j', (value) => {
+    expect(() => parseCCLCComponentSnapshot(changeReadiness(
+      ['readiness', 'domains', '0', 'has_activation_step'], value))).toThrow();
+  });
+  it('keeps the extended domain wire closed', () => {
+    expect(() => parseCCLCComponentSnapshot(changeReadiness(
+      ['readiness', 'domains', '0', 'hasActivationStep'], false))).toThrow('closed fields');
+  });
+  it('preserves exact current health facts, owner clock and blockers', () => {
+    const parsed = parseCCLCComponentSnapshot(componentSnapshot()).readiness;
+    expect(parsed.requestOwnerEpoch).toBe('cclc-owner.1');
+    expect(parsed.ready).toBe(false);
+    expect(parsed.domains[0]?.health?.facts[0]?.value).toEqual({ kind: 'boolean', booleanValue: false });
+    expect(parsed.error?.details.reason).toBe('no_transition_satisfied');
+    expect(parseCCLCComponentSnapshot(changeReadiness(['readiness', 'evaluated_at_ns'], '9223372036854775807')).readiness.evaluatedAtNs)
+      .toBe('9223372036854775807');
+  });
+  it.each([
+    [['readiness'], undefined], [['readiness', 'extra'], true],
+    [['readiness', 'next_intent'], null], [['readiness', 'requested_state'], 'prepared'],
+    [['readiness', 'ready'], 1], [['readiness', 'evaluated_at_ns'], true],
+    [['readiness', 'evaluated_at_ns'], '9223372036854775808'],
+    [['readiness', 'domains'], []],
+    [['readiness', 'domains', '0', 'provider_occurrence', 'control_domain_revision'], 'foreign'],
+    [['readiness', 'domains', '0', 'provider_occurrence', 'lifecycle_plan_catalog_digest'], 'foreign'],
+    [['readiness', 'domains', '0', 'health', 'facts', '0', 'value'], { kind: 'boolean', boolean_value: 'false' }],
+    [['readiness', 'domains', '0', 'health', 'facts', '0', 'value'], { kind: 'integer', integer_value: true }],
+    [['readiness', 'domains', '0', 'health', 'facts', '0', 'value'], { kind: 'integer', integer_value: '1' }],
+    [['readiness', 'domains', '0', 'health', 'facts', '0', 'value'], { kind: 'unknown', boolean_value: false }],
+    [['readiness', 'measured_state'], { required: false, available: false, error: null }],
+    [['readiness', 'measured_state'], { required: null, available: null, error: null }],
+    [['readiness', 'ready'], true],
+  ] as Array<[string[], unknown]>)('rejects torn or invalid readiness at %j', (path, value) => {
+    expect(() => parseCCLCComponentSnapshot(changeReadiness(path, value))).toThrow();
+  });
+  it('keeps durable Active next-step fields null and genuine unavailable health visible', () => {
+    const snapshot = componentSnapshot();
+    snapshot.component_lifecycle_state = 'active';
+    const readiness = snapshot.readiness as Record<string, unknown>;
+    readiness.next_intent = null; readiness.requested_state = null;
+    expect(parseCCLCComponentSnapshot(snapshot).readiness.ready).toBe(false);
+    readiness.ready = true;
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+  });
+  it('rejects duplicate health occurrences and fact IDs', () => {
+    const snapshot = componentSnapshot();
+    const readiness = snapshot.readiness as { domains: Array<{health: {facts: unknown[]}}> };
+    readiness.domains.push(readiness.domains[0]!);
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+    const facts = readiness.domains[0]!.health.facts;
+    readiness.domains.pop(); facts.push(facts[0]);
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+  });
+});
+
+describe('Q114 original diagnostic bounds', () => {
+  it('preserves general measured/provider errors beyond eight details and long lifecycle messages', () => {
+    const error = { code: 'measured_source_unavailable', message: 'm'.repeat(1024),
+      details: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`fact.${index}`, `actual.${index}`])) };
+    const snapshot = componentSnapshot();
+    const readiness = snapshot.readiness as Record<string, unknown>;
+    readiness.error = error;
+    readiness.measured_state = { required: true, available: false, error };
+    (readiness.domains as Array<Record<string, unknown>>)[0]!.error = error;
+    const parsed = parseCCLCComponentSnapshot(snapshot).readiness;
+    expect(parsed.error).toEqual(error);
+    expect(parsed.measuredState.error).toEqual(error);
+    expect(parsed.domains[0]?.error).toEqual(error);
+    error.details.extra = 'actual';
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+  });
+  it('retains the normalized health diagnostic eight-detail limit', () => {
+    const diagnostic = { code: 'provider_diagnostic', message: 'm'.repeat(1024),
+      details: Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`fact.${index}`, `actual.${index}`])) };
+    const snapshot = changeReadiness(['readiness', 'domains', '0', 'health', 'diagnostic'], diagnostic);
+    expect(parseCCLCComponentSnapshot(snapshot).readiness.domains[0]?.health?.diagnostic).toEqual(diagnostic);
+    diagnostic.details.extra = 'actual';
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
   });
 });

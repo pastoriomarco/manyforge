@@ -428,4 +428,61 @@ TEST(ManagerLivenessRpcInternal,
 }
 
 } // namespace
+TEST(NativeShutdownRpc, ExactEpochClosedGrammarAndActualMilestonesRoundTrip) {
+  NativeShutdownProgress actual{"host.epoch",
+                                NativeShutdownPhase::kGroupRetirement,
+                                0U,
+                                4U,
+                                2U,
+                                4U,
+                                1U,
+                                2U,
+                                1U,
+                                1U,
+                                42};
+  EXPECT_EQ(DecodeNativeShutdownRpcRequest(
+                EncodeNativeShutdownRpcRequest(actual.runtime_epoch)),
+            actual.runtime_epoch);
+  EXPECT_EQ(
+      DecodeNativeShutdownRpcResponse(EncodeNativeShutdownRpcResponse(actual)),
+      actual);
+  EXPECT_THROW(DecodeNativeShutdownRpcRequest(
+                   "manyforge.native-shutdown.request.v1 foreign extra"),
+               std::invalid_argument);
+  EXPECT_THROW(
+      DecodeNativeShutdownRpcResponse(
+          "manyforge.native-shutdown.response.v1 epoch 99 0 0 0 0 0 0 0 0 -1"),
+      std::invalid_argument);
+  actual.drained_groups = 3U;
+  EXPECT_THROW(EncodeNativeShutdownRpcResponse(actual), std::invalid_argument);
+}
+
+TEST(NativeShutdownRpc,
+     PollingIsNotProgressAndAbsentOwnersHaveNoDestructorMilestone) {
+  NativeShutdownProjection projection("host.epoch");
+  projection.Enter(NativeShutdownPhase::kExecutionDrain);
+  const auto waiting = projection.Read();
+  EXPECT_EQ(projection.Read(), waiting);
+  std::unique_ptr<int> absent;
+  {
+    NativeShutdownOwnerPhase guard{
+        projection, NativeShutdownPhase::kKernelDestruction, absent};
+  }
+  EXPECT_EQ(projection.Read(), waiting);
+  projection.WorkerJoined();
+  EXPECT_EQ(projection.Read().completed_workers, 1U);
+  NativeShutdownPhase seen_by_destructor = NativeShutdownPhase::kRunning;
+  struct ActualOwner {
+    NativeShutdownProjection &projection;
+    NativeShutdownPhase &seen;
+    ~ActualOwner() { seen = projection.Read().phase; }
+  };
+  {
+    ActualOwner actual{projection, seen_by_destructor};
+    NativeShutdownOwnerPhase guard{
+        projection, NativeShutdownPhase::kKernelDestruction, actual};
+  }
+  EXPECT_EQ(seen_by_destructor, NativeShutdownPhase::kKernelDestruction);
+}
+
 } // namespace manyforge::component_manager::detail

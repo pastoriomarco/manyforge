@@ -115,3 +115,45 @@ def test_composer_proxies_exact_component_and_lifecycle_requests() -> None:
         ),
     ]
     assert not hasattr(client.app.state, "lifecycle_owner")
+
+
+
+def test_composer_close_incident_proxy_preserves_scope_and_ordinary_absence():
+    forwarded = []
+    def handler(request):
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"result": None}, request=request)
+    raw = httpx.Client(base_url="http://headless.test", transport=httpx.MockTransport(handler))
+    client = TestClient(create_app(ComposerState(headless_client=HeadlessHttpClient("http://unused.test", client=raw))))
+    try:
+        body = _lifecycle_body()
+        body.update(intent="recover", reason="cell closed by operator",
+                    close_incident_recovery={"expected_incident_id": "incident.1"})
+        assert client.post("/api/cclc/lifecycle/requests", json=body).status_code == 200
+        assert client.post("/api/cclc/lifecycle/requests/result", json=body).status_code == 200
+    finally: raw.close()
+    assert forwarded == [("/api/cclc/lifecycle/requests", body),
+                         ("/api/cclc/lifecycle/requests/result", body)]
+
+
+def test_composer_process_stop_proxy_forwards_same_request_to_distinct_owner_calls():
+    from manyforge_headless_api.tests.test_manager import _process_stop_request, _process_stop_response
+    request = _process_stop_request()
+    body = {"request": request.model_dump(mode="json")}
+    forwarded = []
+    def handler(message):
+        if message.url.path.startswith("/api/cclc/"):
+            forwarded.append((message.method, message.url.path, json.loads(message.content)))
+        return httpx.Response(200, json=_process_stop_response(request, "pending")["result"], request=message)
+    raw = httpx.Client(base_url="http://headless.test", transport=httpx.MockTransport(handler))
+    client = TestClient(create_app(ComposerState(headless_client=HeadlessHttpClient("http://unused.test", client=raw))))
+    try:
+        assert client.post("/api/cclc/components/other/process/stop", json=body).status_code == 400
+        assert client.post("/api/cclc/components/other/process/stop/result", json=body).status_code == 400
+        for suffix in ("", "/result"):
+            reply = client.post("/api/cclc/components/arm/process/stop" + suffix, json=body)
+            assert reply.status_code == 200 and reply.json()["state"] == "pending"
+            assert reply.json()["receipt"] is None
+    finally: raw.close()
+    assert forwarded == [("POST", "/api/cclc/components/arm/process/stop", body),
+                         ("POST", "/api/cclc/components/arm/process/stop/result", body)]

@@ -203,11 +203,16 @@ export function useResetApply({
       });
       return null;
     }
+    if (outcome.reset.programRunId === null) {
+      fail(plan.correlationId, { kind: 'failed', stage: 'reset', unknown: true, apply: null,
+        message: 'Reset returned an Idle cycle rather than the confirmed held run. Nothing was Applied.' });
+      return null;
+    }
     // A lost reply is not a refusal: follow the same correlated settlement,
     // never resend, and Apply nothing until it is observed.
     advance(plan.correlationId, {
       kind: 'awaiting_idle',
-      reset: outcome.reset,
+      reset: { ...outcome.reset, programRunId: outcome.reset.programRunId },
       delivery: outcome.status === 'sent' ? 'confirmed' : 'unconfirmed',
     });
     return null;

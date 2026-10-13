@@ -344,6 +344,8 @@ class ProgramRunnerApplicationPort(Protocol):
 
 
 def _status(code: str) -> int:
+    if code in {"program_run_started_then_failed", "program_run_superseded_by_stop"}:
+        return 422
     if code.endswith("_not_found"):
         return 404
     if (
@@ -352,9 +354,11 @@ def _status(code: str) -> int:
         or code
         in {
             "authoring_not_ready",
+            "program_run_stopped_before_start",
             "program_cycle_reset_required",
             "program_run_already_active",
             "program_run_draft_applied_mismatch",
+            "program_scene_preparation_failed",
             "persistent_key_request_replayed",
             "stale_generation",
         }

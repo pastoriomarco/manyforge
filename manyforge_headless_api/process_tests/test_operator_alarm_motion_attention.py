@@ -109,6 +109,7 @@ def _start_run_once(
             attempt += 1
             draft = composer.request("GET", "/api/program/draft")["program"]
             try:
+                stack.wait_authoring_admission(expected_allowed=True)
                 return composer.program_run_start(
                     {
                         "request_id": f"alarm.attention.{label}.{attempt}",
@@ -119,9 +120,6 @@ def _start_run_once(
                         "source_document_digest": digest,
                         "expected_applied_record_digest": applied["source"]["record_digest"],
                         "draft_program_revision": draft["program_revision"],
-                        "expected_admission_generation": stack.wait_authoring_admission(
-                            expected_allowed=True
-                        )["admission_generation"],
                     }
                 )
             except HeadlessClientError as error:

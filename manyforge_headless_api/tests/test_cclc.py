@@ -19,6 +19,7 @@ from manyforge_headless_api.cclc import (
     CCLC_SOCKET_FILE,
     CCLCOpenRequestClient,
     _validate_lifecycle_target_facts,
+    _validate_component_readiness,
 )
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
@@ -65,10 +66,7 @@ def test_client_forwards_one_canonical_addressed_request(tmp_path: Path) -> None
         return rfc8785.dumps(
             _response(
                 "component_snapshot",
-                {
-                    "controllable_component_id": "component.arm",
-                    "component_lifecycle_generation": 4,
-                },
+                _target_snapshot(),
             )
         )
 
@@ -141,10 +139,41 @@ def test_client_rejects_owner_error_and_noncanonical_response(tmp_path: Path) ->
     thread.join(timeout=2)
 
 
+def _provider_occurrence() -> dict[str, Any]:
+    return {"control_domain_id": "domain.arm", "provider_instance_id": "provider.arm",
+        "provider_manifest_id": "manifest.arm", "provider_manifest_revision": "sha256:" + "3" * 64,
+        "provider_runtime_unit_id": "runtime.arm", "provider_runtime_epoch": "epoch.arm",
+        "lifecycle_plan_catalog_digest": "sha256:" + "2" * 64}
+
+
+def _readiness_blocker() -> dict[str, Any]:
+    return {"code": "component_lifecycle_transition_missing", "message": "Controller not ready",
+        "details": {"reason": "no_transition_satisfied"}}
+
+
 def _target_snapshot() -> dict[str, Any]:
     return {
         "controllable_component_id": "component.arm",
         "component_lifecycle_generation": 4,
+        "component_lifecycle_state": "prepared",
+        "publication_generation": 7,
+        "graph_revision": "graph.1", "retained_bundle_id": "bundle.1",
+        "snapshot_digest": "sha256:" + "4" * 64,
+        "active_public_pointer_digest": "sha256:" + "1" * 64,
+        "domains": [{"control_domain_id": "domain.arm", "control_domain_revision": "domain.revision.1",
+            "controller_topology_id": "topology.arm", "topology_revision": "topology.revision.1",
+            "active_control_configuration": None, "current_control_bindings": [{
+                "control_binding_id": "binding.arm", "control_binding_revision": "binding.1", "control_route_id": "route.arm"}],
+            "current_resources": ["joint.1"]}],
+        "provider_occurrences": [_provider_occurrence()],
+        "readiness": {"request_owner_epoch": "cclc-owner.1", "evaluated_at_ns": 100,
+            "next_intent": "enable", "requested_state": "active", "ready": False,
+            "error": _readiness_blocker(), "domains": [{
+                "provider_occurrence": {**_provider_occurrence(), "control_domain_revision": "domain.revision.1"},
+                "health": {"observed_state": "prepared", "facts": [{"lifecycle_fact_id": "fact.loaded",
+                    "value": {"kind": "boolean", "boolean_value": False}}], "diagnostic": None},
+                "decision_kind": None, "error": _readiness_blocker()}],
+            "measured_state": {"required": True, "available": True, "error": None}},
         "lifecycle_progress": {
             "blocking_cause_class": "availability",
             "blocking_reason": "controller_manager not ready",
@@ -339,6 +368,31 @@ def _incident_diagnostic() -> dict[str, Any]:
             "core_dump_link": None,
         },
     }
+
+
+def test_client_preserves_real_257_byte_launch_identity(tmp_path: Path) -> None:
+    identity = 'mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n'
+    assert len(identity.encode("utf-8")) == 257
+    diagnostic = _incident_diagnostic()
+    diagnostic["snapshot"]["context"]["launch_identity"] = identity
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+def test_launch_identity_uses_close_packet_bound_without_widening_other_fields() -> None:
+    diagnostic = _incident_diagnostic()
+    diagnostic["snapshot"]["context"]["launch_identity"] = "x" * (256 * 1024)
+    snapshot = _incident_snapshot()
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    _validate_lifecycle_target_facts(snapshot)
+    diagnostic["snapshot"]["context"]["launch_identity"] += "x"
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(snapshot)
+    diagnostic["snapshot"]["context"]["launch_identity"] = "launch.1"
+    diagnostic["snapshot"]["context"]["component_id"] = "x" * 129
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(snapshot)
 
 
 @pytest.mark.parametrize("diagnostic", [
@@ -1032,3 +1086,284 @@ def test_client_reads_incident_events_with_full_width_times(tmp_path: Path) -> N
         _ABOVE_SAFE_NS,
         _MAX_INT64_NS,
     ]
+
+
+@pytest.mark.parametrize(("path", "value"), [
+    (("readiness",), None), (("readiness", "extra"), True),
+    (("readiness", "next_intent"), None), (("readiness", "requested_state"), "prepared"),
+    (("readiness", "ready"), 1), (("readiness", "ready"), True),
+    (("readiness", "evaluated_at_ns"), True), (("readiness", "domains"), []),
+    (("readiness", "domains", 0, "provider_occurrence", "control_domain_revision"), "foreign"),
+    (("readiness", "domains", 0, "provider_occurrence", "lifecycle_plan_catalog_digest"), "foreign"),
+    (("readiness", "domains", 0, "health", "facts", 0, "value"), {"kind": "boolean", "boolean_value": "false"}),
+    (("readiness", "domains", 0, "health", "facts", 0, "value"), {"kind": "integer", "integer_value": True}),
+    (("readiness", "domains", 0, "health", "facts", 0, "value"), {"kind": "integer", "integer_value": "1"}),
+    (("readiness", "measured_state"), {"required": False, "available": False, "error": None}),
+    (("readiness", "measured_state"), {"required": None, "available": None, "error": None}),
+])
+def test_q114_rejects_invalid_closed_readiness(path: tuple, value: Any) -> None:
+    snapshot = _target_snapshot()
+    row = snapshot
+    for key in path[:-1]:
+        row = row[key]
+    row[path[-1]] = value
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+@pytest.mark.parametrize("has_activation_step", [True, False])
+def test_q115_optional_activation_fact_preserves_health_and_blockers(has_activation_step: bool) -> None:
+    snapshot = _target_snapshot()
+    domain = snapshot["readiness"]["domains"][0]
+    domain["has_activation_step"] = has_activation_step
+    domain["health"]["observed_state"] = "faulted"
+    domain["health"]["facts"] = [
+        {"lifecycle_fact_id": "external.fault_present", "value": {"kind": "boolean", "boolean_value": True}},
+        {"lifecycle_fact_id": "external.transport_ready", "value": {"kind": "boolean", "boolean_value": False}},
+    ]
+    _validate_component_readiness(snapshot)
+    assert domain["has_activation_step"] is has_activation_step
+    assert domain["health"]["observed_state"] == "faulted"
+    assert domain["health"]["facts"][0]["value"]["boolean_value"] is True
+    assert domain["health"]["facts"][1]["value"]["boolean_value"] is False
+    assert snapshot["readiness"]["ready"] is False
+    assert snapshot["readiness"]["next_intent"] == "enable"
+    assert domain["error"] == _readiness_blocker()
+
+
+def test_q115_absent_activation_fact_remains_unstated() -> None:
+    snapshot = _target_snapshot()
+    _validate_component_readiness(snapshot)
+    assert "has_activation_step" not in snapshot["readiness"]["domains"][0]
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, {}, []])
+def test_q115_rejects_nonboolean_activation_fact(value: Any) -> None:
+    snapshot = _target_snapshot()
+    snapshot["readiness"]["domains"][0]["has_activation_step"] = value
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+def test_q115_extended_domain_wire_stays_closed() -> None:
+    snapshot = _target_snapshot()
+    snapshot["readiness"]["domains"][0]["hasActivationStep"] = False
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+def test_q114_preserves_blockers_and_exact_health_values() -> None:
+    snapshot = _target_snapshot()
+    snapshot["readiness"]["evaluated_at_ns"] = str(2**63 - 1)
+    _validate_component_readiness(snapshot)
+    facts = snapshot["readiness"]["domains"][0]["health"]["facts"]
+    for value in ({"kind": "unknown"}, {"kind": "boolean", "boolean_value": False},
+                  {"kind": "integer", "integer_value": -(2**53 - 1)}, {"kind": "token", "token_value": "unknown"}):
+        facts[0]["value"] = value
+        _validate_component_readiness(snapshot)
+    snapshot["component_lifecycle_state"] = "active"
+    snapshot["readiness"].update(next_intent=None, requested_state=None)
+    _validate_component_readiness(snapshot)
+    snapshot["readiness"]["domains"].append(snapshot["readiness"]["domains"][0])
+    with pytest.raises(HeadlessApiError):
+        _validate_component_readiness(snapshot)
+
+
+def test_q114_retains_general_error_and_normalized_health_bounds() -> None:
+    snapshot = _target_snapshot()
+    error = {"code": "measured_source_unavailable", "message": "m" * 1024,
+        "details": {f"fact.{index}": f"actual.{index}" for index in range(64)}}
+    snapshot["readiness"]["error"] = error
+    snapshot["readiness"]["measured_state"] = {"required": True, "available": False, "error": error}
+    snapshot["readiness"]["domains"][0]["error"] = error
+    _validate_component_readiness(snapshot)
+    error["details"]["extra"] = "actual"
+    with pytest.raises(HeadlessApiError):
+        _validate_component_readiness(snapshot)
+    del error["details"]["extra"]
+    health_error = {"code": "provider_diagnostic", "message": "m" * 1024,
+        "details": {f"fact.{index}": f"actual.{index}" for index in range(8)}}
+    snapshot["readiness"]["domains"][0]["health"]["diagnostic"] = health_error
+    _validate_component_readiness(snapshot)
+    health_error["details"]["extra"] = "actual"
+    with pytest.raises(HeadlessApiError):
+        _validate_component_readiness(snapshot)
+
+
+@pytest.mark.parametrize("command,method", [("lifecycle_submit", "submit_lifecycle"),
+                                          ("lifecycle_request_result", "lifecycle_request_result")])
+def test_close_incident_recovery_preserves_exact_incident_and_reason(tmp_path, command, method):
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent.update(intent="recover", reason="cell closed by operator",
+                  close_incident_recovery={"expected_incident_id": "incident.component.arm.5000"})
+    result = _incident_recovery_result()
+    result["incident_recovery"]["closure_reason"] = "cell_closed_by_operator"
+    observed = []
+    assert _through_client(tmp_path, command, result,
+        lambda client: getattr(client, method)(intent), observed) == result
+    assert observed[0]["payload"] == intent
+
+
+@pytest.mark.parametrize("mutation", ["foreign_incident", "missing_reason", "wrong_reason", "ordinary_fallback"])
+def test_close_incident_recovery_refuses_a_different_acknowledgement(tmp_path, mutation):
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent.update(intent="recover", reason="cell closed by operator",
+                  close_incident_recovery={"expected_incident_id": "incident.component.arm.5000"})
+    result = _incident_recovery_result()
+    result["incident_recovery"]["closure_reason"] = "cell_closed_by_operator"
+    if mutation == "foreign_incident": result["incident_recovery"]["incident_id"] = "incident.other"
+    elif mutation == "missing_reason": del result["incident_recovery"]["closure_reason"]
+    elif mutation == "wrong_reason": result["incident_recovery"]["closure_reason"] = "other"
+    elif mutation == "ordinary_fallback": del result["incident_recovery"]
+    with pytest.raises(HeadlessApiError):
+        _through_client(tmp_path, "lifecycle_submit", result, lambda client: client.submit_lifecycle(intent))
+
+
+@pytest.mark.parametrize("intent,reason", [("disable", "cell closed by operator"),
+                                         ("recover", "ordinary recovery")])
+def test_close_incident_recovery_http_refuses_non_close_intent_without_effect(intent, reason):
+    fake = FakeCCLC()
+    service = HeadlessService(object(), object(), cell_admission=FakeAdmission())
+    client = TestClient(create_app(service=service, cclc=fake))
+    body = _lifecycle_request(confirmed=True)
+    body.update(intent=intent, reason=reason,
+                close_incident_recovery={"expected_incident_id": "incident.1"})
+    assert client.post("/api/cclc/lifecycle/requests", json=body).status_code == 422
+    assert fake.lifecycle == []
+
+
+def test_process_stop_http_keeps_scope_and_result_read_separate():
+    from manyforge_headless_api.tests.test_manager import _process_stop_request, _process_stop_response
+    request = _process_stop_request()
+    body = {"request": request.model_dump(mode="json")}
+    class Manager:
+        def __init__(self): self.stops = []; self.reads = []
+        def stop_component_process(self, request):
+            self.stops.append(request)
+            return _process_stop_response(request, "pending")["result"]
+        def component_process_stop_result(self, request):
+            self.reads.append(request)
+            return _process_stop_response(request)["result"]
+    manager = Manager()
+    service = HeadlessService(object(), manager, cell_admission=FakeAdmission())
+    client = TestClient(create_app(service=service))
+    bad = client.post("/api/cclc/components/other/process/stop", json=body)
+    assert bad.status_code == 400
+    assert manager.stops == []
+    assert client.post("/api/cclc/components/other/process/stop/result", json=body).status_code == 400
+    assert manager.reads == []
+    submitted = client.post("/api/cclc/components/arm/process/stop", json=body)
+    assert submitted.status_code == 200
+    assert submitted.json()["state"] == "pending"
+    read = client.post("/api/cclc/components/arm/process/stop/result", json=body)
+    assert read.status_code == 200
+    assert read.json()["receipt"]["leader_pid"] == request.leader_pid
+    assert manager.stops == [request] and manager.reads == [request]
+    assert "confirmed" not in submitted.json()["request"]
+
+
+@pytest.mark.parametrize("method,command", [("submit_lifecycle", "lifecycle_submit"), ("lifecycle_request_result", "lifecycle_request_result")])
+@pytest.mark.parametrize("replay", ["stale_request_owner_epoch", "request_id_conflict", "request_ledger_full", "request_result_expired"])
+def test_close_preserves_typed_admission_refusals_without_acknowledgement(tmp_path, method, command, replay):
+    intent = _lifecycle_request(confirmed=True)
+    intent.update(intent="recover", reason="cell closed by operator", close_incident_recovery={"expected_incident_id": "incident.component.arm.5000"})
+    result = {"acceptance": None, "replay_status": replay, "status": None}
+    assert _through_client(tmp_path, command, result, lambda client: getattr(client, method)(intent)) == result
+    ack = _incident_recovery_result(replay)
+    ack["incident_recovery"]["closure_reason"] = "cell_closed_by_operator"
+    with pytest.raises(HeadlessApiError):
+        _through_client(tmp_path, command, ack, lambda client: getattr(client, method)(intent))
+
+
+@pytest.mark.parametrize("method,command", [("submit_lifecycle", "lifecycle_submit"), ("lifecycle_request_result", "lifecycle_request_result")])
+def test_ordinary_recover_cannot_acknowledge_close(tmp_path, method, command):
+    intent = _lifecycle_request(confirmed=True); intent.update(intent="recover")
+    result = _incident_recovery_result(); result["incident_recovery"]["closure_reason"] = "cell_closed_by_operator"
+    with pytest.raises(HeadlessApiError):
+        _through_client(tmp_path, command, result, lambda client: getattr(client, method)(intent))
+
+
+@pytest.mark.parametrize("incident", ["", "x" * 129, "e\u0301", "é" * 65])
+def test_close_http_rejects_invalid_incident_identity_before_effects(incident):
+    fake = FakeCCLC(); service = HeadlessService(object(), object(), cell_admission=FakeAdmission())
+    body = _lifecycle_request(confirmed=True)
+    body.update(intent="recover", reason="cell closed by operator", close_incident_recovery={"expected_incident_id": incident})
+    with TestClient(create_app(service=service, cclc=fake)) as client:
+        assert client.post("/api/cclc/lifecycle/requests", json=body).status_code == 422
+    assert fake.lifecycle == []
+
+
+def test_close_incident_refusal_keeps_409_code():
+    class Port(FakeCCLC):
+        def submit_lifecycle(self, intent):
+            raise HeadlessApiError("component_lifecycle_close_incident_mismatch", "Incident changed", details={"actual": "incident.other"})
+    service = HeadlessService(object(), object(), cell_admission=FakeAdmission())
+    body = _lifecycle_request(confirmed=True)
+    body.update(intent="recover", reason="cell closed by operator", close_incident_recovery={"expected_incident_id": "incident.1"})
+    with TestClient(create_app(service=service, cclc=Port())) as client:
+        response = client.post("/api/cclc/lifecycle/requests", json=body)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "component_lifecycle_close_incident_mismatch"
+
+
+def _lifecycle_point_snapshot() -> dict[str, Any]:
+    return {key: value for key, value in _target_snapshot().items()
+            if key not in {"readiness", "lifecycle_target", "lifecycle_progress"}}
+
+
+def test_lifecycle_point_client_uses_closed_snapshot_without_readiness(tmp_path: Path) -> None:
+    observed = []
+    snapshot = _lifecycle_point_snapshot()
+    thread = _serve_once(tmp_path, lambda request: (
+        observed.append(request) or rfc8785.dumps(_response("component_lifecycle_snapshot", snapshot))))
+    try:
+        result = CCLCOpenRequestClient(tmp_path).component_lifecycle_snapshot("component.arm")
+        assert result == snapshot
+        assert observed == [{"api_version": "manyforge.cclc_open_request.v1",
+            "command": "component_lifecycle_snapshot", "payload": {"controllable_component_id": "component.arm"}}]
+    finally:
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("change", ["foreign", "extra", "bool_generation", "bad_domains"])
+def test_lifecycle_point_client_rejects_foreign_or_malformed_snapshot(tmp_path: Path, change: str) -> None:
+    snapshot = _lifecycle_point_snapshot()
+    if change == "foreign": snapshot["controllable_component_id"] = "component.other"
+    elif change == "extra": snapshot["readiness"] = {}
+    elif change == "bool_generation": snapshot["component_lifecycle_generation"] = True
+    else: snapshot["domains"] = []
+    thread = _serve_once(tmp_path, lambda _request: rfc8785.dumps(_response("component_lifecycle_snapshot", snapshot)))
+    try:
+        with pytest.raises(HeadlessApiError):
+            CCLCOpenRequestClient(tmp_path).component_lifecycle_snapshot("component.arm")
+    finally:
+        thread.join(timeout=2)
+
+
+def test_http_lifecycle_point_read_preserves_snapshot_and_error_details() -> None:
+    class PointCCLC(FakeCCLC):
+        def __init__(self):
+            super().__init__()
+            self.reads = []
+            self.error = None
+        def component_lifecycle_snapshot(self, component_id):
+            self.reads.append(component_id)
+            if self.error is not None: raise self.error
+            return _lifecycle_point_snapshot()
+        def component_snapshot(self, _component_id):
+            pytest.fail("point read used full readiness")
+    port = PointCCLC()
+    service = HeadlessService(object(), object(), cell_admission=FakeAdmission())
+    with TestClient(create_app(service=service, cclc=port)) as client:
+        response = client.get("/api/cclc/components/component.arm/lifecycle-snapshot")
+        assert response.status_code == 200
+        assert response.json() == _lifecycle_point_snapshot()
+        details = {"snapshot_changed": "true", "component_generation_before": "4", "component_generation_after": "5"}
+        port.error = HeadlessApiError("component_lifecycle_facts_stale", "actual component changed", details=details)
+        refused = client.get("/api/cclc/components/component.arm/lifecycle-snapshot")
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["details"] == details
+    assert port.reads == ["component.arm", "component.arm"]
+    assert port.lifecycle == []

@@ -6469,6 +6469,161 @@ SqliteManagerApplyJournal::VerifyIntegrity() const {
 
 void SqliteManagerApplyJournal::Close() { impl_->Close(); }
 
+namespace {
+
+core::Result<void> WithReadOnlyApplySnapshot(const std::filesystem::path &path,
+                                             const core::CellId &cell_id,
+                                             auto &&inspect) {
+  sqlite3 *database = nullptr;
+  try {
+    PreflightApplyJournal(path, cell_id);
+    const auto opened = sqlite3_open_v2(
+        path.string().c_str(), &database,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
+        nullptr);
+    Check(database, opened, "open read-only configuration Apply proof");
+    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
+          "configure read-only configuration Apply timeout");
+    Exec(database, "PRAGMA query_only=ON");
+    {
+      Transaction snapshot(database, "BEGIN");
+      ValidateApplyJournalIdentityAndSchema(database, cell_id, path);
+      inspect(database);
+      snapshot.Commit();
+    }
+    sqlite3_close(database);
+    return core::Result<void>::Ok();
+  } catch (const std::exception &error) {
+    if (database)
+      sqlite3_close(database);
+    return core::Result<void>::Err(core::ErrorDTO{
+        "configuration_apply_proof_unavailable",
+        "exact Manager Apply proof is unavailable",
+        {{"reason", std::string(error.what()).substr(0U, 512U)}}});
+  }
+}
+
+void RequireExactManagerApplyClaim(const core::CellAdmissionClaimDTO &claim,
+                                   const PersistedManagerApplyStatus &status) {
+  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
+      !claim.claim_generation.nonzero() || claim.accepted_at_ns < 0 ||
+      claim.acquired_admission_generation !=
+          claim.intent.expected_admission_generation ||
+      !status.intent.intent.expected_admission_generation ||
+      status.intent.intent.parent_authoring_claim) {
+    throw ManagerApplyJournalIntegrityError(
+        "configuration_apply_claim_invalid");
+  }
+  const core::CellAdmissionClaimIntentDTO expected{
+      core::CellAdmissionClaimKindDTO::kManagerApply,
+      core::CellAdmissionOwnerRoleDTO::kManager,
+      status.intent.intent.request_context.request_owner_epoch,
+      status.intent.intent.apply_id.value(),
+      status.intent.intent.request_context.request_id,
+      status.bring_up_plan ? status.bring_up_plan->plan_digest
+                           : status.intent.intent_digest,
+      *status.intent.intent.expected_admission_generation,
+      {},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt};
+  if (claim.intent != expected)
+    throw ManagerApplyJournalIntegrityError(
+        "configuration_apply_claim_identity_mismatch");
+}
+
+} // namespace
+
+core::Result<void> ValidateTerminalManagerApplyClaimsReadOnly(
+    const std::filesystem::path &database_path, const core::CellId &cell_id,
+    const std::span<const core::CellAdmissionClaimDTO> old_claims) {
+  if (old_claims.size() > core::kMaximumCellAdmissionClaims ||
+      !std::is_sorted(old_claims.begin(), old_claims.end(),
+                      [](const auto &a, const auto &b) {
+                        return a.claim_generation < b.claim_generation;
+                      }) ||
+      std::adjacent_find(old_claims.begin(), old_claims.end(),
+                         [](const auto &a, const auto &b) {
+                           return a.claim_generation == b.claim_generation;
+                         }) != old_claims.end()) {
+    return core::Result<void>::Err(
+        core::ErrorDTO{"invalid_request",
+                       "old Apply claim inventory is not bounded and canonical",
+                       {}});
+  }
+  return WithReadOnlyApplySnapshot(
+      database_path, cell_id, [&](sqlite3 *database) {
+        SqliteManagerApplyJournal::Impl view(database, cell_id);
+        static_cast<void>(view.VerifyIntegrityLocked());
+        for (const auto &claim : old_claims) {
+          const auto intent = view.RequestLocked(claim.intent.owner_epoch,
+                                                 claim.intent.request_id);
+          if (!intent)
+            throw ManagerApplyJournalIntegrityError(
+                "configuration_apply_original_intent_missing");
+          const auto status = view.StatusLocked(
+              intent->intent.apply_id,
+              CheckedSigned(intent->intent.apply_generation.value(),
+                            "apply_generation"));
+          if (!status)
+            throw ManagerApplyJournalIntegrityError(
+                "configuration_apply_original_status_missing");
+          RequireExactManagerApplyClaim(claim, *status);
+          if (!status->terminal_outcome)
+            throw ManagerApplyJournalIntegrityError(
+                "configuration_apply_holder_live");
+          if (status->terminal_outcome->terminal_outcome.succeeded())
+            throw ManagerApplyJournalIntegrityError(
+                "configuration_apply_holder_requires_success_accounting");
+        }
+      });
+}
+
+core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
+    const std::filesystem::path &database_path, const core::CellId &cell_id,
+    const core::CellAdmissionClaimDTO &fresh_claim,
+    const core::CellAdmissionClaimReleaseDTO &release) {
+  if (!core::ValidateCellAdmissionClaimRelease(release).ok() ||
+      release !=
+          core::CellAdmissionClaimReleaseDTO{
+              fresh_claim.intent.owner_role, fresh_claim.intent.owner_epoch,
+              fresh_claim.intent.owner_transaction_id,
+              fresh_claim.intent.request_id,
+              fresh_claim.intent.request_payload_digest,
+              fresh_claim.acquired_admission_generation,
+              fresh_claim.claim_generation, release.settlement} ||
+      release.settlement.settlement_kind !=
+          core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        "invalid_request", "fresh Apply success release identity differs", {}});
+  }
+  return WithReadOnlyApplySnapshot(
+      database_path, cell_id, [&](sqlite3 *database) {
+        SqliteManagerApplyJournal::Impl view(database, cell_id);
+        static_cast<void>(view.VerifyIntegrityLocked());
+        const auto intent = view.RequestLocked(fresh_claim.intent.owner_epoch,
+                                               fresh_claim.intent.request_id);
+        if (!intent)
+          throw ManagerApplyJournalIntegrityError(
+              "fresh_apply_original_intent_missing");
+        const auto status = view.StatusLocked(
+            intent->intent.apply_id,
+            CheckedSigned(intent->intent.apply_generation.value(),
+                          "apply_generation"));
+        if (!status)
+          throw ManagerApplyJournalIntegrityError(
+              "fresh_apply_original_status_missing");
+        RequireExactManagerApplyClaim(fresh_claim, *status);
+        if (status->bring_up_plan || !status->terminal_outcome ||
+            !status->terminal_outcome->terminal_outcome.succeeded() ||
+            status->terminal_outcome->terminal_outcome_digest !=
+                release.settlement.evidence_digest) {
+          throw ManagerApplyJournalIntegrityError(
+              "fresh_apply_success_terminal_not_exact");
+        }
+      });
+}
+
 core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
     const std::filesystem::path &database_path, const core::CellId &cell_id,
     const core::CellAdmissionClaimDTO &claim,

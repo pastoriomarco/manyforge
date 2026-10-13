@@ -8,11 +8,21 @@
 #include <vector>
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_roboplan/controller_robot_description.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
 
 namespace manyforge::roboplan_backend {
+
+/// Construct a secondary measured query from one verified physical binding
+/// and its exact reconciled route. This never changes execution/Stop authority
+/// or creates an observation. A genuine source callback supplies the sample.
+[[nodiscard]] core::Result<core::MeasuredStateSourceDescriptor>
+make_retained_ros2_control_measured_state_descriptor(
+    const core::RuntimeParticipantBinding &physical_binding,
+    const core::ActiveControlConfigurationDTO &reconciled_configuration,
+    const RetainedMeasuredJointStateLane &lane);
 
 /// Exact ROS namespace assigned to one retained Isaac controllable component.
 /// Component identities that cannot be represented as one bounded ROS token

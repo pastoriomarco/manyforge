@@ -46,7 +46,9 @@ CREATE TABLE cclc_journal_metadata (
   terminal_result_bytes_capacity INTEGER NOT NULL,
   highest_transaction_generation INTEGER NOT NULL,
   highest_route_selection_transaction_generation INTEGER NOT NULL,
-  highest_terminal_sequence INTEGER NOT NULL
+  highest_terminal_sequence INTEGER NOT NULL,
+  observer_latest_bring_up BLOB CHECK (observer_latest_bring_up IS NULL OR
+    length(observer_latest_bring_up) BETWEEN 1 AND 524288)
 ) STRICT;
 CREATE TABLE cclc_owner_epochs (
   epoch_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,9 +64,11 @@ CREATE TABLE cclc_request_memberships (
   owner_epoch TEXT NOT NULL,
   request_id TEXT NOT NULL,
   request_kind TEXT NOT NULL CHECK (
-    request_kind IN ('component_lifecycle', 'route_selection')),
+    request_kind IN ('component_lifecycle', 'route_selection', 'lifecycle_target_retirement')),
   semantic_request_digest TEXT NOT NULL,
   retained_result INTEGER NOT NULL CHECK (retained_result IN (0, 1)),
+  target_retirement_blob BLOB,
+  target_retirement_sequence INTEGER,
   UNIQUE(owner_epoch, request_id),
   FOREIGN KEY(owner_epoch) REFERENCES cclc_owner_epochs(owner_epoch)
 ) STRICT;
@@ -251,6 +255,22 @@ void Require(bool condition, std::string code, std::string message) {
   }
 }
 
+class CellClosePrerequisiteFailure final : public std::runtime_error {
+ public:
+  explicit CellClosePrerequisiteFailure(ErrorDTO error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+  [[nodiscard]] const ErrorDTO& error() const noexcept { return error_; }
+ private:
+  ErrorDTO error_;
+};
+
+// Only typed Close retirement may report this dedicated uncertainty. Its
+// complete value is allocated before writes and moved through the exception
+// boundary; ordinary journal errors retain their existing classification.
+struct TargetRetirementCommitUnknown final {
+  ErrorDTO error;
+};
+
 [[nodiscard]] ErrorDTO JournalError(const JournalFailure& error) {
   return ErrorDTO{error.code(), error.what(), {{"reason", error.reason()}}};
 }
@@ -264,6 +284,10 @@ template <typename Value>
     } else {
       return Result<Value>::Ok(function());
     }
+  } catch (TargetRetirementCommitUnknown& error) {
+    return Result<Value>::Err(std::move(error.error));
+  } catch (const CellClosePrerequisiteFailure& error) {
+    return Result<Value>::Err(error.error());
   } catch (const JournalFailure& error) {
     return Result<Value>::Err(JournalError(error));
   } catch (const std::exception& error) {
@@ -578,7 +602,9 @@ CREATE TABLE cclc_component_lifecycle_targets (
   target_generation INTEGER NOT NULL CHECK (target_generation > 0),
   present INTEGER NOT NULL CHECK (present IN (0, 1)),
   reached INTEGER NOT NULL CHECK (reached IN (0, 1)),
-  recovered_cause INTEGER CHECK (recovered_cause IS NULL OR recovered_cause BETWEEN 2 AND 10)
+  recovered_cause INTEGER CHECK (recovered_cause IS NULL OR recovered_cause BETWEEN 2 AND 10),
+  retirement_reason INTEGER NOT NULL CHECK (retirement_reason BETWEEN 0 AND 2),
+  CHECK ((present=1 AND retirement_reason=0) OR (present=0 AND retirement_reason IN (1,2)))
 ) STRICT;
 CREATE TABLE cclc_component_intervention_causes (
   controllable_component_id TEXT NOT NULL,
@@ -740,6 +766,11 @@ FROM cclc_request_memberships m WHERE retained_result=1 AND rejection_blob IS NO
 AND NOT EXISTS (SELECT 1 FROM cclc_lifecycle_cell_claims c
                 WHERE c.owner_epoch=m.owner_epoch AND c.request_id=m.request_id
                 AND c.release_receipt_recorded=0)
+UNION ALL
+SELECT 'lifecycle_target_retirement',membership_sequence,membership_sequence,
+       target_retirement_sequence,length(target_retirement_blob)
+FROM cclc_request_memberships
+WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
 )sql";
 
 [[nodiscard]] const std::vector<SchemaDefinition>& ExpectedSchemaDefinitions() {
@@ -1375,6 +1406,17 @@ class SqliteCCLCJournal::Impl final {
       const std::optional<RequestOwnerEpoch>& quiescent_predecessor,
       CCLCOwnerEpochTransitionPurpose purpose);
 
+  std::optional<ComponentLifecycleTargetRetentionDTO> ReadLifecycleTargetRetention(
+      const ControllableComponentId& component);
+
+  std::vector<ComponentLifecycleTargetDTO> LoadLifecycleTargetsForClose(const RequestOwnerEpoch&);
+  std::optional<CCLCLifecycleTargetRetirementResultDTO> ReadLifecycleTargetRetirementResult(
+      const CCLCLifecycleTargetRetirementIntentDTO&);
+  std::optional<CCLCLifecycleTargetRetirementResultDTO> FindTargetRetirementResultLocked(
+      const CCLCLifecycleTargetRetirementIntentDTO&, std::string_view);
+  CCLCLifecycleTargetRetirementResultDTO RetireLifecycleTargetsForClose(
+      const RequestOwnerEpoch&, const CCLCLifecycleTargetRetirementIntentDTO&,
+      const ICellCloseAdmissionLease&);
   void ReadQuiescentOwner(const RequestOwnerEpoch& expected);
   ApplyComponentGenerationSelectionDTO ReadApplyComponentGenerationSelection(
       const RequestOwnerEpoch&, const ControllableComponentId&,
@@ -1502,6 +1544,14 @@ class SqliteCCLCJournal::Impl final {
   CellObserverIncidentRecordDTO RecordCellObserverIncident(
       const CellObserverIncidentRecordDTO& record);
   std::optional<CellObserverIncidentRecordDTO> LoadOpenCellObserverIncident();
+  std::optional<CellObserverLossAssociationDTO> LoadOpenCellObserverLossAssociation();
+  std::optional<CellObserverBringUpRecordDTO> LoadLatestCellObserverBringUp();
+  CellObserverBringUpAdmissionDTO BeginLatestCellObserverBringUp(
+      const CellObserverBringUpRecordDTO&, const std::optional<CellObserverBringUpRecordDTO>&);
+  CellObserverBringUpRecordDTO UpdateLatestCellObserverBringUp(const CellObserverBringUpRecordDTO&,
+                                                               const CellObserverBringUpRecordDTO&);
+  CellObserverBringUpRecordDTO CloseCellObserverIncidentByOperatorBringUp(
+      const CellObserverBringUpRecordDTO&, const CellObserverBringUpOpenDTO&);
   ComponentIncidentRecordDTO OpenComponentIncident(const ComponentIncidentRecordDTO& record,
                                                    std::uint64_t recovery_generation);
   std::optional<ComponentIncidentRecordDTO> LoadOpenComponentIncident(
@@ -1526,7 +1576,10 @@ class SqliteCCLCJournal::Impl final {
   void RefreshNativeApplyPreparationFailure();
 
  private:
-  std::optional<CellObserverIncidentRecordDTO> ReadOpenCellObserverIncidentLocked();
+  std::optional<CellObserverIncidentRecordDTO> ReadOpenCellObserverIncidentLocked(
+      CellObserverLossAssociationDTO* association = nullptr);
+  std::optional<CellObserverBringUpRecordDTO> ReadLatestCellObserverBringUpLocked();
+  void WriteLatestCellObserverBringUpLocked(const std::string&);
   ComponentIncidentPruneNotice PruneClosedIncidentsLocked();
   void NotifyIncidentPruning(const ComponentIncidentPruneNotice& notice) noexcept;
   std::optional<ComponentIncidentRecordDTO> ReadOpenComponentIncidentLocked(
@@ -1550,6 +1603,8 @@ class SqliteCCLCJournal::Impl final {
   /// The stored row, cancelled or not; caller holds the mutex.
   std::optional<std::pair<ComponentLifecycleTargetDTO, bool>> ReadLifecycleTargetLocked(
       const ControllableComponentId& component);
+  std::optional<ComponentLifecycleTargetRetentionDTO> ReadLifecycleTargetRetentionLocked(
+      const ControllableComponentId& component);
   /// Mint the next target generation for one component; caller holds the
   /// mutex inside a write transaction.
   /// `reset_reached` starts the component over (startup or changed by an
@@ -1560,7 +1615,8 @@ class SqliteCCLCJournal::Impl final {
                                                          bool reset_reached);
   // Retire requested intent only: preserve target/recovery generations,
   // recovered causes, intervention causes and incident evidence.
-  void RetireLifecycleTargetIntentLocked(const ControllableComponentId& component);
+  void RetireLifecycleTargetIntentLocked(const ControllableComponentId& component,
+      LifecycleTargetRetirementReasonDTO reason = LifecycleTargetRetirementReasonDTO::kOrdinaryCancellation);
   /// Cancel the target and drop the intervention causes of a component that
   /// left the adopted set; its generation watermark stays.
   void CancelLifecycleTargetLocked(const ControllableComponentId& component);
@@ -1684,8 +1740,8 @@ class SqliteCCLCJournal::Impl final {
                          "exact_result_history_capacity,terminal_result_bytes_capacity,"
                          "highest_transaction_generation,"
                          "highest_route_selection_transaction_generation,"
-                         "highest_terminal_sequence) "
-                         "VALUES(1,?,?,?,?,?,0,0,0)");
+                         "highest_terminal_sequence,observer_latest_bring_up) "
+                         "VALUES(1,?,?,?,?,?,0,0,0,NULL)");
       metadata.Bind(1, kCCLCJournalSchemaId);
       metadata.Bind(2, kCCLCJournalSchemaVersion);
       metadata.Bind(3, cell_id_.value());
@@ -1695,6 +1751,9 @@ class SqliteCCLCJournal::Impl final {
               "lifecycle journal metadata insert returned an unexpected row");
     }
     // Current-only development journal: earlier versions are not migrated.
+    // Version 19 distinguishes ordinary cancellation from Close on the same
+    // retained target row. Version 18 added bounded target-retirement results
+    // and the existing metadata singleton's observer latest-attempt value.
     // Version 17 added the per-component recovery generation that fences the
     // lifecycle-target driver's writes against a concurrent operator Recover.
     // Version 16 names the operator's incident Recover by its ordinary request
@@ -1913,6 +1972,7 @@ class SqliteCCLCJournal::Impl final {
 
 void SqliteCCLCJournal::Impl::ValidateRetainedState() {
   static_cast<void>(OwnerSequence());
+  static_cast<void>(ReadLatestCellObserverBringUpLocked());
   Statement metadata(database_,
                      "SELECT highest_transaction_generation,"
                      "highest_route_selection_transaction_generation,"
@@ -1987,6 +2047,15 @@ void SqliteCCLCJournal::Impl::ValidateRetainedState() {
   Require(current_component_facts.size() <= kMaximumCCLCComponentWatermarks,
           "component_lifecycle_journal_corrupt",
           "current component lifecycle fact capacity is exceeded");
+
+  Statement retained_targets(database_,
+      "SELECT controllable_component_id FROM cclc_component_lifecycle_targets");
+  while (retained_targets.Step()) {
+    const ControllableComponentId component(retained_targets.Text(0));
+    Require(!component.empty() && component.value().size() <= kMaxLifecycleIdentityBytes &&
+                ReadLifecycleTargetRetentionLocked(component).has_value(),
+            "component_lifecycle_journal_corrupt", "retained target proof is invalid");
+  }
 
   std::map<std::string, std::uint64_t> transaction_identity_guards;
   Statement identity_guards(database_,
@@ -2110,11 +2179,30 @@ void SqliteCCLCJournal::Impl::ValidateRetainedState() {
       "(m.rejection_blob IS NOT NULL AND (m.retained_result<>1 OR "
       "m.rejection_sequence IS NULL OR t.transaction_sequence IS NOT NULL OR "
       "r.transaction_sequence IS NOT NULL OR i.incident_id IS NOT NULL)) OR "
-      "(m.rejection_blob IS NULL AND m.rejection_sequence IS NOT NULL)");
+      "(m.rejection_blob IS NULL AND m.rejection_sequence IS NOT NULL) OR "
+      "(m.request_kind='lifecycle_target_retirement' AND m.retained_result=1 "
+      "AND m.target_retirement_blob IS NULL) OR "
+      "(m.target_retirement_blob IS NOT NULL AND "
+      "(m.request_kind<>'lifecycle_target_retirement' OR m.retained_result<>1 OR "
+      "m.target_retirement_sequence IS NULL OR m.rejection_blob IS NOT NULL OR "
+      "t.transaction_sequence IS NOT NULL OR r.transaction_sequence IS NOT NULL OR "
+      "i.incident_id IS NOT NULL)) OR "
+      "(m.target_retirement_blob IS NULL AND m.target_retirement_sequence IS NOT NULL)");
   Require(membership_consistency.Step() && membership_consistency.Integer(0) == 0 &&
               !membership_consistency.Step(),
           "component_lifecycle_journal_corrupt",
           "request membership and retained-result rows disagree");
+  // A retirement shares the global terminal sequence allocator. Reject a
+  // collision involving this new result family without changing validation
+  // of historical result families against each other.
+  Require(ScalarInteger(database_,
+      "SELECT count(*) FROM (SELECT terminal_sequence FROM ("
+      "SELECT terminal_sequence,0 AS retirement FROM lifecycle_transactions WHERE terminal_sequence IS NOT NULL "
+      "UNION ALL SELECT terminal_sequence,0 FROM route_selection_transactions WHERE terminal_sequence IS NOT NULL "
+      "UNION ALL SELECT rejection_sequence,0 FROM cclc_request_memberships WHERE rejection_sequence IS NOT NULL "
+      "UNION ALL SELECT target_retirement_sequence,1 FROM cclc_request_memberships WHERE target_retirement_sequence IS NOT NULL"
+      ") GROUP BY terminal_sequence HAVING count(*)>1 AND sum(retirement)>0)") == 0,
+      "component_lifecycle_journal_corrupt", "target retirement terminal order is duplicated");
   // Every retained Recover keeps its ordinary request membership.
   Require(ScalarInteger(database_,
                         "SELECT count(*) FROM cclc_component_incidents i WHERE "
@@ -2130,7 +2218,8 @@ void SqliteCCLCJournal::Impl::ValidateRetainedState() {
   Statement memberships(
       database_,
       "SELECT owner_epoch,request_id,request_kind,semantic_request_digest,"
-      "retained_result,rejection_blob,rejection_sequence FROM cclc_request_memberships "
+      "retained_result,rejection_blob,rejection_sequence,target_retirement_blob,target_retirement_sequence "
+      "FROM cclc_request_memberships "
       "ORDER BY membership_sequence");
   while (memberships.Step()) {
     const auto owner_epoch = memberships.Text(0);
@@ -2145,9 +2234,21 @@ void SqliteCCLCJournal::Impl::ValidateRetainedState() {
                       highest_terminal_sequence,
               "component_lifecycle_journal_corrupt", "rejection terminal order is invalid");
     }
+    if (!memberships.IsNull(7)) {
+      const auto blob = memberships.Blob(7);
+      const auto record = detail::DecodeCCLCTargetRetirementRecord(blob);
+      Require(request_kind == "lifecycle_target_retirement" &&
+                  record.intent.request_context.request_owner_epoch.value() == owner_epoch &&
+                  record.intent.request_context.request_id.value() == request_id &&
+                  detail::CCLCTargetRetirementSemanticIntentDigest(record.intent) == semantic_digest &&
+                  detail::EncodeCCLCTargetRetirementRecord(record) == blob &&
+                  Positive(memberships.Integer(8), "target retirement terminal sequence") <= highest_terminal_sequence,
+              "component_lifecycle_journal_corrupt", "target retirement membership result is invalid");
+    }
     Require(!owner_epoch.empty() && owner_epoch.size() <= kMaxLifecycleIdentityBytes &&
                 !request_id.empty() && request_id.size() <= kMaxLifecycleIdentityBytes &&
-                (request_kind == "component_lifecycle" || request_kind == "route_selection") &&
+                (request_kind == "component_lifecycle" || request_kind == "route_selection" ||
+                 request_kind == "lifecycle_target_retirement") &&
                 content_identity::is_sha256_digest(semantic_digest) &&
                 (retained_result == 0 || retained_result == 1),
             "component_lifecycle_journal_corrupt", "CCLC request membership row is invalid");
@@ -3477,6 +3578,7 @@ CCLCLifecycleRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayLifecycle(
           "component_lifecycle_journal_record_invalid",
           "selected evidence requires the private ledger entry");
   Require(!active_owner_epoch.empty() && intent.locally_valid() &&
+              !intent.close_incident_recovery &&
               (apply_delegated || !intent.apply_generation_selection),
           "component_lifecycle_journal_record_invalid",
           "lifecycle request identity or semantic input is invalid");
@@ -6711,11 +6813,21 @@ bool SqliteCCLCJournal::Impl::HasNativeApplyFacts(
 
 std::optional<std::pair<ComponentLifecycleTargetDTO, bool>>
 SqliteCCLCJournal::Impl::ReadLifecycleTargetLocked(const ControllableComponentId& component) {
+  auto retained = ReadLifecycleTargetRetentionLocked(component);
+  if (!retained) return std::nullopt;
+  return std::pair{std::move(retained->target), retained->present};
+}
+
+std::optional<ComponentLifecycleTargetRetentionDTO>
+SqliteCCLCJournal::Impl::ReadLifecycleTargetRetentionLocked(const ControllableComponentId& component) {
   Statement row(database_,
-                "SELECT requested_state,origin,target_generation,present,reached,recovered_cause "
+                "SELECT requested_state,origin,target_generation,present,reached,recovered_cause,retirement_reason "
                 "FROM cclc_component_lifecycle_targets WHERE controllable_component_id=?");
   row.Bind(1, component.value());
   if (!row.Step()) return std::nullopt;
+  Require(row.Integer(6) >= 0 && row.Integer(6) <= 2 &&
+              (row.Integer(3) == 0 || row.Integer(3) == 1),
+          "component_lifecycle_journal_corrupt", "retained target retirement discriminator is invalid");
   const ComponentLifecycleTargetDTO target{
       component,
       static_cast<LifecycleTargetStateDTO>(row.Integer(0)),
@@ -6724,10 +6836,21 @@ SqliteCCLCJournal::Impl::ReadLifecycleTargetLocked(const ControllableComponentId
       row.Integer(4) == 1,
       row.IsNull(5) ? std::nullopt
                     : std::optional(static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(5)))};
-  const bool present = row.Integer(3) == 1;
-  Require(target.locally_valid() && !row.Step(), "component_lifecycle_journal_corrupt",
+  const ComponentLifecycleTargetRetentionDTO retained{
+      target, row.Integer(3) == 1,
+      static_cast<LifecycleTargetRetirementReasonDTO>(row.Integer(6))};
+  Require(retained.locally_valid() && !row.Step(), "component_lifecycle_journal_corrupt",
           "lifecycle target row is invalid or duplicated");
-  return std::pair{target, present};
+  return retained;
+}
+
+std::optional<ComponentLifecycleTargetRetentionDTO>
+SqliteCCLCJournal::Impl::ReadLifecycleTargetRetention(const ControllableComponentId& component) {
+  Require(!component.empty() && component.value().size() <= kMaxLifecycleIdentityBytes,
+          "component_lifecycle_journal_query_invalid", "retained target identity is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  return ReadLifecycleTargetRetentionLocked(component);
 }
 
 ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
@@ -6750,11 +6873,11 @@ ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
   Statement write(database_,
                   "INSERT INTO cclc_component_lifecycle_targets("
                   "controllable_component_id,requested_state,origin,target_generation,present,"
-                  "reached,recovered_cause) VALUES(?,?,?,?,1,?,?) "
+                  "reached,recovered_cause,retirement_reason) VALUES(?,?,?,?,1,?,?,0) "
                   "ON CONFLICT(controllable_component_id) DO UPDATE "
                   "SET requested_state=excluded.requested_state,origin=excluded.origin,"
                   "target_generation=excluded.target_generation,present=1,"
-                  "reached=excluded.reached,recovered_cause=excluded.recovered_cause");
+                  "reached=excluded.reached,recovered_cause=excluded.recovered_cause,retirement_reason=0");
   write.Bind(1, component.value());
   write.Bind(2, static_cast<std::int64_t>(requested_state));
   write.Bind(3, static_cast<std::int64_t>(origin));
@@ -6771,11 +6894,15 @@ ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
 }
 
 void SqliteCCLCJournal::Impl::RetireLifecycleTargetIntentLocked(
-    const ControllableComponentId& component) {
+    const ControllableComponentId& component, LifecycleTargetRetirementReasonDTO reason) {
+  Require(reason == LifecycleTargetRetirementReasonDTO::kOrdinaryCancellation ||
+              reason == LifecycleTargetRetirementReasonDTO::kClose,
+          "component_lifecycle_journal_record_invalid", "target retirement reason is invalid");
   Statement retire(database_,
-                   "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0 "
+                   "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,retirement_reason=? "
                    "WHERE controllable_component_id=? AND present=1");
-  retire.Bind(1, component.value());
+  retire.Bind(1, static_cast<std::int64_t>(reason));
+  retire.Bind(2, component.value());
   Require(!retire.Step(), "component_lifecycle_journal_corrupt",
           "lifecycle target intent retirement returned a row");
 }
@@ -6784,7 +6911,8 @@ void SqliteCCLCJournal::Impl::CancelLifecycleTargetLocked(
     const ControllableComponentId& component) {
   Statement cancel(database_,
                    "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,"
-                   "recovered_cause=NULL WHERE controllable_component_id=?");
+                   "recovered_cause=NULL,retirement_reason=CASE WHEN retirement_reason=2 THEN 2 ELSE 1 END "
+                   "WHERE controllable_component_id=?");
   cancel.Bind(1, component.value());
   Require(!cancel.Step(), "component_lifecycle_journal_corrupt",
           "lifecycle target cancellation returned a row");
@@ -6862,6 +6990,156 @@ std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::LoadLifecycleT
   return LoadLifecycleTargetsLocked();
 }
 
+std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::LoadLifecycleTargetsForClose(
+    const RequestOwnerEpoch& owner) {
+  Require(!owner.empty() && owner.value().size() <= kMaxLifecycleIdentityBytes,
+          "component_lifecycle_journal_query_invalid", "Close owner identity is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  ReadTransaction transaction(database_);
+  Require(ActiveOwner(owner), "stale_request_owner_epoch", "Close target offer owner changed");
+  auto rows = LoadLifecycleTargetsLocked();
+  transaction.Commit();
+  return rows;
+}
+
+std::optional<CCLCLifecycleTargetRetirementResultDTO>
+SqliteCCLCJournal::Impl::FindTargetRetirementResultLocked(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent, const std::string_view digest) {
+  Statement row(database_, "SELECT request_kind,semantic_request_digest,retained_result,"
+                           "target_retirement_blob FROM cclc_request_memberships "
+                           "WHERE owner_epoch=? AND request_id=?");
+  row.Bind(1, intent.request_context.request_owner_epoch.value());
+  row.Bind(2, intent.request_context.request_id.value());
+  if (!row.Step()) return std::nullopt;
+  Require(row.Text(0) == "lifecycle_target_retirement" && row.Text(1) == digest,
+          "request_id_conflict", "Close retirement request identity has different original bytes");
+  Require(row.Integer(2) == 1, "request_result_expired", "original Close target retirement result expired");
+  Require(!row.IsNull(3), "component_lifecycle_journal_corrupt", "retirement result blob is missing");
+  const auto record = detail::DecodeCCLCTargetRetirementRecord(row.Blob(3));
+  Require(record.intent == intent && !row.Step(), "component_lifecycle_journal_corrupt",
+          "retirement original intent differs or has duplicate membership");
+  return CCLCLifecycleTargetRetirementResultDTO{
+      RequestReplayStatusDTO::kReplayedExact, intent.scope, record.retired_targets, intent.request_context};
+}
+
+std::optional<CCLCLifecycleTargetRetirementResultDTO>
+SqliteCCLCJournal::Impl::ReadLifecycleTargetRetirementResult(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  Require(intent.locally_valid(), "component_lifecycle_journal_query_invalid", "Close result intent is invalid");
+  const auto digest = detail::CCLCTargetRetirementSemanticIntentDigest(intent);
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  ReadTransaction transaction(database_);
+  auto result = FindTargetRetirementResultLocked(intent, digest);
+  if (!result && UnstartedInFullNamespace(intent.request_context))
+    Fail("request_ledger_full", "original Close request was absent from its full namespace");
+  transaction.Commit();
+  return result;
+}
+
+CCLCLifecycleTargetRetirementResultDTO SqliteCCLCJournal::Impl::RetireLifecycleTargetsForClose(
+    const RequestOwnerEpoch& owner, const CCLCLifecycleTargetRetirementIntentDTO& intent,
+    const ICellCloseAdmissionLease& close_lease) {
+  Require(intent.locally_valid() && !owner.empty() && owner.value().size() <= kMaxLifecycleIdentityBytes,
+          "component_lifecycle_journal_record_invalid", "Close target retirement intent is invalid");
+  const auto digest = detail::CCLCTargetRetirementSemanticIntentDigest(intent);
+  const auto blob = detail::EncodeCCLCTargetRetirementRecord({intent, intent.expected_targets});
+  // Prepare the complete return value before any durable writes. Positive
+  // COMMIT must not turn into an unknown outcome while allocating its echo.
+  CCLCLifecycleTargetRetirementResultDTO accepted{
+      RequestReplayStatusDTO::kAcceptedNew, intent.scope, intent.expected_targets, intent.request_context};
+  TargetRetirementCommitUnknown commit_unknown{{
+      "persistence_outcome_unknown", "Close target retirement commit cannot be proved",
+      {{"reason", "close_target_retirement_commit_unknown"},
+       {"owner_epoch", intent.request_context.request_owner_epoch.value()},
+       {"request_id", intent.request_context.request_id.value()}}}};
+  auto expected_retired = intent.expected_targets;
+  for (auto& target : expected_retired) target.reached = false;
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  // The original membership is authoritative before current owner, targets,
+  // publication or Kernel prerequisites. A lost reply cannot retire successors.
+  if (auto original = FindTargetRetirementResultLocked(intent, digest)) {
+    transaction.Commit();
+    return std::move(*original);
+  }
+  Require(owner == intent.scope.request_owner_epoch && ActiveOwner(owner),
+          "stale_request_owner_epoch", "fresh Close retirement requires its current owner");
+  Require(!MembershipFull(owner), "request_ledger_full", "Close target request namespace is full");
+  Require(LoadLifecycleTargetsLocked() == intent.expected_targets,
+          "component_lifecycle_target_retirement_conflict", "complete actual lifecycle targets changed");
+  const auto before = close_lease.ValidatePrerequisites();
+  if (!before.ok()) throw CellClosePrerequisiteFailure(before.error());
+  CompactTerminalResults(1U, blob.size());
+  Statement insert(database_,
+      "INSERT INTO cclc_request_memberships(owner_epoch,request_id,request_kind,semantic_request_digest,"
+      "retained_result,target_retirement_blob,target_retirement_sequence) "
+      "VALUES(?,?,'lifecycle_target_retirement',?,1,?,?)");
+  insert.Bind(1, owner.value());
+  insert.Bind(2, intent.request_context.request_id.value());
+  insert.Bind(3, digest);
+  insert.BindBlob(4, blob);
+  const auto terminal_sequence = MintTerminalSequence();
+  insert.Bind(5, static_cast<std::int64_t>(terminal_sequence));
+  Require(!insert.Step() && sqlite3_changes(database_) == 1,
+          "component_lifecycle_journal_corrupt", "Close membership result was not inserted once");
+  for (const auto& target : intent.expected_targets)
+    RetireLifecycleTargetIntentLocked(target.controllable_component_id,
+                                     LifecycleTargetRetirementReasonDTO::kClose);
+  CompactTerminalResults();
+  // The admission lease remains held, while Stop recognition may still
+  // advance real faults. This check can roll back these purely journal writes;
+  // it does not promise a future fault-free Close sequence.
+  const auto final = close_lease.ValidatePrerequisites();
+  if (!final.ok()) throw CellClosePrerequisiteFailure(final.error());
+  try {
+    transaction.Commit();
+  } catch (const JournalFailure&) {
+    // An active SQLite transaction has not committed and rolls back in its
+    // existing destructor. No unknown classification for that ordinary error.
+    if (sqlite3_get_autocommit(database_) == 0) throw;
+    bool committed = false;
+    bool absent = false;
+    try {
+      ReadTransaction snapshot(database_);
+      Statement membership(database_,
+          "SELECT request_kind,semantic_request_digest,retained_result,target_retirement_blob,"
+          "target_retirement_sequence FROM cclc_request_memberships WHERE owner_epoch=? AND request_id=?");
+      membership.Bind(1, owner.value());
+      membership.Bind(2, intent.request_context.request_id.value());
+      const bool found = membership.Step();
+      committed = found && membership.Text(0) == "lifecycle_target_retirement" &&
+          membership.Text(1) == digest && membership.Integer(2) == 1 &&
+          !membership.IsNull(3) && membership.Blob(3) == blob &&
+          membership.Integer(4) == static_cast<std::int64_t>(terminal_sequence);
+      absent = !found;
+      if (found && membership.Step()) committed = absent = false;
+      const auto remaining = LoadLifecycleTargetsLocked();
+      committed = committed && remaining.empty() && ActiveOwner(owner);
+      absent = absent && remaining == intent.expected_targets && ActiveOwner(owner);
+      for (std::size_t index = 0; index < intent.expected_targets.size(); ++index) {
+        const auto actual = ReadLifecycleTargetRetentionLocked(
+            intent.expected_targets[index].controllable_component_id);
+        committed = committed && actual && !actual->present &&
+            actual->retirement_reason == LifecycleTargetRetirementReasonDTO::kClose &&
+            actual->target == expected_retired[index];
+        absent = absent && actual && actual->present &&
+            actual->retirement_reason == LifecycleTargetRetirementReasonDTO::kNone &&
+            actual->target == intent.expected_targets[index];
+      }
+      snapshot.Commit();
+    } catch (...) {
+      throw std::move(commit_unknown);
+    }
+    if (committed) return accepted;
+    if (absent) throw;
+    throw std::move(commit_unknown);
+  }
+  return accepted;
+}
+
 std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::RetireLifecycleTargetsForClose(
     const RequestOwnerEpoch& owner) {
   Require(!owner.empty() && owner.value().size() <= kMaxLifecycleIdentityBytes,
@@ -6873,7 +7151,8 @@ std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::RetireLifecycl
           "Close target retirement requires the actual active owner");
   auto targets = LoadLifecycleTargetsLocked();
   for (const auto& target : targets)
-    RetireLifecycleTargetIntentLocked(target.controllable_component_id);
+    RetireLifecycleTargetIntentLocked(target.controllable_component_id,
+                                     LifecycleTargetRetirementReasonDTO::kClose);
   transaction.Commit();
   return targets;
 }
@@ -7194,7 +7473,8 @@ bool SqliteCCLCJournal::Impl::ComponentInUnadoptedApplyPlan(
 }
 
 std::optional<CellObserverIncidentRecordDTO>
-SqliteCCLCJournal::Impl::ReadOpenCellObserverIncidentLocked() {
+SqliteCCLCJournal::Impl::ReadOpenCellObserverIncidentLocked(
+    CellObserverLossAssociationDTO* const association) {
   Statement row(database_,
                 "SELECT incident_id,observer_cell_id,cause_class,vendor_codes_json,"
                 "detected_at_ns,summary,record_json,observer_latest_exit_id,"
@@ -7217,6 +7497,8 @@ SqliteCCLCJournal::Impl::ReadOpenCellObserverIncidentLocked() {
               row.Text(7).size() <= kMaxComponentIncidentIdBytes &&
               IsExactLowercaseSha256Digest(std::string(kSha256DigestPrefix) + row.Text(8)),
           "component_lifecycle_journal_corrupt", "cell observer incident SQL and payload disagree");
+  if (association)
+    *association = {row.Text(0), row.Text(7), row.Text(8)};
   Require(!row.Step(), "component_lifecycle_journal_corrupt",
           "cell observer slot has more than one open incident");
   return record;
@@ -7227,6 +7509,18 @@ SqliteCCLCJournal::Impl::LoadOpenCellObserverIncident() {
   std::lock_guard lock(mutex_);
   RequireOpen();
   return ReadOpenCellObserverIncidentLocked();
+}
+
+std::optional<CellObserverLossAssociationDTO>
+SqliteCCLCJournal::Impl::LoadOpenCellObserverLossAssociation() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  ReadTransaction transaction(database_);
+  CellObserverLossAssociationDTO association;
+  const auto incident = ReadOpenCellObserverIncidentLocked(&association);
+  transaction.Commit();
+  return incident ? std::optional<CellObserverLossAssociationDTO>(std::move(association))
+                  : std::nullopt;
 }
 
 CellObserverIncidentRecordDTO SqliteCCLCJournal::Impl::RecordCellObserverIncident(
@@ -7241,8 +7535,8 @@ CellObserverIncidentRecordDTO SqliteCCLCJournal::Impl::RecordCellObserverInciden
       Fail("component_lifecycle_incident_invalid", error.what());
     }
   };
-  // Both the input and the final event envelope are qualified before a
-  // transaction. No truncation of mandatory identity or actual exit evidence.
+  // The actual input is qualified before exclusion. The final event envelope
+  // depends on the current open slot and is qualified before its first write.
   const auto input_bytes = encode(record);
   // The storage field is the approved 64 hexadecimal bytes; the hashing
   // API returns the portable "sha256:" prefix as well.
@@ -7250,7 +7544,10 @@ CellObserverIncidentRecordDTO SqliteCCLCJournal::Impl::RecordCellObserverInciden
       content_identity::sha256_digest(input_bytes).substr(kSha256DigestPrefix.size());
   std::unique_lock lock(mutex_);
   RequireOpen();
+  Transaction transaction(database_);
   const auto open = ReadOpenCellObserverIncidentLocked();
+  auto response = open ? *open : record;
+  static_assert(std::is_nothrow_move_constructible_v<CellObserverIncidentRecordDTO>);
   auto event_record = record;
   if (open) {
     event_record.incident_id = open->incident_id;
@@ -7263,11 +7560,10 @@ CellObserverIncidentRecordDTO SqliteCCLCJournal::Impl::RecordCellObserverInciden
     if (latest.Text(0) == record.incident_id) {
       Require(latest.Text(1) == input_digest, "component_lifecycle_incident_conflict",
               "same current observer exit identity has different evidence");
-      return *open;
+      return response;
     }
   }
   const auto event_bytes = encode(event_record);
-  Transaction transaction(database_);
   ComponentIncidentPruneNotice pruned;
   if (open) {
     Statement latest(database_,
@@ -7305,7 +7601,224 @@ CellObserverIncidentRecordDTO SqliteCCLCJournal::Impl::RecordCellObserverInciden
   transaction.Commit();
   lock.unlock();
   NotifyIncidentPruning(pruned);
-  return open ? *open : record;
+  return response;
+}
+
+namespace {
+std::string ObserverBringUpBytes(const CellObserverBringUpRecordDTO& record) {
+  try {
+    return EncodeCellObserverBringUpRecord(record);
+  } catch (const std::length_error&) {
+    Fail("observer_bring_up_record_too_large",
+         "observer bring-up exceeds the 512 KiB encoded bound");
+  } catch (const std::exception& error) {
+    Fail("observer_bring_up_invalid", error.what());
+  }
+}
+bool SameObserverRequest(const PublicRequestContextDTO& left,
+                         const PublicRequestContextDTO& right) {
+  return left.request_id == right.request_id &&
+         left.request_owner_epoch == right.request_owner_epoch;
+}
+bool ObserverUpdatePhase(CellObserverBringUpPhaseDTO before, CellObserverBringUpPhaseDTO after) {
+  using Phase = CellObserverBringUpPhaseDTO;
+  if (before == Phase::kAdmitted)
+    return after == Phase::kRetiring || after == Phase::kFailed || after == Phase::kUnknown;
+  if (before == Phase::kRetiring)
+    return after == Phase::kStarted || after == Phase::kFailed || after == Phase::kUnknown;
+  if (before == Phase::kStarted) return after == Phase::kFailed || after == Phase::kUnknown;
+  return false;
+}
+}  // namespace
+
+std::optional<CellObserverBringUpRecordDTO>
+SqliteCCLCJournal::Impl::ReadLatestCellObserverBringUpLocked() {
+  Statement row(database_,
+                "SELECT observer_latest_bring_up FROM cclc_journal_metadata WHERE singleton=1");
+  Require(row.Step(), "component_lifecycle_journal_corrupt",
+          "observer bring-up metadata is missing");
+  std::optional<CellObserverBringUpRecordDTO> result;
+  if (!row.IsNull(0)) {
+    try {
+      result = DecodeCellObserverBringUpRecord(row.Blob(0));
+    } catch (const std::exception&) {
+      Fail("component_lifecycle_journal_corrupt", "retained observer bring-up record is invalid");
+    }
+    Require(result->intent.replacement.cell_id == cell_id_, "component_lifecycle_journal_corrupt",
+            "retained observer bring-up names a foreign cell");
+  }
+  Require(!row.Step(), "component_lifecycle_journal_corrupt",
+          "observer bring-up metadata is duplicated");
+  return result;
+}
+void SqliteCCLCJournal::Impl::WriteLatestCellObserverBringUpLocked(const std::string& bytes) {
+  Statement write(database_,
+                  "UPDATE cclc_journal_metadata SET observer_latest_bring_up=? WHERE singleton=1");
+  write.BindBlob(1, bytes);
+  Require(!write.Step() && sqlite3_changes(database_) == 1, "component_lifecycle_journal_corrupt",
+          "observer bring-up metadata write lost its row");
+}
+std::optional<CellObserverBringUpRecordDTO>
+SqliteCCLCJournal::Impl::LoadLatestCellObserverBringUp() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  return ReadLatestCellObserverBringUpLocked();
+}
+CellObserverBringUpAdmissionDTO SqliteCCLCJournal::Impl::BeginLatestCellObserverBringUp(
+    const CellObserverBringUpRecordDTO& admitted,
+    const std::optional<CellObserverBringUpRecordDTO>& expected_latest) {
+  static_assert(std::is_nothrow_move_constructible_v<CellObserverBringUpAdmissionDTO>);
+  Require(admitted.locally_valid() && admitted.intent.replacement.cell_id == cell_id_ &&
+              admitted.phase == CellObserverBringUpPhaseDTO::kAdmitted &&
+              admitted.admitted_at_ns == admitted.updated_at_ns,
+          "observer_bring_up_invalid",
+          "observer bring-up admission does not name this cell or initial outcome");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  // Exclude other journal connections before comparing the durable latest
+  // attempt. The instance mutex alone cannot establish this CAS.
+  Transaction transaction(database_);
+  const auto current = ReadLatestCellObserverBringUpLocked();
+  if (current &&
+      SameObserverRequest(current->intent.request_context, admitted.intent.request_context)) {
+    auto replay_intent = admitted.intent;
+    // Ordinary request replay excludes transport-derived attribution. Return
+    // the original durable provenance and admission evidence unchanged.
+    replay_intent.attribution = current->intent.attribution;
+    Require(current->intent == replay_intent, "observer_bring_up_request_conflict",
+            "same observer request has different semantic intent");
+    return {*current, false};
+  }
+  Require(current == expected_latest, "observer_bring_up_stale",
+          "latest observer attempt changed before admission");
+  CellObserverLossAssociationDTO association;
+  const auto incident = ReadOpenCellObserverIncidentLocked(&association);
+  const auto incident_id =
+      incident ? std::optional<std::string>(incident->incident_id) : std::nullopt;
+  Require(incident_id == admitted.intent.predecessor_incident_id,
+          "observer_bring_up_incident_changed",
+          "observer incident changed before explicit admission");
+  const auto loss = incident
+      ? std::optional<CellObserverLossAssociationDTO>(std::move(association)) : std::nullopt;
+  Require(loss == admitted.predecessor_loss, "observer_bring_up_loss_changed",
+          "observer loss changed before explicit admission");
+  const auto bytes = ObserverBringUpBytes(admitted);
+  CellObserverBringUpAdmissionDTO response{admitted, true};
+  WriteLatestCellObserverBringUpLocked(bytes);
+  transaction.Commit();
+  return response;
+}
+CellObserverBringUpRecordDTO SqliteCCLCJournal::Impl::UpdateLatestCellObserverBringUp(
+    const CellObserverBringUpRecordDTO& expected, const CellObserverBringUpRecordDTO& updated) {
+  static_assert(std::is_nothrow_move_constructible_v<CellObserverBringUpRecordDTO>);
+  const auto bytes = ObserverBringUpBytes(updated);
+  Require(expected.locally_valid() && updated.intent == expected.intent &&
+              updated.intent.replacement.cell_id == cell_id_ &&
+              updated.admitted_at_ns == expected.admitted_at_ns &&
+              updated.updated_at_ns >= expected.updated_at_ns &&
+              updated.predecessor_process == expected.predecessor_process &&
+              updated.predecessor_loss == expected.predecessor_loss &&
+              (!expected.predecessor_drained_or_absent || updated.predecessor_drained_or_absent) &&
+              (!expected.started_process || updated.started_process == expected.started_process) &&
+              !updated.first_open && ObserverUpdatePhase(expected.phase, updated.phase),
+          "observer_bring_up_invalid",
+          "observer update changes original identity or is not an actual outcome transition");
+  auto response = updated;
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  const auto current = ReadLatestCellObserverBringUpLocked();
+  if (current && *current == updated) return response;
+  Require(current && *current == expected, "observer_bring_up_stale",
+          "latest observer attempt changed before update");
+  WriteLatestCellObserverBringUpLocked(bytes);
+  transaction.Commit();
+  return response;
+}
+CellObserverBringUpRecordDTO SqliteCCLCJournal::Impl::CloseCellObserverIncidentByOperatorBringUp(
+    const CellObserverBringUpRecordDTO& expected_started,
+    const CellObserverBringUpOpenDTO& first_open) {
+  Require(expected_started.phase == CellObserverBringUpPhaseDTO::kStarted &&
+              expected_started.locally_valid() && first_open.locally_valid() &&
+              expected_started.intent.replacement.cell_id == cell_id_,
+          "observer_bring_up_invalid",
+          "observer closure needs the exact started attempt and first accepted Open");
+  auto completed = expected_started;
+  completed.phase = CellObserverBringUpPhaseDTO::kOpenAccepted;
+  completed.first_open = first_open;
+  completed.updated_at_ns = std::max(completed.updated_at_ns, first_open.accepted_at_ns);
+  const auto bytes = ObserverBringUpBytes(completed);
+  static_assert(std::is_nothrow_move_constructible_v<CellObserverBringUpRecordDTO>);
+  std::unique_lock lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  const auto current = ReadLatestCellObserverBringUpLocked();
+  if (current && *current == completed) return completed;
+  Require(current && *current == expected_started, "observer_bring_up_stale",
+          "first accepted Open does not name the latest exact started attempt");
+  CellObserverLossAssociationDTO association;
+  const auto incident = ReadOpenCellObserverIncidentLocked(&association);
+  const auto& original_id = expected_started.intent.predecessor_incident_id;
+  const auto incident_id =
+      incident ? std::optional<std::string>(incident->incident_id) : std::nullopt;
+  Require(incident_id == original_id, "observer_bring_up_incident_changed",
+          "observer incident changed since explicit bring-up admission");
+  const auto loss = incident
+      ? std::optional<CellObserverLossAssociationDTO>(std::move(association)) : std::nullopt;
+  Require(loss == expected_started.predecessor_loss, "observer_bring_up_loss_changed",
+          "observer loss changed after explicit bring-up admission");
+  std::string event;
+  if (incident) {
+    auto root = content_identity::parse_canonical_json(EncodeCellObserverIncidentRecord(*incident));
+    auto fields = root.as_object();
+    for (auto& [key, value] : fields) {
+      if (key == "event_kind")
+        value =
+            content_identity::CanonicalValue(std::string(kComponentIncidentAcknowledgedEventKind));
+      if (key == "acknowledgement")
+        value = content_identity::CanonicalValue(content_identity::CanonicalValue::Object{
+            {"request_id", content_identity::CanonicalValue(
+                               expected_started.intent.request_context.request_id.value())},
+            {"request_owner_epoch",
+             content_identity::CanonicalValue(
+                 expected_started.intent.request_context.request_owner_epoch.value())},
+            {"source_label", content_identity::CanonicalValue(
+                                 expected_started.intent.request_context.source_label)},
+            {"at_ns", content_identity::nonnegative_int64_value(first_open.accepted_at_ns)},
+            {"reason",
+             content_identity::CanonicalValue(std::string("superseded by operator bring-up"))},
+            {"first_open",
+             content_identity::CanonicalValue(content_identity::CanonicalValue::Object{
+                 {"source_epoch", content_identity::CanonicalValue(first_open.source_epoch)},
+                 {"source_epoch_order", content_identity::CanonicalValue(static_cast<double>(
+                                            first_open.source_epoch_order))}})}});
+    }
+    event = content_identity::canonical_json(content_identity::CanonicalValue(std::move(fields)));
+    Require(event.size() <= kMaxComponentIncidentRecordBytes, "observer_bring_up_record_too_large",
+            "observer acknowledgement exceeds the 512 KiB encoded bound");
+  }
+  WriteLatestCellObserverBringUpLocked(bytes);
+  if (incident) {
+    Statement close(
+        database_,
+        "UPDATE cclc_component_incidents SET acknowledged=1,acknowledged_by=?,"
+        "acknowledged_at_ns=?,acknowledgement_request_id=?,acknowledgement_owner_epoch=? "
+        "WHERE target_kind='cell_observer' AND incident_id=? AND acknowledged=0");
+    close.Bind(1, expected_started.intent.request_context.source_label);
+    close.Bind(2, first_open.accepted_at_ns);
+    close.Bind(3, expected_started.intent.request_context.request_id.value());
+    close.Bind(4, expected_started.intent.request_context.request_owner_epoch.value());
+    close.Bind(5, incident->incident_id);
+    Require(!close.Step() && sqlite3_changes(database_) == 1, "component_lifecycle_journal_corrupt",
+            "observer acknowledgement lost its exact incident");
+    AppendComponentIncidentEventLocked(kComponentIncidentAcknowledgedEventKind,
+                                       incident->incident_id, first_open.accepted_at_ns, event);
+  }
+  const auto pruned = PruneClosedIncidentsLocked();
+  transaction.Commit();
+  lock.unlock();
+  NotifyIncidentPruning(pruned);
+  return completed;
 }
 
 ComponentIncidentPruneNotice SqliteCCLCJournal::Impl::PruneClosedIncidentsLocked() {
@@ -7454,11 +7967,16 @@ std::optional<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::Impl::RecoverCom
   // The ordinary request identity decides first: an exact replay, a reused
   // request id with other content, a stale owner epoch or a full namespace
   // is answered by ordinary CCLC admission from these same records.
-  if (InspectLifecycleRequestLocked(active_owner_epoch, intent, semantic_digest)) {
+  if (const auto inspected = InspectLifecycleRequestLocked(active_owner_epoch, intent, semantic_digest)) {
     transaction.Commit();
-    return std::nullopt;
+    return intent.close_incident_recovery ? inspected : std::nullopt;
   }
   const auto open = ReadOpenComponentIncidentLocked(intent.controllable_component_id);
+  if (intent.close_incident_recovery)
+    Require(open && open->incident.incident_id ==
+                        intent.close_incident_recovery->expected_incident_id,
+            "component_lifecycle_close_incident_mismatch",
+            "Close recovery must match the actual open incident");
   if (!open) {
     transaction.Commit();
     return std::nullopt;
@@ -7468,7 +7986,9 @@ std::optional<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::Impl::RecoverCom
   incident.acknowledged_by = acknowledged_by;
   incident.acknowledged_at_ns = acknowledged_at_ns;
   incident.acknowledgement_request_id = intent.request_context.request_id;
-  const auto payload = ComponentIncidentAcknowledgedPayload(open->record_json, incident);
+  const auto closure = intent.close_incident_recovery
+      ? std::optional{ComponentIncidentClosureReasonDTO::kCellClosedByOperator} : std::nullopt;
+  const auto payload = ComponentIncidentAcknowledgedPayload(open->record_json, incident, closure);
   Require(payload.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "incident acknowledgement record is too large");
 
@@ -7497,6 +8017,16 @@ std::optional<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::Impl::RecoverCom
   close.Bind(6, incident.controllable_component_id.value());
   Require(!close.Step() && sqlite3_changes(database_) == 1,
           "component_lifecycle_journal_corrupt", "incident acknowledgement did not close it");
+  // Preserve the typed acknowledgement in the same bounded incident row so
+  // exact result replay survives owner restart; no second recovery ledger.
+  if (closure) {
+    Statement evidence(database_, "UPDATE cclc_component_incidents SET record_json=? "
+                                  "WHERE incident_id=? AND acknowledged=1");
+    evidence.Bind(1, payload);
+    evidence.Bind(2, incident.incident_id);
+    Require(!evidence.Step() && sqlite3_changes(database_) == 1,
+            "component_lifecycle_journal_corrupt", "Close acknowledgement lost its incident");
+  }
   // The acknowledgement clears what fresh status alone would otherwise have
   // to clear, and starts the component over: it must reach its target again
   // before a further loss is a new incident.
@@ -7523,7 +8053,7 @@ std::optional<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::Impl::RecoverCom
                                        std::nullopt};
   result.incident_recovery = ComponentIncidentRecoveryDTO{
       incident.incident_id, incident.controllable_component_id, incident.cause_class,
-      acknowledged_by, acknowledged_at_ns};
+      acknowledged_by, acknowledged_at_ns, closure};
   return result;
 }
 
@@ -7532,7 +8062,7 @@ SqliteCCLCJournal::Impl::ReadComponentIncidentRecoveryLocked(
     const PublicRequestContextDTO& request) {
   Statement row(database_,
                 "SELECT incident_id,controllable_component_id,cause_class,acknowledged_by,"
-                "acknowledged_at_ns FROM cclc_component_incidents WHERE target_kind='component' "
+                "acknowledged_at_ns,record_json FROM cclc_component_incidents WHERE target_kind='component' "
                 "AND acknowledged=1 AND "
                 "acknowledgement_owner_epoch=? AND acknowledgement_request_id=?");
   row.Bind(1, request.request_owner_epoch.value());
@@ -7541,6 +8071,12 @@ SqliteCCLCJournal::Impl::ReadComponentIncidentRecoveryLocked(
   ComponentIncidentRecoveryDTO recovery{row.Text(0), ControllableComponentId(row.Text(1)),
                                         static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(2)),
                                         row.Text(3), row.Integer(4)};
+  const auto evidence = content_identity::parse_canonical_json(row.Text(5));
+  if (const auto* closure = evidence.find_object_member("closure_reason")) {
+    Require(closure->is_string() && closure->as_string() == "cell_closed_by_operator",
+            "component_lifecycle_journal_corrupt", "incident closure reason is invalid");
+    recovery.closure_reason = ComponentIncidentClosureReasonDTO::kCellClosedByOperator;
+  }
   Require(recovery.locally_valid() && !row.Step(), "component_lifecycle_journal_corrupt",
           "acknowledged incident row is invalid");
   return recovery;
@@ -7799,7 +8335,7 @@ void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_ter
             "oldest terminal CCLC result query returned multiple rows");
 
     Require(request_kind == "component_lifecycle" || request_kind == "route_selection" ||
-                request_kind == "rejection",
+                request_kind == "rejection" || request_kind == "lifecycle_target_retirement",
             "component_lifecycle_journal_corrupt",
             "oldest terminal CCLC result has an invalid request kind");
     if (request_kind == "component_lifecycle") {
@@ -7814,7 +8350,7 @@ void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_ter
               "component_lifecycle_journal_corrupt",
               "terminal lifecycle claim retirement returned a row");
     }
-    if (request_kind != "rejection") {
+    if (request_kind == "component_lifecycle" || request_kind == "route_selection") {
       Statement erase(
           database_, request_kind == "component_lifecycle"
                          ? "DELETE FROM lifecycle_transactions WHERE transaction_sequence=?"
@@ -7826,7 +8362,8 @@ void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_ter
     }
     Statement tombstone(database_,
                         "UPDATE cclc_request_memberships SET "
-                        "retained_result=0,rejection_blob=NULL,rejection_sequence=NULL "
+                        "retained_result=0,rejection_blob=NULL,rejection_sequence=NULL, "
+                        "target_retirement_blob=NULL,target_retirement_sequence=NULL "
                         "WHERE membership_sequence=?");
     tombstone.Bind(1, static_cast<std::int64_t>(membership_sequence));
     Require(!tombstone.Step() && sqlite3_changes(database_) == 1,
@@ -8192,6 +8729,12 @@ Result<std::optional<ComponentLifecycleTargetDTO>> SqliteCCLCJournal::LoadLifecy
       [&]() { return impl_->LoadLifecycleTarget(component); });
 }
 
+Result<std::optional<ComponentLifecycleTargetRetentionDTO>>
+SqliteCCLCJournal::ReadLifecycleTargetRetention(const ControllableComponentId& component) {
+  return AsResult<std::optional<ComponentLifecycleTargetRetentionDTO>>(
+      [&] { return impl_->ReadLifecycleTargetRetention(component); });
+}
+
 Result<ComponentLifecycleTargetFactsDTO> SqliteCCLCJournal::LoadLifecycleTargetFacts(
     const ControllableComponentId& component) {
   return AsResult<ComponentLifecycleTargetFactsDTO>(
@@ -8251,6 +8794,52 @@ Result<std::optional<CellObserverIncidentRecordDTO>>
 SqliteCCLCJournal::LoadOpenCellObserverIncident() {
   return AsResult<std::optional<CellObserverIncidentRecordDTO>>(
       [&] { return impl_->LoadOpenCellObserverIncident(); });
+}
+
+Result<std::optional<CellObserverLossAssociationDTO>>
+SqliteCCLCJournal::LoadOpenCellObserverLossAssociation() {
+  return AsResult<std::optional<CellObserverLossAssociationDTO>>(
+      [&] { return impl_->LoadOpenCellObserverLossAssociation(); });
+}
+
+Result<std::vector<ComponentLifecycleTargetDTO>> SqliteCCLCJournal::LoadLifecycleTargetsForClose(
+    const RequestOwnerEpoch& owner) {
+  return AsResult<std::vector<ComponentLifecycleTargetDTO>>([&] { return impl_->LoadLifecycleTargetsForClose(owner); });
+}
+
+Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>
+SqliteCCLCJournal::ReadLifecycleTargetRetirementResult(const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  return AsResult<std::optional<CCLCLifecycleTargetRetirementResultDTO>>(
+      [&] { return impl_->ReadLifecycleTargetRetirementResult(intent); });
+}
+
+Result<CCLCLifecycleTargetRetirementResultDTO> SqliteCCLCJournal::RetireLifecycleTargetsForClose(
+    const RequestOwnerEpoch& owner, const CCLCLifecycleTargetRetirementIntentDTO& intent,
+    const ICellCloseAdmissionLease& lease) {
+  return AsResult<CCLCLifecycleTargetRetirementResultDTO>(
+      [&] { return impl_->RetireLifecycleTargetsForClose(owner, intent, lease); });
+}
+
+Result<std::optional<CellObserverBringUpRecordDTO>>
+SqliteCCLCJournal::LoadLatestCellObserverBringUp() {
+  return AsResult<std::optional<CellObserverBringUpRecordDTO>>(
+      [&] { return impl_->LoadLatestCellObserverBringUp(); });
+}
+Result<CellObserverBringUpAdmissionDTO> SqliteCCLCJournal::BeginLatestCellObserverBringUp(
+    const CellObserverBringUpRecordDTO& record,
+    const std::optional<CellObserverBringUpRecordDTO>& expected) {
+  return AsResult<CellObserverBringUpAdmissionDTO>(
+      [&] { return impl_->BeginLatestCellObserverBringUp(record, expected); });
+}
+Result<CellObserverBringUpRecordDTO> SqliteCCLCJournal::UpdateLatestCellObserverBringUp(
+    const CellObserverBringUpRecordDTO& expected, const CellObserverBringUpRecordDTO& updated) {
+  return AsResult<CellObserverBringUpRecordDTO>(
+      [&] { return impl_->UpdateLatestCellObserverBringUp(expected, updated); });
+}
+Result<CellObserverBringUpRecordDTO> SqliteCCLCJournal::CloseCellObserverIncidentByOperatorBringUp(
+    const CellObserverBringUpRecordDTO& expected, const CellObserverBringUpOpenDTO& open) {
+  return AsResult<CellObserverBringUpRecordDTO>(
+      [&] { return impl_->CloseCellObserverIncidentByOperatorBringUp(expected, open); });
 }
 
 Result<ComponentIncidentRecordDTO> SqliteCCLCJournal::OpenComponentIncident(

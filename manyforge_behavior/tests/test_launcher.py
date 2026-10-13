@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import inspect
+import subprocess
 import sys
 
 import pytest
@@ -31,7 +32,7 @@ def test_launcher_is_explicitly_unavailable_before_argument_parsing(capsys) -> N
 
 
 def test_ros_full_runtime_services_share_one_canonical_image() -> None:
-    """Runtime service records share the image qualified by the launcher."""
+    """Common tooling aliases share the selected official full image."""
     repo_root = Path(__file__).resolve().parents[2]
     compose = yaml.safe_load(
         (repo_root / "docker-compose.yaml").read_text(encoding="utf-8")
@@ -40,9 +41,47 @@ def test_ros_full_runtime_services_share_one_canonical_image() -> None:
     build_owner = services["ros-jazzy-full"]
     canonical_image = build_owner["image"]
 
-    assert build_owner["build"]["dockerfile"] == "Dockerfile.ros-jazzy-full"
-    assert canonical_image == "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}"
-    for service_name in ("composer-ros", "isaac-topic-control"):
-        service = services[service_name]
-        assert service["image"] == canonical_image
-        assert "build" not in service
+    assert build_owner["build"]["dockerfile"] == "Dockerfile.ros-lyrical-full"
+    assert canonical_image == "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}"
+    service = services["composer-ros"]
+    assert service["image"] == canonical_image
+    assert "build" not in service
+
+
+def test_isaac_image_has_explicit_temporary_qualification_hold() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load(
+        (repo_root / "docker-compose.yaml").read_text(encoding="utf-8")
+    )
+    assert compose["services"]["isaac-topic-control"]["image"] == (
+        "${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}"
+    )
+    assert "build" not in compose["services"]["isaac-topic-control"]
+
+
+def test_real_lite6_base_keeps_its_temporary_qualification_hold() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    recipe = (repo_root / "Dockerfile.ros-jazzy-real-lite6").read_text(encoding="utf-8")
+    helper = (repo_root / "scripts/xarm/build-real-lite6-image.sh").read_text(encoding="utf-8")
+    assert "ARG MANYFORGE_ROS_FULL_BASE_IMAGE=manyforge-ros-jazzy-full:q44-20261010" in recipe
+    assert "BASE_IMAGE=${MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE:-${MANYFORGE_ROS_FULL_BASE_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}}" in helper
+
+
+@pytest.mark.parametrize(("environment", "expected"), [
+    ({}, "manyforge-ros-jazzy-full:q44-20261010"),
+    ({"MANYFORGE_ROS_FULL_IMAGE": "common-lyrical"}, "manyforge-ros-jazzy-full:q44-20261010"),
+    ({"MANYFORGE_ROS_FULL_BASE_IMAGE": "legacy-qualified"}, "legacy-qualified"),
+    ({"MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE": "dedicated-qualified"}, "dedicated-qualified"),
+    ({"MANYFORGE_ROS_FULL_BASE_IMAGE": "legacy-qualified",
+      "MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE": "dedicated-qualified"}, "dedicated-qualified"),
+])
+def test_real_lite6_base_override_compatibility(environment, expected):
+    repo_root = Path(__file__).resolve().parents[2]
+    helper = (repo_root / "scripts/xarm/build-real-lite6-image.sh").read_text(encoding="utf-8")
+    assignment = next(line for line in helper.splitlines() if line.startswith("BASE_IMAGE="))
+    # Evaluate the actual production assignment without source/Docker build effects.
+    selected = subprocess.run(
+        ["/bin/bash", "-c", assignment + '\nprintf "%s" "$BASE_IMAGE"'],
+        env=environment, check=True, capture_output=True, text=True,
+    )
+    assert selected.stdout == expected

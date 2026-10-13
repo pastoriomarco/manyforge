@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <stdexcept>
@@ -143,6 +144,279 @@ std::int64_t CountRows(const std::filesystem::path& database_path, const char* t
   sqlite3_finalize(statement);
   sqlite3_close(database);
   return result;
+}
+
+CellAdmissionClaimDTO ConfigurationClaim(std::uint64_t generation, std::uint64_t admission,
+                                         std::string epoch, std::string request) {
+  auto claim = Claim();
+  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kManagerApply;
+  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kManager;
+  claim.intent.owner_epoch = RequestOwnerEpoch(std::move(epoch));
+  claim.intent.owner_transaction_id = request + ".transaction";
+  claim.intent.request_id = RequestId(std::move(request));
+  claim.intent.scope = {};
+  claim.intent.expected_admission_generation = AdmissionGeneration(admission);
+  claim.claim_generation = CellAdmissionClaimGeneration(generation);
+  claim.acquired_admission_generation = AdmissionGeneration(admission);
+  return claim;
+}
+
+// Use SQLite's real commit hook and authorizer, without a product fault injector.
+// The hook rolls back COMMIT; the optional authorizer then makes outcome readback
+// unavailable. Installation/removal is scoped to this serial test invocation.
+struct ConfigurationCommitFailure final {
+  bool armed{};
+  bool fail_readback{};
+  bool deny_reads{};
+  int commit_failures{};
+};
+thread_local ConfigurationCommitFailure* configuration_commit_failure = nullptr;
+int InstallConfigurationCommitFailure(sqlite3* database, char**, const sqlite3_api_routines*) {
+  auto* control = configuration_commit_failure;
+  if (!control) return SQLITE_OK;
+  sqlite3_commit_hook(
+      database,
+      [](void* value) {
+        auto& failure = *static_cast<ConfigurationCommitFailure*>(value);
+        if (!failure.armed) return 0;
+        failure.armed = false;
+        ++failure.commit_failures;
+        failure.deny_reads = failure.fail_readback;
+        return 1;
+      },
+      control);
+  return sqlite3_set_authorizer(
+      database,
+      [](void* value, int action, const char*, const char*, const char*, const char*) {
+        const auto& failure = *static_cast<ConfigurationCommitFailure*>(value);
+        return failure.deny_reads && (action == SQLITE_SELECT || action == SQLITE_READ)
+                   ? SQLITE_DENY
+                   : SQLITE_OK;
+      },
+      control);
+}
+class ScopedConfigurationCommitFailure final {
+ public:
+  explicit ScopedConfigurationCommitFailure(ConfigurationCommitFailure& value) {
+    configuration_commit_failure = &value;
+    if (sqlite3_auto_extension(reinterpret_cast<void (*)()>(InstallConfigurationCommitFailure)) !=
+        SQLITE_OK)
+      throw std::runtime_error("cannot install scoped SQLite commit-failure hook");
+  }
+  ~ScopedConfigurationCommitFailure() {
+    sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(InstallConfigurationCommitFailure));
+    configuration_commit_failure = nullptr;
+  }
+};
+
+TEST(KernelCellAdmissionSqlite, ConfigurationCommitWithUnavailableReadbackClosesOnlyNewAdmission) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  ConfigurationCommitFailure failure;
+  ScopedConfigurationCommitFailure hook(failure);
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  const RequestOwnerEpoch kernel("kernel.1");
+  auto recovery = journal.BeginOwnerEpoch(kernel, 1, 8U, {});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      kernel, 8U, clock, journal, {}, recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); }, {}, {}, {}, EmptyLivenessSet());
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto intent = ConfigurationClaim(1U, owner.GetAuthoringAdmission().admission_generation.value(),
+                                   EmptyLivenessSet().manager_owner_epoch.value(), "unknown.commit")
+                    .intent;
+  failure.armed = true;
+  failure.fail_readback = true;
+  const auto result = owner.AcquireConfigurationApplyClaim(
+      intent, [](const auto&, auto, const auto&, const auto&) { return Result<void>::Ok(); });
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(failure.commit_failures, 1);
+  EXPECT_EQ(result.error().code, "persistence_outcome_unknown");
+  ASSERT_TRUE(owner.persistence_outcome_unknown());
+  EXPECT_EQ(owner.persistence_outcome_unknown()->details.at("request_id"), "unknown.commit");
+  EXPECT_FALSE(owner.persistence_outcome_unknown()->details.at("commit_error").empty());
+  EXPECT_FALSE(owner.persistence_outcome_unknown()->details.at("readback_error").empty());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(
+      owner
+          .AcquireConfigurationApplyClaim(intent, [](const auto&, auto, const auto&,
+                                                     const auto&) { return Result<void>::Ok(); })
+          .error()
+          .code,
+      "persistence_outcome_unknown");
+  EXPECT_FALSE(owner.CheckManualCellAdmissionReadiness(std::nullopt).ok());
+  EmergencyStopAcceptanceReserve stop_reserve(1U);
+  const EmergencyStopAcceptanceCandidate stop{
+      .request_id = "request.stop.after-unknown",
+      .normalized_request_digest = std::string_view(kDigest),
+      .transport = RequestTransportDTO::kInternal,
+      .assurance = RequestAssuranceDTO::kUnverified,
+      .principal_id = std::nullopt,
+      .malformed_reason = std::nullopt,
+      .proposed_stop_id = "stop.after-unknown",
+      .proposed_stop_generation = StopGeneration(1U),
+      .accepted_at_ns = 11,
+      .disposition = StopResolutionDispositionDTO::kPromotedToFull,
+      .captured_scope_digest = kDigest,
+      .full_stop_scope_digest = kDigest,
+      .overlapping_stop_id = std::nullopt,
+      .full_stop = true};
+  EXPECT_TRUE(stop_reserve.reserve_or_join(stop).accepted());
+  // Removing the injected read fault is not an in-process clear.
+  failure.deny_reads = false;
+  EXPECT_FALSE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
+  EXPECT_TRUE(owner.persistence_outcome_unknown());
+  journal.Close();
+  SqliteOperationJournal restarted(database, CellId("cell.1"));
+  const auto recovered = restarted.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 12, 8U, {});
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  EXPECT_TRUE(
+      recovered.value()
+          .recovered_cell_admission_claims.empty());  // Actual rollback proved after restart.
+}
+
+TEST(KernelCellAdmissionSqlite, ConfigurationCommitWithProvenRollbackDoesNotCloseAdmission) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  ConfigurationCommitFailure failure;
+  ScopedConfigurationCommitFailure hook(failure);
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  const RequestOwnerEpoch kernel("kernel.1");
+  auto recovery = journal.BeginOwnerEpoch(kernel, 1, 8U, {});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      kernel, 8U, clock, journal, {}, recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); }, {}, {}, {}, EmptyLivenessSet());
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  const auto before = owner.GetAuthoringAdmission();
+  auto intent =
+      ConfigurationClaim(1U, before.admission_generation.value(),
+                         EmptyLivenessSet().manager_owner_epoch.value(), "rolled-back.commit")
+          .intent;
+  failure.armed = true;
+  const auto result = owner.AcquireConfigurationApplyClaim(
+      intent, [](const auto&, auto, const auto&, const auto&) { return Result<void>::Ok(); });
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(failure.commit_failures, 1);
+  EXPECT_NE(result.error().code, "persistence_outcome_unknown");
+  EXPECT_EQ(owner.GetAuthoringAdmission(), before);
+  EXPECT_FALSE(owner.persistence_outcome_unknown());
+  EXPECT_FALSE(owner.has_unresolved_claims());
+  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 0);
+}
+
+TEST(KernelCellAdmissionSqlite, ConfigurationApplyRestartsManagerWithoutReleasingTerminalMarkers) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const RequestOwnerEpoch kernel("kernel.1");
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  ASSERT_TRUE(journal.BeginOwnerEpoch(kernel, 1, 8U, {}).ok());
+  const auto old = ConfigurationClaim(1U, 1U, "manager.old", "apply.old");
+  ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(kernel, old).ok());
+  auto fresh = ConfigurationClaim(2U, 2U, "manager.new", "apply.fresh");
+  const std::vector<CellAdmissionClaimDTO> old_held{old};
+  const std::vector<CellAdmissionCurrentOwnerEpochDTO> old_owners{
+      {CellAdmissionOwnerRoleDTO::kManager, old.intent.owner_epoch}};
+  const CellAdmissionCurrentOwnerEpochDTO manager{CellAdmissionOwnerRoleDTO::kManager,
+                                                  fresh.intent.owner_epoch};
+  EXPECT_FALSE(
+      journal.RecordConfigurationApplyClaimAcquired(kernel, fresh, manager, {}, old_owners).ok());
+  auto foreign_owners = old_owners;
+  foreign_owners.front().owner_epoch = RequestOwnerEpoch("foreign.owner");
+  EXPECT_FALSE(
+      journal
+          .RecordConfigurationApplyClaimAcquired(kernel, fresh, manager, old_held, foreign_owners)
+          .ok());
+  const auto acquired =
+      journal.RecordConfigurationApplyClaimAcquired(kernel, fresh, manager, old_held, old_owners);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  EXPECT_EQ(acquired.value(), fresh);
+  auto later_retry = fresh;
+  later_retry.accepted_at_ns = 123456;  // An unknown-commit retry must recover the first timestamp.
+  const auto replay = journal.RecordConfigurationApplyClaimAcquired(kernel, later_retry, manager,
+                                                                    old_held, old_owners);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value(), fresh);
+  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 2);
+  const std::vector<CellAdmissionCurrentOwnerEpochDTO> current_owners{manager};
+  const std::vector<CellAdmissionClaimDTO> held{old, fresh};
+  // Ordinary stale-owner release remains forbidden; only proven fresh success can settle it.
+  EXPECT_FALSE(
+      journal.RecordCellAdmissionClaimReleased(kernel, old, Release(old), AdmissionGeneration(4U))
+          .ok());
+  EXPECT_FALSE(journal
+                   .RecordTerminalApplyClaimsReleasedBySuccess(kernel, fresh, Release(fresh),
+                                                               {fresh}, current_owners,
+                                                               AdmissionGeneration(3U))
+                   .ok());
+  const auto settled = journal.RecordTerminalApplyClaimsReleasedBySuccess(
+      kernel, fresh, Release(fresh), held, current_owners, AdmissionGeneration(3U));
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  EXPECT_EQ(settled.value(), AdmissionGeneration(4U));
+  const auto settled_replay = journal.RecordTerminalApplyClaimsReleasedBySuccess(
+      kernel, fresh, Release(fresh), held, current_owners, AdmissionGeneration(3U));
+  ASSERT_TRUE(settled_replay.ok());
+  EXPECT_EQ(settled_replay.value(), settled.value());
+  auto conflicting_success = Release(fresh);
+  conflicting_success.settlement.evidence_digest = ContentDigest(kDigestB);
+  EXPECT_FALSE(journal
+                   .RecordTerminalApplyClaimsReleasedBySuccess(kernel, fresh, conflicting_success,
+                                                               held, current_owners,
+                                                               AdmissionGeneration(3U))
+                   .ok());
+  EXPECT_EQ(CountRows(database, "cell_admission_claims"), 2);  // Original identities retained.
+  journal.Close();
+  SqliteOperationJournal reopened(database, CellId("cell.1"));
+  const auto recovery = reopened.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  ASSERT_EQ(recovery.value().recovered_cell_admission_claims.size(), 2U);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims[0].claim, old);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims[0].release, Release(old));
+  EXPECT_EQ(recovery.value().recovered_cell_admission_claims[1].claim, fresh);
+  EXPECT_FALSE(recovery.value().recovered_cell_admission_claims[1].release);
+  EXPECT_EQ(recovery.value().recovered_cell_admission_current_owners, current_owners);
+}
+
+TEST(KernelCellAdmissionSqlite, ConfigurationSuccessReleaseRollsBackWholeBatchOnWriteFailure) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const RequestOwnerEpoch kernel("kernel.1");
+  SqliteOperationJournal journal(database, CellId("cell.1"));
+  ASSERT_TRUE(journal.BeginOwnerEpoch(kernel, 1, 8U, {}).ok());
+  const auto first = ConfigurationClaim(1U, 1U, "manager.owner", "apply.first");
+  const auto second = ConfigurationClaim(2U, 2U, "manager.owner", "apply.second");
+  const auto fresh = ConfigurationClaim(3U, 3U, "manager.owner", "apply.fresh");
+  ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(kernel, first).ok());
+  ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(kernel, second).ok());
+  ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(kernel, fresh).ok());
+  const std::vector<CellAdmissionClaimDTO> held{first, second, fresh};
+  const std::vector<CellAdmissionCurrentOwnerEpochDTO> owners{
+      {CellAdmissionOwnerRoleDTO::kManager, fresh.intent.owner_epoch}};
+  sqlite3* writer = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &writer), SQLITE_OK);
+  ASSERT_EQ(
+      sqlite3_exec(writer,
+                   "CREATE TRIGGER fail_second_release BEFORE UPDATE OF release_owner_role ON "
+                   "cell_admission_claims "
+                   "WHEN OLD.claim_generation=2 BEGIN SELECT RAISE(ABORT,'injected failure'); END;",
+                   nullptr, nullptr, nullptr),
+      SQLITE_OK);
+  sqlite3_close(writer);
+  EXPECT_FALSE(journal
+                   .RecordTerminalApplyClaimsReleasedBySuccess(kernel, fresh, Release(fresh), held,
+                                                               owners, AdmissionGeneration(4U))
+                   .ok());
+  ASSERT_EQ(sqlite3_open(database.c_str(), &writer), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(writer, "DROP TRIGGER fail_second_release", nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  sqlite3_close(writer);
+  // Exact original inventory/generation must still match after the failed second update.
+  const auto result = journal.RecordTerminalApplyClaimsReleasedBySuccess(
+      kernel, fresh, Release(fresh), held, owners, AdmissionGeneration(4U));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value(), AdmissionGeneration(5U));
 }
 
 TEST(KernelCellAdmissionSqlite, ProgramNodeAttributionSurvivesOwnerReplacement) {

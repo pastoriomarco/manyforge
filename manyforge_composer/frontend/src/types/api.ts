@@ -416,7 +416,7 @@ export interface ScenarioDocumentSaveResponse {
 export interface NewScenarioDocumentInput {
   path: string;
   name: string;
-  deploymentChoice: 'keep_applied' | 'empty';
+  deploymentChoice: 'empty';
   expectedRetainedBundleId: string;
   expectedGraphRevision: string;
   confirmDiscard: boolean;
@@ -570,11 +570,18 @@ export interface DeploymentWorkspaceResponse {
   unavailableReasons: string[];
 }
 
+export type PreparedActivationOrigin = {
+  kind: 'scenario'; scenarioId: string; sourceDocumentDigest: string;
+} | {
+  kind: 'sealed_canonical_empty'; cellId: string; deploymentArtifactId: string;
+  deploymentRevision: string; retainedBundleId: string; graphRevision: string;
+  admissionDigest: string;
+};
+
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v5';
+  schemaVersion: 'manyforge.prepared_activation_input.v6';
   preparedActivationId: string;
-  scenarioId: string;
-  sourceDocumentDigest: string;
+  origin: PreparedActivationOrigin;
   capturedInputDigest: string;
   deploymentArtifactId: string;
   deploymentRevision: string;
@@ -1544,7 +1551,7 @@ export interface AppliedProgramStatus {
   executable: boolean;
   programId: string | null;
   programRevision: string | null;
-  scenarioId: string;
+  origin: PreparedActivationOrigin;
   message: string | null;
   unresolvedReferences: ProgramUnresolvedReference[];
   affectedNodes: string[];

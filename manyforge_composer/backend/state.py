@@ -21,6 +21,7 @@ from manyforge_behavior.node_environment import NodeEnvironment, build_node_envi
 from manyforge_behavior.canonical_artifact import canonical_json_bytes
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.program_binding_projection import validate_prepared_activation_origin
 
 from .draft_session import (
     ComposerDraftSession,
@@ -119,9 +120,8 @@ _APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
         "program_revision",
         "record_digest",
         "retained_bundle_id",
-        "scenario_id",
+        "origin",
         "schema_version",
-        "source_document_digest",
     }
 )
 _ProgramOutcomeIdentity = tuple[str, str]
@@ -138,8 +138,7 @@ def _is_sha256_identity(value: object) -> bool:
 _PREPARED_ACTIVATION_FIELDS = (
     "schema_version",
     "prepared_activation_id",
-    "scenario_id",
-    "source_document_digest",
+    "origin",
     "captured_input_digest",
     "deployment_artifact_id",
     "deployment_revision",
@@ -615,13 +614,14 @@ class ComposerState:
     @classmethod
     def _published_program_projection(
         cls, status: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         if (
             set(status) != _APPLIED_PROGRAM_STATUS_FIELDS
             or status.get("schema_version") != "manyforge.applied_program_status.v2"
             or type(status.get("executable")) is not bool
         ):
             raise ValueError("Applied Program status has an unsupported shape")
+        origin = validate_prepared_activation_origin(status.get("origin"))
         executable = status["executable"]
         binding_id = status.get("program_binding_id")
         non_executable = status.get("non_executable")
@@ -657,8 +657,6 @@ class ComposerState:
         projection = {
             name: status.get(name)
             for name in (
-                "scenario_id",
-                "source_document_digest",
                 "deployment_artifact_id",
                 "deployment_revision",
                 "retained_bundle_id",
@@ -671,7 +669,6 @@ class ComposerState:
             any(not isinstance(value, str) or not value
                 for name, value in projection.items()
                 if not (no_program and name in {"program_id", "program_revision"}))
-            or not _is_sha256_identity(projection["source_document_digest"])
             or not _is_sha256_identity(projection["deployment_revision"])
             or not _is_sha256_identity(projection["retained_bundle_id"])
             or not _is_sha256_identity(projection["graph_revision"])
@@ -679,6 +676,17 @@ class ComposerState:
             or not _is_sha256_identity(status.get("record_digest"))
         ):
             raise ValueError("Applied Program status lacks activation identity fields")
+        if origin["kind"] == "sealed_canonical_empty":
+            if not no_program or any(
+                origin[name] != projection[name]
+                for name in ("deployment_artifact_id", "deployment_revision",
+                             "retained_bundle_id", "graph_revision")
+            ):
+                raise ValueError("sealed Applied status is contradictory")
+            # A genuine empty publication has no Scenario projection.
+            return None
+        projection.update(scenario_id=origin["scenario_id"],
+                          source_document_digest=origin["source_document_digest"])
         projection["program_outcome"] = outcome
         cls._deployment_publication_identity(projection)
         return projection
@@ -717,9 +725,11 @@ class ComposerState:
                 "activation_deployment_missing",
                 "activation has no captured Deployment authoring input",
             )
+        origin = prepared_activation.get("origin")
         if (
-            prepared_activation.get("scenario_id") != intent.get("scenario_id")
-            or prepared_activation.get("source_document_digest")
+            not isinstance(origin, dict) or origin.get("kind") != "scenario"
+            or origin.get("scenario_id") != intent.get("scenario_id")
+            or origin.get("source_document_digest")
             != intent.get("source_document_digest")
         ):
             raise AuthoringOperationError(
@@ -1091,6 +1101,8 @@ class ComposerState:
         else:
             try:
                 applied = self._published_program_projection(status_reader())
+                if applied is None:
+                    reasons.append("program_not_applied")
             except HeadlessClientError as error:
                 if error.code in {
                     "program_applied_selection_not_found",

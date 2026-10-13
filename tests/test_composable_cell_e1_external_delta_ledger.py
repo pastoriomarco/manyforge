@@ -174,7 +174,7 @@ def _selected_roboplan_source_ids() -> set[str]:
     """Return the RoboPlan source ids the image and setup verifiers select."""
 
     selected: set[str] = set()
-    for name in ("Dockerfile", "Dockerfile.ros-jazzy-full"):
+    for name in ("Dockerfile", "Dockerfile.ros-lyrical-full"):
         source = (_REPO_ROOT / name).read_text(encoding="utf-8")
         selected.update(re.findall(r"ROBOPLAN_SOURCE_ID=(roboplan_[0-9a-z_]+)", source))
         selected.update(re.findall(r"--source-id (roboplan_[0-9a-z_]+)", source))

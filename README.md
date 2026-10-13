@@ -179,19 +179,36 @@ maintained native owners and their focused process suites are current. The
 historical aggregate, ROS/Isaac, and physical product-lane suites remain
 unavailable.
 
-The separate ROS Jazzy image remains a development toolchain for focused
-internal contracts. Such checks do not restore or qualify a ROS product:
+The official full ROS Lyrical image supplies focused ROS development checks
+on amd64 and arm64. Legacy Compose service names are compatibility aliases
+for this same image; such checks do not restore or qualify a ROS product:
 
 ```bash
+docker compose --profile ros-full build ros-jazzy-full
 docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
 ```
 
-The ROS image starts from `ros:jazzy-ros-base-noble` and keeps ROS Python
-dependencies apt-managed. The default development image remains ROS-free; ROS
-wrappers/adapters live in the `manyforge_ros` lane.
+`Dockerfile.ros-lyrical-full` starts from pinned Ubuntu Noble and keeps ROS
+Python dependencies apt-managed. Its cache derivative adds pinned ccache
+tooling to an immutable local image; it does not define another runtime lane.
+The default development image remains ROS-free; ROS wrappers/adapters live in
+the `manyforge_ros` lane.
 
-The heavier ROS Jazzy full image also remains a build/test toolchain, but its
-product entry point is explicitly unavailable:
+The held image overrides are separate: `MANYFORGE_ISAAC_ROS_IMAGE` and
+`MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE`, both defaulting to the existing laptop
+Jazzy tag `manyforge-ros-jazzy-full:q44-20261010`. Preserve this existing image;
+the common full-image build does not recreate it. That amd64 image is not
+available on current Orin/Thor inventories; their held lanes remain unavailable
+until an exact qualified image is supplied.
+
+The temporary qualification hold keeps the actual Isaac topic-control and experimental real-Lite6
+overlay image defaults on their current bases. Migrating these defaults awaits a
+Lyrical topic-control roundtrip and xArm driver build/mock bring-up, respectively.
+This hold is a qualification boundary, not a second official development image;
+no live Isaac or hardware qualification follows from toolchain checks.
+
+The same full Lyrical toolchain also backs the legacy `ros-jazzy-full` alias,
+but its product entry point is explicitly unavailable:
 
 ```bash
 docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh

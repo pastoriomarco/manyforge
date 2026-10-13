@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/cell_admission.hpp>
+#include <memory>
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/operator_alarm_attention.hpp>
@@ -9,11 +10,44 @@ namespace manyforge::core {
 
 struct ActiveControlConfigurationDTO;
 struct SelectedComponentBringUpOfferDTO;
+struct CCLCLifecycleTargetRetirementIntentDTO;
+struct CCLCLifecycleTargetRetirementResultDTO;
+
+/// Stack-scoped exclusion on the existing Kernel admission mutex. It
+/// creates no claim, generation or retained permission. Validate is a current
+/// fact check, not a promise that future Stop faults cannot arise.
+class ICellCloseAdmissionLease {
+ public:
+  virtual ~ICellCloseAdmissionLease() = default;
+  [[nodiscard]] virtual Result<void> ValidatePrerequisites() const = 0;
+  /// Private synchronous Close join: prepare all bounded values before SQL.
+  /// No projection changes during preparation, and no public wire authority.
+  [[nodiscard]] virtual Result<void> PrepareCommandEligibilityClosure(
+      const CCLCLifecycleTargetRetirementIntentDTO&) {
+    return Result<void>::Err({"cell_close_eligibility_join_unavailable",
+                             "the Kernel Close eligibility join is unavailable", {}});
+  }
+  /// Consume this lease's exact prepared, newly accepted retirement once.
+  /// Passive replay cannot reclose a later authorized publication. No allocation
+  /// or generation/route/participant change is permitted at this boundary.
+  [[nodiscard]] virtual bool CloseCommandEligibilityAfterRetirement(
+      const CCLCLifecycleTargetRetirementIntentDTO&,
+      const CCLCLifecycleTargetRetirementResultDTO&) noexcept { return false; }
+  /// Only the owner-reported uncertain durable retirement path may use this
+  /// conservative one-shot closure; it proves no retirement or physical rest.
+  [[nodiscard]] virtual bool CloseCommandEligibilityForUnknownRetirement(
+      const CCLCLifecycleTargetRetirementIntentDTO&) noexcept { return false; }
+};
 
 class IKernelCellAdmissionPort {
  public:
   virtual ~IKernelCellAdmissionPort() = default;
 
+  [[nodiscard]] virtual Result<std::unique_ptr<ICellCloseAdmissionLease>>
+  AcquireCellCloseAdmissionLease() {
+    return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Err(
+        {"cell_close_prerequisites_unavailable", "the Kernel Close admission join is unavailable", {}});
+  }
   [[nodiscard]] virtual AuthoringAdmissionDTO GetAuthoringAdmission() const = 0;
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) = 0;

@@ -27,6 +27,8 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "content_identity_internal.hpp"
+#include "canonical_empty_admission_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 
@@ -830,8 +832,9 @@ prepare(const std::filesystem::path &root, const BindingCompilerContext &context
   FilesystemCatalogArtifactStore catalog_store(root);
   manyforge::deployment::FilesystemRawArtifactStore raw_store(root);
   return manyforge::deployment::assemble_prepared_activation(
-      {manyforge::core::ContentDigest("sha256:" + std::string(64U, '1')),
-       "scenario.readback",
+      {manyforge::deployment::PreparedScenarioOrigin{
+           "scenario.readback",
+           manyforge::core::ContentDigest("sha256:" + std::string(64U, '1'))},
        manyforge::core::ContentDigest("sha256:" + std::string(64U, '2')),
        "optional"},
       *context.bundle, context.model_map, *contract,
@@ -1418,3 +1421,75 @@ TEST(ProgramBindingCompilerTest,
 }
 
 } // namespace
+
+TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecked) {
+  namespace d = manyforge::deployment;
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto prepared = prepare(root.path(), context, kLite6ArmTargetId);
+  ASSERT_NE(prepared.scenario_origin(), nullptr);
+  EXPECT_EQ(prepared.scenario_origin()->scenario_id, "scenario.readback");
+  EXPECT_EQ(prepared.sealed_canonical_empty_origin(), nullptr);
+  EXPECT_EQ(prepared.normalized_root().find_object_member("scenario_id"), nullptr);
+  EXPECT_EQ(prepared.normalized_root().find_object_member("source_document_digest"), nullptr);
+  auto origin = prepared.normalized_root().find_object_member("origin")->as_object();
+  origin.emplace_back("cell_id", CanonicalValue("foreign"));
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_input(reidentify(
+      with_member(prepared.normalized_root(), "origin", CanonicalValue(origin))))),
+      d::PreparedActivationInputError);
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_input(reidentify(
+      with_member(prepared.normalized_root(), "schema_version",
+                  CanonicalValue("manyforge.prepared_activation_input.v5"))))),
+      d::PreparedActivationInputError);
+}
+
+TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) {
+  namespace d = manyforge::deployment;
+  ScopedTrustedRoot package;
+  const auto admission = d::detail::generate_native_empty_package(
+      package.path(), manyforge::core::CellId("prepared_empty_cell"),
+      d::detail::native_execution_runtime_profile_document());
+  const d::FilesystemVerifiedCatalogArtifactSource catalog(package.path());
+  const d::FilesystemVerifiedRawArtifactSource raw(package.path());
+  const auto prepared = d::assemble_sealed_canonical_empty_activation(admission, catalog, raw);
+  ASSERT_NE(prepared.sealed_canonical_empty_origin(), nullptr);
+  EXPECT_EQ(prepared.scenario_origin(), nullptr);
+  EXPECT_EQ(prepared.closure().retained_bundle->canonical_bytes(),
+            admission.retained_bundle().canonical_bytes());
+  EXPECT_EQ(prepared.closure().program, nullptr);
+  EXPECT_EQ(prepared.closure().program_binding, nullptr);
+  EXPECT_FALSE(prepared.program_id().has_value());
+  EXPECT_FALSE(prepared.program_revision().has_value());
+  EXPECT_EQ(prepared.captured_input_digest(),
+      d::sealed_canonical_empty_capture_digest(*prepared.sealed_canonical_empty_origin()));
+  ScopedTrustedRoot activation;
+  const d::FilesystemPreparedActivationRepository repository(activation.path());
+  EXPECT_TRUE(repository.put_if_absent(prepared));
+  EXPECT_FALSE(repository.put_if_absent(prepared));
+  EXPECT_THROW(static_cast<void>(repository.get_verified(prepared.prepared_activation_id())),
+               d::PreparedActivationInputError);
+  const auto replay = repository.get_verified(prepared.prepared_activation_id(), &admission);
+  ASSERT_NE(replay, nullptr);
+  EXPECT_EQ(replay->prepared_activation_id(), prepared.prepared_activation_id());
+  ScopedTrustedRoot foreign;
+  const auto other = d::detail::generate_native_empty_package(
+      foreign.path(), manyforge::core::CellId("other_prepared_empty_cell"),
+      d::detail::native_execution_runtime_profile_document());
+  EXPECT_THROW(static_cast<void>(repository.get_verified(prepared.prepared_activation_id(), &other)),
+               d::PreparedActivationInputError);
+  // Rehashed, structurally coherent JSON is still not an actual admission.
+  auto forged_origin = *prepared.sealed_canonical_empty_origin();
+  forged_origin.admission_digest = manyforge::core::ContentDigest("sha256:" + std::string(64U, 'f'));
+  auto forged = with_member(prepared.normalized_root(), "origin",
+                           d::prepared_activation_origin_value(forged_origin));
+  forged = with_member(forged, "captured_input_digest",
+                       CanonicalValue(d::sealed_canonical_empty_capture_digest(forged_origin).value()));
+  const auto parsed = d::parse_prepared_activation_input(reidentify(forged));
+  ASSERT_TRUE(repository.put_if_absent(parsed));
+  EXPECT_THROW(static_cast<void>(repository.get_verified(parsed.prepared_activation_id(), &admission)),
+               d::PreparedActivationInputError);
+  auto mixed_origin = d::prepared_activation_origin_value(*prepared.sealed_canonical_empty_origin()).as_object();
+  mixed_origin.emplace_back("scenario_id", CanonicalValue(nullptr));
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_origin(CanonicalValue(mixed_origin))),
+               d::PreparedActivationInputError);
+}

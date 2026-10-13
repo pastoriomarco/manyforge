@@ -222,6 +222,7 @@ private:
   manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;
+  IManagerSelectedRuntimeCompositionPort &runtime_composition_port_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   ApplyIdFactory apply_id_factory_;
   InitialSceneSource initial_scene_source_;

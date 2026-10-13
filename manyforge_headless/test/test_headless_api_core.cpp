@@ -875,7 +875,7 @@ TEST(HeadlessApiCore,
             {"incomplete", CanonicalValue(false)},
             {"prepared_activation", CanonicalValue(CanonicalValue::Object{
                 {"schema_version",
-                 CanonicalValue("manyforge.prepared_activation_input.v5")},
+                 CanonicalValue("manyforge.prepared_activation_input.v6")},
                 {"retained_bundle_id", CanonicalValue(Digest('f'))},
                 {"graph_revision", Member(active, "graph_revision")},
                 {"program_outcome", CanonicalValue(CanonicalValue::Object{
@@ -918,12 +918,15 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
       })},
   }));
   const CanonicalValue prepared(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v5")},
+      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v6")},
       {"prepared_activation_id", CanonicalValue(Digest('a'))},
       {"retained_bundle_id", Member(active, "retained_bundle_id")},
       {"graph_revision", Member(active, "graph_revision")},
-      {"scenario_id", CanonicalValue("new_scenario")},
-      {"source_document_digest", CanonicalValue(Digest('b'))},
+      {"origin", CanonicalValue(CanonicalValue::Object{
+          {"kind", CanonicalValue("scenario")},
+          {"scenario_id", CanonicalValue("new_scenario")},
+          {"source_document_digest", CanonicalValue(Digest('b'))},
+      })},
       {"deployment_artifact_id", CanonicalValue("new_deployment")},
       {"deployment_revision", CanonicalValue(Digest('c'))},
       {"program_id", CanonicalValue(nullptr)},
@@ -1023,10 +1026,14 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
       {"intent_digest", CanonicalValue(Digest(digest))},
       {"prepared_activation", CanonicalValue(CanonicalValue::Object{
           {"schema_version",
-           CanonicalValue("manyforge.prepared_activation_input.v5")},
+           CanonicalValue("manyforge.prepared_activation_input.v6")},
           {"retained_bundle_id", Member(active, "retained_bundle_id")},
           {"graph_revision", Member(active, "graph_revision")},
-          {"scenario_id", CanonicalValue(scenario_id)},
+          {"origin", CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("scenario")},
+              {"scenario_id", CanonicalValue(scenario_id)},
+              {"source_document_digest", CanonicalValue(Digest('b'))},
+          })},
           {"program_id", CanonicalValue(nullptr)},
           {"program_revision", CanonicalValue(nullptr)},
           {"program_outcome", CanonicalValue(CanonicalValue::Object{
@@ -1038,7 +1045,8 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
 
 CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
                                        const double publication_generation,
-                                       const bool include_older_apply) {
+                                       const bool include_older_apply,
+                                       const bool sealed_current = false) {
   PublishHealthySources(directory, "open");
   auto payload = ManagerPayload();
   auto active = Member(payload, "active");
@@ -1057,6 +1065,25 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
   if (include_older_apply) {
     records.push_back(
         CommittedApplyRecord("apply.old", 'c', "other_cell", true, active));
+  }
+  if (sealed_current) {
+    auto prepared = Member(records.front(), "prepared_activation");
+    auto sealed_prepared_fields = prepared.as_object();
+    sealed_prepared_fields.emplace_back("deployment_artifact_id",
+                                       CanonicalValue("deployment.empty"));
+    sealed_prepared_fields.emplace_back("deployment_revision",
+                                       CanonicalValue(Digest('a')));
+    prepared = CanonicalValue(std::move(sealed_prepared_fields));
+    prepared = WithField(prepared, "origin", CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("sealed_canonical_empty")},
+        {"cell_id", CanonicalValue(std::string(kCellId))},
+        {"deployment_artifact_id", CanonicalValue("deployment.empty")},
+        {"deployment_revision", CanonicalValue(Digest('a'))},
+        {"retained_bundle_id", Member(active, "retained_bundle_id")},
+        {"graph_revision", Member(active, "graph_revision")},
+        {"admission_digest", CanonicalValue(Digest('f'))},
+    }));
+    records.front() = WithField(records.front(), "prepared_activation", prepared);
   }
   payload = WithField(payload, "active", active);
   payload = WithField(payload, "apply", CanonicalValue(CanonicalValue::Object{
@@ -1077,12 +1104,12 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   TemporaryDirectory directory;
   const auto activation = CommittedActivationCore(directory, 3.0, true);
   EXPECT_EQ(Text(activation, "schema_version"),
-            "manyforge.committed_scenario_activation.v1");
+            "manyforge.committed_scenario_activation.v2");
   EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
   EXPECT_EQ(Text(activation, "apply_id"), "apply.new");
   EXPECT_EQ(std::get<double>(Member(activation, "apply_generation").storage()),
             1.0);
-  EXPECT_EQ(Text(activation, "scenario_id"), "cell_pick");
+  EXPECT_EQ(Text(Member(activation, "origin"), "scenario_id"), "cell_pick");
   EXPECT_EQ(std::get<double>(Member(activation, "publication_generation").storage()),
             3.0);
   // A Scenario without a Program declares nothing; it is still an activation.
@@ -1093,17 +1120,42 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   const auto &committed = Array(activation, "committed_applies");
   ASSERT_EQ(committed.size(), 2U);
   EXPECT_EQ(Text(committed[0], "record_digest"), Digest('c'));
-  EXPECT_EQ(Text(committed[0], "scenario_id"), "other_cell");
+  EXPECT_EQ(Text(Member(committed[0], "origin"), "scenario_id"), "other_cell");
   EXPECT_EQ(Text(committed[0], "apply_id"), "apply.old");
   EXPECT_EQ(std::get<double>(Member(committed[0], "apply_generation").storage()),
             1.0);
   EXPECT_EQ(Text(committed[1], "record_digest"), Digest('d'));
-  EXPECT_EQ(Text(committed[1], "scenario_id"), "cell_pick");
+  EXPECT_EQ(Text(Member(committed[1], "origin"), "scenario_id"), "cell_pick");
   EXPECT_EQ(Text(committed[1], "apply_id"), "apply.new");
   EXPECT_EQ(std::get<double>(Member(committed[1], "apply_generation").storage()),
             1.0);
   EXPECT_EQ(committed[0].as_object().size(), 4U);
   EXPECT_EQ(committed[1].as_object().size(), 4U);
+}
+
+TEST(HeadlessApiCore, SealedEmptyApplyRemainsInTheCompleteCommittedHistory) {
+  TemporaryDirectory directory;
+  const auto activation = CommittedActivationCore(directory, 3.0, true, true);
+  EXPECT_EQ(Text(Member(activation, "origin"), "kind"), "sealed_canonical_empty");
+  EXPECT_EQ(activation.find_object_member("scenario_id"), nullptr);
+  EXPECT_TRUE(Member(activation, "program").is_null());
+  const auto &history = Array(activation, "committed_applies");
+  ASSERT_EQ(history.size(), 2U);
+  EXPECT_EQ(Text(Member(history[0], "origin"), "kind"), "scenario");
+  EXPECT_EQ(Text(Member(history[1], "origin"), "kind"), "sealed_canonical_empty");
+  EXPECT_EQ(history[1].find_object_member("scenario_id"), nullptr);
+  HeadlessApiCore core(Config(directory, "api.epoch.status"), Clocks());
+  const auto status = core.AppliedProgramStatus();
+  EXPECT_EQ(Text(Member(status, "origin"), "kind"), "sealed_canonical_empty");
+  EXPECT_EQ(status.find_object_member("scenario_id"), nullptr);
+  EXPECT_FALSE(std::get<bool>(Member(status, "executable").storage()));
+  EXPECT_TRUE(Member(status, "program_id").is_null());
+  try {
+    static_cast<void>(core.AppliedProgramSelection());
+    FAIL() << "sealed empty Apply returned an executable Program";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "program_not_selected");
+  }
 }
 
 TEST(HeadlessApiCore, CommittedActivationRefusesAHistoryThatMissesAPublication) {

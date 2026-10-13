@@ -7,17 +7,18 @@
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_component_manager/selected_bundle_transition.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
-#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
-#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -634,6 +635,14 @@ private:
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::CellAdmissionClaimDTO &,
       const manyforge::core::CellAdmissionClaimReleaseDTO &);
+  friend manyforge::core::Result<void>
+  ValidateTerminalManagerApplyClaimsReadOnly(
+      const std::filesystem::path &, const manyforge::core::CellId &,
+      std::span<const manyforge::core::CellAdmissionClaimDTO>);
+  friend manyforge::core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
+      const std::filesystem::path &, const manyforge::core::CellId &,
+      const manyforge::core::CellAdmissionClaimDTO &,
+      const manyforge::core::CellAdmissionClaimReleaseDTO &);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -646,6 +655,22 @@ ValidateManagerApplyCellAdmissionSettlementReadOnly(
     const std::filesystem::path &database_path,
     const manyforge::core::CellId &cell_id,
     const manyforge::core::CellAdmissionClaimDTO &claim,
+    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
+
+/// Prove immutable failed/unknown terminals for the exact old claims. A missing
+/// terminal stays LIVE; this read neither terminalizes nor settles anything.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateTerminalManagerApplyClaimsReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    std::span<const manyforge::core::CellAdmissionClaimDTO> old_claims);
+/// Fresh immutable success only. The Kernel separately proves that every old
+/// fence was released before its admission owner settles the old claim rows.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateFreshManagerApplySuccessReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    const manyforge::core::CellAdmissionClaimDTO &fresh_claim,
     const manyforge::core::CellAdmissionClaimReleaseDTO &release);
 
 /// Read one exact sealed parent and its existing phase records without opening

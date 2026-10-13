@@ -81,13 +81,21 @@ from manyforge_headless_api.models import (
 from manyforge_headless_api.program_model_transport import (
     HeadlessProgramModelAuditSink,
 )
+from manyforge_headless_api.program_binding_projection import (
+    validate_committed_scenario_activation,
+)
+from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 
 from manyforge_headless_api.cell_admission import (
     CellAdmissionClient,
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
-from .cycle_journal import ProgramCycleJournal, ProgramCycleJournalVersionError
+from .cycle_journal import (
+    ProgramCycleJournal,
+    ProgramCycleJournalVersionError,
+    ProgramCycleStopWon,
+)
 from .execution_transport import ProgramRunnerExecutionTransport
 from .liveness import (
     ProgramRunnerLivenessError,
@@ -112,6 +120,7 @@ from .models import (
     RuntimeBlackboardWriteRequest,
 )
 from .persistent_keys import (
+    MAX_RECONCILED_APPLIES,
     OPERATOR_WRITABLE_ACCESS,
     CommittedActivation,
     PersistentKeyEdit,
@@ -1093,7 +1102,7 @@ class ProgramRuntime:
 
     @staticmethod
     def _headless_error(error: HeadlessClientError) -> ProgramRunnerError:
-        return ProgramRunnerError(error.code, str(error))
+        return ProgramRunnerError(error.code, str(error), details=error.details)
 
     @staticmethod
     def _runner_error(error: Exception) -> ProgramRunnerError:
@@ -1426,7 +1435,9 @@ class ProgramRuntime:
         recovery_stop = self._current_cycle_recovery_stop(cycle)
         recovery_reset = self._current_cycle_recovery_reset(cycle)
         allowed_by_state = {
-            "program_run": cycle.state == "idle_after_reset",
+            "program_run": cycle.state == "idle_after_reset" and not (
+                cycle.failure and cycle.failure.get("code") == "program_scene_preparation_failed"
+            ),
             "program_motion_start": cycle.state == "running",
             "program_motion_stop": cycle.state in {"starting", "running"},
             "program_motion_resume": cycle.state == "running",
@@ -1434,6 +1445,7 @@ class ProgramRuntime:
             "program_stop": cycle.state in {"starting", "running"} or recovery_stop,
             "program_reset": cycle.state
             in {
+                "idle_after_reset",
                 "running",
                 "terminal_awaiting_reset",
             }
@@ -1499,6 +1511,9 @@ class ProgramRuntime:
                     else (
                         "program_cycle_reconciliation_required"
                         if cycle.reconciliation_required
+                        else "program_scene_preparation_failed"
+                        if kind == "program_run" and cycle.failure
+                        and cycle.failure.get("code") == "program_scene_preparation_failed"
                         else f"program_cycle_state_{cycle.state}"
                     )
                 ),
@@ -1864,12 +1879,13 @@ class ProgramRuntime:
         scene_proof: Mapping[str, Any] | None,
         effect_may_have_started: bool,
         started_snapshot: Mapping[str, Any] | None = None,
+        failure: ProgramRunnerError | None = None,
     ) -> None:
         current = journal.read()
         if current.state == "terminal_awaiting_reset":
             return
         if current.claim is None:
-            if current.state != "stopping" or not isinstance(scene_proof, Mapping):
+            if current.state != "stopping" or effect_may_have_started:
                 journal.require_reconciliation(
                     expected_generation=current.cycle_generation
                 )
@@ -1879,7 +1895,7 @@ class ProgramRuntime:
                 "kind": "proven_no_effect",
                 "claim": None,
                 "program_run_id": current.program_run_id,
-                "prepared_scene": deepcopy(dict(scene_proof)),
+                "prepared_scene": deepcopy(dict(scene_proof or {})),
             }
             journal.transition(
                 expected_generation=current.cycle_generation,
@@ -1951,6 +1967,18 @@ class ProgramRuntime:
                 start_settlement=settlement,
                 program_run_id=program_run_id,
                 run_snapshot=terminal_snapshot,
+                failure=None if failure is None else {
+                    "code": failure.code,
+                    "message": f"Program run {program_run_id} started, then failed: {failure}. "
+                               "Reset the Program cycle before another Run.",
+                    "details": {**failure.details, "program_run_id": program_run_id,
+                                "claim_generation": current.claim["claim_generation"],
+                                "needs_reset": True},
+                    "failed_phase": "starting",
+                    "program_run_id": program_run_id,
+                    "claim_generation": current.claim["claim_generation"],
+                    "needs_reset": True,
+                },
             )
         except Exception as error:
             try:
@@ -1979,8 +2007,8 @@ class ProgramRuntime:
                 != "manyforge.program_cycle_start_settlement.v1"
                 or settlement.get("claim") != cycle.claim
                 or not isinstance(prepared_scene, Mapping)
-                or prepared_scene.get("schema_version")
-                != "manyforge.prepared_program_scene.v1"
+                or (prepared_scene != {} and prepared_scene.get("schema_version")
+                    != "manyforge.prepared_program_scene.v1")
                 or settlement.get("kind")
                 not in {"proven_no_effect", "terminal_effects_settled"}
                 or self._digest(settlement) != reference
@@ -2309,6 +2337,9 @@ class ProgramRuntime:
                 resulting_generation = self._admission_generation(
                     admission_client.get()
                 )
+                journal.complete_scene_preparation(
+                    expected_generation=cycle.cycle_generation, owner_epoch=self.owner_epoch
+                )
                 return {
                     "schema_version": "manyforge.program_scene_preparation.v1",
                     "status": "prepared",
@@ -2317,17 +2348,17 @@ class ProgramRuntime:
                     "admission_generation": resulting_generation,
                     "prepared_scene": deepcopy(proof),
                 }
-            except ProgramRunnerError:
-                raise
-            except HeadlessClientError as error:
-                raise self._headless_error(error) from error
-            except (ProgramRunOwnerError, ProgramSchedulingError) as error:
-                raise self._runner_error(error) from error
             except Exception as error:
-                raise ProgramRunnerError(
-                    "program_scene_preparation_failed",
-                    str(error) or type(error).__name__,
-                ) from error
+                failure = {
+                    "code": "program_scene_preparation_failed",
+                    "message": str(error) or type(error).__name__,
+                }
+                journal.record_scene_preparation_failure(
+                    expected_generation=cycle.cycle_generation,
+                    owner_epoch=self.owner_epoch,
+                    failure=failure,
+                )
+                raise ProgramRunnerError(failure["code"], failure["message"]) from error
 
     def start(self) -> None:
         if self._closed:
@@ -2578,7 +2609,7 @@ class ProgramRuntime:
                 )
             component_ids.add(component_id)
         for component_id in sorted(component_ids):
-            observed = self._headless.cclc_component(component_id)
+            observed = self._headless.cclc_component_lifecycle_snapshot(component_id)
             if (
                 not isinstance(observed, Mapping)
                 or observed.get("controllable_component_id") != component_id
@@ -2705,6 +2736,11 @@ class ProgramRuntime:
                         "program_cycle_reset_required",
                         "Program cycle is not Idle after an explicit Reset",
                     )
+                if cycle.failure and cycle.failure.get("code") == "program_scene_preparation_failed":
+                    raise ProgramRunnerError(
+                        "program_scene_preparation_failed",
+                        cycle.failure["message"],
+                    )
                 try:
                     journal.require_run_history_capacity()
                 except OverflowError as error:
@@ -2713,11 +2749,6 @@ class ProgramRuntime:
                     ) from error
                 owner_admission = admission_client.get()
                 generation = self._admission_generation(owner_admission)
-                if generation != request.expected_admission_generation:
-                    raise ProgramRunnerError(
-                        "stale_generation",
-                        "Run admission generation changed before claim acquisition",
-                    )
                 applied = self._headless.program_applied()
                 source = applied.get("source")
                 if (
@@ -2770,9 +2801,8 @@ class ProgramRuntime:
                     },
                     "intervention_evidence": None,
                 }
-                # Starting is backend truth before scene convergence or owner
-                # acquisition can take noticeable time.  The pending evidence
-                # is refreshed below if scene commits advance admission.
+                # Run never prepares or compares the Scene. Starting remains
+                # backend truth before owner acquisition and capture.
                 journal.begin_acquire(
                     expected_generation=cycle.cycle_generation,
                     provisional_run_id=program_run_id,
@@ -2782,9 +2812,7 @@ class ProgramRuntime:
                     client_sequence=request.client_sequence,
                 )
                 starting_committed = True
-                scene_context, initial_scene, scene_proof = self._prepare_run_scene(
-                    run_admission, program_run_id
-                )
+                scene_context = run_admission.port_context(program_run_id)
                 abort_if_stop_won()
                 execution_identity = self._kernel.identity()
                 kernel_epoch = execution_identity["identity"].get("owner_epoch")
@@ -2795,9 +2823,7 @@ class ProgramRuntime:
                     )
                 self._starting_kernel_owner_epoch = kernel_epoch
                 abort_if_stop_won()
-                # Scene preparation may have consumed one or more short
-                # authored-scene claims. Acquire Run only from the fresh
-                # generation that follows those exact owner commits.
+                # Acquire Run only from the current owner admission generation.
                 owner_admission = admission_client.get()
                 generation = self._admission_generation(owner_admission)
                 claim_intent["expected_admission_generation"] = generation
@@ -2861,11 +2887,6 @@ class ProgramRuntime:
                 # Re-read here so a Disable that won after the first check
                 # cannot be overtaken by Program execution.
                 self._verify_required_components_active(applied_after_claim)
-                self._verify_run_scene(
-                    scene_context,
-                    initial_scene,
-                    scene_proof,
-                )
                 recovery_fences = self._run_recovery_fences(
                     applied_after_claim,
                     execution_identity,
@@ -2976,21 +2997,32 @@ class ProgramRuntime:
                 identities = {key: capture[key] for key in identity_fields}
                 identities["runtime_recovery_fences"] = recovery_fences
                 identities["prepared_scene"] = deepcopy(scene_proof)
-                with self._terminal_observation_lock:
-                    journal.transition(
-                        expected_generation=cycle.cycle_generation,
-                        expected_states=("starting",),
-                        state="running",
-                        program_run_id=snapshot.capture.program_run_id,
-                        capture_identities=identities,
-                        run_snapshot=result,
+                try:
+                    with self._terminal_observation_lock:
+                        journal.transition(
+                            expected_generation=cycle.cycle_generation,
+                            expected_states=("starting",),
+                            state="running",
+                            program_run_id=snapshot.capture.program_run_id,
+                            capture_identities=identities,
+                            run_snapshot=result,
+                            expected_running_owner_epoch=self.owner_epoch,
+                            expected_running_claim=claim,
+                        )
+                        pending_terminal = self._pending_terminal_snapshots.pop(
+                            snapshot.capture.program_run_id,
+                            None,
+                        )
+                        if pending_terminal is not None:
+                            self._record_terminal_snapshot(pending_terminal)
+                except ProgramCycleStopWon:
+                    # The CAS classified the exact Stop under the journal lock;
+                    # perform its existing settlement only after leaving locks.
+                    abort_if_stop_won()
+                    raise ProgramRunnerError(
+                        "program_run_superseded_by_stop",
+                        "Program Stop was accepted before Run admission completed",
                     )
-                    pending_terminal = self._pending_terminal_snapshots.pop(
-                        snapshot.capture.program_run_id,
-                        None,
-                    )
-                    if pending_terminal is not None:
-                        self._record_terminal_snapshot(pending_terminal)
                 # Capture first, then publish the durable Running owner state,
                 # and only then enable the first effectful tree tick.
                 self._host.schedule(program_run_id)
@@ -3000,18 +3032,20 @@ class ProgramRuntime:
                     result=result,
                 )
             except HeadlessClientError as error:
-                release_scene_context()
-                if acquired_for_request:
-                    self._terminalize_failed_start(
-                        journal,
-                        scene_proof=scene_proof,
-                        effect_may_have_started=host_start_invoked,
-                        started_snapshot=started_snapshot,
-                    )
-                else:
-                    retain_unacquired_start_uncertainty()
                 outcome = self._headless_error(error)
+                release_scene_context()
+                if acquired_for_request:
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                        failure=outcome,
+                    )
+                else:
+                    retain_unacquired_start_uncertainty()
             except CellAdmissionError as error:
+                outcome = ProgramRunnerError(error.code, str(error), details=error.details)
                 release_scene_context()
                 if acquired_for_request:
                     self._terminalize_failed_start(
@@ -3019,35 +3053,25 @@ class ProgramRuntime:
                         scene_proof=scene_proof,
                         effect_may_have_started=host_start_invoked,
                         started_snapshot=started_snapshot,
+                        failure=outcome,
                     )
                 else:
                     retain_unacquired_start_uncertainty()
-                outcome = ProgramRunnerError(error.code, str(error))
             except ProgramRunnerError as error:
-                release_scene_context()
-                if acquired_for_request:
-                    self._terminalize_failed_start(
-                        journal,
-                        scene_proof=scene_proof,
-                        effect_may_have_started=host_start_invoked,
-                        started_snapshot=started_snapshot,
-                    )
-                else:
-                    retain_unacquired_start_uncertainty()
                 outcome = error
+                release_scene_context()
+                if acquired_for_request:
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                        failure=outcome,
+                    )
+                else:
+                    retain_unacquired_start_uncertainty()
             except (ProgramRunOwnerError, ProgramSchedulingError) as error:
-                release_scene_context()
-                if acquired_for_request:
-                    self._terminalize_failed_start(
-                        journal,
-                        scene_proof=scene_proof,
-                        effect_may_have_started=host_start_invoked,
-                        started_snapshot=started_snapshot,
-                    )
-                else:
-                    retain_unacquired_start_uncertainty()
                 outcome = self._runner_error(error)
-            except Exception as error:
                 release_scene_context()
                 if acquired_for_request:
                     self._terminalize_failed_start(
@@ -3055,23 +3079,102 @@ class ProgramRuntime:
                         scene_proof=scene_proof,
                         effect_may_have_started=host_start_invoked,
                         started_snapshot=started_snapshot,
+                        failure=outcome,
                     )
                 else:
                     retain_unacquired_start_uncertainty()
-                outcome = ProgramRunnerError(
-                    "program_run_admission_failed",
-                    str(error) or type(error).__name__,
-                )
+            except Exception as error:
+                outcome = ProgramRunnerError("program_run_admission_failed", str(error) or type(error).__name__)
+                release_scene_context()
+                if acquired_for_request:
+                    self._terminalize_failed_start(
+                        journal,
+                        scene_proof=scene_proof,
+                        effect_may_have_started=host_start_invoked,
+                        started_snapshot=started_snapshot,
+                        failure=outcome,
+                    )
+                else:
+                    retain_unacquired_start_uncertainty()
             else:
                 return result
             finally:
                 self._starting_kernel_owner_epoch = None
-            self._retain_rejection(
-                journal,
-                owner_epoch=request.request_owner_epoch,
-                request_id=request.request_id,
-                error=outcome,
-            )
+            if acquired_for_request:
+                failed_cycle = journal.read()
+                details = {
+                    **outcome.details,
+                    "cause_code": outcome.code,
+                    "cause_message": str(outcome),
+                    "program_run_id": failed_cycle.program_run_id,
+                    "claim_generation": claim["claim_generation"],
+                    "needs_reset": True,
+                }
+                if failed_cycle.state == "terminal_awaiting_reset":
+                    if (
+                        outcome.code == "program_run_superseded_by_stop"
+                        and failed_cycle.failure is None
+                    ):
+                        # An accepted Stop has already settled this start;
+                        # retain its stopped outcome and unchanged journal.
+                        outcome = ProgramRunnerError(
+                            outcome.code,
+                            f"Program run {failed_cycle.program_run_id} stopped during start. "
+                            "Reset the Program cycle before another Run.",
+                            details={**details, "stopped_by_operator": True},
+                        )
+                    else:
+                        # A held Program-cycle claim is an accepted start, even
+                        # when no host run or ordinary motion was created.
+                        outcome = ProgramRunnerError(
+                            "program_run_started_then_failed",
+                            f"Program run {failed_cycle.program_run_id} started, then failed: "
+                            f"{outcome}. Reset the Program cycle before another Run.",
+                            details=details,
+                        )
+                    journal.complete_request(
+                        owner_epoch=request.request_owner_epoch,
+                        request_id=request.request_id,
+                        result={"error": {"code": outcome.code, "message": str(outcome),
+                                          "details": outcome.details}},
+                    )
+                else:
+                    # Unknown settlement stays unresolved and cannot become
+                    # an ordinary refusal or a synthetic terminal result.
+                    outcome = ProgramRunnerError(
+                        "program_cycle_reconciliation_required",
+                        str(outcome), details=details,
+                    )
+            else:
+                if outcome.code == "program_run_superseded_by_stop":
+                    stopped_cycle = journal.read()
+                    if (
+                        stopped_cycle.state == "terminal_awaiting_reset"
+                        and stopped_cycle.program_run_id == program_run_id
+                        and stopped_cycle.claim is None
+                        and stopped_cycle.failure is None
+                        and not host_start_invoked
+                        and self._cycle_terminal_evidence_is_exact(journal, stopped_cycle)
+                    ):
+                        outcome = ProgramRunnerError(
+                            "program_run_stopped_before_start",
+                            f"Program run {program_run_id} stopped before start. "
+                            "Reset the Program cycle before another Run.",
+                            details={**outcome.details,
+                                     "cause_code": outcome.code,
+                                     "cause_message": str(outcome),
+                                     "program_run_id": program_run_id,
+                                     "claim_generation": None,
+                                     "stopped_by_operator": True,
+                                     "no_effect": True,
+                                     "needs_reset": True},
+                        )
+                self._retain_rejection(
+                    journal,
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    error=outcome,
+                )
             raise outcome
 
     def read_run(self, program_run_id: str) -> dict[str, Any]:
@@ -3463,16 +3566,46 @@ class ProgramRuntime:
             )
         return self._persistent_keys
 
-    def _committed_activation(self) -> tuple[CommittedActivation, Program | None]:
-        """Manager's committed Scenario activation, as Headless projects it."""
+    def _committed_projection(self) -> dict[str, Any]:
+        """Validate the full committed inventory before interpreting its origin."""
 
         try:
             projection = self._headless.committed_scenario_activation()
-        except HeadlessClientError as error:
+            if (
+                not isinstance(projection, Mapping)
+                or projection.get("schema_version")
+                != "manyforge.committed_scenario_activation.v2"
+                or not isinstance(projection.get("origin"), Mapping)
+            ):
+                raise ProgramRunnerError(
+                    "persistent_key_activation_unavailable",
+                    "the committed activation lacks the current typed origin",
+                )
+            projection = validate_committed_scenario_activation(projection)
+            if len(projection["committed_applies"]) > MAX_RECONCILED_APPLIES:
+                raise ProgramRunnerError(
+                    "persistent_key_activation_unavailable",
+                    "the complete committed Apply history exceeds its bound",
+                )
+            return projection
+        except (HeadlessClientError, ProgramBindingTransportError) as error:
             raise ProgramRunnerError(
                 "persistent_key_activation_unavailable",
                 f"the committed Scenario activation is unavailable: {error}",
             ) from error
+
+    def _committed_activation(
+        self, projection: dict[str, Any] | None = None
+    ) -> tuple[CommittedActivation, Program | None]:
+        """Read a genuine Scenario from the completely validated inventory."""
+
+        if projection is None:
+            projection = self._committed_projection()
+        if projection["origin"]["kind"] != "scenario":
+            raise ProgramRunnerError(
+                "persistent_key_activation_unavailable",
+                "the committed activation has no Scenario",
+            )
         program: Program | None = None
         if projection["program"] is not None:
             try:
@@ -3487,11 +3620,13 @@ class ProgramRuntime:
         try:
             activation = CommittedActivation(
                 record_digest=projection["record_digest"],
-                scenario_id=projection["scenario_id"],
+                scenario_id=projection["origin"]["scenario_id"],
                 declarations={} if program is None else dict(program.blackboard_keys),
+                # Sealed rows were validated above and carry no Scenario.
                 committed_applies={
-                    row["record_digest"]: row["scenario_id"]
+                    row["record_digest"]: row["origin"]["scenario_id"]
                     for row in projection["committed_applies"]
+                    if row["origin"]["kind"] == "scenario"
                 },
             )
         except PersistentKeyRegisterError as error:
@@ -3505,18 +3640,28 @@ class ProgramRuntime:
         register: PersistentKeyRegister,
         *,
         expected_record_digest: str | None = None,
+        projection: dict[str, Any] | None = None,
     ) -> tuple[CommittedActivation, Program | None, PersistentKeyReconciliation]:
         """Make the register follow Manager's current committed activation."""
 
-        activation, program = self._committed_activation()
+        if projection is None:
+            projection = self._committed_projection()
+        # Preserve Scenario's Program-parse precedence; sealed origin checks
+        # the expected record before reporting that no Scenario is available.
+        scenario_activation = (
+            self._committed_activation(projection)
+            if projection["origin"]["kind"] == "scenario"
+            else None
+        )
         if (
             expected_record_digest is not None
-            and activation.record_digest != expected_record_digest
+            and projection["record_digest"] != expected_record_digest
         ):
             raise ProgramRunnerError(
                 "program_run_applied_selection_stale",
                 "the committed Scenario activation is not the admitted one",
             )
+        activation, program = scenario_activation or self._committed_activation(projection)
         try:
             reconciliation = register.reconcile(activation)
         except PersistentKeyRegisterError as error:
@@ -3541,8 +3686,19 @@ class ProgramRuntime:
         """
 
         register = self._persistent_key_register()
+        projection = self._committed_projection()
+        if projection["origin"]["kind"] == "sealed_canonical_empty":
+            return {
+                "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
+                "outcome": "no_scenario",
+                "record_digest": projection["record_digest"],
+                "origin": deepcopy(projection["origin"]),
+                "dropped": [],
+                "unobserved_applies": [],
+                "history_changed": False,
+            }
         activation, _program, reconciliation = self._reconcile_persistent_keys(
-            register
+            register, projection=projection
         )
         return {
             "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
@@ -5140,6 +5296,60 @@ class ProgramRuntime:
             self._require_manager_current()
             admission, journal = self._require_cycle_owner()
             cycle = journal.read()
+            if cycle.state == "idle_after_reset" and cycle.claim is None:
+                if (
+                    cycle.owner_epoch != request.expected_owner_epoch
+                    or cycle.owner_epoch != self.owner_epoch
+                    or cycle.cycle_generation != request.expected_cycle_generation
+                    or cycle.reconciliation_required
+                    or cycle.acquisition_pending is not None
+                    or request.program_run_id is not None
+                    or request.expected_claim_generation is not None
+                    or request.terminal_reference is not None
+                    or request.settlement_evidence_digest is not None
+                ):
+                    raise ProgramRunnerError("program_cycle_reset_stale", "Reset does not identify the current idle cycle")
+                record = journal.record_request(
+                    owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id,
+                    kind="reset",
+                    intent=request.model_dump(mode="json"),
+                    cycle_generation=cycle.cycle_generation,
+                )
+                self._require_new_command(record)
+                try:
+                    applied = self._headless.program_applied()
+                    self.prepare_applied_scene(
+                        ProgramScenePreparationRequest.model_validate({
+                            "request_id": request.request_id,
+                            "request_owner_epoch": request.request_owner_epoch,
+                            "source_label": request.source_label,
+                            "correlation_id": request.correlation_id,
+                            "expected_applied_record_digest": applied["source"]["record_digest"],
+                            "expected_admission_generation": self._admission_generation(admission.get()),
+                        })
+                    )
+                    result = {
+                        "schema_version": "manyforge.program_cycle_reset_result.v1",
+                        "program_run_id": None,
+                        "reset_cycle_generation": cycle.cycle_generation,
+                        "idle_cycle_generation": cycle.cycle_generation + 1,
+                        "settlement_reference": None,
+                        "admission": admission.get(),
+                        "runtime_controls": None,
+                    }
+                    journal.publish_idle_reset(
+                        expected_generation=cycle.cycle_generation,
+                        owner_epoch=self.owner_epoch,
+                        request_owner_epoch=request.request_owner_epoch,
+                        request_id=request.request_id,
+                        result=result,
+                    )
+                    return result
+                except ProgramRunnerError as error:
+                    self._retain_rejection(journal, owner_epoch=request.request_owner_epoch,
+                                           request_id=request.request_id, error=error)
+                    raise
             pending = journal.pending_commands()
             requested_intent = request.model_dump(mode="json")
             try:

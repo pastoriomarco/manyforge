@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ struct RetainedRos2ControlBackendConfig final {
   /// Exact successor computed from the owned predecessor before retirement.
   /// Absent on ordinary startup; never derived from caller counters here.
   std::optional<core::SelectedControllerOccurrenceDTO> successor_occurrence;
+  /// Actual owner of the same clock passed to the factory callback. Required
+  /// for a measured lane; retained by the existing backend handle through
+  /// transport teardown. Never substitute a borrowed shared-pointer alias.
+  std::shared_ptr<core::IClock> measured_receiver_clock;
 };
 
 /// The sole addressed arm-state authority of a controller-backed runtime:

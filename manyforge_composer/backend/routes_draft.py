@@ -276,7 +276,11 @@ def _non_executable_applied_context(
             "restorationGates": [],
         }
     program = status.get("program") if isinstance(status, dict) else None
+    publication = None
     try:
+        publication = state._published_program_projection(status)
+        if publication is None:
+            raise ValueError("non-executable Scenario publication is absent")
         program_identity = Program.from_dict(
             program,
             _active_catalog(state),
@@ -292,7 +296,8 @@ def _non_executable_applied_context(
     ):
         program_identity = None
     if (
-        not isinstance(status, dict)
+        publication is None
+        or not isinstance(status, dict)
         or status.get("executable") is not False
         or not isinstance(program, dict)
         or program.get("program_id") != status.get("program_id")
@@ -305,8 +310,8 @@ def _non_executable_applied_context(
         }
     return (
         _AppliedContext(
-            scenario_id=status["scenario_id"],
-            source_document_digest=status["source_document_digest"],
+            scenario_id=publication["scenario_id"],
+            source_document_digest=publication["source_document_digest"],
             program_revision=status["program_revision"],
             record_digest=status["record_digest"],
             program_document=program,

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import sqlite3
 from threading import Barrier, Thread
 
 import pytest
+import rfc8785
 
 from manyforge_program_runner.cycle_journal import (
     SCHEMA_VERSION,
     ProgramCycleJournal,
     ProgramCycleJournalVersionError,
+    ProgramCycleStopWon,
 )
 
 
@@ -1129,3 +1132,32 @@ def test_native_settlement_readers_accept_the_current_journal_schema() -> None:
         f"constexpr int kProgramCycleJournalSchema = {SCHEMA_VERSION};"
         in source
     )
+
+
+@pytest.mark.parametrize("mismatch", ["none", "owner", "generation", "run", "claim", "failure", "terminal"])
+def test_running_cas_classifies_only_exact_accepted_stop(tmp_path, mismatch):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    claim = {"claim_generation": 9, "intent": {"owner_epoch": "runner.1", "owner_transaction_id": "run.1"}}
+    journal.transition(expected_generation=1, expected_states=("idle_after_reset",),
+                       state="starting", program_run_id="run.1", claim=claim)
+    journal.mark_stopping(expected_generation=1, program_run_id="run.1")
+    if mismatch == "failure":
+        journal.transition(expected_generation=1, expected_states=("stopping",), state="stopping",
+                           failure={"code": "actual_failure"})
+    if mismatch == "terminal":
+        snapshot = {"run_revision": 2, "state": "stopped", "capture": {"program_run_id": "run.1"}}
+        reference = "sha256:" + hashlib.sha256(rfc8785.dumps({
+            "program_run_id": "run.1", "run_revision": 2, "state": "stopped"})).hexdigest()
+        journal.observe_terminal(expected_generation=1, program_run_id="run.1",
+                                 terminal_reference=reference, snapshot=snapshot)
+    before = journal.read()
+    expected = ProgramCycleStopWon if mismatch in {"none", "terminal"} else RuntimeError
+    with pytest.raises(expected) as caught:
+        journal.transition(expected_generation=2 if mismatch == "generation" else 1,
+                           expected_states=("starting",), state="running",
+                           program_run_id="foreign.run" if mismatch == "run" else "run.1",
+                           expected_running_owner_epoch="foreign.owner" if mismatch == "owner" else "runner.1",
+                           expected_running_claim={**claim, "claim_generation": 10} if mismatch == "claim" else claim)
+    assert isinstance(caught.value, ProgramCycleStopWon) == (mismatch in {"none", "terminal"})
+    assert journal.read() == before
+    journal.close()

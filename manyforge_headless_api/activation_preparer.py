@@ -14,7 +14,11 @@ import stat
 import subprocess
 import tempfile
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+from pydantic import ValidationError
+
+from .models import ManagerApplyPreparedActivation, PreparedSealedCanonicalEmptyOrigin
 
 import rfc8785
 
@@ -54,9 +58,8 @@ _RECEIPT_FIELDS = {
     "program_outcome",
     "program_revision",
     "retained_bundle_id",
-    "scenario_id",
+    "origin",
     "schema_version",
-    "source_document_digest",
 }
 _EXPECTED_RESULT_FIELDS = _RECEIPT_FIELDS | {"activation_payload"}
 
@@ -248,13 +251,6 @@ def _read_stored_prepared_activation(
     return stored
 
 
-def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value = dict(pairs)
-    if len(value) != len(pairs):
-        raise ValueError("duplicate JSON member")
-    return value
-
-
 def _require_stored_product(
     receipt: Mapping[str, Any], stored: bytes
 ) -> dict[str, Any]:
@@ -269,7 +265,6 @@ def _require_stored_product(
     try:
         value = json.loads(
             stored.decode("utf-8", errors="strict"),
-            object_pairs_hook=_reject_duplicate_members,
         )
         canonical = rfc8785.dumps(value)
     except (UnicodeError, ValueError, rfc8785.CanonicalizationError) as error:
@@ -291,6 +286,14 @@ def _require_stored_product(
             "activation_preparer_response_invalid",
             "Stored prepared activation differs from the preparer receipt",
         )
+    if receipt["origin"]["kind"] == "sealed_canonical_empty":
+        try:
+            ManagerApplyPreparedActivation.model_validate(dict(receipt))
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "activation_preparer_response_invalid",
+                "Activation preparer returned an invalid sealed origin or receipt",
+            ) from error
     identity = dict(value)
     prepared_activation_id = identity.pop("prepared_activation_id")
     expected_identity = "sha256:" + hashlib.sha256(
@@ -306,6 +309,15 @@ def _require_stored_product(
             "activation_preparer_response_invalid",
             "Stored prepared activation has an invalid payload",
         )
+    if value["origin"]["kind"] == "sealed_canonical_empty":
+        payload = value["activation_payload"]
+        if (payload.get("program") is not None
+                or "program_binding" not in payload or payload["program_binding"] is not None
+                or payload.get("program_role_assignment") != {"component_roles": [], "target_roles": []}):
+            raise HeadlessApiError(
+                "activation_preparer_response_invalid",
+                "Sealed empty preparation returned fabricated Program facts",
+            )
     return value
 
 
@@ -406,6 +418,8 @@ class ActivationPreparer:
         runtime_cell_id: str,
         timeout_seconds: float | None,
         publish_canonical_empty: bool = False,
+        canonical_empty_package_root: Path | None = None,
+        canonical_empty_admission_filename: Path | None = None,
     ) -> None:
         if not isinstance(runtime_cell_id, str) or re.fullmatch(
             r"[a-z][a-z0-9_.-]{0,127}", runtime_cell_id
@@ -418,6 +432,8 @@ class ActivationPreparer:
         self._profiles = _model_preparation_profiles(capability_root)
         self._timeout_seconds = timeout_seconds
         self._publish_canonical_empty = publish_canonical_empty
+        self._canonical_empty_package_root = canonical_empty_package_root
+        self._canonical_empty_admission_filename = canonical_empty_admission_filename
         self._lock = threading.Lock()
         self._prepared: dict[str, dict[str, Any]] = {}
 
@@ -445,19 +461,15 @@ class ActivationPreparer:
         program: Mapping[str, Any] | None,
         program_role_assignment: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if not self._lock.acquire(blocking=False):
-            raise HeadlessApiError(
-                "activation_preparer_busy",
-                "another activation input is already being prepared",
-            )
-        input_path: Path | None = None
-        try:
+        origin = {"kind": "scenario", "scenario_id": scenario_id,
+                  "source_document_digest": source_document_digest}
+
+        def request_value() -> dict[str, Any]:
             prepared_model_closure = _prepare_model_closure(
-                deployment=deployment,
-                model_source_closure=model_source_closure,
+                deployment=deployment, model_source_closure=model_source_closure,
                 profiles=self._profiles,
             )
-            request = {
+            return {
                 "schema_version": "manyforge.activation_preparation_request.v3",
                 "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
@@ -469,6 +481,49 @@ class ActivationPreparer:
                 "program": dict(program) if program is not None else None,
                 "program_role_assignment": dict(program_role_assignment),
             }
+
+        return self._prepare(request_value, origin, captured_input_digest)
+
+    def prepare_canonical_empty(self, selection: Mapping[str, Any]) -> dict[str, Any]:
+        """Prepare the actual sealed selection through the same bounded worker."""
+        if (self._canonical_empty_package_root is None
+                or self._canonical_empty_admission_filename is None):
+            raise HeadlessApiError(
+                "canonical_empty_preparation_unavailable",
+                "Canonical-empty preparation requires the configured Manager admission",
+            )
+        origin = PreparedSealedCanonicalEmptyOrigin.model_validate({
+            "kind": "sealed_canonical_empty", "cell_id": selection["cell_id"],
+            "deployment_artifact_id": selection["deployment_artifact_id"],
+            "deployment_revision": selection["deployment_revision"],
+            "retained_bundle_id": selection["candidate_retained_bundle_id"],
+            "graph_revision": selection["candidate_graph_revision"],
+            "admission_digest": selection["admission_digest"],
+        }).model_dump(mode="json")
+        if origin["cell_id"] != self._runtime_cell_id:
+            raise HeadlessApiError("stale_generation", "Sealed admission names a different runtime cell")
+        captured = "sha256:" + hashlib.sha256(rfc8785.dumps({
+            "schema_version": "manyforge.sealed_canonical_empty_capture.v1",
+            "origin": origin,
+        })).hexdigest()
+        return self._prepare(lambda: {
+            "schema_version": "manyforge.sealed_canonical_empty_preparation_request.v1",
+            "runtime_cell_id": self._runtime_cell_id, "origin": origin,
+            "captured_input_digest": captured,
+        }, origin, captured, sealed=True)
+
+    def _prepare(
+        self, request_value: Callable[[], dict[str, Any]], origin: dict[str, Any],
+        captured_input_digest: str, *, sealed: bool = False,
+    ) -> dict[str, Any]:
+        if not self._lock.acquire(blocking=False):
+            raise HeadlessApiError(
+                "activation_preparer_busy",
+                "another activation input is already being prepared",
+            )
+        input_path: Path | None = None
+        try:
+            request = request_value()
             encoded = rfc8785.dumps(request)
             if len(encoded) > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES:
                 raise HeadlessApiError(
@@ -493,7 +548,12 @@ class ActivationPreparer:
                 "--activation-root",
                 str(self._activation_root),
             ]
-            if self._publish_canonical_empty:
+            if sealed:
+                command.extend([
+                    "--canonical-empty-package-root", str(self._canonical_empty_package_root),
+                    "--canonical-empty-admission-filename", str(self._canonical_empty_admission_filename),
+                ])
+            elif self._publish_canonical_empty:
                 command.append("--publish-canonical-empty")
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 try:
@@ -527,9 +587,10 @@ class ActivationPreparer:
                 detail = stderr.read().decode("utf-8", errors="replace").strip()
             if completed.returncode != 0:
                 logging.getLogger(__name__).error(
-                    "Activation preparation failed: runtime=%s scenario=%s input=%s detail=%s",
+                    "Activation preparation failed: runtime=%s origin_kind=%s origin_id=%s input=%s detail=%s",
                     self._runtime_cell_id,
-                    scenario_id,
+                    origin["kind"],
+                    origin.get("scenario_id", origin.get("cell_id")),
                     captured_input_digest,
                     detail[:4096],
                 )
@@ -540,7 +601,7 @@ class ActivationPreparer:
                 )
             try:
                 receipt = json.loads(output.decode("utf-8", errors="strict"))
-            except (UnicodeError, json.JSONDecodeError) as error:
+            except (UnicodeError, ValueError) as error:
                 raise HeadlessApiError(
                     "activation_preparer_response_invalid",
                     "Activation preparer returned invalid JSON",
@@ -549,8 +610,8 @@ class ActivationPreparer:
                 not isinstance(receipt, dict)
                 or set(receipt) != _RECEIPT_FIELDS
                 or receipt.get("schema_version")
-                != "manyforge.prepared_activation_input.v5"
-                or receipt.get("source_document_digest") != source_document_digest
+                != "manyforge.prepared_activation_input.v6"
+                or receipt.get("origin") != origin
                 or receipt.get("captured_input_digest") != captured_input_digest
                 or not isinstance(receipt.get("prepared_activation_id"), str)
             ):

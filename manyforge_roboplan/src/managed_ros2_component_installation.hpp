@@ -57,15 +57,11 @@ ReadRos2ComponentReceipt(
               row->disposition !=
                   deployment::ApplyComponentDisposition::kRemove,
           "ROS installed receipt requires an exact candidate component");
-  const bool retained =
-      row->disposition == deployment::ApplyComponentDisposition::kRetain;
+  // Q118: the authored delta is immutable; retention reports the actual owner.
+  const bool retained = predecessor_handle == &handle;
   if (retained)
     RefuseExitedRos2Retain(component_id, retained_process_exit);
-  require(retained ? predecessor_handle == &handle
-          : row->disposition == deployment::ApplyComponentDisposition::kAdd
-              ? predecessor_handle == nullptr
-              : predecessor_handle != nullptr && predecessor_handle != &handle,
-          "ROS installed receipt disagrees with the physical handle lifetime");
+
   require(row->candidate_runtime_identity == installed_runtime_identity &&
               execution != nullptr &&
               handle.OwnsBackend(execution, motion, tool) &&

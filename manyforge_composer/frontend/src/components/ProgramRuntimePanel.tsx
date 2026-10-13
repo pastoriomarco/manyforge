@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 
 import {
+  PROGRAM_RESET_READINESS_MESSAGE,
   programMotionStopSettled,
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
@@ -26,6 +27,7 @@ import { incidentFacts } from '../state/componentLifecyclePresentation';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
+import { parseApiErrorDto } from '../api/parsers';
 import {
   BlackboardValueEditor,
   blackboardValueDraft,
@@ -98,6 +100,8 @@ function actionLabel(value: string): string {
 }
 
 function cycleFailureMessage(failure: Record<string, JsonValue> | null): string | null {
+  const structured = parseApiErrorDto({ detail: failure });
+  if (structured !== null) return structuredErrorText(structured);
   const message = failure?.message;
   if (typeof message === 'string' && message.length > 0) return message;
   const code = failure?.code;
@@ -258,7 +262,7 @@ export function ProgramRuntimePanel({
               {state.applied
                 ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
                 : state.nonExecutable !== null
-                  ? `${state.nonExecutable.scenarioId} · ${state.nonExecutable.programId === null ? 'no Program' : 'not executable in this Deployment'}`
+                  ? `${state.nonExecutable.origin.kind === 'scenario' ? state.nonExecutable.origin.scenarioId : state.nonExecutable.origin.cellId} · ${state.nonExecutable.programId === null ? 'no Program' : 'not executable in this Deployment'}`
                   : 'Apply a validated Draft before Execute.'}
             </small>
             {state.applied && (
@@ -731,10 +735,21 @@ export function deriveTransportGuidance({
   } else if (facts.resetRequired) {
     notices.push({
       id: 'program.reset-required',
+      severity: program.cycleFailure === null ? 'info' : 'error',
+      domain: 'runtime',
+      title: program.cycleFailure === null ? 'Program finished' : 'Run failed',
+      message: program.cycleFailure === null
+        ? 'Use Reset in the Program controls before another Execute.'
+        : facts.programRecoveryMessage,
+    });
+  } else if (facts.cellFault === null && facts.manualRecovery.length === 0
+    && program.commandDisabledReason('program_run') === PROGRAM_RESET_READINESS_MESSAGE) {
+    notices.push({
+      id: 'program.reset-readiness',
       severity: 'info',
       domain: 'runtime',
-      title: 'Program finished',
-      message: 'Use Reset in the Program controls before another Execute.',
+      title: PROGRAM_RESET_READINESS_MESSAGE,
+      message: 'Run stays disabled until the current cell admission is ready.',
     });
   }
   return notices;

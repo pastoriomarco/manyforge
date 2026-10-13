@@ -273,6 +273,15 @@ failure reasons. In particular:
 - Replacing the package root requires complete-stack `stop`/`start`. Manager
   performs no live mixed-package upgrade and has no component-level version
   compatibility path.
+- Normal Manager shutdown stops launch groups in parallel and waits for actual
+  host exit. Each group's existing SIGINT grace and KILL escalation remains;
+  worker, projection and owner destruction has no automatic total kill timer.
+  Shutdown logs name the current phase and actual completed milestones.
+  If progress stalls, the log says `shutdown stuck at <phase>; to force:
+  manyforge-operator stop`. Run the existing `manyforge-operator stop` with the
+  same `--state-root` and `--instance-id` shown above to force the recorded
+  instance's bounded TERM/wait/KILL cleanup. This is an explicit operator
+  action; a responsive status reply alone does not prove teardown progress.
 - Stop asks Manager for semantic shutdown, then performs bounded authenticated
   process cleanup. Only the recorded launch instance may be terminated; a
   deadline failure is `cleanup_deadline_exceeded`, not success.
@@ -305,6 +314,14 @@ absolute observer executable from the same built overlay to Manager. The
 Manager-owned check/observer path uses the retained site snapshot before world
 effects; it creates no host ROS dependency or second observer owner.
 
+The temporary Isaac qualification hold records Jazzy setup paths as compatibility
+inputs; neither host sources these paths. ROS runs inside the qualified image.
+`HELD_ISAAC_ROS_IMAGE_ID` must identify the exact qualified image on the remote
+host; the common Lyrical image is not a substitute. The current Orin inventory
+has no qualified arm64 held Jazzy full image (the preserved laptop image is
+amd64), so this recipe is unavailable there until one is
+explicitly supplied and qualified.
+
 Use the same global state root/instance ID and provide every source-matched
 remote path and digest. The command shape is:
 
@@ -318,7 +335,7 @@ python3 -m manyforge_operator \
   --local-ros-environment-script "$MANYFORGE_ROOT/config/ros/isaac_i9.env.sh" \
   --remote-target tndlux@192.168.1.68 \
   --remote-source-root /mnt/nova_ssd/codex-manyforge/runners/manyforge \
-  --remote-container-image-id "$FULL_ROS_IMAGE_ID" \
+  --remote-container-image-id "$HELD_ISAAC_ROS_IMAGE_ID" \
   --remote-container-name manyforge-isaac-runtime \
   --remote-cache-root /mnt/nova_ssd/codex-manyforge/cache/isaac-runtime \
   --remote-runtime-root /mnt/nova_ssd/codex-manyforge/state/isaac-runtime \
@@ -341,7 +358,7 @@ python3 -m manyforge_operator \
   --expected-head-tree "$MANYFORGE_TREE"
 ```
 
-`FULL_ROS_IMAGE_ID` is the full immutable `sha256:<64 lowercase hex>` ID of
+`HELD_ISAAC_ROS_IMAGE_ID` is the full immutable `sha256:<64 lowercase hex>` ID of
 an already present, qualified full ROS image. G does not pull or build an image.
 The qualified package/admission and catalogs are mounted read-only at their
 explicit absolute paths. An optional `--remote-composer-static-dir` overrides

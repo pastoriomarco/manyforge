@@ -297,7 +297,13 @@ RetainedRos2ControlLifecycleProduct::Create(
           std::unique_ptr<RetainedRos2ControlLifecycleProduct>>::Err(
           port.error());
     }
-    registrations.push_back({std::move(occurrence), std::move(port.value())});
+    registrations.push_back(
+        {std::move(occurrence), std::move(port.value()),
+         [runtime_handle = handle->second,
+          domain = desired.control_domain_id](std::int64_t now_ns) {
+           return runtime_handle->ReadLifecycleHealth(domain,
+                                                       core::TimePoint(now_ns));
+         }});
   }
 
   std::vector<core::BuildOwnedLifecyclePlanCatalogEntryDTO> catalog_entries;

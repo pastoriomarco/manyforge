@@ -42,6 +42,8 @@ struct Options final {
   std::filesystem::path capability_root;
   std::filesystem::path activation_root;
   bool publish_canonical_empty{false};
+  std::filesystem::path canonical_empty_package_root;
+  std::filesystem::path canonical_empty_admission_filename;
 };
 
 class PreparedCatalogSource final
@@ -93,6 +95,12 @@ class PreparedCatalogSource final
     } else if (option == "--activation-root" &&
                result.activation_root.empty()) {
       result.activation_root = value;
+    } else if (option == "--canonical-empty-package-root" &&
+               result.canonical_empty_package_root.empty()) {
+      result.canonical_empty_package_root = value;
+    } else if (option == "--canonical-empty-admission-filename" &&
+               result.canonical_empty_admission_filename.empty()) {
+      result.canonical_empty_admission_filename = value;
     } else {
       throw std::invalid_argument("invalid or repeated preparation option");
     }
@@ -291,6 +299,52 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
           read_file(options.input),
           deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
+  if (text(member(root, "schema_version", "request"), "schema_version") ==
+      "manyforge.sealed_canonical_empty_preparation_request.v1") {
+    require_exact_fields(root,
+                         {"schema_version", "runtime_cell_id", "origin",
+                          "captured_input_digest"},
+                         "sealed canonical empty preparation request");
+    if (options.canonical_empty_package_root.empty() ||
+        options.canonical_empty_admission_filename.empty()) {
+      throw std::invalid_argument("sealed canonical empty admission is unavailable");
+    }
+    if (options.publish_canonical_empty) {
+      throw std::invalid_argument("sealed canonical empty preparation cannot publish an admission");
+    }
+    const auto admission = deployment::FilesystemCanonicalEmptyRetainedBundleSource(
+        options.canonical_empty_package_root,
+        options.canonical_empty_admission_filename).load_verified();
+    const auto requested_origin = deployment::parse_prepared_activation_origin(
+        member(root, "origin", "request"));
+    const deployment::PreparedSealedCanonicalEmptyOrigin expected{
+        admission.cell_id(), admission.deployment_artifact_id(),
+        admission.deployment_revision(), admission.retained_bundle_id(),
+        admission.graph_revision(), admission.admission_digest()};
+    const auto *sealed = std::get_if<deployment::PreparedSealedCanonicalEmptyOrigin>(
+        &requested_origin);
+    if (sealed == nullptr || *sealed != expected ||
+        text(member(root, "runtime_cell_id", "request"), "runtime_cell_id") !=
+            admission.cell_id().value() ||
+        text(member(root, "captured_input_digest", "request"), "captured_input_digest") !=
+            deployment::sealed_canonical_empty_capture_digest(expected).value()) {
+      throw std::invalid_argument("sealed canonical empty request differs from actual admission");
+    }
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog(
+        options.canonical_empty_package_root);
+    const deployment::FilesystemVerifiedRawArtifactSource raw(
+        options.canonical_empty_package_root);
+    const auto prepared = deployment::assemble_sealed_canonical_empty_activation(
+        admission, catalog, raw);
+    materialize_activation(prepared, options.activation_root);
+    static_cast<void>(deployment::FilesystemPreparedActivationRepository(
+        options.activation_root).put_if_absent(prepared));
+    deployment::CanonicalValue::Object receipt;
+    for (const auto &[name, value] : prepared.normalized_root().as_object()) {
+      if (name != "activation_payload") receipt.emplace_back(name, value);
+    }
+    return deployment::CanonicalValue(std::move(receipt));
+  }
   if (text(member(root, "schema_version", "request"), "schema_version") !=
       "manyforge.activation_preparation_request.v3") {
     throw std::invalid_argument(
@@ -480,10 +534,10 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"retained_bundle_id",
        deployment::CanonicalValue(
            materialized.bundle->retained_bundle_id().value())},
-      {"scenario_id", deployment::CanonicalValue(scenario_id)},
+      {"origin", deployment::prepared_activation_origin_value(
+          deployment::PreparedScenarioOrigin{scenario_id, core::ContentDigest(source_digest)})},
       {"schema_version",
        deployment::CanonicalValue(std::string(deployment::kPreparedActivationInputSchemaVersion))},
-      {"source_document_digest", deployment::CanonicalValue(source_digest)},
   };
   const auto prepared_id = deployment::sha256_digest(
       deployment::canonical_json(deployment::CanonicalValue(identity)));

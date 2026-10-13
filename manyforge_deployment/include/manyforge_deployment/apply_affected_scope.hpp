@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <stdexcept>
 
 #include <manyforge_core/types/configuration_fence.hpp>
@@ -21,5 +22,13 @@ public:
 [[nodiscard]] core::ConfigurationFenceScopeDTO
 derive_apply_configuration_fence_scope(const RetainedBundle &predecessor,
                                        const RetainedBundle &candidate);
+
+/// Trusted current-owner observations add restart/retire resources to the
+/// authored change scope before the existing canonical overlap closure.
+[[nodiscard]] core::ConfigurationFenceScopeDTO
+derive_apply_configuration_fence_scope(
+    const RetainedBundle &predecessor, const RetainedBundle &candidate,
+    std::span<const core::ControllableComponentId> actual_restart_components,
+    std::span<const RetainedBundle *const> actual_terminal_products = {});
 
 } // namespace manyforge::deployment

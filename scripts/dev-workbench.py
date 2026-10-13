@@ -33,6 +33,7 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
 ).rstrip(os.pathsep)
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from scripts.lib.export_retention import create_host_ros_log_session
 
 
 WORKSPACE = Path("/workspace")
@@ -731,6 +732,13 @@ class Workbench:
         }
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
+        if self.ros2_control:
+            # One runtime-wide ROS home preserves controller-manager spawner
+            # lock coordination across controllers, replacements and epochs.
+            # Controller child logs still use their existing artifact root.
+            ros_home = paths["execution_run"] / "ros-home"
+            ros_home.mkdir(parents=True, exist_ok=True)
+            os.environ["ROS_HOME"] = str(ros_home)
         return paths
 
     def _composer_command(self, base_url: str) -> list[str]:
@@ -898,6 +906,11 @@ class Workbench:
                     "intended first ROS Scenario changed during startup preparation; "
                     "no runtime was started"
                 )
+        if self.ros2_control:
+            # One actual workbench session owns host logs. Controller children
+            # retain their per-artifact override; ROS_HOME remains runtime-wide.
+            ros_logs = create_host_ros_log_session(STATE_ROOT)
+            os.environ["ROS_LOG_DIR"] = str(ros_logs)
         # Bring up the two reconciliation services before Manager.  A new
         # Manager must be able to reconcile the retained Program Runner owner
         # on its first heartbeat; starting Manager first creates a needless
@@ -945,6 +958,8 @@ class Workbench:
                 str(paths["publications"]),
                 "--install-root",
                 str(bootstrap_root),
+                "--canonical-empty-admission-filename",
+                str(bootstrap_admission),
                 "--artifact-root",
                 str(paths["artifacts"]),
                 "--node-catalog-path",

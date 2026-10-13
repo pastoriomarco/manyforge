@@ -148,13 +148,18 @@ ExactReleaseIdentity(const core::CellAdmissionClaimDTO &claim,
     std::string_view program_run_id, std::string_view reference) {
   const auto settlement = ci::parse_canonical_json(encoded);
   const auto kind = StringMember(settlement, "kind");
+  const auto &prepared_scene = Member(settlement, "prepared_scene");
+  const bool scene_matches =
+      prepared_scene.is_object() &&
+      (prepared_scene.as_object().empty() ||
+       StringMember(prepared_scene, "schema_version") ==
+           "manyforge.prepared_program_scene.v1");
   if (StringMember(settlement, "schema_version") !=
           "manyforge.program_cycle_start_settlement.v1" ||
       (kind != "proven_no_effect" && kind != "terminal_effects_settled") ||
       DecodeCellAdmissionClaim(
           ci::canonical_json(Member(settlement, "claim"))) != claim ||
-      StringMember(Member(settlement, "prepared_scene"), "schema_version") !=
-          "manyforge.prepared_program_scene.v1" ||
+      !scene_matches ||
       StringMember(settlement, "program_run_id") != program_run_id ||
       ci::sha256_digest(ci::canonical_json(settlement)) != reference)
     return false;

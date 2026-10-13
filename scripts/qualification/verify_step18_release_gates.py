@@ -1603,7 +1603,7 @@ printf 'STEP18_GXX_VERSION=%s\n' "${step18_gxx_version}"
 
 def _ros_setup() -> str:
     return r'''set +u
-source /opt/ros/jazzy/setup.bash
+source "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"
 source /opt/manyforge/topic_based_ros2_control/install/setup.bash
 source /opt/manyforge/venv/bin/activate
 set -u'''

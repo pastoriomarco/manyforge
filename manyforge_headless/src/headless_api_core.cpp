@@ -867,6 +867,35 @@ AppliedProgramOutcome ReadAppliedProgramOutcome(const CanonicalValue &prepared) 
   }
 }
 
+/// The exact prepared origin is retained on every committed Apply, including
+/// a sealed empty Apply which carries no Scenario or Program.
+const CanonicalValue &ReadPreparedOrigin(const CanonicalValue &prepared) {
+  const auto &origin = RequiredMember(prepared, "origin");
+  try {
+    const auto typed = deployment::parse_prepared_activation_origin(origin);
+    if (const auto *sealed =
+            std::get_if<deployment::PreparedSealedCanonicalEmptyOrigin>(&typed)) {
+      Require(sealed->deployment_artifact_id.value() ==
+                      RequiredString(prepared, "deployment_artifact_id") &&
+                  sealed->deployment_revision.value() ==
+                      RequiredString(prepared, "deployment_revision") &&
+                  sealed->retained_bundle_id.value() ==
+                      RequiredString(prepared, "retained_bundle_id") &&
+                  sealed->graph_revision.value() ==
+                      RequiredString(prepared, "graph_revision") &&
+                  RequiredString(RequiredMember(prepared, "program_outcome"), "kind") ==
+                      "no_program" &&
+                  RequiredMember(prepared, "program_id").is_null() &&
+                  RequiredMember(prepared, "program_revision").is_null(),
+              "program_applied_selection_invalid", "invalid sealed empty origin");
+    }
+  } catch (const deployment::PreparedActivationInputError &error) {
+    CoreFail("program_applied_selection_invalid",
+             std::string("invalid prepared origin: ") + error.what());
+  }
+  return origin;
+}
+
 /// One operator-readable sentence naming every unresolved reference.
 std::string NonExecutableMessage(
     const deployment::ProgramNonExecutableOutcomeDTO &outcome) {
@@ -909,6 +938,10 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   if (!outcome.program_binding_id.has_value()) {
     CoreFail("program_not_selected", "No Program is selected; create a Program and Apply it before Execute.");
   }
+  const auto &origin = ReadPreparedOrigin(prepared);
+  Require(RequiredString(origin, "kind") == "scenario",
+          "program_applied_selection_invalid",
+          "a bound Program requires an actual Scenario origin");
   const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto active_graph_revision = RequiredString(active, "graph_revision");
   const auto bundle = retained_bundle_source_.get_verified(
@@ -1001,8 +1034,8 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       {"program_revision", CanonicalValue(program_revision.value())},
       {"retained_bundle_id", CanonicalValue(active_bundle_id)},
       {"source_document_digest",
-       RequiredMember(prepared, "source_document_digest")},
-      {"scenario_id", RequiredMember(prepared, "scenario_id")},
+       RequiredMember(origin, "source_document_digest")},
+      {"scenario_id", RequiredMember(origin, "scenario_id")},
       {"schema_version",
        CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
       {"source",
@@ -1033,6 +1066,7 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
   const auto &record = ActiveAppliedRecordLocked(runtime);
   const auto &prepared = RequiredMember(record, "prepared_activation");
   const auto outcome = ReadAppliedProgramOutcome(prepared);
+  const auto &origin = ReadPreparedOrigin(prepared);
   // Derived from the durable active Apply on every read; nothing here is a
   // stored warning that could outlive the facts it describes.
   CanonicalValue program(nullptr);
@@ -1073,11 +1107,9 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
       {"program_revision", RequiredMember(prepared, "program_revision")},
       {"record_digest", RequiredMember(record, "intent_digest")},
       {"retained_bundle_id", RequiredMember(prepared, "retained_bundle_id")},
-      {"scenario_id", RequiredMember(prepared, "scenario_id")},
+      {"origin", origin},
       {"schema_version",
        CanonicalValue(std::string(kAppliedProgramStatusSchemaVersion))},
-      {"source_document_digest",
-       RequiredMember(prepared, "source_document_digest")},
   });
 }
 
@@ -1093,14 +1125,15 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   const auto publication_generation = RequiredCounter(
       RequiredMember(RequiredMember(manager_payload, "active"), "publication"),
       "publication_generation", 2U);
-  // Each committed Apply: record digest, Scenario, and Apply identity.
+  // Every committed Apply, including sealed empty origins, remains in the
+  // complete publication inventory. Canonical origin bytes keep ordering exact.
   using CommittedApply =
       std::tuple<std::string, std::string, std::string, std::uint64_t>;
   const auto committed_apply = [](const CanonicalValue &apply_record) {
     return CommittedApply(
         RequiredString(apply_record, "intent_digest"),
-        RequiredString(RequiredMember(apply_record, "prepared_activation"),
-                       "scenario_id"),
+        content_identity::canonical_json(ReadPreparedOrigin(
+            RequiredMember(apply_record, "prepared_activation"))),
         RequiredString(apply_record, "apply_id"),
         RequiredCounter(apply_record, "apply_generation", 1U));
   };
@@ -1125,13 +1158,13 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
           "Manager's committed Applies do not account for every publication");
   CanonicalValue::Array committed_applies;
   committed_applies.reserve(committed.size());
-  for (const auto &[record_digest, scenario_id, apply_id, apply_generation] :
+  for (const auto &[record_digest, origin_json, apply_id, apply_generation] :
        committed) {
     committed_applies.emplace_back(CanonicalValue(CanonicalValue::Object{
         {"apply_generation", Number(apply_generation, "apply_generation")},
         {"apply_id", CanonicalValue(apply_id)},
         {"record_digest", CanonicalValue(record_digest)},
-        {"scenario_id", CanonicalValue(scenario_id)},
+        {"origin", content_identity::parse_canonical_json(origin_json)},
     }));
   }
   const auto &prepared = RequiredMember(record, "prepared_activation");
@@ -1156,7 +1189,7 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   Require(std::binary_search(committed.begin(), committed.end(), active),
           "program_activation_history_incomplete",
           "the active Apply is not among Manager's committed Applies");
-  const auto &[record_digest, scenario_id, apply_id, apply_generation] = active;
+  const auto &[record_digest, origin_json, apply_id, apply_generation] = active;
   return CanonicalValue(CanonicalValue::Object{
       {"apply_generation", Number(apply_generation, "apply_generation")},
       {"apply_id", CanonicalValue(apply_id)},
@@ -1165,7 +1198,7 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
       {"publication_generation",
        Number(publication_generation, "publication_generation")},
       {"record_digest", CanonicalValue(record_digest)},
-      {"scenario_id", CanonicalValue(scenario_id)},
+      {"origin", content_identity::parse_canonical_json(origin_json)},
       {"schema_version",
        CanonicalValue(std::string(kCommittedScenarioActivationSchemaVersion))},
   });

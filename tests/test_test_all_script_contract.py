@@ -650,8 +650,8 @@ def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None
 
 
 
-@pytest.mark.parametrize("name", ("Dockerfile.ros-jazzy", "Dockerfile.ros-jazzy-full"))
-def test_jazzy_images_build_the_selected_picknik_source(name: str) -> None:
+@pytest.mark.parametrize("name", ("Dockerfile.ros-jazzy", "Dockerfile.ros-jazzy-full", "Dockerfile.ros-lyrical-full"))
+def test_ros_images_build_the_selected_picknik_source(name: str) -> None:
     source = (_REPO_ROOT / name).read_text(encoding="utf-8")
     assert "https://github.com/PickNikRobotics/topic_based_ros2_control.git" in source
     assert "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" in source
@@ -895,3 +895,16 @@ def test_deployment_package_participates_in_repository_version_guard() -> None:
     source = (_REPO_ROOT / "scripts/ci/verify-version-sync.sh").read_text(encoding="utf-8")
     assert 'check "manyforge_deployment CMakeLists.txt"' in source
     assert "manyforge_program_runner" in source
+
+
+def test_ros_services_share_the_official_full_lyrical_image() -> None:
+    compose = yaml.safe_load((_REPO_ROOT / "docker-compose.yaml").read_text())
+    services = compose["services"]
+    for name in ("ros-jazzy", "ros-jazzy-full", "composer-ros"):
+        assert services[name]["image"] == "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}"
+    assert "build" not in services["ros-jazzy"]
+    assert services["ros-jazzy-full"]["build"]["dockerfile"] == "Dockerfile.ros-lyrical-full"
+    cache = (_REPO_ROOT / "Dockerfile.ros-lyrical-cache").read_text()
+    assert "ARG MANYFORGE_ROS_BASE=manyforge-ros-lyrical-full:eval-20261011" in cache
+    assert "/opt/ros/lyrical/setup.bash" in cache
+    assert "EVALUATION ONLY" not in (_REPO_ROOT / "Dockerfile.ros-lyrical-full").read_text()

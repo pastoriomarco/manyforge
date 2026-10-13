@@ -14,6 +14,7 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -44,6 +45,35 @@ template <typename Value>
   }
   auto verified = core::verify_runtime_participant_binding(std::move(owner));
   if (!verified.ok()) return "candidate_binding";
+  return retained_product_reseal_physical_owner_difference(predecessor,
+                                                          verified.value());
+}
+
+// Stage reuses a physical transport beside the route owner's qualified
+// prospective bindings. Normalize only this comparison copy; the descriptor
+// and every observation retain the complete unmodified candidate tuple.
+// This is deliberately separate from the unchanged effect-side Rebind guard.
+[[nodiscard]] std::string_view measured_candidate_physical_owner_difference(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate) {
+  auto owner = candidate.value();
+  if (!owner.control_path || !predecessor.value().control_path)
+    return "control_path";
+  auto &path = *owner.control_path;
+  const auto &before = *predecessor.value().control_path;
+  if (path.active_control_configuration_generation.value() <
+      before.active_control_configuration_generation.value())
+    return "control_path.active_control_configuration_generation";
+  path.control_binding_revision = before.control_binding_revision;
+  path.control_route_id = before.control_route_id;
+  path.activation_set_id = before.activation_set_id;
+  path.active_control_configuration_id = before.active_control_configuration_id;
+  path.active_control_configuration_generation =
+      before.active_control_configuration_generation;
+  path.runtime_scale_qualification = before.runtime_scale_qualification;
+  auto verified = core::verify_runtime_participant_binding(std::move(owner));
+  if (!verified.ok())
+    return "candidate_binding";
   return retained_product_reseal_physical_owner_difference(predecessor,
                                                           verified.value());
 }
@@ -317,6 +347,8 @@ struct RetainedRos2ControlRuntimeHandle::ArmState final {
   RetainedRos2ControlArmActivity activity;
   std::shared_ptr<ArmPort::Gate> gate{std::make_shared<ArmPort::Gate>()};
   rclcpp::Subscription<ActivityMessage>::SharedPtr activity_subscription;
+  std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts>
+      activity_endpoints;
   rclcpp::Client<SwitchService>::SharedPtr switch_client;
   /// Q54: the controller manager's statistics for this controller.
   std::shared_ptr<RetainedControllerStatisticsMonitor> statistics_monitor;
@@ -324,81 +356,174 @@ struct RetainedRos2ControlRuntimeHandle::ArmState final {
       statistics_subscription;
 };
 
-// Each reader aliases this owner, so publication storage outlives the handle
-// or a descriptor replacement. The callback owns neither handle nor channel.
-struct RetainedRos2ControlRuntimeHandle::MeasuredStateChannels final {
+// Aliasing reader leases own the channel, including its real receiver clock.
+// The callback retains no handle or executor whose last destruction could drain
+// the callback's own executor thread.
+struct PreparedMeasuredStateSources::Storage final {
   struct Channel final {
-    core::MeasuredStateSourceDescriptor descriptor;
     std::unique_ptr<core::AddressedObservedStatePublication> publication;
     std::vector<double> positions;
     std::vector<double> velocities;
   };
-  std::mutex mutex;
-  bool active{false};
-  std::vector<Channel> channels;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
-
-  void Retire() {
-    // Serialize with the complete receipt/publication operation, including a
-    // callback that was already dispatched by the existing executor.
+  Storage(std::vector<core::MeasuredStateSourceDescriptor> descriptors,
+          std::shared_ptr<core::IClock> clock, rclcpp::Node::SharedPtr node)
+      : descriptors(std::move(descriptors)), clock(std::move(clock)),
+        node(std::move(node)) {}
+  ~Storage() {
     std::lock_guard lock(mutex);
     active = false;
     subscription.reset();
   }
+  std::mutex mutex;
+  bool active{false};
+  const std::vector<core::MeasuredStateSourceDescriptor> descriptors;
+  const std::shared_ptr<core::IClock> clock;
+  const rclcpp::Node::SharedPtr node;
+  std::vector<Channel> channels;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 };
 
-core::Result<std::vector<std::shared_ptr<const core::IObservedStateProvider>>>
-RetainedRos2ControlRuntimeHandle::ConfigureMeasuredStateSources(
+PreparedMeasuredStateSources::PreparedMeasuredStateSources(
+    std::shared_ptr<Storage> storage,
+    std::vector<std::shared_ptr<const core::IObservedStateProvider>> readers)
+    : storage_(std::move(storage)), readers_(std::move(readers)) {}
+
+const std::vector<core::MeasuredStateSourceDescriptor> &
+PreparedMeasuredStateSources::descriptors() const noexcept {
+  return storage_->descriptors;
+}
+
+void PreparedMeasuredStateSources::EnablePublication() noexcept {
+  std::lock_guard lock(storage_->mutex);
+  storage_->active = true;
+}
+
+core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
+RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
     std::vector<core::MeasuredStateSourceDescriptor> descriptors,
-    std::string joint_state_topic, core::IClock &receiver_clock) {
+    std::shared_ptr<core::IClock> receiver_clock,
+    const core::RuntimeParticipantBinding &candidate_motion,
+    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper) {
+  using Sources = std::shared_ptr<PreparedMeasuredStateSources>;
   using Readers = std::vector<std::shared_ptr<const core::IObservedStateProvider>>;
-  if (joint_state_topic.empty() || joint_state_topic.front() != '/')
-    return reject<Readers>("measured_state_topic_invalid",
-                           "Measured JointState topic must be explicitly absolute.");
-  const auto owner = weak_from_this();
-  if (owner.expired())
-    return reject<Readers>("measured_state_owner_missing",
-                           "Measured readers require the retained shared handle owner.");
-  auto replacement = std::make_shared<MeasuredStateChannels>();
-  Readers readers;
-  replacement->channels.reserve(descriptors.size());
-  readers.reserve(descriptors.size());
-  for (auto &descriptor : descriptors) {
-    const auto valid = descriptor.validate();
-    if (!valid.ok()) return core::Result<Readers>::Err(valid.error());
-    const auto count = descriptor.source_joint_names.size();
-    auto publication = std::make_unique<core::AddressedObservedStatePublication>(
-        descriptor.publication);
-    readers.emplace_back(replacement, publication.get());
-    replacement->channels.push_back({std::move(descriptor), std::move(publication),
-                                    std::vector<double>(count), std::vector<double>(count)});
-  }
   std::lock_guard lock(mutex_);
-  if (!resources_ || !arm_ || clock_ != &receiver_clock)
-    return reject<Readers>("measured_state_owner_mismatch",
-                           "Measured source requires the bound node and its exact owner clock.");
+  if (!resources_ || !arm_ || !receiver_clock ||
+      clock_ != receiver_clock.get() || weak_from_this().expired())
+    return reject<Sources>(
+        "measured_state_owner_mismatch",
+        "Measured source requires the bound node and its exact owning clock.");
+  if (!motion_binding_ ||
+      candidate_gripper.has_value() != gripper_binding_.has_value())
+    return reject<Sources>(
+        "measured_state_candidate_owner_mismatch",
+        "Measured candidate must retain the bound motion and tool owners.");
+  const auto motion_difference = measured_candidate_physical_owner_difference(
+      *motion_binding_, candidate_motion);
+  const auto gripper_difference =
+      candidate_gripper ? measured_candidate_physical_owner_difference(
+                              *gripper_binding_, *candidate_gripper)
+                        : std::string_view{};
+  const auto difference =
+      motion_difference.empty() ? gripper_difference : motion_difference;
+  if (!difference.empty())
+    return reject<Sources>(
+        "measured_state_candidate_owner_mismatch",
+        "Measured candidate differs from the bound physical owner: " +
+            std::string(difference));
+  if (!arm_->transport.measured_joint_state_lane)
+    return reject<Sources>(
+        "measured_state_lane_unavailable",
+        "Bound lane has no qualified continuous measured source.");
+  const auto &lane = *arm_->transport.measured_joint_state_lane;
+  if (lane.absolute_topic.empty() || lane.absolute_topic.front() != '/' ||
+      lane.freshness_budget_ns <= 0 ||
+      lane.measured_state_authority_id.value() !=
+          kMeasuredJointStateAuthorityId ||
+      lane.measured_source_profile_id != kMeasuredJointStateProfileId)
+    return reject<Sources>(
+        "measured_state_lane_unqualified",
+        "Bound lane measured source contract is unavailable.");
+  for (const auto &descriptor : descriptors) {
+    const auto valid = descriptor.validate();
+    if (!valid.ok())
+      return core::Result<Sources>::Err(valid.error());
+    const auto &config = descriptor.publication;
+    const auto &query = config.query_context;
+    const auto matches =
+        [&](const core::RuntimeParticipantBinding *binding) {
+          if (!binding)
+            return false;
+          auto expected = core::make_observed_state_query_context(
+              *binding, lane.freshness_budget_ns);
+          if (!expected.ok())
+            return false;
+          // Only the secondary measured role differs from the candidate's
+          // execution authority. Route association remains exact throughout.
+          expected.value().state_authority_id =
+              lane.measured_state_authority_id;
+          expected.value().state_authority_class =
+              core::StateAuthorityClass::kMeasured;
+          if (query != expected.value() ||
+              config.authority_generation !=
+                  query.active_control_configuration_generation.value())
+            return false;
+          const auto &resources = binding->value().resources;
+          if (resources.size() != descriptor.source_joint_names.size())
+            return false;
+          for (std::size_t index = 0; index < resources.size(); ++index)
+            if (!resources[index].source_joint_name ||
+                *resources[index].source_joint_name !=
+                    descriptor.source_joint_names[index])
+              return false;
+          return true;
+        };
+    if ((!matches(&candidate_motion) &&
+         !matches(candidate_gripper ? &*candidate_gripper : nullptr)) ||
+        config.source_precedence.front().source_id != lane.absolute_topic ||
+        config.source_precedence.front().authority_profile_id !=
+            lane.measured_source_profile_id)
+      return reject<Sources>(
+          "measured_state_physical_source_mismatch",
+          "Measured source differs from the actual bound physical lane.");
+  }
+  auto replacement = std::make_shared<PreparedMeasuredStateSources::Storage>(
+      std::move(descriptors), std::move(receiver_clock), resources_->node());
+  Readers readers;
+  replacement->channels.reserve(replacement->descriptors.size());
+  readers.reserve(replacement->descriptors.size());
+  for (const auto &descriptor : replacement->descriptors) {
+    const auto count = descriptor.source_joint_names.size();
+    auto publication =
+        std::make_unique<core::AddressedObservedStatePublication>(
+            descriptor.publication);
+    readers.emplace_back(replacement, publication.get());
+    replacement->channels.push_back({std::move(publication),
+                                     std::vector<double>(count),
+                                     std::vector<double>(count)});
+  }
   if (!replacement->channels.empty()) {
-    const std::weak_ptr<MeasuredStateChannels> weak_channels = replacement;
+    const std::weak_ptr<PreparedMeasuredStateSources::Storage> weak_channels =
+        replacement;
     try {
-      replacement->subscription = resources_->node()->create_subscription<
+      replacement->subscription = replacement->node->create_subscription<
           sensor_msgs::msg::JointState>(
-          joint_state_topic, rclcpp::SensorDataQoS().keep_last(1),
-          [weak_channels, clock = &receiver_clock](
+          lane.absolute_topic, rclcpp::SensorDataQoS().keep_last(1),
+          [weak_channels](
               const sensor_msgs::msg::JointState::ConstSharedPtr message) {
-            // The channel alone owns this callback's publication storage.
-            // Retire serializes with this whole operation before the handle
-            // quiesces its transport or releases the borrowed owner clock.
-            // Never pin the handle here: its last release must not occur on
-            // the executor that its destructor drains.
             const auto channels = weak_channels.lock();
-            if (!channels) return;
+            if (!channels)
+              return;
             std::lock_guard publication_lock(channels->mutex);
-            if (!channels->active) return;
-            const auto received = clock->now();
+            if (!channels->active)
+              return;
+            const auto received = channels->clock->now();
             const auto source_time = static_cast<std::int64_t>(message->header.stamp.sec) *
                                          1'000'000'000LL + message->header.stamp.nanosec;
-            for (auto &channel : channels->channels) {
-              const auto &config = channel.descriptor.publication;
+            for (std::size_t channel_index = 0;
+                 channel_index < channels->channels.size(); ++channel_index) {
+              auto &channel = channels->channels[channel_index];
+              const auto &descriptor = channels->descriptors[channel_index];
+              const auto &config = descriptor.publication;
               // Preserve the existing bounded numeric producer's rejection for
               // oversized input; do not allocate or truncate the ROS sample.
               if (message->name.size() > config.maximum_source_resource_count) {
@@ -409,14 +534,16 @@ RetainedRos2ControlRuntimeHandle::ConfigureMeasuredStateSources(
               bool complete = message->name.size() == message->position.size();
               const bool velocities = message->velocity.size() == message->name.size();
               for (std::size_t index = 0; complete && index < channel.positions.size(); ++index) {
-                const auto &name = channel.descriptor.source_joint_names[index];
+                const auto &name = descriptor.source_joint_names[index];
                 const auto found = std::find(message->name.begin(), message->name.end(), name);
                 complete = found != message->name.end() &&
                     std::find(std::next(found), message->name.end(), name) == message->name.end();
-                if (!complete) break;
+                if (!complete)
+                  break;
                 const auto source_index = static_cast<std::size_t>(found - message->name.begin());
                 channel.positions[index] = message->position[source_index];
-                if (velocities) channel.velocities[index] = message->velocity[source_index];
+                if (velocities)
+                  channel.velocities[index] = message->velocity[source_index];
               }
               // An incomplete/new invalid sample replaces prior completeness;
               // source names never become authority or compiled coordinate names.
@@ -429,16 +556,14 @@ RetainedRos2ControlRuntimeHandle::ConfigureMeasuredStateSources(
             }
           });
     } catch (const std::exception &error) {
-      return reject<Readers>("measured_state_subscription_failed", error.what());
+      // A valid commanded route must not gain a measured transport admission
+      // rule. Keep the actual operational failure visible at its producer.
+      RCLCPP_WARN(replacement->node->get_logger(), "Measured state subscription unavailable: %s", error.what());
+      return core::Result<Sources>::Ok(nullptr);
     }
   }
-  if (measured_state_channels_) measured_state_channels_->Retire();
-  {
-    std::lock_guard publication_lock(replacement->mutex);
-    replacement->active = true;
-  }
-  measured_state_channels_ = std::move(replacement);
-  return core::Result<Readers>::Ok(std::move(readers));
+  return core::Result<Sources>::Ok(Sources(new PreparedMeasuredStateSources(
+      std::move(replacement), std::move(readers))));
 }
 
 RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
@@ -452,7 +577,6 @@ RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
     guard_hooks_.reset();
   }
   hooks.reset();
-  if (measured_state_channels_) measured_state_channels_->Retire();
   if (arm_ && arm_->adapter)
     arm_->adapter->shutdown();
   if (gripper_)
@@ -465,7 +589,6 @@ RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
   arm_.reset();
   gripper_.reset();
   resources_.reset();
-  measured_state_channels_.reset();
 }
 
 core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
@@ -476,7 +599,8 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
     const std::optional<core::SelectedControllerOccurrenceDTO>
-        &successor_occurrence) {
+        &successor_occurrence,
+    std::shared_ptr<core::IClock> clock_owner) {
   const auto reject_owned = [&](const char *reason, const char *message) {
     if (gripper)
       gripper->shutdown();
@@ -486,6 +610,10 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
     resources.reset();
     return reject<void>(reason, message);
   };
+  if (clock_owner && clock_owner.get() != &clock)
+    return reject_owned(
+        "ros2_control_handle_clock_owner_mismatch",
+        "ROS runtime handle clock owner must name its exact receiver clock");
   if (!resources || !make_participant ||
       gripper_binding.has_value() != (gripper != nullptr) ||
       !motion_binding.value().control_path.has_value() ||
@@ -589,6 +717,7 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
   }
 
   std::lock_guard lock(mutex_);
+  clock_owner_ = std::move(clock_owner);
   resources_ = std::move(resources);
   clock_ = &clock;
   arm_ = std::move(state);
@@ -654,13 +783,15 @@ void RetainedRos2ControlRuntimeHandle::InstallGuardHooks(
 }
 
 void RetainedRos2ControlRuntimeHandle::InstallControllerProcessFaultSource(
-    std::function<std::optional<std::string>()> source) {
+    std::function<std::optional<std::string>()> source,
+    std::function<core::Result<std::optional<std::string>>()> health_source) {
   std::lock_guard lock(mutex_);
   if (start_attempted_ || process_fault_source_ || !source) {
     throw std::logic_error(
         "ROS controller process fault source is installed once, before start");
   }
   process_fault_source_ = std::move(source);
+  process_health_source_ = std::move(health_source);
 }
 
 bool RetainedRos2ControlRuntimeHandle::CacheControllerProcessIncidentDiagnostic(
@@ -792,11 +923,18 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
     const auto gripper_controller = arm_->transport.gripper_controller;
     const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak =
         weak_from_this();
+    arm_->activity_endpoints =
+        std::make_shared<ros2_control_execution::SelectedRosEndpointFacts>(
+            node, controller.controller_manager + "/activity",
+            "controller_manager_msgs/msg/ControllerManagerActivity");
+    const auto endpoint_facts = arm_->activity_endpoints;
     rclcpp::SubscriptionOptions options;
     // The controller manager appearing or disappearing changes what its
     // (transient-local) activity sample can still claim.
     options.event_callbacks.matched_callback =
-        [weak](rclcpp::MatchedInfo &info) {
+        [weak, endpoint_facts](rclcpp::MatchedInfo &info) {
+          endpoint_facts->ObserveMatchedCount(info.current_count);
+          endpoint_facts->Refresh();
           if (const auto self = weak.lock()) {
             auto activity = self->arm_activity();
             activity.controller_manager_present = info.current_count > 0;
@@ -880,6 +1018,10 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
             const auto self = weak.lock();
             if (!self)
               return;
+            // The existing observer timer also runs while no state sample is
+            // present. It consumes graph edges, including unmatched QoS
+            // endpoints, without a separate poller or a graph call in Core.
+            self->RefreshEndpointFacts();
             std::shared_ptr<ArmPort> port;
             std::function<void(const core::ExecutionControllerSampleDTO &)>
                 observer;
@@ -910,6 +1052,48 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
     start_failure_ = std::current_exception();
     throw;
   }
+}
+
+void RetainedRos2ControlRuntimeHandle::RefreshEndpointFacts() {
+  std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts> activity;
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_)
+      return;
+    activity = arm_->activity_endpoints;
+    adapter = arm_->adapter;
+  }
+  // No owner/command lock spans SDK graph reads.
+  if (activity)
+    activity->Refresh();
+  if (adapter)
+    adapter->RefreshEndpointFacts();
+}
+
+std::optional<core::ErrorDTO>
+RetainedRos2ControlRuntimeHandle::ReadEndpointDiagnostic() const {
+  std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts> activity;
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_)
+      return std::nullopt;
+    activity = arm_->activity_endpoints;
+    adapter = arm_->adapter;
+  }
+  // Before StartBackend there is no installed CM observation checkpoint.
+  // Preserve the existing unstarted-lane classification.
+  if (!activity)
+    return std::nullopt;
+  const auto activity_error = activity->ReadError();
+  const auto state_error = adapter ? adapter->ReadEndpointDiagnostic() : std::nullopt;
+  // A positive conflict takes precedence over an unrelated unsettled stream.
+  if (activity_error && activity_error->code == "duplicate_component_instance")
+    return activity_error;
+  if (state_error && state_error->code == "duplicate_component_instance")
+    return state_error;
+  return activity_error ? activity_error : state_error;
 }
 
 RetainedRos2ControlArmActivity
@@ -1039,6 +1223,9 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::PrepareArmController() {
+  RefreshEndpointFacts();
+  if (auto error = ReadEndpointDiagnostic())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
   std::lock_guard lock(mutex_);
   if (!arm_)
     return not_sent("ros2_control_arm_unbound", "no arm controller is bound");
@@ -1060,6 +1247,9 @@ RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::ActivateArmController(
     const std::stop_token cancellation) {
   std::lock_guard switch_lock(switch_mutex_);
+  RefreshEndpointFacts();
+  if (auto error = ReadEndpointDiagnostic())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
   std::function<core::Result<void>()> before_activation;
   {
     std::lock_guard lock(mutex_);
@@ -1165,6 +1355,9 @@ RetainedRos2ControlRuntimeHandle::RecoverArmController(
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::PrepareGripperController() {
+  RefreshEndpointFacts();
+  if (auto error = ReadEndpointDiagnostic())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
   std::lock_guard lock(mutex_);
   if (!arm_ || !arm_->transport.gripper_controller ||
       !gripper_activity_.controller_manager_present ||
@@ -1184,6 +1377,11 @@ RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::SwitchGripperController(
     const bool activate, const std::stop_token cancellation) {
   std::lock_guard switch_lock(switch_mutex_);
+  if (activate) {
+    RefreshEndpointFacts();
+    if (auto error = ReadEndpointDiagnostic())
+      return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
+  }
   std::string controller;
   bool needs_switch;
   {
@@ -1286,59 +1484,123 @@ RetainedRos2ControlRuntimeHandle::lifecycle_snapshot_source() {
   };
 }
 
-core::Result<RetainedExternallyManagedDomainSnapshot>
-RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
-    const core::ControlDomainId &control_domain_id,
-    const core::TimePoint now_ns) {
-  using Cause = core::LifecycleBlockingCauseClassDTO;
-  using State = core::ComponentLifecycleStateDTO;
-  std::function<std::optional<std::string>()> fault_hook;
-  std::function<std::optional<std::string>()> process_fault_source;
-  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
-  std::string diagnostic_incident_id;
-  ros2_control_execution::Ros2GripperCommandBackend *gripper = nullptr;
-  std::optional<std::string> gripper_id;
-  bool is_motion = false;
-  bool is_gripper = false;
-  bool startup = true;
+struct RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs final {
+  bool is_motion{};
+  bool is_gripper{};
+  bool startup{true};
+  bool cm_gripper{};
+  bool bound{};
+  bool activation_client_discovered{};
+  bool discovery_attempted{};
+  core::ComponentLifecycleStateDTO requested{
+      core::ComponentLifecycleStateDTO::kDeclared};
+  core::ComponentLifecycleStateDTO gripper_requested{
+      core::ComponentLifecycleStateDTO::kDeclared};
   RetainedRos2ControlArmActivity activity;
   RetainedRos2ControlArmActivity gripper_activity;
-  bool cm_gripper = false;
-  State gripper_requested = State::kDeclared;
-  State requested = State::kDeclared;
-  bool bound = false;
-  bool activation_client_discovered = false;
+  core::LifecycleBlockingCauseClassDTO retained_cause{
+      core::LifecycleBlockingCauseClassDTO::kNone};
+  std::function<std::optional<std::string>()> fault_hook;
+  std::function<std::optional<std::string>()> process_fault_source;
+  std::function<core::Result<std::optional<std::string>>()>
+      process_health_source;
+  std::optional<std::string> process_fault;
+  std::optional<std::string> guard_fault;
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
-  {
-    std::lock_guard lock(mutex_);
-    if (!arm_ || now_ns < 0 || control_domain_id.empty()) {
-      return reject<RetainedExternallyManagedDomainSnapshot>(
-          "ros2_control_lifecycle_source_unavailable",
-          "ROS runtime lifecycle source is unbound or unavailable");
-    }
-    is_motion = motion_domain_id_ == control_domain_id;
-    is_gripper = gripper_ != nullptr && gripper_domain_id_ == control_domain_id;
-    gripper = gripper_.get();
-    gripper_id = gripper_id_;
-    activity = arm_->activity;
-    gripper_activity = gripper_activity_;
-    gripper_requested = gripper_requested_;
-    cm_gripper = arm_->transport.gripper_controller.has_value();
-    requested = arm_->requested;
-    bound = arm_->bound;
-    activation_client_discovered = arm_->activation_client_discovered;
-    adapter = arm_->adapter;
-    if (guard_hooks_.has_value())
-      fault_hook = guard_hooks_->fault;
-    process_fault_source = process_fault_source_;
-    diagnostic_snapshot = process_diagnostic_snapshot_;
-    diagnostic_incident_id = process_diagnostic_incident_id_;
-    if (const auto found = domain_generations_.find(control_domain_id);
-        found != domain_generations_.end()) {
-      startup = !found->second.exact_configuration_seen;
-    }
-  }
+  ros2_control_execution::Ros2GripperCommandBackend *gripper{};
+  std::optional<std::string> gripper_id;
+  std::optional<ros2_control_execution::Ros2GripperTransportReadinessSnapshot>
+      gripper_snapshot;
+  std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
+  std::string diagnostic_incident_id;
+};
 
+struct RetainedRos2ControlRuntimeHandle::LifecycleClassification final {
+  core::ComponentLifecycleStateDTO state;
+  bool ready;
+  bool loaded;
+  bool fault_present;
+  bool transport_ready;
+  bool inactive_unrequested;
+  core::LifecycleBlockingCauseClassDTO cause;
+  std::optional<core::ErrorDTO> diagnostic;
+  std::string signature;
+};
+
+core::Result<RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs>
+RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
+    const core::ControlDomainId &domain, const core::TimePoint now_ns) const {
+  std::lock_guard lock(mutex_);
+  if (!arm_ || now_ns < 0 || domain.empty())
+    return reject<LifecycleHealthInputs>(
+        "ros2_control_lifecycle_source_unavailable",
+        "ROS runtime lifecycle source is unbound or unavailable");
+  LifecycleHealthInputs inputs;
+  inputs.is_motion = motion_domain_id_ == domain;
+  inputs.is_gripper = gripper_ != nullptr && gripper_domain_id_ == domain;
+  inputs.gripper = gripper_.get();
+  inputs.gripper_id = gripper_id_;
+  inputs.activity = arm_->activity;
+  inputs.gripper_activity = gripper_activity_;
+  inputs.gripper_requested = gripper_requested_;
+  inputs.cm_gripper = arm_->transport.gripper_controller.has_value();
+  inputs.requested = arm_->requested;
+  inputs.bound = arm_->bound;
+  inputs.activation_client_discovered = arm_->activation_client_discovered;
+  inputs.adapter = arm_->adapter;
+  if (guard_hooks_)
+    inputs.fault_hook = guard_hooks_->fault;
+  inputs.process_fault_source = process_fault_source_;
+  inputs.process_health_source = process_health_source_;
+  inputs.diagnostic_snapshot = process_diagnostic_snapshot_;
+  inputs.diagnostic_incident_id = process_diagnostic_incident_id_;
+  if (const auto found = domain_generations_.find(domain);
+      found != domain_generations_.end()) {
+    inputs.startup = !found->second.exact_configuration_seen;
+    inputs.retained_cause = found->second.last_intervention_cause;
+  }
+  return core::Result<LifecycleHealthInputs>::Ok(std::move(inputs));
+}
+
+void RetainedRos2ControlRuntimeHandle::ReadLifecycleMonitorFacts(
+    LifecycleHealthInputs &inputs) {
+  using State = core::ComponentLifecycleStateDTO;
+  if (inputs.process_fault && (inputs.is_motion || inputs.is_gripper))
+    return;
+  if (inputs.is_motion) {
+    inputs.guard_fault = inputs.fault_hook ? inputs.fault_hook() : std::nullopt;
+    const auto &activity = inputs.activity;
+    if (!inputs.activation_client_discovered && inputs.bound &&
+        activity.controller_manager_present && activity.observed &&
+        activity.controller_loaded && activity.hardware_active &&
+        activity.controller_active && inputs.requested == State::kActive) {
+      inputs.discovery_attempted = true;
+      inputs.activation_client_discovered =
+          inputs.adapter->ActionServerIsReady();
+    }
+  } else if (inputs.is_gripper && inputs.gripper_id) {
+    inputs.gripper_snapshot =
+        inputs.gripper->gripper_transport_readiness(*inputs.gripper_id);
+  }
+}
+
+RetainedRos2ControlRuntimeHandle::LifecycleClassification
+RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
+    const LifecycleHealthInputs &inputs) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  using State = core::ComponentLifecycleStateDTO;
+  const auto is_motion = inputs.is_motion;
+  const auto is_gripper = inputs.is_gripper;
+  const auto startup = inputs.startup;
+  const auto &activity = inputs.activity;
+  const auto &gripper_activity = inputs.gripper_activity;
+  const auto cm_gripper = inputs.cm_gripper;
+  const auto requested = inputs.requested;
+  const auto gripper_requested = inputs.gripper_requested;
+  const auto bound = inputs.bound;
+  const auto activation_client_discovered = inputs.activation_client_discovered;
+  const auto &gripper_id = inputs.gripper_id;
+  const auto &diagnostic_incident_id = inputs.diagnostic_incident_id;
   std::optional<core::ErrorDTO> diagnostic;
   State state = State::kDegraded;
   bool ready = false;
@@ -1349,8 +1611,7 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
   Cause cause = Cause::kAvailability;
   std::string signature;
   // Q80: an exited Manager-owned controller launch fails the component.
-  const auto process_fault =
-      process_fault_source ? process_fault_source() : std::nullopt;
+  const auto &process_fault = inputs.process_fault;
   if (process_fault.has_value() && (is_motion || is_gripper)) {
     state = State::kFaulted;
     cause = Cause::kFault;
@@ -1369,26 +1630,10 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
                 ":controller_process:" + *process_fault +
                 ":diagnostic:" + diagnostic_incident_id;
   } else if (is_motion) {
-    const auto guard_fault = fault_hook ? fault_hook() : std::nullopt;
+    const auto &guard_fault = inputs.guard_fault;
     transport_ready = activity.controller_manager_present && activity.observed;
     loaded = transport_ready && activity.controller_loaded &&
              activity.hardware_active;
-    // DX256/257: only a pending activation postcondition queries this epoch's
-    // actual client. Port readiness keeps its existing observed meaning.
-    if (!activation_client_discovered && bound && loaded &&
-        activity.controller_active && requested == State::kActive) {
-      const bool discovered = adapter->ActionServerIsReady();
-      std::lock_guard lock(mutex_);
-      if (arm_ && arm_->adapter == adapter && arm_->bound &&
-          arm_->requested == State::kActive &&
-          arm_->activity.controller_manager_present && arm_->activity.observed &&
-          arm_->activity.controller_loaded && arm_->activity.hardware_active &&
-          arm_->activity.controller_active) {
-        arm_->activation_client_discovered =
-            arm_->activation_client_discovered || discovered;
-        activation_client_discovered = arm_->activation_client_discovered;
-      }
-    }
     const bool binding_ready = bound && activation_client_discovered;
     ready = loaded && activity.controller_active && binding_ready &&
             requested == State::kActive;
@@ -1436,7 +1681,7 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
            << guard_fault.value_or("");
     signature = stream.str();
   } else if (is_gripper && gripper_id.has_value()) {
-    const auto snapshot = gripper->gripper_transport_readiness(*gripper_id);
+    const auto &snapshot = *inputs.gripper_snapshot;
     signature = gripper_signature(snapshot);
     transport_ready = snapshot.ready;
     ready = snapshot.ready;
@@ -1473,12 +1718,130 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
                    std::to_string(gripper_activity.controller_active) + ":" +
                    std::string(core::to_string(gripper_requested));
     }
-  } else {
+  }
+
+  return {state,
+          ready,
+          loaded,
+          fault_present,
+          transport_ready,
+          inactive_unrequested,
+          cause,
+          std::move(diagnostic),
+          std::move(signature)};
+}
+
+core::Result<core::LifecycleDomainHealthDTO>
+RetainedRos2ControlRuntimeHandle::ReadLifecycleHealth(
+    const core::ControlDomainId &domain, const core::TimePoint now_ns) const {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  auto captured = CaptureLifecycleHealthInputs(domain, now_ns);
+  if (!captured.ok())
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(captured.error());
+  auto &inputs = captured.value();
+  if (!inputs.is_motion && !(inputs.is_gripper && inputs.gripper_id))
+    return reject<core::LifecycleDomainHealthDTO>(
+        "ros2_control_lifecycle_domain_unknown",
+        "Requested health domain is not bound to this ROS runtime");
+  if (inputs.process_fault_source) {
+    if (!inputs.process_health_source)
+      return reject<core::LifecycleDomainHealthDTO>(
+          "ros2_control_process_health_unavailable",
+          "Exact process owner has no pure cached health projection");
+    auto fault = inputs.process_health_source();
+    if (!fault.ok())
+      return core::Result<core::LifecycleDomainHealthDTO>::Err(fault.error());
+    inputs.process_fault = std::move(fault.value());
+  }
+  if (auto endpoint_error = ReadEndpointDiagnostic())
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(*endpoint_error);
+  ReadLifecycleMonitorFacts(inputs);
+  auto classification = ComputeLifecycleHealth(inputs);
+  const auto reported = classification.cause == Cause::kAvailability &&
+                                inputs.retained_cause != Cause::kNone
+                            ? inputs.retained_cause
+                            : classification.cause;
+  core::LifecycleDomainHealthDTO result{
+      classification.state,
+      lifecycle_facts(classification.ready, classification.inactive_unrequested,
+                      classification.loaded, classification.fault_present,
+                      classification.transport_ready, reported),
+      std::move(classification.diagnostic)};
+  if (inputs.is_gripper && inputs.gripper_id)
+    result.has_activation_step = inputs.cm_gripper;
+  if (!result.locally_valid())
+    return reject<core::LifecycleDomainHealthDTO>(
+        "ros2_control_lifecycle_health_invalid",
+        "ROS lifecycle health projection is invalid");
+  return core::Result<core::LifecycleDomainHealthDTO>::Ok(std::move(result));
+}
+
+core::Result<RetainedExternallyManagedDomainSnapshot>
+RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
+    const core::ControlDomainId &domain, const core::TimePoint now_ns) {
+  // Lifecycle Observe is already an NRT observation checkpoint. Refresh
+  // endpoint facts here, while leaving its state/Disable/Recover semantics
+  // unchanged. Prepare/Enable Initialize consumes the separate pure health.
+  RefreshEndpointFacts();
+  auto captured = CaptureLifecycleHealthInputs(domain, now_ns);
+  if (!captured.ok())
+    return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
+        captured.error());
+  auto inputs = std::move(captured.value());
+  // The original advancement callback remains exclusive to lifecycle Observe.
+  inputs.process_fault = inputs.process_fault_source
+                             ? inputs.process_fault_source()
+                             : std::nullopt;
+  if (!(inputs.process_fault && (inputs.is_motion || inputs.is_gripper)) &&
+      !inputs.is_motion && !(inputs.is_gripper && inputs.gripper_id))
     return reject<RetainedExternallyManagedDomainSnapshot>(
         "ros2_control_lifecycle_domain_unknown",
         "requested lifecycle domain is not bound to this ROS runtime");
-  }
+  ReadLifecycleMonitorFacts(inputs);
+  auto classification = ComputeLifecycleHealth(inputs);
+  return CommitLifecycleObservation(domain, std::move(inputs),
+                                    std::move(classification));
+}
 
+core::Result<RetainedExternallyManagedDomainSnapshot>
+RetainedRos2ControlRuntimeHandle::CommitLifecycleObservation(
+    const core::ControlDomainId &control_domain_id,
+    LifecycleHealthInputs inputs, LifecycleClassification classification) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  using State = core::ComponentLifecycleStateDTO;
+  // Preserve the original epoch/activity recheck before committing discovery.
+  if (inputs.discovery_attempted) {
+    {
+      std::lock_guard lock(mutex_);
+      if (arm_ && arm_->adapter == inputs.adapter && arm_->bound &&
+          arm_->requested == State::kActive &&
+          arm_->activity.controller_manager_present &&
+          arm_->activity.observed && arm_->activity.controller_loaded &&
+          arm_->activity.hardware_active && arm_->activity.controller_active) {
+        arm_->activation_client_discovered =
+            arm_->activation_client_discovered ||
+            inputs.activation_client_discovered;
+        inputs.activation_client_discovered =
+            arm_->activation_client_discovered;
+      } else {
+        // Original classification retained its captured flag if the recheck
+        // failed; a pure discovery result was never committed to that epoch.
+        inputs.activation_client_discovered = false;
+      }
+    }
+    classification = ComputeLifecycleHealth(inputs);
+  }
+  auto &state = classification.state;
+  auto &ready = classification.ready;
+  auto &loaded = classification.loaded;
+  auto &fault_present = classification.fault_present;
+  auto &transport_ready = classification.transport_ready;
+  auto &inactive_unrequested = classification.inactive_unrequested;
+  auto &cause = classification.cause;
+  auto &signature = classification.signature;
+  auto &diagnostic = classification.diagnostic;
+  const auto &process_fault = inputs.process_fault;
+  auto diagnostic_snapshot = std::move(inputs.diagnostic_snapshot);
   std::lock_guard lock(mutex_);
   auto &generation = domain_generations_[control_domain_id];
   // An availability observation cannot clear an intervention-requiring cause;

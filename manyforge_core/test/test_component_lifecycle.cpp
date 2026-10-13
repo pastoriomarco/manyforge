@@ -1066,6 +1066,32 @@ TEST(ComponentLifecycleValueCodec, PreservesIntentAttributionAndProgramEvidenceA
   EXPECT_THROW((void)EncodeComponentLifecycleIntent(ordinary), std::invalid_argument);
 }
 
+TEST(ComponentLifecycleValueCodec, CloseRecoveryRequiresExactIncidentAndPreservesClosedEncoding) {
+  auto close = intent();
+  close.intent = ComponentLifecycleIntentKindDTO::kRecover;
+  close.reason = "cell closed by operator";
+  close.close_incident_recovery = CloseComponentIncidentRecoveryDTO{"incident.1"};
+  ASSERT_TRUE(close.locally_valid());
+  const auto bytes = EncodeComponentLifecycleIntent(close);
+  EXPECT_EQ(DecodeComponentLifecycleIntent(bytes), close);
+  EXPECT_THROW((void)DecodeComponentLifecycleIntent(bytes + "tail"), std::invalid_argument);
+  auto other = close;
+  other.close_incident_recovery->expected_incident_id = "incident.2";
+  EXPECT_FALSE(close.replay_equal(other));
+  other = close;
+  other.close_incident_recovery.reset();
+  EXPECT_FALSE(close.replay_equal(other));
+  other = close;
+  other.reason = "operator-confirmed";
+  EXPECT_FALSE(other.locally_valid());
+  other = close;
+  other.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  EXPECT_FALSE(other.locally_valid());
+  other = close;
+  other.close_incident_recovery->expected_incident_id.clear();
+  EXPECT_FALSE(other.locally_valid());
+}
+
 TEST(ComponentLifecycleValueCodec, SelectedResultsKeepExactClosedAcceptanceAndNoAdmissionShapes) {
   const auto status = selected_bring_up_status();
   const CCLCLifecycleRequestResultDTO accepted{RequestReplayStatusDTO::kAcceptedNew,

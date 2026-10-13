@@ -89,12 +89,11 @@ services:
     profiles:
       - dev-composer
 
-  # ROS Jazzy lane for ROS adapter/wrapper development and validation.
+  # ROS adapter/wrapper checks use the official full Lyrical toolchain.
+  # Keep this legacy service name as a compatibility alias.
   # Host networking is intentional for ROS 2 DDS discovery during development.
   ros-jazzy:
-    build:
-      context: .
-      dockerfile: Dockerfile.ros-jazzy
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
     logging: *default-logging
     network_mode: host
     ipc: host
@@ -118,10 +117,10 @@ services:
   ros-jazzy-full:
     # This is the sole build owner for the ROS-full toolchain image. Runtime
     # services below remain fenced port targets until their restoration gates.
-    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
     build:
       context: .
-      dockerfile: Dockerfile.ros-jazzy-full
+      dockerfile: Dockerfile.ros-lyrical-full
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
@@ -147,7 +146,7 @@ services:
   # a runtime. Only the shared ROS toolchain/container inputs remain here;
   # deleted Composer runtime wires are not kept as dormant environment fields.
   composer-ros:
-    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
     logging: *default-logging
     restart: "no"
     network_mode: host
@@ -172,8 +171,12 @@ services:
   # owned laptop process; this Orin-side service builds into the persistent
   # cache, proves the exact stopped world, then exposes JTC and thin adapters.
   # Composer/Program auto-load and DemoSupervisor ownership remain absent.
+  # Temporary qualification hold (Q120): preserve the current Isaac lane
+  # image until the Lyrical topic-control roundtrip is qualified.
+  # This exact amd64 image exists on the laptop; Orin/Thor need an explicitly
+  # supplied qualified held image. The common Lyrical override cannot select it.
   isaac-topic-control:
-    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
+    image: ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}
     logging: *default-logging
     restart: "no"
     network_mode: host

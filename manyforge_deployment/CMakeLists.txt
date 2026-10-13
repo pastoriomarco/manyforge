@@ -1301,6 +1301,8 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_program_binding_compiler PRIVATE
     manyforge_deployment GTest::gtest_main)
+  target_link_libraries(test_program_binding_compiler PRIVATE
+    manyforge_deployment_canonical_package_generator)
   gtest_discover_tests(test_program_binding_compiler
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

@@ -43,6 +43,20 @@ constexpr std::string_view kMockLaunchFile = "mock_control.launch.py";
 constexpr std::string_view kIsaacLaunchFile =
     "isaac_topic_based_control.launch.py";
 
+[[nodiscard]] int parent_death_signal(const ControllerLaunchCommand &command) {
+  const auto &argv = command.argv;
+  // Q116 applies only to these qualified ROS launch roles. Cell launches and
+  // arbitrary controller commands retain their existing SIGTERM policy.
+  if (argv.size() >= 4U && argv[0] == kRos2 && argv[1] == "launch" &&
+      argv[2] == kBringupPackage &&
+      ((command.lane == ControllerLaunchLane::kMock &&
+        argv[3] == kMockLaunchFile) ||
+       (command.lane == ControllerLaunchLane::kIsaac &&
+        argv[3] == kIsaacLaunchFile)))
+    return SIGINT;
+  return SIGTERM;
+}
+
 [[nodiscard]] std::string argument_name(const std::string &argument) {
   const auto separator = argument.find(":=");
   // `ros2 launch` rejects an empty value before anything starts: an absent
@@ -269,6 +283,7 @@ struct SpawnResult final {
 struct SpawnRequest final {
   std::vector<std::string> argv;
   std::filesystem::path artifacts_root;
+  int parent_death_signal;
   std::promise<SpawnResult> result;
 };
 
@@ -277,7 +292,8 @@ struct SpawnRequest final {
 /// never be that parent.
 [[nodiscard]] SpawnResult
 spawn_now(const std::vector<std::string> &argv,
-          const std::filesystem::path &artifacts_root) {
+          const std::filesystem::path &artifacts_root,
+          const int parent_death_signal) {
   if (argv.empty()) fail("empty command");
   const auto executable = resolve_executable(argv.front());
   if (!executable.has_value()) {
@@ -331,7 +347,8 @@ spawn_now(const std::vector<std::string> &argv,
       ::signal(signal_number, SIG_DFL);
     }
     int failure = 0;
-    if (::setpgid(0, 0) != 0 || ::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+    if (::setpgid(0, 0) != 0 ||
+        ::prctl(PR_SET_PDEATHSIG, parent_death_signal) != 0) {
       failure = errno;
     } else if (::getppid() != parent) {
       failure = ESRCH;
@@ -784,7 +801,7 @@ void ControllerLaunchProcess::append_start_header() {
                     observed_utc_now() + cell_launch_fields(*cell) +
                     " pid=" + std::to_string(pid_) + " request_context=" +
                     log_field(start_context_) + " launch_identity=" +
-                    log_field(cell->identity) + "\n");
+                    bounded_text(log_field(cell->identity), 4096U) + "\n");
     return;
   }
   const auto line =
@@ -792,7 +809,7 @@ void ControllerLaunchProcess::append_start_header() {
       " component=" + log_field(command().controllable_component_id) +
       " pid=" + std::to_string(pid_) +
       " request_context=" + log_field(start_context_) +
-      " launch_identity=" + log_field(command().identity) + "\n";
+      " launch_identity=" + bounded_text(log_field(command().identity), 4096U) + "\n";
   output_->append(line);
 }
 
@@ -884,6 +901,14 @@ std::optional<CellLaunchExitEvidence> CellLaunchProcess::exit_evidence() {
   return occurrence_->cell_exit_evidence_;
 }
 
+bool CellLaunchProcess::group_drained() const {
+  std::lock_guard lock(occurrence_->mutex_);
+  // stop_complete_ publishes the retirement lane's scan before the same
+  // mutex release; unfinished retirement never reads its in-flight scan.
+  return occurrence_->stop_complete_ && occurrence_->exact_leader_reaped_ &&
+         occurrence_->stop_scanned_drained_;
+}
+
 void ControllerLaunchProcess::update_request_context(std::string context) {
   std::lock_guard lock(mutex_);
   current_request_context_ = std::move(context);
@@ -937,25 +962,40 @@ ControllerLaunchProcess::cleanup_observation() {
   return cleanup_;
 }
 
-void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexcept {
-  // Scalar observation never takes this lock. All official reapers/signallers
-  // of this occurrence do, keeping its WNOWAIT identity until the last scan.
+void ControllerLaunchProcess::begin_stop(
+    const std::chrono::milliseconds grace) noexcept {
   std::lock_guard retirement_lock(retirement_mutex_);
-  std::string context;
-  std::string incident_id;
+  std::lock_guard lock(mutex_);
+  if (stop_deadline_.has_value() || stop_complete_)
+    return;
+  observe_exit_locked();
+  stopping_ = true;
+  // A Background cleanup and aggregate shutdown share this exact first signal
+  // time. Neither another caller nor another poll can extend the grace.
+  if (group_owned_) {
+    stop_signal_sent_ = ::kill(-pid_, SIGINT) == 0;
+    stop_context_ = current_request_context_;
+    stop_incident_id_ = last_incident_id_;
+  }
+  stop_deadline_ = std::chrono::steady_clock::now() + grace;
+}
+
+bool ControllerLaunchProcess::poll_stop() noexcept {
+  std::lock_guard retirement_lock(retirement_mutex_);
+  const auto &context = stop_context_;
+  const auto &incident_id = stop_incident_id_;
   bool owned = false;
+  bool exited = false;
   {
     std::lock_guard lock(mutex_);
+    if (stop_complete_)
+      return true;
+    if (!stop_deadline_)
+      return false;
     observe_exit_locked();
     owned = group_owned_;
-    stopping_ = true;
-    if (owned) {
-      static_cast<void>(::kill(-pid_, SIGINT));
-      context = current_request_context_;
-      incident_id = last_incident_id_;
-    }
+    exited = exit_.has_value();
   }
-  bool scanned_drained = false;
   const auto no_live_members = [&] {
     try {
       return !group_has_running_members(pid_);
@@ -963,82 +1003,56 @@ void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexce
       return false; // Allocation/read errors never establish absence.
     }
   };
-  if (owned) {
-    const auto deadline = std::chrono::steady_clock::now() + grace;
-    while (true) {
-      bool exited = false;
-      {
-        std::lock_guard lock(mutex_);
-        observe_exit_locked();
-        if (!group_owned_)
-          break;
-        exited = exit_.has_value();
-      }
-      if (exited && no_live_members()) {
-        scanned_drained = true;
-        break;
-      }
-      if (std::chrono::steady_clock::now() >= deadline)
-        break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    bool can_reap = false;
+  if (owned && !stop_escalated_) {
+    if (exited && no_live_members())
+      stop_scanned_drained_ = true;
+    if (!stop_scanned_drained_ &&
+        std::chrono::steady_clock::now() < *stop_deadline_)
+      return false;
     {
       std::lock_guard lock(mutex_);
       observe_exit_locked();
-      can_reap = group_owned_;
-      if (can_reap)
-        static_cast<void>(::kill(-pid_, SIGKILL));
+      if (group_owned_)
+        stop_kill_sent_ = ::kill(-pid_, SIGKILL) == 0;
+      stop_escalated_ = true;
     }
-    // No second grace: a complete read immediately after escalation may prove
-    // drain; otherwise Unknown. The same leader is still owned/unreaped here.
-    if (can_reap && !scanned_drained)
-      scanned_drained = no_live_members();
-    while (can_reap) {
-      int status = 0;
-      int result = 0;
-      int wait_error = 0;
-      {
-        std::lock_guard lock(mutex_);
-        observe_exit_locked();
-        if (!group_owned_)
-          break;
-        // WNOHANG keeps scalar evidence/status responsive while an actual
-        // child takes time to become waitable after SIGKILL. No new deadline.
-        result = ::waitpid(pid_, &status, WNOHANG);
-        wait_error = errno;
-        if (result == pid_) {
-          exact_leader_reaped_ = true;
-          if (!exit_.has_value())
-            exit_ = describe_status(status,
-                std::holds_alternative<CellLaunchCommand>(command_));
-          capture_exit_locked(
-              WIFEXITED(status) ? std::optional<int>(WEXITSTATUS(status))
-                                : std::nullopt,
-              WIFSIGNALED(status) ? std::optional<int>(WTERMSIG(status))
-                                  : std::nullopt,
-              WIFSIGNALED(status) && WCOREDUMP(status));
-          group_owned_ = false;
-        } else if (result < 0 && wait_error != EINTR) {
-          if (!exit_.has_value())
-            exit_ = std::holds_alternative<CellLaunchCommand>(command_)
-                        ? "cell launch process is no longer a child of this host"
-                        : "controller launch process is no longer a child of this host";
-          group_owned_ = false;
-          capture_exit_locked(std::nullopt, std::nullopt, false);
-        }
-      }
-      if (result == pid_ || (result < 0 && wait_error != EINTR))
-        break;
-      if (result == 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    // Preserve the original one scan after escalation, with no second grace.
+    if (!stop_scanned_drained_)
+      stop_scanned_drained_ = no_live_members();
   }
   {
     std::lock_guard lock(mutex_);
+    if (group_owned_) {
+      int status = 0;
+      observe_exit_locked();
+      const auto result = ::waitpid(pid_, &status, WNOHANG);
+      const int wait_error = errno;
+      if (result == 0 || (result < 0 && wait_error == EINTR))
+        return false; // Post-KILL reap keeps the original unbounded wait.
+      if (result == pid_) {
+        exact_leader_reaped_ = true;
+        if (!exit_)
+          exit_ = describe_status(
+              status, std::holds_alternative<CellLaunchCommand>(command_));
+        capture_exit_locked(
+            WIFEXITED(status) ? std::optional<int>(WEXITSTATUS(status))
+                              : std::nullopt,
+            WIFSIGNALED(status) ? std::optional<int>(WTERMSIG(status))
+                                : std::nullopt,
+            WIFSIGNALED(status) && WCOREDUMP(status));
+      } else {
+        if (!exit_)
+          exit_ = std::holds_alternative<CellLaunchCommand>(command_)
+                      ? "cell launch process is no longer a child of this host"
+                      : "controller launch process is no longer a child of "
+                        "this host";
+        capture_exit_locked(std::nullopt, std::nullopt, false);
+      }
+      group_owned_ = false;
+    }
     if (cleanup_.state != ControllerLaunchCleanupState::kDrained) {
       cleanup_.state = ControllerLaunchCleanupState::kUnknown;
-      if (scanned_drained && exact_leader_reaped_) {
+      if (stop_scanned_drained_ && exact_leader_reaped_) {
         if (const auto *component =
                 std::get_if<ControllerLaunchCommand>(&command_)) {
           try {
@@ -1052,6 +1066,7 @@ void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexce
         }
       }
     }
+    stop_complete_ = true;
   }
   if (owned) {
     try {
@@ -1060,17 +1075,26 @@ void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexce
                         observed_utc_now() + cell_launch_fields(*cell) +
                         " pid=" + std::to_string(pid_) + " request_context=" +
                         log_field(context) + "\n");
-        return;
+      } else {
+        output_->append("manyforge_controller_launch_end observed_utc=" +
+                        observed_utc_now() + " component=" +
+                        log_field(command().controllable_component_id) +
+                        " pid=" + std::to_string(pid_) +
+                        " request_context=" + log_field(context) +
+                        " incident_id=" + log_field(incident_id) + "\n");
       }
-      output_->append(
-          "manyforge_controller_launch_end observed_utc=" + observed_utc_now() +
-          " component=" + log_field(command().controllable_component_id) +
-          " pid=" + std::to_string(pid_) + " request_context=" +
-          log_field(context) + " incident_id=" + log_field(incident_id) + "\n");
     } catch (...) {
       // Containment completed; optional output loss cannot terminate the host.
     }
   }
+  return true;
+}
+
+void ControllerLaunchProcess::stop(
+    const std::chrono::milliseconds grace) noexcept {
+  begin_stop(grace);
+  while (!poll_stop())
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
 struct ControllerLaunchSupervisor::Spawner final {
@@ -1253,7 +1277,8 @@ struct ControllerLaunchSupervisor::Spawner final {
       if (request != nullptr) {
         try {
           request->result.set_value(
-              spawn_now(request->argv, request->artifacts_root));
+              spawn_now(request->argv, request->artifacts_root,
+                        request->parent_death_signal));
         } catch (...) {
           request->result.set_exception(std::current_exception());
         }
@@ -1292,8 +1317,9 @@ struct ControllerLaunchSupervisor::Spawner final {
   }
 
   SpawnResult spawn(const std::vector<std::string> &argv,
-                    const std::filesystem::path &artifacts_root) {
-    SpawnRequest request{argv, artifacts_root, {}};
+                    const std::filesystem::path &artifacts_root,
+                    const int parent_death_signal = SIGTERM) {
+    SpawnRequest request{argv, artifacts_root, parent_death_signal, {}};
     auto result = request.result.get_future();
     {
       std::lock_guard lock(mutex);
@@ -1340,6 +1366,8 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
     std::shared_ptr<ControllerLaunchProcess> predecessor;
     {
       std::lock_guard lock(mutex_);
+      if (host_shutdown_started_)
+        fail("controller launch submission is closed for host shutdown");
       const auto found = processes_.find(command.controllable_component_id);
       if (found != processes_.end())
         predecessor = found->second.current;
@@ -1362,6 +1390,8 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
         predecessor->stop(stop_grace_);
     }
     std::unique_lock lock(mutex_);
+    if (host_shutdown_started_)
+      fail("controller launch submission is closed for host shutdown");
     const auto found = processes_.find(command.controllable_component_id);
     const auto actual =
         found == processes_.end() ? nullptr : found->second.current;
@@ -1382,7 +1412,8 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
             : found->second.counters;
     if (found != processes_.end())
       found->second.current.reset();
-    const auto spawned = spawner_->spawn(command.argv, artifacts_root);
+    const auto spawned = spawner_->spawn(command.argv, artifacts_root,
+                                         parent_death_signal(command));
     auto process =
         std::shared_ptr<ControllerLaunchProcess>(new ControllerLaunchProcess(
             command, spawned.pid, artifacts_root / "ros", std::move(context),
@@ -1416,6 +1447,9 @@ std::shared_ptr<CellLaunchProcess> ControllerLaunchSupervisor::start_cell_proces
     fail("cell launch role is unknown");
   }
   prepare_upstream_log_directory(artifacts_root);
+  std::lock_guard submission_lock(mutex_);
+  if (host_shutdown_started_)
+    fail("cell launch submission is closed for host shutdown");
   const auto spawned = spawner_->spawn(command.argv, artifacts_root);
   auto occurrence = std::shared_ptr<ControllerLaunchProcess>(
       new ControllerLaunchProcess(command, spawned.pid, artifacts_root / "ros",
@@ -1457,8 +1491,68 @@ bool ControllerLaunchSupervisor::retire_exact(
   return true;
 }
 
+ControllerLaunchSupervisor::HostShutdownSnapshot
+ControllerLaunchSupervisor::BeginHostShutdown(
+    const std::vector<std::shared_ptr<CellLaunchProcess>> &cells) {
+  HostShutdownSnapshot snapshot;
+  {
+    std::lock_guard lock(mutex_);
+    host_shutdown_started_ = true;
+    for (const auto &[component, slot] : processes_) {
+      static_cast<void>(component);
+      if (slot.current)
+        snapshot.push_back(slot.current);
+    }
+    for (const auto &cell : cells) {
+      if (cell && std::find(snapshot.begin(), snapshot.end(),
+                            cell->occurrence_) == snapshot.end())
+        snapshot.push_back(cell->occurrence_);
+    }
+  }
+  for (const auto &process : snapshot)
+    process->begin_stop(stop_grace_);
+  return snapshot;
+}
+
+ControllerLaunchSupervisor::ShutdownProgress
+ControllerLaunchSupervisor::PollHostShutdown(
+    const HostShutdownSnapshot &snapshot) noexcept {
+  ShutdownProgress progress;
+  progress.total = snapshot.size();
+  for (const auto &process : snapshot) {
+    const bool complete = process->poll_stop();
+    {
+      std::lock_guard retirement_lock(process->retirement_mutex_);
+      std::lock_guard lock(process->mutex_);
+      progress.signalled += process->stop_signal_sent_;
+      progress.escalated += process->stop_kill_sent_;
+      progress.reaped += process->exact_leader_reaped_;
+      progress.drained +=
+          process->stop_scanned_drained_ && process->exact_leader_reaped_;
+      progress.unknown += complete && !(process->stop_scanned_drained_ &&
+                                        process->exact_leader_reaped_);
+      if (!complete) {
+        ++progress.pending;
+        if (progress.pending_pid < 0)
+          progress.pending_pid = process->pid_;
+      }
+    }
+    if (complete) {
+      if (const auto *component =
+              std::get_if<ControllerLaunchCommand>(&process->command_)) {
+        std::lock_guard lock(mutex_);
+        const auto found =
+            processes_.find(component->controllable_component_id);
+        if (found != processes_.end() && found->second.current == process)
+          found->second.current.reset();
+      }
+    }
+  }
+  return progress;
+}
+
 void ControllerLaunchSupervisor::stop_all() noexcept {
-  std::vector<std::shared_ptr<ControllerLaunchProcess>> current;
+  HostShutdownSnapshot current;
   {
     std::lock_guard lock(mutex_);
     for (const auto &[component, slot] : processes_) {
@@ -1467,10 +1561,12 @@ void ControllerLaunchSupervisor::stop_all() noexcept {
         current.push_back(slot.current);
     }
   }
-  // This bounded snapshot defines the occurrences being stopped. A concurrent
-  // later publication is preserved by the same exact-pointer retirement path.
+  // Ordinary stop_all does not close submission. Its exact snapshot preserves
+  // any concurrently published successor, while all original graces overlap.
   for (const auto &process : current)
-    static_cast<void>(retire_exact(process));
+    process->begin_stop(stop_grace_);
+  while (PollHostShutdown(current).pending != 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
 void ControllerLaunchSupervisor::enqueue_host_log(std::string line) noexcept {

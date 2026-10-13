@@ -29,8 +29,13 @@ constexpr std::uint8_t kSelectedResultTag = 7U;
 constexpr std::uint8_t kApplySubmitTag = 8U;
 constexpr std::uint8_t kApplyReadTag = 9U;
 constexpr std::uint8_t kApplyResultTag = 10U;
+constexpr std::uint8_t kInstalledInventoryRequestTag = 16U;
+constexpr std::uint8_t kInstalledInventoryResultTag = 17U;
 constexpr std::uint8_t kInspectionRequestTag = 11U;
 constexpr std::uint8_t kInspectionResultTag = 12U;
+constexpr std::uint8_t kProcessStopSubmitTag = 13U;
+constexpr std::uint8_t kProcessStopReadTag = 14U;
+constexpr std::uint8_t kProcessStopResultTag = 15U;
 constexpr std::uint8_t kInspectionPlanningTail = 2U;
 constexpr std::string_view kInspectionPlanningRequestMagic = "MFNSRC4-INSPECT-PLANNING-REQUEST-V1";
 constexpr std::string_view kInspectionPlanningResultMagic = "MFNSRC4-INSPECT-PLANNING-RESULT-V2";
@@ -390,6 +395,98 @@ void WriteApplyRequest(Writer &writer,
           std::move(common.runtime_unit_id), std::move(common.runtime_epoch),
           std::move(common.manager_runtime_epoch),
           core::DecodeApplyComponentBringUpAuthority(reader.String())};
+}
+
+void WriteInstalledInventoryRequest(
+    Writer &writer, const ManagerComponentProcessInventoryRequestDTO &request) {
+  WriteProjectionRevision(writer, request.predecessor_projection_revision);
+  WriteGeneration(writer, request.expected_predecessor_publication_generation);
+  WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
+  WriteStrong(writer, request.runtime_unit_id);
+  WriteStrong(writer, request.runtime_epoch);
+  WriteStrong(writer, request.manager_runtime_epoch);
+}
+ManagerComponentProcessInventoryRequestDTO
+ReadInstalledInventoryRequest(Reader &reader) {
+  return {ReadProjectionRevision(reader),
+          ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
+          ReadStrong<core::ContentDigest>(reader),
+          ReadStrong<core::RuntimeUnitId>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader)};
+}
+void WriteInstalledOccurrence(Writer &writer,
+                              const ManagerComponentProcessOccurrenceDTO &row) {
+  WriteStrong(writer, row.controllable_component_id);
+  writer.String(row.launch_identity);
+  writer.U32(static_cast<std::uint32_t>(row.leader_pid));
+  writer.Byte(static_cast<std::uint8_t>(row.process_presence));
+  writer.Byte(static_cast<std::uint8_t>(row.cleanup_state));
+  writer.Boolean(row.receipt.has_value());
+  if (row.receipt) {
+    writer.U32(static_cast<std::uint32_t>(row.receipt->leader_pid));
+    writer.String(row.receipt->controllable_component_id);
+    writer.String(row.receipt->launch_identity);
+    writer.String(row.receipt->observed_utc);
+  }
+  WriteOptionalStrong(writer, row.installed_runtime_identity);
+}
+ManagerComponentProcessOccurrenceDTO ReadInstalledOccurrence(Reader &reader) {
+  auto component = ReadStrong<core::ControllableComponentId>(reader);
+  auto launch = reader.String();
+  const auto pid = reader.U32();
+  if (pid >
+      static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
+    Fail("installed occurrence PID exceeds signed value domain");
+  ManagerComponentProcessOccurrenceDTO row{
+      std::move(component), std::move(launch), static_cast<std::int32_t>(pid),
+      static_cast<ProcessPresenceState>(reader.Byte()),
+      static_cast<core::ControllerLaunchCleanupState>(reader.Byte())};
+  if (reader.Boolean()) {
+    const auto leader = reader.U32();
+    if (leader > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+      Fail("installed drain receipt PID exceeds signed value domain");
+    row.receipt = core::ControllerLaunchGroupDrainReceipt{
+        static_cast<int>(leader), reader.String(), reader.String(),
+        reader.String()};
+  }
+  row.installed_runtime_identity =
+      ReadOptionalStrong<core::ContentDigest>(reader);
+  return row;
+}
+
+void WriteProcessStopRequest(Writer &writer, const ManagerComponentProcessStopRequestDTO &request) {
+  WriteStrong(writer, request.request_context.request_id);
+  WriteStrong(writer, request.request_context.request_owner_epoch);
+  writer.String(request.request_context.source_label);
+  writer.Boolean(request.request_context.correlation_id.has_value());
+  if (request.request_context.correlation_id) writer.String(*request.request_context.correlation_id);
+  WriteProjectionRevision(writer, request.predecessor_projection_revision);
+  WriteGeneration(writer, request.expected_predecessor_publication_generation);
+  WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
+  WriteStrong(writer, request.runtime_unit_id);
+  WriteStrong(writer, request.runtime_epoch);
+  WriteStrong(writer, request.manager_runtime_epoch);
+  WriteStrong(writer, request.controllable_component_id);
+  writer.String(request.launch_identity);
+  writer.U32(static_cast<std::uint32_t>(request.leader_pid));
+}
+
+ManagerComponentProcessStopRequestDTO ReadProcessStopRequest(Reader &reader) {
+  core::PublicRequestContextDTO context{ReadStrong<core::RequestId>(reader),
+      ReadStrong<core::RequestOwnerEpoch>(reader), reader.String(), std::nullopt};
+  if (reader.Boolean()) context.correlation_id = reader.String();
+  ManagerComponentProcessStopRequestDTO request{std::move(context),
+      ReadProjectionRevision(reader),
+      ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
+      ReadStrong<core::ContentDigest>(reader), ReadStrong<core::RuntimeUnitId>(reader),
+      ReadStrong<core::RuntimeEpoch>(reader), ReadStrong<core::RuntimeEpoch>(reader),
+      ReadStrong<core::ControllableComponentId>(reader), reader.String(), 0};
+  const auto pid = reader.U32();
+  if (pid > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
+    Fail("process Stop PID exceeds signed value domain");
+  request.leader_pid = static_cast<std::int32_t>(pid);
+  return request;
 }
 
 void WriteInspectionRequest(
@@ -795,6 +892,30 @@ std::string EncodeSelectedRuntimeCompositionRpcRequest(
   return std::move(writer).Finish();
 }
 
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessStopRequestDTO &request) {
+  if (!request.valid()) Fail("cannot encode invalid process Stop request");
+  Writer writer(kProcessStopSubmitTag);
+  WriteProcessStopRequest(writer, request);
+  return std::move(writer).Finish();
+}
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessStopReadRequestDTO &request) {
+  if (!request.valid()) Fail("cannot encode invalid process Stop read");
+  Writer writer(kProcessStopReadTag);
+  WriteProcessStopRequest(writer, request.request);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessInventoryRequestDTO &request) {
+  if (!request.valid())
+    Fail("cannot encode invalid installed process inventory request");
+  Writer writer(kInstalledInventoryRequestTag);
+  WriteInstalledInventoryRequest(writer, request);
+  return std::move(writer).Finish();
+}
+
 SelectedRuntimeCompositionRpcRequest
 DecodeSelectedRuntimeCompositionRpcRequestVariant(
     const std::string_view bytes) {
@@ -802,6 +923,12 @@ DecodeSelectedRuntimeCompositionRpcRequestVariant(
   const auto tag = reader.Byte();
   SelectedRuntimeCompositionRpcRequest request =
       [&]() -> SelectedRuntimeCompositionRpcRequest {
+    if (tag == kInstalledInventoryRequestTag)
+      return ReadInstalledInventoryRequest(reader);
+    if (tag == kProcessStopSubmitTag)
+      return ReadProcessStopRequest(reader);
+    if (tag == kProcessStopReadTag)
+      return ManagerComponentProcessStopReadRequestDTO{ReadProcessStopRequest(reader)};
     if (tag == kRequestTag) {
       auto ordinary = ReadRequest(reader);
       ordinary.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
@@ -813,7 +940,8 @@ DecodeSelectedRuntimeCompositionRpcRequestVariant(
       return ManagerSelectedComponentBringUpReadRequestDTO{
           ReadSelectedRequest(reader)};
     }
-    if (tag == kApplySubmitTag) return ReadApplyRequest(reader);
+    if (tag == kApplySubmitTag)
+      return ReadApplyRequest(reader);
     if (tag == kApplyReadTag)
       return ManagerApplyComponentBringUpReadRequestDTO{ReadApplyRequest(reader)};
     if (tag == kInspectionRequestTag) {
@@ -884,6 +1012,35 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
             WriteCellObserverTail(writer, *value.cell_observer);
           WriteInspectionPlanningResultTail(writer, value);
           return std::move(writer).Finish();
+        } else if constexpr (std::is_same_v<
+                                 Value,
+                                 ManagerComponentProcessInventoryResultDTO>) {
+          if (!value.valid())
+            Fail("cannot encode invalid installed process inventory result");
+          Writer writer(kInstalledInventoryResultTag);
+          WriteInstalledInventoryRequest(writer, value.request);
+          WriteVector(writer, value.process_occurrences,
+                      WriteInstalledOccurrence);
+          writer.Boolean(value.error.has_value());
+          if (value.error)
+            WriteError(writer, *value.error);
+          return std::move(writer).Finish();
+        } else if constexpr (std::is_same_v<
+                                 Value, ManagerComponentProcessStopResultDTO>) {
+          if (!value.valid()) Fail("cannot encode invalid process Stop result");
+          Writer writer(kProcessStopResultTag);
+          WriteProcessStopRequest(writer, value.request);
+          writer.Byte(static_cast<std::uint8_t>(value.state));
+          writer.Boolean(value.receipt.has_value());
+          if (value.receipt) {
+            writer.U32(static_cast<std::uint32_t>(value.receipt->leader_pid));
+            writer.String(value.receipt->controllable_component_id);
+            writer.String(value.receipt->launch_identity);
+            writer.String(value.receipt->observed_utc);
+          }
+          writer.Boolean(value.error.has_value());
+          if (value.error) WriteError(writer, *value.error);
+          return std::move(writer).Finish();
         } else {
           Writer writer(kFailureTag);
           WriteError(writer, value.error);
@@ -901,6 +1058,33 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     auto error = ReadError(reader);
     reader.Finish();
     return SelectedRuntimeCompositionRpcFailure{std::move(error)};
+  }
+  if (tag == kInstalledInventoryResultTag) {
+    ManagerComponentProcessInventoryResultDTO result{
+        ReadInstalledInventoryRequest(reader),
+        ReadVector<ManagerComponentProcessOccurrenceDTO>(
+            reader, ReadInstalledOccurrence)};
+    if (reader.Boolean())
+      result.error = ReadError(reader);
+    reader.Finish();
+    if (!result.valid())
+      Fail("decoded installed process inventory is invalid");
+    return result;
+  }
+  if (tag == kProcessStopResultTag) {
+    ManagerComponentProcessStopResultDTO result{ReadProcessStopRequest(reader),
+        static_cast<core::ControllerLaunchCleanupState>(reader.Byte())};
+    if (reader.Boolean()) {
+      const auto pid = reader.U32();
+      if (pid > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+        Fail("drain receipt PID exceeds signed value domain");
+      result.receipt = core::ControllerLaunchGroupDrainReceipt{
+          static_cast<int>(pid), reader.String(), reader.String(), reader.String()};
+    }
+    if (reader.Boolean()) result.error = ReadError(reader);
+    reader.Finish();
+    if (!result.valid()) Fail("decoded process Stop result is invalid");
+    return result;
   }
   if (tag == kSelectedResultTag) {
     ManagerSelectedComponentBringUpResultDTO result{ReadSelectedRequest(reader),

@@ -12,6 +12,8 @@ import { useOperationalErrorMirror } from '../state/operationalErrors';
 import {
   componentLifecyclePresentation,
   componentLifecycleToneClass,
+  componentReadinessDomainPresentation,
+  readinessErrorPresentation,
 } from '../state/componentLifecyclePresentation';
 
 const ACTIONS: Array<{
@@ -66,6 +68,27 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
       <p className="muted">Requested target: {presentation.target}</p>
       <p className="muted">Achieved: {presentation.achieved}</p>
       <p className="muted">Readiness: {presentation.readiness}</p>
+      {snapshot.readiness.domains.map((domain) => {
+        const presented = componentReadinessDomainPresentation(domain);
+        const planError = readinessErrorPresentation(domain.error);
+        const diagnostic = domain.health?.diagnostic
+          ? readinessErrorPresentation(domain.health.diagnostic) : null;
+        return (
+          <div key={`${domain.providerOccurrence.controlDomainId}:${domain.providerOccurrence.providerInstanceId}`}>
+            <p>{domain.providerOccurrence.controlDomainId}: {presented.state}</p>
+            {planError !== null && <p>{planError}</p>}
+            {diagnostic !== null && diagnostic !== planError && <p>{diagnostic}</p>}
+            {presented.facts.map((fact) => (
+              <p className="muted" key={fact.lifecycleFactId}>{fact.lifecycleFactId}: {
+                fact.value.kind === 'unknown' ? 'unknown'
+                  : fact.value.kind === 'boolean' ? String(fact.value.booleanValue)
+                    : fact.value.kind === 'integer' ? String(fact.value.integerValue) : fact.value.tokenValue
+              }</p>
+            ))}
+          </div>
+        );
+      })}
+      {snapshot.readiness.measuredState.error !== null && <p>{readinessErrorPresentation(snapshot.readiness.measuredState.error)}</p>}
       {presentation.incident !== null && <p>Incident: {presentation.incident}</p>}
       <p>{presentation.consequence}</p>
     </div>
@@ -210,12 +233,12 @@ export function CCLCPanelView({
       </div>
 
       <div className="button-row" aria-label="Explicit activation">
-        <button type="button" disabled={!enabled || !mutationAvailable || busy || snapshot === null || controller.pendingActivationRequest !== null}
+        <button type="button" disabled={!enabled || !mutationAvailable || busy || snapshot === null || controller.activationUnresolved}
           onClick={() => setConfirmation({ kind: 'activation', sequence: false,
             label: 'Activate component?', detail: 'Prepare if required, then Enable this component to Active.' })}>
           Activate
         </button>
-        <button type="button" disabled={!enabled || !mutationAvailable || busy || componentIds.length === 0 || controller.pendingActivationRequest !== null}
+        <button type="button" disabled={!enabled || !mutationAvailable || busy || componentIds.length === 0 || controller.activationUnresolved}
           onClick={() => setConfirmation({ kind: 'activation', sequence: true,
             label: 'Activate sequence?', detail: 'Activate in the applied Deployment list order. Stop at the first failure or unknown outcome.' })}>
           Activate sequence
@@ -223,7 +246,27 @@ export function CCLCPanelView({
         {busy && controller.activationProgress !== null && (
           <button type="button" onClick={controller.cancelActivation}>Cancel remaining activation</button>
         )}
+        {!busy && controller.activationProgress !== null && controller.activationProgress.startsWith('Activation stopped')
+          && !controller.activationUnresolved && <button type="button" disabled={!enabled || !mutationAvailable || componentIds.length === 0}
+            onClick={() => setConfirmation({ kind: 'activation', sequence: true, label: 'Retry activation sequence?',
+              detail: 'Run the whole current Deployment list again with fresh checks. Already Active components are skipped.' })}>Retry activation sequence</button>}
       </div>
+      <div aria-label="Configured component health">
+        {componentIds.map((id) => {
+          const current = controller.componentHealth[id];
+          return <div key={id}><strong>{id}</strong>{current?.snapshot
+            ? <ComponentLifecycleSummary snapshot={current.snapshot} />
+            : <p>{current?.error ?? 'Current component health has not been read.'}</p>}</div>;
+        })}
+      </div>
+      {controller.activationRefusal !== null && <div role="status">
+        <p>{controller.activationRefusal.componentId}: {
+          controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault — intervention required' : 'Not ready'
+        }</p>
+        {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready'].map((field) => (
+          <p key={field}>{field}: {controller.activationRefusal!.error.details[field] ?? 'missing'}</p>
+        ))}
+      </div>}
       {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
       {controller.pendingActivationRequest !== null && (
         <div role="status">
@@ -310,7 +353,7 @@ export function CCLCPanel({
   mutationAvailable: boolean;
   mutationUnavailableReason: string | null;
 }) {
-  const controller = useCCLC(enabled, admissionGeneration);
+  const controller = useCCLC(enabled, admissionGeneration, componentIds);
   const { componentId, setComponentId, refresh } = controller;
   useEffect(() => {
     const next = componentIds.includes(componentId) ? componentId : componentIds[0] ?? '';

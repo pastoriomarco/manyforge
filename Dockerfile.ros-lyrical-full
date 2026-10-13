@@ -1,8 +1,8 @@
-# ManyForge ROS Lyrical Full Runtime/Test Environment (EVALUATION ONLY)
+# ManyForge official ROS Lyrical Full Runtime/Test Environment
 #
-# Lyrical variant of Dockerfile.ros-jazzy-full. It does not replace the Jazzy
-# image. Every layer and pin mirrors the Jazzy file; each Lyrical-specific
-# difference is marked "LYRICAL:" below.
+# Single ROS development/build/test image for amd64 and arm64. The cache
+# derivative adds build tooling to an immutable local image; it is not a lane.
+# Legacy Jazzy recipe filenames remain historical inputs, not selected defaults.
 #
 # Purpose:
 #   - Run ManyForge Composer/behavior/RoboPlan and ROS adapters in one image.
@@ -11,8 +11,8 @@
 #   - Provide the production-shaped integration image for Isaac Sim, ROS drivers,
 #     and simulator/robot adapter validation.
 #
-# This image is heavier than Dockerfile.ros-jazzy.  Keep the lightweight
-# ros-jazzy image as the fast ROS adapter lane.
+# Runtime/product availability is defined by the selected entrypoint, not by
+# this toolchain image or a successful build.
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder

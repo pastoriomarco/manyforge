@@ -195,7 +195,14 @@ RetainedNativeLifecycleProduct::Create(
       return core::Result<
           std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(port.error());
     }
-    registrations.push_back({std::move(occurrence), std::move(port.value())});
+    auto native_port = std::move(port.value());
+    registrations.push_back(
+        {std::move(occurrence), native_port,
+         [native_port, domain = desired.control_domain_id](
+             std::int64_t now_ns) {
+           return native_port->ReadLifecycleHealth(domain,
+                                                   core::TimePoint(now_ns));
+         }});
   }
 
   std::vector<core::BuildOwnedLifecyclePlanCatalogEntryDTO> catalog_entries;

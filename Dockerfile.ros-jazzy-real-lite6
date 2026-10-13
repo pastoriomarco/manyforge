@@ -6,7 +6,7 @@
 # supplies an exact local xarm_ros2 source context and verifies its content
 # digest before this image compiles it.
 
-ARG MANYFORGE_ROS_FULL_BASE_IMAGE=manyforge-ros-jazzy-full
+ARG MANYFORGE_ROS_FULL_BASE_IMAGE=manyforge-ros-jazzy-full:q44-20261010
 FROM ${MANYFORGE_ROS_FULL_BASE_IMAGE}
 
 USER root

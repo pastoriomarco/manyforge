@@ -233,6 +233,104 @@ make_simulation_jtc_config(const std::string &runtime_namespace,
 
 } // namespace
 
+core::Result<core::MeasuredStateSourceDescriptor>
+make_retained_ros2_control_measured_state_descriptor(
+    const core::RuntimeParticipantBinding &physical_binding,
+    const core::ActiveControlConfigurationDTO &configuration,
+    const RetainedMeasuredJointStateLane &lane) {
+  using Result = core::Result<core::MeasuredStateSourceDescriptor>;
+  const auto &value = physical_binding.value();
+  const auto unavailable = [&](std::string reason) {
+    return Result::Err(core::ErrorDTO{
+        "configured_robot_measured_state_unavailable",
+        "Measured source has no exact qualified physical route",
+        {{"component_id", value.controllable_component_id.value()},
+         {"reason", std::move(reason)}}});
+  };
+  if (!value.control_path || lane.absolute_topic.empty() ||
+      lane.absolute_topic.front() != '/' || lane.freshness_budget_ns <= 0 ||
+      lane.measured_state_authority_id.value() !=
+          kMeasuredJointStateAuthorityId ||
+      lane.measured_source_profile_id != kMeasuredJointStateProfileId)
+    return unavailable("measured_lane_source_unqualified");
+  const auto &path = *value.control_path;
+  if (!configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      configuration.control_domain_id != path.control_domain_id ||
+      configuration.control_domain_revision != path.control_domain_revision ||
+      configuration.activation_set_id != path.activation_set_id ||
+      configuration.controller_topology_id != path.controller_topology_id ||
+      configuration.topology_revision != path.topology_revision ||
+      configuration.source_runtime_unit_id != path.provider_runtime_unit_id ||
+      configuration.source_runtime_epoch != path.provider_runtime_epoch ||
+      configuration.active_control_configuration_id !=
+          path.active_control_configuration_id ||
+      configuration.active_control_configuration_generation !=
+          path.active_control_configuration_generation ||
+      !std::any_of(configuration.binding_routes.begin(),
+                   configuration.binding_routes.end(), [&](const auto &route) {
+                     return route.control_binding_id ==
+                                path.control_binding_id &&
+                            route.control_binding_revision ==
+                                path.control_binding_revision &&
+                            route.control_route_id == path.control_route_id;
+                   }))
+    return unavailable("measured_source_route_identity_mismatch");
+  std::vector<core::ResourceId> resources;
+  std::vector<std::string> compiled_names;
+  std::vector<core::CoordinateKind> kinds;
+  std::vector<std::string> source_names;
+  resources.reserve(value.resources.size());
+  compiled_names.reserve(value.resources.size());
+  kinds.reserve(value.resources.size());
+  source_names.reserve(value.resources.size());
+  for (const auto &resource : value.resources) {
+    if (!resource.source_joint_name || resource.source_joint_name->empty())
+      return unavailable("measured_source_coordinate_mapping_invalid");
+    resources.push_back(resource.resource_id);
+    compiled_names.push_back(resource.compiled_resource_name);
+    kinds.push_back(resource.coordinate_kind);
+    source_names.push_back(*resource.source_joint_name);
+  }
+  core::ObservedStateQueryContextDTO query{
+      value.controllable_component_id,
+      value.command_target_id,
+      value.capability_id,
+      path.control_domain_id,
+      path.control_domain_revision,
+      path.control_binding_id,
+      path.control_binding_revision,
+      path.controller_topology_id,
+      path.topology_revision,
+      path.control_route_id,
+      std::move(resources),
+      std::move(compiled_names),
+      std::move(kinds),
+      path.control_interface_contract_id,
+      path.control_interface_revision,
+      configuration.active_control_configuration_id,
+      configuration.active_control_configuration_generation,
+      path.provider_instance_id,
+      path.provider_manifest_id,
+      path.provider_manifest_revision,
+      path.provider_runtime_epoch,
+      lane.measured_state_authority_id,
+      core::StateAuthorityClass::kMeasured,
+      lane.freshness_budget_ns};
+  core::MeasuredStateSourceDescriptor descriptor{
+      {std::move(query),
+       {{core::ObservedRobotStateSourceKind::kJointState, lane.absolute_topic,
+         core::ObservedRobotStateAuthorityProfile::kMeasured,
+         lane.freshness_budget_ns, lane.measured_source_profile_id}},
+       configuration.active_control_configuration_generation.value()},
+      std::move(source_names)};
+  const auto valid = descriptor.validate();
+  if (!valid.ok())
+    return Result::Err(valid.error());
+  return Result::Ok(std::move(descriptor));
+}
+
 std::string retained_isaac_ros_namespace(
     const core::RuntimeParticipantBinding &binding) {
   const auto &component_id =
@@ -334,6 +432,11 @@ make_retained_isaac_ros2_control_backend_config(
       std::string(kArmJointCommandsTopic), std::string(kIsaacJointStatesTopic),
       static_cast<core::Duration>(kJointStateMaxAgeS * 1e9),
       static_cast<core::Duration>(1e9 / rates.state_publish_rate_hz)};
+  config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
+      config.isaac_guard->joint_states_topic,
+      config.participant.stop.controller_state_max_age_ns,
+      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+      std::string(kMeasuredJointStateProfileId)};
 
   const auto &gripper = *gripper_binding;
   if (gripper.value().resources.size() != 1U ||
@@ -444,6 +547,11 @@ make_retained_mock_ros2_control_backend_config(
       runtime_namespace, profile.arm_controller_name,
       profile.hardware_component_name, transport_joints, rates,
       profile.hard_stop_completion_timeout_s);
+  config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
+      runtime_namespace + "/joint_states",
+      config.participant.stop.controller_state_max_age_ns,
+      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+      std::string(kMeasuredJointStateProfileId)};
   auto &participant = config.participant;
   for (std::size_t index = 0; index < compiled_joints.size(); ++index) {
     const auto found =

@@ -55,11 +55,14 @@ from .history_query import (
     HistorianDiscoveryRequest,
     HistorianDebugRequest,
 )
+from .close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetirementIntent
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
+    ComponentProcessStopBody,
     ActivationPreparationRequest,
+    CanonicalEmptyActivationPreparationRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
@@ -303,6 +306,8 @@ class RequestBodyLimitMiddleware:
 
 
 def _error_status(code: str) -> int:
+    if code in {"program_run_started_then_failed", "program_run_superseded_by_stop"}:
+        return 422
     if code == "full_stack_restart_required":
         return 409
     if code in {
@@ -353,6 +358,7 @@ def _error_status(code: str) -> int:
             "activation_preparation_failed",
             "prepared_activation_unverified",
             "authoring_not_ready",
+            "program_run_stopped_before_start",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
             "program_node_preview_busy",
@@ -361,6 +367,8 @@ def _error_status(code: str) -> int:
             "cclc_request_admission_deferred",
             "persistent_key_request_replayed",
             "unacknowledged_operator_alarms",
+            "component_lifecycle_close_incident_mismatch",
+            "request_result_expired",
         }
     ):
         return 409
@@ -373,10 +381,12 @@ def _error_status(code: str) -> int:
         "program_activation_history_incomplete",
         "program_runner_unavailable",
         "program_run_scheduling_failed",
+        "program_cycle_reconciliation_required",
         "request_ledger_full",
         "scene_projection_commit_uncertain",
         "persistent_key_storage_uncertain",
         "execution_control_ingress_busy",
+        "component_lifecycle_owner_settlement_unknown",
     }:
         return 503
     if (
@@ -464,6 +474,8 @@ def create_app(
                 activation_root=config.activation_preparer_activation_root,
                 runtime_cell_id=config.cell_id,
                 timeout_seconds=config.activation_preparer_timeout_seconds,
+                canonical_empty_package_root=config.install_root,
+                canonical_empty_admission_filename=config.canonical_empty_admission_filename,
             )
         service = HeadlessService(
             core,
@@ -848,6 +860,26 @@ def create_app(
         control_state_source.notify_cold()
         return {"admission": admission}
 
+    @app.get("/api/manager/canonical-empty-selection")
+    def canonical_empty_selection() -> dict[str, Any]:
+        return service.canonical_empty_selection()
+
+    @app.get("/api/cclc/targets/retirement-offer")
+    def lifecycle_target_retirement_offer() -> dict[str, Any]:
+        return cclc_port().lifecycle_target_retirement_offer()
+
+    @app.post("/api/cclc/targets/retire")
+    def retire_lifecycle_targets(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
+        return cclc_port().retire_lifecycle_targets(body)
+
+    @app.post("/api/cclc/targets/retire/result")
+    def lifecycle_target_retirement_result(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
+        return {"result": cclc_port().lifecycle_target_retirement_result(body)}
+
+    @app.post("/api/cclc/targets/settlement")
+    def lifecycle_owner_settlement(body: LifecycleOwnerSettlementRequest) -> dict[str, Any]:
+        return cclc_port().lifecycle_owner_settlement(body.scope)
+
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
         return service.manager_status()
@@ -866,6 +898,12 @@ def create_app(
     ) -> dict[str, Any]:
         return cclc_port().component_snapshot(component_id)
 
+    @app.get("/api/cclc/components/{component_id}/lifecycle-snapshot")
+    def cclc_component_lifecycle_snapshot(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return cclc_port().component_lifecycle_snapshot(component_id)
+
     @app.get("/api/cclc/owner")
     def cclc_owner_identity() -> dict[str, Any]:
         return cclc_port().owner_identity()
@@ -875,6 +913,28 @@ def create_app(
         component_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
         return cclc_port().route_templates(component_id)
+
+    @app.get("/api/cclc/components/{component_id}/process/stop-offer")
+    def component_process_stop_offer(component_id: Annotated[str, Path(min_length=1, max_length=128)]) -> dict[str, Any]:
+        return service.component_process_stop_offer(component_id)
+
+    @app.post("/api/cclc/components/{component_id}/process/stop")
+    def stop_component_process(
+        component_id: Annotated[str, Path(min_length=1, max_length=128)],
+        body: ComponentProcessStopBody,
+    ) -> dict[str, Any]:
+        if component_id != body.request.controllable_component_id:
+            raise HeadlessApiError("invalid_request", "Process Stop component path does not match its request")
+        return service.stop_component_process(body.request)
+
+    @app.post("/api/cclc/components/{component_id}/process/stop/result")
+    def component_process_stop_result(
+        component_id: Annotated[str, Path(min_length=1, max_length=128)],
+        body: ComponentProcessStopBody,
+    ) -> dict[str, Any]:
+        if component_id != body.request.controllable_component_id:
+            raise HeadlessApiError("invalid_request", "Process Stop component path does not match its request")
+        return service.component_process_stop_result(body.request)
 
     @app.post("/api/cclc/lifecycle/requests")
     def cclc_lifecycle_submit(
@@ -1391,7 +1451,7 @@ def create_app(
 
     @app.post("/api/activation-preparations")
     def prepare_activation(
-        request: ActivationPreparationRequest,
+        request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest,
     ) -> dict[str, Any]:
         return service.prepare_activation(request)
 

@@ -303,6 +303,10 @@ class CycleRecord:
     runtime_controls: dict[str, Any] | None
 
 
+class ProgramCycleStopWon(RuntimeError):
+    """The exact accepted Stop won the existing Starting-to-Running CAS."""
+
+
 @dataclass(frozen=True, slots=True)
 class RequestRecord:
     disposition: str
@@ -1625,6 +1629,9 @@ class ProgramCycleJournal:
         session_id: str | None = None,
         client_sequence: str | None = None,
         command_kind: str | None = None,
+        failure: Mapping[str, Any] | None = None,
+        expected_running_owner_epoch: str | None = None,
+        expected_running_claim: Mapping[str, Any] | None = None,
     ) -> None:
         if state not in STATES:
             raise ValueError("invalid Program-cycle state")
@@ -1645,7 +1652,8 @@ class ProgramCycleJournal:
                     causal_correlation_id=COALESCE(?,causal_correlation_id),
                     causal_session_id=COALESCE(?,causal_session_id),
                     causal_client_sequence=COALESCE(?,causal_client_sequence),
-                    current_command_kind=COALESCE(?,current_command_kind)
+                    current_command_kind=COALESCE(?,current_command_kind),
+                    failure_json=COALESCE(failure_json,?)
                 WHERE singleton=1 AND cycle_generation=?
                   AND state IN ({placeholders})
                 """,
@@ -1661,11 +1669,40 @@ class ProgramCycleJournal:
                     session_id,
                     client_sequence,
                     command_kind,
+                    self._dump(failure),
                     expected_generation,
                     *expected_states,
                 ),
             ).rowcount
             if changed != 1:
+                if (
+                    state == "running"
+                    and expected_states == ("starting",)
+                    and expected_running_owner_epoch is not None
+                    and expected_running_claim is not None
+                ):
+                    current = self.read()
+                    stopped_terminal = False
+                    if current.state == "terminal_awaiting_reset":
+                        stopped = self.read_run_snapshot(program_run_id)
+                        if stopped is not None and stopped.get("state") == "stopped":
+                            stopped_terminal = current.terminal_reference == (
+                                "sha256:" + hashlib.sha256(rfc8785.dumps({
+                                    "program_run_id": program_run_id,
+                                    "run_revision": stopped.get("run_revision"),
+                                    "state": "stopped",
+                                })).hexdigest()
+                            )
+                    if (
+                        current.cycle_generation == expected_generation
+                        and current.owner_epoch == expected_running_owner_epoch
+                        and current.program_run_id == program_run_id
+                        and current.claim == dict(expected_running_claim)
+                        and (current.state == "stopping" or stopped_terminal)
+                        and current.current_command_kind == "program_stop"
+                        and current.failure is None
+                    ):
+                        raise ProgramCycleStopWon("Accepted Program Stop won Running")
                 raise RuntimeError("Program-cycle transition is stale")
             if run_snapshot is not None:
                 self._retain_run_snapshot_locked(run_snapshot)
@@ -2129,6 +2166,75 @@ class ProgramCycleJournal:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Program-cycle Reset recovery is stale")
+
+    def record_scene_preparation_failure(
+        self, *, expected_generation: int, owner_epoch: str, failure: Mapping[str, Any]
+    ) -> None:
+        if failure.get("code") != "program_scene_preparation_failed":
+            raise ValueError("invalid Scene preparation failure")
+        encoded = self._dump(failure)
+        with self._transaction():
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle SET failure_json=COALESCE(failure_json,?),
+                    execution_control_revision=execution_control_revision+1
+                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
+                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
+                  AND reconciliation_required=0
+                """, (encoded, expected_generation, owner_epoch),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Scene preparation failure is stale")
+
+    def complete_scene_preparation(self, *, expected_generation: int, owner_epoch: str) -> None:
+        with self._transaction():
+            current = self.read()
+            failure = current.failure
+            if failure is not None and failure.get("code") != "program_scene_preparation_failed":
+                raise RuntimeError("Scene preparation cannot clear another failure")
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle SET failure_json=NULL,
+                    execution_control_revision=execution_control_revision+1
+                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
+                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
+                  AND reconciliation_required=0
+                """, (expected_generation, owner_epoch),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Scene preparation completion is stale")
+
+    def publish_idle_reset(
+        self, *, expected_generation: int, owner_epoch: str,
+        request_owner_epoch: str, request_id: str, result: Mapping[str, Any]
+    ) -> None:
+        encoded = self._dump(result)
+        with self._transaction():
+            request = self._database.execute(
+                "SELECT cycle_generation FROM program_cycle_inflight_commands "
+                "WHERE request_owner_epoch=? AND request_id=? AND request_kind='reset'",
+                (request_owner_epoch, request_id),
+            ).fetchone()
+            if request != (expected_generation,):
+                raise RuntimeError("Idle Reset in-flight request is absent")
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle SET cycle_generation=cycle_generation+1,
+                    reset_result_json=?,execution_control_revision=execution_control_revision+1
+                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
+                  AND state='idle_after_reset' AND claim_json IS NULL
+                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
+                  AND reconciliation_required=0 AND failure_json IS NULL
+                """, (encoded, expected_generation, owner_epoch),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Idle Reset completion is stale")
+            self._database.execute(
+                "DELETE FROM program_cycle_inflight_commands WHERE request_owner_epoch=? AND request_id=?",
+                (request_owner_epoch, request_id),
+            )
 
     def require_reconciliation(
         self,

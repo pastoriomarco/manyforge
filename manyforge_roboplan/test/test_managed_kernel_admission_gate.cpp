@@ -290,6 +290,59 @@ ReleaseRequest(const core::RouteConfigurationFenceAcceptedDTO &accepted,
 }
 
 TEST(ManagedKernelAdmissionGate,
+     TerminalApplyOverlapPreservesBothBarriersAndRejectsAnActiveEffect) {
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, ActiveConfigurations(), gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  const core::ConfigurationFenceId old_id("fence.old-terminal");
+  const core::ConfigurationFenceId fresh_id("fence.fresh");
+  gate.RestoreFence(old_id, scope);
+  const auto observed = gate.Observe(scope);
+  unsigned validations = 0U;
+  bool committed = false;
+  const auto validate = [&](const auto &id, const auto &exact_scope) {
+    ++validations;
+    EXPECT_EQ(id, old_id);
+    EXPECT_EQ(exact_scope, scope);
+  };
+  EXPECT_THROW(gate.AcquireFenceDurably(
+                   fresh_id, scope, observed.operation_resource_generation,
+                   ActiveConfigurations(), [&] { committed = true; }),
+               std::runtime_error);
+  EXPECT_THROW(gate.AcquireFenceDurably(
+                   fresh_id, scope, observed.operation_resource_generation,
+                   ActiveConfigurations(), [&] { committed = true; },
+                   [](const auto &, const auto &) {
+                     throw std::runtime_error(
+                         "original Apply is live or unknown");
+                   }),
+               std::runtime_error);
+  gate.RunWithExactHeldFence(old_id, scope, [&] {
+    EXPECT_THROW(gate.AcquireFenceDurably(
+                     fresh_id, scope, observed.operation_resource_generation,
+                     ActiveConfigurations(), [&] { committed = true; },
+                     validate),
+                 std::runtime_error);
+  });
+  EXPECT_EQ(validations, 0U);
+  EXPECT_FALSE(committed);
+  gate.AcquireFenceDurably(
+      fresh_id, scope, observed.operation_resource_generation,
+      ActiveConfigurations(), [&] { committed = true; }, validate);
+  EXPECT_EQ(validations, 1U);
+  EXPECT_TRUE(committed);
+  EXPECT_TRUE(gate.exact_fence_is_held(old_id, scope));
+  EXPECT_TRUE(gate.exact_fence_is_held(fresh_id, scope));
+  EXPECT_FALSE(gate.reserve(*table, OperationOwner(), scope.resources).ok());
+  gate.ReleaseFence(fresh_id, scope);
+  EXPECT_FALSE(gate.reserve(*table, OperationOwner(), scope.resources).ok());
+  gate.ReleaseFence(old_id, scope);
+  EXPECT_TRUE(gate.reserve(*table, OperationOwner(), scope.resources).ok());
+}
+
+TEST(ManagedKernelAdmissionGate,
      SerializesOperationFirstAndFenceFirstOnTheActualSlotTable) {
   ManagedKernelAdmissionGate gate;
   auto table = std::make_shared<core::ResourceSlotTable>(
@@ -1140,6 +1193,66 @@ TEST(
 }
 
 } // namespace
+
+TEST(ManagedKernelApplyFenceOwner,
+     TerminalOverlapUsesTheExactExistingDurableApplyRow) {
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  ManagedKernelApplyFenceOwner owner(fixture.Config("terminal-overlap"), gate);
+  auto scope = AffectedScope();
+  scope.domains.front().predecessor_control_domain_revision.reset();
+  scope.bindings.front().predecessor_control_binding_revision.reset();
+  const core::RuntimeEpoch manager_epoch("manager.terminal-overlap");
+  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const core::ApplyConfigurationFenceIntentDTO old_intent{
+      {core::RequestId("old.apply.fence"),
+       core::RequestOwnerEpoch("manager.owner"), "test", std::nullopt},
+      {core::ApplyId("old.apply"), core::ApplyGeneration(1U)},
+      scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      observed.operation_resource_generation,
+      observed.configuration_fence_generation,
+      {},
+      "old Apply"};
+  const auto old = owner.Acquire(old_intent);
+  auto next = old_intent;
+  next.owner_request_context.request_id = core::RequestId("fresh.apply.fence");
+  next.owner_transaction = {core::ApplyId("fresh.apply"),
+                            core::ApplyGeneration(1U)};
+  next.expected_fence_generation = old.configuration_fence_generation;
+  EXPECT_THROW(static_cast<void>(owner.Acquire(next)), std::runtime_error);
+  EXPECT_THROW(
+      static_cast<void>(owner.Acquire(
+          next,
+          [](const auto &, const auto &) {
+            return core::Result<void>::Err(
+                {"original_apply_live", "original Apply is not terminal", {}});
+          })),
+      std::runtime_error);
+  unsigned validations = 0U;
+  const auto fresh =
+      owner.Acquire(next, [&](const auto &original, const auto &accepted) {
+        ++validations;
+        EXPECT_EQ(original, old_intent);
+        EXPECT_EQ(accepted, old);
+        return core::Result<void>::Ok();
+      });
+  ASSERT_TRUE(fresh.matches(next));
+  EXPECT_EQ(validations, 1U);
+  EXPECT_TRUE(gate.exact_fence_is_held(old.configuration_fence_id, scope));
+  EXPECT_TRUE(gate.exact_fence_is_held(fresh.configuration_fence_id, scope));
+  const auto replay = owner.Acquire(next, [&](const auto &, const auto &) {
+    ++validations;
+    return core::Result<void>::Err({"unexpected_revalidation",
+                                    "exact replay must remain observation",
+                                    {}});
+  });
+  EXPECT_EQ(replay.configuration_fence_id, fresh.configuration_fence_id);
+  EXPECT_EQ(replay.replay_status, core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(validations, 1U);
+}
 
 TEST(ManagedKernelApplyFenceOwner,
      InitialComponentPreparationPinsEmptyPredecessorBeforeCandidateStaging) {

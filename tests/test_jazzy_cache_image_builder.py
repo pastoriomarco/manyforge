@@ -27,7 +27,7 @@ def image_env(tmp_path: Path) -> dict[str, str]:
         "with Path(os.environ['DOCKER_CALLS']).open('a') as calls:\n"
         "    calls.write(json.dumps(args) + '\\n')\n"
         "if args[:2] == ['image', 'inspect']:\n"
-        "    if args[-1].startswith('manyforge-ros-jazzy-cache-base:'):\n"
+        "    if args[-1].startswith('manyforge-ros-lyrical-cache-base:'):\n"
         "        if not os.environ.get('BASE_ALIAS'): sys.exit(1)\n"
         "        print(os.environ['BASE_ALIAS'])\n"
         "    else: print('sha256:' + '1' * 64)\n"
@@ -56,9 +56,9 @@ def test_requires_explicit_local_base_before_docker(image_env: dict[str, str]) -
 
 
 def test_builds_cache_only_layer_from_resolved_local_image(image_env: dict[str, str]) -> None:
-    assert _build(image_env, 'user-jazzy:existing').returncode == 0
+    assert _build(image_env, 'user-lyrical:existing').returncode == 0
     calls = _calls(image_env)
-    alias = 'manyforge-ros-jazzy-cache-base:' + '1' * 64
+    alias = 'manyforge-ros-lyrical-cache-base:' + '1' * 64
     assert ['image', 'tag', _BASE_ID, alias] in calls
     build = next(call for call in calls if call[0] == 'build')
     assert '--pull=false' in build
@@ -70,16 +70,17 @@ def test_builds_cache_only_layer_from_resolved_local_image(image_env: dict[str, 
     assert 'CCACHE_DISABLE=1' in dockerfile
     assert 'ENTRYPOINT []' in dockerfile
     assert 'ubuntu:noble' in dockerfile
+    assert '/opt/ros/lyrical/setup.bash' in dockerfile
     assert 'ros-jazzy-' not in dockerfile
 
 
 def test_reuses_matching_immutable_alias(image_env: dict[str, str]) -> None:
-    assert _build({**image_env, 'BASE_ALIAS': _BASE_ID}, 'user-jazzy:existing').returncode == 0
+    assert _build({**image_env, 'BASE_ALIAS': _BASE_ID}, 'user-lyrical:existing').returncode == 0
     assert not any(call[:2] == ['image', 'tag'] for call in _calls(image_env))
 
 
 def test_rejects_conflicting_alias_without_build_or_retag(image_env: dict[str, str]) -> None:
-    result = _build({**image_env, 'BASE_ALIAS': 'sha256:' + '2' * 64}, 'user-jazzy:existing')
+    result = _build({**image_env, 'BASE_ALIAS': 'sha256:' + '2' * 64}, 'user-lyrical:existing')
     assert result.returncode == 69
     assert 'different image ID' in result.stderr
     assert not any(call[0] == 'build' or call[:2] == ['image', 'tag'] for call in _calls(image_env))

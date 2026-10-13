@@ -418,6 +418,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<RuntimeScaleControlStatusDTO> present_runtime_scale_control(
       const RuntimeScaleControlSelectorDTO& selector) const;
 
+  [[nodiscard]] Result<std::unique_ptr<ICellCloseAdmissionLease>>
+  AcquireCellCloseAdmissionLease() override;
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] bool has_external_route_recovery_claims() const;
   [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
@@ -431,6 +433,17 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// wired; proof-unavailable refusal is not permanent Q91 policy.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer);
+  /// Trusted ordinary Apply convergence on this Kernel's existing claim owner.
+  /// The host supplies actual installed-state and immutable terminal checks;
+  /// no public request can provide or skip this process-local validator.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionConfigurationApplyValidator& validate);
+  /// Fresh ordinary Apply success, after every exact old fence is released.
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
+      const CellAdmissionClaimDTO& fresh_claim,
+      const CellAdmissionClaimReleaseDTO& fresh_success_release,
+      const CellAdmissionConfigurationApplySuccessValidator& validate);
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const ActiveControlConfigurationDTO& predecessor) override;
@@ -446,6 +459,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Copy the current held ledger entry for a subsequent exact recovery query.
   /// The observation itself grants no acquisition, effects or release.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaim(
+      CellAdmissionClaimKindDTO kind) const;
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaim(
+      CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const;
+  [[nodiscard]] std::vector<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaims(
       CellAdmissionClaimKindDTO kind) const;
   [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const override;
@@ -667,6 +684,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct RuntimeScaleControlSetting;
   struct RuntimeScaleControlResolution;
   struct RuntimeScaleControlScope;
+  class CellCloseAdmissionLease;
   struct ActiveOperation;
   class OperationCommitGuard;
   struct StopTransaction;

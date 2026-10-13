@@ -125,9 +125,9 @@ def _non_executable_status(
         "program_revision": selection["program_revision"],
         "record_digest": "sha256:" + "b" * 64,
         "retained_bundle_id": selection["retained_bundle_id"],
-        "scenario_id": selection["scenario_id"],
+        "origin": {"kind": "scenario", "scenario_id": selection["scenario_id"],
+                   "source_document_digest": selection["source_document_digest"]},
         "schema_version": "manyforge.applied_program_status.v2",
-        "source_document_digest": selection["source_document_digest"],
     }
 
 
@@ -150,8 +150,8 @@ def _captured_activation(
         "program_revision": selection["program_revision"],
         "program_outcome": deepcopy(program_outcome),
         "retained_bundle_id": selection["retained_bundle_id"],
-        "scenario_id": selection["scenario_id"],
-        "source_document_digest": selection["source_document_digest"],
+        "origin": {"kind": "scenario", "scenario_id": selection["scenario_id"],
+                   "source_document_digest": selection["source_document_digest"]},
     }
     return state._captured_deployment_context(intent, prepared)
 
@@ -197,9 +197,9 @@ class _Headless:
             "program_revision": applied["program_revision"],
             "record_digest": applied["source"]["record_digest"],
             "retained_bundle_id": applied["retained_bundle_id"],
-            "scenario_id": applied["scenario_id"],
+            "origin": {"kind": "scenario", "scenario_id": applied["scenario_id"],
+                       "source_document_digest": applied["source_document_digest"]},
             "schema_version": "manyforge.applied_program_status.v2",
-            "source_document_digest": applied["source_document_digest"],
         }
 
     def authoring_admission(self) -> dict[str, Any]:
@@ -558,3 +558,49 @@ def test_contradictory_applied_program_status_is_not_a_publication() -> None:
     assert published["unavailable_reasons"] == [
         "program_applied_status_invalid"
     ]
+
+
+def test_sealed_empty_publication_has_no_current_or_published_scenario() -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    status = _non_executable_status(selection)
+    status.update(program_id=None, program_revision=None, program=None,
+                  non_executable=None, message="No Program is selected")
+    status["origin"] = {
+        "kind": "sealed_canonical_empty", "cell_id": "cell_a",
+        "deployment_artifact_id": selection["deployment_artifact_id"],
+        **{name: selection[name] for name in ("deployment_revision", "retained_bundle_id", "graph_revision")},
+        "admission_digest": "sha256:" + "c" * 64,
+    }
+    headless.applied_status = status
+    headless.manager_target = True
+    state = _state(headless, _Coordinator(), program=None)
+    published = state.published_scenario()
+    assert published["published_scenario"] is None
+    assert published["ready"] is False
+    assert published["unavailable_reasons"] == ["program_not_applied"]
+    assert state.current_scenario()["current_scenario"] is None
+    assert state.applied_deployment_document is None
+
+
+@pytest.mark.parametrize("malformed_origin", [False, True])
+def test_h1a_restore_reads_checked_scenario_origin(monkeypatch, malformed_origin) -> None:
+    from manyforge_composer.backend import routes_draft
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    headless.applied_status = _non_executable_status(selection)
+    if malformed_origin:
+        del headless.applied_status["origin"]["source_document_digest"]
+    state = _state(headless, _Coordinator(), program=program)
+    monkeypatch.setattr(routes_draft, "_active_catalog", lambda _state: state.node_catalog)
+    context, error = routes_draft._non_executable_applied_context(state)
+    if malformed_origin:
+        assert context is None
+        assert error["code"] == "program_applied_selection_invalid"
+    else:
+        assert error is None
+        assert context.scenario_id == selection["scenario_id"]
+        assert context.source_document_digest == selection["source_document_digest"]
+        assert context.program_document == program.to_dict()

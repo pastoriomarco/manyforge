@@ -14,6 +14,7 @@
 #include <variant>
 #include <vector>
 
+#include <manyforge_core/types/controller_launch_group_drain.hpp>
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/controller_robot_description.hpp>
 
@@ -167,21 +168,8 @@ struct ControllerLaunchCachedFaultState final {
 [[nodiscard]] std::optional<std::string> ProjectControllerLaunchFault(
     const ControllerLaunchCachedFaultState &state);
 
-enum class ControllerLaunchCleanupState {
-  kNotRequested,
-  kPending,
-  kUnknown,
-  kDrained
-};
-
-/// Process-group proof from the original live host, never physical robot state.
-/// The no-live-member scan precedes release of the exact zombie leader pin.
-struct ControllerLaunchGroupDrainReceipt final {
-  int leader_pid;
-  std::string controllable_component_id;
-  std::string launch_identity;
-  std::string observed_utc;
-};
+using ControllerLaunchCleanupState = core::ControllerLaunchCleanupState;
+using ControllerLaunchGroupDrainReceipt = core::ControllerLaunchGroupDrainReceipt;
 
 struct ControllerLaunchCleanupObservation final {
   ControllerLaunchCleanupState state{
@@ -233,9 +221,9 @@ struct CellLaunchExitEvidence final {
 class CellLaunchProcess;
 
 /// One started launch process. Its own process group holds the whole
-/// `ros2 launch` tree; stopping signals the group. The child receives SIGTERM
-/// if the starting thread's process dies (PR_SET_PDEATHSIG; starts happen on
-/// the supervisor's long-lived thread).
+/// `ros2 launch` tree; stopping signals the group. On parent death the canonical
+/// Mock/Isaac controller launch roles receive SIGINT, other roles SIGTERM
+/// (PR_SET_PDEATHSIG; starts happen on the supervisor's long-lived thread).
 class ControllerLaunchProcess final {
 public:
   ~ControllerLaunchProcess();
@@ -279,6 +267,8 @@ private:
   ControllerLaunchProcess(CellLaunchCommand command, int pid,
                           std::filesystem::path upstream_log_directory,
                           std::string context);
+  void begin_stop(std::chrono::milliseconds grace) noexcept;
+  [[nodiscard]] bool poll_stop() noexcept;
   void append_start_header();
   void observe_exit_locked();
   /// Complete the one cached readiness attempt outside the evidence lock.
@@ -306,6 +296,15 @@ private:
   std::optional<ControllerLaunchExitEvidence> exit_evidence_;
   std::optional<CellLaunchExitEvidence> cell_exit_evidence_;
   bool exact_leader_reaped_{false};
+  // One retirement, shared by blocking callers and host aggregate polling.
+  std::optional<std::chrono::steady_clock::time_point> stop_deadline_;
+  bool stop_signal_sent_{false};
+  bool stop_kill_sent_{false};
+  bool stop_escalated_{false};
+  bool stop_scanned_drained_{false};
+  bool stop_complete_{false};
+  std::string stop_context_;
+  std::string stop_incident_id_;
   std::optional<std::string> fault_reason_;
   bool readiness_capture_started_{false};
   bool readiness_capture_complete_{false};
@@ -322,6 +321,9 @@ public:
     return std::get<CellLaunchCommand>(occurrence_->command_);
   }
   [[nodiscard]] std::optional<CellLaunchExitEvidence> exit_evidence();
+  /// Cached positive group scan plus this host's exact leader reap. An exit,
+  /// timeout, missing handle or owner epoch change cannot establish this fact.
+  [[nodiscard]] bool group_drained() const;
   [[nodiscard]] ControllerLaunchOutputSnapshot output_snapshot() const {
     return occurrence_->output_snapshot();
   }
@@ -409,6 +411,27 @@ public:
       core::IScheduler &scheduler, std::int64_t now_ns,
       std::function<ControllerLaunchReadinessEvidence()> readiness = {});
 
+  struct ShutdownProgress final {
+    std::size_t total{};
+    std::size_t pending{};
+    std::size_t signalled{};
+    std::size_t escalated{};
+    std::size_t reaped{};
+    std::size_t drained{};
+    std::size_t unknown{};
+    int pending_pid{-1};
+  };
+  using HostShutdownSnapshot =
+      std::vector<std::shared_ptr<ControllerLaunchProcess>>;
+  /// One host-exit cut: close launch submission and retain the actual component
+  /// and caller-owned cell occurrences. Every group begins before any poll.
+  [[nodiscard]] HostShutdownSnapshot BeginHostShutdown(
+      const std::vector<std::shared_ptr<CellLaunchProcess>> &cells);
+  /// Advance each original retirement once, without renewing its grace.
+  /// Completed exact map entries retire; later publications are never removed.
+  [[nodiscard]] ShutdownProgress
+  PollHostShutdown(const HostShutdownSnapshot &snapshot) noexcept;
+
   /// Stop every registered component. Host-owned cell processes retire through
   /// their own exact occurrence, independently of component removal.
   void stop_all() noexcept;
@@ -441,6 +464,7 @@ private:
   /// O(distinct actually launched IDs): vacant slots keep only two counters,
   /// never a process, generated artifacts or output tail. No silent eviction.
   std::map<std::string, Slot> processes_;
+  bool host_shutdown_started_{false};
 };
 
 /// The host's one supervisor (created on first use, lives until exit).

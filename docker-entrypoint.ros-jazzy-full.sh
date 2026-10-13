@@ -7,7 +7,7 @@ set -e
 # tooling. The prefix keeps the bytecode-cache speedup on a container path.
 export PYTHONPYCACHEPREFIX="/tmp/manyforge-pycache"
 
-ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+ROS_DISTRO="${ROS_DISTRO:-lyrical}"
 MANYFORGE_VENV="${MANYFORGE_VENV:-/opt/manyforge/venv}"
 
 if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then

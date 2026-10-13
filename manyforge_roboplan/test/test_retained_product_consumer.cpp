@@ -18,6 +18,7 @@
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
@@ -26,6 +27,8 @@
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
+#include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -3573,7 +3576,8 @@ enum class Lite6AggregateCheck {
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
   kExecutionPortParticipant,
-  kSameRoutePredecessorQualification
+  kSameRoutePredecessorQualification,
+  kMeasuredPublication, kMeasuredOptionalDomainRace, kMeasuredNullOptionalDomainRace
 };
 
 void check_refreshed_cell_model(
@@ -3861,6 +3865,7 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
           return selected;
         };
   }
+  unsigned rebinds = 0, enabled = 0, retired = 0, reentrant_reads = 0;
   auto runtime = create_retained_native_runtime(std::move(runtime_input),
                                                 std::move(runtime_config));
   if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
@@ -3885,6 +3890,201 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_NE(runtime->addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
+  if (check == Lite6AggregateCheck::kMeasuredPublication ||
+      check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
+      check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
+    // Use the already verified retained fixture and real backends/Kernel.
+    // Stop readiness is produced by the existing sealed repository boundary.
+    deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
+    core::FilesystemResolvedStopBasePlanRepository plans(temporary.path());
+    const auto make_configuration = [&](const core::RuntimeParticipantBinding &binding,
+                                        core::ActiveControlConfigurationGeneration generation) {
+      const auto &path = *binding.value().control_path;
+      const auto desired = std::find_if(
+          materialized.bundle->value().desired_control_configurations.begin(),
+          materialized.bundle->value().desired_control_configurations.end(),
+          [&](const auto &row) { return row.control_domain_id == path.control_domain_id; });
+      if (desired == materialized.bundle->value().desired_control_configurations.end())
+        throw std::runtime_error("actual fixture desired domain missing");
+      std::vector<core::ActiveControlConfigurationBindingRouteDTO> routes;
+      for (const auto &row : desired->binding_routes)
+        routes.push_back({row.control_binding_id, row.control_binding_revision, row.control_route_id});
+      core::ActiveControlConfigurationDTO result{
+          path.active_control_configuration_id, path.control_domain_id,
+          path.control_domain_revision, std::move(routes), desired->activation_set_id,
+          path.controller_topology_id, path.topology_revision,
+          path.provider_runtime_unit_id, path.provider_runtime_epoch, generation.value(),
+          {}, generation, core::ActiveControlConfigurationStateDTO::kReconciled};
+      for (const auto &representative : runtime->control_binding_representatives) {
+        const auto &selected = *representative.value().control_path;
+        if (selected.control_domain_id != path.control_domain_id) continue;
+        const auto channel = retained_bindings_share_backend_owner(runtime->motion_binding, representative)
+                                 ? runtime->motion_state_channel : runtime->gripper_state_channel;
+        for (const auto &resource : representative.value().resources)
+          result.kinematic_resource_source_projections.push_back(
+              {resource.resource_id, {{selected.control_binding_id, selected.control_binding_revision}},
+               selected.provider_instance_id, selected.provider_manifest_id,
+               selected.provider_manifest_revision, selected.state_authority_id,
+               selected.state_authority_class, channel->source_kind()});
+      }
+      std::sort(result.kinematic_resource_source_projections.begin(),
+                result.kinematic_resource_source_projections.end(),
+                [](const auto &a, const auto &b) { return a.resource_id < b.resource_id; });
+      return result;
+    };
+    const auto ready = [&](const core::ActiveControlConfigurationDTO &configuration) {
+      const auto desired = std::find_if(
+          materialized.bundle->value().desired_control_configurations.begin(),
+          materialized.bundle->value().desired_control_configurations.end(),
+          [&](const auto &row) { return row.control_domain_id == configuration.control_domain_id; });
+      if (desired == materialized.bundle->value().desired_control_configurations.end())
+        throw std::runtime_error("actual fixture desired domain missing");
+      const auto expected = deployment::load_verified_controller_lifecycle_expected_domain(
+          *materialized.bundle, artifacts, *desired,
+          configuration.source_runtime_unit_id, configuration.source_runtime_epoch);
+      std::vector<core::RuntimeParticipantBinding> bindings;
+      for (const auto &binding : runtime->control_binding_representatives)
+        if (binding.value().control_path->control_domain_id == configuration.control_domain_id)
+          bindings.push_back(binding);
+      const std::vector<core::RouteSelectionComponentExpectationDTO> components{
+          {component_id, core::ComponentLifecycleGeneration(1U), core::ComponentLifecycleStateDTO::kPrepared}};
+      return deployment::resolve_store_and_verify_route_readiness_batch(
+          *materialized.bundle, artifacts, expected, configuration, components, bindings, plans);
+    };
+    const auto initial = make_configuration(runtime->motion_binding,
+        runtime->motion_binding.value().control_path->active_control_configuration_generation);
+    ASSERT_TRUE(initial.locally_valid());
+    auto initial_ready = ready(initial);
+    ASSERT_TRUE(initial_ready.ok()) << initial_ready.error().message;
+    auto installed = runtime->PublishAndReadBackRouteConfiguration(initial, std::move(initial_ready.value()));
+    ASSERT_TRUE(installed.ok()) << installed.error().message;
+    EXPECT_EQ(installed.value().active_configuration, initial);
+    const auto absent = runtime->addressed_kernel->current_runtime_route_configuration(
+        runtime->gripper_binding->value().control_path->control_domain_id);
+    ASSERT_TRUE(absent.ok());
+    ASSERT_FALSE(absent.value());
+    const auto actual_rebind = runtime->rebind_motion_route;
+    runtime->rebind_motion_route = [&, actual_rebind](auto binding, auto aliases) {
+      ++rebinds;
+      return actual_rebind(std::move(binding), std::move(aliases));
+    };
+    auto successor = make_configuration(runtime->motion_binding,
+        core::ActiveControlConfigurationGeneration(initial.active_control_configuration_generation.value() + 1U));
+    auto successor_ready = ready(successor);
+    ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
+    const auto physical_before = runtime->motion_binding.value();
+    const auto channel_before = runtime->motion_state_channel->binding().value();
+    using PreparedResult = core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>;
+    if (check != Lite6AggregateCheck::kMeasuredPublication) {
+      const auto other = make_configuration(*runtime->gripper_binding,
+          runtime->gripper_binding->value().control_path->active_control_configuration_generation);
+      auto other_ready = ready(other);
+      ASSERT_TRUE(other_ready.ok()) << other_ready.error().message;
+      bool outer = true;
+      runtime->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &) {
+        if (!outer) return PreparedResult::Ok(nullptr);
+        outer = false;
+        const auto nested = runtime->PublishAndReadBackRouteConfiguration(other, other_ready.value());
+        EXPECT_TRUE(nested.ok()) << (nested.ok() ? "" : nested.error().message);
+        if (check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace)
+          return PreparedResult::Ok(nullptr);
+        return PreparedResult::Ok(std::make_shared<RetainedPreparedRobotMeasuredSources>(
+            RetainedPreparedRobotMeasuredSources{{motion.value().controllable_component_id, {}}, [&] { ++enabled; }}));
+      };
+      const auto raced = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
+      ASSERT_FALSE(raced.ok());
+      EXPECT_EQ(raced.error().details.at("reason"), "measured_source_association_changed");
+      EXPECT_EQ(rebinds, 0U);
+      EXPECT_EQ(enabled, 0U);
+      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
+      const auto still_current = runtime->addressed_kernel->current_runtime_route_configuration(initial.control_domain_id);
+      ASSERT_TRUE(still_current.ok());
+      ASSERT_TRUE(still_current.value());
+      EXPECT_EQ(still_current.value()->active_configuration, initial);
+      const auto appeared = runtime->addressed_kernel->current_runtime_route_configuration(other.control_domain_id);
+      ASSERT_TRUE(appeared.ok());
+      ASSERT_TRUE(appeared.value());
+      EXPECT_EQ(appeared.value()->active_configuration, other);
+      return;
+    }
+    runtime->prepare_measured_sources = [&](const auto &, const auto &, const auto &) {
+      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
+      EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
+      EXPECT_EQ(rebinds, 0U);
+      return PreparedResult::Err({"test_association_invalid", "exact source association refused", {}});
+    };
+    const auto rejected = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "test_association_invalid");
+    EXPECT_EQ(rebinds, 0U);
+    EXPECT_EQ(runtime->motion_binding.value(), physical_before);
+    EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
+    const auto failed_readback = runtime->addressed_kernel->current_runtime_route_configuration(initial.control_domain_id);
+    ASSERT_TRUE(failed_readback.ok());
+    ASSERT_TRUE(failed_readback.value());
+    EXPECT_EQ(failed_readback.value()->active_configuration, initial);
+    struct ProducerLease final {
+      std::function<void()> retire;
+      ~ProducerLease() { retire(); }
+    };
+    std::weak_ptr<const RetainedPreparedRobotMeasuredSources> committed;
+    runtime->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &configurations) {
+      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
+      EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
+      EXPECT_EQ(rebinds, 0U);
+      EXPECT_EQ(configurations.size(), 1U); // the genuinely absent tool domain stays absent
+      auto lease = std::make_shared<ProducerLease>();
+      lease->retire = [&, weak_runtime = std::weak_ptr<RetainedNativeRuntime>(runtime)] {
+        ++retired;
+        auto live = weak_runtime.lock();
+        if (!live) return;
+        // Reenter the actual route exclusion after retirement. The configured
+        // nil preparer has no side effects and cannot recursively own a lease.
+        const auto unavailable = live->PrepareCurrentMeasuredSources();
+        EXPECT_FALSE(unavailable.ok());
+        if (!unavailable.ok()) {
+          EXPECT_EQ(unavailable.error().details.at("reason"), "measured_prepared_sources_missing");
+        }
+        ++reentrant_reads;
+      };
+      auto prepared = std::make_shared<RetainedPreparedRobotMeasuredSources>(
+          RetainedPreparedRobotMeasuredSources{{motion.value().controllable_component_id, {}},
+              [&, lease, successor] {
+                ++enabled;
+                const auto current = runtime->addressed_kernel->current_runtime_route_configuration(successor.control_domain_id);
+                EXPECT_TRUE(current.ok());
+                if (current.ok() && current.value())
+                  EXPECT_EQ(current.value()->active_configuration, successor);
+                else ADD_FAILURE() << "Enable preceded exact Kernel publication";
+                EXPECT_EQ(runtime->motion_binding.value().control_path->active_control_configuration_generation,
+                          successor.active_control_configuration_generation);
+              }});
+      committed = prepared;
+      return PreparedResult::Ok(prepared);
+    };
+    const auto published = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
+    ASSERT_TRUE(published.ok()) << published.error().message;
+    EXPECT_EQ(published.value().active_configuration, successor);
+    EXPECT_EQ(enabled, 1U);
+    EXPECT_EQ(rebinds, 1U);
+    EXPECT_FALSE(committed.expired());
+    EXPECT_EQ(retired, 0U);
+    runtime->prepare_measured_sources = [](const auto &, const auto &, const auto &) { return PreparedResult::Ok(nullptr); };
+    auto nil_configuration = make_configuration(runtime->motion_binding,
+        core::ActiveControlConfigurationGeneration(successor.active_control_configuration_generation.value() + 1U));
+    auto nil_ready = ready(nil_configuration);
+    ASSERT_TRUE(nil_ready.ok()) << nil_ready.error().message;
+    const auto nil_published = runtime->PublishAndReadBackRouteConfiguration(nil_configuration, nil_ready.value());
+    ASSERT_TRUE(nil_published.ok()) << nil_published.error().message;
+    EXPECT_EQ(nil_published.value().active_configuration, nil_configuration);
+    EXPECT_EQ(runtime->motion_state_channel->binding().value(), runtime->motion_binding.value());
+    EXPECT_EQ(enabled, 1U);
+    EXPECT_EQ(rebinds, 2U);
+    EXPECT_TRUE(committed.expired());
+    EXPECT_EQ(retired, 1U);
+    EXPECT_EQ(reentrant_reads, 1U);
+    return;
+  }
   if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification) {
     const auto before = runtime->motion_binding;
     const auto &path = *before.value().control_path;
@@ -4456,6 +4656,16 @@ TEST(RetainedProductCrossConsumer,
 TEST(RetainedProductCrossConsumer,
      SameRoutePredecessorAdoptionPreservesExactScaleQualificationWithoutOpeningReadiness) {
   check_predicted_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
+}
+
+TEST(RetainedNativeMeasuredRoutePublication, ExactStagePrecedesRebindAndRealThenNullCommitPreserveKernelPublication) {
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
+}
+TEST(RetainedNativeMeasuredRoutePublication, RealStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredOptionalDomainRace);
+}
+TEST(RetainedNativeMeasuredRoutePublication, NullStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
+  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredNullOptionalDomainRace);
 }
 
 TEST(RetainedProductCrossConsumer,

@@ -7,6 +7,7 @@
 
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 
@@ -39,8 +40,7 @@ prepared_activation_artifact_rows(std::vector<PreparedActivationArtifact> artifa
 /// Scenario-level facts of one prepared activation that are not derived from
 /// the retained bundle, Program or role assignment.
 struct PreparedActivationAssemblyInput final {
-  core::ContentDigest source_document_digest;
-  std::string scenario_id;
+  PreparedActivationOrigin origin;
   core::ContentDigest captured_input_digest;
   /// One of "required", "optional" or "forbidden".
   std::string assistant_mode;
@@ -57,6 +57,18 @@ struct PreparedActivationAssemblyInput final {
     const VerifiedRetainedModelMap &model_map,
     const ProgramBindingContract &program, const CanonicalValue &role_assignment,
     const ICatalogArtifactSource &catalog, const IRawArtifactStore &raw_artifacts);
+
+/// Derive the no-Program origin and capture from the actual verified admission.
+/// Preserve its exact infrastructure bundle and required retained artifacts.
+[[nodiscard]] PreparedActivationInput assemble_sealed_canonical_empty_activation(
+    const CanonicalEmptyRetainedBundleAdmission &admission,
+    const ICatalogArtifactSource &catalog,
+    const FilesystemVerifiedRawArtifactSource &raw_artifacts);
+
+/// Compare a structurally parsed sealed origin with the actual owner proof.
+void verify_prepared_canonical_empty_origin(
+    const PreparedActivationInput &prepared,
+    const CanonicalEmptyRetainedBundleAdmission &admission);
 
 /// Assemble for a candidate whose retained product set may contain no model
 /// map. Absence is accepted only when the candidate has no controllable
@@ -83,7 +95,8 @@ public:
 
   /// The verified stored value, or null when none is stored under this id.
   [[nodiscard]] std::shared_ptr<const PreparedActivationInput>
-  get_verified(const core::ContentDigest &prepared_activation_id) const;
+  get_verified(const core::ContentDigest &prepared_activation_id,
+               const CanonicalEmptyRetainedBundleAdmission *sealed_admission = nullptr) const;
 
 private:
   std::filesystem::path root_;

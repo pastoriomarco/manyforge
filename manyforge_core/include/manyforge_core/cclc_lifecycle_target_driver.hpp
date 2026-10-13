@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/component_lifecycle_readiness.hpp>
+
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -266,6 +268,11 @@ class CCLCLifecycleTargetDriver final {
 
   /// Durable target plus owner-local progress for one component.
   [[nodiscard]] Result<ComponentLifecycleTargetViewDTO> ReadTargetView(
+      const ControllableComponentId& component);
+
+  /// Side-effect-free current retained facts, including a no-target incident
+  /// and unrecorded owner causes. Never retries writes or evaluates a target.
+  [[nodiscard]] Result<ComponentLifecycleReadinessTargetFactsDTO> ReadReadinessFacts(
       const ControllableComponentId& component);
 
   /// The operator's Recover of an open incident (contract item 3): an

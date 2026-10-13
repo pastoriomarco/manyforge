@@ -112,7 +112,8 @@ public:
       core::FilesystemResolvedStopBasePlanRepository *existing_repository =
           nullptr,
       std::shared_ptr<const void> installed_lifetime = {},
-      std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_inventory = {})
+      std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_inventory = {},
+      CCLCReadinessSourceCapture capture_readiness_sources = {})
       : installed_product_lifetime(std::move(installed_lifetime)),
         retained_bundle(std::move(bundle)),
         active_publication_reader(publication_reader),
@@ -141,7 +142,8 @@ public:
                  readiness,
                  ProductIdentity(*retained_bundle, expected_publication),
                  &route_snapshot_source,
-                 std::move(measured_inventory)} {}
+                 std::move(measured_inventory),
+                 std::move(capture_readiness_sources)} {}
 
   // First member: all borrowed installed product sources/ports are destroyed
   // before this single owning lifetime pin is released.
@@ -234,7 +236,9 @@ CCLCRuntimeComposition::Create(
         core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
             const core::ControlDomainId &)>
         kernel_current_configuration_source,
-    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port) {
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port,
+    std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_state_inventory,
+    CCLCReadinessSourceCapture capture_readiness_sources) {
   if (!config.trusted_roots_valid() || retained_bundle == nullptr ||
       !expected_active_publication.valid() ||
       expected_active_publication.request.candidate_retained_bundle_id !=
@@ -260,7 +264,9 @@ CCLCRuntimeComposition::Create(
             std::move(kernel_current_configuration_source),
             kernel_cell_admission_port,
             kernel_route_fence_port, kernel_publication_owner, clock,
-            scheduler, component_command_readiness_port));
+            scheduler, component_command_readiness_port,
+            std::move(measured_state_inventory),
+            std::move(capture_readiness_sources)));
     return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Ok(
         std::move(result));
   } catch (const std::exception &exception) {
@@ -332,7 +338,9 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
     core::IClock &clock, core::IScheduler &scheduler,
-    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port)
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port,
+    std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_state_inventory,
+    CCLCReadinessSourceCapture capture_readiness_sources)
     : config_(std::move(config)),
       journal_(config_.state_root / std::string(core::kCCLCJournalFilename),
                config_.cell_id, config_.exact_result_history_capacity,
@@ -347,7 +355,10 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
           std::move(controller_ports), std::move(source_projections),
           std::move(kernel_current_configuration_source), plan_repository_,
           config_, kernel_route_fence_port, kernel_publication_owner, clock,
-          component_command_readiness_port)),
+          component_command_readiness_port, nullptr,
+          std::shared_ptr<const void>{},
+          std::move(measured_state_inventory),
+          std::move(capture_readiness_sources))),
       coordinator_(
           config_.coordinator, journal_, domain_reservations_,
           std::shared_ptr<const core::ComponentLifecycleProductContext>(
@@ -420,7 +431,8 @@ CCLCRuntimeComposition::PrepareProductContext(CCLCProductContextInputs inputs) {
         config_, kernel_route_fence_port_, inputs.kernel_publication_owner,
         clock_, inputs.readiness_port, plan_repository_.get(),
         std::move(inputs.installed_product_lifetime),
-        std::move(inputs.measured_state_inventory));
+        std::move(inputs.measured_state_inventory),
+        std::move(inputs.capture_readiness_sources));
     // Recheck after construction/source qualification, outside owner locks.
     const auto after =
         product->active_publication_reader.ReadActiveBundlePublication(
@@ -558,6 +570,35 @@ CCLCRuntimeComposition::RecordCellObserverIncident(
 core::Result<std::optional<core::CellObserverIncidentRecordDTO>>
 CCLCRuntimeComposition::LoadOpenCellObserverIncident() {
   return journal_.LoadOpenCellObserverIncident();
+}
+
+core::Result<std::optional<core::CellObserverLossAssociationDTO>>
+CCLCRuntimeComposition::LoadOpenCellObserverLossAssociation() {
+  return journal_.LoadOpenCellObserverLossAssociation();
+}
+
+core::Result<std::optional<core::CellObserverBringUpRecordDTO>>
+CCLCRuntimeComposition::LoadLatestCellObserverBringUp() {
+  return journal_.LoadLatestCellObserverBringUp();
+}
+core::Result<core::CellObserverBringUpAdmissionDTO>
+CCLCRuntimeComposition::BeginLatestCellObserverBringUp(
+    const core::CellObserverBringUpRecordDTO &admitted,
+    const std::optional<core::CellObserverBringUpRecordDTO> &expected_latest) {
+  return journal_.BeginLatestCellObserverBringUp(admitted, expected_latest);
+}
+core::Result<core::CellObserverBringUpRecordDTO>
+CCLCRuntimeComposition::UpdateLatestCellObserverBringUp(
+    const core::CellObserverBringUpRecordDTO &expected,
+    const core::CellObserverBringUpRecordDTO &updated) {
+  return journal_.UpdateLatestCellObserverBringUp(expected, updated);
+}
+core::Result<core::CellObserverBringUpRecordDTO>
+CCLCRuntimeComposition::CloseCellObserverIncidentByOperatorBringUp(
+    const core::CellObserverBringUpRecordDTO &expected_started,
+    const core::CellObserverBringUpOpenDTO &first_open) {
+  return journal_.CloseCellObserverIncidentByOperatorBringUp(expected_started,
+                                                             first_open);
 }
 
 core::Result<core::ApplyComponentGenerationSelectionDTO>

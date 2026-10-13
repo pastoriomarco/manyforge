@@ -432,9 +432,10 @@ void WriteMetadata(
   for (const auto scenario_id : scenario_ids) {
     const auto prepared = deployment::assemble_prepared_activation(
         deployment::PreparedActivationAssemblyInput{
+            deployment::PreparedScenarioOrigin{
+                std::string(scenario_id),
+                core::ContentDigest("sha256:" + std::string(64U, 'e'))},
             core::ContentDigest("sha256:" + std::string(64U, '2')),
-            std::string(scenario_id),
-            core::ContentDigest("sha256:" + std::string(64U, 'e')),
             "optional",
         },
         bundle, *model_map, *program.program, program.role_assignment,

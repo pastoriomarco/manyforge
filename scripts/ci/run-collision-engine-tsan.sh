@@ -38,13 +38,13 @@ if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
 fi
 export TSAN_OPTIONS
 
-if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+if [[ -f "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash" ]]; then
   # CMake's ament package templates import ament_package from the ROS Python
   # tree. Source ROS here so the TSan lane is reproducible under docker exec and
   # not dependent on an interactive shell profile.
   # shellcheck disable=SC1091
   set +u
-  source /opt/ros/jazzy/setup.bash
+  source "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"
   set -u
 fi
 

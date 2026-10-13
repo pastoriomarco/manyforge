@@ -8,6 +8,17 @@
 > `b6a6796ad8b14f1ed1d5c6585c3a5677ad848926`; it is a reimplementation and
 > acceptance reference, not a runnable fallback.
 
+Temporary qualification hold: the experimental real-Lite6 overlay remains
+on its existing Jazzy base. A Lyrical xArm driver build plus mock bring-up is
+required before changing that default; no hardware run is authorized by these
+tooling changes. The ordinary full Lyrical development image is independent.
+The builder uses the dedicated `MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE` input,
+whose default is the preserved laptop amd64 image
+`manyforge-ros-jazzy-full:q44-20261010`. The common Lyrical image override
+does not select this base. Current Orin/Thor inventories lack that held image;
+their held lane remains unavailable until an explicit qualified base is supplied.
+The common full-image build does not recreate this preserved Jazzy base.
+
 This runbook qualifies one physical Lite6 for the experimental ManyForge
 real-robot lane. It separates safe observation, supervised lifecycle
 qualification, and physical motion. Passing an earlier stage never authorizes a

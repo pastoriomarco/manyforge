@@ -1268,6 +1268,44 @@ it('accepts an authorization-only incident Recover only for the requested compon
 });
 
 
+it('Close Recover requires the exact incident and its typed closure reason on submission and readback', async () => {
+  const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
+    request_context: { request_id: 'close.recover', request_owner_epoch: 'owner.1',
+      source_label: 'manyforge_composer', correlation_id: 'close.1' },
+    controllable_component_id: 'component.arm', intent: 'recover',
+    expected_graph_revision: 'graph.1', expected_component_lifecycle_generation: 4,
+    expected_admission_generation: 7, expected_control_domains: [],
+    reason: 'cell closed by operator', close_incident_recovery: { expected_incident_id: 'incident.1' },
+    confirmed: true,
+  };
+  const recovery = { acknowledged_at_ns: 9000, acknowledged_by: 'manyforge_composer',
+    cause_class: 'provider_lost', controllable_component_id: 'component.arm',
+    incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator' };
+  const envelope = { acceptance: null, status: null, replay_status: 'accepted_new',
+    incident_recovery: recovery };
+  const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+  fetchMock.mockResolvedValue(response(envelope));
+  await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({
+    incidentRecovery: { incidentId: 'incident.1', closureReason: 'cell_closed_by_operator' },
+  });
+  fetchMock.mockResolvedValue(response({ result: envelope }));
+  await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({
+    incidentRecovery: { incidentId: 'incident.1', closureReason: 'cell_closed_by_operator' },
+  });
+  for (const invalid of [
+    { ...recovery, incident_id: 'incident.replaced' },
+    Object.fromEntries(Object.entries(recovery).filter(([key]) => key !== 'closure_reason')),
+  ]) {
+    fetchMock.mockResolvedValue(response({ ...envelope, incident_recovery: invalid }));
+    await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('exact incident');
+    fetchMock.mockResolvedValue(response({ result: { ...envelope, incident_recovery: invalid } }));
+    await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('exact incident');
+  }
+  fetchMock.mockResolvedValue(response({ acceptance: null, status: null,
+    replay_status: 'stale_request_owner_epoch' }));
+  await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({ replayStatus: 'stale_request_owner_epoch', incidentRecovery: null });
+});
+
 describe('exact lifecycle request-result read', () => {
   const request: Parameters<typeof api.cclc.lifecycleRequestResult>[0] = {
     request_context: { request_id: 'sent.request', request_owner_epoch: 'owner.1',
@@ -1304,5 +1342,111 @@ describe('exact lifecycle request-result read', () => {
       fetchMock.mockResolvedValue(response(payload));
       await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('must contain only result');
     }
+  });
+});
+
+
+it.each(['accepted_new', 'replayed_exact', 'stale_request_owner_epoch', 'request_id_conflict', 'request_ledger_full', 'request_result_expired'])(
+  'requires Close acknowledgement only for accepted recovery, preserving %s', async (replay) => {
+    const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
+      request_context: { request_id: 'close.1', request_owner_epoch: 'owner.1', source_label: 'composer', correlation_id: null },
+      controllable_component_id: 'component.arm', intent: 'recover', expected_graph_revision: 'graph.1',
+      expected_component_lifecycle_generation: 4, expected_admission_generation: 7, expected_control_domains: [],
+      reason: 'cell closed by operator', confirmed: true, close_incident_recovery: { expected_incident_id: 'incident.1' },
+    };
+    const result = { acceptance: null, status: null, replay_status: replay };
+    const accepted = replay === 'accepted_new' || replay === 'replayed_exact';
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(response(result));
+    if (accepted) await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('exact incident');
+    else await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({ replayStatus: replay, incidentRecovery: null });
+    fetchMock.mockResolvedValue(response({ result }));
+    if (accepted) await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('exact incident');
+    else await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({ replayStatus: replay, incidentRecovery: null });
+    if (!accepted) {
+      const ack = { ...result, incident_recovery: { acknowledged_at_ns: 1, acknowledged_by: 'composer',
+        cause_class: 'provider_lost', controllable_component_id: 'component.arm', incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator' } };
+      fetchMock.mockResolvedValue(response(ack));
+      await expect(api.cclc.submitLifecycle(request)).rejects.toThrow();
+      fetchMock.mockResolvedValue(response({ result: ack }));
+      await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow();
+    }
+  },
+);
+it.each([undefined, null])('ordinary Recover rejects a Close acknowledgement when Close field is %s', async (close) => {
+  const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
+    request_context: { request_id: 'recover.1', request_owner_epoch: 'owner.1', source_label: 'composer', correlation_id: null },
+    controllable_component_id: 'component.arm', intent: 'recover', expected_graph_revision: 'graph.1',
+    expected_component_lifecycle_generation: 4, expected_admission_generation: 7, expected_control_domains: [],
+    reason: 'operator recovery', confirmed: true, close_incident_recovery: close,
+  };
+  const result = { acceptance: null, status: null, replay_status: 'accepted_new', incident_recovery: {
+    acknowledged_at_ns: 1, acknowledged_by: 'composer', cause_class: 'provider_lost',
+    controllable_component_id: 'component.arm', incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator',
+  } };
+  const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+  fetchMock.mockResolvedValue(response(result));
+  await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('Ordinary Recover');
+  fetchMock.mockResolvedValue(response({ result }));
+  await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('Ordinary Recover');
+});
+
+
+describe('canonical-empty preparation response envelope', () => {
+  const actualResponse = {
+  "prepared_activation": {
+    "assistant_mode": "optional",
+    "captured_input_digest": "sha256:c4c20c8f79a0c76ee1304bb429025afb690fd37a39f578a06cb7a8d36a9a54c5",
+    "deployment_artifact_id": "ur5e_lite6_wall.canonical_empty",
+    "deployment_revision": "sha256:a054aaab64456ed3e895b4b60ec3f3391553040e1204e9cf6c2be737ca70a2de",
+    "graph_revision": "sha256:f528d4acf2fed2bea4794c767141c2083356bd0730a20a98060a9959534d466d",
+    "node_environment_digest": "sha256:827d1febcd0154c0fd1daca27e4d02a5682de4287737cc7dbb99eb378eb1f954",
+    "origin": {
+      "admission_digest": "sha256:a21efe1461d8c6fa3ad31b0827d1796ee915e9e06b2fb68eda714349fa461204",
+      "cell_id": "ui6i_ur5e_lite6_wall_cell",
+      "deployment_artifact_id": "ur5e_lite6_wall.canonical_empty",
+      "deployment_revision": "sha256:a054aaab64456ed3e895b4b60ec3f3391553040e1204e9cf6c2be737ca70a2de",
+      "graph_revision": "sha256:f528d4acf2fed2bea4794c767141c2083356bd0730a20a98060a9959534d466d",
+      "kind": "sealed_canonical_empty",
+      "retained_bundle_id": "sha256:e42be21788712cf9227f8304f8e1d405370b57ac05f2534c4c32719d90ce7266"
+    },
+    "prepared_activation_id": "sha256:3fbca34cd16ac03f92fceea93bb031f760296e076437831f9a3b58bc294041f8",
+    "program_id": null,
+    "program_outcome": {
+      "kind": "no_program"
+    },
+    "program_revision": null,
+    "retained_bundle_id": "sha256:e42be21788712cf9227f8304f8e1d405370b57ac05f2534c4c32719d90ce7266",
+    "schema_version": "manyforge.prepared_activation_input.v6"
+  }
+};
+  it('unwraps the actual live v6 sealed preparation without changing its receipt', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(actualResponse));
+    vi.stubGlobal('fetch', fetchMock);
+    const body = { request_owner_epoch: 'actual.manager', expected_admission_generation: 50,
+      origin: actualResponse.prepared_activation.origin };
+    const prepared = await api.manager.prepareCanonicalEmpty(body);
+    expect(prepared).toEqual(actualResponse.prepared_activation);
+    expect(prepared.prepared_activation_id).toBe(actualResponse.prepared_activation.prepared_activation_id);
+    expect(prepared.program_outcome).toEqual({ kind: 'no_program' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/activation-preparations');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(String(options.body))).toEqual(body);
+  });
+  it.each(['bare', 'extra', 'missing', 'null-receipt', 'extra-receipt'])('rejects a malformed %s carrier', async (kind) => {
+    let payload: unknown = actualResponse;
+    if (kind === 'bare') payload = actualResponse.prepared_activation;
+    if (kind === 'extra') payload = { ...actualResponse, unexpected: true };
+    if (kind === 'missing') payload = {};
+    if (kind === 'null-receipt') payload = { prepared_activation: null };
+    if (kind === 'extra-receipt') payload = {
+      prepared_activation: { ...actualResponse.prepared_activation, unexpected: true },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(response(payload));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.manager.prepareCanonicalEmpty({})).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

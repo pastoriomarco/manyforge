@@ -176,6 +176,14 @@ public:
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO
                         &native_runtime_binding) const override;
+  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<
+      ManagerComponentProcessInventoryResultDTO>
+  InspectInstalledComponentProcesses(
+      const ManagerComponentProcessInventoryRequestDTO &request) override;
   [[nodiscard]] manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
   InspectComponentBringUp(const ManagerComponentBringUpInspectionRequestDTO &request) override;
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(

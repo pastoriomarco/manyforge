@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import {
   StructuralContractError,
+  parsePreparedActivationInput,
   parseAuthoringWorkspaceSnapshot,
   parseAppliedProgramSelection,
   parseAppliedProgramStatus,
@@ -39,6 +40,7 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunStatus,
   parseApiErrorDto,
+  parseKnownProgramRunOutcome,
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioDocumentIndexResponse,
@@ -572,10 +574,9 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     intent_digest: `sha256:${'f'.repeat(64)}`,
     phase: 'fence_held',
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v5',
+      schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
-      scenario_id: 'fixture',
-      source_document_digest: `sha256:${'b'.repeat(64)}`,
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}` },
       captured_input_digest: `sha256:${'c'.repeat(64)}`,
       deployment_artifact_id: 'deployment.fixture',
       deployment_revision: `sha256:${'d'.repeat(64)}`,
@@ -1444,10 +1445,9 @@ describe('Program product projections', () => {
       status: 'accepted',
       confirmation_token: null,
       prepared_activation: {
-        schema_version: 'manyforge.prepared_activation_input.v5',
+        schema_version: 'manyforge.prepared_activation_input.v6',
         prepared_activation_id: digestC,
-        scenario_id: 'fixture',
-        source_document_digest: digestA,
+        origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
         captured_input_digest: digestB,
         deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
@@ -1515,9 +1515,8 @@ describe('Applied Program status parser', () => {
     program_revision: digest,
     record_digest: digest,
     retained_bundle_id: digest,
-    scenario_id: 'scenario-a',
+    origin: { kind: 'scenario', scenario_id: 'scenario-a', source_document_digest: digest },
     schema_version: 'manyforge.applied_program_status.v2',
-    source_document_digest: digest,
   };
 
   it('reports an executable Program with no references', () => {
@@ -1683,10 +1682,9 @@ describe('Deployment workspace parser', () => {
     const digestB = `sha256:${'b'.repeat(64)}`;
     const digestC = `sha256:${'c'.repeat(64)}`;
     const preparedActivation = {
-      schema_version: 'manyforge.prepared_activation_input.v5',
+      schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: digestC,
-      scenario_id: 'fixture',
-      source_document_digest: digestA,
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
       captured_input_digest: digestB,
       deployment_artifact_id: 'deployment.fixture',
       deployment_revision: digestA,
@@ -1718,7 +1716,7 @@ describe('Deployment workspace parser', () => {
       preview_ms: 8.25,
     });
     expect(parsed.result.applyId).toBe('apply-1');
-    expect(parsed.result.preparedActivation.scenarioId).toBe('fixture');
+    expect((parsed.result.preparedActivation.origin as { scenarioId: string }).scenarioId).toBe('fixture');
   });
 
   it('accepts the authored graph without embedding its compiler-issued revision', () => {
@@ -4140,5 +4138,95 @@ describe('expression check parser', () => {
       diagnostics: [{ code: 'x', message: 'm', position: 1, length: null, name: null }],
     })).toThrow('a position and a length together, or neither');
     expect(() => parseExpressionCheckResult({ ...valid, extra: true })).toThrow('exactly');
+  });
+});
+
+describe('typed prepared activation origin v6', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v6',
+    origin: { kind: 'sealed_canonical_empty', cell_id: 'cell_a', deployment_artifact_id: 'deployment_a',
+      deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, admission_digest: digest },
+    prepared_activation_id: digest, captured_input_digest: digest, deployment_artifact_id: 'deployment_a',
+    deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest,
+    program_id: null, program_revision: null, program_outcome: { kind: 'no_program' },
+    node_environment_digest: digest, assistant_mode: 'optional' });
+
+  it('keeps sealed admission identity without a fabricated Scenario or Program', () => {
+    const parsed = parsePreparedActivationInput(receipt(), 'prepared');
+    expect(parsed.origin).toEqual({ kind: 'sealed_canonical_empty', cellId: 'cell_a', deploymentArtifactId: 'deployment_a',
+      deploymentRevision: digest, retainedBundleId: digest, graphRevision: digest, admissionDigest: digest });
+    expect(parsed).not.toHaveProperty('scenarioId');
+    expect(parsed.programId).toBeNull();
+  });
+
+  it.each(['v3', 'v4', 'v5'])('refuses obsolete prepared schema %s', (version) => {
+    expect(() => parsePreparedActivationInput({ ...receipt(), schema_version: `manyforge.prepared_activation_input.${version}` }, 'prepared')).toThrow();
+  });
+
+  it.each([
+    { scenario_id: 'fake' }, { source_document_digest: null }, { program_id: 'fake' },
+    { program_revision: digest }, { assistant_mode: 'required' }, { deployment_artifact_id: 'foreign' },
+    { graph_revision: `sha256:${'b'.repeat(64)}` }, { retained_bundle_id: `sha256:${'b'.repeat(64)}` },
+    { deployment_revision: `sha256:${'b'.repeat(64)}` },
+  ])('refuses branch-inconsistent receipt %j', (change) => {
+    expect(() => parsePreparedActivationInput({ ...receipt(), ...change }, 'prepared')).toThrow();
+  });
+
+  it.each([{ kind: 'future' }, { scenario_id: null }, { source_document_digest: digest },
+    { cell_id: 'x'.repeat(129) }, { admission_digest: 'not-a-digest' }, { deployment_artifact_id: '' }])(
+    'refuses mixed or invalid origin %j', (change) => {
+      const value = receipt();
+      expect(() => parsePreparedActivationInput({ ...value, origin: { ...value.origin, ...change } }, 'prepared')).toThrow();
+    });
+});
+
+it('projects sealed no-Program status without inventing Scenario facts', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const status = { schema_version: 'manyforge.applied_program_status.v2', deployment_artifact_id: 'deployment_a',
+    deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, record_digest: digest,
+    executable: false, program_id: null, program_revision: null, program_binding_id: null, program: null,
+    non_executable: null, message: 'No Program is selected',
+    origin: { kind: 'sealed_canonical_empty', cell_id: 'cell_a', deployment_artifact_id: 'deployment_a',
+      deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, admission_digest: digest } };
+  expect(parseAppliedProgramStatus(status).origin.kind).toBe('sealed_canonical_empty');
+  expect(parseAppliedProgramStatus(status)).not.toHaveProperty('scenarioId');
+  for (const change of [{ scenario_id: 'fake' }, { program_id: 'fake' }, { deployment_artifact_id: 'foreign' }]) {
+    expect(() => parseAppliedProgramStatus({ ...status, ...change })).toThrow();
+  }
+});
+
+
+describe('closed known Program Run outcomes', () => {
+  function outcome(code = 'program_run_started_then_failed') {
+    const before = code === 'program_run_stopped_before_start';
+    const stopped = before || code === 'program_run_superseded_by_stop';
+    return { detail: { code, message: stopped ? 'Operator Stop won' : 'Component became inactive',
+      details: { program_run_id: 'program-cycle.2', claim_generation: before ? null : 9,
+        needs_reset: true, cause_code: stopped ? 'program_run_superseded_by_stop' : 'program_required_component_not_active',
+        cause_message: stopped ? 'Operator Stop won' : 'Component became inactive',
+        ...(stopped ? { stopped_by_operator: true } : {}), ...(before ? { no_effect: true } : {}),
+        actual_native_comparison: 'preserved',
+      } } };
+  }
+  it.each(['program_run_started_then_failed', 'program_run_superseded_by_stop',
+    'program_run_stopped_before_start'])('reads the actual typed %s and native facts', (code) => {
+    const parsed = parseKnownProgramRunOutcome(outcome(code), code === 'program_run_stopped_before_start' ? 409 : 422);
+    expect(parsed.code).toBe(code);
+    expect(parsed.details?.actual_native_comparison).toBe('preserved');
+    expect(parsed.details?.needs_reset).toBe(true);
+  });
+  it.each(['envelope-extra', 'dto-extra', 'unknown-kind', 'missing-run', 'reset-string',
+    'claim-string', 'nested-native', 'foreign-stop-field', 'wrong-status'])('rejects %s', (caseName) => {
+    const value = outcome() as unknown as { detail: Record<string, unknown>; [key: string]: unknown };
+    const details = value.detail.details as Record<string, unknown>;
+    if (caseName === 'envelope-extra') value.extra = true;
+    if (caseName === 'dto-extra') value.detail.kind = 'failed';
+    if (caseName === 'unknown-kind') value.detail.code = 'program_outcome_other';
+    if (caseName === 'missing-run') delete details.program_run_id;
+    if (caseName === 'reset-string') details.needs_reset = 'true';
+    if (caseName === 'claim-string') details.claim_generation = '9';
+    if (caseName === 'nested-native') details.actual_native_comparison = { changed: true };
+    if (caseName === 'foreign-stop-field') details.stopped_by_operator = true;
+    expect(() => parseKnownProgramRunOutcome(value, caseName === 'wrong-status' ? 409 : 422)).toThrow();
   });
 });

@@ -313,6 +313,58 @@ void ExpectBothComponents(const core::ConfigurationFenceScopeDTO &scope) {
   EXPECT_EQ(scope.domains.size(), 2U);
 }
 
+TEST(ApplyAffectedScope,
+     ActualRestartAddsOnlyItsResourcesToTheExistingAuthoredClosure) {
+  const auto graph = NativeGraph();
+  const auto predecessor = Bundle(graph, NativeProducts());
+  auto candidate = predecessor;
+  EXPECT_TRUE(derive_apply_configuration_fence_scope_verified_values(
+                  predecessor, candidate)
+                  .resources.empty());
+  const std::vector restart{core::ControllableComponentId("component-b")};
+  ExpectOnlyComponentB(derive_apply_configuration_fence_scope_verified_values(
+      predecessor, candidate, restart));
+  auto changed = graph;
+  std::get<core::JsonValueDTO::Array>(
+      changed.runtime_units.front()
+          .configuration.at("initial_joint_positions_rad")
+          .value)
+      .front() = core::JsonValueDTO{0.3};
+  candidate = Bundle(changed, NativeProducts());
+  ExpectBothComponents(derive_apply_configuration_fence_scope_verified_values(
+      predecessor, candidate, restart));
+  const std::vector foreign{core::ControllableComponentId("foreign-component")};
+  EXPECT_THROW(derive_apply_configuration_fence_scope_verified_values(
+                   predecessor, candidate, foreign),
+               ApplyAffectedScopeError);
+}
+
+TEST(ApplyAffectedScope,
+     FailedAddedOwnerUsesItsExactTerminalProductResourcesForEmptyApply) {
+  const auto empty = Bundle(Graph({}, {}, {}, {}), NativeProducts());
+  const auto failed = Bundle(NativeGraph(), NativeProducts());
+  const std::vector components{core::ControllableComponentId("component-b")};
+  const std::vector<const core::RetainedBundleDTO *> sources{&failed};
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      empty, empty, components, sources);
+  ExpectOnlyComponentB(scope);
+  EXPECT_FALSE(
+      scope.bindings.front().candidate_control_binding_revision.has_value());
+  auto conflicting = failed;
+  conflicting.cell_graph.control_bindings.back().control_binding_revision =
+      core::ControlBindingRevision("conflicting.actual.revision");
+  const std::vector<const core::RetainedBundleDTO *> conflict{&failed,
+                                                              &conflicting};
+  const std::vector both{core::ControllableComponentId("component-a"),
+                         core::ControllableComponentId("component-b")};
+  EXPECT_THROW(derive_apply_configuration_fence_scope_verified_values(
+                   empty, empty, both, conflict),
+               ApplyAffectedScopeError);
+  EXPECT_THROW(derive_apply_configuration_fence_scope_verified_values(
+                   empty, empty, components),
+               ApplyAffectedScopeError);
+}
+
 TEST(ApplyAffectedScope, NativeInitialPositionChangeFencesOnlyItsComponent) {
   const auto predecessor = NativeGraph();
   auto candidate = predecessor;

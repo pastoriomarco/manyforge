@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <variant>
 
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/retained_product.hpp>
@@ -18,7 +19,31 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v5";
+    "manyforge.prepared_activation_input.v6";
+
+struct PreparedScenarioOrigin final {
+  std::string scenario_id;
+  core::ContentDigest source_document_digest;
+  friend bool operator==(const PreparedScenarioOrigin &, const PreparedScenarioOrigin &) = default;
+};
+
+struct PreparedSealedCanonicalEmptyOrigin final {
+  core::CellId cell_id;
+  core::DeploymentArtifactId deployment_artifact_id;
+  core::DeploymentRevision deployment_revision;
+  core::RetainedBundleId retained_bundle_id;
+  core::GraphRevision graph_revision;
+  core::ContentDigest admission_digest;
+  friend bool operator==(const PreparedSealedCanonicalEmptyOrigin &, const PreparedSealedCanonicalEmptyOrigin &) = default;
+};
+
+using PreparedActivationOrigin =
+    std::variant<PreparedScenarioOrigin, PreparedSealedCanonicalEmptyOrigin>;
+
+[[nodiscard]] PreparedActivationOrigin parse_prepared_activation_origin(const CanonicalValue &value);
+[[nodiscard]] CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin);
+[[nodiscard]] core::ContentDigest sealed_canonical_empty_capture_digest(
+    const PreparedSealedCanonicalEmptyOrigin &origin);
 
 class PreparedActivationInputError final : public std::invalid_argument {
 public:
@@ -52,12 +77,14 @@ public:
       noexcept {
     return prepared_activation_id_;
   }
-  [[nodiscard]] const core::ContentDigest &source_document_digest() const
-      noexcept {
-    return source_document_digest_;
+  [[nodiscard]] const PreparedActivationOrigin &origin() const noexcept {
+    return origin_;
   }
-  [[nodiscard]] std::string_view scenario_id() const noexcept {
-    return scenario_id_;
+  [[nodiscard]] const PreparedScenarioOrigin *scenario_origin() const noexcept {
+    return std::get_if<PreparedScenarioOrigin>(&origin_);
+  }
+  [[nodiscard]] const PreparedSealedCanonicalEmptyOrigin *sealed_canonical_empty_origin() const noexcept {
+    return std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin_);
   }
   [[nodiscard]] const core::ContentDigest &captured_input_digest() const
       noexcept {
@@ -119,8 +146,7 @@ public:
 private:
   PreparedActivationInput(
       core::ContentDigest prepared_activation_id,
-      core::ContentDigest source_document_digest,
-      std::string scenario_id,
+      PreparedActivationOrigin origin,
       core::ContentDigest captured_input_digest,
       core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
@@ -135,8 +161,7 @@ private:
       VerifiedPreparedActivationClosure closure);
 
   core::ContentDigest prepared_activation_id_;
-  core::ContentDigest source_document_digest_;
-  std::string scenario_id_;
+  PreparedActivationOrigin origin_;
   core::ContentDigest captured_input_digest_;
   core::DeploymentArtifactId deployment_artifact_id_;
   core::DeploymentRevision deployment_revision_;

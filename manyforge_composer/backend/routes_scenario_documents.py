@@ -131,7 +131,7 @@ NEW_SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
 
 class NewScenarioDocumentRequest(LoadScenarioDocumentRequest):
     name: str = Field(min_length=1, max_length=256, pattern=NEW_SCENARIO_NAME_PATTERN)
-    deployment_choice: Literal["keep_applied", "empty"] = Field(alias="deploymentChoice")
+    deployment_choice: Literal["empty"] = Field(alias="deploymentChoice")
     expected_retained_bundle_id: str = Field(alias="expectedRetainedBundleId", min_length=1)
     expected_graph_revision: str = Field(alias="expectedGraphRevision", min_length=1)
 
@@ -526,22 +526,19 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "New closes the current Scenario and clears its Scene; confirmation is required", status_code=409)
                 if not body.name.strip():
                     raise ScenarioArtifactError("scenario_name_invalid", "Scenario name must not be blank")
-                context = None
-                if body.deployment_choice == "keep_applied":
-                    publication = state.published_scenario().get("published_scenario")
-                    context = (state.applied_activation_for_publication(publication)
-                               if isinstance(publication, dict) else None)
-                    if context is None or not isinstance(context.get("project_path"), str):
-                        raise ScenarioArtifactError("scenario_applied_source_unavailable",
-                            "The exact Applied Deployment source is unavailable; New cannot substitute its Draft", status_code=409)
-                    deployment = deepcopy(context["deployment"])
-                else:
-                    deployment = {
-                        "api_version": "manyforge.deployment_intent.v2",
-                        "deployment_artifact_id": "empty_scenario",
-                        "name": "Empty Deployment",
-                        "components": [], "attachments": [], "policies": {},
-                    }
+                if state.headless_client is None:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_unavailable",
+                        "New Scenario requires the configured Manager",
+                        status_code=503,
+                    )
+                _require_scenario_new_empty(state, state.headless_client.manager_status())
+                deployment = {
+                    "api_version": "manyforge.deployment_intent.v2",
+                    "deployment_artifact_id": "empty_scenario",
+                    "name": "Empty Deployment",
+                    "components": [], "attachments": [], "policies": {},
+                }
                 authoring = empty_authoring(authoring_catalog)
                 authoring["name"] = body.name.strip()
                 scenario_document = build_scenario_document(
@@ -554,18 +551,12 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 scenario_document, target, members, manifest = prepare_scenario_artifact(
                     scenario_document, body.path, allowed_roots=state.allowed_fs_roots,
-                    source_project_path=context["project_path"] if context is not None else None,
                 )
                 if target.exists() or target.is_symlink():
                     raise ScenarioArtifactError("scenario_destination_exists", "New requires a new project folder", status_code=409)
                 source_path = str(target)
                 source_digest = prepared_scenario_source_digest(members, manifest)
                 source_diagnostics = []
-                if context is not None and capture_deployment_model_sources(
-                    scenario_document["deployment_draft"], project_root=target
-                ) != context["model_source_closure"]:
-                    raise ScenarioArtifactError("scenario_applied_source_changed",
-                        "Applied Deployment sources changed; New cannot silently apply them", status_code=409)
             else:
                 (scenario_document, source_path, source_digest, source_diagnostics) = capture_scenario_artifact_with_diagnostics(
                     body.path, allowed_roots=state.allowed_fs_roots)
@@ -634,7 +625,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
             )
             manager_status = state.headless_client.manager_status()
-            if not creating:
+            if creating:
+                _require_scenario_new_empty(state, manager_status)
+            else:
                 _require_scenario_load_identity(state, scenario_document_id, manager_status)
             bundle, graph, _epoch = state._manager_current(manager_status)
             if creating and (body.expected_retained_bundle_id != bundle or body.expected_graph_revision != graph):
@@ -673,19 +666,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 confirmed=True,
             )
             if creating:
-                # The dialog authorizes exactly keep-all or remove-all for the
-                # captured Applied Deployment, never a hidden replacement/add.
+                # New begins only from the owner-proved canonical empty cell.
+                # Its empty candidate cannot introduce a component effect.
                 preview = activation_preview.get("candidate_preview")
                 impact = preview.get("impact") if isinstance(preview, dict) else None
                 changes = impact.get("components") if isinstance(impact, dict) else None
-                expected = "retain" if body.deployment_choice == "keep_applied" else "remove"
-                if not isinstance(changes, list) or any(
-                    not isinstance(change, dict) or change.get("disposition") != expected
-                    for change in changes
-                ):
+                if not isinstance(changes, list) or changes:
                     raise ScenarioArtifactError(
                         "scenario_new_impact_changed",
-                        "New would change components beyond the confirmed Deployment choice",
+                        "New requires an empty component impact after Close",
                         status_code=409,
                     )
             # Both retained Draft replacements are validated outside every
@@ -947,6 +936,26 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             raise_operation_failure(error, effects, _raise)
 
     return router
+
+
+def _require_scenario_new_empty(
+    state: ComposerState, manager_status: dict[str, Any]
+) -> None:
+    """New never creates a project before the current owner proves Close."""
+    state._manager_current(manager_status)
+    canonical_empty = manager_status["status"]["active"].get("canonical_empty")
+    if type(canonical_empty) is not bool:
+        raise ScenarioArtifactError(
+            "scenario_load_current_configuration_unavailable",
+            "New Scenario requires the Manager's current canonical-empty proof",
+            status_code=409,
+        )
+    if not canonical_empty:
+        raise ScenarioArtifactError(
+            "scenario_close_required",
+            "Close first before creating a new scenario",
+            status_code=409,
+        )
 
 
 def _require_scenario_load_identity(

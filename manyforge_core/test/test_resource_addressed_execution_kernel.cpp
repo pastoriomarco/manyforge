@@ -19,6 +19,7 @@
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
+#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
@@ -750,6 +751,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
     ++validate_command_calls;
+    if (validate_command_hook) validate_command_hook();
     return next_command_validation;
   }
 
@@ -966,6 +968,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> preview_calls{};
   std::atomic<int> command_calls{};
   mutable std::atomic<int> validate_command_calls{};
+  std::function<void()> validate_command_hook;
   mutable std::atomic<int> get_gripper_status_calls{};
   std::atomic<int> stop_gripper_calls{};
   std::atomic<int> reset_gripper_calls{};
@@ -16573,6 +16576,141 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(rejected.error().details.at("reason"), "runtime_route_configuration_not_ready");
 }
 
+// The SQL producer's real accepted-result tests are separate. This fixture
+// exercises the trusted private Kernel join with complete typed result values,
+// never claims a durable retirement or a complete Close from authored facts.
+[[nodiscard]] CCLCLifecycleTargetRetirementIntentDTO KernelCloseIntent(
+    const ControllableComponentId& component) {
+  const RequestOwnerEpoch owner("close.cclc.owner");
+  return {{RequestId("close.kernel.request"), owner, "operator", std::nullopt},
+          {owner, ActiveBundlePublicationGeneration(1U),
+           ContentDigest("sha256:" + std::string(64U, 'a'))},
+          {{component, LifecycleTargetStateDTO::kActive,
+            LifecycleTargetOriginDTO::kOperator, 1U, false, std::nullopt}}};
+}
+
+void AssertLateCloseRefusesInstallation(bool coordinated) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                  CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  const auto first_registration = registration(first, first_engine);
+  const auto second_registration = registration(second, second_engine);
+  std::vector<RuntimeParticipantExecutionRegistration> registrations{first_registration};
+  if (coordinated) registrations.push_back(second_registration);
+  ResourceAddressedExecutionKernel kernel(registrations, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  if (coordinated) {
+    ASSERT_TRUE(kernel.publish_runtime_route_configuration(
+        route_configuration_for(first_registration), registrations).ok());
+    ASSERT_TRUE(kernel.publish_runtime_route_configuration(
+        route_configuration_for(second_registration), registrations).ok());
+  } else {
+    ASSERT_TRUE(kernel.publish_runtime_route_configuration(
+        route_configuration_for(first_registration), {first_registration}).ok());
+  }
+  enable_component_commands(kernel, first_registration);
+  if (coordinated) enable_component_commands(kernel, second_registration);
+  const auto before = kernel.component_command_readiness(first.value().controllable_component_id);
+  ASSERT_TRUE(before.ok());
+  ASSERT_TRUE(before.value().command_eligible);
+  const auto intent = KernelCloseIntent(first.value().controllable_component_id);
+  ASSERT_TRUE(intent.locally_valid());
+  const CCLCLifecycleTargetRetirementResultDTO accepted{
+      RequestReplayStatusDTO::kAcceptedNew, intent.scope,
+      intent.expected_targets, intent.request_context};
+  bool closed = false;
+  auto &last_engine = coordinated ? second_engine : first_engine;
+  last_engine.validate_command_hook = [&] {
+    if (closed) return;
+    // Validation is after initial component eligibility and before the real
+    // admission barrier. In the coordinated path even the first participant
+    // has completed preflight when the second triggers this interleaving.
+    auto acquired = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(acquired.ok());
+    ASSERT_TRUE(acquired.value()->PrepareCommandEligibilityClosure(intent).ok());
+    ASSERT_TRUE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+    closed = true;
+  };
+  const auto journal_before = journal.calls;
+  const auto refused = kernel.execute(coordinated
+      ? coordinated_command_operation("close.late.coordinated")
+      : command_operation("close.late.single"));
+  ASSERT_TRUE(closed);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "component_command_not_eligible");
+  EXPECT_EQ(journal.calls, journal_before);
+  EXPECT_EQ(first_engine.prepare_command_calls, 0);
+  EXPECT_EQ(second_engine.prepare_command_calls, 0);
+  EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 0);
+  const auto slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(slots.begin(), slots.end(), [](const auto& row) {
+    return row.state == ResourceSlotState::kFree;
+  }));
+  const auto after = kernel.component_command_readiness(first.value().controllable_component_id);
+  ASSERT_TRUE(after.ok());
+  EXPECT_FALSE(after.value().command_eligible);
+  EXPECT_EQ(after.value().component_lifecycle_generation, before.value().component_lifecycle_generation);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CloseSingleInstallationRechecksEligibilityAfterPreflight) {
+  AssertLateCloseRefusesInstallation(false);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CloseCoordinatedInstallationRechecksEveryParticipantAfterPreflight) {
+  AssertLateCloseRefusesInstallation(true);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparedCloseRejectsForeignResultAndReplayCannotRecloseAuthorizedReopen) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(
+      route_configuration_for(registered), {registered}).ok());
+  enable_component_commands(kernel, registered);
+  const auto intent = KernelCloseIntent(binding.value().controllable_component_id);
+  CCLCLifecycleTargetRetirementResultDTO accepted{
+      RequestReplayStatusDTO::kAcceptedNew, intent.scope,
+      intent.expected_targets, intent.request_context};
+  {
+    auto acquired = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(acquired.ok());
+    ASSERT_TRUE(acquired.value()->PrepareCommandEligibilityClosure(intent).ok());
+    auto foreign = accepted;
+    foreign.request_context.request_id = RequestId("close.foreign");
+    EXPECT_FALSE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, foreign));
+    EXPECT_TRUE(kernel.component_command_readiness(binding.value().controllable_component_id).value().command_eligible);
+    EXPECT_TRUE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+    EXPECT_FALSE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+  }
+  // Existing positive authority, new projection; reading an old retirement
+  // result must remain passive rather than silently closing this publication.
+  enable_component_commands(kernel, registered);
+  accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
+  auto replay = kernel.AcquireCellCloseAdmissionLease();
+  ASSERT_TRUE(replay.ok());
+  ASSERT_TRUE(replay.value()->PrepareCommandEligibilityClosure(intent).ok());
+  EXPECT_FALSE(replay.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+  EXPECT_TRUE(kernel.component_command_readiness(binding.value().controllable_component_id).value().command_eligible);
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, RouteReadinessNeverGrantsComponentCommandEligibility) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -16599,6 +16737,81 @@ TEST(ResourceAddressedExecutionKernelTest, RouteReadinessNeverGrantsComponentCom
   const auto admitted = kernel.execute(motion_operation("request.motion.enabled"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
   EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, UnknownCloseConsumesOnlyItsExactPreparedEligibility) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered}).ok());
+  enable_component_commands(kernel, registered);
+  const auto original = kernel.component_command_readiness(binding.value().controllable_component_id).value();
+  const auto intent = KernelCloseIntent(binding.value().controllable_component_id);
+  auto lease = kernel.AcquireCellCloseAdmissionLease();
+  ASSERT_TRUE(lease.ok());
+  ASSERT_TRUE(lease.value()->PrepareCommandEligibilityClosure(intent).ok());
+  auto foreign = intent;
+  foreign.request_context.request_id = RequestId("foreign.uncertain.close");
+  EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(foreign));
+  EXPECT_EQ(kernel.component_command_readiness(binding.value().controllable_component_id).value(), original);
+  EXPECT_TRUE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
+  EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
+  const auto closed = kernel.component_command_readiness(binding.value().controllable_component_id).value();
+  EXPECT_FALSE(closed.command_eligible);
+  EXPECT_EQ(closed.component_lifecycle_generation, original.component_lifecycle_generation);
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, HeldLifecycleClaimExcludesSuccessorAndReleasedClaimCannotRepublish) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) { return Result<void>::Ok(); };
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered}).ok());
+  enable_component_commands(kernel, registered);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const CellAdmissionClaimIntentDTO intent{
+      CellAdmissionClaimKindDTO::kComponentLifecycle, CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+      RequestOwnerEpoch("cclc.owner"), "lifecycle.close.held", RequestId("held.enable"),
+      ContentDigest(test_digest('a')), kernel.GetAuthoringAdmission().admission_generation, {}, {}, {}, {}};
+  const auto claim = kernel.AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(claim.ok()) << claim.error().message;
+  const auto component = binding.value().controllable_component_id;
+  const ComponentCommandReadinessPublicationDTO old{
+      ComponentReadinessAuthorityDTO::kLifecycleClaim, LifecycleTransactionId(intent.owner_transaction_id),
+      std::nullopt, component, ComponentLifecycleGeneration(2U), false};
+  ASSERT_TRUE(kernel.publish_component_command_readiness(old).ok());
+  auto successor = intent;
+  successor.owner_transaction_id = "lifecycle.successor";
+  successor.request_id = RequestId("fresh.enable");
+  successor.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(successor).ok());
+  EXPECT_FALSE(publish_under_restart_exclusion(kernel, component, ComponentLifecycleGeneration(3U), true).ok());
+  const CellAdmissionClaimReleaseDTO release{
+      intent.owner_role, intent.owner_epoch, intent.owner_transaction_id, intent.request_id,
+      intent.request_payload_digest, claim.value().acquired_admission_generation, claim.value().claim_generation,
+      {CellAdmissionSettlementKindDTO::kProvenNoEffect, intent.request_payload_digest}};
+  ASSERT_TRUE(kernel.ReleaseCellAdmissionClaim(release).ok());
+  ASSERT_TRUE(publish_under_restart_exclusion(kernel, component, ComponentLifecycleGeneration(3U), true).ok());
+  const auto reopened = kernel.component_command_readiness(component).value();
+  auto late = old;
+  late.command_eligible = true;
+  const auto refused = kernel.publish_component_command_readiness(late);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "component_readiness_claim_not_held");
+  EXPECT_EQ(kernel.component_command_readiness(component).value(), reopened);
+  EXPECT_EQ(engine.execute_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RouteRepublicationNeitherEnablesNorClosesAComponent) {
@@ -19883,6 +20096,94 @@ TEST(ResourceAddressedExecutionKernelTest,
 // timeout, the participant reports it and the Kernel ends the operation
 // Stopped with no error through its own Stop (the lane's hard stop), exactly
 // once, like an operator Stop and without a cell-wide latch.
+TEST(ResourceAddressedExecutionKernelTest, CloseGuardAllowsIdleInstalledEngineAndQuiescentStoppedBeforeReset) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine)); // Registration is not motion.
+  {
+    auto lease = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(lease.ok());
+    EXPECT_TRUE(lease.value()->ValidatePrerequisites().ok());
+  }
+  const auto accepted = kernel.execute(motion_operation("request.close.guard"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  auto lease = kernel.AcquireCellCloseAdmissionLease();
+  ASSERT_TRUE(lease.ok());
+  const auto planning = lease.value()->ValidatePrerequisites();
+  ASSERT_FALSE(planning.ok());
+  EXPECT_EQ(planning.error().code, "cell_close_operation_nonterminal");
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  EXPECT_FALSE(lease.value()->ValidatePrerequisites().ok());
+  // A raw backend Stopped event is not ordinary Stop settlement. Exercise
+  // the existing genuine hold-timeout Stop/certificate lane while this lease
+  // retains admission but releases state between prerequisite checks.
+  engine.deliver_event(KernelEvent{KernelEventType::kStopRequested,
+      engine.next_execution_id, 0, ExecutionState::kExecuting, ExecutionState::kExecuting,
+      std::nullopt, {{"reason", "zero_speed_hold_timeout"}}});
+  ASSERT_TRUE(wait_until([&] {
+    const auto row = kernel.get_operation_state(accepted.value().operation_id);
+    if (!row.ok() || !row.value().active_stop_id) return false;
+    const auto status = kernel.get_stop_status(*row.value().active_stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto stopped = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(stopped.ok());
+  EXPECT_EQ(stopped.value().state, OperationStateKind::kStopped);
+  EXPECT_TRUE(lease.value()->ValidatePrerequisites().ok()); // No ordinary Reset required.
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CloseGuardRejectsActualUncertainTerminalWithoutInferringRest) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.close.uncertain"));
+  ASSERT_TRUE(accepted.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired,
+                         ErrorDTO{"provider_unknown", "actual effect remains unknown", {}});
+  auto lease = kernel.AcquireCellCloseAdmissionLease();
+  ASSERT_TRUE(lease.ok());
+  const auto unknown = lease.value()->ValidatePrerequisites();
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().code, "cell_close_containment_uncertain");
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CloseGuardRejectsActualComponentContainmentStopFault) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  engine.prepared_cancel_terminal_state = ExecutionState::kFailed;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("request.close.latched"));
+  ASSERT_TRUE(accepted.ok());
+  const auto contained = kernel.RequestComponentIncidentContainment(
+      {"incident.close.1", ControllableComponentId("component.arm"), LifecycleBlockingCauseClassDTO::kProviderLost});
+  ASSERT_TRUE(contained.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(contained.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  ASSERT_TRUE(kernel.get_stop_fault_latch().has_value());
+  auto lease = kernel.AcquireCellCloseAdmissionLease();
+  ASSERT_TRUE(lease.ok());
+  const auto refused = lease.value()->ValidatePrerequisites();
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "cell_close_stop_fault");
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ZeroSpeedHoldTimeoutEndsTheOperationStoppedWithoutError) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -20560,5 +20861,148 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(error->details.at("controlled_stop_error_reason"),
             "controlled_stop_frozen_factor_unusable");
 }
+
+#ifdef MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL
+TEST(ResourceAddressedExecutionKernelTest,
+     ConfigurationApplyConvergenceUsesTheExistingDurableOwnerAndKeepsOldClaimsUntilSuccess) {
+  TemporaryOperationJournal temporary;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  SqliteOperationJournal journal(temporary.directory / "operation.sqlite3", CellId("cell.test"),
+                                 32U);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+    return Result<void>::Ok();
+  };
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const CellAdmissionClaimIntentDTO old_intent{CellAdmissionClaimKindDTO::kManagerApply,
+                                               CellAdmissionOwnerRoleDTO::kManager,
+                                               EmptyManagerLivenessSet().manager_owner_epoch,
+                                               "old.apply",
+                                               RequestId("old.apply"),
+                                               ContentDigest(test_digest('1')),
+                                               kernel.GetAuthoringAdmission().admission_generation,
+                                               {},
+                                               {},
+                                               {}};
+  const auto old = kernel.AcquireCellAdmissionClaim(old_intent);
+  ASSERT_TRUE(old.ok()) << old.error().message;
+  CellAdmissionReadinessSnapshotDTO incomplete{
+      true,
+      ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"),
+                            1U,
+                            ProgramCycleStateDTO::kIdleAfterReset,
+                            {},
+                            {},
+                            {}},
+      true,
+      1U,
+      0U,
+      true,
+      false,
+      0U,
+      1U,
+      1U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(incomplete).ok());
+  auto fresh_intent = old_intent;
+  fresh_intent.owner_transaction_id = "fresh.apply";
+  fresh_intent.request_id = RequestId("fresh.apply");
+  fresh_intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(fresh_intent).ok());
+  EXPECT_FALSE(kernel.AcquireConfigurationApplyCellAdmissionClaim(fresh_intent, {}).ok());
+  const auto unknown = kernel.AcquireConfigurationApplyCellAdmissionClaim(
+      fresh_intent, [](const auto&, auto, const auto&, const auto&) {
+        return Result<void>::Err(
+            {"actual_installed_state_unknown", "actual state is unavailable", {}});
+      });
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().code, "actual_installed_state_unknown");
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply),
+            old.value());
+  int checked = 0;
+  const auto fresh = kernel.AcquireConfigurationApplyCellAdmissionClaim(
+      fresh_intent, [&](const auto& intent, auto held, const auto&, const auto& epoch) {
+        ++checked;
+        EXPECT_EQ(intent, fresh_intent);
+        EXPECT_EQ(held.size(), 1U);
+        if (!held.empty()) {
+          EXPECT_EQ(held.front(), old.value());
+        }
+        EXPECT_EQ(epoch, EmptyManagerLivenessSet().manager_runtime_epoch);
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(fresh.ok()) << fresh.error().message;
+  const auto replay = kernel.AcquireConfigurationApplyCellAdmissionClaim(
+      fresh_intent, [&](const auto&, auto, const auto&, const auto&) {
+        ++checked;
+        return Result<void>::Err(
+            {"unexpected_revalidation", "replay must retain original acquisition", {}});
+      });
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), fresh.value());
+  EXPECT_EQ(checked, 1);
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply,
+                                              old_intent.owner_transaction_id),
+            old.value());
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply,
+                                              fresh_intent.owner_transaction_id),
+            fresh.value());
+  EXPECT_FALSE(
+      kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply, "foreign.apply")
+          .has_value());
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaims(CellAdmissionClaimKindDTO::kManagerApply),
+            (std::vector{old.value(), fresh.value()}));
+  const auto& claim = fresh.value();
+  const CellAdmissionClaimReleaseDTO success{
+      claim.intent.owner_role,
+      claim.intent.owner_epoch,
+      claim.intent.owner_transaction_id,
+      claim.intent.request_id,
+      claim.intent.request_payload_digest,
+      claim.acquired_admission_generation,
+      claim.claim_generation,
+      {CellAdmissionSettlementKindDTO::kTerminalEffectsSettled, ContentDigest(test_digest('2'))}};
+  const auto before_fences = kernel.ReleaseTerminalApplyClaimsAfterSuccess(
+      claim, success, [](const auto&, const auto&, auto) {
+        return Result<void>::Err({"old_fence_held", "old fence has not been released", {}});
+      });
+  ASSERT_FALSE(before_fences.ok());
+  EXPECT_EQ(before_fences.error().code, "old_fence_held");
+  const auto accounted = kernel.ReleaseTerminalApplyClaimsAfterSuccess(
+      claim, success, [&](const auto& actual, const auto& release, auto old_rows) {
+        EXPECT_EQ(actual, claim);
+        EXPECT_EQ(release, success);
+        EXPECT_EQ(old_rows.size(), 1U);
+        if (!old_rows.empty()) {
+          EXPECT_EQ(old_rows.front(), old.value());
+        }
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(accounted.ok()) << accounted.error().message;
+  EXPECT_FALSE(accounted.value().authoring_allowed);  // Fresh exclusion is still held.
+  EXPECT_FALSE(kernel
+                   .ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply,
+                                               old_intent.owner_transaction_id)
+                   .has_value());
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kManagerApply,
+                                              fresh_intent.owner_transaction_id),
+            fresh.value());
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaims(CellAdmissionClaimKindDTO::kManagerApply),
+            (std::vector{fresh.value()}));
+  ASSERT_TRUE(kernel.ReleaseCellAdmissionClaim(success).ok());
+  EXPECT_TRUE(kernel.ReadHeldCellAdmissionClaims(CellAdmissionClaimKindDTO::kManagerApply).empty());
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+#endif
 
 }  // namespace

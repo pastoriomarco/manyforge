@@ -6,8 +6,11 @@
 set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 container_name=${MANYFORGE_DEV_CONTAINER_NAME:-manyforge-development-workbench}
+[[ "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "Invalid Docker container name" >&2; exit 64; }
 image=${MANYFORGE_DEV_IMAGE:-manyforge-dev:latest}
 cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
+runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-"$cache_base/runtime/$container_name"}
+retention_helper="$repo_root/scripts/lib/export_retention.py"
 project=
 bootstrap_project=
 ros2_control=false
@@ -32,6 +35,31 @@ expected_id, image, instance, digest=sys.argv[1:]
 if (expected_id and row["Id"] != expected_id) or row["Image"] != image or labels.get("manyforge.launch-instance") != instance or labels.get("manyforge.launch-input-digest") != digest:
     raise SystemExit("Refusing foreign or changed operator container")
 ' "${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-}" "$image" "$operator_instance" "$operator_digest"
+}
+
+assert_runtime_root_available() {
+  local running
+  running=$(docker container ls --filter status=running --filter status=paused --filter status=restarting \
+    --filter label=manyforge.dev.ros2-control --quiet --no-trunc) || return $?
+  [[ -n "$running" ]] || return 0
+  local -a running_ids
+  mapfile -t running_ids <<<"$running"
+  docker inspect "${running_ids[@]}" | python3 -c '
+import json,os,sys
+root=os.path.realpath(sys.argv[1])
+try:
+    rows=json.load(sys.stdin)
+    if not isinstance(rows,list):
+        raise ValueError("container inspection is not a list")
+except (ValueError,TypeError) as error:
+    raise SystemExit("Could not verify exclusive ManyForge state root: "+str(error))
+for row in rows:
+    if not any(row["State"].get(key, False) for key in ("Running", "Paused", "Restarting")):
+        continue
+    for mount in row["Mounts"]:
+        if mount.get("Type") == "bind" and mount.get("Destination") == "/tmp/manyforge-state" and os.path.realpath(mount["Source"]) == root:
+            raise SystemExit("Refusing shared live ManyForge state root: "+root+" already bound by "+row["Id"])
+' "$runtime_root"
 }
 
 operator_status() {
@@ -73,8 +101,7 @@ cleanup_failed_start() {
     # G then calls the same evidence-preserving stop path below.
     operator_status || true
   elif [[ $result -ne 0 && "$started_container" == true ]]; then
-    docker stop --time 15 "$container_ref" >/dev/null 2>&1 || true
-    docker rm "$container_ref" >/dev/null 2>&1 || true
+    stop_with_evidence || true
   fi
   exit "$result"
 }
@@ -101,66 +128,153 @@ stop_with_evidence() {
     return 69
   fi
 
-  local timestamp evidence_root evidence_path partial_path
-  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-  evidence_root=${MANYFORGE_DEV_EVIDENCE_ROOT:-"$cache_base/evidence"}
-  evidence_path="$evidence_root/$timestamp"
-  partial_path="$evidence_path.partial"
-  if ! mkdir -p "$evidence_root" ||
-      [[ -e "$evidence_path" || -e "$partial_path" ]] ||
-      ! mkdir "$partial_path"; then
-    echo "Could not create partial evidence folder: $partial_path" >&2
-    echo "The stopped container was retained: $container_name" >&2
+  if ! capture_stopped_container; then
+    enforce_retained_limit || true
     return 69
   fi
+}
 
-  # Skip what is reproducible from the image and the Scenario at this commit:
-  # installed binaries, content-addressed model/mesh copies, the prepared
-  # activation inputs that embed them and the native host's unpacked planning
-  # robot packages. The Manager journal keeps their exact digests, so the
-  # failed Apply stays identifiable.
-  if ! docker cp "$container_ref:/tmp/manyforge-state" - |
-      tar --extract --no-same-owner --directory "$partial_path" \
-        --exclude='manyforge-state/installed-targets' \
-        --exclude='manyforge-state/artifacts/raw-artifacts' \
-        --exclude='manyforge-state/artifacts/prepared-activations' \
-        --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
-    echo "Could not copy runtime evidence. Partial evidence: $partial_path" >&2
-    echo "The stopped container was retained: $container_name" >&2
+container_state_mount() {
+  docker inspect --format '{{json .Mounts}}' "$container_ref" | python3 -c '
+import json,sys
+mounts=json.load(sys.stdin)
+roots=[row["Source"] for row in mounts if row.get("Type")=="bind" and row.get("Destination")=="/tmp/manyforge-state"]
+if len(roots)>1: raise SystemExit("Ambiguous runtime state mount")
+print(roots[0] if roots else "")
+'
+}
+
+rotate_quiescent_root() {
+  local runtime_root=$1
+  local -a aggregate=()
+  if [[ -z ${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-} ]] && python3 -c '
+import pathlib,sys
+raise SystemExit(0 if pathlib.Path(sys.argv[1]).resolve().parent == pathlib.Path(sys.argv[2]).resolve() else 1)
+' "$runtime_root" "$cache_base/runtime"; then
+    aggregate=(--default-roots "$cache_base/runtime")
+  fi
+  if assert_runtime_root_available; then
+    python3 "$retention_helper" rotate "$runtime_root" "${aggregate[@]}" || echo "WARNING ManyForge retention helper failed; runtime remains available" >&2
+  else
+    echo "WARNING ManyForge retention skipped: state root has another live user or inspection failed" >&2
+  fi
+}
+
+capture_stopped_container() {
+  local mounted_root timestamp evidence_root evidence_path partial_path inspect_format kind
+  local inspect_summary tail_path
+  local -a prepare_options=()
+  [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == false ]] || {
+    echo "Container $container_ref is not confirmed stopped; capture/removal refused" >&2; return 69;
+  }
+  mounted_root=$(container_state_mount) || return 69
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
+  evidence_root=${MANYFORGE_DEV_EVIDENCE_ROOT:-"$cache_base/evidence"}
+  kind=legacy_state
+  if [[ -n "$mounted_root" ]]; then
+    mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
+    evidence_root="$mounted_root/evidence"
+    prepare_options=(--state-root "$mounted_root")
+    kind=console_tail
+  fi
+  if [[ -z "$mounted_root" ]]; then
+    evidence_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$evidence_root") || return 69
+    prepare_options=(--legacy)
+  fi
+  evidence_path="$evidence_root/$timestamp"
+  if [[ -e "$evidence_path" ]]; then
+    echo "Container is stopped, capture failed, container retained: $container_ref; destination exists: $evidence_path" >&2
     return 69
   fi
-  if ! docker logs "$container_ref" >"$partial_path/docker.log" 2>&1; then
+  # This summary is also the approved failed-capture receipt; write it FIRST.
+  inspect_format='{"container_id":{{json .Id}},"manyforge_export_kind":"'"$kind"'","image":{{json .Image}},"mounts":{{json .Mounts}},'
+  inspect_format+='"state":{"status":{{json .State.Status}},"running":{{json .State.Running}},'
+  inspect_format+='"exit_code":{{json .State.ExitCode}},"finished_at":{{json .State.FinishedAt}}}}'
+  if ! inspect_summary=$(docker inspect --format "$inspect_format" "$container_ref" | python3 -c '
+import json,sys
+data=sys.stdin.buffer.read(65537)
+if len(data)>65536: raise SystemExit("Stopped-container summary exceeds 64KB")
+row=json.loads(data)
+if row["state"]["running"] is not False or row["state"]["status"] not in ("exited","dead","created"):
+    raise SystemExit("Container is no longer stopped")
+print(json.dumps(row,separators=(",",":")))
+'); then
+    echo "Could not inspect the stopped-container capture." >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+    return 69
+  fi
+  if ! partial_path=$(python3 "$retention_helper" prepare "$evidence_root" --timestamp "$timestamp" "${prepare_options[@]}" <<<"$inspect_summary"); then
+    echo "Could not prepare the stopped-container capture. Partial evidence: $evidence_root" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+    return 69
+  fi
+  if [[ -z "$mounted_root" ]]; then
+    # Transitional unmounted containers may hold the only durable evidence.
+    if ! docker cp "$container_ref:/tmp/manyforge-state" - |
+        tar --extract --no-same-owner --directory "$partial_path" \
+          --exclude='manyforge-state/installed-targets' \
+          --exclude='manyforge-state/artifacts/raw-artifacts' \
+          --exclude='manyforge-state/artifacts/prepared-activations' \
+          --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
+      echo "Could not copy legacy runtime evidence. Partial evidence: $partial_path" >&2
+      echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
+      return 69
+    fi
+  fi
+  tail_path="$partial_path/docker.log"
+  [[ -z "$mounted_root" ]] || tail_path="$partial_path/.docker.log.next"
+  if ! docker logs "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
     echo "Could not copy container logs. Partial evidence: $partial_path" >&2
-    echo "The stopped container was retained: $container_name" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
   fi
-  if [[ "$operator_mode" == true ]]; then
-    printf 'docker logs %s\n' "$container_ref" >"$partial_path/docker-logs-reference.txt" || return 69
-  fi
-  local inspect_format
-  inspect_format='{"image":{{json .Image}},"mounts":{{json .Mounts}},'
-  inspect_format+='"state":{"status":{{json .State.Status}},'
-  inspect_format+='"running":{{json .State.Running}},'
-  inspect_format+='"exit_code":{{json .State.ExitCode}},'
-  inspect_format+='"finished_at":{{json .State.FinishedAt}}}}'
-  if ! docker inspect --format "$inspect_format" "$container_ref" \
-      >"$partial_path/docker-inspect.json"; then
-    echo "Could not inspect the stopped container. Partial evidence: $partial_path" >&2
-    echo "The stopped container was retained: $container_name" >&2
+  if [[ -n "$mounted_root" ]] && ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
+    echo "Could not replace bounded console tail. Partial evidence: $partial_path" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref; prior tail preserved" >&2
     return 69
   fi
-  if ! mv --no-clobber --no-target-directory "$partial_path" "$evidence_path" ||
-      [[ -e "$partial_path" ]]; then
+  if ! mv --no-clobber --no-target-directory "$partial_path" "$evidence_path" || [[ -e "$partial_path" ]]; then
     echo "Could not finalize evidence folder. Partial evidence: $partial_path" >&2
-    echo "The stopped container was retained: $container_name" >&2
+    echo "Container is stopped, capture failed, container retained: $container_ref" >&2
     return 69
   fi
+  [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == false ]] || return 69
   if ! docker rm "$container_ref" >/dev/null; then
     echo "Evidence was preserved at $evidence_path, but the stopped container could not be removed." >&2
     return 69
   fi
-
   echo "Evidence preserved at $evidence_path"
+  [[ -z "$mounted_root" ]] || rotate_quiescent_root "$mounted_root"
+}
+
+enforce_retained_limit() {
+  local current=$container_ref current_id ids candidates older mode
+  current_id=$(docker inspect --format '{{.Id}}' "$current") || return 69
+  ids=$(docker container ls --all --filter label=manyforge.dev.ros2-control --quiet --no-trunc) || return 69
+  [[ -n "$ids" ]] || return 0
+  local -a stopped_ids
+  mapfile -t stopped_ids <<<"$ids"
+  candidates=$(docker inspect "${stopped_ids[@]}" | python3 "$retention_helper" retained "$repo_root" \
+    --current-id "$current_id" --legacy-evidence "${MANYFORGE_DEV_EVIDENCE_ROOT:-$cache_base/evidence}") || return 69
+  while read -r older mode; do
+    [[ -n "$older" ]] || continue
+    # Requalify the actual stopped occurrence immediately before retrying it.
+    [[ $(docker inspect "$older" | python3 "$retention_helper" retained "$repo_root" \
+      --current-id "$current_id" --legacy-evidence "${MANYFORGE_DEV_EVIDENCE_ROOT:-$cache_base/evidence}") == "$older $mode" ]] || continue
+    container_ref=$older
+    if capture_stopped_container; then
+      echo "Retried older retained container $older once; capture succeeded and container was removed" >&2
+    elif [[ "$mode" == mounted && $(docker inspect -f '{{.State.Running}}' "$older") == false ]]; then
+      if docker rm "$older" >/dev/null; then
+        echo "WARNING ManyForge older retained container $older removed after one failed capture retry; persistent state remains, console capture failed" >&2
+      else
+        echo "WARNING ManyForge could not remove older retained container $older after retry" >&2
+      fi
+    else
+      echo "WARNING ManyForge kept legacy container $older: failed retry may hold sole open-incident journal; manually export or explicitly remove after investigation" >&2
+    fi
+    container_ref=$current
+  done <<<"$candidates"
 }
 
 command=${1:-}
@@ -226,11 +340,12 @@ case "$command" in
         echo "Use '$0 stop' before selecting another scenario." >&2
         exit 69
       fi
-      if [[ "$operator_mode" == true ]]; then
-        stop_with_evidence
-      else
-        docker rm "$container_ref" >/dev/null
+      existing_mount=$(container_state_mount) || exit 69
+      if [[ -z "$existing_mount" && -d "$runtime_root" && -n $(find "$runtime_root" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        echo "Refusing legacy unmounted transition into nonempty runtime root: $runtime_root; preserve/export legacy state and choose an empty root" >&2
+        exit 69
       fi
+      stop_with_evidence
     fi
     image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
       echo "Development image is unavailable: $image" >&2
@@ -242,8 +357,7 @@ case "$command" in
     mkdir -p "$cache_root/build" "$cache_root/node_modules"
     # Installation Composer settings and the Program runner's persistent
     # blackboard values survive stop/start (values are checked against the
-    # applied Program; see DEVELOPMENT_WORKBENCH.md). Only these folders are
-    # persistent; all other runtime state still resets with the container.
+    # applied Program; see DEVELOPMENT_WORKBENCH.md).
     state_base="$cache_base/state"
     if [[ "$operator_mode" == true ]]; then
       state_base="$cache_base/state/$operator_instance"
@@ -252,11 +366,20 @@ case "$command" in
     runner_state="$state_base/program-runner"
     mkdir -p "$composer_state" "$runner_state"
     serve_args=(serve)
+    if [[ "$operator_mode" == true ]]; then
+      runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:?explicit runtime state root required}
+    fi
+    [[ "$runtime_root" == /* ]] || { echo "Runtime state root must be an absolute host path" >&2; exit 64; }
+    # The selected container is already absent here. A different live owned
+    # container must never share these journals, even with an explicit override.
+    assert_runtime_root_available || exit 69
+    if [[ "$operator_mode" != true ]]; then
+      mkdir -p "$runtime_root"
+    fi
     operator_mounts=()
     operator_labels=()
     if [[ "$operator_mode" == true ]]; then
       [[ "$ros2_control" == true && -z "$project" && -z "$bootstrap_project" ]] || { echo "G requires ROS and no auto-Load" >&2; exit 64; }
-      runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:?explicit runtime state root required}
       install_root=${MANYFORGE_DEV_OPERATOR_INSTALL_ROOT:?qualified install root required}
       [[ "$runtime_root" == /* && "$runtime_root" != /tmp && "$runtime_root" != /tmp/* && "$runtime_root" != /run && "$runtime_root" != /run/* ]] || { echo "Operator runtime state requires persistent absolute host storage" >&2; exit 64; }
       mkdir -p "$runtime_root"
@@ -269,7 +392,7 @@ case "$command" in
         --canonical-empty-admission-filename "${MANYFORGE_DEV_OPERATOR_ADMISSION:?qualified admission required}"
         --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
         --composer-port 9000 --composer-bind-host 0.0.0.0)
-      operator_mounts=(-v "$runtime_root:/tmp/manyforge-state" -v "$install_root:$install_root:ro")
+      operator_mounts=(-v "$install_root:$install_root:ro")
       for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG ISAAC_SITE_SETTINGS OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
         variable="MANYFORGE_DEV_$option"
         if [[ -n ${!variable:-} ]]; then
@@ -296,7 +419,7 @@ case "$command" in
       # The full ROS image has its own development UID. Keep all bind-mounted
       # writes with the launching user's ownership, including npm/ROS caches.
       mkdir -p "$cache_root/home"
-      for directory in "$repo_root" "$cache_root" "$cache_root/build" \
+      for directory in "$repo_root" "$runtime_root" "$cache_root" "$cache_root/build" \
           "$cache_root/home" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
         if [[ ! -w "$directory" ]]; then
           echo "ROS workbench requires a writable host-owned directory: $directory" >&2
@@ -321,6 +444,7 @@ case "$command" in
     if [[ -n "$bootstrap_project" ]]; then
       serve_args+=(--bootstrap-project "$bootstrap_project")
     fi
+    rotate_quiescent_root "$runtime_root"
     container_ref=$(docker run -d \
       --name "$container_name" \
       --label "manyforge.dev.ros2-control=$ros2_control" \
@@ -335,6 +459,7 @@ case "$command" in
       "${ros_environment[@]}" \
       "${operator_mounts[@]}" \
       -v "$repo_root:/workspace" \
+      -v "$runtime_root:/tmp/manyforge-state" \
       -v "$cache_root:/runner" \
       -v "$composer_state:/var/lib/manyforge/composer" \
       -v "$runner_state:/var/lib/manyforge/program-runner" \
@@ -410,21 +535,11 @@ print(any(ref in line.split() for line in sys.stdin), end="")
       shift
     fi
     (($# == 0)) || { usage; exit 64; }
-    if [[ "$operator_mode" == true ]]; then
-      keep_evidence=true
-    fi
-    if [[ "$keep_evidence" == true ]]; then
-      docker inspect "$container_ref" >/dev/null 2>&1 || {
-        echo "Cannot preserve evidence: development workbench container does not exist." >&2
-        exit 69
-      }
-      stop_with_evidence
-      echo "Development workbench is stopped. Build and npm caches were retained."
-      exit 0
-    fi
     if docker inspect "$container_ref" >/dev/null 2>&1; then
-      docker stop --time 15 "$container_ref" >/dev/null || true
-      docker rm "$container_ref" >/dev/null || true
+      stop_with_evidence
+    elif [[ "$keep_evidence" == true || "$operator_mode" == true ]]; then
+      echo "Cannot preserve evidence: development workbench container does not exist." >&2
+      exit 69
     fi
     echo "Development workbench is stopped. Build and npm caches were retained."
     ;;

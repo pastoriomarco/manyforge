@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/manager_apply_fence_coordinator.hpp"
 
+#include <algorithm>
+
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 
@@ -78,9 +80,30 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
     Fail("sealed candidate does not match the durable Apply intent");
   }
 
-  const auto scope =
+  const auto authored_scope =
       manyforge::deployment::derive_apply_configuration_fence_scope(predecessor,
                                                                     candidate);
+  // An exact persisted attempt is immutable even if the installed owner has
+  // since changed. Only a fresh attempt consumes current-owner scope evidence.
+  const auto previous_attempt = apply_journal.ReadFenceAttempt(
+      apply_intent.apply_id, apply_intent.apply_generation);
+  const auto scope = previous_attempt
+                         ? previous_attempt->fence_intent.scope
+                         : expectation.actual_scope.value_or(authored_scope);
+  const auto contains = [](const auto &whole, const auto &part) {
+    return std::all_of(part.begin(), part.end(), [&](const auto &row) {
+      return std::find(whole.begin(), whole.end(), row) != whole.end();
+    });
+  };
+  if (!scope.valid() ||
+      !contains(scope.controllable_component_ids,
+                authored_scope.controllable_component_ids) ||
+      !contains(scope.domains, authored_scope.domains) ||
+      !contains(scope.bindings, authored_scope.bindings) ||
+      !contains(scope.resources, authored_scope.resources)) {
+    Fail(
+        "actual Apply fence scope omits the immutable authored change closure");
+  }
   // The per-component decision is fixed with the scope, before any fence or
   // runtime effect: later phases execute it, they never re-derive it.
   auto component_delta =

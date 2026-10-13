@@ -34,6 +34,8 @@ constexpr std::string_view kProgramStatusMagic = "MF-CCLC-STATUS-V2";
 constexpr std::string_view kProgramNodeMagic = "MF-PROGRAM-NODE-ADMISSION-V1";
 constexpr std::string_view kIntentMagic = "MF-CCLC-INTENT-V1";
 constexpr std::string_view kIntentValueMagic = "MF-CCLC-INTENT-VALUE-V1";
+constexpr std::string_view kCloseIntentMagic = "MF-CCLC-CLOSE-RECOVER-INTENT-V1";
+constexpr std::string_view kCloseIntentValueMagic = "MF-CCLC-CLOSE-RECOVER-INTENT-VALUE-V1";
 constexpr std::string_view kSelectedResultMagic = "MF-CCLC-SELECTED-RESULT-V1";
 constexpr std::string_view kPrimitiveIntentMagic = "MF-CCLC-PRIMITIVE-INTENT-V1";
 constexpr std::string_view kPrimitiveResultMagic = "MF-CCLC-PRIMITIVE-RESULT-V1";
@@ -1888,6 +1890,48 @@ void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
   return result;
 }
 
+void PutRetirementTargets(Writer& writer,
+                          const std::vector<ComponentLifecycleTargetDTO>& targets) {
+  writer.Vector(targets, [&](const auto& target) {
+    writer.Identity(target.controllable_component_id);
+    writer.EnumValue(target.requested_state);
+    writer.EnumValue(target.origin);
+    writer.U64(target.target_generation);
+    writer.Bool(target.reached);
+    writer.Optional<LifecycleBlockingCauseClassDTO>(target.recovered_cause,
+        [&](const auto cause) { writer.EnumValue(cause); });
+  });
+}
+
+std::vector<ComponentLifecycleTargetDTO> GetRetirementTargets(Reader& reader) {
+  return reader.Vector<ComponentLifecycleTargetDTO>([&] {
+    return ComponentLifecycleTargetDTO{
+        reader.Identity<ControllableComponentId>(),
+        reader.EnumValue<LifecycleTargetStateDTO>(),
+        reader.EnumValue<LifecycleTargetOriginDTO>(), reader.U64(), reader.Bool(),
+        reader.Optional<LifecycleBlockingCauseClassDTO>([&] {
+          return reader.EnumValue<LifecycleBlockingCauseClassDTO>();
+        })};
+  });
+}
+
+void PutRetirementIntent(Writer& writer,
+                         const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  PutPublicRequestContext(writer, intent.request_context);
+  writer.Identity(intent.scope.request_owner_epoch);
+  writer.U64(intent.scope.publication_generation.value());
+  writer.Identity(intent.scope.active_public_pointer_digest);
+  PutRetirementTargets(writer, intent.expected_targets);
+}
+
+CCLCLifecycleTargetRetirementIntentDTO GetRetirementIntent(Reader& reader) {
+  auto context = GetPublicRequestContext(reader);
+  CCLCLifecycleTargetRetirementScopeDTO scope{
+      reader.Identity<RequestOwnerEpoch>(),
+      ActiveBundlePublicationGeneration(reader.U64()), reader.Identity<ContentDigest>()};
+  return {std::move(context), std::move(scope), GetRetirementTargets(reader)};
+}
+
 }  // namespace
 
 std::string EncodeProgramNodeAdmissionEvidence(const ProgramNodeAdmissionEvidenceDTO& evidence) {
@@ -1956,6 +2000,40 @@ bool IsCCLCSelectedBringUpClaimIntentEncoding(std::string_view bytes) noexcept {
       return false;
   }
   return bytes.substr(4U, kSelectedClaimMagic.size()) == kSelectedClaimMagic;
+}
+
+std::string EncodeCCLCTargetRetirementRecord(const CCLCTargetRetirementRecordDTO& record) {
+  if (!record.intent.locally_valid() ||
+      record.retired_targets != record.intent.expected_targets)
+    throw CodecFailure("CCLC target retirement record is invalid");
+  Writer writer;
+  writer.String("MF-CCLC-TARGET-RETIREMENT-RESULT-V1");
+  PutRetirementIntent(writer, record.intent);
+  // Successful CAS retires exactly these rows. Do not duplicate them in the
+  // result blob or invent lifecycle transaction identities.
+  return std::move(writer).Finish();
+}
+
+CCLCTargetRetirementRecordDTO DecodeCCLCTargetRetirementRecord(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-CCLC-TARGET-RETIREMENT-RESULT-V1")
+    throw CodecFailure("CCLC target retirement record magic is invalid");
+  auto intent = GetRetirementIntent(reader);
+  reader.RequireEnd();
+  if (!intent.locally_valid())
+    throw CodecFailure("CCLC target retirement record failed closed validation");
+  auto retired = intent.expected_targets;
+  return {std::move(intent), std::move(retired)};
+}
+
+std::string CCLCTargetRetirementSemanticIntentDigest(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  if (!intent.locally_valid())
+    throw CodecFailure("CCLC target retirement intent is invalid");
+  Writer writer;
+  writer.String("MF-CCLC-TARGET-RETIREMENT-INTENT-V1");
+  PutRetirementIntent(writer, intent);
+  return content_identity::sha256_digest(std::move(writer).Finish());
 }
 
 std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error) {
@@ -2081,7 +2159,8 @@ std::string ComponentLifecycleSemanticIntentDigest(const ComponentLifecycleInten
     throw CodecFailure("component lifecycle intent is invalid at journal ingress");
   }
   Writer writer;
-  writer.String(HasQualifiedApplyPredecessor(intent) ? kApplyQualifiedGenerationIntentMagic
+  writer.String(intent.close_incident_recovery ? kCloseIntentMagic
+      : HasQualifiedApplyPredecessor(intent) ? kApplyQualifiedGenerationIntentMagic
       : intent.apply_generation_selection ? kApplyGenerationIntentMagic : kIntentMagic);
   PutIntent(writer, intent, false);
   if (intent.apply_generation_selection)
@@ -2089,6 +2168,8 @@ std::string ComponentLifecycleSemanticIntentDigest(const ComponentLifecycleInten
   if (intent.program_node_evidence) {
     PutProgramNode(writer, *intent.program_node_evidence);
   }
+  if (intent.close_incident_recovery)
+    writer.String(intent.close_incident_recovery->expected_incident_id);
   return content_identity::sha256_digest(std::move(writer).Finish());
 }
 
@@ -2547,13 +2628,16 @@ std::string EncodeComponentLifecycleIntent(const ComponentLifecycleIntentDTO& in
   if (!intent.locally_valid())
     throw detail::CodecFailure("component lifecycle intent value is invalid");
   detail::Writer writer;
-  writer.String(detail::HasQualifiedApplyPredecessor(intent) ? detail::kApplyQualifiedGenerationIntentMagic
+  writer.String(intent.close_incident_recovery ? detail::kCloseIntentValueMagic
+      : detail::HasQualifiedApplyPredecessor(intent) ? detail::kApplyQualifiedGenerationIntentMagic
       : intent.apply_generation_selection ? detail::kApplyGenerationIntentMagic : detail::kIntentValueMagic);
   detail::PutIntent(writer, intent, true);
   writer.Optional<ProgramNodeAdmissionEvidenceDTO>(intent.program_node_evidence,
       [&](const auto& evidence) { detail::PutProgramNode(writer, evidence); });
   if (intent.apply_generation_selection)
     detail::PutApplyGenerationSelection(writer, *intent.apply_generation_selection);
+  if (intent.close_incident_recovery)
+    writer.String(intent.close_incident_recovery->expected_incident_id);
   return std::move(writer).Finish();
 }
 
@@ -2561,7 +2645,8 @@ ComponentLifecycleIntentDTO DecodeComponentLifecycleIntent(std::string_view byte
   detail::Reader reader(bytes);
   const auto magic = reader.String();
   if (magic != detail::kIntentValueMagic && magic != detail::kApplyGenerationIntentMagic &&
-      magic != detail::kApplyQualifiedGenerationIntentMagic)
+      magic != detail::kApplyQualifiedGenerationIntentMagic &&
+      magic != detail::kCloseIntentValueMagic)
     throw detail::CodecFailure("component lifecycle intent value magic is invalid");
   auto intent = detail::GetIntent(reader);
   intent.program_node_evidence = reader.Optional<ProgramNodeAdmissionEvidenceDTO>(
@@ -2569,6 +2654,8 @@ ComponentLifecycleIntentDTO DecodeComponentLifecycleIntent(std::string_view byte
   if (magic == detail::kApplyGenerationIntentMagic || magic == detail::kApplyQualifiedGenerationIntentMagic)
     intent.apply_generation_selection = detail::GetApplyGenerationSelection(
         reader, magic == detail::kApplyQualifiedGenerationIntentMagic);
+  if (magic == detail::kCloseIntentValueMagic)
+    intent.close_incident_recovery = CloseComponentIncidentRecoveryDTO{reader.String()};
   reader.RequireEnd();
   if (!intent.locally_valid())
     throw detail::CodecFailure("component lifecycle intent value failed closed validation");

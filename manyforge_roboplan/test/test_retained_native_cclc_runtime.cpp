@@ -543,6 +543,52 @@ TEST(RetainedNativeApplyPlanning, RetainedRouteIsExactCurrentFactBeforeAnyEffect
   EXPECT_EQ(current.front(), make_retained_plan_readback(runtime));
 }
 
+TEST(RetainedNativeApplyPlanning,
+     ActualRestartKeepsAuthoredRetainButUsesFreshInactiveGeneration) {
+  const auto bundle =
+      load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto runtime = make_runtime_context(*bundle);
+  const auto delta = deployment::derive_apply_component_delta(*bundle, *bundle);
+  const auto original = delta;
+  const std::vector<core::RuntimeParticipantBinding> bindings{runtime.binding};
+  const std::vector<core::ControllableComponentId> no_retained, no_removed;
+  const auto result = DeriveRetainedNativeApplyPlanRequest(
+      {core::ApplyId("actual.restart"), core::ApplyGeneration(7U)}, *bundle,
+      bundle.get(), delta, bindings, {},
+      core::ComponentLifecycleStateDTO::kDeclared,
+      std::span<const core::ControllableComponentId>(no_retained),
+      std::span<const core::ControllableComponentId>(no_removed));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_TRUE(result.value().retained_components.empty());
+  EXPECT_TRUE(result.value().retained_routes.empty());
+  EXPECT_EQ(result.value().components,
+            std::vector<core::ControllableComponentId>{
+                runtime.component->controllable_component_id});
+  EXPECT_EQ(result.value().changed_component_state,
+            core::ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(delta, original);
+  const std::vector<core::ControllableComponentId> foreign{
+      core::ControllableComponentId("foreign")};
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(
+                   result.value().apply, *bundle, bundle.get(), delta, bindings,
+                   {}, core::ComponentLifecycleStateDTO::kDeclared,
+                   std::span<const core::ControllableComponentId>(foreign),
+                   std::span<const core::ControllableComponentId>(no_removed))
+                   .ok());
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(
+                   result.value().apply, *bundle, bundle.get(), delta, bindings,
+                   {}, core::ComponentLifecycleStateDTO::kDeclared,
+                   std::span<const core::ControllableComponentId>(no_retained),
+                   std::span<const core::ControllableComponentId>(
+                       result.value().components))
+                   .ok());
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(
+                   result.value().apply, *bundle, bundle.get(), delta, bindings,
+                   {}, core::ComponentLifecycleStateDTO::kDeclared,
+                   std::span<const core::ControllableComponentId>(no_retained))
+                   .ok());
+}
+
 TEST(RetainedNativeApplyPlanning, InitialAdditionContainsOnlyPlannedCandidateValues) {
   const auto bundle = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
   const auto runtime = make_runtime_context(*bundle);
@@ -1610,6 +1656,17 @@ public:
     return *kernel_;
   }
 
+  [[nodiscard]] core::Result<std::optional<core::ActiveControlConfigurationDTO>>
+  current_configuration(const core::ControlDomainId &domain) const {
+    if (!kernel_)
+      return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(std::nullopt);
+    auto current = kernel_->current_runtime_route_configuration(domain);
+    if (!current.ok())
+      return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Err(current.error());
+    return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+        current.value() ? std::optional(current.value()->active_configuration) : std::nullopt);
+  }
+
   [[nodiscard]] std::size_t execute_count() const noexcept {
     return engine_.execute_count();
   }
@@ -1800,7 +1857,183 @@ private:
   bool fail_;
 };
 
-enum class ReadinessCase { kPublication, kFailedRestart, kRepeatedReconciliation };
+enum class ReadinessCase {
+  kPublication, kFailedRestart, kRepeatedReconciliation,
+  kMeasuredCapture, kMeasuredFailedStage, kMeasuredRace,
+  kMeasuredUnavailable, kMeasuredNilRace, kConstructionOnce, kConstructionThrows
+};
+
+// Exercise the actual runtime source-association seam against this fixture's
+// real Kernel/CCLC route readback. An empty prepared view deliberately supplies
+// no measured positions; it must never be confused with a healthy feed.
+void CheckMeasuredSourceProtocol(
+    ReadinessCase test_case,
+    const deployment::VerifiedRouteReadinessParticipant &participant,
+    core::ResourceAddressedExecutionKernel &kernel,
+    const core::ComponentLifecycleCurrentSnapshotDTO &snapshot) {
+  unsigned enabled = 0, released = 0, reentrant_reads = 0;
+  bool expect_available_on_release = true;
+  auto owner = std::make_shared<RetainedNativeRuntime>(
+      participant.participant_binding, std::nullopt);
+  owner->control_binding_representatives = {participant.participant_binding};
+  owner->cell_addressed_kernel = &kernel;
+  const auto missing = owner->PrepareCurrentMeasuredSources();
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().details.at("reason"), "measured_preparer_missing");
+  const auto uncaptured = owner->CaptureReadinessSources(snapshot, owner);
+  ASSERT_FALSE(uncaptured.ok());
+  EXPECT_EQ(uncaptured.error().details.at("reason"), "measured_current_sources_missing");
+
+  if (test_case == ReadinessCase::kMeasuredUnavailable) {
+    owner->prepare_measured_sources = [](const auto &, const auto &, const auto &) {
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(nullptr);
+    };
+    const auto unavailable = owner->PrepareCurrentMeasuredSources();
+    ASSERT_FALSE(unavailable.ok());
+    EXPECT_EQ(unavailable.error().details.at("reason"), "measured_prepared_sources_missing");
+    EXPECT_FALSE(owner->CaptureReadinessSources(snapshot, owner).ok());
+    EXPECT_EQ(enabled, 0U);
+  }
+
+  std::weak_ptr<RetainedNativeRuntime> weak_owner = owner;
+  struct Lease final {
+    std::function<void()> release;
+    ~Lease() { release(); }
+  };
+  std::weak_ptr<const RetainedPreparedRobotMeasuredSources> first_prepared;
+  bool remember_first = true;
+  const auto stage_empty = [&](const core::RuntimeParticipantBinding &motion) {
+    auto lease = std::make_shared<Lease>();
+    lease->release = [&, weak_owner, snapshot] {
+      ++released;
+      if (auto live = weak_owner.lock()) {
+        // This takes the same route exclusion. A destructor under that lock
+        // would deadlock and fail this bounded CTest case.
+        const auto current = live->CaptureReadinessSources(snapshot, live);
+        EXPECT_EQ(current.ok(), expect_available_on_release);
+        if (!expect_available_on_release && !current.ok()) {
+          EXPECT_EQ(current.error().details.at("reason"), "measured_current_sources_missing");
+        }
+        ++reentrant_reads;
+      }
+    };
+    auto prepared = std::make_shared<RetainedPreparedRobotMeasuredSources>(
+        RetainedPreparedRobotMeasuredSources{
+            {motion.value().controllable_component_id, {}},
+            [&, lease] { ++enabled; }});
+    if (remember_first) {
+      first_prepared = prepared;
+      remember_first = false;
+    }
+    return prepared;
+  };
+  owner->prepare_measured_sources = [&](const auto &motion, const auto &gripper,
+                                        const auto &configurations) {
+    EXPECT_FALSE(gripper);
+    EXPECT_EQ(configurations.size(), 1U);
+    if (configurations.size() != 1U)
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Err(
+          {"test_configuration_missing", "current route unavailable", {}});
+    EXPECT_EQ(configurations.front().active_control_configuration_generation,
+              motion.value().control_path->active_control_configuration_generation);
+    return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(
+        stage_empty(motion));
+  };
+  const auto initial = owner->PrepareCurrentMeasuredSources();
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  EXPECT_TRUE(initial.value().sources.empty());
+  EXPECT_EQ(enabled, 1U);
+  auto captured = owner->CaptureReadinessSources(snapshot, owner);
+  ASSERT_TRUE(captured.ok()) << captured.error().message;
+  ASSERT_TRUE(captured.value().measured_sources);
+  EXPECT_TRUE(captured.value().measured_sources->sources.empty());
+  ASSERT_TRUE(captured.value().validate_current);
+  EXPECT_TRUE(captured.value().validate_current().ok());
+  auto foreign = snapshot;
+  foreign.provider_occurrences.front().provider_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(owner->CaptureReadinessSources(foreign, owner).ok());
+  auto other = std::make_shared<RetainedNativeRuntime>(participant.participant_binding, std::nullopt);
+  EXPECT_FALSE(owner->CaptureReadinessSources(snapshot, other).ok());
+
+  if (test_case == ReadinessCase::kMeasuredCapture) {
+    owner.reset();
+    ASSERT_FALSE(weak_owner.expired());
+    EXPECT_TRUE(captured.value().validate_current().ok());
+    EXPECT_FALSE(first_prepared.expired());
+    captured.value().validate_current = {};
+    EXPECT_TRUE(weak_owner.expired());
+    EXPECT_TRUE(first_prepared.expired());
+    EXPECT_EQ(released, 1U);
+    return;
+  }
+  if (test_case == ReadinessCase::kMeasuredUnavailable) {
+    owner->prepare_measured_sources = [](const auto &, const auto &, const auto &) {
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(nullptr);
+    };
+    const auto unavailable = owner->PrepareCurrentMeasuredSources();
+    ASSERT_FALSE(unavailable.ok());
+    EXPECT_EQ(unavailable.error().details.at("reason"), "measured_prepared_sources_missing");
+    EXPECT_EQ(enabled, 1U);
+    EXPECT_FALSE(captured.value().validate_current().ok());
+    EXPECT_FALSE(owner->CaptureReadinessSources(snapshot, owner).ok());
+    EXPECT_FALSE(first_prepared.expired());
+    expect_available_on_release = false;
+    captured.value().validate_current = {};
+    EXPECT_TRUE(first_prepared.expired());
+    EXPECT_EQ(released, 1U);
+    EXPECT_EQ(reentrant_reads, 1U);
+    owner.reset();
+    return;
+  }
+  if (test_case == ReadinessCase::kMeasuredFailedStage) {
+    owner->prepare_measured_sources = [](const auto &, const auto &, const auto &) {
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Err(
+          {"test_stage_failed", "producer staging failed", {}});
+    };
+    const auto failed = owner->PrepareCurrentMeasuredSources();
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.error().code, "test_stage_failed");
+    EXPECT_EQ(enabled, 1U);
+    EXPECT_EQ(released, 0U);
+    EXPECT_TRUE(captured.value().validate_current().ok());
+    owner->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &) {
+      auto invalid = stage_empty(motion);
+      invalid->source_view.component_id = core::ControllableComponentId("foreign.component");
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(invalid);
+    };
+    const auto malformed = owner->PrepareCurrentMeasuredSources();
+    ASSERT_FALSE(malformed.ok());
+    EXPECT_EQ(malformed.error().details.at("reason"), "measured_prepared_scope_mismatch");
+    EXPECT_EQ(enabled, 1U);
+    EXPECT_EQ(released, 1U);
+    EXPECT_EQ(reentrant_reads, 1U);
+    EXPECT_TRUE(captured.value().validate_current().ok());
+  } else {
+    bool nested = false;
+    owner->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &) {
+      const bool outer = !nested;
+      if (outer) {
+        nested = true;
+        const auto successor = owner->PrepareCurrentMeasuredSources();
+        EXPECT_TRUE(successor.ok());
+      }
+      return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(
+          test_case == ReadinessCase::kMeasuredNilRace && outer
+              ? nullptr : stage_empty(motion));
+    };
+    const auto raced = owner->PrepareCurrentMeasuredSources();
+    ASSERT_FALSE(raced.ok());
+    EXPECT_EQ(raced.error().details.at("reason"), "measured_source_association_changed");
+    EXPECT_EQ(enabled, 2U); // only the initial and committed inner sources
+    EXPECT_EQ(released, test_case == ReadinessCase::kMeasuredNilRace ? 0U : 1U);
+    EXPECT_EQ(reentrant_reads, test_case == ReadinessCase::kMeasuredNilRace ? 0U : 1U);
+    EXPECT_FALSE(captured.value().validate_current().ok());
+    EXPECT_FALSE(first_prepared.expired()); // old capture still owns its producer
+  }
+  captured.value().validate_current = {};
+  EXPECT_EQ(released, test_case == ReadinessCase::kMeasuredRace ? 2U : 1U);
+  owner.reset();
+}
 
 void CheckRetainedProductReadiness(ReadinessCase test_case) {
   const std::filesystem::path fixture_root =
@@ -1869,10 +2102,20 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
       bundle->value().cell_graph.cell_id, clock);
   core::ManualScheduler scheduler;
 
+  std::function<core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+      const core::ControlDomainId &)> current_configuration;
+  const bool measured_case = test_case == ReadinessCase::kMeasuredCapture ||
+      test_case == ReadinessCase::kMeasuredFailedStage || test_case == ReadinessCase::kMeasuredRace ||
+      test_case == ReadinessCase::kMeasuredUnavailable || test_case == ReadinessCase::kMeasuredNilRace;
+  if (measured_case)
+    current_configuration = [&](const auto &domain) {
+      return publication_owner.current_configuration(domain);
+    };
+
   auto composition = CreateRetainedNativeCCLCRuntime(
       config, bundle, publication_store, publication.value(), artifacts,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-      kernel_ports, publication_owner, clock, scheduler);
+      kernel_ports, publication_owner, clock, scheduler, std::move(current_configuration));
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   ASSERT_TRUE(composition.value()->Start().ok());
   const auto current_request_owner =
@@ -1997,6 +2240,15 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
             "component_command_not_eligible");
   EXPECT_EQ(publication_owner.execute_count(), 0U);
 
+  if (measured_case) {
+    const auto snapshot = composition.value()->ReadCurrentComponentSnapshot(
+        runtime.component->controllable_component_id);
+    ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
+    CheckMeasuredSourceProtocol(test_case, published.front(), publication_owner.kernel(), snapshot.value());
+    EXPECT_EQ(publication_owner.execute_count(), 0U);
+    return;
+  }
+
   if (test_case != ReadinessCase::kPublication) {
     // Close and reopen the real durable CCLC owner while retaining the route
     // and engine. Inject only the readiness port result, not recovery logic.
@@ -2008,6 +2260,33 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
         publication_owner.kernel(), test_case == ReadinessCase::kFailedRestart);
     config.composition.coordinator.request_owner_epoch =
         core::RequestOwnerEpoch("cclc.native.readiness.restarted");
+    unsigned construction_calls = 0, capture_calls = 0;
+    const bool construction_case = test_case == ReadinessCase::kConstructionOnce ||
+        test_case == ReadinessCase::kConstructionThrows;
+    if (construction_case) {
+      config.prepare_readiness_dependencies = [&]() -> RetainedNativeCCLCReadinessDependencies {
+        ++construction_calls;
+        // Recovery has already reconstructed the actual command eligibility
+        // and installed current route before construction dependencies run.
+        EXPECT_EQ(readiness.publications, 1U);
+        const auto current = publication_owner.current_configuration(runtime.domain->control_domain_id);
+        EXPECT_TRUE(current.ok());
+        if (current.ok()) {
+          EXPECT_TRUE(current.value().has_value());
+          if (current.value()) {
+            EXPECT_EQ(*current.value(), *route_status.value()->resulting_active_control_configuration);
+          }
+        }
+        if (test_case == ReadinessCase::kConstructionThrows)
+          throw std::runtime_error("test readiness dependency construction failure");
+        return {{}, [&](const core::ComponentLifecycleCurrentSnapshotDTO &) {
+          ++capture_calls;
+          return core::Result<core::ComponentLifecycleReadinessSourceView>::Err(
+              {"measured_source_unavailable", "test has no measured producer",
+               {{"reason", "test_no_measured_producer"}}});
+        }};
+      };
+    }
     std::function<core::Result<void>()> reconcile;
     auto recovered = CreateRecoveredRetainedNativeCellCCLCRuntime(
         config, bundle, publication_store, publication.value(), artifacts,
@@ -2040,6 +2319,33 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
     } else {
       ASSERT_TRUE(recovered.ok()) << recovered.error().message;
       ASSERT_TRUE(reconcile);
+      if (construction_case) {
+        EXPECT_EQ(construction_calls, 1U);
+        const auto reconciled = reconcile();
+        ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+        for (unsigned attempt = 0; attempt < 3U; ++attempt) {
+          const auto read = recovered.value()->coordinator().ReadCurrentComponentView(
+              runtime.component->controllable_component_id,
+              [&] { return recovered.value()->lifecycle_target_driver().ReadTargetView(
+                  runtime.component->controllable_component_id); },
+              [&] { return recovered.value()->lifecycle_target_driver().ReadReadinessFacts(
+                  runtime.component->controllable_component_id); });
+          ASSERT_TRUE(read.ok()) << read.error().message;
+          EXPECT_FALSE(read.value().readiness.ready);
+          ASSERT_TRUE(read.value().readiness.measured_state.error);
+          EXPECT_EQ(read.value().readiness.measured_state.error->details.at("reason"), "measured_inventory_unavailable");
+          ASSERT_FALSE(read.value().readiness.domains.empty());
+          ASSERT_TRUE(read.value().readiness.domains.front().error);
+          EXPECT_EQ(read.value().readiness.domains.front().error->details.at("reason"),
+                    test_case == ReadinessCase::kConstructionThrows
+                        ? "measured_dependency_construction_failed" : "test_no_measured_producer");
+          EXPECT_EQ(construction_calls, 1U);
+          EXPECT_EQ(brand_port->dispatch_count(), 2U);
+          EXPECT_EQ(publication_owner.execute_count(), 0U);
+        }
+        EXPECT_EQ(capture_calls, test_case == ReadinessCase::kConstructionThrows ? 0U : 3U);
+        return;
+      }
       const auto before = readiness.ReadComponentCommandReadiness(
           runtime.component->controllable_component_id);
       ASSERT_TRUE(before.ok());
@@ -2108,6 +2414,18 @@ TEST(RetainedNativeCCLCRuntime, FailedRestartReadinessKeepsAdmissionAndCommandsC
 
 TEST(RetainedNativeCCLCRuntime, RepeatedReconciliationAfterReleaseDoesNotReconstructOrDispatch) {
   CheckRetainedProductReadiness(ReadinessCase::kRepeatedReconciliation);
+}
+
+TEST(RetainedNativeMeasuredSourceProtocol, EmptyCommittedSourcesAndExactCaptureKeepActualOwners) {
+  CheckRetainedProductReadiness(ReadinessCase::kMeasuredCapture);
+}
+
+TEST(RetainedNativeMeasuredSourceProtocol, FailedAndMalformedStagesPreserveCurrentAssociation) {
+  CheckRetainedProductReadiness(ReadinessCase::kMeasuredFailedStage);
+}
+
+TEST(RetainedNativeMeasuredSourceProtocol, ConcurrentStageRefusesAndRetiresProducerOutsideRouteLock) {
+  CheckRetainedProductReadiness(ReadinessCase::kMeasuredRace);
 }
 
 TEST(RetainedNativeCCLCRuntime,
@@ -2212,6 +2530,21 @@ TEST(RetainedNativeCCLCRuntime,
     EXPECT_EQ(predecessor_adoption_calls, 0U);
     EXPECT_FALSE(reconcile_after_start);
   }
+}
+
+
+TEST(RetainedNativeMeasuredSourceProtocol, UnavailableInitialAndSuccessorRetireOldCaptureWithoutEnable) {
+  CheckRetainedProductReadiness(ReadinessCase::kMeasuredUnavailable);
+}
+TEST(RetainedNativeMeasuredSourceProtocol, NullStageStillRefusesConcurrentAssociationChange) {
+  CheckRetainedProductReadiness(ReadinessCase::kMeasuredNilRace);
+}
+
+TEST(RetainedNativeCCLCReadinessConstruction, RunsOnceAfterRecoveryAndNeverFromPureReads) {
+  CheckRetainedProductReadiness(ReadinessCase::kConstructionOnce);
+}
+TEST(RetainedNativeCCLCReadinessConstruction, ThrowingDependenciesPreserveConstructionAndUnavailableReadiness) {
+  CheckRetainedProductReadiness(ReadinessCase::kConstructionThrows);
 }
 
 } // namespace

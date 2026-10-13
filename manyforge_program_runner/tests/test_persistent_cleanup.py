@@ -124,7 +124,6 @@ def _start(runtime: ProgramRuntime, headless: _Headless) -> dict[str, Any]:
                 "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": headless.current["record_digest"],
                 "draft_program_revision": _DIGEST_A,
-                "expected_admission_generation": 1,
             }
         )
     )
@@ -464,3 +463,35 @@ def test_another_register_version_refuses_the_runner_by_name(tmp_path: Path) -> 
     assert refused.value.code == "persistent_key_register_version_unsupported"
     assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v1"}'
 
+
+@pytest.mark.usefixtures("_no_scene")
+def test_scenario_empty_scenario_preserves_values_and_only_reports_missed_scenario(tmp_path):
+    headless, _first = _store_pallet_nine(tmp_path)
+    missed = headless.apply(_WITHOUT_PALLET)
+    empty_digest = headless.apply_sealed_empty()
+    register_path = tmp_path / "persistent-keys.json"
+    original = register_path.read_bytes()
+    empty_runtime, _host = _runtime(tmp_path, headless, "empty")
+    try:
+        no_scenario = empty_runtime.reconcile_persistent_values()
+        assert no_scenario["outcome"] == "no_scenario"
+        assert no_scenario["record_digest"] == empty_digest
+        assert no_scenario["origin"] == headless.current["origin"]
+        assert "scenario_id" not in no_scenario
+        assert no_scenario["dropped"] == []
+        assert no_scenario["unobserved_applies"] == []
+        assert no_scenario["history_changed"] is False
+        assert register_path.read_bytes() == original
+        assert _stored_values(tmp_path) == {"pallet_index": 9, "layer": 4}
+    finally:
+        empty_runtime.shutdown()
+    headless.apply(_PALLET)
+    pallet, runtime, run = _pallet_after_rerun(tmp_path, headless, "after-empty")
+    assert pallet == 9
+    faults = [event for event in _audit(runtime, run)
+              if event["kind"] == "persistent_key_apply_not_observed"]
+    assert faults == [{
+        "kind": "persistent_key_apply_not_observed", "scenario_id": _SCENARIO,
+        "code": "applied_program_not_observed", "record_digest": missed,
+    }]
+    assert empty_digest not in runtime._persistent_keys.unobserved_applies(_SCENARIO)  # noqa: SLF001

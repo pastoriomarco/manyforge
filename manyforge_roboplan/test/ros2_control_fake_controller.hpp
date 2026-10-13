@@ -364,6 +364,14 @@ public:
     Publish();
   }
 
+  /// End the peer executor before destroying its actual ROS endpoints.
+  /// Context shutdown alone leaves these shared endpoint owners alive.
+  void StopAndDestroyEndpoints() {
+    PeerNode::Stop();
+    switch_.reset();
+    activity_.reset();
+  }
+
   /// Switch outside CCLC (an unrequested deactivation or restart).
   void SetControllerActive(bool active) {
     active_ = active;

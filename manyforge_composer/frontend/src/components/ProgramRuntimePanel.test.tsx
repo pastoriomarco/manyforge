@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import { PROGRAM_RESET_READINESS_MESSAGE } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
 import type {
@@ -307,6 +308,43 @@ function controller(
 }
 
 describe('Program runtime projection', () => {
+  it('shows the genuine origin of a no-Program publication', () => {
+    const view = controller();
+    view.state.applied = null;
+    view.state.run = null;
+    view.state.nonExecutable = {
+      deploymentArtifactId: 'deployment',
+      deploymentRevision: `sha256:${'a'.repeat(64)}`,
+      executable: false,
+      programId: null,
+      programRevision: null,
+      origin: {
+        kind: 'sealed_canonical_empty',
+        cellId: 'empty-cell',
+        deploymentArtifactId: 'deployment',
+        deploymentRevision: `sha256:${'a'.repeat(64)}`,
+        retainedBundleId: `sha256:${'b'.repeat(64)}`,
+        graphRevision: `sha256:${'c'.repeat(64)}`,
+        admissionDigest: `sha256:${'d'.repeat(64)}`,
+      },
+      message: null,
+      unresolvedReferences: [],
+      affectedNodes: [],
+      affectedExecutionGroups: [],
+    };
+    const sealed = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />);
+    expect(sealed).toContain('empty-cell · no Program');
+    expect(sealed).not.toContain('cell-pick');
+
+    view.state.nonExecutable.origin = {
+      kind: 'scenario',
+      scenarioId: 'authored-cell',
+      sourceDocumentDigest: `sha256:${'e'.repeat(64)}`,
+    };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />))
+      .toContain('authored-cell · no Program');
+  });
+
   it('shows exact owner status without duplicating the standard commands', () => {
     const markup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={controller()} />,
@@ -1165,6 +1203,30 @@ describe('Program runtime projection', () => {
     }
   });
 
+  it('shows post-Reset waiting in the existing notice stack and preserves fault priority', () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    program.commandAllowed = vi.fn(() => false);
+    program.commandDisabledReason = vi.fn(() => PROGRAM_RESET_READINESS_MESSAGE);
+    const robot = robotController();
+    const guidance = () => deriveTransportGuidance({
+      enabled: true, program, robot, motionActive: false,
+      onReviewProgramRecovery: vi.fn(),
+    });
+    expect(guidance()).toEqual([expect.objectContaining({
+      id: 'program.reset-readiness', severity: 'info', title: PROGRAM_RESET_READINESS_MESSAGE,
+    })]);
+    const markup = renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robot} onOpenRobotControls={vi.fn()} />);
+    expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
+    program.commandDisabledReason = vi.fn(() => null);
+    expect(guidance()).toEqual([]);
+    program.commandDisabledReason = vi.fn(() => PROGRAM_RESET_READINESS_MESSAGE);
+    program.cycleState = 'recovery_required';
+    program.cycleFailure = { code: 'program_scene_preparation_failed', message: 'Scene convergence failed' };
+    expect(guidance().map((notice) => notice.id)).toContain('recovery.program');
+    expect(guidance().map((notice) => notice.id)).not.toContain('program.reset-readiness');
+  });
+
   it('points Program faults to recovery and normal terminal runs to Reset', () => {
     const program = controller('intervention_required', 'recovery_required');
     program.state.run!.message = 'Participant requires reconciliation';
@@ -1193,6 +1255,7 @@ describe('Program runtime projection', () => {
       .toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)/);
     program.cycleState = 'terminal_awaiting_reset';
     // A normal finished run is information, not a warning or error.
+    program.cycleFailure = null;
     expect(guidance()).toEqual([expect.objectContaining({
       id: 'program.reset-required', severity: 'info', title: 'Program finished',
     })]);
@@ -1384,4 +1447,28 @@ describe('Program runtime projection', () => {
       vi.unstubAllGlobals();
     }
   });
+});
+
+
+it('shows a failed accepted start and native comparison facts while Reset remains required', () => {
+  const program = controller('failed', 'terminal_awaiting_reset');
+  program.state.run = null; // Start failed before a host RunStatus existed.
+  program.cycleFailure = {
+    code: 'component_lifecycle_facts_stale',
+    message: 'Program run program-cycle.2 started, then failed. Reset the Program cycle.',
+    details: { admission_changed: 'true', admission_generation_before: '36', admission_generation_after: '37',
+      snapshot_changed: 'false', program_run_id: 'program-cycle.2', claim_generation: 9, needs_reset: true },
+  };
+  const robot = robotController();
+  robot.currentStatus = statusFixture();
+  const [notice] = deriveTransportGuidance({
+    enabled: true, program, robot, motionActive: false, onReviewProgramRecovery: vi.fn(),
+  });
+  expect(notice).toMatchObject({ id: 'program.reset-required', severity: 'error', title: 'Run failed' });
+  expect(notice.message).toContain('program-cycle.2');
+  expect(notice.message).toContain('Admission changed: true');
+  expect(notice.message).toContain('Admission generation before: 36');
+  expect(notice.message).toContain('Admission generation after: 37');
+  expect(notice.message).toContain('Snapshot changed: false');
+  expect(notice.message).toContain('Claim generation: 9');
 });

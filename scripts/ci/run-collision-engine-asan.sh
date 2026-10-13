@@ -28,12 +28,12 @@ GTEST_TIMEOUT_SECONDS="${MANYFORGE_ASAN_GTEST_TIMEOUT_SECONDS:-300}"
 export ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}halt_on_error=1:detect_leaks=1:exitcode=66"
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:+${UBSAN_OPTIONS}:}halt_on_error=1:print_stacktrace=1:exitcode=66"
 
-if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+if [[ -f "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash" ]]; then
   # CMake's ament package templates import ament_package from the ROS Python
   # tree. Keep this reproducible under docker exec and non-interactive shells.
   # shellcheck disable=SC1091
   set +u
-  source /opt/ros/jazzy/setup.bash
+  source "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"
   set -u
 fi
 

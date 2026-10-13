@@ -39,6 +39,7 @@ import type {
   CurrentScenarioResponse,
   DraftMutationResponse,
   PreparedActivationInput,
+  PreparedActivationOrigin,
   DeploymentCandidateOperationResponse,
   DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
@@ -2225,14 +2226,13 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
     'deployment_artifact_id', 'deployment_revision', 'executable',
     'graph_revision', 'message', 'non_executable', 'program',
     'program_binding_id', 'program_id', 'program_revision', 'record_digest',
-    'retained_bundle_id', 'scenario_id', 'schema_version',
-    'source_document_digest',
+    'retained_bundle_id', 'origin', 'schema_version',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.applied_program_status.v1'
-    && schemaVersion !== 'manyforge.applied_program_status.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_status.v1 or v2');
+  if (schemaVersion !== 'manyforge.applied_program_status.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_status.v2');
   }
+  const origin = parsePreparedActivationOrigin(record.origin, `${path}.origin`);
   const executable = booleanAt(record.executable, `${path}.executable`);
   const noProgram = record.program_id === null;
   if ((noProgram && (schemaVersion !== 'manyforge.applied_program_status.v2'
@@ -2241,6 +2241,13 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
     || (!noProgram && executable !== (record.non_executable === null))
     || executable !== (record.program_binding_id !== null)) {
     return fail(path, 'a binding exactly when executable, named references otherwise');
+  }
+  if (origin.kind === 'sealed_canonical_empty' && (!noProgram
+    || origin.deploymentArtifactId !== record.deployment_artifact_id
+    || origin.deploymentRevision !== record.deployment_revision
+    || origin.retainedBundleId !== record.retained_bundle_id
+    || origin.graphRevision !== record.graph_revision)) {
+    return fail(path, 'sealed empty origin matching its exact no-Program status');
   }
   const references = record.non_executable === null
     ? { unresolvedReferences: [], affectedNodes: [], affectedExecutionGroups: [] }
@@ -2260,7 +2267,7 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
     executable,
     programId: noProgram ? null : stringAt(record.program_id, `${path}.program_id`),
     programRevision: noProgram ? null : digestAt(record.program_revision, `${path}.program_revision`),
-    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    origin,
     message: nullableStringAt(record.message, `${path}.message`),
     ...references,
   };
@@ -3663,26 +3670,52 @@ export function parseDeploymentWorkspaceResponse(
   };
 }
 
-function parsePreparedActivationInput(
+export function parsePreparedActivationOrigin(value: unknown, path: string): PreparedActivationOrigin {
+  const row = objectAt(value, path);
+  if (row.kind === 'scenario') {
+    exactKeysAt(row, ['kind', 'scenario_id', 'source_document_digest'], path);
+    return { kind: 'scenario', scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
+      sourceDocumentDigest: digestAt(row.source_document_digest, `${path}.source_document_digest`) };
+  }
+  if (row.kind !== 'sealed_canonical_empty') return fail(`${path}.kind`, 'scenario or sealed_canonical_empty');
+  exactKeysAt(row, ['kind', 'cell_id', 'deployment_artifact_id', 'deployment_revision',
+    'retained_bundle_id', 'graph_revision', 'admission_digest'], path);
+  const identity = (value: unknown, name: string): string => {
+    const text = stringAt(value, `${path}.${name}`);
+    if (!text || text.normalize('NFC') !== text || new TextEncoder().encode(text).length > 128) {
+      return fail(`${path}.${name}`, 'nonempty NFC identity of at most 128 UTF-8 bytes');
+    }
+    return text;
+  };
+  return { kind: 'sealed_canonical_empty', cellId: identity(row.cell_id, 'cell_id'),
+    deploymentArtifactId: identity(row.deployment_artifact_id, 'deployment_artifact_id'),
+    deploymentRevision: digestAt(row.deployment_revision, `${path}.deployment_revision`),
+    retainedBundleId: digestAt(row.retained_bundle_id, `${path}.retained_bundle_id`),
+    graphRevision: digestAt(row.graph_revision, `${path}.graph_revision`),
+    admissionDigest: digestAt(row.admission_digest, `${path}.admission_digest`) };
+}
+
+export function parsePreparedActivationInput(
   value: unknown,
   path: string,
 ): PreparedActivationInput {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'schema_version', 'prepared_activation_id', 'scenario_id',
-    'source_document_digest', 'captured_input_digest', 'deployment_artifact_id',
+    'schema_version', 'prepared_activation_id', 'origin',
+    'captured_input_digest', 'deployment_artifact_id',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
     'program_id', 'program_revision', 'program_outcome',
     'node_environment_digest', 'assistant_mode',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.prepared_activation_input.v5') {
+  if (schemaVersion !== 'manyforge.prepared_activation_input.v6') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v5',
+      'manyforge.prepared_activation_input.v6',
     );
   }
   const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);
+  const origin = parsePreparedActivationOrigin(record.origin, `${path}.origin`);
   const outcomeKind = stringAt(outcome.kind, `${path}.program_outcome.kind`);
   let programBindingId: string | null;
   if (outcomeKind === 'no_program') {
@@ -3705,13 +3738,18 @@ function parsePreparedActivationInput(
   } else {
     return fail(`${path}.program_outcome.kind`, 'bound, non_executable, or no_program');
   }
+  if (origin.kind === 'sealed_canonical_empty' && (outcomeKind !== 'no_program'
+    || origin.deploymentArtifactId !== record.deployment_artifact_id
+    || origin.deploymentRevision !== record.deployment_revision
+    || origin.retainedBundleId !== record.retained_bundle_id
+    || origin.graphRevision !== record.graph_revision)) {
+    return fail(path, 'sealed empty origin matching its exact no-Program candidate');
+  }
   return {
     schemaVersion,
     preparedActivationId: digestAt(record.prepared_activation_id,
       `${path}.prepared_activation_id`),
-    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
-    sourceDocumentDigest: digestAt(record.source_document_digest,
-      `${path}.source_document_digest`),
+    origin,
     capturedInputDigest: digestAt(record.captured_input_digest,
       `${path}.captured_input_digest`),
     deploymentArtifactId: stringAt(
@@ -4301,6 +4339,66 @@ export function parseApiErrorDto(payload: unknown): StructuredError | null {
     details,
     origin: null,
   };
+}
+
+/** Known Run outcomes retain the closed ErrorDTO carrier and native flat facts. */
+export function parseKnownProgramRunOutcome(payload: unknown, status: number): StructuredError {
+  const path = 'programRunOutcome';
+  const envelope = objectAt(payload, path);
+  exactKeysAt(envelope, ['detail'], path);
+  const dto = objectAt(envelope.detail, `${path}.detail`);
+  allowedKeysAt(dto, ['code', 'message', 'details'], ['request_id'], `${path}.detail`);
+  const code = stringAt(dto.code, `${path}.code`);
+  const beforeStart = code === 'program_run_stopped_before_start';
+  const stopped = beforeStart || code === 'program_run_superseded_by_stop';
+  if ((!stopped && code !== 'program_run_started_then_failed')
+    || status !== (beforeStart ? 409 : 422)) {
+    return fail(path, 'a known Run outcome and its matching HTTP status');
+  }
+  if (dto.request_id !== undefined) failureIdentityAt(dto.request_id, `${path}.request_id`);
+  const details = objectAt(dto.details, `${path}.details`);
+  const keys = Object.keys(details);
+  if (keys.length > FAILURE_DETAIL_MAX_ENTRIES) {
+    return fail(path, `at most ${FAILURE_DETAIL_MAX_ENTRIES} outcome details`);
+  }
+  const parsed: FailureDetails = {};
+  for (const key of keys) {
+    const value = details[key];
+    if (utf8Length(key) > 64 || key.length === 0
+      || !(value === null || typeof value === 'boolean'
+        || (typeof value === 'number' && Number.isFinite(value)
+          && (!Number.isInteger(value) || Number.isSafeInteger(value)))
+        || (typeof value === 'string'
+          && utf8Length(value) <= (key === 'cause_message' ? FAILURE_MESSAGE_MAX_BYTES : FAILURE_TEXT_MAX_BYTES)))) {
+      return fail(`${path}.details.${key}`, 'a bounded flat ErrorDTO detail');
+    }
+    parsed[key] = value as string | number | boolean | null;
+  }
+  const runId = failureIdentityAt(details.program_run_id, `${path}.program_run_id`);
+  if (runId === null || details.needs_reset !== true) {
+    return fail(path, 'the actual run identity and needs_reset:true');
+  }
+  if (beforeStart) {
+    if (details.claim_generation !== null || details.no_effect !== true) {
+      return fail(path, 'no claim and proven no effect before start');
+    }
+  } else {
+    positiveIntegerAt(details.claim_generation, `${path}.claim_generation`);
+    if (details.no_effect !== undefined) return fail(path, 'no preclaim effect assertion');
+  }
+  if (stopped ? details.stopped_by_operator !== true : details.stopped_by_operator !== undefined) {
+    return fail(path, 'the Stop discriminant only on a stopped outcome');
+  }
+  const cause = failureIdentityAt(details.cause_code, `${path}.cause_code`);
+  if (cause === null) return fail(path, 'the named owner cause');
+  if (stopped && cause !== 'program_run_superseded_by_stop') {
+    return fail(path, 'the actual operator Stop cause');
+  }
+  const causeMessage = failureMessageAt(details.cause_message, `${path}.cause_message`);
+  if (causeMessage.length === 0) return fail(path, 'the owner cause message');
+  const message = failureMessageAt(dto.message, `${path}.message`);
+  if (message.length === 0) return fail(path, 'the owner outcome message');
+  return { code, message, details: parsed, origin: null };
 }
 
 export function parseProgramRunStatus(value: unknown): ProgramRunStatus {

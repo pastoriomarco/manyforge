@@ -91,15 +91,21 @@ text_array(std::initializer_list<std::string_view> values) {
   return CanonicalValue(std::move(result));
 }
 
-// Native fixtures anchor the generic native lifecycle, whose surface is
-// exactly Observe plus its planned Prepare/Enable/Disable (no Recover plan).
-inline void append_lifecycle_capability_offers(CanonicalValue::Array &offers) {
-  for (const std::string_view capability_id : {
-           "component.lifecycle.disable",
-           "component.lifecycle.enable",
-           "component.lifecycle.observe",
-           "component.lifecycle.prepare",
-       }) {
+// Native defaults keep Observe/Prepare/Enable/Disable. The ROS product fixture
+// explicitly includes its real Recover plan in both records and offers.
+inline std::vector<std::string_view>
+lifecycle_capability_ids(bool include_recover = false) {
+  std::vector<std::string_view> ids{
+      "component.lifecycle.disable", "component.lifecycle.enable",
+      "component.lifecycle.observe", "component.lifecycle.prepare"};
+  if (include_recover)
+    ids.push_back("component.lifecycle.recover");
+  return ids;
+}
+
+inline void append_lifecycle_capability_offers(CanonicalValue::Array &offers,
+                                              bool include_recover = false) {
+  for (const auto capability_id : lifecycle_capability_ids(include_recover)) {
     const auto *definition =
         core::find_builtin_capability_definition(capability_id);
     if (definition == nullptr) {
@@ -549,7 +555,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                         bool qualified_motion_controlled_stop = false,
                         std::string_view lifecycle_semantic_digest = {},
                         bool ros2_control_execution = false,
-                        std::string_view provider_id = "lite6_arm_provider") {
+                        std::string_view provider_id = "lite6_arm_provider",
+                        bool include_lifecycle_recover = false) {
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -589,13 +596,10 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
   std::vector<std::string> lifecycle_capability_bytes;
   if (!lifecycle_semantic_digest.empty()) {
-    constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{
-        "component.lifecycle.disable", "component.lifecycle.enable",
-        "component.lifecycle.observe", "component.lifecycle.prepare",
-    };
-    lifecycle_capabilities.reserve(kLifecycleCapabilities.size());
-    lifecycle_capability_bytes.reserve(kLifecycleCapabilities.size());
-    for (const auto capability_id : kLifecycleCapabilities) {
+    const auto ids = lifecycle_capability_ids(include_lifecycle_recover);
+    lifecycle_capabilities.reserve(ids.size());
+    lifecycle_capability_bytes.reserve(ids.size());
+    for (const auto capability_id : ids) {
       const auto *lifecycle_descriptor =
           core::find_builtin_capability_definition(capability_id);
       if (lifecycle_descriptor == nullptr) {
@@ -1067,7 +1071,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
           {"required_endpoint_role_ids", text_array({"command", "state"})},
       })};
   if (!lifecycle_semantic_digest.empty()) {
-    append_lifecycle_capability_offers(offered_capabilities);
+    append_lifecycle_capability_offers(offered_capabilities,
+                                      include_lifecycle_recover);
   }
   sort_capability_offers(offered_capabilities);
   CanonicalValue::Object provider_root{
@@ -2703,7 +2708,9 @@ make_lite6_controllable_retention_fixture(
     std::string_view first_ros_frame_prefix = {},
     std::string_view isaac_world = "lite6_grf_ros2",
     bool ros_mock_peers = true,
-    std::string_view empty_ros_configuration_field = {}) {
+    std::string_view empty_ros_configuration_field = {},
+    std::string_view direct_provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (gripper_only &&
       (!aggregate_gripper || !native_motion || !stoppable ||
@@ -2742,7 +2749,8 @@ make_lite6_controllable_retention_fixture(
       chained, native_motion, stoppable, containment_granularity,
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
       ros2_control_execution,
-      shared_native_domain ? "manyforge.provider.native_control" : "lite6_arm_provider");
+      shared_native_domain ? "manyforge.provider.native_control" : direct_provider_id,
+      include_lifecycle_recover);
   if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
     auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
         false, true, true, "resource", false, {}, false);
@@ -3065,11 +3073,15 @@ make_lite6_ros2_control_motion_retention_fixture(
     bool stoppable = false,
     std::string_view motion_limit_target_id = kLite6ArmTargetId,
     const std::optional<CanonicalValue> &default_fault_stop_profiles =
-        std::nullopt) {
+        std::nullopt,
+    std::string_view lifecycle_semantic_digest = {},
+    std::string_view provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false) {
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, stoppable, "resource", false,
-      {}, {}, true, false, false, std::nullopt, false,
-      motion_limit_target_id, default_fault_stop_profiles);
+      lifecycle_semantic_digest, {}, true, false, false, std::nullopt, false,
+      motion_limit_target_id, default_fault_stop_profiles, std::nullopt, {},
+      "lite6_grf_ros2", true, {}, provider_id, include_lifecycle_recover);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

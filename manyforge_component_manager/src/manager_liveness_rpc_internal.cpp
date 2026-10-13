@@ -298,4 +298,108 @@ std::string EncodeManagerLivenessRpcRejection(std::string_view reason) {
          std::string(reason);
 }
 
+std::string_view NativeShutdownPhaseName(const NativeShutdownPhase phase) {
+  switch (phase) {
+  case NativeShutdownPhase::kRunning:
+    return "running";
+  case NativeShutdownPhase::kGroupRetirement:
+    return "group-retirement";
+  case NativeShutdownPhase::kExecutionDrain:
+    return "execution-drain";
+  case NativeShutdownPhase::kCurrentBuilderDrain:
+    return "current-builder-drain";
+  case NativeShutdownPhase::kManagedBuilderDrain:
+    return "managed-builder-drain";
+  case NativeShutdownPhase::kProjectionDrain:
+    return "projection-drain";
+  case NativeShutdownPhase::kKernelDestruction:
+    return "kernel-destruction";
+  case NativeShutdownPhase::kPreparedCompositionDestruction:
+    return "prepared-composition-destruction";
+  case NativeShutdownPhase::kRetiredCompositionDestruction:
+    return "retired-composition-destruction";
+  case NativeShutdownPhase::kActiveCompositionDestruction:
+    return "active-composition-destruction";
+  case NativeShutdownPhase::kFailedCompositionDestruction:
+    return "failed-composition-destruction";
+  case NativeShutdownPhase::kCellProcessesDestruction:
+    return "cell-processes-destruction";
+  case NativeShutdownPhase::kProjectionDestruction:
+    return "projection-destruction";
+  case NativeShutdownPhase::kLivenessReceiverDestruction:
+    return "liveness-receiver-destruction";
+  case NativeShutdownPhase::kStopSurveillanceDestruction:
+    return "stop-surveillance-destruction";
+  case NativeShutdownPhase::kSchedulerOwnerRelease:
+    return "scheduler-owner-release";
+  case NativeShutdownPhase::kFenceOwnerDestruction:
+    return "fence-owner-destruction";
+  case NativeShutdownPhase::kServicingLaneDrain:
+    return "servicing-lane-drain";
+  }
+  Fail("unknown shutdown phase");
+}
+
+bool IsNativeShutdownRpcPacket(std::string_view bytes) noexcept {
+  return bytes.starts_with(kNativeShutdownRequestTag);
+}
+std::string EncodeNativeShutdownRpcRequest(std::string_view epoch) {
+  CheckToken(epoch);
+  if (epoch.size() > 1024U)
+    Fail("shutdown epoch exceeds bound");
+  return std::string(kNativeShutdownRequestTag) + ' ' + std::string(epoch);
+}
+std::string DecodeNativeShutdownRpcRequest(std::string_view bytes) {
+  const auto f = Fields(bytes);
+  if (f.size() != 2U || f[0] != kNativeShutdownRequestTag)
+    Fail("wrong shutdown request shape");
+  CheckToken(f[1]);
+  if (f[1].size() > 1024U)
+    Fail("shutdown epoch exceeds bound");
+  return f[1];
+}
+std::string EncodeNativeShutdownRpcResponse(const NativeShutdownProgress &p) {
+  CheckToken(p.runtime_epoch);
+  if (p.runtime_epoch.size() > 1024U || p.completed_workers > 3U ||
+      p.pending_groups > p.total_groups ||
+      p.signalled_groups > p.total_groups ||
+      p.escalated_groups > p.total_groups || p.reaped_groups > p.total_groups ||
+      p.drained_groups > p.reaped_groups || p.unknown_groups > p.total_groups ||
+      p.pending_pid < -1 || p.pending_pid == 0 ||
+      (p.pending_groups == 0U && p.pending_pid != -1))
+    Fail("invalid shutdown progress");
+  static_cast<void>(NativeShutdownPhaseName(p.phase));
+  std::ostringstream out;
+  out << kNativeShutdownResponseTag << ' ' << p.runtime_epoch << ' '
+      << static_cast<unsigned>(p.phase) << ' ' << p.completed_workers << ' '
+      << p.total_groups << ' ' << p.pending_groups << ' ' << p.signalled_groups
+      << ' ' << p.escalated_groups << ' ' << p.reaped_groups << ' '
+      << p.drained_groups << ' ' << p.unknown_groups << ' ' << p.pending_pid;
+  return out.str();
+}
+NativeShutdownProgress DecodeNativeShutdownRpcResponse(std::string_view bytes) {
+  const auto f = Fields(bytes);
+  if (f.size() != 12U || f[0] != kNativeShutdownResponseTag)
+    Fail("wrong shutdown response shape");
+  const auto phase = Unsigned<unsigned>(f[2]);
+  if (phase > static_cast<unsigned>(NativeShutdownPhase::kServicingLaneDrain))
+    Fail("unknown shutdown phase");
+  const auto pid = Signed(f[11]);
+  if (pid < -1 || pid > std::numeric_limits<int>::max())
+    Fail("invalid shutdown pending PID");
+  NativeShutdownProgress p{f[1],
+                           static_cast<NativeShutdownPhase>(phase),
+                           Unsigned<std::size_t>(f[3]),
+                           Unsigned<std::size_t>(f[4]),
+                           Unsigned<std::size_t>(f[5]),
+                           Unsigned<std::size_t>(f[6]),
+                           Unsigned<std::size_t>(f[7]),
+                           Unsigned<std::size_t>(f[8]),
+                           Unsigned<std::size_t>(f[9]),
+                           Unsigned<std::size_t>(f[10]),
+                           static_cast<int>(pid)};
+  static_cast<void>(EncodeNativeShutdownRpcResponse(p));
+  return p;
+}
+
 }  // namespace manyforge::component_manager::detail

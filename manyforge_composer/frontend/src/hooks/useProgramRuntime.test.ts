@@ -22,6 +22,8 @@ import {
   programMotionStopSettled,
   programRuntimeWakeKey,
   programTerminalFailureMessage,
+  programResetReadinessMessage,
+  PROGRAM_RESET_READINESS_MESSAGE,
 } from './useProgramRuntime';
 
 afterEach(() => {
@@ -70,6 +72,27 @@ function admissionFixtures() {
 }
 
 describe('Program runtime idle selection', () => {
+  it('explains post-Reset readiness without enabling Run or labeling startup as Reset', () => {
+    const { applied, workspace, snapshot } = admissionFixtures();
+    const waiting = {
+      ...snapshot, authoringAdmission: { authoringAllowed: false, admissionGeneration: 32 },
+    };
+    expect(programResetReadinessMessage(waiting)).toBe(PROGRAM_RESET_READINESS_MESSAGE);
+    expect(buildProgramStartRequest(applied, true, null, waiting, workspace, 'operator', 'run')).toBeNull();
+    expect(programResetReadinessMessage(snapshot)).toBeNull();
+    expect(buildProgramStartRequest(applied, true, null, snapshot, workspace, 'operator', 'run')).not.toBeNull();
+    expect(programResetReadinessMessage(null)).toBeNull();
+    expect(programResetReadinessMessage({
+      ...waiting, programCycle: { ...waiting.programCycle, cycleGeneration: 1 },
+    })).toBeNull();
+    expect(programResetReadinessMessage({
+      ...waiting, programCycle: { ...waiting.programCycle, state: 'resetting' },
+    })).toBeNull();
+    expect(programResetReadinessMessage({
+      ...waiting, programCycle: { ...waiting.programCycle,
+        failure: { code: 'program_scene_preparation_failed', message: 'Scene convergence failed', details: {} } },
+    })).toBeNull();
+  });
   it('uses semantic owner revisions instead of a fixed browser poll', () => {
     const source = readFileSync(new URL('./useProgramRuntime.ts', import.meta.url), 'utf8');
     expect(source).not.toContain('setInterval');
@@ -547,7 +570,6 @@ describe('Program runtime authority requests', () => {
       source_document_digest: digest('a'),
       expected_applied_record_digest: digest('c'),
       draft_program_revision: digest('b'),
-      expected_admission_generation: 9,
     });
 
     expect(buildProgramStartRequest(

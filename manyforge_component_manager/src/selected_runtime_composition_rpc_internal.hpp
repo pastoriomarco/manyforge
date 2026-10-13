@@ -22,14 +22,19 @@ using SelectedRuntimeCompositionRpcRequest =
                  ManagerSelectedComponentBringUpReadRequestDTO,
                  ManagerApplyComponentBringUpRequestDTO,
                  ManagerApplyComponentBringUpReadRequestDTO,
-                 ManagerComponentBringUpInspectionRequestDTO>;
+                 ManagerComponentBringUpInspectionRequestDTO,
+                 ManagerComponentProcessStopRequestDTO,
+                 ManagerComponentProcessStopReadRequestDTO,
+                 ManagerComponentProcessInventoryRequestDTO>;
 
 using SelectedRuntimeCompositionRpcResponse =
     std::variant<ManagerSelectedRuntimeCompositionResultDTO,
                  SelectedRuntimeCompositionRpcFailure,
                  ManagerSelectedComponentBringUpResultDTO,
                  ManagerApplyComponentBringUpResultDTO,
-                 ManagerComponentBringUpInspectionResultDTO>;
+                 ManagerComponentBringUpInspectionResultDTO,
+                 ManagerComponentProcessStopResultDTO,
+                 ManagerComponentProcessInventoryResultDTO>;
 
 [[nodiscard]] bool
 IsSelectedRuntimeCompositionRpcPacket(std::string_view bytes) noexcept;
@@ -51,6 +56,12 @@ DecodeSelectedRuntimeCompositionRpcRequest(std::string_view bytes);
 // fields preserve the existing MFNSRC4 tag11/tag12 and Q96 observer bytes.
 [[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
     const ManagerComponentBringUpInspectionRequestDTO &request);
+[[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessStopRequestDTO &request);
+[[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessStopReadRequestDTO &request);
+[[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentProcessInventoryRequestDTO &request);
 [[nodiscard]] SelectedRuntimeCompositionRpcRequest
 DecodeSelectedRuntimeCompositionRpcRequestVariant(std::string_view bytes);
 

@@ -21,6 +21,10 @@
 
 namespace manyforge::deployment {
 
+using CCLCReadinessSourceCapture = std::function<
+    core::Result<core::ComponentLifecycleReadinessSourceView>(
+        const core::ComponentLifecycleCurrentSnapshotDTO &)>;
+
 /// Stable construction policy for one production CCLC owner epoch.
 ///
 /// The durable state and disposable run roots are trusted, pre-existing
@@ -78,6 +82,7 @@ struct CCLCProductContextInputs final {
   IRouteConfigurationKernelPublicationOwner &kernel_publication_owner;
   std::shared_ptr<const void> installed_product_lifetime;
   std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_state_inventory{};
+  CCLCReadinessSourceCapture capture_readiness_sources{};
 };
 
 /// Complete L0.4 production lifetime join for one exact retained bundle.
@@ -159,7 +164,10 @@ public:
                  const core::ControlDomainId &)>
              kernel_current_configuration_source = {},
          core::ICCLCComponentCommandReadinessPort
-             *component_command_readiness_port = nullptr);
+             *component_command_readiness_port = nullptr,
+         std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory>
+             measured_state_inventory = {},
+         CCLCReadinessSourceCapture capture_readiness_sources = {});
 
   /// Starts effectful retained-transaction recovery and request transports.
   /// Construction alone permits owner-local observation, without admitting
@@ -179,6 +187,21 @@ public:
   /// Observe the first open record in the existing single cell observer slot.
   [[nodiscard]] core::Result<std::optional<core::CellObserverIncidentRecordDTO>>
   LoadOpenCellObserverIncident();
+  /// The actual existing row association for explicit bring-up admission CAS.
+  [[nodiscard]] core::Result<std::optional<core::CellObserverLossAssociationDTO>>
+  LoadOpenCellObserverLossAssociation();
+
+  [[nodiscard]] core::Result<std::optional<core::CellObserverBringUpRecordDTO>>
+  LoadLatestCellObserverBringUp();
+  [[nodiscard]] core::Result<core::CellObserverBringUpAdmissionDTO>
+  BeginLatestCellObserverBringUp(const core::CellObserverBringUpRecordDTO& admitted,
+      const std::optional<core::CellObserverBringUpRecordDTO>& expected_latest);
+  [[nodiscard]] core::Result<core::CellObserverBringUpRecordDTO>
+  UpdateLatestCellObserverBringUp(const core::CellObserverBringUpRecordDTO& expected,
+      const core::CellObserverBringUpRecordDTO& updated);
+  [[nodiscard]] core::Result<core::CellObserverBringUpRecordDTO>
+  CloseCellObserverIncidentByOperatorBringUp(const core::CellObserverBringUpRecordDTO& expected_started,
+      const core::CellObserverBringUpOpenDTO& first_open);
 
   /// Observe this genuine owner's Q97 component generation selection. The
   /// journal verifies its current owner and later acceptance repeats the CAS.
@@ -233,7 +256,10 @@ private:
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
       core::IClock &clock, core::IScheduler &scheduler,
-      core::ICCLCComponentCommandReadinessPort *component_command_readiness_port);
+      core::ICCLCComponentCommandReadinessPort *component_command_readiness_port,
+      std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory>
+          measured_state_inventory,
+      CCLCReadinessSourceCapture capture_readiness_sources);
 
   CCLCRuntimeCompositionConfig config_;
   core::SqliteCCLCJournal journal_;

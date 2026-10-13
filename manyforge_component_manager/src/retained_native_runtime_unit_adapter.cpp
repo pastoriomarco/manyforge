@@ -91,7 +91,6 @@ constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
 constexpr auto kManagerLivenessTimeout = std::chrono::milliseconds(750);
 constexpr auto kProjectionPreparationTimeout = std::chrono::seconds(10);
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
-constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 
 [[nodiscard]] std::string_view ProjectionOperationName(
     const detail::NativeProjectionRpcRequest &request) noexcept {
@@ -953,6 +952,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // name an unrelated process, so it is never waited on again; the stale
     // registry row is observed as absent and erased by its next observer.
     bool reaped{};
+    bool shutdown_requested{};
+    bool shutdown_acknowledged{};
+    bool shutdown_progress_pending{};
     RuntimeEpoch runtime_epoch;
     UniqueFd channel;
     std::string product_identity;
@@ -961,8 +963,22 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     std::set<ProjectionBindingKey> admitted_projection_bindings;
     // At most one observation response may be outstanding. A timeout never
     // closes the shared host's channel or terminates its healthy components.
-    std::optional<ManagerComponentBringUpInspectionRequestDTO> pending_inspection;
+    std::optional<std::variant<ManagerComponentBringUpInspectionRequestDTO,
+                               ManagerComponentProcessInventoryRequestDTO>>
+        pending_inspection;
     bool invalid_pending_inspection_response{};
+    struct PendingProcessStop final {
+      ManagerComponentProcessStopRequestDTO request;
+      bool read_only;
+      // A consuming READ's late response remains in this exact association
+      // until its caller reads it. Other observations may settle the packet,
+      // but cannot consume or replace its proof.
+      std::optional<std::variant<ManagerComponentProcessStopResultDTO,
+                                 detail::SelectedRuntimeCompositionRpcFailure>>
+          response;
+    };
+    std::optional<PendingProcessStop> pending_process_stop;
+    bool invalid_pending_process_stop_response{};
 
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
@@ -1139,8 +1155,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   ~Impl() {
     std::lock_guard lock(mutex);
     for (auto &[runtime_id, child] : children) {
-      EraseLivenessEndpoint(runtime_id);
       StopChildNoThrow(child);
+      EraseLivenessEndpoint(runtime_id);
     }
   }
 
@@ -1255,19 +1271,62 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Fail("native runtime child observation returned a foreign PID");
   }
 
+  [[nodiscard]] bool SettlePendingProcessStop(Child &child) {
+    if (!child.pending_process_stop) return true;
+    if (child.invalid_pending_process_stop_response) return false;
+    if (child.pending_process_stop->response) return true;
+    try {
+      const auto packet = ReceivePacket(child.channel.get(), std::chrono::milliseconds(0));
+      if (!packet) return false;
+      auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
+      if (const auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response)) {
+        if (!result->valid() || result->request != child.pending_process_stop->request) {
+          child.invalid_pending_process_stop_response = true;
+          return false;
+        }
+      } else if (!std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(response)) {
+        child.invalid_pending_process_stop_response = true;
+        return false;
+      }
+      if (child.pending_process_stop->read_only) {
+        if (auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response))
+          child.pending_process_stop->response.emplace(std::move(*result));
+        else
+          child.pending_process_stop->response.emplace(
+              std::move(std::get<detail::SelectedRuntimeCompositionRpcFailure>(response)));
+      } else {
+        child.pending_process_stop.reset();
+      }
+      return true;
+    } catch (...) {
+      child.invalid_pending_process_stop_response = true;
+      return false;
+    }
+  }
+
   [[nodiscard]] bool SettlePendingInspection(Child &child) {
+    if (!SettlePendingProcessStop(child)) return false;
     if (!child.pending_inspection) return true;
     if (child.invalid_pending_inspection_response) return false;
     try {
       const auto packet = ReceivePacket(child.channel.get(), std::chrono::milliseconds(0));
       if (!packet) return false;
       const auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
-      if (const auto *result = std::get_if<ManagerComponentBringUpInspectionResultDTO>(&response)) {
-        if (!result->valid() || result->request != *child.pending_inspection) {
-          child.invalid_pending_inspection_response = true;
-          return false;
-        }
-      } else if (!std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(response)) {
+      const bool matched = std::visit(
+          [&](const auto &original) {
+            using Request = std::decay_t<decltype(original)>;
+            using Response = std::conditional_t<
+                std::is_same_v<Request,
+                               ManagerComponentBringUpInspectionRequestDTO>,
+                ManagerComponentBringUpInspectionResultDTO,
+                ManagerComponentProcessInventoryResultDTO>;
+            const auto *result = std::get_if<Response>(&response);
+            return result && result->valid() && result->request == original;
+          },
+          *child.pending_inspection);
+      if (!matched &&
+          !std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(
+              response)) {
         child.invalid_pending_inspection_response = true;
         return false;
       }
@@ -1474,6 +1533,138 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
            "kind");
     }
     return manyforge::core::Result<Response>::Ok(*typed);
+  }
+
+  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+  ComponentProcessStopCall(const ManagerComponentProcessStopRequestDTO &request, bool read_only) {
+    using Result = manyforge::core::Result<ManagerComponentProcessStopResultDTO>;
+    if (!request.valid()) Fail("component process Stop request is invalid");
+    const auto unknown = [&](const char *code, const char *message) {
+      return Result::Ok({request, manyforge::core::ControllerLaunchCleanupState::kUnknown,
+                         std::nullopt, manyforge::core::ErrorDTO{code, message, {}}});
+    };
+    const auto encoded = read_only
+        ? detail::EncodeSelectedRuntimeCompositionRpcRequest(ManagerComponentProcessStopReadRequestDTO{request})
+        : detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
+    std::lock_guard lock(mutex);
+    const auto found = children.find(request.runtime_unit_id.value());
+    if (found == children.end())
+      return unknown("component_process_stop_owner_unavailable", "the original managed host is unavailable");
+    if (!ChildIsLive(found->second)) {
+      EraseChild(found);
+      return unknown("component_process_stop_owner_unavailable", "the original managed host exited without drain proof");
+    }
+    if (found->second.runtime_epoch != request.runtime_epoch)
+      return Result::Err({"component_process_stop_foreign_host", "process Stop names a different host occurrence", {}});
+    if (!SettlePendingInspection(found->second))
+      return unknown("component_process_stop_pending", "the original managed response remains unresolved");
+    if (found->second.pending_process_stop) {
+      auto &pending = *found->second.pending_process_stop;
+      if (read_only) {
+        if (pending.request != request)
+          return unknown("component_process_stop_pending",
+                         "the retained READ response belongs to another exact request");
+        auto response = std::move(*pending.response);
+        found->second.pending_process_stop.reset();
+        if (auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(&response))
+          return Result::Err(std::move(failure->error));
+        return Result::Ok(std::move(std::get<ManagerComponentProcessStopResultDTO>(response)));
+      }
+      if (pending.request == request) {
+        // Exact duplicate Stop returns the already received result without
+        // sending or consuming the retained READ association.
+        if (const auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
+                &*pending.response))
+          return Result::Err(failure->error);
+        return Result::Ok(std::get<ManagerComponentProcessStopResultDTO>(*pending.response));
+      }
+      // A newer explicit Stop replaces the previous settled association, as
+      // the host's existing latest-result contract does. A READ never does.
+      found->second.pending_process_stop.reset();
+    }
+    Child::PendingProcessStop pending{request, read_only, std::nullopt};
+    // This explicit teardown reuses the original management lane's retire_exact.
+    // A late response keeps correlation and the host alive; READ never signals.
+    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
+    found->second.pending_process_stop.emplace(std::move(pending));
+    const auto packet = ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    if (!packet)
+      return unknown("component_process_stop_response_unavailable", "process Stop has no exact response yet");
+    found->second.invalid_pending_process_stop_response = true;
+    const auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
+    if (const auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(&response)) {
+      found->second.pending_process_stop.reset();
+      found->second.invalid_pending_process_stop_response = false;
+      return Result::Err(failure->error);
+    }
+    const auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response);
+    if (!result || !result->valid() || result->request != request)
+      Fail("managed host returned a foreign component process Stop result");
+    found->second.pending_process_stop.reset();
+    found->second.invalid_pending_process_stop_response = false;
+    return Result::Ok(*result);
+  }
+
+  [[nodiscard]] manyforge::core::Result<
+      ManagerComponentProcessInventoryResultDTO>
+  InspectInstalledComponentProcesses(
+      const ManagerComponentProcessInventoryRequestDTO &request) {
+    using Result =
+        manyforge::core::Result<ManagerComponentProcessInventoryResultDTO>;
+    if (!request.valid())
+      Fail("installed process inventory request is invalid");
+    const auto encoded =
+        detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
+    std::lock_guard lock(mutex);
+    const auto found = children.find(request.runtime_unit_id.value());
+    if (found == children.end())
+      return Result::Err({"installed_process_inspection_unavailable",
+                          "installed process inspection has no managed child",
+                          {}});
+    if (!ChildIsLive(found->second)) {
+      EraseChild(found);
+      return Result::Err(
+          {"installed_process_inspection_unavailable",
+           "managed child exited before installed process inspection",
+           {}});
+    }
+    if (found->second.runtime_epoch != request.runtime_epoch)
+      return Result::Err(
+          {"installed_process_inspection_foreign_runtime",
+           "installed process inspection names another actual host epoch",
+           {}});
+    if (!SettlePendingInspection(found->second))
+      return Result::Err({"installed_process_inspection_pending",
+                          "previous process read or Stop has no exact response",
+                          {}});
+    const auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+        kProjectionPreparationTimeout);
+    auto pending = request;
+    SendPacket(found->second.channel.get(), encoded, timeout);
+    found->second.pending_inspection.emplace(std::move(pending));
+    const auto packet = ReceivePacket(found->second.channel.get(), timeout);
+    if (!packet)
+      return Result::Err({"installed_process_inspection_timed_out",
+                          "installed process inventory response is "
+                          "unavailable; shared host remains running",
+                          {}});
+    found->second.invalid_pending_inspection_response = true;
+    const auto response =
+        detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
+    if (const auto *failure =
+            std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
+                &response)) {
+      found->second.pending_inspection.reset();
+      found->second.invalid_pending_inspection_response = false;
+      return Result::Err(failure->error);
+    }
+    const auto *result =
+        std::get_if<ManagerComponentProcessInventoryResultDTO>(&response);
+    if (!result || !result->valid() || result->request != request)
+      Fail("managed child returned foreign installed process inventory");
+    found->second.pending_inspection.reset();
+    found->second.invalid_pending_inspection_response = false;
+    return Result::Ok(*result);
   }
 
   [[nodiscard]] manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
@@ -1925,78 +2116,126 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
   }
 
-  [[nodiscard]] bool
-  WaitForChildExit(Child &child,
-                   const std::chrono::steady_clock::time_point deadline) {
-    for (;;) {
-      if (!ChildIsLive(child)) {
-        return true;
-      }
-      if (std::chrono::steady_clock::now() >= deadline) {
-        return false;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  [[nodiscard]] detail::NativeShutdownProgress
+  ReadShutdownProgress(Child &child) {
+    // StopChild owns the ordinary mutex/channel. Heartbeat renewals keep their
+    // independent existing endpoint, stream and mutex throughout host drain.
+    if (!child.shutdown_acknowledged) {
+      const auto acknowledgement =
+          ReceivePacket(child.channel.get(), kStatusTimeout);
+      if (!acknowledgement || *acknowledgement != "shutdown-accepted")
+        Fail("shutdown acknowledgement is unavailable or belongs to another "
+             "request");
+      child.shutdown_acknowledged = true;
     }
+    if (!child.shutdown_progress_pending) {
+      SendPacket(
+          child.channel.get(),
+          detail::EncodeNativeShutdownRpcRequest(child.runtime_epoch.value()),
+          kStatusTimeout);
+      child.shutdown_progress_pending = true;
+    }
+    // A timed-out status remains the sole outstanding diagnostic request;
+    // only its actual reply clears this transport state. Never queue retries.
+    const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
+    if (!packet)
+      Fail("shutdown progress response is unavailable");
+    child.shutdown_progress_pending = false;
+    auto result = detail::DecodeNativeShutdownRpcResponse(*packet);
+    if (result.runtime_epoch != child.runtime_epoch.value())
+      Fail("shutdown progress names a foreign runtime epoch");
+    return result;
   }
 
   void StopChildNoThrow(Child &child) noexcept {
-    try {
-      StopChild(child);
-    } catch (...) {
-      if (!child.reaped) {
-        KillAndReap(child.pid);
-        child.reaped = true;
+    for (;;) {
+      try {
+        StopChild(child);
+        return;
+      } catch (const std::exception &error) {
+        // Unknown direct-child ownership is not permission to target a reused
+        // PID. Normal destruction waits for an explicit operator force action.
+        std::cerr << "shutdown stuck at child-exit-observation: "
+                  << error.what() << "; to force: manyforge-operator stop\n";
+      } catch (...) {
+        std::cerr << "shutdown stuck at child-exit-observation; to force: "
+                     "manyforge-operator stop\n";
       }
+      std::this_thread::sleep_for(kGracefulStopTimeout);
     }
-    child.channel.Reset();
   }
 
   void StopChild(Child &child) {
-    if (!ChildIsLive(child)) {
-      child.channel.Reset();
+    if (!ChildIsLive(child))
       return;
-    }
-    std::cerr << "native runtime child shutdown requested: pid=" << child.pid
-              << " epoch=" << child.runtime_epoch.value() << '\n';
-    try {
-      SendPacket(child.channel.get(), "shutdown",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     kStatusTimeout));
-    } catch (...) {
-      // A failed graceful request does not weaken the direct-child stop
-      // guarantee; continue through the bounded signal path below.
-    }
-    if (WaitForChildExit(child, std::chrono::steady_clock::now() +
-                                    kGracefulStopTimeout)) {
-      child.channel.Reset();
-      return;
-    }
-    if (::kill(child.pid, SIGTERM) != 0 && errno != ESRCH) {
-      Fail(ErrnoDetail("could not terminate native runtime child", errno));
-    }
-    if (WaitForChildExit(child,
-                         std::chrono::steady_clock::now() + kTermStopTimeout)) {
-      child.channel.Reset();
-      return;
-    }
-    if (::kill(child.pid, SIGKILL) != 0 && errno != ESRCH) {
-      Fail(ErrnoDetail("could not kill native runtime child", errno));
-    }
-    int status = 0;
-    pid_t result = -1;
-    do {
-      result = ::waitpid(child.pid, &status, 0);
-    } while (result < 0 && errno == EINTR);
-    if (result != child.pid) {
-      if (result < 0) {
-        Fail(ErrnoDetail("could not reap native runtime child", errno));
+    if (!child.shutdown_requested) {
+      child.shutdown_requested =
+          true; // one request, even if delivery is unknown
+      std::cerr << "native runtime child shutdown requested: pid=" << child.pid
+                << " epoch=" << child.runtime_epoch.value() << '\n';
+      try {
+        SendPacket(child.channel.get(), "shutdown", kStatusTimeout);
+      } catch (const std::exception &error) {
+        std::cerr << "native shutdown delivery failed or unknown: "
+                  << error.what()
+                  << "; requesting existing SIGTERM handler once: pid="
+                  << child.pid << '\n';
+        // Existing handler requests the same host teardown. No automatic
+        // total wait/escalation and no signal on a merely delayed status reply.
+        if (::kill(child.pid, SIGTERM) != 0 && errno != ESRCH)
+          std::cerr << "native shutdown SIGTERM request failed: errno=" << errno
+                    << '\n';
       }
-      Fail("native runtime child reap returned a foreign PID");
     }
-    std::cerr << "native runtime child killed after bounded stop: pid="
-              << child.pid << '\n';
-    child.reaped = true;
-    child.channel.Reset();
+    std::optional<detail::NativeShutdownProgress> last_progress;
+    auto last_change = std::chrono::steady_clock::now();
+    bool stuck_reported = false;
+    std::string last_observation_error;
+    while (ChildIsLive(child)) {
+      try {
+        const auto progress = ReadShutdownProgress(child);
+        if (!last_progress || progress != *last_progress) {
+          last_progress = progress;
+          last_change = std::chrono::steady_clock::now();
+          stuck_reported = false;
+          std::cerr << "native shutdown entering/waiting at "
+                    << detail::NativeShutdownPhaseName(progress.phase)
+                    << " pid=" << child.pid
+                    << " epoch=" << progress.runtime_epoch
+                    << " workers_joined=" << progress.completed_workers
+                    << " groups_pending=" << progress.pending_groups << '/'
+                    << progress.total_groups
+                    << " signalled=" << progress.signalled_groups
+                    << " escalated=" << progress.escalated_groups
+                    << " reaped=" << progress.reaped_groups
+                    << " drained=" << progress.drained_groups
+                    << " unknown=" << progress.unknown_groups
+                    << " pending_pid=" << progress.pending_pid << '\n';
+        }
+        last_observation_error.clear();
+      } catch (const std::exception &error) {
+        // Responsiveness/transport loss never proves EXIT or authorizes force.
+        if (last_observation_error != error.what()) {
+          last_observation_error = error.what();
+          std::cerr << "native shutdown progress unavailable: " << error.what()
+                    << '\n';
+        }
+      }
+      // Reuse the former graceful observation window only for one diagnostic;
+      // it is no longer an automatic kill budget. Unchanged replies do not
+      // refresh actual progress. The explicit operator path retains force.
+      if (!stuck_reported && std::chrono::steady_clock::now() - last_change >=
+                                 kGracefulStopTimeout) {
+        std::cerr << "shutdown stuck at "
+                  << (last_progress ? detail::NativeShutdownPhaseName(
+                                          last_progress->phase)
+                                    : std::string_view("progress-unavailable"))
+                  << " pid=" << child.pid
+                  << "; to force: manyforge-operator stop\n";
+        stuck_reported = true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 
   [[nodiscard]] Child
@@ -2884,6 +3123,24 @@ ManagerSelectedRuntimeCompositionResultDTO
 RetainedNativeRuntimeUnitAdapter::InstallOrObserve(
     const ManagerSelectedRuntimeCompositionRequestDTO &request) {
   return impl_->InstallOrObserveRuntimeComposition(request);
+}
+
+manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+RetainedNativeRuntimeUnitAdapter::StopComponentProcess(
+    const ManagerComponentProcessStopRequestDTO &request) {
+  return impl_->ComponentProcessStopCall(request, false);
+}
+manyforge::core::Result<ManagerComponentProcessStopResultDTO>
+RetainedNativeRuntimeUnitAdapter::ReadComponentProcessStop(
+    const ManagerComponentProcessStopReadRequestDTO &request) {
+  if (!request.valid()) Fail("component process Stop read request is invalid");
+  return impl_->ComponentProcessStopCall(request.request, true);
+}
+
+manyforge::core::Result<ManagerComponentProcessInventoryResultDTO>
+RetainedNativeRuntimeUnitAdapter::InspectInstalledComponentProcesses(
+    const ManagerComponentProcessInventoryRequestDTO &request) {
+  return impl_->InspectInstalledComponentProcesses(request);
 }
 
 manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>

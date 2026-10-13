@@ -37,15 +37,25 @@ const context: CCLCRequestContext = {
   correlation_id: null,
 };
 
+function readiness(state: CCLCComponentSnapshot['lifecycleState'], ready = true): CCLCComponentSnapshot['readiness'] {
+  return { requestOwnerEpoch: 'cclc-owner.1', evaluatedAtNs: 100,
+    nextIntent: state === 'declared' || state === 'disabled' ? 'prepare' : state === 'prepared' ? 'enable' : null,
+    requestedState: state === 'declared' || state === 'disabled' ? 'prepared' : state === 'prepared' ? 'active' : null,
+    ready, error: ready ? null : { code: 'missing_reference', message: 'Measured feed unavailable', details: {} },
+    domains: [], measuredState: { required: false, available: null, error: null } };
+}
+
 const snapshot: CCLCComponentSnapshot = {
   componentId: 'component.arm',
   lifecycleGeneration: 4,
   lifecycleState: 'prepared',
   retainedBundleId: 'bundle.1',
+    publicationGeneration: 1, activePublicPointerDigest: 'pointer.1',
   graphRevision: 'graph.1',
   providers: [],
   lifecycleTarget: null,
   lifecycleProgress: null,
+  readiness: readiness('prepared'),
   domains: [{
     controlDomainId: 'domain.arm',
     controlDomainRevision: 'domain.revision.1',
@@ -241,7 +251,7 @@ describe('explicit ordinary activation', () => {
     let state: CCLCComponentSnapshot['lifecycleState'] = 'declared';
     const commands: string[] = [];
     await activateThroughOrdinaryLifecycle(
-      async () => ({ snapshot: { ...snapshot, lifecycleState: state }, ownerEpoch: 'owner.1' }),
+      async () => ({ snapshot: { ...snapshot, lifecycleState: state, readiness: readiness(state) }, ownerEpoch: 'owner.1' }),
       async (intent) => {
         commands.push(intent);
         state = intent === 'prepare' ? 'prepared' : 'active';
@@ -289,7 +299,7 @@ it('does not submit Enable while the accepted Prepare is still unfinished', asyn
   const commands: string[] = [];
   const accepted = new Promise<void>((resolve) => { finishPrepare = resolve; });
   const activation = activateThroughOrdinaryLifecycle(
-    async () => ({ snapshot: { ...snapshot, lifecycleState: state }, ownerEpoch: 'owner.1' }),
+    async () => ({ snapshot: { ...snapshot, lifecycleState: state, readiness: readiness(state) }, ownerEpoch: 'owner.1' }),
     async (intent) => {
       commands.push(intent);
       if (intent === 'prepare') await accepted;
@@ -332,7 +342,7 @@ type FakeDocument = {
 
 let hookRoot: { render: (value: ReactNode) => void; unmount: () => void } | null = null;
 let hook: ReturnType<typeof useCCLC> | null = null;
-async function mountCCLC() {
+async function mountCCLC(configuredComponentIds?: readonly string[]) {
   const document = {
     nodeType: 9,
     documentElement: null,
@@ -373,7 +383,7 @@ async function mountCCLC() {
   const { createRoot } = await import('react-dom/client');
   hookRoot = createRoot(makeNode('div') as unknown as Element);
   function Harness({ enabled }: { enabled: boolean }) {
-    const controller = useCCLC(enabled, 7);
+    const controller = useCCLC(enabled, 7, configuredComponentIds);
     useEffect(() => { hook = controller; }, [controller]);
     return null;
   }
@@ -407,7 +417,7 @@ describe('mounted explicit activation API boundaries', () => {
     }
     apiMock.execution.identity.mockImplementation(async () => execution);
     apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: 'cclc-owner.1' });
-    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id, lifecycleState: state }));
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id, lifecycleState: state, readiness: readiness(state) }));
     apiMock.cclc.routeTemplates.mockImplementation(async (id: string) => ({ ...templates, componentId: id }));
     apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
       scenarioId: 'fixture', deploymentRevision: 'deployment.1',
@@ -432,7 +442,7 @@ describe('mounted explicit activation API boundaries', () => {
     apiMock.execution.identity.mockImplementation(async () => ++reads < 3 ? execution
       : { ...execution, graphRevision: 'replacement.graph', retainedBundleId: 'replacement.bundle' });
     apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
-      lifecycleState: state, ...(reads < 3 ? {} : { graphRevision: 'replacement.graph', retainedBundleId: 'replacement.bundle' }) }));
+      lifecycleState: state, readiness: readiness(state), ...(reads < 3 ? {} : { graphRevision: 'replacement.graph', retainedBundleId: 'replacement.bundle' }) }));
     apiMock.cclc.routeTemplates.mockImplementation(async (id: string) => ({ ...templates, componentId: id,
       ...(reads < 3 ? {} : { graphRevision: 'replacement.graph', retainedBundleId: 'replacement.bundle' }) }));
     await act(async () => { await hook!.activate(); });
@@ -510,4 +520,192 @@ describe('mounted explicit activation API boundaries', () => {
       await flushHook();
     },
   );
+  it('keeps indefinite missing-measurement or fault readiness waits effect-free and cancelable', async () => {
+    await mountCCLC();
+    const readsBefore = apiMock.cclc.component.mock.calls.length;
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+      lifecycleState: state, readiness: { ...readiness(state, false), error: {
+        code: 'component_fault', message: 'Controller fault requires repair', details: { reason: 'fault_present' } } } }));
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.busy).toBe(true);
+    expect(apiMock.cclc.component.mock.calls.length - readsBefore).toBe(82);
+    expect(hook!.activationProgress).toBe('component.arm: Not ready — [component_fault] Controller fault requires repair · fault_present');
+    await act(async () => { hook!.cancelActivation(); await activation; });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.activationUnresolved).toBe(false);
+  });
+
+  it('uses the existing passive cycle for all configured rows without effects or selected-route changes', async () => {
+    await mountCCLC(['component.other', 'component.arm']);
+    const selected = hook!.componentId;
+    apiMock.cclc.component.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(apiMock.cclc.component.mock.calls.map(([id]) => id)).toEqual(['component.other', 'component.arm']);
+    expect(Object.keys(hook!.componentHealth).sort()).toEqual(['component.arm', 'component.other']);
+    expect(hook!.snapshot?.componentId).toBe(selected);
+    expect(hook!.routeTemplates?.componentId).toBe(selected);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('does not overlap passive cycles while a component GET remains unresolved', async () => {
+    await mountCCLC(['component.other', 'component.arm']);
+    let resolveRead!: (value: CCLCComponentSnapshot) => void;
+    apiMock.cclc.component.mockClear();
+    apiMock.cclc.component.mockImplementation((id: string) => id === 'component.other'
+      ? new Promise((resolve) => { resolveRead = resolve; })
+      : Promise.resolve({ ...snapshot, componentId: id, lifecycleState: state, readiness: readiness(state) }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(1);
+    await act(async () => { resolveRead({ ...snapshot, componentId: 'component.other', lifecycleState: state, readiness: readiness(state) }); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(2);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('requires new Prepared-step readiness after the explicit Prepare finishes', async () => {
+    await mountCCLC();
+    let enabled = false;
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+      lifecycleState: state, readiness: readiness(state, state !== 'prepared' || enabled) }));
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['prepare']);
+    enabled = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['prepare', 'enable']);
+  });
+
+  it('retains the accepted nonterminal transaction after Cancel and prohibits a new effect until exact terminal readback', async () => {
+    await mountCCLC();
+    const pending = { ...acceptedLifecycle('prepare'), status: { ...acceptedLifecycle('prepare').status,
+      phase: 'accepted', terminalResult: null } };
+    apiMock.cclc.submitLifecycle.mockResolvedValueOnce(pending);
+    apiMock.cclc.lifecycleStatus.mockResolvedValue(pending.status);
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    expect(hook!.pendingActivationRequest).toBeNull();
+    await act(async () => { hook!.cancelActivation(); await activation; });
+    expect(hook!.activationUnresolved).toBe(true);
+    await act(async () => { await hook!.activate(); });
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+    state = 'prepared';
+    apiMock.cclc.lifecycleStatus.mockResolvedValue(acceptedLifecycle('prepare').status);
+    await act(async () => { await hook!.reconcileTransaction(); });
+    expect(hook!.activationUnresolved).toBe(false);
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+    await act(async () => { await hook!.activate(); });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['prepare', 'enable']);
+  });
+
+  it('does not publish a late positive readiness response or submit after Cancel', async () => {
+    await mountCCLC();
+    let resolveRead!: (value: CCLCComponentSnapshot) => void;
+    apiMock.cclc.component.mockImplementation(() => new Promise((resolve) => { resolveRead = resolve; }));
+    const previous = hook!.snapshot;
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    await act(async () => { hook!.cancelActivation(); resolveRead({ ...snapshot, lifecycleState: 'declared', readiness: readiness('declared') }); await activation; });
+    expect(hook!.snapshot).toBe(previous);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('keeps a readiness Prepare race refusal truthful without retrying or choosing another component', async () => {
+    await mountCCLC();
+    apiMock.cclc.submitLifecycle.mockResolvedValue({ ...acceptedLifecycle('prepare'), status: {
+      ...acceptedLifecycle('prepare').status, terminalResult: 'failed_known_no_effect', error: {
+        code: 'component_lifecycle_transition_missing', message: 'No transition satisfied',
+        details: { reason: 'no_transition_satisfied', observed_state: 'declared', observed_controller_loaded: 'unknown',
+          observed_fault_present: 'false', observed_transport_ready: 'false' } } } });
+    await act(async () => { await hook!.activate(); });
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+    expect(hook!.componentId).toBe('component.arm');
+    expect(hook!.activationRefusal?.error.details.observed_controller_loaded).toBe('unknown');
+    expect(hook!.activationUnresolved).toBe(false);
+    expect(hook!.error).toBeNull();
+  });
+
+  it.each(['publication', 'host-owner'])('ends a wait when only the exact %s changes', async (change) => {
+    await mountCCLC();
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+      lifecycleState: state, readiness: readiness(state, false) }));
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    if (change === 'publication') {
+      apiMock.execution.identity.mockResolvedValue({ ...execution, activePublicationGeneration: 2 });
+      apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+        lifecycleState: state, readiness: readiness(state), publicationGeneration: 2, activePublicPointerDigest: 'pointer.2' }));
+    } else apiMock.execution.identity.mockResolvedValue({ ...execution, ownerEpoch: 'replacement-host-owner' });
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.componentHealth['component.arm']?.snapshot).toBeNull();
+    expect(hook!.error).toContain(change === 'publication' ? 'applied publication changed' : 'execution owner changed');
+  });
+
+  it.each(['refresh', 'activate'] as const)('invalidates prior Ready when a newer %s GET fails', async (action) => {
+    await mountCCLC();
+    expect(hook!.componentHealth['component.arm']?.snapshot?.readiness.ready).toBe(true);
+    apiMock.cclc.component.mockRejectedValue(new Error('Invalid current readiness schema'));
+    await act(async () => { await hook![action](); });
+    expect(hook!.snapshot).toBeNull();
+    expect(hook!.componentHealth['component.arm']?.snapshot).toBeNull();
+    expect(hook!.componentHealth['component.arm']?.error).toContain('Invalid current readiness schema');
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('does not let an obsolete failed GET erase a newer healthy read', async () => {
+    await mountCCLC();
+    let rejectOld!: (error: Error) => void;
+    apiMock.cclc.component.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+    let old!: Promise<void>;
+    await act(async () => { old = hook!.refresh(); });
+    await act(async () => { await hook!.refresh(); });
+    const current = hook!.snapshot;
+    await act(async () => { rejectOld(new Error('Obsolete failure')); await old; });
+    expect(hook!.snapshot).toBe(current);
+    expect(hook!.componentHealth['component.arm']?.error).toBeNull();
+  });
+
+  it('runs Retry as a new whole-current-list command and skips already Active components', async () => {
+    await mountCCLC();
+    const states: Record<string, CCLCComponentSnapshot['lifecycleState']> = {
+      'component.other': 'active', 'component.arm': 'declared' };
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+      lifecycleState: states[id]!, readiness: readiness(states[id]!) }));
+    apiMock.cclc.submitLifecycle.mockImplementation(async (request) => {
+      states[request.controllable_component_id] = request.intent === 'prepare' ? 'prepared' : 'active';
+      return acceptedLifecycle(request.intent);
+    });
+    await act(async () => { await hook!.activateSequence(); });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.arm', 'prepare'], ['component.arm', 'enable']]);
+    expect(hook!.componentId).toBe('component.arm');
+    apiMock.cclc.submitLifecycle.mockClear();
+    await act(async () => { await hook!.activateSequence(); });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('pins publication for the entire sequence across an Active skip and the next component', async () => {
+    await mountCCLC();
+    apiMock.cclc.component.mockClear();
+    let publication = 1;
+    apiMock.execution.identity.mockImplementation(async () => ({ ...execution, activePublicationGeneration: publication }));
+    apiMock.cclc.component.mockImplementation(async (id: string) => {
+      if (id === 'component.arm') publication = 2;
+      return { ...snapshot, componentId: id, publicationGeneration: publication,
+        activePublicPointerDigest: `pointer.${publication}`, lifecycleState: id === 'component.other' ? 'active' : 'declared',
+        readiness: readiness(id === 'component.other' ? 'active' : 'declared') };
+    });
+    // Execution identity must expose the same current publication when the next row is read.
+    apiMock.execution.identity.mockImplementation(async () => {
+      if (apiMock.cclc.component.mock.calls.length >= 2) publication = 2;
+      return { ...execution, activePublicationGeneration: publication };
+    });
+    await act(async () => { await hook!.activateSequence(); });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toContain('applied publication changed');
+  });
+
 });

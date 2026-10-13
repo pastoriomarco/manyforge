@@ -30,6 +30,115 @@ inline constexpr std::string_view kManagerLivenessRejectionTag =
     "manyforge.manager-liveness.rejected.v1";
 inline constexpr std::size_t kMaximumManagerLivenessRpcPacketBytes = 16U * 1024U;
 
+// Private child-exit projection on the existing dedicated channel. A response
+// proves servicing; only changed real phase/milestone facts prove progress.
+inline constexpr std::string_view kNativeShutdownRequestTag =
+    "manyforge.native-shutdown.request.v1";
+inline constexpr std::string_view kNativeShutdownResponseTag =
+    "manyforge.native-shutdown.response.v1";
+enum class NativeShutdownPhase : unsigned {
+  kRunning,
+  kGroupRetirement,
+  kExecutionDrain,
+  kCurrentBuilderDrain,
+  kManagedBuilderDrain,
+  kProjectionDrain,
+  kKernelDestruction,
+  kPreparedCompositionDestruction,
+  kRetiredCompositionDestruction,
+  kActiveCompositionDestruction,
+  kFailedCompositionDestruction,
+  kCellProcessesDestruction,
+  kProjectionDestruction,
+  kLivenessReceiverDestruction,
+  kStopSurveillanceDestruction,
+  kSchedulerOwnerRelease,
+  kFenceOwnerDestruction,
+  kServicingLaneDrain
+};
+struct NativeShutdownProgress final {
+  std::string runtime_epoch;
+  NativeShutdownPhase phase{NativeShutdownPhase::kRunning};
+  std::size_t completed_workers{};
+  std::size_t total_groups{};
+  std::size_t pending_groups{};
+  std::size_t signalled_groups{};
+  std::size_t escalated_groups{};
+  std::size_t reaped_groups{};
+  std::size_t drained_groups{};
+  std::size_t unknown_groups{};
+  int pending_pid{-1};
+  bool operator==(const NativeShutdownProgress &) const = default;
+};
+[[nodiscard]] std::string_view
+NativeShutdownPhaseName(NativeShutdownPhase phase);
+[[nodiscard]] bool IsNativeShutdownRpcPacket(std::string_view bytes) noexcept;
+[[nodiscard]] std::string
+EncodeNativeShutdownRpcRequest(std::string_view epoch);
+[[nodiscard]] std::string
+DecodeNativeShutdownRpcRequest(std::string_view bytes);
+[[nodiscard]] std::string
+EncodeNativeShutdownRpcResponse(const NativeShutdownProgress &progress);
+[[nodiscard]] NativeShutdownProgress
+DecodeNativeShutdownRpcResponse(std::string_view bytes);
+
+// Sole projection of the existing teardown caller's facts; no status poll
+// increments a counter, drains a process or accesses a borrowed runtime.
+class NativeShutdownProjection final {
+public:
+  explicit NativeShutdownProjection(std::string epoch) {
+    value_.runtime_epoch = std::move(epoch);
+  }
+  void Enter(NativeShutdownPhase phase) {
+    std::lock_guard lock(mutex_);
+    value_.phase = phase;
+  }
+  void WorkerJoined() {
+    std::lock_guard lock(mutex_);
+    ++value_.completed_workers;
+  }
+  void Groups(std::size_t total, std::size_t pending, std::size_t signalled,
+              std::size_t escalated, std::size_t reaped, std::size_t drained,
+              std::size_t unknown, int pid) {
+    std::lock_guard lock(mutex_);
+    value_.total_groups = total;
+    value_.pending_groups = pending;
+    value_.signalled_groups = signalled;
+    value_.escalated_groups = escalated;
+    value_.reaped_groups = reaped;
+    value_.drained_groups = drained;
+    value_.unknown_groups = unknown;
+    value_.pending_pid = pid;
+  }
+  [[nodiscard]] NativeShutdownProgress Read() const {
+    std::lock_guard lock(mutex_);
+    return value_;
+  }
+  void EnterDuringShutdown(NativeShutdownPhase phase) {
+    std::lock_guard lock(mutex_);
+    if (value_.phase != NativeShutdownPhase::kRunning)
+      value_.phase = phase;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  NativeShutdownProgress value_;
+};
+// Declared immediately after its actual owner: reports entry before that
+// owner's destructor. A later phase comes only after actual return.
+template <typename Owner> struct NativeShutdownOwnerPhase final {
+  NativeShutdownProjection &projection;
+  NativeShutdownPhase phase;
+  Owner &owner;
+  ~NativeShutdownOwnerPhase() {
+    if constexpr (requires { static_cast<bool>(owner); }) {
+      if (!owner)
+        return; // An absent owner has no destructor work to report.
+    }
+    projection.EnterDuringShutdown(phase);
+  }
+};
+
 enum class ManagerLivenessCommandClass {
   kEffectful,
   kStop,

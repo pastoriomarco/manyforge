@@ -1128,11 +1128,12 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   deployment::FilesystemRawArtifactStore raw_artifacts(package_root);
   const auto prepared = deployment::assemble_prepared_activation(
-      {core::ContentDigest("sha256:2020202020202020202020202020202020202020202020"
+      {deployment::PreparedScenarioOrigin{
+           "scenario.test",
+           core::ContentDigest("sha256:1414141414141414141414141414141414141414141414"
+                               "141414141414141414")},
+       core::ContentDigest("sha256:2020202020202020202020202020202020202020202020"
                            "202020202020202020"),
-       "scenario.test",
-       core::ContentDigest("sha256:1414141414141414141414141414141414141414141414"
-                           "141414141414141414"),
        "optional"},
       candidate, model_map, *program, fixture.program_role_assignment,
       catalogs, raw_artifacts);
@@ -1644,6 +1645,170 @@ TEST(ManagerDaemonProcess,
   EXPECT_FALSE(std::filesystem::exists(directory.execution_socket_path()));
 }
 
+TEST(ManagerDaemonProcess, ProcessStopDecoderPreservesActualMultilineLaunchIdentity) {
+  using content_identity::CanonicalValue;
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(), "manager-source.json");
+  const auto before = manager_source.Read();
+  ASSERT_TRUE(before);
+  const std::string launches[]{
+      "mock\nlite6_robot\nlite6_lite_gripper\n/manyforge/lite6_robot\nlite6_traj_controller\nlite_gripper_controller\n\nsha256:948e121935a4e7d66ca927d1945438e48332cce2bd820f60488fc049bb18d4b1\nsha256:61f01507a85d3a8d6539b8488d9a525dbaf115dca33338dc0d1702168d3b34a4\n",
+      "mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n"};
+  EXPECT_EQ(launches[0].size(), 250U);
+  EXPECT_EQ(launches[1].size(), 257U);
+  const auto base = deployment::parse_strict_json_model_yaml(
+      R"({"request_context":{"request_id":"close.stop.1","request_owner_epoch":"caller.1","source_label":"composer"},"predecessor_projection_revision":{"retained_bundle_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","graph_revision":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","scene_revision":{"scene_id":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","revision_id":1,"content_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},"expected_predecessor_publication_generation":1,"expected_predecessor_public_pointer_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","runtime_unit_id":"host.1","runtime_epoch":"host.epoch.1","manager_runtime_epoch":"foreign.manager.epoch","controllable_component_id":"placeholder","launch_identity":"placeholder","leader_pid":42})").root();
+  const auto exchange = [&](const std::string &command, const std::string &launch,
+                            const std::string &component, const std::string &runtime_unit) {
+    auto fields = base.as_object();
+    for (auto &[key, value] : fields) {
+      if (key == "launch_identity") value = CanonicalValue(launch);
+      if (key == "controllable_component_id") value = CanonicalValue(component);
+      if (key == "runtime_unit_id") value = CanonicalValue(runtime_unit);
+    }
+    const auto packet = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+        {"command", CanonicalValue(command)}, {"request", CanonicalValue(std::move(fields))}}));
+    return deployment::parse_strict_json_model_yaml(SendCommand(directory.socket_path(), packet)).root();
+  };
+  for (std::size_t i = 0U; i < 2U; ++i) {
+    const std::string component = i == 0U ? "lite6_robot" : "ur5e_robot";
+    for (const auto *command : {"stop_component_process", "component_process_stop_result"}) {
+      const auto response = exchange(command, launches[i], component, "host.1");
+      EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(false));
+      const auto &error = RequiredMember(response, "error");
+      EXPECT_EQ(RequiredText(error, "code"), "manager_command_rejected");
+      // Reaching the original Manager occurrence guard proves complete decoding;
+      // the foreign Manager epoch prevents forwarding or any Stop effect.
+      EXPECT_EQ(RequiredText(error, "message"),
+                "Manager daemon: component process Stop names another Manager occurrence");
+    }
+  }
+  for (const auto &launch : {std::string(), launches[1]}) {
+    const auto response = exchange("stop_component_process", launch, "ur5e_robot",
+                                   launch.empty() ? "host.1" : std::string(257U, 'x'));
+    EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(false));
+    const auto message = RequiredText(RequiredMember(response, "error"), "message");
+    EXPECT_NE(message.find(launch.empty() ? "command field launch_identity" : "command field runtime_unit_id"),
+              std::string::npos);
+  }
+  const auto component_rejected = exchange("stop_component_process", launches[1], std::string(129U, 'x'), "host.1");
+  EXPECT_NE(RequiredText(RequiredMember(component_rejected, "error"), "message").find(
+      "component process Stop request is invalid"), std::string::npos);
+  const auto after = manager_source.Read();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
+  EXPECT_EQ(RequiredMember(after->payload, "active"), RequiredMember(before->payload, "active"));
+}
+
+TEST(ManagerDaemonProcess, ProcessStopOfferReturnsKnownEmptyInventoryAndIsPassive) {
+  using content_identity::CanonicalValue;
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(), "manager-source.json");
+  const auto before = manager_source.Read();
+  ASSERT_TRUE(before);
+  const auto bytes = SendCommand(directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":"component.1"})");
+  const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
+  ASSERT_EQ(response.as_object().size(), 4U);
+  EXPECT_EQ(RequiredMember(response, "api_version"), CanonicalValue("manyforge.manager_command_response.v1"));
+  EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(true)) << bytes;
+  EXPECT_EQ(RequiredMember(response, "error"), CanonicalValue(nullptr));
+  const auto &offer = RequiredMember(response, "result");
+  ASSERT_EQ(offer.as_object().size(), 2U);
+  EXPECT_EQ(RequiredMember(offer, "controllable_component_id"), CanonicalValue("component.1"));
+  EXPECT_TRUE(RequiredMember(offer, "process_inventories").as_array().empty());
+  for (const auto* request : {
+      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer"})",
+      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":false})",
+      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":"component.1","extra":true})"}) {
+    const auto rejected_bytes = SendCommand(directory.socket_path(), request);
+    const auto rejected = deployment::parse_strict_json_model_yaml(rejected_bytes).root();
+    EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false)) << rejected_bytes;
+    EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
+        CanonicalValue("manager_command_rejected")) << rejected_bytes;
+  }
+  const auto after = manager_source.Read();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
+  EXPECT_EQ(RequiredMember(after->payload, "active"), RequiredMember(before->payload, "active"));
+}
+
+TEST(ManagerDaemonProcess, CanonicalEmptySelectionIsClosedAndPassive) {
+  using content_identity::CanonicalValue;
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  const auto admission = source.load_verified();
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto before = manager_source.Read();
+  ASSERT_TRUE(before.has_value());
+  EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(before->payload));
+  const auto bytes = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})");
+  const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
+  ASSERT_EQ(response.as_object().size(), 3U);
+  EXPECT_EQ(RequiredMember(response, "api_version"),
+            CanonicalValue("manyforge.manager_command_response.v1"));
+  ASSERT_EQ(RequiredMember(response, "ok"), CanonicalValue(true)) << bytes;
+  const auto &selection = RequiredMember(response, "canonical_empty_selection");
+  ASSERT_EQ(selection.as_object().size(), 7U);
+  EXPECT_EQ(RequiredMember(selection, "request_owner_epoch"),
+            CanonicalValue(before->source_owner_epoch));
+  EXPECT_EQ(RequiredMember(selection, "cell_id"),
+            CanonicalValue(admission.cell_id().value()));
+  EXPECT_EQ(RequiredMember(selection, "deployment_artifact_id"),
+            CanonicalValue(admission.deployment_artifact_id().value()));
+  EXPECT_EQ(RequiredMember(selection, "deployment_revision"),
+            CanonicalValue(admission.deployment_revision().value()));
+  EXPECT_EQ(RequiredMember(selection, "candidate_retained_bundle_id"),
+            CanonicalValue(admission.retained_bundle_id().value()));
+  EXPECT_EQ(RequiredMember(selection, "candidate_graph_revision"),
+            CanonicalValue(admission.graph_revision().value()));
+  EXPECT_EQ(RequiredMember(selection, "admission_digest"),
+            CanonicalValue(admission.admission_digest().value()));
+  EXPECT_EQ(
+      SendCommand(
+          directory.socket_path(),
+          R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})"),
+      bytes);
+  for (
+      const std::string_view request :
+      {std::string_view("{"),
+       std::string_view(
+           R"({"api_version":"manyforge.manager_command.v1","command":false})"),
+       std::string_view(
+           R"({"api_version":false,"command":"canonical_empty_selection"})"),
+       std::string_view(
+           R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection","extra":true})")}) {
+    const auto rejected_bytes =
+        SendCommand(directory.socket_path(), std::string(request));
+    const auto rejected =
+        deployment::parse_strict_json_model_yaml(rejected_bytes).root();
+    EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false))
+        << rejected_bytes;
+    EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
+              CanonicalValue("manager_command_rejected"))
+        << rejected_bytes;
+  }
+  const auto after = manager_source.Read();
+  ASSERT_TRUE(after.has_value());
+  EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(after->payload));
+  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
+  EXPECT_EQ(RequiredMember(after->payload, "active"),
+            RequiredMember(before->payload, "active"));
+  EXPECT_EQ(RequiredMember(after->payload, "apply"),
+            RequiredMember(before->payload, "apply"));
+}
+
 TEST(ManagerDaemonProcess,
      PublishesWithoutComposerAndSurvivesManagerReplacement) {
   DaemonDirectory directory;
@@ -2137,6 +2302,19 @@ TEST(ManagerDaemonProcess,
   std::filesystem::rename(selected_root, displaced_root);
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
 
+  const auto selection_bytes = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})");
+  const auto selection =
+      deployment::parse_strict_json_model_yaml(selection_bytes).root();
+  EXPECT_EQ(RequiredMember(selection, "ok"),
+            content_identity::CanonicalValue(false))
+      << selection_bytes;
+  EXPECT_EQ(RequiredMember(RequiredMember(selection, "error"), "code"),
+            content_identity::CanonicalValue("full_stack_restart_required"))
+      << selection_bytes;
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), children_before_replacement);
+
   const auto reconcile = SendCommand(
       directory.socket_path(),
       R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
@@ -2308,6 +2486,105 @@ TEST(ManagerDaemonProcess,
 }
 
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+TEST(ManagerDaemonProcess,
+     NativeLivenessWarningsNameTheirScopeAndRearmAfterActualSuccess) {
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  const auto socket = directory.program_runner_liveness_socket_path();
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         fixture.admission_filename,
+                         installed_manager.string(), socket.string());
+  manager.WaitReady(directory);
+
+  const std::string prefix =
+      "Manager native liveness renewal remains fail-closed:";
+  const auto warning_count = [&] {
+    const auto text = ReadStartupStderr(directory);
+    std::size_t count = 0U;
+    for (auto position = text.find(prefix); position != std::string::npos;
+         position = text.find(prefix, position + prefix.size()))
+      ++count;
+    return count;
+  };
+  const auto wait_for_warning = [&](const std::size_t expected) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (warning_count() < expected &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(warning_count(), expected) << ReadStartupStderr(directory);
+  };
+  const auto heartbeat = std::chrono::nanoseconds(
+      deployment::native_execution_runtime_contract::manager_liveness_policy()
+          .heartbeat_period_ns);
+  const auto expect_unchanged_over_heartbeats = [&](const std::size_t expected) {
+    const auto deadline = std::chrono::steady_clock::now() + 3 * heartbeat;
+    while (std::chrono::steady_clock::now() < deadline) {
+      EXPECT_EQ(warning_count(), expected) << ReadStartupStderr(directory);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  };
+
+  wait_for_warning(1U);
+  EXPECT_NE(ReadStartupStderr(directory).find("cell=" + fixture.cell_id),
+            std::string::npos);
+  EXPECT_NE(ReadStartupStderr(directory).find(
+                "predicate=program_runner_liveness_probe "
+                "scope=cell-role:program_runner"),
+            std::string::npos);
+  EXPECT_NE(ReadStartupStderr(directory).find(
+                "Program Runner liveness socket is not an exact same-user socket"),
+            std::string::npos);
+  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
+  expect_unchanged_over_heartbeats(1U);
+
+  // A stale same-user socket changes the actual connection failure, without
+  // introducing another server or modifying the renewal packet contract.
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto spelling = socket.string();
+  ASSERT_LT(spelling.size(), sizeof(address.sun_path));
+  const int stale = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+  ASSERT_GE(stale, 0);
+  std::copy(spelling.begin(), spelling.end(), address.sun_path);
+  const int bound = ::bind(stale, reinterpret_cast<sockaddr *>(&address),
+                           sizeof(address));
+  static_cast<void>(::close(stale));
+  ASSERT_EQ(bound, 0);
+  wait_for_warning(2U);
+  EXPECT_NE(ReadStartupStderr(directory).find(
+                "connect Program Runner liveness socket"),
+            std::string::npos);
+  expect_unchanged_over_heartbeats(2U);
+  std::filesystem::remove(socket);
+
+  ProgramRunnerProcess runner(directory, fixture.cell_id);
+  // Owner-issued admission proves the complete validated renewal/readiness
+  // path succeeded; a probe or a retry-gate reset alone is not recovery.
+  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  const auto recovered_warnings = warning_count();
+  expect_unchanged_over_heartbeats(recovered_warnings);
+  const auto saved_socket = socket.string() + ".saved";
+  std::filesystem::rename(socket, saved_socket);
+  wait_for_warning(recovered_warnings + 1U);
+  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
+  // Restore promptly, before spending the existing lease-expiry budget. No
+  // changed intermediate cause may disguise a missing success-edge reset.
+  std::filesystem::rename(saved_socket, socket);
+  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  expect_unchanged_over_heartbeats(recovered_warnings + 1U);
+  std::filesystem::rename(socket, saved_socket);
+  wait_for_warning(recovered_warnings + 2U);
+  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
+  std::filesystem::rename(saved_socket, socket);
+  const auto stopped = manager.Stop(SIGTERM);
+  EXPECT_TRUE(WIFEXITED(stopped));
+}
+
 TEST(ManagerDaemonProcess,
      GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
   const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata();

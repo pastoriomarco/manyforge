@@ -66,6 +66,101 @@ struct CellObserverIncidentRecordDTO final {
 /// record, including event_kind under the same single 512 KiB bound.
 [[nodiscard]] std::string CellObserverIncidentEventPayload(
     const CellObserverIncidentRecordDTO& record);
+
+/// The existing selected-runtime command packet is capped at 256 KiB. The
+/// checked launch path cannot exceed that raw bound; the complete durable
+/// record still has the existing 512 KiB incident bound after JSON escaping.
+inline constexpr std::size_t kMaxObserverBringUpSnapshotPathBytes = 256U * 1024U;
+
+/// Actual association from the existing open observer incident row. The
+/// original incident is immutable while each genuine later exit advances
+/// its existing latest-exit identity and digest.
+struct CellObserverLossAssociationDTO final {
+  std::string incident_id;
+  std::string latest_exit_id;
+  std::string latest_exit_digest;
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverLossAssociationDTO&,
+                         const CellObserverLossAssociationDTO&) = default;
+};
+
+/// One explicit observer bring-up, retained in this cell's existing journal.
+/// These values are evidence from the actual owners, never process, Scene or
+/// lifecycle authority. Only the latest attempt is retained; reads do no work.
+struct CellObserverBringUpIntentDTO final {
+  PublicRequestContextDTO request_context;
+  RequestAttributionDTO attribution;
+  ProjectionRevisionDTO projection_revision;
+  ActiveBundlePublicationGeneration publication_generation;
+  ContentDigest publication_digest;
+  RuntimeUnitId runtime_unit_id;
+  RuntimeEpoch host_epoch;
+  std::string manager_epoch;
+  std::string scene_owner_epoch;
+  /// Canonical closed Scene identity supplied and checked by Manager.
+  std::string scene_identity_json;
+  CellObserverIncidentTargetDTO predecessor;
+  CellObserverIncidentTargetDTO replacement;
+  std::string retained_snapshot_path;
+  std::optional<std::string> predecessor_incident_id;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverBringUpIntentDTO&,
+                         const CellObserverBringUpIntentDTO&) = default;
+};
+
+struct CellObserverBringUpProcessDTO final {
+  std::int64_t leader_pid{};
+  std::string launch_identity;
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverBringUpProcessDTO&,
+                         const CellObserverBringUpProcessDTO&) = default;
+};
+
+enum class CellObserverBringUpPhaseDTO : std::uint8_t {
+  kAdmitted, kRetiring, kStarted, kOpenAccepted, kFailed, kUnknown,
+};
+
+/// The first accepted Open is captured by Manager under its existing checks.
+/// A reconnect cannot mint this evidence or stand in for that first Open.
+struct CellObserverBringUpOpenDTO final {
+  std::string source_epoch;
+  std::uint64_t source_epoch_order{};
+  std::int64_t accepted_at_ns{};
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverBringUpOpenDTO&,
+                         const CellObserverBringUpOpenDTO&) = default;
+};
+
+struct CellObserverBringUpRecordDTO final {
+  CellObserverBringUpIntentDTO intent;
+  CellObserverBringUpPhaseDTO phase{CellObserverBringUpPhaseDTO::kAdmitted};
+  std::int64_t admitted_at_ns{};
+  std::int64_t updated_at_ns{};
+  std::optional<CellObserverBringUpProcessDTO> predecessor_process;
+  /// Historical positive drain/absence from the actual owner, not an inference
+  /// from epoch change, timeout, missing callback or missing process handle.
+  bool predecessor_drained_or_absent{};
+  std::optional<CellObserverBringUpProcessDTO> started_process;
+  std::optional<CellObserverBringUpOpenDTO> first_open;
+  std::optional<ErrorDTO> diagnostic;
+  /// Captured admission evidence, preserved on replay and outcome updates.
+  /// Null names a genuinely checked absent slot, never a new owner epoch.
+  std::optional<CellObserverLossAssociationDTO> predecessor_loss{};
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverBringUpRecordDTO&,
+                         const CellObserverBringUpRecordDTO&) = default;
+};
+
+struct CellObserverBringUpAdmissionDTO final {
+  CellObserverBringUpRecordDTO record;
+  /// Only accepted-new permits the caller's one existing scheduler callback.
+  bool accepted_new{};
+};
+
+/// Closed canonical record, capped at kMaxComponentIncidentRecordBytes.
+[[nodiscard]] std::string EncodeCellObserverBringUpRecord(const CellObserverBringUpRecordDTO&);
+[[nodiscard]] CellObserverBringUpRecordDTO DecodeCellObserverBringUpRecord(std::string_view);
 /// Every incident time is in the CCLC owner clock domain (the one of
 /// `accepted_at_ns`): a full-width nonnegative int64 (spec 210 §1.1). JSON
 /// carries it through `content_identity::nonnegative_int64_value` (a number
@@ -187,18 +282,24 @@ struct ComponentLifecycleIncidentDTO final {
 /// the retained cause, but dispatches no vendor primitive; the policy-permitted
 /// steps run later through the target-following driver once ordinary
 /// admission is open again (for example after the cell latch is recovered).
+enum class ComponentIncidentClosureReasonDTO : std::uint8_t {
+  kCellClosedByOperator = 0,
+};
+
 struct ComponentIncidentRecoveryDTO final {
   std::string incident_id;
   ControllableComponentId controllable_component_id;
   LifecycleBlockingCauseClassDTO cause_class{LifecycleBlockingCauseClassDTO::kUnknown};
   std::string acknowledged_by;
   std::int64_t acknowledged_at_ns{};
+  std::optional<ComponentIncidentClosureReasonDTO> closure_reason{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
     return !incident_id.empty() && incident_id.size() <= kMaxComponentIncidentIdBytes &&
            !controllable_component_id.empty() &&
            lifecycle_cause_requires_intervention(cause_class) && !acknowledged_by.empty() &&
-           acknowledged_at_ns >= 0;
+           acknowledged_at_ns >= 0 &&
+           (!closure_reason || *closure_reason == ComponentIncidentClosureReasonDTO::kCellClosedByOperator);
   }
 
   friend bool operator==(const ComponentIncidentRecoveryDTO&,
@@ -307,6 +408,7 @@ ComponentIncidentContainmentReceiptFromRecord(
 /// The `component_incident_acknowledged` payload: the record plus who
 /// recovered it, when and with which request.
 [[nodiscard]] std::string ComponentIncidentAcknowledgedPayload(
-    std::string_view record_json, const ComponentLifecycleIncidentDTO& acknowledged);
+    std::string_view record_json, const ComponentLifecycleIncidentDTO& acknowledged,
+    std::optional<ComponentIncidentClosureReasonDTO> closure_reason = std::nullopt);
 
 }  // namespace manyforge::core

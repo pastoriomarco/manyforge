@@ -58,6 +58,8 @@ template <typename Id>
     return false;
   }
   switch (left.request_kind) {
+    case CCLCRequestKindDTO::kLifecycleTargetRetirement:
+      return true; // Retirement has no domain effect reservation.
     case CCLCRequestKindDTO::kComponentLifecycle: {
       const auto* left_owner =
           std::get_if<ComponentLifecycleDomainReservationOwnerDTO>(&left.owner);
@@ -122,6 +124,8 @@ CCLCDomainReservationOwnerDTO::CCLCDomainReservationOwnerDTO(
 
 bool CCLCDomainReservationOwnerDTO::locally_valid() const noexcept {
   switch (request_kind) {
+    case CCLCRequestKindDTO::kLifecycleTargetRetirement:
+      return false; // Journal membership does not mint an effect owner.
     case CCLCRequestKindDTO::kComponentLifecycle:
       return std::holds_alternative<ComponentLifecycleDomainReservationOwnerDTO>(owner) &&
              std::get<ComponentLifecycleDomainReservationOwnerDTO>(owner).locally_valid();

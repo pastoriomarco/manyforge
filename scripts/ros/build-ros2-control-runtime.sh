@@ -9,7 +9,7 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
-ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+ROS_DISTRO="${ROS_DISTRO:-lyrical}"
 MANYFORGE_VENV="${MANYFORGE_VENV:-/opt/manyforge/venv}"
 BUILD_ROOT="${MANYFORGE_ROS2_CONTROL_BUILD_ROOT:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/isaac}"
 ROBOPLAN_BUILD="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${BUILD_ROOT}/roboplan}"
@@ -154,7 +154,7 @@ cmake --build "${ROBOPLAN_BUILD}" \
 
 # Keep cmeel's Boost/TinyXML stack out of the ament-only overlay.  The C++
 # runtime above consumes the qualified RoboPlan prefix; the ROS overlay below
-# must resolve Jazzy's ABI-compatible dependency set.
+# must resolve the selected ROS distro's ABI-compatible dependency set.
 MANYFORGE_ROS_CMAKE_PREFIX_PATH=
 MANYFORGE_SAVED_IFS=${IFS}
 IFS=:

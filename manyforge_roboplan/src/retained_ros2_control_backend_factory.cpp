@@ -169,6 +169,18 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           core::IScheduler &scheduler) -> RetainedRuntimeBackendSet {
         auto selected = single_use->take();
         require_decided_lane_inputs(selected.participant);
+        if (selected.arm.measured_joint_state_lane.has_value()) {
+          if (!selected.measured_receiver_clock) {
+            throw std::invalid_argument(
+                "measured_receiver_clock_missing: measured lane requires its "
+                "owning receiver clock");
+          }
+          if (selected.measured_receiver_clock.get() != &clock) {
+            throw std::invalid_argument(
+                "measured_receiver_clock_mismatch: measured lane requires the "
+                "exact factory receiver clock");
+          }
+        }
         if (!motion_channel ||
             !motion_binding.value().control_path.has_value() ||
             motion_binding.value().control_path->state_authority_class !=
@@ -243,7 +255,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                   state_authority, std::move(participant_config));
             },
             std::move(gripper), motion_binding, gripper_binding,
-            selected.successor_occurrence);
+            selected.successor_occurrence,
+            std::move(selected.measured_receiver_clock));
         if (!bound.ok()) {
           throw std::invalid_argument(bound.error().message);
         }

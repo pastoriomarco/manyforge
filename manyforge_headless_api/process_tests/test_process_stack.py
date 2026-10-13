@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -51,14 +52,31 @@ def keep_failure_evidence(root: Path) -> None:
         return
     test = os.environ.get("PYTEST_CURRENT_TEST", "unknown").split(" ", 1)[0]
     target = Path(raw) / test.replace("/", "_").replace("::", "__")
+    copied = 0
+    skipped = 0
+    readiness_files: list[dict[str, str]] = []
     for path in root.rglob("*"):
         if path.is_file() and not path.is_symlink() and (
             path.suffix in {".log", ".sqlite3", ".sqlite3-wal", ".sqlite3-shm"}
             or path.name.startswith("controller_launch")
+            or path.name == "readiness-last-snapshot.json"
         ):
             destination = target / path.relative_to(root)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
+            copied += 1
+            if path.name == "readiness-last-snapshot.json":
+                readiness_files.append({
+                    "path": str(path.relative_to(root)),
+                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                })
+        elif path.is_file() or path.is_symlink():
+            skipped += 1
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "failure-copy-summary.json").write_text(json.dumps({
+        "copied_file_count": copied, "skipped_file_count": skipped,
+        "readiness_files": readiness_files,
+    }, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _drain_into(source, destination_fd: int) -> None:
@@ -285,6 +303,13 @@ class ProcessStack:
             "--freshness-ms",
             str(self.freshness_milliseconds),
         ]
+        if self.manager_admission_filename is not None:
+            command.extend(
+                (
+                    "--canonical-empty-admission-filename",
+                    self.manager_admission_filename,
+                )
+            )
         if self.enable_program_runner:
             command.extend(
                 (

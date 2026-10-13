@@ -20,6 +20,7 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
+#include <manyforge_core/types/component_lifecycle_readiness.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <memory>
 #include <optional>
@@ -81,6 +82,10 @@ struct ComponentLifecycleProductContext final {
   /// Owned complete configured robot membership and exact measured readers.
   /// Unwired legacy contexts may omit this; absence is never measured proof.
   const std::shared_ptr<const ConfiguredRobotMeasuredStateInventory> measured_state_inventory{};
+  /// Pure capture from this installed product's existing route owner; current
+  /// association is checked both before and after health/measured reads.
+  const std::function<Result<ComponentLifecycleReadinessSourceView>(
+      const ComponentLifecycleCurrentSnapshotDTO&)> capture_readiness_sources{};
 };
 
 /// One accounted product operation. The shared lease safely encloses the
@@ -169,6 +174,14 @@ class ComponentLifecycleCoordinator final {
   /// request/status reads do not acquire this pin and remain available.
   [[nodiscard]] Result<ComponentLifecycleProductPin> AcquireProductPin() const;
 
+  /// One side-effect-free component projection under one accounted Q105 pin.
+  /// Target callbacks read only the existing driver/journal owners. Missing
+  /// sources stay unavailable; this never invokes Observe or obtains a claim.
+  [[nodiscard]] Result<CCLCComponentReadDTO> ReadCurrentComponentView(
+      const ControllableComponentId& component,
+      const std::function<Result<ComponentLifecycleTargetViewDTO>()>& read_target,
+      const std::function<Result<ComponentLifecycleReadinessTargetFactsDTO>()>& read_target_facts) const;
+
   /// Original composition-local publication handoff. Prepared dependencies
   /// carry lifetime/identity only; this method additionally proves the actual
   /// owner's admissions, transactions, worker/callback tails and journal are
@@ -202,6 +215,14 @@ class ComponentLifecycleCoordinator final {
   /// Owner-private non-real-time settlement read for retired target evidence.
   /// It never drains/cancels work or reopens admission; unavailable stays unknown.
   [[nodiscard]] Result<void> ReadLifecycleOwnerSettlement() const;
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementOfferDTO> ReadLifecycleTargetRetirementOffer() const;
+  [[nodiscard]] Result<CCLCLifecycleTargetRetirementResultDTO> RetireLifecycleTargetsForClose(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent);
+  [[nodiscard]] Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>> ReadLifecycleTargetRetirementResult(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) const;
+  [[nodiscard]] Result<void> ReadLifecycleOwnerSettlement(
+      const CCLCLifecycleTargetRetirementScopeDTO& scope) const;
+
 
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
       const ComponentLifecycleIntentDTO& intent);

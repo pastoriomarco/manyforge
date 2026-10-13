@@ -574,6 +574,21 @@ class HeadlessHttpClient:
     def manager_status(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/status")
 
+    def canonical_empty_selection(self) -> dict[str, Any]:
+        return self.request("GET", "/api/manager/canonical-empty-selection")
+
+    def lifecycle_target_retirement_offer(self) -> dict[str, Any]:
+        return self.request("GET", "/api/cclc/targets/retirement-offer")
+
+    def retire_lifecycle_targets(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/targets/retire", body=body)
+
+    def lifecycle_target_retirement_result(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/targets/retire/result", body=body)
+
+    def lifecycle_owner_settlement(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/cclc/targets/settlement", body=body)
+
     def manager_graph(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/graph")
 
@@ -593,6 +608,12 @@ class HeadlessHttpClient:
             "GET", self._cclc_identity_path("/api/cclc/components", component_id)
         )
 
+    def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET", self._cclc_identity_path("/api/cclc/components", component_id)
+            + "/lifecycle-snapshot",
+        )
+
     def cclc_owner_identity(self) -> dict[str, Any]:
         return self.request("GET", "/api/cclc/owner")
 
@@ -602,6 +623,17 @@ class HeadlessHttpClient:
             self._cclc_identity_path("/api/cclc/components", component_id)
             + "/route-templates",
         )
+
+    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
+        return self.request("GET", self._cclc_identity_path("/api/cclc/components", component_id) + "/process/stop-offer")
+
+    def stop_component_process(self, component_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", self._cclc_identity_path("/api/cclc/components", component_id)
+                            + "/process/stop", body=body)
+
+    def component_process_stop_result(self, component_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", self._cclc_identity_path("/api/cclc/components", component_id)
+                            + "/process/stop/result", body=body)
 
     def submit_component_lifecycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/cclc/lifecycle/requests", body=body)

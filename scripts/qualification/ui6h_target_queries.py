@@ -1745,7 +1745,6 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                 ],
                 "expected_applied_record_digest": applied["source"]["record_digest"],
                 "draft_program_revision": program["program_revision"],
-                "expected_admission_generation": admission["admission_generation"],
             }
             if args.runtime_groups:
                 browser = SelectionBrowser(args.runtime_groups, stack, workbench)

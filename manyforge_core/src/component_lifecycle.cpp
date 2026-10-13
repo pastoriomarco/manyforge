@@ -951,6 +951,13 @@ bool ApplyComponentGenerationSelectionDTO::locally_valid() const noexcept {
 }
 
 bool ComponentLifecycleIntentDTO::locally_valid() const noexcept {
+  if (close_incident_recovery &&
+      (intent != ComponentLifecycleIntentKindDTO::kRecover ||
+       !reason || *reason != "cell closed by operator" ||
+       program_node_evidence || apply_generation_selection ||
+       close_incident_recovery->expected_incident_id.empty() ||
+       close_incident_recovery->expected_incident_id.size() > kMaxLifecycleIdentityBytes))
+    return false;
   const bool apply_generation_valid = apply_generation_selection &&
       apply_generation_selection->locally_valid() && !program_node_evidence &&
       (intent == ComponentLifecycleIntentKindDTO::kPrepare ||
@@ -1004,7 +1011,8 @@ bool ComponentLifecycleIntentDTO::replay_equal(
          expected_control_domains == other.expected_control_domains && reason == other.reason &&
          expected_admission_generation == other.expected_admission_generation &&
          program_node_evidence == other.program_node_evidence &&
-         apply_generation_selection == other.apply_generation_selection;
+         apply_generation_selection == other.apply_generation_selection &&
+         close_incident_recovery == other.close_incident_recovery;
 }
 
 bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {

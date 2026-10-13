@@ -280,8 +280,8 @@ into a program-local mesh folder (unavailable on current `dev`):
 ```bash
 docker run --rm --network host \
   -v /home/tndlux/workspaces/dev_ws/src/manyforge:/workspace \
-  -w /workspace manyforge-ros-jazzy-full \
-  bash -lc 'source /opt/ros/jazzy/setup.bash;
+  -w /workspace ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010} \
+  bash -lc 'source /opt/ros/${ROS_DISTRO}/setup.bash;
     export PYTHONPATH=/workspace:/workspace/manyforge_ros:${PYTHONPATH};
     python3 -m manyforge_ros.isaac_mesh_transfer \
       --timeout 90 \
@@ -304,19 +304,19 @@ visual mesh.
 Call the default Trigger service:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/${ROS_DISTRO}/setup.bash
 ros2 service call /manyforge/isaac_collider_report std_srvs/srv/Trigger '{}'
 ```
 
 Send a parameterized request:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/${ROS_DISTRO}/setup.bash
 ros2 topic echo /manyforge/isaac_collider_query/response
 ```
 
 ```bash
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/${ROS_DISTRO}/setup.bash
 ros2 topic pub --once /manyforge/isaac_collider_query/request std_msgs/msg/String \
   "{data: '{\"version\":\"manyforge.isaac.collider_query.v0.1\",\"request_id\":\"probe-1\",\"exclude_subtrees\":[\"/World/ur10e_robotiq2f_140_ROS\"],\"probe_prims\":[\"/World/ur10e_robotiq2f_140_ROS\"],\"include_hidden\":false,\"include_cooked_convex\":true,\"output_profile\":\"llm_scene_authoring\"}'}"
 ```

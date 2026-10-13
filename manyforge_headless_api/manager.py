@@ -9,9 +9,12 @@ from typing import Any, Protocol
 import unicodedata
 
 import rfc8785
+from pydantic import ValidationError
 
 from .models import (
     ManagerApplyRequest,
+    ComponentProcessStopRequest,
+    ComponentProcessStopResult,
     ManagerApplyStatus,
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
@@ -28,6 +31,7 @@ from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
 )
+from .close_wire import CanonicalEmptySelection
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
@@ -54,6 +58,14 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 
 class ManagerPort(Protocol):
+    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]: ...
+
+    def canonical_empty_selection(self) -> dict[str, Any]: ...
+
+    def stop_component_process(self, request: ComponentProcessStopRequest) -> dict[str, Any]: ...
+
+    def component_process_stop_result(self, request: ComponentProcessStopRequest) -> dict[str, Any]: ...
+
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]: ...
@@ -176,6 +188,85 @@ class ManagerCommandClient:
                 "Manager command response has no boolean result",
             )
         return response
+
+    def _component_process_stop(
+        self, command: str, request: ComponentProcessStopRequest,
+    ) -> dict[str, Any]:
+        response = self._exchange({
+            "api_version": MANAGER_COMMAND_VERSION,
+            "command": command,
+            "request": request.model_dump(mode="json"),
+        })
+        if response["ok"] is False:
+            error = response.get("error")
+            if (set(response) not in ({"api_version", "ok", "error"}, {"api_version", "ok", "error", "result"})
+                    or response.get("result") is not None or not isinstance(error, dict)
+                    or set(error) not in ({"code", "message"}, {"code", "message", "details"})
+                    or ("result" in response and "details" not in error)
+                    or not isinstance(error["code"], str) or not error["code"]
+                    or not isinstance(error["message"], str) or not error["message"]
+                    or ("details" in error and (not isinstance(error["details"], dict)
+                        or len(error["details"]) > 4096
+                        or any(not isinstance(key, str) or not isinstance(value, str)
+                               for key, value in error["details"].items())))):
+                raise HeadlessApiError("manager_command_response_invalid", "Process Stop error envelope is invalid")
+            raise HeadlessApiError(error["code"], error["message"], details=error.get("details", {}))
+        if set(response) != {"api_version", "ok", "error", "result"}:
+            raise HeadlessApiError("manager_command_response_invalid", "Process Stop response envelope is invalid")
+        if response["error"] is not None:
+            raise HeadlessApiError("manager_command_response_invalid", "Successful process Stop response carries an error")
+        try:
+            result = ComponentProcessStopResult.model_validate(response["result"])
+        except ValidationError as error:
+            raise HeadlessApiError("manager_command_response_invalid", "Process Stop result is invalid") from error
+        if result.request != request:
+            raise HeadlessApiError("manager_command_response_identity_mismatch", "Process Stop result does not match the exact launch request")
+        return response["result"]
+
+    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
+        response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
+            "command": "component_process_stop_offer", "controllable_component_id": component_id})
+        if response["ok"] is False:
+            error = response.get("error")
+            if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not isinstance(error.get("message"), str):
+                raise HeadlessApiError("manager_command_response_invalid", "Process Stop offer error is invalid")
+            raise HeadlessApiError(error["code"], error["message"], details=error.get("details", {}))
+        result = response.get("result")
+        if (set(response) != {"api_version", "ok", "error", "result"} or response["error"] is not None
+                or not isinstance(result, dict) or set(result) != {"controllable_component_id", "process_inventories"}
+                or result["controllable_component_id"] != component_id or not isinstance(result["process_inventories"], list)):
+            raise HeadlessApiError("manager_command_response_invalid", "Process Stop offer is invalid")
+        return result
+
+    def stop_component_process(self, request: ComponentProcessStopRequest) -> dict[str, Any]:
+        return self._component_process_stop("stop_component_process", request)
+
+    def canonical_empty_selection(self) -> dict[str, Any]:
+        response = self._exchange({
+            "api_version": MANAGER_COMMAND_VERSION,
+            "command": "canonical_empty_selection",
+        })
+        if response["ok"] is False:
+            error = response.get("error")
+            if (set(response) != {"api_version", "ok", "error"}
+                    or not isinstance(error, dict)
+                    or set(error) not in ({"code", "message"}, {"code", "message", "details"})
+                    or not isinstance(error.get("code"), str) or not error["code"]
+                    or not isinstance(error.get("message"), str) or not error["message"]
+                    or ("details" in error and (not isinstance(error["details"], dict)
+                        or any(not isinstance(k, str) or not isinstance(v, str) for k, v in error["details"].items())))):
+                raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection error is invalid")
+            raise HeadlessApiError(error["code"], error["message"], details=error.get("details", {}))
+        if set(response) != {"api_version", "ok", "canonical_empty_selection"}:
+            raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection envelope is invalid")
+        try:
+            CanonicalEmptySelection.model_validate(response["canonical_empty_selection"])
+        except ValidationError as error:
+            raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection is invalid") from error
+        return response["canonical_empty_selection"]
+
+    def component_process_stop_result(self, request: ComponentProcessStopRequest) -> dict[str, Any]:
+        return self._component_process_stop("component_process_stop_result", request)
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest

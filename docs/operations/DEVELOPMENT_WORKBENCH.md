@@ -169,9 +169,10 @@ Run every command from the repository root.
    --update` (with the built Deployment and Program revision tools).
 
    The project must be a folder containing `scenario.yaml` inside the
-   repository's `examples/` folder, the only root startup accepts. Keep the terminal output: if a start fails,
-   the launcher removes the container it created, and the output is then the
-   only record of the cause (`… start --project X 2>&1 | tee start.log`).
+   repository's `examples/` folder, the only root startup accepts. Keep the
+   terminal output (`… start --project X 2>&1 | tee start.log`). A failed
+   developer start uses the same evidence capture as stop; a failed capture
+   retains the stopped container and reports its reason.
    A cached start takes about half a minute; the first start, or one after
    native source changes, compiles and takes much longer.
 2. **Check readiness.** A successful start prints the owner-issued current
@@ -194,9 +195,9 @@ Run every command from the repository root.
 
 **After a host reboot** the workbench does not start by itself. Its container
 is left `Exited`; run the start command again, which removes the stale
-container on its own. A reboot is a clean restart: runtime state lived in the
-container and is gone, unsaved Program and Deployment Drafts are lost, the
-selected saved Scenario is loaded again, and Composer settings are kept.
+container on its own. Durable journals, incidents and runtime files remain on
+the host; keeping those records does not resume motion or a Program. The
+selected saved Scenario is loaded through the ordinary startup path.
 
 During every start the log shows two error-looking lines before the native
 execution host is up. They are expected and stop once the start reports ready:
@@ -214,29 +215,103 @@ with their dependencies. It deliberately runs no tests, sanitizers, qualificatio
 matrices, package materializers, or proof generators. `status` reports the exact
 owner-issued active tuple.
 
-Plain `stop` discards runtime state. To stop the workbench and preserve its
-diagnostic state, use:
+Every removal path (plain stop, failed developer start, exited-container
+replacement and operator stop) first stops the container and confirms it is
+stopped. It preserves the last 10,000,000 bytes of Docker console output plus
+a small image/mount/exit summary in the actual persistent root's
+`evidence/<UTC timestamp>/`. Runtime state stays in its bind mount; it is not
+copied into that folder. `stop --keep-evidence` remains accepted and uses this
+same policy. The summary excludes container environment variables.
 
-```bash
-./scripts/compose-dev.sh stop --keep-evidence
-```
+Mounted capture reuses one `.mounted-<container-id>.partial/` folder with an
+exact matching receipt. It writes the current stopped-container summary first,
+then atomically replaces `docker.log` only after the bounded console capture
+succeeds. The summary and tail use two separate replacements, so a failed
+retry or crash between them preserves the prior tail; a partial folder can
+therefore contain an earlier attempt's tail alongside the current summary.
+Completion renames the folder to its UTC timestamp before removing the stopped container.
+A capture failure reports its reason and keeps the stopped container. If
+another failed capture would retain a second container, the launcher retries an
+older stopped container once, only when its partial summary matches its actual ID, image, mounts and this workspace. A mounted
+older container is removed after that retry, with the outcome reported.
+Unidentified historical containers and legacy unmounted containers whose retry
+fails stay protected: the warning names them and asks for manual export or
+explicit removal after investigation. Exit 69 after a capture failure means
+the container stopped, capture failed and the stopped container was retained;
+it does not mean shutdown failed. The launcher reuses the receipt-proven mounted
+partial in place. Do not store user files in ManyForge runtime folders: extra
+files and directories inside positively owned captures or artifact epochs may
+be deleted with an eligible unit, or removed when a capture is replaced.
+Links inside an owned unit are unlinked without following their targets. A
+pre-existing mount point inside a unit protects that unit and produces a warning.
+Concurrent privileged mount changes are outside the supported operator scope. Unknown ownership and multiple matching historical partials
+retain their refusal and protection. Back up wanted evidence elsewhere.
 
-The command copies nothing until Docker confirms that the container stopped.
-It then writes `.manyforge-dev/evidence/<UTC timestamp>.partial/`, containing the
-`manyforge-state/` tree except what is reproducible from the image and the
-Scenario: `installed-targets/`, `artifacts/raw-artifacts/` (model and mesh
-copies), `artifacts/prepared-activations/` (activation inputs embedding
-them) and `execution-run/manyforge-retained-planning-*` (unpacked planning
-robot packages); the Manager journal keeps their digests,
-plus `docker.log` and a bounded `docker-inspect.json` summary containing the
-image, mounts and exit state (not container environment variables). Once
-complete, it renames the bundle to `<UTC timestamp>/`, removes the container
-and prints that path. Evidence is not deleted automatically. If collection or
-finalization fails, the command exits non-zero, keeps the stopped container and
-may leave the partial directory.
-If only container removal fails, the completed bundle and stopped container are
-both retained. When set, `MANYFORGE_DEV_CACHE_BASE` places the bundle under its
-own `evidence/` directory instead.
+For transitional containers without the persistent-root mount, removal still
+uses the former full-state export under `MANYFORGE_DEV_EVIDENCE_ROOT` (default
+`.manyforge-dev/evidence/`), excluding reproducible installed binaries, model
+copies, prepared activations and unpacked planning meshes. Mounted containers
+always use their actual runtime root's evidence directory. A legacy
+replacement refuses a nonempty destination root; ordinary mounted replacements
+reuse their existing root. There is no automatic migration. Legacy retries
+replace the same `.legacy-<container-id>.partial` folder with a matching
+receipt instead of accumulating full-state partial copies. Unknown historical
+partials remain protected. The legacy export path can be removed once an inventory confirms that no unmounted containers remain.
+
+Q99 runs one bounded retention pass before a new container starts and after a
+confirmed stop, after checking that no running, paused or restarting ManyForge
+container uses that root. Serialize operations sharing an explicit root; the
+mount inspection is a point-in-time check. Selected roots may have symlinked
+ancestors; links leading to a unit folder remain protected, with an
+accounting-incomplete warning. Other independently eligible units can
+still rotate. Links inside a positively owned unit may be unlinked; their targets
+are never followed or deleted. The site
+settings are `MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT=10` and
+`MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES=10000000000`. They are triggers for
+cleanup, not authority to delete useful traces. Usage accounts allocated
+log/evidence bytes across default roots under `.manyforge-dev/runtime/*` on
+the same filesystem; an explicit custom root is accounted separately. The
+free-space floor uses the actual filesystem. Docker's existing `50m` × 3
+console rotation is independent; this is not machine-wide accounting or
+discovery of custom roots.
+
+Only older completed console captures, superseded generated controller-launch
+artifact epochs, and older owned host ROS log sessions are eligible. ROS host
+logs use `execution-run/ros/<sequence>-<session-start-ns>`, stamped once before
+the first workbench service starts under the existing state-root lock. The
+highest sequence identifies the latest session independently of wall-clock
+changes and is always protected; an older
+session containing a file at or after that start time is also protected.
+Legacy timestamp-only names and malformed or ambiguous names remain protected.
+Latest-session discovery lists all top-level names; recursive accounting still
+examines at most 1,000 candidate units per pass, with sequenced sessions ahead
+of protected legacy names. A failed name listing protects
+all observed ROS sessions, while a limited deep inventory does not stop
+reclamation of independently qualified older sessions. The stable runtime-wide
+`execution-run/ros-home` preserves spawner lock coordination across controllers
+and epochs and is never rotated. Controller child logs retain their existing
+per-artifact `ros` directory. Running a ROS host outside the supported workbench
+requires explicit owned `ROS_HOME` and `ROS_LOG_DIR` environment paths; the host
+provides no fallback path policy. Console chronology comes from
+the generated UTC capture name; artifact chronology comes from the write time
+of validated ManyForge component metadata markers. Extra files and directory
+timestamp changes do not set this order; a marker write time is not an immutable
+creation timestamp. At most eight eligible
+deletion attempts run per pass; a failed deletion protects that folder for the
+pass and cleanup continues with another eligible folder. The latest capture,
+latest artifact epoch per bundle (including equal marker times), partial captures, unknown ownership, and
+sibling roots are protected. Any open or unknown CCLC incident protects every artifact epoch, console capture and host ROS session; an
+uncheckpointed or changed journal/WAL is unknown. Retention pins its read-only
+protection inputs before inventory and checks that they still identify the
+same journal before deletion. Sibling roots are rotated only on their own next
+start/stop. Live journals, incident records, current publication/state, inputs
+and build caches are never candidates. Directory inventories observe at most
+1000 entries each. Overflow warns that usage is a measured lower bound and
+unseen material is protected. Cleanup can consider independently eligible
+observed units only when measured usage or the actual filesystem free-space
+floor proves pressure, oldest observed first. Protected-only or unresolved
+pressure reports a warning and stops cleanup; it never gates motion or
+startup.
 
 Each resolved immutable workbench image gets a separate cache under
 `.manyforge-dev/images/`; rebuilding the mutable image tag therefore cannot
@@ -245,8 +320,25 @@ the cache parent, when needed, with `MANYFORGE_DEV_CACHE_BASE`.
 
 Repeating the same `start` is idempotent. Selecting a different project while
 the workbench is running is refused; stop it before switching. A failed new
-start removes only the container it created. `stop` removes runtime state while
-retaining build, npm, and repository-bootstrap caches under `.manyforge-dev/`.
+start stops the container it created and uses the same capture policy before
+removing it. Container removal keeps the durable
+runtime root and the build, npm, and repository-bootstrap caches.
+
+The complete runtime state root is mounted at `/tmp/manyforge-state` in the
+container. Its ordinary host location is
+`.manyforge-dev/runtime/<container-name>/`, under `MANYFORGE_DEV_CACHE_BASE` when
+configured. It is shared across image updates for that workspace and container
+name. Set `MANYFORGE_DEV_RUNTIME_STATE_ROOT` to override it with an absolute host
+directory; the operator-managed path already requires an explicit persistent
+directory. A start refuses a state root bound by another running ManyForge
+container. Give concurrent container names separate roots. On an Orin, place
+`MANYFORGE_DEV_CACHE_BASE` or the explicit runtime root under `/mnt/nova_ssd`,
+so these files stay on the SSD rather than the eMMC home.
+
+The binding takes effect when creating a container. An already running container
+keeps its existing mounts until an explicit stop/start; the launcher does not
+recreate it automatically. Runtime journals and incident evidence are live
+records and are excluded from log/evidence rotation.
 
 Composer settings (viewer display toggles, tree editor link style and start
 direction, Motion panel layout and confirmations, and profiles; the gear at
@@ -255,8 +347,8 @@ the top right) are installation-specific and survive stop/start. They are kept i
 `/var/lib/manyforge/composer` (`MANYFORGE_STATE_DIR=/var/lib/manyforge`).
 Values of `persistent` blackboard keys are owned by the Program runner and kept
 beside them in `.manyforge-dev/state/program-runner/persistent-keys.json`
-(mounted as `/var/lib/manyforge/program-runner`). Only these two folders
-persist; all other runtime state still resets with the container.
+(mounted as `/var/lib/manyforge/program-runner`). These installation settings
+remain separate from the persistent runtime root described above.
 Stored values survive `stop`/`start` while the applied Program still declares
 their key persistent with the same type and fields; a value whose key a
 committed Apply removed or restructured is dropped with a notice. The
@@ -278,6 +370,8 @@ runner `9011`, and internal Composer API `9020`. If one is occupied, startup
 fails with a direct diagnostic rather than taking over the process.
 
 ## Operation and troubleshooting
+
+Apply through the private Manager socket does not prepare the program scene; use Headless.
 
 Use Composer at `http://localhost:3000` for Program, Scene and Deployment work.
 Read Runtime/history and component readiness before issuing commands. Apply
@@ -314,11 +408,10 @@ docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-develo
 ```
 
 Use the selected `MANYFORGE_DEV_CONTAINER_NAME` if overridden. Child-process
-output is inherited by the container log. Capture logs/status before plain
-`stop`, which removes the container and runtime state; persist wanted artifacts
-first, or use `stop --keep-evidence` for the diagnostic bundle described above.
-On a failed new start, the launcher prints the last logs before removing the
-container it created, so retain the startup terminal output too.
+output is inherited by the container log. Stop keeps durable runtime state
+and captures the bounded console tail before removal. Capture any additional
+logs/status needed for investigation explicitly. Failed developer startup uses
+the same capture policy; retain the startup terminal output too.
 
 ### Terminal Apply recovery (simulated workbench only)
 
@@ -419,9 +512,8 @@ and owner-controlled failed-start cleanup all preserve runtime evidence and
 Docker logs before removing the exact owned container. An export failure keeps
 the container/logs. Failed startup returns exact metadata to G while retaining
 the ROS client for authenticated own-Sim cleanup, rather than removing it in
-the developer failed-start trap. Normal Workbench cleanup is unchanged.
-Docker logs retain the existing json-file50MiB ×3 bound; G exports to one
-explicit root. Global export/ROS-log/retained-container retention budgets
-remain pending; no new deletion policy is implied. See the
+the developer failed-start trap. Both paths use the bounded capture and Q99
+retention policy above. Docker logs retain the independent existing
+`max-size=50m`, `max-file=3` bound. See the
 [operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md#5-split-isaac-topology-and-other-unavailable-lanes)
 for complete inputs, identity and qualification limits.

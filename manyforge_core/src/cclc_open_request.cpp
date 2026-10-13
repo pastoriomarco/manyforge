@@ -141,6 +141,50 @@ template <typename StrongCounter>
           std::move(correlation)};
 }
 
+[[nodiscard]] CCLCLifecycleTargetRetirementScopeDTO retirement_scope(const CanonicalValue& value) {
+  exact_object(value, {"request_owner_epoch", "publication_generation", "active_public_pointer_digest"},
+               {}, "target retirement scope");
+  CCLCLifecycleTargetRetirementScopeDTO scope{
+      RequestOwnerEpoch(text(member(value, "request_owner_epoch", "target retirement scope"), "owner")),
+      ActiveBundlePublicationGeneration(unsigned_integer(
+          member(value, "publication_generation", "target retirement scope"), "publication generation")),
+      ContentDigest(text(member(value, "active_public_pointer_digest", "target retirement scope"), "pointer digest"))};
+  if (!scope.locally_valid()) fail("target retirement scope is invalid");
+  return scope;
+}
+
+[[nodiscard]] CCLCLifecycleTargetRetirementIntentDTO retirement_intent(const CanonicalValue& value) {
+  exact_object(value, {"request_context", "scope", "expected_targets"}, {}, "target retirement intent");
+  std::vector<ComponentLifecycleTargetDTO> targets;
+  for (const auto& row : bounded_array(member(value, "expected_targets", "target retirement intent"),
+                                       kMaximumCCLCComponentWatermarks, "expected targets")) {
+    exact_object(row, {"controllable_component_id", "requested_state", "origin", "target_generation",
+                       "reached", "recovered_cause"}, {}, "retirement target row");
+    const auto& reached = member(row, "reached", "retirement target row");
+    if (!reached.is_bool()) fail("retirement target reached is not a boolean");
+    const auto& cause_value = member(row, "recovered_cause", "retirement target row");
+    std::optional<LifecycleBlockingCauseClassDTO> cause;
+    if (!cause_value.is_null()) {
+      cause = parse_lifecycle_blocking_cause_class(text(cause_value, "recovered cause"));
+      if (!cause) fail("retirement target recovered cause is unknown");
+    }
+    targets.push_back({ControllableComponentId(text(member(row, "controllable_component_id", "retirement target row"), "component")),
+      enum_value<LifecycleTargetStateDTO>(member(row, "requested_state", "retirement target row"),
+          {{"active", LifecycleTargetStateDTO::kActive}, {"prepared", LifecycleTargetStateDTO::kPrepared},
+           {"disabled", LifecycleTargetStateDTO::kDisabled}}, "target state"),
+      enum_value<LifecycleTargetOriginDTO>(member(row, "origin", "retirement target row"),
+          {{"startup", LifecycleTargetOriginDTO::kStartup}, {"operator", LifecycleTargetOriginDTO::kOperator},
+           {"program", LifecycleTargetOriginDTO::kProgram}}, "target origin"),
+      unsigned_integer(member(row, "target_generation", "retirement target row"), "target generation"),
+      reached.as_bool(), cause});
+  }
+  CCLCLifecycleTargetRetirementIntentDTO intent{
+      request_context(member(value, "request_context", "target retirement intent")),
+      retirement_scope(member(value, "scope", "target retirement intent")), std::move(targets)};
+  if (!intent.locally_valid()) fail("target retirement intent is invalid");
+  return intent;
+}
+
 [[nodiscard]] ExpectedActiveControlConfigurationDTO expected_active_configuration(
     const CanonicalValue& value) {
   exact_object(value, {"presence"},
@@ -251,7 +295,7 @@ template <typename StrongCounter>
                {"request_context", "controllable_component_id", "intent", "expected_graph_revision",
                 "expected_component_lifecycle_generation", "expected_control_domains",
                 "expected_admission_generation"},
-               {"reason", "program_node_evidence"}, "component lifecycle intent");
+               {"reason", "program_node_evidence", "close_incident_recovery"}, "component lifecycle intent");
   std::vector<ExpectedControlDomainRevisionDTO> domains;
   const auto& encoded =
       bounded_array(member(value, "expected_control_domains", "component lifecycle intent"),
@@ -288,6 +332,12 @@ template <typename StrongCounter>
           member(value, "expected_admission_generation", "component lifecycle intent"),
           "expected admission generation")),
       program_node_evidence(value)};
+  if (const auto* close = value.find_object_member("close_incident_recovery")) {
+    exact_object(*close, {"expected_incident_id"}, {}, "Close incident recovery");
+    result.close_incident_recovery = CloseComponentIncidentRecoveryDTO{
+        text(member(*close, "expected_incident_id", "Close incident recovery"),
+             "expected incident id")};
+  }
   if (!result.locally_valid()) {
     fail("component lifecycle intent is invalid");
   }
@@ -714,16 +764,17 @@ template <typename StrongCounter>
   // Present only for the authorization-only Recover of an open incident.
   if (value.incident_recovery) {
     const auto& recovery = *value.incident_recovery;
-    fields.emplace_back(
-        "incident_recovery",
-        CanonicalValue(CanonicalValue::Object{
+    CanonicalValue::Object recovered{
             {"acknowledged_at_ns",
              content_identity::nonnegative_int64_value(recovery.acknowledged_at_ns)},
             {"acknowledged_by", CanonicalValue(recovery.acknowledged_by)},
             {"cause_class", CanonicalValue(std::string(to_string(recovery.cause_class)))},
             {"controllable_component_id",
              CanonicalValue(recovery.controllable_component_id.value())},
-            {"incident_id", CanonicalValue(recovery.incident_id)}}));
+            {"incident_id", CanonicalValue(recovery.incident_id)}};
+    if (recovery.closure_reason)
+      recovered.emplace_back("closure_reason", CanonicalValue("cell_closed_by_operator"));
+    fields.emplace_back("incident_recovery", CanonicalValue(std::move(recovered)));
   }
   return CanonicalValue(std::move(fields));
 }
@@ -799,6 +850,44 @@ template <typename StrongCounter>
       {"target_generation", safe_unsigned(value->target_generation)}});
 }
 
+[[nodiscard]] CanonicalValue retirement_scope_value(const CCLCLifecycleTargetRetirementScopeDTO& scope) {
+  if (!scope.locally_valid()) throw std::invalid_argument("retirement scope is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"request_owner_epoch", CanonicalValue(scope.request_owner_epoch.value())},
+      {"publication_generation", safe_unsigned(scope.publication_generation.value())},
+      {"active_public_pointer_digest", CanonicalValue(scope.active_public_pointer_digest.value())}});
+}
+
+[[nodiscard]] CanonicalValue retirement_targets_value(const std::vector<ComponentLifecycleTargetDTO>& targets) {
+  if (!ValidCCLCRetirementTargets(targets)) throw std::invalid_argument("retirement target rows are invalid");
+  CanonicalValue::Array rows;
+  for (const auto& row : targets) {
+    rows.emplace_back(CanonicalValue::Object{
+        {"controllable_component_id", CanonicalValue(row.controllable_component_id.value())},
+        {"requested_state", CanonicalValue(std::string(to_string(row.requested_state)))},
+        {"origin", CanonicalValue(std::string(to_string(row.origin)))},
+        {"target_generation", safe_unsigned(row.target_generation)},
+        {"reached", CanonicalValue(row.reached)},
+        {"recovered_cause", row.recovered_cause ? CanonicalValue(std::string(to_string(*row.recovered_cause))) : CanonicalValue(nullptr)}});
+  }
+  return CanonicalValue(std::move(rows));
+}
+
+[[nodiscard]] CanonicalValue retirement_result_value(const CCLCLifecycleTargetRetirementResultDTO& result) {
+  if (!result.locally_valid()) throw std::invalid_argument("retirement result is invalid");
+  CanonicalValue::Object context{
+      {"request_id", CanonicalValue(result.request_context.request_id.value())},
+      {"request_owner_epoch", CanonicalValue(result.request_context.request_owner_epoch.value())},
+      {"source_label", CanonicalValue(result.request_context.source_label)}};
+  if (result.request_context.correlation_id)
+    context.emplace_back("correlation_id", CanonicalValue(*result.request_context.correlation_id));
+  return CanonicalValue(CanonicalValue::Object{
+      {"request_context", CanonicalValue(std::move(context))},
+      {"replay_status", CanonicalValue(std::string(to_string(result.replay_status)))},
+      {"scope", retirement_scope_value(result.scope)},
+      {"retired_targets", retirement_targets_value(result.retired_targets)}});
+}
+
 // Contract item 2 (addendum 2): the open incident, null when none. Times are
 // full-width nonnegative owner-clock nanoseconds (spec 210 §1.1): a JSON
 // number up to 2^53-1, a canonical decimal string above.
@@ -849,9 +938,124 @@ template <typename StrongCounter>
            : CanonicalValue(nullptr)}});
 }
 
-[[nodiscard]] CanonicalValue component_snapshot_value(
-    const ComponentLifecycleCurrentSnapshotDTO& value,
-    const ComponentLifecycleTargetViewDTO& target_view) {
+[[nodiscard]] CanonicalValue readiness_error_value(const std::optional<ErrorDTO>& error,
+                                                   std::size_t maximum_details = 64U) {
+  if (!error) return CanonicalValue(nullptr);
+  if (error->code.empty() || error->code.size() > kMaxLifecycleErrorCodeBytes ||
+      error->message.size() > kMaxLifecycleErrorMessageBytes || error->details.size() > maximum_details ||
+      std::any_of(error->details.begin(), error->details.end(), [](const auto& detail) {
+        return detail.first.empty() || detail.first.size() > kMaxLifecycleErrorDetailKeyBytes ||
+               detail.second.size() > kMaxLifecycleErrorDetailValueBytes;
+      })) fail("component readiness error is outside its existing bound");
+  return error_value(*error);
+}
+
+[[nodiscard]] CanonicalValue readiness_health_value(const std::optional<LifecycleDomainHealthDTO>& health) {
+  if (!health) return CanonicalValue(nullptr);
+  if (!health->locally_valid()) fail("component readiness health is invalid");
+  CanonicalValue::Array facts;
+  for (const auto& fact : health->facts) {
+    const auto kind = [&]() -> std::string {
+      switch (fact.value.kind) {
+        case LifecycleFactValueKindDTO::kUnknown: return "unknown";
+        case LifecycleFactValueKindDTO::kBoolean: return "boolean";
+        case LifecycleFactValueKindDTO::kInteger: return "integer";
+        case LifecycleFactValueKindDTO::kToken: return "token";
+      }
+      fail("component readiness fact kind is invalid");
+    }();
+    CanonicalValue::Object value{{"kind", CanonicalValue(kind)}};
+    switch (fact.value.kind) {
+      case LifecycleFactValueKindDTO::kUnknown: break;
+      case LifecycleFactValueKindDTO::kBoolean:
+        value.emplace_back("boolean_value", CanonicalValue(*fact.value.boolean_value)); break;
+      case LifecycleFactValueKindDTO::kInteger:
+        value.emplace_back("integer_value", safe_signed(*fact.value.integer_value)); break;
+      case LifecycleFactValueKindDTO::kToken:
+        value.emplace_back("token_value", CanonicalValue(*fact.value.token_value)); break;
+    }
+    facts.emplace_back(CanonicalValue::Object{
+        {"lifecycle_fact_id", CanonicalValue(fact.lifecycle_fact_id.value())},
+        {"value", CanonicalValue(std::move(value))}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"diagnostic", readiness_error_value(health->diagnostic, kMaxLifecycleErrorDetails)},
+      {"facts", CanonicalValue(std::move(facts))},
+      {"observed_state", CanonicalValue(std::string(to_string(health->observed_state)))}});
+}
+
+[[nodiscard]] CanonicalValue component_readiness_value(
+    const ComponentLifecycleCurrentSnapshotDTO& snapshot,
+    const ComponentLifecycleReadinessDTO& value) {
+  if (value.request_owner_epoch.empty() || value.request_owner_epoch.value().size() > kMaxLifecycleIdentityBytes ||
+      value.evaluated_at_ns < 0 || value.next_intent.has_value() != value.requested_state.has_value() ||
+      value.domains.size() != snapshot.provider_occurrences.size() || value.ready == value.error.has_value())
+    fail("component readiness owner, step or aggregate is invalid");
+  const auto state = snapshot.component_lifecycle_state;
+  if (((state == ComponentLifecycleStateDTO::kDeclared || state == ComponentLifecycleStateDTO::kDisabled) &&
+       (value.next_intent != ComponentLifecycleIntentKindDTO::kPrepare ||
+        value.requested_state != ComponentLifecycleStateDTO::kPrepared)) ||
+      (state == ComponentLifecycleStateDTO::kPrepared &&
+       (value.next_intent != ComponentLifecycleIntentKindDTO::kEnable ||
+        value.requested_state != ComponentLifecycleStateDTO::kActive)) ||
+      ((state != ComponentLifecycleStateDTO::kDeclared && state != ComponentLifecycleStateDTO::kDisabled &&
+        state != ComponentLifecycleStateDTO::kPrepared) && value.next_intent))
+    fail("component readiness step differs from its current lifecycle state");
+  CanonicalValue::Array domains;
+  for (std::size_t index = 0; index < value.domains.size(); ++index) {
+    const auto& domain = value.domains[index];
+    const auto& provider = domain.provider_occurrence;
+    if (provider != snapshot.provider_occurrences[index] || (!domain.health && !domain.error) ||
+        (domain.decision_kind &&
+         (*domain.decision_kind != LifecycleDomainPlanDecisionKind::kAlreadySatisfied &&
+          *domain.decision_kind != LifecycleDomainPlanDecisionKind::kDispatchPrimitive)) ||
+        (domain.decision_kind && (!domain.health || domain.error || !value.next_intent)) ||
+        (value.ready && (domain.error || !domain.health ||
+                       (value.next_intent && !domain.decision_kind))))
+      fail("component readiness domain does not match its exact provider or decision");
+    CanonicalValue::Object occurrence{
+        {"control_domain_id", CanonicalValue(provider.control_domain_id.value())},
+        {"control_domain_revision", CanonicalValue(provider.control_domain_revision.value())},
+        {"lifecycle_plan_catalog_digest", CanonicalValue(provider.lifecycle_plan_catalog_digest.value())},
+        {"provider_instance_id", CanonicalValue(provider.provider_instance_id.value())},
+        {"provider_manifest_id", CanonicalValue(provider.provider_manifest_id.value())},
+        {"provider_manifest_revision", CanonicalValue(provider.provider_manifest_revision.value())},
+        {"provider_runtime_epoch", CanonicalValue(provider.provider_runtime_epoch.value())},
+        {"provider_runtime_unit_id", CanonicalValue(provider.provider_runtime_unit_id.value())}};
+    CanonicalValue::Object domain_value{
+        {"decision_kind", domain.decision_kind
+            ? CanonicalValue(std::string(*domain.decision_kind == LifecycleDomainPlanDecisionKind::kAlreadySatisfied
+                                  ? "already_satisfied" : "dispatch_primitive")) : CanonicalValue(nullptr)},
+        {"error", readiness_error_value(domain.error)},
+        {"health", readiness_health_value(domain.health)},
+        {"provider_occurrence", CanonicalValue(std::move(occurrence))}};
+    if (domain.has_activation_step.has_value())
+      domain_value.emplace_back("has_activation_step", CanonicalValue(*domain.has_activation_step));
+    domains.emplace_back(std::move(domain_value));
+  }
+  const auto& measured = value.measured_state;
+  if ((!measured.required && (measured.available || !measured.error)) ||
+      (measured.required && !*measured.required && (measured.available || measured.error)) ||
+      (measured.required && *measured.required &&
+       (!measured.available || *measured.available == measured.error.has_value())) ||
+      (value.ready && (!measured.required || measured.error)))
+    fail("component readiness measured applicability or verdict is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"domains", CanonicalValue(std::move(domains))},
+      {"error", readiness_error_value(value.error)},
+      {"evaluated_at_ns", content_identity::nonnegative_int64_value(value.evaluated_at_ns)},
+      {"measured_state", CanonicalValue(CanonicalValue::Object{
+          {"available", measured.available ? CanonicalValue(*measured.available) : CanonicalValue(nullptr)},
+          {"error", readiness_error_value(measured.error)},
+          {"required", measured.required ? CanonicalValue(*measured.required) : CanonicalValue(nullptr)}})},
+      {"next_intent", value.next_intent ? CanonicalValue(std::string(to_string(*value.next_intent))) : CanonicalValue(nullptr)},
+      {"ready", CanonicalValue(value.ready)},
+      {"request_owner_epoch", CanonicalValue(value.request_owner_epoch.value())},
+      {"requested_state", value.requested_state ? CanonicalValue(std::string(to_string(*value.requested_state))) : CanonicalValue(nullptr)}});
+}
+
+[[nodiscard]] CanonicalValue::Object component_lifecycle_snapshot_fields(
+    const ComponentLifecycleCurrentSnapshotDTO& value) {
   CanonicalValue::Array domains;
   domains.reserve(value.domains.size());
   for (const auto& domain : value.domains) {
@@ -904,13 +1108,22 @@ template <typename StrongCounter>
       {"controllable_component_id", CanonicalValue(value.controllable_component_id.value())},
       {"domains", CanonicalValue(std::move(domains))},
       {"graph_revision", CanonicalValue(publication.request.candidate_graph_revision.value())},
-      {"lifecycle_progress", lifecycle_progress_value(target_view.progress)},
-      {"lifecycle_target", lifecycle_target_value(target_view.target)},
       {"provider_occurrences", CanonicalValue(std::move(providers))},
       {"publication_generation", safe_unsigned(publication.publication_generation.value())},
       {"retained_bundle_id",
        CanonicalValue(publication.request.candidate_retained_bundle_id.value())},
       {"snapshot_digest", CanonicalValue(value.snapshot_digest.value())}};
+  return fields;
+}
+
+[[nodiscard]] CanonicalValue component_snapshot_value(
+    const ComponentLifecycleCurrentSnapshotDTO& value,
+    const ComponentLifecycleTargetViewDTO& target_view,
+    const ComponentLifecycleReadinessDTO& readiness) {
+  auto fields = component_lifecycle_snapshot_fields(value);
+  fields.emplace_back("lifecycle_progress", lifecycle_progress_value(target_view.progress));
+  fields.emplace_back("lifecycle_target", lifecycle_target_value(target_view.target));
+  fields.emplace_back("readiness", component_readiness_value(value, readiness));
   if (target_view.dropped_output_lines.has_value() != target_view.dropped_output_bytes.has_value())
     throw std::invalid_argument("component output drop counters are incomplete");
   if (target_view.dropped_output_lines) {
@@ -1021,6 +1234,25 @@ ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleTargetView(
   return target_driver_->ReadTargetView(component_id);
 }
 
+Result<CCLCLifecycleTargetRetirementOfferDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleTargetRetirementOffer() {
+  return coordinator_.ReadLifecycleTargetRetirementOffer();
+}
+Result<CCLCLifecycleTargetRetirementResultDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::RetireLifecycleTargetsForClose(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  return coordinator_.RetireLifecycleTargetsForClose(intent);
+}
+Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleTargetRetirementResult(
+    const CCLCLifecycleTargetRetirementIntentDTO& intent) {
+  return coordinator_.ReadLifecycleTargetRetirementResult(intent);
+}
+Result<void> ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleOwnerSettlement(
+    const CCLCLifecycleTargetRetirementScopeDTO& scope) {
+  return coordinator_.ReadLifecycleOwnerSettlement(scope);
+}
+
 RequestOwnerEpoch
 ComponentLifecycleCoordinatorOpenRequestPort::ReadRequestOwnerEpoch() const {
   return coordinator_.request_owner_epoch();
@@ -1046,7 +1278,8 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
     if (!recovered.ok()) {
       // During exchange, exact Recover replay remains a journal observation;
       // a genuinely new Recover is refused before its mutation or admission.
-      if (recovered.error().code == "cclc_product_exchange_pending")
+      if (recovered.error().code == "cclc_product_exchange_pending" &&
+          !intent.close_incident_recovery)
         return coordinator_.SubmitLifecycle(intent);
       return Result<CCLCLifecycleRequestResultDTO>::Err(recovered.error());
     }
@@ -1092,6 +1325,17 @@ ComponentLifecycleCoordinatorOpenRequestPort::ReadCurrentComponent(
   auto pin = coordinator_.AcquireProductPin();
   if (!pin.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(pin.error());
   return pin.value().context().current_snapshot_source.ReadCurrentComponentSnapshot(component_id);
+}
+
+Result<CCLCComponentReadDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::ReadCurrentComponentView(
+    const ControllableComponentId& component_id) const {
+  if (target_driver_ == nullptr)
+    return Result<CCLCComponentReadDTO>::Err(
+        {"cclc_product_read_unavailable", "the component target owner is not composed", {}});
+  return coordinator_.ReadCurrentComponentView(component_id,
+      [&] { return target_driver_->ReadTargetView(component_id); },
+      [&] { return target_driver_->ReadReadinessFacts(component_id); });
 }
 
 Result<CCLCRouteSelectionTemplateSetDTO>
@@ -1153,24 +1397,66 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
               {"request_owner_epoch", CanonicalValue(owner_epoch.value())}})));
     }
 
+    if (command == "lifecycle_target_retirement_offer") {
+      exact_object(payload, {}, {}, "target retirement offer");
+      const auto result = port.ReadLifecycleTargetRetirementOffer();
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      if (!result.value().locally_valid()) fail("target retirement offer is invalid");
+      return encode_response(response_value(command, CanonicalValue(CanonicalValue::Object{
+          {"scope", retirement_scope_value(result.value().scope)},
+          {"targets", retirement_targets_value(result.value().targets)}})));
+    }
+    if (command == "lifecycle_target_retire" || command == "lifecycle_target_retirement_result") {
+      const auto intent = retirement_intent(payload);
+      if (command == "lifecycle_target_retire") {
+        const auto result = port.RetireLifecycleTargetsForClose(intent);
+        if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+        if (result.value().request_context != intent.request_context || result.value().scope != intent.scope || result.value().retired_targets != intent.expected_targets)
+          fail("target retirement result differs from its original request");
+        return encode_response(response_value(command, retirement_result_value(result.value())));
+      }
+      const auto result = port.ReadLifecycleTargetRetirementResult(intent);
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      if (result.value() && (result.value()->request_context != intent.request_context || result.value()->scope != intent.scope ||
+                            result.value()->retired_targets != intent.expected_targets))
+        fail("target retirement read differs from its original request");
+      return encode_response(response_value(command,
+          result.value() ? retirement_result_value(*result.value()) : CanonicalValue(nullptr)));
+    }
+    if (command == "lifecycle_owner_settlement") {
+      exact_object(payload, {"scope"}, {}, "owner settlement request");
+      const auto scope = retirement_scope(member(payload, "scope", "owner settlement request"));
+      const auto result = port.ReadLifecycleOwnerSettlement(scope);
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      return encode_response(response_value(command, CanonicalValue(CanonicalValue::Object{
+          {"scope", retirement_scope_value(scope)}, {"settled", CanonicalValue(true)}})));
+    }
+
+    if (command == "component_lifecycle_snapshot") {
+      exact_object(payload, {"controllable_component_id"}, {}, "component lifecycle snapshot request");
+      auto result = port.ReadCurrentComponent(ControllableComponentId(
+          text(member(payload, "controllable_component_id", "component lifecycle snapshot request"),
+               "controllable_component_id")));
+      if (!result.ok()) return encode_response(error_response_value(command, result.error()));
+      const auto verified = VerifyComponentLifecycleCurrentSnapshot(result.value());
+      if (!verified.ok()) return encode_response(error_response_value(command, verified.error()));
+      return encode_response(response_value(command,
+          CanonicalValue(component_lifecycle_snapshot_fields(result.value()))));
+    }
     if (command == "component_snapshot") {
       exact_object(payload, {"controllable_component_id"}, {}, "component snapshot request");
-      auto result = port.ReadCurrentComponent(ControllableComponentId(
+      auto result = port.ReadCurrentComponentView(ControllableComponentId(
           text(member(payload, "controllable_component_id", "component snapshot request"),
                "controllable_component_id")));
       if (!result.ok()) {
         return encode_response(error_response_value(command, result.error()));
       }
-      const auto verified = VerifyComponentLifecycleCurrentSnapshot(result.value());
+      const auto verified = VerifyComponentLifecycleCurrentSnapshot(result.value().snapshot);
       if (!verified.ok()) {
         return encode_response(error_response_value(command, verified.error()));
       }
-      auto target_view = port.ReadLifecycleTargetView(result.value().controllable_component_id);
-      if (!target_view.ok()) {
-        return encode_response(error_response_value(command, target_view.error()));
-      }
-      return encode_response(response_value(
-          command, component_snapshot_value(result.value(), target_view.value())));
+      return encode_response(response_value(command, component_snapshot_value(
+          result.value().snapshot, result.value().target_view, result.value().readiness)));
     }
     if (command == "incident_events") {
       exact_object(payload, {"after_sequence", "limit"}, {}, "incident events request");

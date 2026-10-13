@@ -6,6 +6,7 @@
 #include <functional>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
+#include <manyforge_core/types/component_lifecycle_readiness.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
@@ -105,6 +106,23 @@ using RetainedRuntimeBackendFactory = std::function<RetainedRuntimeBackendSet(
 using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
+
+/// Prepared leases for the existing runtime's exact measured route association.
+/// The callback enables the actual prepared producer and must not throw.
+struct RetainedPreparedRobotMeasuredSources final {
+  core::RobotMeasuredStateSourceView source_view;
+  std::function<void()> enable_publication;
+};
+
+/// A successful null payload is source absence, not a route-publication error.
+/// Err is reserved for invalid/failed preparation and exact association errors;
+/// callers must not hide unexpected transport failures as source absence.
+using RetainedRobotMeasuredSourcePreparer = std::function<
+    core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>(
+        const core::RuntimeParticipantBinding &candidate_motion,
+        const std::optional<core::RuntimeParticipantBinding> &candidate_gripper,
+        const std::vector<core::ActiveControlConfigurationDTO>
+            &candidate_configurations)>;
 
 struct RetainedResolvedParticipant final {
   core::RuntimeParticipantBinding binding;
@@ -282,6 +300,9 @@ struct RetainedNativeRuntimeInput final {
   bool fault_stop_profile_from_deployment{false};
   std::optional<core::MotionInterruptStopProfileDTO>
       deployment_fault_stop_profile{};
+  /// Optional actual producer staging. Empty preserves legacy construction;
+  /// measured readiness then reports an unavailable source association.
+  RetainedRobotMeasuredSourcePreparer prepare_measured_sources{};
 };
 
 struct RetainedNativeRuntime;
@@ -427,6 +448,8 @@ struct RetainedNativeRuntime final
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;
   RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
+  /// Set once by composition; staging never changes lifecycle/controller state.
+  RetainedRobotMeasuredSourcePreparer prepare_measured_sources;
   /// The stable Kernel stores a non-owning pointer to this source. A retained
   /// root may change during Apply, so the stable owner is shared with the
   /// candidate root until the Kernel itself retires.
@@ -522,6 +545,14 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<core::GripperCommandStatusDTO>
   ReadGripperStatus(const core::RuntimeParticipantBinding &source) const;
 
+  [[nodiscard]] core::Result<core::RobotMeasuredStateSourceView>
+  PrepareCurrentMeasuredSources();
+
+  [[nodiscard]] core::Result<core::ComponentLifecycleReadinessSourceView>
+  CaptureReadinessSources(
+      const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,
+      const std::shared_ptr<RetainedNativeRuntime> &owning_runtime) const;
+
 private:
   friend core::Result<void> reseal_retained_native_runtime_for_apply(
       RetainedNativeRuntime &runtime,
@@ -544,6 +575,8 @@ private:
   // own when it is the root). No owner read or write escapes it.
   [[nodiscard]] bool
   GripperSourceIsCurrent(const core::RuntimeParticipantBinding &source) const;
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+      prepared_measured_sources_;
   mutable std::mutex route_publication_mutex_;
 };
 
@@ -624,6 +657,8 @@ void attach_retained_native_addressed_owner(
 /// group, unit, or worker identities throw before any operation is admitted.
 [[nodiscard]] std::shared_ptr<RetainedNativeRuntime>
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
-                               RetainedNativeRuntimeConfig config);
+                               RetainedNativeRuntimeConfig config,
+                               std::shared_ptr<WallClock> shared_clock = {},
+                               std::shared_ptr<SimpleScheduler> shared_scheduler = {});
 
 } // namespace manyforge::roboplan_backend

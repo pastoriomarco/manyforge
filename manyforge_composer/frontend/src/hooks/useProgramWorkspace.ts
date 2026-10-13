@@ -572,7 +572,7 @@ export function useProgramWorkspace(
   }, [requireWorkspace, run, scenarioFence]);
 
   const newScenarioDocument = useCallback((input: NewScenarioDocumentInput) => {
-    void run('new_scenario_document', async () => {
+    return run('new_scenario_document', async () => {
       const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('New Scenario is not admitted.');
       const response = await api.scenarioDocuments.new(requestFence, input);
@@ -593,7 +593,7 @@ export function useProgramWorkspace(
     path: string,
     confirmDiscard: boolean,
   ) => {
-    void run('load_scenario_document', async () => {
+    return run('load_scenario_document', async () => {
       const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('Scenario Load is not admitted.');
       const response = await api.scenarioDocuments.load(

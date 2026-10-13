@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,41 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 dev_workbench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dev_workbench)
+
+
+def test_ros_home_is_owned_shared_and_inherited_before_service_spawn(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setenv("ROS_HOME", str(tmp_path / "inherited-home"))
+    workbench = dev_workbench.Workbench(
+        project_path=None, ros2_control=True,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+    )
+    paths = workbench._paths()
+    home = paths["execution_run"] / "ros-home"
+    assert os.environ["ROS_HOME"] == str(home)
+    assert home.is_dir()
+    lock = home / "existing-spawner-lock"
+    lock.write_text("same runtime", encoding="utf-8")
+
+    # Reusing the same runtime must not choose a per-controller/epoch home or
+    # rotate the lock directory. The actual spawn copies this environment.
+    assert workbench._paths() == paths
+    assert lock.read_text(encoding="utf-8") == "same runtime"
+    result = tmp_path / "child-home.txt"
+    workbench._spawn("environment fixture", (
+        sys.executable, "-c",
+        "import os,pathlib,sys; home=pathlib.Path(os.environ['ROS_HOME']); "
+        "(home/'writable-child-probe').write_text('owned'); "
+        "pathlib.Path(sys.argv[1]).write_text(str(home))",
+        str(result),
+    ))
+    assert workbench.processes[-1][1].wait(timeout=10) == 0
+    assert result.read_text(encoding="utf-8") == str(home)
+    assert (home / "writable-child-probe").read_text(encoding="utf-8") == "owned"
+    assert lock.read_text(encoding="utf-8") == "same runtime"
+    assert not (tmp_path / "inherited-home").exists()
 
 
 def test_repository_bootstrap_uses_the_exact_source_owned_generator(
@@ -742,6 +778,10 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
     extension = tmp_path / "extension.so"
     extension.write_bytes(b"fixture extension")
     clock = [0.0]
+    session_started_ns = 1791900000000000000
+    monkeypatch.setattr(dev_workbench.time, "time_ns", lambda: session_started_ns)
+    monkeypatch.setenv("ROS_HOME", str(tmp_path / "foreign-home"))
+    monkeypatch.setenv("ROS_LOG_DIR", str(tmp_path / "foreign-logs"))
     def backend():
         clock[0] += 120.0  # Arbitrary fixture duration, not a runtime claim.
         return extension
@@ -764,6 +804,10 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
     commands = []
     socket_owner = socket.socket(socket.AF_UNIX)
     def spawn(name, command):
+        logs = tmp_path / "state/execution-run/ros" / f"1-{session_started_ns}"
+        assert os.environ["ROS_LOG_DIR"] == str(logs)
+        assert logs.is_dir()
+        assert os.environ["ROS_HOME"] == str(tmp_path / "state/execution-run/ros-home")
         commands.append((name, tuple(command)))
         workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
         if name == "Manager":
@@ -805,6 +849,9 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
     assert workbench._readiness_deadline == 125.0  # Build duration is outside readiness budget.
     timing = json.loads((tmp_path / "state/workbench-startup-timing.json").read_text())
     assert timing == {"build_elapsed_seconds": 120.0, "readiness_elapsed_seconds": 0.0}
+    assert os.environ["ROS_LOG_DIR"] == str(tmp_path / "state/execution-run/ros" / f"1-{session_started_ns}")
+    assert not (tmp_path / "foreign-home").exists()
+    assert not (tmp_path / "foreign-logs").exists()
     for name, command in commands[:2]:
         assert command[command.index("--cell-id") + 1] == "fixture_cell"
         assert command[command.index("--owner-id") + 1].endswith("fixture-instance")

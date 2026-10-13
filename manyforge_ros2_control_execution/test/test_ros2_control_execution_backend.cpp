@@ -1,5 +1,7 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
+#include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -274,6 +276,121 @@ private:
       scale_sub_;
 };
 std::atomic<std::uint64_t> Rig::sequence_{0};
+
+TEST(JtcExecutionPort, EndpointFactsKeepRetainedBindingsAndScalingPublishersSeparate) {
+  Rig rig(true);
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    rig.successor->RefreshEndpointFacts();
+    return !rig.adapter->ReadEndpointDiagnostic() &&
+           !rig.successor->ReadEndpointDiagnostic();
+  }));
+  rig.state();
+  rig.adapter->RefreshEndpointFacts();
+  EXPECT_FALSE(rig.adapter->ReadEndpointDiagnostic());
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
+  Rig rig;
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    return !rig.adapter->ReadEndpointDiagnostic();
+  }));
+  const auto topic = rig.config(1).state_topic;
+  auto second = rig.resources.node()->create_publisher<
+      control_msgs::msg::JointTrajectoryControllerState>(topic, rclcpp::QoS(10));
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    const auto error = rig.adapter->ReadEndpointDiagnostic();
+    return error && error->code == "duplicate_component_instance";
+  }));
+  const auto error = rig.adapter->ReadEndpointDiagnostic();
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->details.at("topic"), topic);
+  EXPECT_EQ(error->details.at("endpoint_count"), "2");
+  second.reset();
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    return !rig.adapter->ReadEndpointDiagnostic();
+  }));
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointGraphFindsIncompatibleQosPublisherWithoutMatchedCount) {
+  Rig rig;
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    return !rig.adapter->ReadEndpointDiagnostic();
+  }));
+  auto incompatible = rig.resources.node()->create_publisher<
+      control_msgs::msg::JointTrajectoryControllerState>(
+      rig.config(1).state_topic, rclcpp::QoS(10).best_effort());
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    const auto error = rig.adapter->ReadEndpointDiagnostic();
+    return error && error->code == "duplicate_component_instance" &&
+           error->details.at("evidence_kind") == "ros_publisher_endpoints";
+  }));
+  const auto error = rig.adapter->ReadEndpointDiagnostic();
+  ASSERT_TRUE(error);
+  EXPECT_NE(error->details.at("first_endpoint"), error->details.at("second_endpoint"));
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointFactsDoNotCountSharedJointStatePublishers) {
+  Rig rig;
+  auto first = rig.resources.node()->create_publisher<sensor_msgs::msg::JointState>(
+      "/q127_shared_isaac_joint_states", 10);
+  auto second = rig.resources.node()->create_publisher<sensor_msgs::msg::JointState>(
+      "/q127_shared_isaac_joint_states", 10);
+  ASSERT_TRUE(wait_until([&] {
+    rig.adapter->RefreshEndpointFacts();
+    return !rig.adapter->ReadEndpointDiagnostic();
+  }));
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointFactsRetainUnsettledReadErrorsWithoutEffects) {
+  Rig rig;
+  SelectedRosEndpointFacts invalid(rig.resources.node(), "invalid topic name",
+      "control_msgs/msg/JointTrajectoryControllerState");
+  ASSERT_TRUE(wait_until([&] {
+    invalid.Refresh();
+    const auto error = invalid.ReadError();
+    return error && error->details.at("graph_reason") ==
+                        "selected_endpoint_graph_read_failed";
+  }));
+  const auto error = invalid.ReadError();
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->code, "component_instance_graph_unsettled");
+  EXPECT_EQ(error->details.at("graph_reason"), "selected_endpoint_graph_read_failed");
+  EXPECT_EQ(invalid.ReadError(), error);
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointCacheReadsDoNotConsumeAnUnsettledEdge) {
+  Rig rig;
+  SelectedRosEndpointFacts facts(rig.resources.node(), rig.config(1).state_topic,
+      "control_msgs/msg/JointTrajectoryControllerState");
+  ASSERT_TRUE(wait_until([&] {
+    facts.Refresh();
+    return !facts.ReadError();
+  }));
+  // This is the existing SDK matched-edge input; cached reads must not
+  // acknowledge it or manufacture a stable observation.
+  facts.ObserveMatchedCount(1);
+  for (int read = 0; read < 3; ++read) {
+    const auto error = facts.ReadError();
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code, "component_instance_graph_unsettled");
+  }
+  ASSERT_TRUE(wait_until([&] {
+    facts.Refresh();
+    return !facts.ReadError();
+  }));
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
 
 TEST(JtcExecutionPort, SubmitMapsFullPvaAndReportsLocalAcceptanceAndUuid) {
   Rig rig;

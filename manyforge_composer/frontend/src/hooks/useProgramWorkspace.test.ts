@@ -638,10 +638,10 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
     });
     const input = {
-      name: 'New cell', path: '/workspace/new', deploymentChoice: 'keep_applied' as const,
+      name: 'New cell', path: '/workspace/new', deploymentChoice: 'empty' as const,
       expectedRetainedBundleId: 'bundle', expectedGraphRevision: 'graph', confirmDiscard: true,
     };
-    await act(async () => { latest?.newScenarioDocument(input); });
+    await act(async () => { await latest?.newScenarioDocument(input); });
     expect(apiMock.scenarioDocuments.new).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ draftId: 'draft-1', deploymentDraftId: 'deployment-draft-1' }), input,
     );
@@ -780,7 +780,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       await Promise.resolve();
     });
     expect(latest?.state.message).toContain('already match the Applied configuration');
-    expect(latest?.state.message).toContain('No activation was needed');
+    expect(latest?.state.message).toContain('No configuration change was needed');
     expect(latest?.state.transitionStatus).toBe('applied');
   });
 });

@@ -37,6 +37,9 @@ import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
+import { closeScenario as closeCurrentScenario } from './state/scenarioClose';
+import { waitForObservation } from './hooks/useCCLC';
+import type { ManagerActiveProjection } from './types/api';
 import {
   managerActivationSettlementKey,
   nodeEnvironmentRefreshKey,
@@ -483,6 +486,26 @@ export default function App() {
   // a lost reply's exact request id. A different or older operation's status
   // never clears it.
   const [trackedApply, setTrackedApply] = useState<ManagerApplyIdentity | null>(null);
+  const closeAbort = useRef<AbortController | null>(null);
+  const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
+  useEffect(() => () => closeAbort.current?.abort(), []);
+  const closeCurrent = useCallback(async (expected: ManagerActiveProjection) => {
+    if (closeAbort.current !== null) throw new Error('Scenario Close is already in progress.');
+    const abort = new AbortController();
+    closeAbort.current = abort;
+    try {
+      return await closeCurrentScenario({ expected, signal: abort.signal,
+        admissionGeneration: () => {
+          const state = headlessStateSource.getShellSnapshot();
+          if (state.snapshot === null || state.transportStatus !== 'connected'
+            || state.semanticStatus !== 'current') throw new Error('Control source is unavailable; Close is unresolved.');
+          return state.snapshot.authoringAdmission.admissionGeneration;
+        },
+        waitForObservation: () => waitForObservation(abort.signal),
+        trackApply: setTrackedApply, progress: setScenarioCloseProgress,
+      });
+    } finally { closeAbort.current = null; setScenarioCloseProgress(null); }
+  }, [headlessStateSource]);
   useEffect(() => {
     if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
   }, [programController.acceptedApply]);
@@ -918,6 +941,8 @@ export default function App() {
       controller={programController}
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
       localInvalidEdit={programInvalidEdit}
+      closeScenario={closeCurrent}
+      closeProgress={scenarioCloseProgress}
     />
   );
 

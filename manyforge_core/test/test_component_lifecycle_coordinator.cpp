@@ -11,6 +11,7 @@
 #include <future>
 #include <limits>
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
+#include <manyforge_core/cclc_open_request.hpp>
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
@@ -29,6 +30,7 @@
 
 #include "../src/component_lifecycle_journal_codec_internal.hpp"
 #include "cclc_test_admission_port.hpp"
+#include "close_retirement_sqlite_faults.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -1048,6 +1050,10 @@ class FakeReadinessPort final : public ICCLCComponentCommandReadinessPort {
     std::lock_guard lock(mutex_);
     failures_remaining_ = count;
   }
+  void ApplyPreparedClose() noexcept {
+    std::lock_guard lock(mutex_);
+    state_.command_eligible = false;
+  }
   [[nodiscard]] std::vector<std::string> calls() const {
     std::lock_guard lock(mutex_);
     return calls_;
@@ -1370,6 +1376,11 @@ class SettlementBarrierJournal final : public ICCLCJournal {
       const CellAdmissionRecoveryReceiptDTO& receipt) override {
     return journal_.RecordCellClaimReleaseReceipt(active_owner_epoch, release, receipt);
   }
+  Result<std::uint64_t> RecordLifecycleTerminalAndClaimRelease(
+      const RequestOwnerEpoch& owner, const ComponentLifecycleStatusDTO& status,
+      const CellAdmissionClaimReleaseDTO& release) override {
+    return journal_.RecordLifecycleTerminalAndClaimRelease(owner, status, release);
+  }
   Result<std::uint64_t> RecordEffectPrepared(
       const RequestOwnerEpoch& active_owner_epoch, const CCLCEffectAttemptDTO& prepared_attempt,
       const ComponentLifecycleStatusDTO& successor_status) override {
@@ -1390,8 +1401,11 @@ class SettlementBarrierJournal final : public ICCLCJournal {
   }
   Result<ComponentLifecycleCurrentFactReadbackDTO> LoadCurrentComponentLifecycleFact(
       const ControllableComponentId& controllable_component_id) override {
-    return journal_.LoadCurrentComponentLifecycleFact(controllable_component_id);
+    auto result = journal_.LoadCurrentComponentLifecycleFact(controllable_component_id);
+    if (result.ok() && on_component_fact_read) on_component_fact_read(result.value());
+    return result;
   }
+  std::function<void(ComponentLifecycleCurrentFactReadbackDTO&)> on_component_fact_read{};
   Result<std::optional<CCLCRouteSelectionRequestResultDTO>> InspectRouteSelectionRequest(
       const RequestOwnerEpoch& active_owner_epoch, const RouteSelectionIntentDTO& intent) override {
     return journal_.InspectRouteSelectionRequest(active_owner_epoch, intent);
@@ -4373,6 +4387,1040 @@ TEST(ComponentLifecycleCoordinator, OrdinaryChildDomainReservationsStillRejectOv
       ComponentLifecycleProductIdentity{publication, {ControllableComponentId("component.1")}}});
 }
 
+Result<void> SeedCloseComponentFact(SqliteCCLCJournal& journal, ActiveBundlePublicationReceiptDTO& publication) {
+  const auto plan = journal.PlanNativeApply(DeclaredNativeApplyPlanRequest());
+  if (!plan.ok()) return Result<void>::Err(plan.error());
+  publication.request.transaction_ref = NamedApplyPublicationTransactionDTO{ApplyId("apply.ros"), ApplyGeneration(1U)};
+  publication.request.expected_previous_publication_generation = ActiveBundlePublicationGeneration(1U);
+  return journal.AdoptNativeApplyFacts({publication, plan.value().components, {}});
+}
+
+class CloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
+ public:
+  class Lease final : public ICellCloseAdmissionLease {
+   public:
+    explicit Lease(CloseLeaseAdmissionPort& owner) : owner_(owner) {}
+    Result<void> ValidatePrerequisites() const override {
+      ++owner_.checks;
+      if (owner_.fail_at != 0 && owner_.checks == owner_.fail_at)
+        return Result<void>::Err({"cell_close_stop_fault", "actual test guard changed", {{"reason", "active_stop_fault"}}});
+      return Result<void>::Ok();
+    }
+    Result<void> PrepareCommandEligibilityClosure(
+        const CCLCLifecycleTargetRetirementIntentDTO& intent) override {
+      prepared_ = intent;
+      return Result<void>::Ok();
+    }
+    bool CloseCommandEligibilityAfterRetirement(
+        const CCLCLifecycleTargetRetirementIntentDTO& intent,
+        const CCLCLifecycleTargetRetirementResultDTO& result) noexcept override {
+      if (!prepared_ || *prepared_ != intent ||
+          result.replay_status != RequestReplayStatusDTO::kAcceptedNew ||
+          result.request_context != prepared_->request_context ||
+          result.scope != prepared_->scope || result.retired_targets != prepared_->expected_targets)
+        return false;
+      ++owner_.closures;
+      if (owner_.readiness) owner_.readiness->ApplyPreparedClose();
+      return true;
+    }
+    bool CloseCommandEligibilityForUnknownRetirement(
+        const CCLCLifecycleTargetRetirementIntentDTO& intent) noexcept override {
+      if (!prepared_ || *prepared_ != intent) return false;
+      ++owner_.unknown_closures;
+      if (owner_.readiness) owner_.readiness->ApplyPreparedClose();
+      return true;
+    }
+   private:
+    CloseLeaseAdmissionPort& owner_;
+    std::optional<CCLCLifecycleTargetRetirementIntentDTO> prepared_;
+  };
+  Result<std::unique_ptr<ICellCloseAdmissionLease>> AcquireCellCloseAdmissionLease() override {
+    ++acquires;
+    std::unique_ptr<ICellCloseAdmissionLease> lease = std::make_unique<Lease>(*this);
+    return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Ok(std::move(lease));
+  }
+  int checks{};
+  int acquires{};
+  int fail_at{};
+  int closures{};
+  int unknown_closures{};
+  FakeReadinessPort* readiness{};
+};
+
+// Reproduce the exact final scoped-settlement lock ordering with a real
+// exclusion and barriers. The test-only timed acquisition bounds a regressed
+// blocking implementation; no production timeout or guard changes.
+class ContendedCloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
+ public:
+  class Lease final : public ICellCloseAdmissionLease {
+   public:
+    Lease(ContendedCloseLeaseAdmissionPort& owner,
+          std::unique_lock<std::timed_mutex> lock, bool first)
+        : owner_(owner), lock_(std::move(lock)), first_(first) {}
+    Result<void> ValidatePrerequisites() const override {
+      if (first_ && ++checks_ == 2) {
+        std::unique_lock barrier(owner_.barrier_);
+        owner_.at_final_validation_ = true;
+        owner_.changed_.notify_all();
+        if (!owner_.changed_.wait_for(barrier, std::chrono::seconds(2),
+                                     [&] { return owner_.competing_acquisition_; }))
+          return Result<void>::Err({"test_barrier_timeout", "competing offer did not acquire CCLC", {}});
+      }
+      return Result<void>::Ok();
+    }
+   private:
+    ContendedCloseLeaseAdmissionPort& owner_;
+    std::unique_lock<std::timed_mutex> lock_;
+    bool first_;
+    mutable int checks_{};
+  };
+  Result<std::unique_ptr<ICellCloseAdmissionLease>> AcquireCellCloseAdmissionLease() override {
+    const bool first = acquires_.fetch_add(1) == 0;
+    if (!first) {
+      std::lock_guard barrier(barrier_);
+      // The competing Offer calls this only while retaining CCLC exclusion.
+      competing_acquisition_ = true;
+      changed_.notify_all();
+    }
+    std::unique_lock lock(admission_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(2)))
+      return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Err(
+          {"test_kernel_lease_timeout", "scoped settlement retained a reversed blocking lock", {}});
+    std::unique_ptr<ICellCloseAdmissionLease> lease =
+        std::make_unique<Lease>(*this, std::move(lock), first);
+    return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Ok(std::move(lease));
+  }
+  bool WaitForFinalValidation() {
+    std::unique_lock barrier(barrier_);
+    return changed_.wait_for(barrier, std::chrono::seconds(2),
+                             [&] { return at_final_validation_; });
+  }
+ private:
+  std::timed_mutex admission_;
+  std::mutex barrier_;
+  std::condition_variable changed_;
+  std::atomic<int> acquires_{};
+  bool at_final_validation_{};
+  bool competing_acquisition_{};
+};
+
+TEST(ComponentLifecycleCoordinator,
+     CloseScopedSettlementDoesNotWaitForCCLCWhileRetainingKernelAdmission) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto brand = std::make_shared<FakeBrandPort>(journal,
+      std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(brand);
+  ContendedCloseLeaseAdmissionPort kernel;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  auto publication = ActivePublication();
+  publication.durable_public_pointer_content_digest = ContentDigest(Sha('c'));
+  ASSERT_TRUE(SeedCloseComponentFact(journal, publication).ok());
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations,
+      ProductContextFor(snapshots, catalogs, resolver, publication), kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const CCLCLifecycleTargetRetirementScopeDTO scope{
+      coordinator.request_owner_epoch(), publication.publication_generation,
+      publication.durable_public_pointer_content_digest};
+  auto settlement = std::async(std::launch::async, [&] {
+    return coordinator.ReadLifecycleOwnerSettlement(scope);
+  });
+  ASSERT_TRUE(kernel.WaitForFinalValidation());
+  auto offer = std::async(std::launch::async, [&] {
+    return coordinator.ReadLifecycleTargetRetirementOffer();
+  });
+  const auto settled = settlement.get();
+  ASSERT_FALSE(settled.ok());
+  EXPECT_EQ(settled.error().code, "component_lifecycle_owner_settlement_unknown");
+  const auto offered = offer.get();
+  ASSERT_TRUE(offered.ok()) << offered.error().message;
+  EXPECT_EQ(offered.value().scope, scope);
+  EXPECT_EQ(brand->dispatch_count(), 0U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+  EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, CloseRetirementUsesActualScopedJournalAndReplaysBeforeSuccessorPublication) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto brand = std::make_shared<FakeBrandPort>(journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(brand);
+  CloseLeaseAdmissionPort kernel;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  auto previous = ActivePublication();
+  previous.durable_public_pointer_content_digest = ContentDigest(Sha('c'));
+  ASSERT_TRUE(SeedCloseComponentFact(journal, previous).ok());
+  const auto old_context = ProductContextFor(snapshots, catalogs, resolver, previous);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, old_context, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  ASSERT_TRUE(journal.SetLifecycleTarget(ControllableComponentId("component.1"), LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator).ok());
+  ComponentLifecycleCoordinatorOpenRequestPort open(coordinator);
+  const auto offer = open.ReadLifecycleTargetRetirementOffer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  ASSERT_EQ(offer.value().targets.size(), 1U);
+  const CCLCLifecycleTargetRetirementIntentDTO intent{
+      {RequestId("close.owner.1"), coordinator.request_owner_epoch(), "operator", std::string("close.correlation")},
+      offer.value().scope, offer.value().targets};
+  auto stale = intent;
+  stale.scope.publication_generation = ActiveBundlePublicationGeneration(3U);
+  const auto refused = open.RetireLifecycleTargetsForClose(stale);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_lifecycle_target_retirement_scope_stale");
+  EXPECT_EQ(journal.LoadLifecycleTargets().value(), intent.expected_targets);
+  const auto retired = open.RetireLifecycleTargetsForClose(intent);
+  ASSERT_TRUE(retired.ok()) << retired.error().message;
+  EXPECT_EQ(retired.value().request_context, intent.request_context);
+  EXPECT_EQ(retired.value().retired_targets, intent.expected_targets);
+  EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+  EXPECT_TRUE(open.ReadLifecycleOwnerSettlement(intent.scope).ok());
+  auto next = NextProductPublication(previous);
+  next.durable_public_pointer_content_digest = ContentDigest(Sha('d'));
+  const auto successor = ProductContextFor(snapshots, catalogs, resolver, next);
+  const auto exchange = coordinator.TryExchangeProductContext(old_context, successor, coordinator.request_owner_epoch(), previous);
+  ASSERT_TRUE(exchange.ok()) << exchange.error().message;
+  EXPECT_EQ(exchange.value().phase, ComponentLifecycleProductExchangePhase::kCompleted);
+  ASSERT_TRUE(journal.SetLifecycleTarget(ControllableComponentId("component.1"), LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator).ok());
+  const auto new_targets = journal.LoadLifecycleTargets().value();
+  kernel.fail_at = kernel.checks + 1;
+  const auto replay = open.RetireLifecycleTargetsForClose(intent);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(journal.LoadLifecycleTargets().value(), new_targets);
+  EXPECT_EQ(open.ReadLifecycleTargetRetirementResult(intent).value()->request_context, intent.request_context);
+  EXPECT_FALSE(open.ReadLifecycleOwnerSettlement(intent.scope).ok());
+  EXPECT_EQ(brand->dispatch_count(), 0U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, CloseRetirementActualJournalRollsBackGuardChangeBeforeCommit) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto brand = std::make_shared<FakeBrandPort>(journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(brand);
+  CloseLeaseAdmissionPort kernel;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  auto publication = ActivePublication();
+  publication.durable_public_pointer_content_digest = ContentDigest(Sha('c'));
+  ASSERT_TRUE(SeedCloseComponentFact(journal, publication).ok());
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations,
+      ProductContextFor(snapshots, catalogs, resolver, publication), kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  ASSERT_TRUE(journal.SetLifecycleTarget(ControllableComponentId("component.1"), LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator).ok());
+  const auto offer = coordinator.ReadLifecycleTargetRetirementOffer();
+  ASSERT_TRUE(offer.ok());
+  const CCLCLifecycleTargetRetirementIntentDTO intent{
+      {RequestId("close.guard.owner"), coordinator.request_owner_epoch(), "operator", std::nullopt},
+      offer.value().scope, offer.value().targets};
+  kernel.fail_at = kernel.checks + 2; // SQL acceptance succeeds; precommit changes.
+  const auto refused = coordinator.RetireLifecycleTargetsForClose(intent);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "cell_close_stop_fault");
+  EXPECT_EQ(journal.LoadLifecycleTargets().value(), intent.expected_targets);
+  EXPECT_FALSE(coordinator.ReadLifecycleTargetRetirementResult(intent).value());
+  EXPECT_EQ(brand->dispatch_count(), 0U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+namespace {
+enum class HeldCloseOrder { kRetireFirst, kPublishFirst, kUnreadable };
+
+// Hold the actual accepted primitive response, after its claim and SQL
+// acceptance, so retirement races the original completion rather than a
+// guessed worker delay. The guard releases before coordinator destruction.
+class HeldCloseDispatch final {
+ public:
+  void Enter() {
+    std::unique_lock lock(mutex_);
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [&] { return released_; });
+  }
+  bool Wait() {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(2), [&] { return entered_; });
+  }
+  void Release() {
+    std::lock_guard lock(mutex_);
+    released_ = true;
+    changed_.notify_all();
+  }
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool entered_{};
+  bool released_{};
+};
+
+void VerifyHeldCloseOrder(HeldCloseOrder order) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = temporary.path() / std::string(kCCLCJournalFilename);
+  SqliteCCLCJournal journal(path, CellId("cell.1"), 8U);
+  auto plan_request = DeclaredNativeApplyPlanRequest();
+  const auto plan = journal.PlanNativeApply(plan_request);
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  ASSERT_EQ(plan.value().components.size(), 1U);
+  auto publication = ActivePublication();
+  publication.durable_public_pointer_content_digest = ContentDigest(Sha('c'));
+  publication.request.transaction_ref = NamedApplyPublicationTransactionDTO{ApplyId("apply.ros"), ApplyGeneration(1U)};
+  publication.request.expected_previous_publication_generation = ActiveBundlePublicationGeneration(1U);
+  ASSERT_TRUE(journal.AdoptNativeApplyFacts({publication, plan.value().components, {}}).ok());
+  const auto generation = plan.value().components.front().generation;
+  const auto catalog = EnableCatalog();
+  auto snapshot = Snapshot("snapshot.close.held", ComponentLifecycleStateDTO::kDeclared,
+                           generation, catalog);
+  snapshot.active_publication_receipt = publication;
+  FakeSnapshotSource snapshots({snapshot});
+  FakeCatalogSource catalogs(catalog);
+  HeldCloseDispatch dispatch;
+  std::atomic<int> dispatched{};
+  auto brand = std::make_shared<FakeBrandPort>(journal,
+      std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                              ComponentLifecycleStateDTO::kPrepared,
+                                              ComponentLifecycleStateDTO::kPrepared,
+                                              ComponentLifecycleStateDTO::kActive},
+      DispatchMode::kKnownSuccess, 1U, std::vector<LifecycleFactDTO>{}, [&] {
+        if (++dispatched == 2) dispatch.Enter();
+      });
+  FakeResolver resolver(brand, catalog);
+  CloseLeaseAdmissionPort kernel;
+  FakeReadinessPort readiness;
+  kernel.readiness = &readiness;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  CCLCDomainReservationTable reservations;
+  const auto context = std::make_shared<const ComponentLifecycleProductContext>(
+      ComponentLifecycleProductContext{snapshots, catalogs, resolver, std::nullopt, &readiness,
+        ComponentLifecycleProductIdentity{publication, {ControllableComponentId("component.1")}}});
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, context, kernel, clock, scheduler);
+  struct ReleaseOnExit {
+    HeldCloseDispatch& dispatch;
+    ~ReleaseOnExit() { dispatch.Release(); }
+  } guard{dispatch};
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto prepare = PrepareIntent(coordinator.request_owner_epoch());
+  prepare.expected_component_lifecycle_generation = generation;
+  const auto prepared = coordinator.SubmitLifecycle(prepare);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(prepared.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto prepared_status = journal.LoadRetainedLifecycleStatus(
+      prepared.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(prepared_status.ok());
+  ASSERT_TRUE(prepared_status.value());
+  ASSERT_EQ(prepared_status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  snapshot.component_lifecycle_state = ComponentLifecycleStateDTO::kPrepared;
+  snapshot.component_lifecycle_generation = prepared.value().acceptance->component_lifecycle_generation;
+  snapshots.SetSnapshot(snapshot);
+  auto enable = PrepareIntent(coordinator.request_owner_epoch());
+  enable.request_context.request_id = RequestId("close.held.enable");
+  enable.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  enable.expected_component_lifecycle_generation = snapshot.component_lifecycle_generation;
+  const auto accepted = coordinator.SubmitLifecycle(enable);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(dispatch.Wait());
+  const auto transaction = accepted.value().acceptance->lifecycle_transaction_id;
+  const auto held = journal.LoadRetainedLifecycleStatus(transaction);
+  ASSERT_TRUE(held.ok());
+  ASSERT_TRUE(held.value());
+  ASSERT_FALSE(held.value()->terminal_result);
+  ASSERT_EQ(journal.LoadLifecycleTargets().value().size(), 1U);
+  const auto offer = coordinator.ReadLifecycleTargetRetirementOffer();
+  ASSERT_TRUE(offer.ok()) << offer.error().message;
+  const CCLCLifecycleTargetRetirementIntentDTO retirement{
+      {RequestId("close.held.retire"), coordinator.request_owner_epoch(), "operator", std::nullopt},
+      offer.value().scope, offer.value().targets};
+  if (order == HeldCloseOrder::kPublishFirst) {
+    dispatch.Release();
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    EXPECT_TRUE(readiness.state().command_eligible);
+    ASSERT_TRUE(coordinator.RetireLifecycleTargetsForClose(retirement).ok());
+  } else if (order == HeldCloseOrder::kUnreadable) {
+    journal.Close();
+  } else {
+    ASSERT_TRUE(coordinator.RetireLifecycleTargetsForClose(retirement).ok());
+    EXPECT_FALSE(readiness.state().command_eligible);
+    // The original work remains held; Close does not invent a retirement
+    // refusal or rearrange the subsequent owner settlement step.
+    EXPECT_FALSE(journal.LoadRetainedLifecycleStatus(transaction).value()->terminal_result);
+  }
+  dispatch.Release();
+  const bool drained = coordinator.DrainFor(std::chrono::seconds(2));
+  if (order == HeldCloseOrder::kUnreadable) {
+    EXPECT_FALSE(drained); // The original live claim is deliberately retained.
+    EXPECT_FALSE(coordinator.accepting_new_requests());
+    ASSERT_EQ(readiness.publications().size(), 1U); // Only completed Prepare.
+    EXPECT_FALSE(readiness.publications().front().command_eligible);
+    SqliteCCLCJournal reopened(path, CellId("cell.1"), 8U);
+    const auto unfinished = reopened.LoadRetainedLifecycleStatus(transaction);
+    ASSERT_TRUE(unfinished.ok());
+    ASSERT_TRUE(unfinished.value());
+    EXPECT_FALSE(unfinished.value()->terminal_result);
+    return;
+  }
+  ASSERT_TRUE(drained);
+  const auto status = journal.LoadRetainedLifecycleStatus(transaction);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded)
+      << (status.value()->error ? status.value()->error->message : "");
+  EXPECT_EQ(brand->dispatch_count(), 2U);
+  const auto publications = readiness.publications();
+  ASSERT_EQ(publications.size(), 2U);
+  EXPECT_FALSE(publications.front().command_eligible);
+  const bool expected_positive = order == HeldCloseOrder::kPublishFirst;
+  EXPECT_EQ(publications.back().command_eligible, expected_positive);
+  EXPECT_FALSE(readiness.state().command_eligible);
+  EXPECT_EQ(kernel.closures, 1);
+  EXPECT_TRUE(coordinator.ReadLifecycleOwnerSettlement(retirement.scope).ok());
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+}  // namespace
+
+TEST(ComponentLifecycleCoordinator, CloseRetirementSuppressesOriginalHeldEnablePublication) {
+  VerifyHeldCloseOrder(HeldCloseOrder::kRetireFirst);
+}
+TEST(ComponentLifecycleCoordinator, CloseRetirementClosesOriginalEnableAlreadyPublished) {
+  VerifyHeldCloseOrder(HeldCloseOrder::kPublishFirst);
+}
+TEST(ComponentLifecycleCoordinator, UnreadableTargetRetirementProofRetainsOriginalHeldClaim) {
+  VerifyHeldCloseOrder(HeldCloseOrder::kUnreadable);
+}
+
+TEST(ComponentLifecycleCoordinator, CloseCommitUnknownClosesPreparedEligibilityButProvenRollbackDoesNot) {
+  for (const bool unreadable : {false, true}) {
+    SCOPED_TRACE(unreadable);
+    test::CloseRetirementCommitFailure failure;
+    test::ScopedCloseRetirementCommitFailure hook(failure);
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+    CCLCDomainReservationTable reservations;
+    FakeSnapshotSource snapshots({Snapshot()});
+    FakeCatalogSource catalogs(PrepareCatalog());
+    auto brand = std::make_shared<FakeBrandPort>(journal,
+        std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+    FakeResolver resolver(brand);
+    CloseLeaseAdmissionPort kernel;
+    FakeReadinessPort readiness;
+    kernel.readiness = &readiness;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    auto publication = ActivePublication();
+    publication.durable_public_pointer_content_digest = ContentDigest(Sha('c'));
+    ASSERT_TRUE(SeedCloseComponentFact(journal, publication).ok());
+    ComponentLifecycleCoordinator coordinator(Config(), journal, reservations,
+        ProductContextFor(snapshots, catalogs, resolver, publication), kernel, clock, scheduler);
+    ASSERT_TRUE(coordinator.Start().ok());
+    ASSERT_TRUE(journal.SetLifecycleTarget(ControllableComponentId("component.1"),
+        LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator).ok());
+    const auto offer = coordinator.ReadLifecycleTargetRetirementOffer();
+    ASSERT_TRUE(offer.ok());
+    const CCLCLifecycleTargetRetirementIntentDTO intent{
+        {RequestId("close.owner.commit"), coordinator.request_owner_epoch(), "operator", std::nullopt},
+        offer.value().scope, offer.value().targets};
+    failure.fail_readback = unreadable;
+    failure.armed = true;
+    const auto result = coordinator.RetireLifecycleTargetsForClose(intent);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(failure.commit_failures, 1);
+    EXPECT_EQ(result.error().code == "persistence_outcome_unknown", unreadable);
+    EXPECT_EQ(coordinator.accepting_new_requests(), !unreadable);
+    EXPECT_EQ(readiness.state().command_eligible, !unreadable);
+    EXPECT_EQ(kernel.unknown_closures, unreadable ? 1 : 0);
+    EXPECT_EQ(kernel.closures, 0);
+    EXPECT_EQ(brand->dispatch_count(), 0U);
+    failure.deny_reads = false;
+    EXPECT_EQ(journal.LoadLifecycleTargets().value(), intent.expected_targets);
+    EXPECT_FALSE(journal.ReadLifecycleTargetRetirementResult(intent).value());
+    EXPECT_TRUE(reservations.snapshot().empty());
+  }
+}
+
+// The grouped-read fixture has a qualified non-robot component. Its empty
+// geometry inventory says nothing about a physical robot's measured readiness.
+class ReadinessHealthResolver final : public ICCLCBrandLifecyclePortResolver {
+ public:
+  explicit ReadinessHealthResolver(std::shared_ptr<FakeBrandPort> port,
+                                   BrandLifecyclePlanCatalogDTO catalog = PrepareCatalog())
+      : port_(std::move(port)), provider_(Provider(catalog)) {}
+
+  Result<std::shared_ptr<IBrandLifecyclePort>> ResolveExactLifecyclePort(
+      const ResolvedLifecycleProviderOccurrenceDTO&) const override {
+    ++execution_resolves;
+    return Result<std::shared_ptr<IBrandLifecyclePort>>::Ok(port_);
+  }
+
+  Result<LifecycleDomainHealthDTO> ReadExactLifecycleHealth(
+      const ResolvedLifecycleProviderOccurrenceDTO& provider,
+      std::int64_t now_ns) const override {
+    ++health_reads;
+    last_now = now_ns;
+    if (provider != provider_)
+      return Result<LifecycleDomainHealthDTO>::Err(
+          {"lifecycle_port_mismatch", "provider mismatch", {}});
+    if (on_health_read) on_health_read();
+    if (health_error)
+      return Result<LifecycleDomainHealthDTO>::Err(*health_error);
+    return Result<LifecycleDomainHealthDTO>::Ok(health);
+  }
+
+  LifecycleDomainHealthDTO health{ComponentLifecycleStateDTO::kDeclared, {}, std::nullopt};
+  std::optional<ErrorDTO> health_error;
+  std::function<void()> on_health_read;
+  mutable std::size_t health_reads{};
+  mutable std::size_t execution_resolves{};
+  mutable std::int64_t last_now{};
+ private:
+  std::shared_ptr<FakeBrandPort> port_;
+  ResolvedLifecycleProviderOccurrenceDTO provider_;
+};
+
+[[nodiscard]] ComponentLifecycleCurrentSnapshotDTO VerifiedReadinessSnapshot() {
+  auto value = Snapshot();
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(value);
+  if (!digest.ok()) throw std::runtime_error(digest.error().message);
+  value.snapshot_digest = digest.value();
+  return value;
+}
+
+struct GroupedReadinessFixture final {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal{temporary.path() / std::string(kCCLCJournalFilename),
+                           CellId("cell.1"), 8U};
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots{{VerifiedReadinessSnapshot()}};
+  FakeCatalogSource catalogs{PrepareCatalog()};
+  std::shared_ptr<FakeBrandPort> port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+  ReadinessHealthResolver resolver{port};
+  CountingAdmissionReadPort kernel;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  bool association_available = true;
+  bool association_current = true;
+  std::size_t validations{};
+  std::size_t target_fact_reads{};
+  ComponentLifecycleReadinessTargetFactsDTO target_facts{{}, std::nullopt};
+  std::function<void()> before_target_facts;
+  std::shared_ptr<const ComponentLifecycleProductContext> context;
+  std::unique_ptr<ComponentLifecycleCoordinator> coordinator;
+
+  GroupedReadinessFixture() {
+    context = std::make_shared<const ComponentLifecycleProductContext>(
+        ComponentLifecycleProductContext{
+            snapshots, catalogs, resolver, std::nullopt, nullptr,
+            ComponentLifecycleProductIdentity{ActivePublication(),
+                                               {ControllableComponentId("component.1")}},
+            nullptr,
+            std::make_shared<const ConfiguredRobotMeasuredStateInventory>(
+                std::vector<ConfiguredRobotMeasuredStateRequirement>{}),
+            [this](const ComponentLifecycleCurrentSnapshotDTO&) {
+              if (!association_available)
+                return Result<ComponentLifecycleReadinessSourceView>::Err(
+                    {"route_source_unavailable", "route source is unavailable", {}});
+              return Result<ComponentLifecycleReadinessSourceView>::Ok(
+                  {std::nullopt, [this] {
+                    ++validations;
+                    return association_current ? Result<void>::Ok()
+                        : Result<void>::Err({"route_source_changed", "route source changed", {}});
+                  }});
+            }});
+    coordinator = std::make_unique<ComponentLifecycleCoordinator>(
+        Config(), journal, reservations, context, kernel, clock, scheduler);
+    const auto started = coordinator->Start();
+    if (!started.ok()) throw std::runtime_error(started.error().message);
+  }
+
+  Result<CCLCComponentReadDTO> Read() {
+    return coordinator->ReadCurrentComponentView(ControllableComponentId("component.1"),
+        [this] { return Result<ComponentLifecycleTargetViewDTO>::Ok(
+                     {target_facts.facts.target, std::nullopt, std::nullopt, std::nullopt}); },
+        [this] {
+          ++target_fact_reads;
+          if (before_target_facts) before_target_facts();
+          return Result<ComponentLifecycleReadinessTargetFactsDTO>::Ok(target_facts);
+        });
+  }
+
+  void ExpectNoExecutionEffects() const {
+    EXPECT_EQ(resolver.execution_resolves, 0U);
+    EXPECT_EQ(port->observation_count(), 0U);
+    EXPECT_EQ(port->dispatch_count(), 0U);
+    EXPECT_EQ(kernel.claim_acquires.load(), 0U);
+    EXPECT_TRUE(reservations.snapshot().empty());
+  }
+};
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessUsesExactPureHealthWithoutIntentOrObservation) {
+  GroupedReadinessFixture fixture;
+  const auto owner = fixture.coordinator->request_owner_epoch();
+  for (const auto now : {123, 456}) {
+    fixture.clock.set(now);
+    auto read = fixture.Read();
+    ASSERT_TRUE(read.ok()) << read.error().message;
+    EXPECT_TRUE(read.value().readiness.ready);
+    EXPECT_EQ(read.value().readiness.request_owner_epoch, owner);
+    EXPECT_EQ(read.value().readiness.evaluated_at_ns, now);
+    EXPECT_EQ(read.value().readiness.next_intent, ComponentLifecycleIntentKindDTO::kPrepare);
+    EXPECT_EQ(read.value().readiness.requested_state, ComponentLifecycleStateDTO::kPrepared);
+    ASSERT_EQ(read.value().readiness.domains.size(), 1U);
+    EXPECT_EQ(read.value().readiness.domains.front().provider_occurrence,
+              Provider(PrepareCatalog()));
+    EXPECT_EQ(read.value().readiness.domains.front().decision_kind,
+              LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
+    EXPECT_EQ(read.value().readiness.measured_state.required, false);
+    EXPECT_FALSE(read.value().readiness.measured_state.available);
+    EXPECT_EQ(fixture.resolver.last_now, now);
+    EXPECT_EQ(read.value().snapshot, VerifiedReadinessSnapshot());
+  }
+  EXPECT_EQ(fixture.resolver.health_reads, 2U);
+  EXPECT_EQ(fixture.validations, 4U);
+  EXPECT_EQ(fixture.target_fact_reads, 4U);
+  EXPECT_EQ(fixture.coordinator->request_owner_epoch(), owner);
+  EXPECT_TRUE(fixture.journal.ReadQuiescentOwner(owner).ok());
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, EndpointConflictsRefusePrepareBeforePrimitiveEffects) {
+  for (const auto code : {"duplicate_component_instance",
+                          "component_instance_graph_unsettled"}) {
+    SCOPED_TRACE(code);
+    GroupedReadinessFixture fixture;
+    fixture.clock.set(100);
+    fixture.resolver.health_error = ErrorDTO{code, "selected endpoint conflict",
+                                            {{"topic", "/selected/activity"}}};
+    const auto read = fixture.Read();
+    ASSERT_TRUE(read.ok());
+    EXPECT_FALSE(read.value().readiness.ready);
+    ASSERT_TRUE(read.value().readiness.error);
+    EXPECT_EQ(read.value().readiness.error->code, code);
+    const auto accepted = fixture.coordinator->SubmitLifecycle(
+        PrepareIntent(fixture.coordinator->request_owner_epoch()));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance);
+    ASSERT_TRUE(fixture.coordinator->DrainFor(std::chrono::seconds(2)));
+    const auto status = fixture.coordinator->LoadLifecycleStatus(
+        accepted.value().acceptance->lifecycle_transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value());
+    EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+    ASSERT_TRUE(status.value()->error);
+    EXPECT_EQ(status.value()->error->code, code);
+    EXPECT_EQ(fixture.port->dispatch_count(), 0U);
+    EXPECT_TRUE(fixture.reservations.snapshot().empty());
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, EndpointConflictRefusesEnableAfterGenuineCompletedPrepare) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  auto snapshot = Snapshot("endpoint.enable", ComponentLifecycleStateDTO::kDeclared,
+                           ComponentLifecycleGeneration(3U), catalog);
+  FakeSnapshotSource snapshots({snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(journal,
+      std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                              ComponentLifecycleStateDTO::kPrepared,
+                                              ComponentLifecycleStateDTO::kPrepared});
+  ReadinessHealthResolver resolver(port, catalog);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto prepared = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(prepared.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto prepared_status = coordinator.LoadLifecycleStatus(
+      prepared.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(prepared_status.ok());
+  ASSERT_TRUE(prepared_status.value());
+  ASSERT_EQ(prepared_status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  ASSERT_EQ(port->dispatch_count(), 1U);
+  snapshot.component_lifecycle_state = ComponentLifecycleStateDTO::kPrepared;
+  snapshot.component_lifecycle_generation = prepared.value().acceptance->component_lifecycle_generation;
+  snapshots.SetSnapshot(snapshot);
+  auto enable = PrepareIntent(coordinator.request_owner_epoch());
+  enable.request_context.request_id = RequestId("endpoint.enable");
+  enable.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  enable.expected_component_lifecycle_generation = snapshot.component_lifecycle_generation;
+  resolver.health_error = ErrorDTO{"duplicate_component_instance", "selected endpoint conflict", {}};
+  const auto accepted = coordinator.SubmitLifecycle(enable);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status = coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->code, "duplicate_component_instance");
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, EndpointConflictDoesNotBlockOrdinaryDisable) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots(OrdinaryDisableSnapshots());
+  FakeCatalogSource catalogs(DisableCatalog());
+  auto port = std::make_shared<FakeBrandPort>(journal,
+      std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive,
+                                              ComponentLifecycleStateDTO::kDisabled});
+  ReadinessHealthResolver resolver(port);
+  resolver.health_error = ErrorDTO{"duplicate_component_instance", "selected endpoint conflict", {}};
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted = coordinator.SubmitLifecycle(DisableIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status = coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_EQ(resolver.health_reads, 0U);
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessForwardsActivationStepWithoutChangingAdmission) {
+  GroupedReadinessFixture fixture;
+  for (const auto metadata : {std::optional<bool>{}, std::optional<bool>{false},
+                              std::optional<bool>{true}}) {
+    fixture.resolver.health.has_activation_step = metadata;
+    const auto read = fixture.Read();
+    ASSERT_TRUE(read.ok()) << read.error().message;
+    ASSERT_EQ(read.value().readiness.domains.size(), 1U);
+    const auto& row = read.value().readiness.domains.front();
+    EXPECT_EQ(row.has_activation_step, metadata);
+    EXPECT_TRUE(read.value().readiness.ready);
+    EXPECT_EQ(read.value().readiness.next_intent, ComponentLifecycleIntentKindDTO::kPrepare);
+    EXPECT_EQ(row.decision_kind, LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
+    EXPECT_EQ(row.health->facts, fixture.resolver.health.facts);
+  }
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessDoesNotUsePredecessorHealthWhenRouteSourceUnavailable) {
+  GroupedReadinessFixture fixture;
+  fixture.association_available = false;
+  const auto read = fixture.Read();
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_FALSE(read.value().readiness.ready);
+  ASSERT_TRUE(read.value().readiness.error);
+  EXPECT_EQ(read.value().readiness.error->code, "route_source_unavailable");
+  ASSERT_EQ(read.value().readiness.domains.size(), 1U);
+  EXPECT_FALSE(read.value().readiness.domains.front().health);
+  EXPECT_FALSE(read.value().readiness.domains.front().decision_kind);
+  EXPECT_EQ(fixture.resolver.health_reads, 0U);
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessRejectsRouteAssociationChangingDuringHealthRead) {
+  GroupedReadinessFixture fixture;
+  fixture.resolver.on_health_read = [&] { fixture.association_current = false; };
+  const auto read = fixture.Read();
+  ASSERT_FALSE(read.ok());
+  EXPECT_EQ(read.error().code, "route_source_changed");
+  EXPECT_EQ(fixture.validations, 2U);
+  EXPECT_EQ(fixture.resolver.health_reads, 1U);
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessRejectsRecoveryFactsChangingDuringRead) {
+  GroupedReadinessFixture fixture;
+  fixture.before_target_facts = [&] {
+    if (fixture.target_fact_reads == 2U) ++fixture.target_facts.facts.recovery_generation;
+  };
+  const auto read = fixture.Read();
+  ASSERT_FALSE(read.ok());
+  EXPECT_EQ(read.error().code, "component_lifecycle_facts_stale");
+  EXPECT_EQ(read.error().details.at("reason"), "component_read_changed");
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessDiagnosticDoesNotInventAnotherPlanPredicate) {
+  GroupedReadinessFixture fixture;
+  fixture.resolver.health.diagnostic = ErrorDTO{
+      "transport_note", "availability diagnostic", {{"reason", "availability"}}};
+  fixture.resolver.health.facts = {{LifecycleFactId(std::string(kLifecycleBlockingCauseFactId)),
+                                  TokenFactValue("availability")}};
+  const auto read = fixture.Read();
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_TRUE(read.value().readiness.ready);
+  ASSERT_TRUE(read.value().readiness.domains.front().health);
+  EXPECT_EQ(read.value().readiness.domains.front().health->diagnostic,
+            fixture.resolver.health.diagnostic);
+  EXPECT_FALSE(read.value().readiness.domains.front().error);
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator, GroupedReadinessHonorsActualRecoveredCauseWithoutClearingIt) {
+  GroupedReadinessFixture fixture;
+  fixture.resolver.health.facts = {{LifecycleFactId(std::string(kLifecycleBlockingCauseFactId)),
+                                  TokenFactValue("protective_stop")}};
+  const auto blocked = fixture.Read();
+  ASSERT_TRUE(blocked.ok()) << blocked.error().message;
+  EXPECT_FALSE(blocked.value().readiness.ready);
+  ASSERT_TRUE(blocked.value().readiness.error);
+  EXPECT_EQ(blocked.value().readiness.error->details.at("cause_class"), "protective_stop");
+  fixture.target_facts.facts.target = ComponentLifecycleTargetDTO{
+      ControllableComponentId("component.1"), LifecycleTargetStateDTO::kActive,
+      LifecycleTargetOriginDTO::kOperator, 1U, false,
+      LifecycleBlockingCauseClassDTO::kProtectiveStop};
+  const auto target_before = fixture.target_facts;
+  const auto allowed = fixture.Read();
+  ASSERT_TRUE(allowed.ok()) << allowed.error().message;
+  EXPECT_TRUE(allowed.value().readiness.ready);
+  EXPECT_EQ(fixture.target_facts, target_before);
+  fixture.ExpectNoExecutionEffects();
+}
+
+[[nodiscard]] ComponentLifecycleCurrentSnapshotDTO ExchangeSnapshot(
+    const ActiveBundlePublicationReceiptDTO& publication, std::uint64_t generation,
+    ComponentLifecycleStateDTO state = ComponentLifecycleStateDTO::kDeclared) {
+  auto snapshot = Snapshot("exchange.snapshot", state, ComponentLifecycleGeneration(generation));
+  snapshot.active_publication_receipt = publication;
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+  if (!digest.ok()) throw std::runtime_error(digest.error().message);
+  snapshot.snapshot_digest = digest.value();
+  return snapshot;
+}
+
+class ExchangeGenerationFixture final {
+ public:
+  ExchangeGenerationFixture()
+      : journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"), 8U),
+        boundary(journal),
+        previous(SeedFour()),
+        successor(NextProductPublication(previous)),
+        old_snapshots({ExchangeSnapshot(previous, 4U)}),
+        new_snapshots({ExchangeSnapshot(successor, 5U)}),
+        catalogs(PrepareCatalog()),
+        port(std::make_shared<FakeBrandPort>(
+            journal,
+            std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                    ComponentLifecycleStateDTO::kPrepared})),
+        resolver(port),
+        old_context(ProductContextFor(old_snapshots, catalogs, resolver, previous)),
+        new_context(ProductContextFor(new_snapshots, catalogs, resolver, successor)),
+        coordinator(Config(), boundary, reservations, old_context, kernel, clock, scheduler) {
+    clock.set(100);
+    const auto started = coordinator.Start();
+    if (!started.ok()) throw std::runtime_error(started.error().message);
+  }
+
+  void AdoptSuccessor() {
+    auto request = DeclaredNativeApplyPlanRequest();
+    request.apply =
+        std::get<NamedApplyPublicationTransactionDTO>(successor.request.transaction_ref);
+    request.candidate_retained_bundle_id = successor.request.candidate_retained_bundle_id;
+    request.candidate_graph_revision = successor.request.candidate_graph_revision;
+    const auto plan = journal.PlanNativeApply(request);
+    if (!plan.ok()) throw std::runtime_error(plan.error().message);
+    if (plan.value().components.front().generation != ComponentLifecycleGeneration(5U))
+      throw std::runtime_error("replacement did not reserve the genuine fifth generation");
+    const auto adopted = journal.AdoptNativeApplyFacts({successor, plan.value().components, {}});
+    if (!adopted.ok()) throw std::runtime_error(adopted.error().message);
+  }
+
+  auto Exchange() {
+    return coordinator.TryExchangeProductContext(old_context, new_context,
+                                                 coordinator.request_owner_epoch(), previous);
+  }
+  void ExpectOldProduct() {
+    const auto current = coordinator.AcquireProductPin();
+    ASSERT_TRUE(current.ok());
+    EXPECT_EQ(&current.value().context(), old_context.get());
+    EXPECT_EQ(port->dispatch_count(), 0U);
+  }
+
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal;
+  SettlementBarrierJournal boundary;
+  ActiveBundlePublicationReceiptDTO previous;
+  ActiveBundlePublicationReceiptDTO successor;
+  FakeSnapshotSource old_snapshots;
+  FakeSnapshotSource new_snapshots;
+  FakeCatalogSource catalogs;
+  std::shared_ptr<FakeBrandPort> port;
+  FakeResolver resolver;
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  CCLCDomainReservationTable reservations;
+  std::shared_ptr<const ComponentLifecycleProductContext> old_context;
+  std::shared_ptr<const ComponentLifecycleProductContext> new_context;
+  ComponentLifecycleCoordinator coordinator;
+
+ private:
+  ActiveBundlePublicationReceiptDTO SeedFour() {
+    auto publication = ActivePublication();
+    for (std::uint64_t generation = 1U; generation <= 4U; ++generation) {
+      publication = NextProductPublication(publication);
+      publication.request.transaction_ref = NamedApplyPublicationTransactionDTO{
+          ApplyId("seed.apply." + std::to_string(generation)), ApplyGeneration(generation)};
+      auto request = DeclaredNativeApplyPlanRequest();
+      request.apply =
+          std::get<NamedApplyPublicationTransactionDTO>(publication.request.transaction_ref);
+      const auto plan = journal.PlanNativeApply(request);
+      if (!plan.ok()) throw std::runtime_error(plan.error().message);
+      const auto adopted =
+          journal.AdoptNativeApplyFacts({publication, plan.value().components, {}});
+      if (!adopted.ok()) throw std::runtime_error(adopted.error().message);
+    }
+    return publication;
+  }
+};
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeSynchronizesAdoptedGenerationBeforePrepare) {
+  std::string stage = "construct durable generation fixture";
+  try {
+    ExchangeGenerationFixture fixture;
+    stage = "adopt successor";
+    fixture.AdoptSuccessor();
+    stage = "exchange";
+    const auto exchanged = fixture.Exchange();
+    ASSERT_TRUE(exchanged.ok()) << exchanged.error().message;
+    EXPECT_EQ(exchanged.value().phase, ComponentLifecycleProductExchangePhase::kCompleted);
+    const auto reads = fixture.new_snapshots.read_count();
+    stage = "replay";
+    ASSERT_TRUE(fixture.Exchange().ok());
+    EXPECT_EQ(fixture.new_snapshots.read_count(), reads);
+    auto intent = PrepareIntent(fixture.coordinator.request_owner_epoch());
+    intent.expected_component_lifecycle_generation = ComponentLifecycleGeneration(5U);
+    stage = "prepare generation five";
+    const auto prepared = fixture.coordinator.SubmitLifecycle(intent);
+    ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+    ASSERT_TRUE(prepared.value().acceptance);
+    EXPECT_EQ(prepared.value().acceptance->component_lifecycle_generation,
+              ComponentLifecycleGeneration(6U));
+    stage = "drain preparation";
+    EXPECT_TRUE(fixture.coordinator.DrainFor(std::chrono::seconds(2)));
+  } catch (const std::exception& error) {
+    FAIL() << stage << ": " << error.what();
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeRejectsSnapshotGenerationAndForeignScope) {
+  for (const unsigned variant : {0U, 1U, 2U, 3U}) {
+    SCOPED_TRACE(variant);
+    ExchangeGenerationFixture fixture;
+    fixture.AdoptSuccessor();
+    auto snapshot = ExchangeSnapshot(fixture.successor, variant == 0U ? 4U : 5U);
+    if (variant == 1U) snapshot.controllable_component_id = ControllableComponentId("foreign");
+    if (variant == 2U) snapshot.active_publication_receipt = fixture.previous;
+    if (variant == 3U) snapshot.snapshot_digest = ContentDigest(Sha('f'));
+    fixture.new_snapshots.SetSnapshot(std::move(snapshot));
+    EXPECT_FALSE(fixture.Exchange().ok());
+    fixture.ExpectOldProduct();
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeRefusesMissingAndLowerExistingFloor) {
+  for (const bool missing : {false, true}) {
+    SCOPED_TRACE(missing);
+    ExchangeGenerationFixture fixture;
+    fixture.AdoptSuccessor();
+    fixture.new_snapshots.SetSnapshot(ExchangeSnapshot(fixture.successor, 3U));
+    fixture.boundary.on_component_fact_read = [&](auto& fact) {
+      fact.durable_generation =
+          missing ? std::nullopt : std::optional(ComponentLifecycleGeneration(3U));
+      if (missing) fact.current_state.reset();
+    };
+    const auto refused = fixture.Exchange();
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "product_generation_floor_regressed");
+    fixture.ExpectOldProduct();
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeRefusesFactsChangingBeforeCommit) {
+  for (const bool change_snapshot : {false, true}) {
+    SCOPED_TRACE(change_snapshot);
+    ExchangeGenerationFixture fixture;
+    fixture.AdoptSuccessor();
+    unsigned reads = 0U;
+    fixture.boundary.on_component_fact_read = [&](auto& fact) {
+      if (++reads == 2U) {
+        if (change_snapshot)
+          fixture.new_snapshots.SetSnapshot(
+              ExchangeSnapshot(fixture.successor, 5U, ComponentLifecycleStateDTO::kPrepared));
+        else
+          fact.current_state = ComponentLifecycleStateDTO::kPrepared;
+      }
+    };
+    const auto refused = fixture.Exchange();
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "product_generation_proof_changed");
+    fixture.ExpectOldProduct();
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeRefusesOwnerClosingDuringGenerationProof) {
+  ExchangeGenerationFixture fixture;
+  fixture.AdoptSuccessor();
+  fixture.boundary.on_component_fact_read = [&](auto&) { fixture.coordinator.CloseAdmission(); };
+  EXPECT_FALSE(fixture.Exchange().ok());
+  fixture.ExpectOldProduct();
+}
+
+TEST(ComponentLifecycleCoordinator, ProductExchangeEmptyMembershipPreservesOutsideFloor) {
+  ExchangeGenerationFixture fixture;
+  // Remove through the genuine plan/adoption: no current component remains,
+  // while its durable generation floor must survive the empty product.
+  auto removal = DeclaredNativeApplyPlanRequest();
+  removal.apply =
+      std::get<NamedApplyPublicationTransactionDTO>(fixture.successor.request.transaction_ref);
+  removal.components.clear();
+  removal.removed_components = {ControllableComponentId("component.1")};
+  const auto plan = fixture.journal.PlanNativeApply(removal);
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  ASSERT_TRUE(fixture.journal.AdoptNativeApplyFacts({fixture.successor, {}, {}}).ok());
+  fixture.new_context =
+      std::make_shared<const ComponentLifecycleProductContext>(ComponentLifecycleProductContext{
+          fixture.new_snapshots, fixture.catalogs, fixture.resolver, std::nullopt, nullptr,
+          ComponentLifecycleProductIdentity{fixture.successor, {}}});
+  const auto exchanged = fixture.Exchange();
+  ASSERT_TRUE(exchanged.ok()) << exchanged.error().message;
+  EXPECT_EQ(fixture.new_snapshots.read_count(), 0U);
+  auto reintroduced = NextProductPublication(fixture.successor);
+  fixture.new_snapshots.SetSnapshot(ExchangeSnapshot(reintroduced, 3U));
+  fixture.boundary.on_component_fact_read = [](auto& fact) {
+    fact.durable_generation = ComponentLifecycleGeneration(3U);
+  };
+  const auto next =
+      ProductContextFor(fixture.new_snapshots, fixture.catalogs, fixture.resolver, reintroduced);
+  const auto refused = fixture.coordinator.TryExchangeProductContext(
+      fixture.new_context, next, fixture.coordinator.request_owner_epoch(), fixture.successor);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "product_generation_floor_regressed");
+}
+
 TEST(ComponentLifecycleCoordinator, ProductExchangeWaitsForWholePassAndWithdrawsForeignRequest) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
@@ -4478,12 +5526,14 @@ TEST(ComponentLifecycleCoordinator, ProductExchangePinsAdmissionRereadThroughDur
   auto original_acknowledgement = *replay.value().acceptance;
   original_acknowledgement.replay_status = accepted.value().acceptance->replay_status;
   EXPECT_EQ(original_acknowledgement, *accepted.value().acceptance);
+  new_snapshots.SetSnapshot(ExchangeSnapshot(new_context->identity->publication, 4U,
+                                             ComponentLifecycleStateDTO::kPrepared));
   const auto complete =
       coordinator.TryExchangeProductContext(old_context, new_context, owner, previous);
   ASSERT_TRUE(complete.ok()) << complete.error().message;
   EXPECT_EQ(complete.value().phase, ComponentLifecycleProductExchangePhase::kCompleted);
   EXPECT_EQ(port->dispatch_count(), 1U);
-  EXPECT_EQ(new_snapshots.read_count(), 0U);
+  EXPECT_EQ(new_snapshots.read_count(), 2U);
 }
 
 TEST(ComponentLifecycleCoordinator, ProductExchangeWaitsForAcceptedWorkerAfterAdmissionPinEnds) {
@@ -4547,6 +5597,8 @@ TEST(ComponentLifecycleCoordinator, ProductExchangeWaitsForAcceptedWorkerAfterAd
   }
   release.set_value();
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  snapshots.SetSnapshot(ExchangeSnapshot(new_context->identity->publication, 4U,
+                                         ComponentLifecycleStateDTO::kPrepared));
   const auto complete =
       coordinator.TryExchangeProductContext(old_context, new_context, owner, previous);
   ASSERT_TRUE(complete.ok()) << complete.error().message;
@@ -4775,6 +5827,8 @@ TEST(ComponentLifecycleCoordinator, ProductExchangeKeepsOneBoundFollowerPassAcro
   resume.set_value();
   EXPECT_TRUE(passed.get());
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  snapshots.SetSnapshot(ExchangeSnapshot(new_context->identity->publication, 4U,
+                                         ComponentLifecycleStateDTO::kPrepared));
   const auto complete =
       coordinator.TryExchangeProductContext(old_context, new_context, owner, previous);
   ASSERT_TRUE(complete.ok()) << complete.error().message;

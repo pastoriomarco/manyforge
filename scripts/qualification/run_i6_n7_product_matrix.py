@@ -499,7 +499,6 @@ def qualify_scenario(
                         "correlation_id": f"n7.{scenario_id}",
                         "expected_applied_record_digest": applied["source"]["record_digest"],
                         "draft_program_revision": program["program_revision"],
-                        "expected_admission_generation": admission["admission_generation"],
                         "request_id": f"n7.start.{scenario_id}",
                         "request_owner_epoch": "n7-product-matrix",
                         "source_document_digest": applied[

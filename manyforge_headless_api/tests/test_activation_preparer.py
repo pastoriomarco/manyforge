@@ -109,9 +109,9 @@ def _result(program: object = ...) -> dict[str, object]:
     if program is ...:
         program = copy.deepcopy(_admitted_program())
     identity: dict[str, object] = {
-        "schema_version": "manyforge.prepared_activation_input.v5",
-        "source_document_digest": _DIGEST,
-        "scenario_id": "scenario_a",
+        "schema_version": "manyforge.prepared_activation_input.v6",
+        "origin": {"kind": "scenario", "scenario_id": "scenario_a",
+                   "source_document_digest": _DIGEST},
         "captured_input_digest": _DIGEST,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": _DIGEST,
@@ -127,7 +127,7 @@ def _result(program: object = ...) -> dict[str, object]:
             else {"kind": "no_program"}
         ),
         "node_environment_digest": _DIGEST,
-        "assistant_mode": "forbidden",
+        "assistant_mode": "forbidden" if program is not None else "optional",
         "activation_payload": {
             "program": program,
             "raw_artifacts": [{"bytes": "YQ=="}],
@@ -233,7 +233,7 @@ def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
         )
     assert raised.value.code == "activation_preparation_failed"
     assert raised.value.details == {"preparer_detail": diagnostic[:4096]}
-    assert "scenario=scenario_a" in caplog.text
+    assert "origin_kind=scenario origin_id=scenario_a" in caplog.text
     assert f"input={_DIGEST}" in caplog.text
     assert diagnostic[:4096] in caplog.text
     assert diagnostic not in caplog.text
@@ -609,3 +609,109 @@ def test_preparer_refuses_a_program_payload_for_no_program(
         _prepare_with_result(preparer, monkeypatch, result)
 
     assert raised.value.code == "activation_preparer_response_invalid"
+
+
+def _sealed_selection() -> dict[str, str]:
+    return {"request_owner_epoch": "manager-actual", "cell_id": "cell_a",
+            "deployment_artifact_id": "cell_a", "deployment_revision": _DIGEST,
+            "candidate_retained_bundle_id": _DIGEST, "candidate_graph_revision": _DIGEST,
+            "admission_digest": "sha256:" + "2" * 64}
+
+
+def _sealed_result() -> dict[str, object]:
+    selection = _sealed_selection()
+    origin = {"kind": "sealed_canonical_empty", "cell_id": selection["cell_id"],
+              "deployment_artifact_id": selection["deployment_artifact_id"],
+              "deployment_revision": selection["deployment_revision"],
+              "retained_bundle_id": selection["candidate_retained_bundle_id"],
+              "graph_revision": selection["candidate_graph_revision"],
+              "admission_digest": selection["admission_digest"]}
+    value = _result(None)
+    value["origin"] = origin
+    value["captured_input_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps({
+        "schema_version": "manyforge.sealed_canonical_empty_capture.v1", "origin": origin,
+    })).hexdigest()
+    value["activation_payload"].update({"program_binding": None,
+                                      "program_role_assignment": {"component_roles": [], "target_roles": []}})
+    return _reidentified(value)
+
+
+def test_sealed_preparation_uses_actual_package_and_shared_worker_cache(tmp_path, monkeypatch) -> None:
+    preparer = _preparer(tmp_path)
+    preparer._canonical_empty_package_root = tmp_path / "actual-manager-package"
+    preparer._canonical_empty_admission_filename = Path("actual-admission.json")
+    observed = {}
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        observed["input"] = json.loads(Path(command[command.index("--input") + 1]).read_bytes())
+        kwargs["stdout"].write(_publish(tmp_path / "artifacts", _sealed_result()))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    receipt = preparer.prepare_canonical_empty(_sealed_selection())
+    assert observed["input"] == {
+        "schema_version": "manyforge.sealed_canonical_empty_preparation_request.v1",
+        "runtime_cell_id": "cell_a", "origin": _sealed_result()["origin"],
+        "captured_input_digest": _sealed_result()["captured_input_digest"],
+    }
+    assert "scenario_id" not in receipt and "source_document_digest" not in receipt
+    command = observed["command"]
+    assert command[command.index("--canonical-empty-package-root") + 1] == str(tmp_path / "actual-manager-package")
+    assert command[command.index("--canonical-empty-admission-filename") + 1] == "actual-admission.json"
+    assert "--publish-canonical-empty" not in command
+    assert preparer.prepared_value(receipt["prepared_activation_id"]) == receipt
+    assert not list(tmp_path.glob("activation-preparation-*.json"))
+    preparer._lock.acquire()
+    try:
+        with pytest.raises(HeadlessApiError) as busy:
+            preparer.prepare_canonical_empty(_sealed_selection())
+        assert busy.value.code == "activation_preparer_busy"
+    finally:
+        preparer._lock.release()
+
+
+def test_sealed_preparation_without_actual_admission_configuration_is_unavailable(tmp_path, monkeypatch) -> None:
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("missing configured admission must not invoke worker")
+    monkeypatch.setattr(subprocess, "run", unexpected)
+    with pytest.raises(HeadlessApiError) as error:
+        _preparer(tmp_path).prepare_canonical_empty(_sealed_selection())
+    assert error.value.code == "canonical_empty_preparation_unavailable"
+
+
+@pytest.mark.parametrize("field,value", [("program", {"program_id": "fake"}),
+    ("program_binding", {}), ("program_role_assignment", {"component_roles": ["fake"], "target_roles": []})])
+def test_sealed_stored_product_rejects_program_facts(field, value) -> None:
+    product = _sealed_result()
+    product["activation_payload"][field] = value
+    product = _reidentified(product)
+    with pytest.raises(HeadlessApiError) as error:
+        activation_preparer._require_stored_product(_receipt(product), rfc8785.dumps(product))
+    assert error.value.code == "activation_preparer_response_invalid"
+
+
+def test_ordinary_worker_receipt_preserves_existing_json_member_semantics(tmp_path, monkeypatch) -> None:
+    preparer = _preparer(tmp_path)
+    product = _result()
+    output = _publish(tmp_path / "artifacts", product)
+    # Existing JSON parsing keeps the final member; stored canonical bytes and
+    # their exact content identity are still checked independently.
+    output = b'{"schema_version":"superseded",' + output[1:]
+    assert _prepare_with_output(preparer, monkeypatch, output) == _receipt(product)
+
+
+def test_sealed_worker_receipt_must_match_actual_selection(tmp_path, monkeypatch) -> None:
+    preparer = _preparer(tmp_path)
+    preparer._canonical_empty_package_root = tmp_path / "actual-manager-package"
+    preparer._canonical_empty_admission_filename = Path("actual-admission.json")
+    def run(_command, **kwargs):
+        product = _sealed_result()
+        product["origin"]["admission_digest"] = "sha256:" + "e" * 64
+        kwargs["stdout"].write(_publish(tmp_path / "artifacts", _reidentified(product)))
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(HeadlessApiError) as error:
+        preparer.prepare_canonical_empty(_sealed_selection())
+    assert error.value.code == "activation_preparer_response_invalid"
+    assert not preparer._prepared

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run ROS adapter tests in the ROS Jazzy image.
+# Run ROS adapter tests in the official full ROS Lyrical image.
 #
 # Intended usage:
 #   docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
-ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+ROS_DISTRO="${ROS_DISTRO:-lyrical}"
 
 if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     # shellcheck disable=SC1090

@@ -733,7 +733,7 @@ ROS_INTEGRATION_DATA_OVERLAY=/opt/manyforge/xarm_description/install
 source_ros_integration_environment() {
     set +u
     # shellcheck disable=SC1090
-    source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+    source "/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"
     # shellcheck disable=SC1091
     source "$ROS_INTEGRATION_TOPIC_INSTALL/setup.bash"
     # shellcheck disable=SC1091

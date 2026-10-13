@@ -1,16 +1,19 @@
 #include "manyforge_component_manager/selected_bundle_transition.hpp"
 #include "manyforge_component_manager/selected_runtime_composition.hpp"
 
+#include "selected_runtime_composition_rpc_internal.hpp"
+
 #include <algorithm>
 #include <limits>
-#include <sys/types.h>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_deployment/artifact_codec.hpp>
-#include <stdexcept>
-#include <variant>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+#include <stdexcept>
+#include <sys/types.h>
+#include <tuple>
+#include <variant>
 
 namespace manyforge::component_manager {
 namespace {
@@ -26,6 +29,98 @@ bool ObserverSourceIdentityIsValid(const std::string_view source_id,
 }
 
 }  // namespace
+
+bool ManagerComponentProcessStopRequestDTO::valid() const noexcept {
+  using namespace manyforge::core;
+  const auto identity = [](const auto &value) {
+    return !value.empty() && value.value().size() <= kMaxLifecycleIdentityBytes;
+  };
+  return identity(request_context.request_id) && identity(request_context.request_owner_epoch) &&
+         !request_context.source_label.empty() &&
+         request_context.source_label.size() <= kMaxLifecycleRequestLabelBytes &&
+         (!request_context.correlation_id ||
+          (!request_context.correlation_id->empty() &&
+           request_context.correlation_id->size() <= kMaxLifecycleRequestLabelBytes)) &&
+         predecessor_projection_revision.valid() &&
+         expected_predecessor_publication_generation.nonzero() &&
+         IsExactLowercaseSha256Digest(expected_predecessor_public_pointer_digest.value()) &&
+         identity(runtime_unit_id) && identity(runtime_epoch) && identity(manager_runtime_epoch) &&
+         identity(controllable_component_id) && !launch_identity.empty() &&
+         launch_identity.size() <= detail::kMaximumSelectedRuntimeCompositionRpcPacketBytes && leader_pid > 0;
+}
+
+bool ManagerComponentProcessStopResultDTO::valid() const noexcept {
+  using namespace manyforge::core;
+  if (!request.valid() ||
+      !(state == ControllerLaunchCleanupState::kNotRequested ||
+        state == ControllerLaunchCleanupState::kPending ||
+        state == ControllerLaunchCleanupState::kUnknown ||
+        state == ControllerLaunchCleanupState::kDrained)) return false;
+  if (state != ControllerLaunchCleanupState::kDrained) return !receipt;
+  return receipt && !error && receipt->leader_pid == request.leader_pid &&
+         receipt->controllable_component_id == request.controllable_component_id.value() &&
+         receipt->launch_identity == request.launch_identity && !receipt->observed_utc.empty() &&
+         receipt->observed_utc.size() <= kMaxLifecycleIdentityBytes;
+}
+
+bool ManagerComponentProcessInventoryRequestDTO::valid() const noexcept {
+  using namespace manyforge::core;
+  const auto identity = [](const auto &value) {
+    return !value.empty() && value.value().size() <= kMaxLifecycleIdentityBytes;
+  };
+  return predecessor_projection_revision.valid() &&
+         expected_predecessor_publication_generation.nonzero() &&
+         IsExactLowercaseSha256Digest(
+             expected_predecessor_public_pointer_digest.value()) &&
+         identity(runtime_unit_id) && identity(runtime_epoch) &&
+         identity(manager_runtime_epoch);
+}
+
+bool ManagerComponentProcessOccurrenceDTO::valid() const noexcept {
+  using namespace manyforge::core;
+  if (controllable_component_id.empty() ||
+      controllable_component_id.value().size() > kMaxLifecycleIdentityBytes ||
+      launch_identity.empty() ||
+      launch_identity.size() > detail::kMaximumSelectedRuntimeCompositionRpcPacketBytes || leader_pid <= 0 ||
+      (process_presence != ProcessPresenceState::kUnknown &&
+       process_presence != ProcessPresenceState::kAbsent &&
+       process_presence != ProcessPresenceState::kPresent) ||
+      (cleanup_state != ControllerLaunchCleanupState::kNotRequested &&
+       cleanup_state != ControllerLaunchCleanupState::kPending &&
+       cleanup_state != ControllerLaunchCleanupState::kUnknown &&
+       cleanup_state != ControllerLaunchCleanupState::kDrained) ||
+      (installed_runtime_identity &&
+       !IsExactLowercaseSha256Digest(installed_runtime_identity->value())))
+    return false;
+  if (cleanup_state != ControllerLaunchCleanupState::kDrained)
+    return !receipt;
+  if (process_presence == ProcessPresenceState::kPresent)
+    return false;
+  return receipt && receipt->leader_pid == leader_pid &&
+         receipt->controllable_component_id ==
+             controllable_component_id.value() &&
+         receipt->launch_identity == launch_identity &&
+         !receipt->observed_utc.empty() &&
+         receipt->observed_utc.size() <= kMaxLifecycleIdentityBytes;
+}
+
+bool ManagerComponentProcessInventoryResultDTO::valid() const noexcept {
+  if (!request.valid() ||
+      process_occurrences.size() > kMaximumComponentProcessInventoryEntries ||
+      !std::all_of(process_occurrences.begin(), process_occurrences.end(),
+                   [](const auto &row) { return row.valid(); }))
+    return false;
+  const auto key = [](const auto &row) {
+    return std::tie(row.controllable_component_id, row.launch_identity,
+                    row.leader_pid);
+  };
+  if (std::adjacent_find(process_occurrences.begin(), process_occurrences.end(),
+                         [&](const auto &a, const auto &b) {
+                           return !(key(a) < key(b));
+                         }) != process_occurrences.end())
+    return false;
+  return !error || (!error->code.empty() && !error->message.empty());
+}
 
 bool ManagerComponentBringUpInspectionRequestDTO::valid() const noexcept {
   return candidate_projection_revision.valid() && predecessor_projection_revision.valid() &&
@@ -220,10 +315,7 @@ bool ManagerRuntimeComponentReceiptDTO::valid() const noexcept {
                        return !epoch.runtime_unit_id.empty() &&
                               !epoch.runtime_epoch.empty();
                      }) &&
-         predecessor_runtime_retained ==
-             (disposition == ApplyComponentDisposition::kRetain) &&
-         (disposition == ApplyComponentDisposition::kRetain ||
-          !product_binding_resealed);
+         (predecessor_runtime_retained || !product_binding_resealed);
 }
 
 bool ComponentReceiptsMatchRequest(
@@ -247,14 +339,15 @@ bool ComponentReceiptsMatchRequest(
     if (!receipt.valid() ||
         receipt.controllable_component_id != change.controllable_component_id ||
         receipt.disposition != change.disposition ||
-        receipt.installed_runtime_identity != change.candidate_runtime_identity ||
+        receipt.installed_runtime_identity !=
+            change.candidate_runtime_identity ||
         // The sole managed native host owns every component runtime (N7):
         // each receipt names exactly that runtime unit at the request's
         // epoch, never a stale, foreign or additional owner.
         receipt.runtime_unit_epochs !=
             std::vector<manyforge::core::RuntimeUnitEpochBindingDTO>{
                 {request.runtime_unit_id, request.runtime_epoch}} ||
-        (change.disposition == ApplyComponentDisposition::kRetain &&
+        (receipt.predecessor_runtime_retained &&
          receipt.product_binding_resealed != product_changed)) {
       return false;
     }

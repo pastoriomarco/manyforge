@@ -735,7 +735,10 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
     const std::uint64_t expected_operation_resource_generation,
     const std::vector<core::DomainActiveControlConfigurationDTO>
         &expected_active_control_configurations,
-    const std::function<void()> &commit_durable_fence) {
+    const std::function<void()> &commit_durable_fence,
+    const std::function<void(const core::ConfigurationFenceId &,
+                             const core::ConfigurationFenceScopeDTO &)>
+        &validate_terminal_overlap) {
   Require(!fence_id.empty() && scope.valid(),
           "fence acquisition identity or scope is invalid");
   ValidateConfigurations(expected_active_control_configurations);
@@ -757,11 +760,15 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
   Require(SelectConfigurations(observation.active_control_configurations, scope,
                                false) == expected_active_control_configurations,
           "active control configuration changed before fence acquisition");
-  Require(
-      std::none_of(
-          held_fences_.begin(), held_fences_.end(),
-          [&](const auto &held) { return ScopesOverlap(held.scope, scope); }),
-      "an overlapping configuration fence already closes operation admission");
+  for (const auto &held : held_fences_) {
+    if (!ScopesOverlap(held.scope, scope))
+      continue;
+    Require(held.active_effect_count == 0U &&
+                static_cast<bool>(validate_terminal_overlap),
+            "an overlapping configuration fence already closes operation "
+            "admission");
+    validate_terminal_overlap(held.fence_id, held.scope);
+  }
   held_fences_.push_back({fence_id, scope});
   // Keep the same admission mutex held through the durable transaction. A
   // future operation-admission join therefore either precedes this fence or
@@ -969,7 +976,9 @@ public:
   }
 
   [[nodiscard]] core::ConfigurationFenceAcceptedDTO
-  Acquire(const core::ApplyConfigurationFenceIntentDTO &intent) {
+  Acquire(const core::ApplyConfigurationFenceIntentDTO &intent,
+          const ManagedTerminalApplyFenceValidator &validate_terminal_overlap =
+              {}) {
     std::lock_guard lock(mutex_);
     Require(intent.valid(), "Apply-fence intent is invalid");
     const auto intent_bytes = EncodeRequest(intent);
@@ -1027,7 +1036,8 @@ public:
     admission_gate_.AcquireFenceDurably(
         accepted.configuration_fence_id, accepted.captured_scope,
         intent.expected_operation_resource_generation,
-        intent.expected_active_control_configurations, [&] {
+        intent.expected_active_control_configurations,
+        [&] {
           Transaction transaction(database_);
           Statement insert(
               database_,
@@ -1059,7 +1069,42 @@ public:
                       sqlite3_changes(database_) == 1,
                   "durable fence-generation compare-and-swap failed");
           transaction.Commit();
-        });
+        },
+        validate_terminal_overlap
+            ? std::function<void(const core::ConfigurationFenceId &,
+                                 const core::ConfigurationFenceScopeDTO
+                                     &)>{[&](const auto &id,
+                                             const auto &scope) {
+                Statement statement(
+                    database_,
+                    "SELECT owner_kind,intent_blob,accepted_blob,state,"
+                    "release_request_blob,release_receipt_blob "
+                    "FROM kernel_apply_fences WHERE fence_id=?");
+                statement.Text(1, id.value());
+                const auto old = ReadOptionalRow(statement);
+                Require(
+                    old && old->state == 0 &&
+                        old->owner_kind == DurableFenceOwnerKind::kApply,
+                    "overlapping barrier is not an ordinary held Apply fence");
+                const auto old_intent =
+                    DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
+                        old->intent_bytes);
+                const auto old_accepted =
+                    DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+                        old->accepted_bytes);
+                Require(old_accepted.matches(old_intent) &&
+                            old_accepted.configuration_fence_id == id &&
+                            old_accepted.captured_scope == scope,
+                        "overlapping Apply fence differs from its durable "
+                        "exact scope");
+                const auto validated =
+                    validate_terminal_overlap(old_intent, old_accepted);
+                if (!validated.ok())
+                  Fail(validated.error().code + ": " +
+                       validated.error().message);
+              }}
+            : std::function<void(const core::ConfigurationFenceId &,
+                                 const core::ConfigurationFenceScopeDTO &)>{});
     return accepted;
   }
 
@@ -2710,6 +2755,12 @@ ManagedKernelApplyFenceOwner::ObserveAdmission(
 core::ConfigurationFenceAcceptedDTO ManagedKernelApplyFenceOwner::Acquire(
     const core::ApplyConfigurationFenceIntentDTO &intent) {
   return impl_->Acquire(intent);
+}
+
+core::ConfigurationFenceAcceptedDTO ManagedKernelApplyFenceOwner::Acquire(
+    const core::ApplyConfigurationFenceIntentDTO &intent,
+    const ManagedTerminalApplyFenceValidator &validate_terminal_overlap) {
+  return impl_->Acquire(intent, validate_terminal_overlap);
 }
 
 core::ApplyFenceAcquireAttemptReconcileResultDTO

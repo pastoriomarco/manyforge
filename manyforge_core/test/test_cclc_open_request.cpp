@@ -122,6 +122,12 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
         {"missing_reference", "component snapshot is absent", {}});
   }
 
+  Result<CCLCComponentReadDTO> ReadCurrentComponentView(
+      const ControllableComponentId& component_id) const override {
+    const auto result = ReadCurrentComponent(component_id);
+    return Result<CCLCComponentReadDTO>::Err(result.error());
+  }
+
   Result<CCLCRouteSelectionTemplateSetDTO> ReadRouteSelectionTemplates(
       const ControllableComponentId& component_id) const override {
     route_template_component_id = component_id;
@@ -147,6 +153,39 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
     route_result_intent = intent;
     return Result<std::optional<CCLCRouteSelectionRequestResultDTO>>::Ok(std::nullopt);
   }
+
+  Result<CCLCLifecycleTargetRetirementOfferDTO> ReadLifecycleTargetRetirementOffer() override {
+    return Result<CCLCLifecycleTargetRetirementOfferDTO>::Ok({retirement_scope, retirement_rows});
+  }
+  Result<CCLCLifecycleTargetRetirementResultDTO> RetireLifecycleTargetsForClose(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) override {
+    ++retirement_writes;
+    retirement_request = intent;
+    return Result<CCLCLifecycleTargetRetirementResultDTO>::Ok(
+        {RequestReplayStatusDTO::kAcceptedNew, intent.scope, intent.expected_targets, intent.request_context});
+  }
+  Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>> ReadLifecycleTargetRetirementResult(
+      const CCLCLifecycleTargetRetirementIntentDTO& intent) override {
+    retirement_read = intent;
+    return Result<std::optional<CCLCLifecycleTargetRetirementResultDTO>>::Ok(std::nullopt);
+  }
+  Result<void> ReadLifecycleOwnerSettlement(const CCLCLifecycleTargetRetirementScopeDTO& scope) override {
+    settlement_scope = scope;
+    if (settlement_unknown)
+      return Result<void>::Err({"cclc_owner_unsettled", "actual owner settlement is unavailable", {}});
+    return Result<void>::Ok();
+  }
+  CCLCLifecycleTargetRetirementScopeDTO retirement_scope{
+      RequestOwnerEpoch("client.epoch.1"), ActiveBundlePublicationGeneration(7U),
+      ContentDigest("sha256:" + std::string(64U, 'a'))};
+  std::vector<ComponentLifecycleTargetDTO> retirement_rows{
+      {ControllableComponentId("component.arm"), LifecycleTargetStateDTO::kActive,
+       LifecycleTargetOriginDTO::kOperator, 5U, false, LifecycleBlockingCauseClassDTO::kFault}};
+  int retirement_writes{};
+  bool settlement_unknown{true};
+  std::optional<CCLCLifecycleTargetRetirementIntentDTO> retirement_request;
+  std::optional<CCLCLifecycleTargetRetirementIntentDTO> retirement_read;
+  std::optional<CCLCLifecycleTargetRetirementScopeDTO> settlement_scope;
 
   std::optional<ComponentLifecycleIntentDTO> lifecycle_intent;
   std::optional<RouteSelectionIntentDTO> route_intent;
@@ -186,6 +225,35 @@ TEST(CCLCOpenRequest, StampsTransportAttributionAndPreservesLifecycleReplayResul
   EXPECT_EQ(Member(response, "command").as_string(), "lifecycle_submit");
   EXPECT_EQ(Member(Member(response, "result"), "replay_status").as_string(), "request_id_conflict");
   EXPECT_TRUE(Member(Member(response, "result"), "acceptance").is_null());
+}
+
+TEST(CCLCOpenRequest, CloseRecoveryIsClosedTypedAndCannotAliasOrdinaryRecover) {
+  FakeOpenPort port;
+  auto fields = LifecycleIntentValue().as_object();
+  for (auto& [name, value] : fields) {
+    if (name == "intent") value = CanonicalValue("recover");
+    if (name == "reason") value = CanonicalValue("cell closed by operator");
+  }
+  fields.emplace_back("close_incident_recovery", CanonicalValue(CanonicalValue::Object{
+      {"expected_incident_id", CanonicalValue("incident.exact")}}));
+  const auto encoded = Request("lifecycle_submit", CanonicalValue(fields));
+  const auto submitted = ExecuteCanonicalCCLCOpenRequest(encoded, port, {});
+  ASSERT_TRUE(submitted.ok());
+  ASSERT_TRUE(port.lifecycle_intent);
+  ASSERT_TRUE(port.lifecycle_intent->close_incident_recovery);
+  EXPECT_EQ(port.lifecycle_intent->close_incident_recovery->expected_incident_id, "incident.exact");
+  port.lifecycle_intent.reset();
+  for (auto& [name, value] : fields) {
+    if (name == "close_incident_recovery")
+      value = CanonicalValue(CanonicalValue::Object{
+          {"expected_incident_id", CanonicalValue("incident.exact")},
+          {"ordinary_fallback", CanonicalValue(true)}});
+  }
+  const auto refused = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_submit", CanonicalValue(fields)), port, {});
+  ASSERT_TRUE(refused.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(refused.value()), "ok").as_bool());
+  EXPECT_FALSE(port.lifecycle_intent);
 }
 
 TEST(CCLCOpenRequest, PreservesCompleteRouteIntentAndReturnsBoundedAdmissionFact) {
@@ -305,6 +373,17 @@ TEST(CCLCOpenRequest, RejectsNoncanonicalUnknownAndPayloadAttributionFields) {
   return snapshot;
 }
 
+[[nodiscard]] ComponentLifecycleReadinessDTO UnavailableReadiness(
+    const ComponentLifecycleCurrentSnapshotDTO& snapshot) {
+  const ErrorDTO unavailable{"cclc_product_read_unavailable", "test source has no qualified health", {}};
+  ComponentLifecycleReadinessDTO value{RequestOwnerEpoch("owner"), 42,
+      ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleStateDTO::kPrepared,
+      false, unavailable, {}, {std::nullopt, std::nullopt, unavailable}};
+  for (const auto& occurrence : snapshot.provider_occurrences)
+    value.domains.push_back({occurrence, std::nullopt, std::nullopt, unavailable});
+  return value;
+}
+
 class TargetViewPort final : public ICCLCOpenRequestPort {
  public:
   RequestOwnerEpoch ReadRequestOwnerEpoch() const override { return RequestOwnerEpoch("owner"); }
@@ -318,7 +397,18 @@ class TargetViewPort final : public ICCLCOpenRequestPort {
   }
   Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId&) const override {
-    return Result<ComponentLifecycleCurrentSnapshotDTO>::Ok(VerifiedSnapshot());
+    ++legacy_component_reads;
+    auto snapshot = VerifiedSnapshot();
+    if (mutate_snapshot) mutate_snapshot(snapshot);
+    return Result<ComponentLifecycleCurrentSnapshotDTO>::Ok(std::move(snapshot));
+  }
+  Result<CCLCComponentReadDTO> ReadCurrentComponentView(
+      const ControllableComponentId&) const override {
+    ++grouped_reads;
+    auto snapshot = VerifiedSnapshot();
+    CCLCComponentReadDTO result{snapshot, view, UnavailableReadiness(snapshot)};
+    if (mutate_read) mutate_read(result);
+    return Result<CCLCComponentReadDTO>::Ok(std::move(result));
   }
   Result<std::vector<ComponentIncidentEventDTO>> ReadIncidentEvents(
       std::uint64_t after, std::size_t limit) override {
@@ -330,6 +420,7 @@ class TargetViewPort final : public ICCLCOpenRequestPort {
   }
   Result<ComponentLifecycleTargetViewDTO> ReadLifecycleTargetView(
       const ControllableComponentId&) const override {
+    ++legacy_target_reads;
     return Result<ComponentLifecycleTargetViewDTO>::Ok(view);
   }
   Result<CCLCRouteSelectionTemplateSetDTO> ReadRouteSelectionTemplates(
@@ -346,6 +437,11 @@ class TargetViewPort final : public ICCLCOpenRequestPort {
     return Result<std::optional<RouteSelectionStatusDTO>>::Ok(std::nullopt);
   }
 
+  mutable std::size_t grouped_reads{};
+  mutable std::size_t legacy_component_reads{};
+  mutable std::size_t legacy_target_reads{};
+  std::function<void(CCLCComponentReadDTO&)> mutate_read;
+  std::function<void(ComponentLifecycleCurrentSnapshotDTO&)> mutate_snapshot;
   ComponentLifecycleTargetViewDTO view;
   std::optional<CCLCLifecycleRequestResultDTO> submit_result;
   std::vector<ComponentIncidentEventDTO> events;
@@ -361,6 +457,170 @@ class TargetViewPort final : public ICCLCOpenRequestPort {
   const auto response = content_identity::parse_canonical_json(result.value());
   if (!Member(response, "ok").as_bool()) throw std::logic_error(result.value());
   return Member(response, "result");
+}
+
+[[nodiscard]] LifecycleDomainHealthDTO WireHealth() {
+  return {ComponentLifecycleStateDTO::kPrepared,
+          {{LifecycleFactId("boolean"), {LifecycleFactValueKindDTO::kBoolean, true, std::nullopt, std::nullopt}},
+           {LifecycleFactId("integer"), {LifecycleFactValueKindDTO::kInteger, std::nullopt, 9007199254740991LL, std::nullopt}},
+           {LifecycleFactId("token"), {LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt, "automatic"}},
+           {LifecycleFactId("unknown"), {LifecycleFactValueKindDTO::kUnknown, std::nullopt, std::nullopt, std::nullopt}}},
+          std::nullopt};
+}
+
+void MakeReady(CCLCComponentReadDTO& value) {
+  value.readiness.ready = true;
+  value.readiness.error.reset();
+  value.readiness.measured_state = {true, true, std::nullopt};
+  for (auto& domain : value.readiness.domains) {
+    domain.health = WireHealth();
+    domain.decision_kind = LifecycleDomainPlanDecisionKind::kAlreadySatisfied;
+    domain.error.reset();
+  }
+}
+
+TEST(CCLCOpenRequest, ReadinessUsesOneGroupedReadAndDoesNotAlterVerifiedSnapshotIdentity) {
+  TargetViewPort port;
+  const auto first = SnapshotResult(port);
+  EXPECT_EQ(port.grouped_reads, 1U);
+  EXPECT_EQ(port.legacy_component_reads, 0U);
+  EXPECT_EQ(port.legacy_target_reads, 0U);
+  const auto& unavailable = Member(first, "readiness");
+  EXPECT_EQ(unavailable.as_object().size(), 8U);
+  EXPECT_FALSE(Member(unavailable, "ready").as_bool());
+  EXPECT_EQ(Member(unavailable, "next_intent").as_string(), "prepare");
+  EXPECT_EQ(Member(unavailable, "requested_state").as_string(), "prepared");
+  EXPECT_EQ(Member(unavailable, "request_owner_epoch").as_string(), "owner");
+  const auto digest = Member(first, "snapshot_digest").as_string();
+  port.mutate_read = MakeReady;
+  const auto ready = SnapshotResult(port);
+  EXPECT_EQ(Member(ready, "snapshot_digest").as_string(), digest);
+  EXPECT_TRUE(Member(Member(ready, "readiness"), "ready").as_bool());
+  EXPECT_EQ(port.grouped_reads, 2U);
+  EXPECT_EQ(port.legacy_component_reads, 0U);
+  EXPECT_EQ(port.legacy_target_reads, 0U);
+}
+
+TEST(CCLCOpenRequest, ReadinessActivationStepIsOptionalBooleanOutsideHealthFacts) {
+  TargetViewPort port;
+  for (const auto metadata : {std::optional<bool>{}, std::optional<bool>{false},
+                              std::optional<bool>{true}}) {
+    port.mutate_read = [metadata](CCLCComponentReadDTO& value) {
+      MakeReady(value);
+      value.readiness.domains.front().has_activation_step = metadata;
+      value.readiness.domains.front().health->has_activation_step = metadata;
+    };
+    const auto result = SnapshotResult(port);
+    const auto& readiness = Member(result, "readiness");
+    const auto& row = Member(readiness, "domains").as_array().front();
+    EXPECT_TRUE(Member(readiness, "ready").as_bool());
+    EXPECT_EQ(row.as_object().size(), metadata.has_value() ? 5U : 4U);
+    if (metadata.has_value()) {
+      EXPECT_EQ(Member(row, "has_activation_step").as_bool(), *metadata);
+    }
+    EXPECT_EQ(Member(row, "health").as_object().size(), 3U);
+    EXPECT_EQ(Member(Member(row, "health"), "facts").as_array().size(), 4U);
+  }
+}
+
+TEST(CCLCOpenRequest, ReadinessPreservesTaggedHealthFactsAndFullWidthEvaluationTime) {
+  TargetViewPort port;
+  port.mutate_read = [](CCLCComponentReadDTO& value) {
+    MakeReady(value);
+    value.readiness.evaluated_at_ns = std::numeric_limits<std::int64_t>::max();
+  };
+  const auto result = SnapshotResult(port);
+  const auto& readiness = Member(result, "readiness");
+  EXPECT_EQ(Member(readiness, "evaluated_at_ns").as_string(), "9223372036854775807");
+  const auto& row = Member(readiness, "domains").as_array().front();
+  EXPECT_EQ(Member(row, "provider_occurrence").as_object().size(), 8U);
+  EXPECT_EQ(Member(row, "decision_kind").as_string(), "already_satisfied");
+  const auto& health = Member(row, "health");
+  EXPECT_EQ(Member(health, "observed_state").as_string(), "prepared");
+  const auto& facts = Member(health, "facts").as_array();
+  ASSERT_EQ(facts.size(), 4U);
+  EXPECT_TRUE(Member(Member(facts[0], "value"), "boolean_value").as_bool());
+  EXPECT_EQ(content_identity::canonical_json(Member(Member(facts[1], "value"), "integer_value")),
+            "9007199254740991");
+  EXPECT_EQ(Member(Member(facts[2], "value"), "token_value").as_string(), "automatic");
+  EXPECT_EQ(Member(facts[3], "value").as_object().size(), 1U);
+  port.mutate_read = [](CCLCComponentReadDTO& value) {
+    MakeReady(value);
+    value.readiness.domains.front().health->facts[1].value.integer_value = 9007199254740992LL;
+  };
+  EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+}
+
+TEST(CCLCOpenRequest, ReadinessKeepsGeneralErrorsFullWhileHealthDiagnosticUsesLifecycleBound) {
+  TargetViewPort port;
+  ErrorDTO source_error{"measured_source_unavailable", "actual source error", {}};
+  for (int i = 0; i < 64; ++i) source_error.details.emplace("source." + std::to_string(i), "actual");
+  port.mutate_read = [&](CCLCComponentReadDTO& value) {
+    value.readiness.error = source_error;
+    value.readiness.measured_state = {true, false, source_error};
+    auto& row = value.readiness.domains.front();
+    row.error = source_error;
+    row.health = WireHealth();
+    row.health->diagnostic = ErrorDTO{"source_availability", "actual lifecycle diagnostic", {}};
+    for (int i = 0; i < 8; ++i) row.health->diagnostic->details.emplace("fact." + std::to_string(i), "known");
+  };
+  const auto result = SnapshotResult(port);
+  const auto& readiness = Member(result, "readiness");
+  EXPECT_EQ(Member(Member(readiness, "error"), "details").as_object().size(), 64U);
+  EXPECT_EQ(Member(Member(Member(readiness, "measured_state"), "error"), "details").as_object().size(), 64U);
+  const auto& row = Member(readiness, "domains").as_array().front();
+  EXPECT_EQ(Member(Member(row, "error"), "details").as_object().size(), 64U);
+  EXPECT_EQ(Member(Member(Member(row, "health"), "diagnostic"), "details").as_object().size(), 8U);
+  source_error.details.emplace("source.extra", "actual");
+  EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+  source_error.details.erase("source.extra");
+  port.mutate_read = [](CCLCComponentReadDTO& value) {
+    auto& row = value.readiness.domains.front();
+    row.health = WireHealth();
+    row.health->diagnostic = ErrorDTO{"source_availability", "actual diagnostic", {}};
+    for (int i = 0; i < 9; ++i) row.health->diagnostic->details.emplace("fact." + std::to_string(i), "known");
+  };
+  EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+}
+
+TEST(CCLCOpenRequest, ActiveReadinessHasNoActivationIntentOrInventedDecision) {
+  TargetViewPort port;
+  port.mutate_read = [](CCLCComponentReadDTO& value) {
+    value.snapshot.component_lifecycle_state = ComponentLifecycleStateDTO::kActive;
+    value.snapshot.snapshot_digest = ComputeComponentLifecycleCurrentSnapshotDigest(value.snapshot).value();
+    MakeReady(value);
+    value.readiness.next_intent.reset();
+    value.readiness.requested_state.reset();
+    value.readiness.domains.front().decision_kind.reset();
+    value.readiness.domains.front().health->observed_state = ComponentLifecycleStateDTO::kActive;
+  };
+  const auto result = SnapshotResult(port);
+  const auto& readiness = Member(result, "readiness");
+  EXPECT_TRUE(Member(readiness, "ready").as_bool());
+  EXPECT_TRUE(Member(readiness, "next_intent").is_null());
+  EXPECT_TRUE(Member(readiness, "requested_state").is_null());
+  EXPECT_TRUE(Member(Member(readiness, "domains").as_array().front(), "decision_kind").is_null());
+}
+
+TEST(CCLCOpenRequest, ReadinessRejectsForeignOccurrenceAndContradictoryOwnerVerdicts) {
+  const std::vector<std::function<void(CCLCComponentReadDTO&)>> mutations{
+      [](auto& value) { value.readiness.request_owner_epoch = RequestOwnerEpoch(""); },
+      [](auto& value) { value.readiness.evaluated_at_ns = -1; },
+      [](auto& value) { value.readiness.domains.front().provider_occurrence.control_domain_revision = ControlDomainRevision("foreign"); },
+      [](auto& value) { value.readiness.ready = true; value.readiness.error.reset(); },
+      [](auto& value) { value.readiness.requested_state.reset(); },
+      [](auto& value) { value.readiness.measured_state = {false, true, std::nullopt}; },
+      [](auto& value) { value.readiness.measured_state = {true, true, value.readiness.error}; },
+      [](auto& value) { value.readiness.domains.clear(); },
+      [](auto& value) { MakeReady(value); value.readiness.domains.front().decision_kind =
+          static_cast<LifecycleDomainPlanDecisionKind>(255); },
+  };
+  for (std::size_t i = 0; i < mutations.size(); ++i) {
+    SCOPED_TRACE(i);
+    TargetViewPort port;
+    port.mutate_read = mutations[i];
+    EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+  }
 }
 
 TEST(CCLCOpenRequest, ComponentSnapshotAlwaysCarriesNullableTargetAndProgress) {
@@ -516,6 +776,15 @@ TEST(CCLCOpenRequest, IncidentRecoveryResultAndIncidentEventsAreExact) {
             R"({"acknowledged_at_ns":6000,"acknowledged_by":"operator.ada",)"
             R"("cause_class":"emergency_stop","controllable_component_id":"component.arm",)"
             R"("incident_id":"incident.component.arm.5000"})");
+  recovered.incident_recovery->closure_reason =
+      ComponentIncidentClosureReasonDTO::kCellClosedByOperator;
+  port.submit_result = recovered;
+  const auto close_wire = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_submit", LifecycleIntentValue()), port, {});
+  ASSERT_TRUE(close_wire.ok());
+  const auto close_response = content_identity::parse_canonical_json(close_wire.value());
+  EXPECT_EQ(Member(Member(Member(close_response, "result"), "incident_recovery"),
+                   "closure_reason").as_string(), "cell_closed_by_operator");
   // An incident recovery never carries a transaction or a rejection.
   auto mixed = recovered;
   mixed.rejection = ErrorDTO{"x", "x", {{"effect", "not_started"}}};
@@ -635,5 +904,112 @@ TEST(CCLCOpenRequest, IncidentRecoveryAndEventTimesUseTheFullWidthClockContract)
   EXPECT_FALSE(refused.ok());
 }
 
+TEST(CCLCOpenRequest, TargetRetirementEchoesCompleteClosedCASAndSettlementNeverHidesUnknown) {
+  FakeOpenPort port;
+  const RequestAttributionDTO attribution{RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified,
+                                          std::nullopt};
+  const auto offer = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_target_retirement_offer", CanonicalValue(CanonicalValue::Object{})), port, attribution);
+  ASSERT_TRUE(offer.ok());
+  const auto offered = content_identity::parse_canonical_json(offer.value());
+  ASSERT_TRUE(Member(offered, "ok").as_bool());
+  const auto scope = Member(Member(offered, "result"), "scope");
+  const auto targets = Member(Member(offered, "result"), "targets");
+  ASSERT_EQ(targets.as_array().size(), 1U);
+  EXPECT_FALSE(Member(targets.as_array().front(), "reached").as_bool());
+  EXPECT_EQ(Member(targets.as_array().front(), "recovered_cause").as_string(), "fault");
+  const CanonicalValue intent(CanonicalValue::Object{
+      {"request_context", ContextValue("retire.1")}, {"scope", scope}, {"expected_targets", targets}});
+  const auto retired = ExecuteCanonicalCCLCOpenRequest(Request("lifecycle_target_retire", intent), port, attribution);
+  ASSERT_TRUE(retired.ok());
+  const auto result = content_identity::parse_canonical_json(retired.value());
+  EXPECT_TRUE(Member(result, "ok").as_bool());
+  EXPECT_EQ(Member(Member(result, "result"), "retired_targets"), targets);
+  EXPECT_EQ(Member(Member(result, "result"), "request_context"), ContextValue("retire.1"));
+  ASSERT_TRUE(port.retirement_request);
+  EXPECT_EQ(port.retirement_request->expected_targets, port.retirement_rows);
+  const auto read = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_target_retirement_result", intent), port, attribution);
+  ASSERT_TRUE(read.ok());
+  EXPECT_TRUE(Member(content_identity::parse_canonical_json(read.value()), "result").is_null());
+  EXPECT_EQ(port.retirement_read, port.retirement_request);
+  EXPECT_EQ(port.retirement_writes, 1);
+  const CanonicalValue settlement(CanonicalValue::Object{{"scope", scope}});
+  const auto unknown = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_owner_settlement", settlement), port, attribution);
+  ASSERT_TRUE(unknown.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(unknown.value()), "ok").as_bool());
+  port.settlement_unknown = false;
+  const auto settled = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_owner_settlement", settlement), port, attribution);
+  ASSERT_TRUE(settled.ok());
+  EXPECT_TRUE(Member(Member(content_identity::parse_canonical_json(settled.value()), "result"), "settled").as_bool());
+  EXPECT_EQ(port.retirement_writes, 1);
+
+  auto bad_fields = intent.as_object();
+  bad_fields.emplace_back("confirmed", CanonicalValue(true));
+  const auto bad = ExecuteCanonicalCCLCOpenRequest(
+      Request("lifecycle_target_retire", CanonicalValue(std::move(bad_fields))), port, attribution);
+  ASSERT_TRUE(bad.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(bad.value()), "ok").as_bool());
+  auto duplicate = targets.as_array();
+  duplicate.push_back(duplicate.front());
+  const auto bad_rows = ExecuteCanonicalCCLCOpenRequest(Request("lifecycle_target_retire",
+      CanonicalValue(CanonicalValue::Object{{"request_context", ContextValue("retire.2")},
+         {"scope", scope}, {"expected_targets", CanonicalValue(std::move(duplicate))}})), port, attribution);
+  ASSERT_TRUE(bad_rows.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(bad_rows.value()), "ok").as_bool());
+  EXPECT_EQ(port.retirement_writes, 1);
+}
+
+}  // namespace
+}  // namespace manyforge::core
+
+namespace manyforge::core {
+namespace {
+TEST(CCLCOpenRequest, ProgramLifecyclePointReadDoesNotCollectChangingReadiness) {
+  TargetViewPort port;
+  port.mutate_read = [](CCLCComponentReadDTO&) {
+    throw std::logic_error("background admission publication changed during full readiness read");
+  };
+  const auto result = ExecuteCanonicalCCLCOpenRequest(
+      Request("component_lifecycle_snapshot", CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("component.arm")}})), port, {});
+  ASSERT_TRUE(result.ok());
+  const auto response = content_identity::parse_canonical_json(result.value());
+  ASSERT_TRUE(Member(response, "ok").as_bool()) << result.value();
+  const auto& snapshot = Member(response, "result");
+  EXPECT_EQ(snapshot.as_object().size(), 10U);
+  EXPECT_EQ(Member(snapshot, "controllable_component_id").as_string(), "component.arm");
+  EXPECT_EQ(Member(snapshot, "component_lifecycle_state").as_string(), "declared");
+  EXPECT_EQ(Member(snapshot, "snapshot_digest").as_string(), VerifiedSnapshot().snapshot_digest.value());
+  EXPECT_EQ(snapshot.find_object_member("readiness"), nullptr);
+  EXPECT_EQ(snapshot.find_object_member("lifecycle_target"), nullptr);
+  EXPECT_EQ(port.legacy_component_reads, 1U);
+  EXPECT_EQ(port.grouped_reads, 0U);
+  EXPECT_EQ(port.legacy_target_reads, 0U);
+  EXPECT_FALSE(port.submit_result.has_value());
+}
+
+TEST(CCLCOpenRequest, ProgramLifecyclePointReadRejectsCorruptSnapshotAndOpenPayload) {
+  TargetViewPort port;
+  port.mutate_snapshot = [](ComponentLifecycleCurrentSnapshotDTO& value) {
+    value.component_lifecycle_state = ComponentLifecycleStateDTO::kActive;
+    // A changed lifecycle state with the predecessor digest is not a verified snapshot.
+  };
+  const auto result = ExecuteCanonicalCCLCOpenRequest(
+      Request("component_lifecycle_snapshot", CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("component.arm")}})), port, {});
+  ASSERT_TRUE(result.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(result.value()), "ok").as_bool());
+  const auto closed = ExecuteCanonicalCCLCOpenRequest(
+      Request("component_lifecycle_snapshot", CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("component.arm")},
+          {"ignore_readiness", CanonicalValue(true)}})), port, {});
+  ASSERT_TRUE(closed.ok());
+  EXPECT_FALSE(Member(content_identity::parse_canonical_json(closed.value()), "ok").as_bool());
+  EXPECT_EQ(port.legacy_component_reads, 1U);
+  EXPECT_EQ(port.grouped_reads, 0U);
+}
 }  // namespace
 }  // namespace manyforge::core

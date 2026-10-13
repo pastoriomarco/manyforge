@@ -4,6 +4,8 @@ import type {
   CCLCComponentSnapshot,
   CCLCIncidentCauseClass,
   CCLCLifecycleTargetOrigin,
+  CCLCReadinessDomain,
+  CCLCTransactionStatus,
 } from '../types/cclc';
 
 /**
@@ -104,14 +106,34 @@ function targetFact(snapshot: CCLCComponentSnapshot): string {
     + `target ${target.targetGeneration})`;
 }
 
-function readinessFact(snapshot: CCLCComponentSnapshot): string {
+/** Preserve the actual owner ErrorDTO; this formatting adds no classification. */
+export function readinessErrorPresentation(error: CCLCTransactionStatus['error']): string | null {
+  if (error === null) return null;
+  return [`[${error.code}] ${error.message}`, error.details.reason]
+    .filter((part): part is string => typeof part === 'string').join(' · ');
+}
+
+function targetWaitFact(snapshot: CCLCComponentSnapshot): string | null {
+  if (snapshot.readiness.ready) return null;
   const progress = snapshot.lifecycleProgress;
-  if (progress === null) return 'Not reported by the lifecycle owner';
+  const start = progress?.waitingSinceNs;
+  if (progress?.phase === 'satisfied' || progress?.phase === 'cancelled' || start === null || start === undefined) return 'Target wait duration unavailable';
+  if (snapshot.readiness.evaluatedAtNs === undefined) return 'Target wait duration unavailable';
+  const evaluated = BigInt(snapshot.readiness.evaluatedAtNs);
+  const waiting = BigInt(start);
+  if (evaluated < waiting) return 'Target wait duration unavailable';
+  const milliseconds = (evaluated - waiting) / 1_000_000n;
+  return `Target wait: ${milliseconds / 1000n}.${String(milliseconds % 1000n).padStart(3, '0')} s at last owner evaluation`;
+}
+
+function readinessFact(snapshot: CCLCComponentSnapshot): string {
+  const readiness = snapshot.readiness;
   return [
-    CAUSE_LABELS[progress.blockingCauseClass],
-    progress.blockingReason,
-    progress.nextIntent === null ? null : `next step: ${progress.nextIntent}`,
-  ].filter((part): part is string => part !== null).join(' · ');
+    readiness.ready ? 'Ready' : 'Not ready',
+    readinessErrorPresentation(readiness.error),
+    readiness.nextIntent === null ? null : `next step: ${readiness.nextIntent}`,
+    targetWaitFact(snapshot),
+  ].filter((part): part is string => typeof part === 'string').join(' · ');
 }
 
 function verdict(
@@ -148,6 +170,9 @@ function verdict(
         'Motion is unavailable while the lifecycle owner reconciles the outcome from actual observation.',
     };
   }
+  if (achieved === 'faulted' || snapshot.readiness.domains.some((domain) => domain.health?.observedState === 'faulted')) {
+    return { message: 'Fault — intervention required', tone: 'intervention', consequence: INTERVENTION_CONSEQUENCE };
+  }
   if (
     cause === 'availability'
     && target?.requestedState === 'active'
@@ -162,10 +187,12 @@ function verdict(
     };
   }
   if (progress !== null && progress.phase === 'cancelled') {
+    const retired = progress.blockingReason?.startsWith('target_retired:') === true;
+    const reason = retired ? progress.blockingReason!.slice('target_retired:'.length).trim() : '';
     return {
-      message: 'Lifecycle target cancelled',
+      message: retired ? 'Target retired' : 'Lifecycle target cancelled',
       tone: 'waiting',
-      consequence: 'No automatic progression; manual lifecycle requests remain available.',
+      consequence: `${reason ? `${reason}. ` : ''}No automatic progression; manual lifecycle requests remain available.`,
     };
   }
   if (progress !== null && progress.phase !== 'satisfied') {
@@ -177,6 +204,9 @@ function verdict(
         : `Lifecycle step in progress: ${progress.nextIntent}`;
     }
     return { message, tone: 'waiting', consequence: WAITING_CONSEQUENCE };
+  }
+  if (!snapshot.readiness.ready) {
+    return { message: 'Not ready', tone: 'waiting', consequence: WAITING_CONSEQUENCE };
   }
   if (achieved === 'active') {
     return {
@@ -204,6 +234,21 @@ export function componentLifecyclePresentation(
       ? incidentFacts(snapshot.lifecycleProgress.incident)
       : null,
   };
+}
+
+/** Read-only wording of the selected domain; raw health/classification is retained. */
+export function componentReadinessDomainPresentation(domain: CCLCReadinessDomain) {
+  const facts = domain.health?.facts ?? [];
+  if (domain.hasActivationStep !== false) {
+    return { state: domain.health?.observedState ?? 'health unavailable', facts };
+  }
+  const state = domain.health === null ? 'No activation step · health unavailable'
+    : domain.health.observedState === 'faulted' ? 'No activation step · faulted'
+      : 'No activation step';
+  return { state, facts: facts.filter((fact) => ![
+    'external.controller_loaded', 'external.controller_configuration_ready',
+    'external.controller_inactive_unrequested',
+  ].includes(fact.lifecycleFactId)) };
 }
 
 /** Existing shared status-pill classes; no lifecycle-specific styling system. */

@@ -835,10 +835,15 @@ if(BUILD_TESTING)
       # Runtime handle (CCLC controller switching, binding epochs) and the
       # Isaac guard binding against in-process ROS stand-ins.
       add_executable(test_retained_ros2_control_runtime_handle
-        test/test_retained_ros2_control_runtime_handle.cpp)
+        test/test_retained_ros2_control_runtime_handle.cpp
+        test/test_retained_ros2_control_lifecycle_product.cpp)
+      target_include_directories(test_retained_ros2_control_runtime_handle PRIVATE
+        "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
+        "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
       target_link_libraries(test_retained_ros2_control_runtime_handle PRIVATE
         manyforge_roboplan_ros2_control_runtime
         manyforge_roboplan_native_runtime_support
+        manyforge_deployment_canonical_package_generator
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_runtime_handle
         PROPERTIES TIMEOUT 120)
@@ -881,6 +886,8 @@ if(BUILD_TESTING)
     # dependency packages deliberately have BUILD_TESTING disabled here.
     add_executable(test_retained_native_cclc_runtime
       test/test_retained_native_cclc_runtime.cpp
+      test/test_retained_native_lifecycle_product.cpp
+      test/test_retained_measured_robot_geometry.cpp
       "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test/test_cclc_runtime_composition.cpp")
     target_include_directories(test_retained_native_cclc_runtime PRIVATE
       "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
@@ -1296,6 +1303,11 @@ if(BUILD_TESTING)
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}")
+    if(TARGET test_retained_ros2_control_runtime_handle)
+      target_compile_definitions(test_retained_ros2_control_runtime_handle PRIVATE
+        MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
+        MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
+    endif()
 
     # Same provider/controller catalog and host infrastructure as the ordinary
     # fixture, with a new graph/bundle for projection candidate staging.
@@ -1350,6 +1362,7 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
+      manyforge_core_filesystem_resolved_stop_base_plan_repository
       manyforge_roboplan_retained_consumer
       manyforge_roboplan_collision_projection
       manyforge_roboplan_native_state_projection
